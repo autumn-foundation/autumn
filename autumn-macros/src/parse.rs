@@ -1,14 +1,151 @@
 //! Shared parsing and validation helpers for route macros.
 
 use proc_macro2::TokenStream;
-use quote::format_ident;
+use quote::{format_ident, quote};
+use syn::parse::ParseStream;
 use syn::{Attribute, Ident, ItemFn, LitStr, Token};
+
+/// Keys accepted inside a route attribute's `seo(...)` argument, in the order
+/// they are documented. Each one maps 1:1 onto a
+/// `autumn_web::seo::SeoRouteDefaults` field and a `SeoMeta` builder method.
+///
+/// [`SeoAttrArgs::emit`] derives the setter call for a key by concatenating
+/// `with_` onto it, and that setter lives in the *other* crate — so adding a
+/// key here without adding the matching
+/// `SeoRouteDefaults::with_<key>` still compiles this crate and only fails in
+/// a user's crate ("no method named `with_…`"). The
+/// `every_supported_key_round_trips` integration test in
+/// `autumn/tests/integration/seo.rs` exercises all of them and is what catches
+/// that mismatch; extend it when extending this list.
+const SEO_KEYS: &[&str] = &[
+    "title",
+    "description",
+    "canonical",
+    "og_title",
+    "og_description",
+    "og_image",
+    "og_type",
+    "og_url",
+    "twitter_card",
+    "twitter_title",
+    "twitter_description",
+    "twitter_image",
+    "robots",
+];
+
+/// Parsed `seo(...)` route attribute argument (#1182).
+///
+/// Holds the declared keys in source order, each paired with its string
+/// literal. An absent `seo(...)` argument is an empty `Vec`, which emits
+/// `SeoRouteDefaults::EMPTY`.
+#[derive(Default)]
+pub struct SeoAttrArgs {
+    /// Declared `(key, value)` pairs in source order. The key is stored as a
+    /// plain `String` (raw-ident prefix already stripped) because it is only
+    /// ever used to build a `with_<key>` setter name.
+    fields: Vec<(String, LitStr)>,
+}
+
+impl SeoAttrArgs {
+    /// Parse the body of a `seo(...)` argument, given a stream positioned at
+    /// the `seo` identifier's parenthesized group.
+    ///
+    /// Rejects unknown keys, repeated keys, and non-string values so a typo
+    /// surfaces as a compile error rather than silently-dropped metadata.
+    pub fn parse_group(input: ParseStream) -> syn::Result<Self> {
+        let span = input.span();
+        let content;
+        syn::parenthesized!(content in input);
+
+        let mut fields: Vec<(String, LitStr)> = Vec::new();
+        while !content.is_empty() {
+            let key: Ident = content.parse()?;
+            // Compare against the unprefixed name so `r#title` isn't reported
+            // as unknown while the diagnostic lists `title` as supported.
+            let key_name = key.to_string();
+            let key_name = key_name.strip_prefix("r#").unwrap_or(&key_name).to_owned();
+            if !SEO_KEYS.contains(&key_name.as_str()) {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "unknown `seo(...)` key `{key_name}`. Supported keys: `{}`.",
+                        SEO_KEYS.join("`, `")
+                    ),
+                ));
+            }
+            if fields.iter().any(|(existing, _)| *existing == key_name) {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!("duplicate `seo(...)` key `{key_name}`. Declare each key once."),
+                ));
+            }
+            let _eq: Token![=] = content.parse()?;
+            // Span the *value*, not the key: with `seo(og_image = OG_URL)` the
+            // key is the part the user got right.
+            let value_span = content.span();
+            let value: LitStr = content.parse().map_err(|_| {
+                syn::Error::new(
+                    value_span,
+                    format!("`seo({key_name} = ...)` expects a string literal."),
+                )
+            })?;
+            fields.push((key_name, value));
+
+            if content.peek(Token![,]) {
+                let _comma: Token![,] = content.parse()?;
+            } else {
+                break;
+            }
+        }
+
+        // Anything left over means the argument list is malformed (e.g. a
+        // missing comma). Reject it rather than silently dropping keys.
+        if !content.is_empty() {
+            return Err(content.error("expected `,` between `seo(...)` keys"));
+        }
+
+        // An empty `seo()` is almost certainly an unfinished edit. Rejecting it
+        // is consistent with rejecting typo'd keys: the whole point is that
+        // declared SEO metadata never silently fails to render.
+        if fields.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "empty `seo(...)`. Declare at least one key, e.g. \
+                     `seo(title = \"…\")`. Supported keys: `{}`.",
+                    SEO_KEYS.join("`, `")
+                ),
+            ));
+        }
+
+        Ok(Self { fields })
+    }
+
+    /// Emit the `autumn_web::seo::SeoRouteDefaults` value for these declared
+    /// keys, leaving the rest at their `SeoRouteDefaults::EMPTY` value.
+    ///
+    /// Deliberately built by chaining the `const fn with_*` setters rather than
+    /// by emitting a struct literal. A literal in the *user's* crate would pin
+    /// `SeoRouteDefaults` as exhaustively-constructible forever — adding a
+    /// fourteenth SEO key later would then be a breaking change — and it would
+    /// also trip `clippy::needless_update` there once every key is spelled out.
+    pub fn emit(&self) -> TokenStream {
+        let setters = self.fields.iter().map(|(key, value)| {
+            let setter = format_ident!("with_{}", key);
+            quote! { .#setter(#value) }
+        });
+        quote! {
+            ::autumn_web::seo::SeoRouteDefaults::EMPTY #(#setters)*
+        }
+    }
+}
 
 /// Parsed route macro attribute arguments.
 ///
 /// Supports:
 /// - `"/path"` — path only
 /// - `"/path", name = "helper_name"` — path with custom helper name
+/// - `"/path", seo(title = "…", description = "…")` — route-level SEO defaults
 pub struct RouteAttrArgs {
     pub path: LitStr,
     /// Override for the path-helper function name. When `None`, the helper
@@ -20,6 +157,8 @@ pub struct RouteAttrArgs {
     pub sunset_opt_out: bool,
     /// Per-route override for the global inbound request timeout.
     pub timeout: RouteTimeoutAttr,
+    /// Route-level SEO meta tag defaults from the `seo(...)` argument.
+    pub seo: SeoAttrArgs,
 }
 
 /// Parsed `timeout_ms = ...` / `timeout = "off"` route attribute.
@@ -52,6 +191,8 @@ impl syn::parse::Parse for RouteAttrArgs {
         let mut api_version = None;
         let mut sunset_opt_out = false;
         let mut timeout = RouteTimeoutAttr::Inherit;
+        let mut seo = SeoAttrArgs::default();
+        let mut seen_seo = false;
 
         while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
@@ -59,6 +200,26 @@ impl syn::parse::Parse for RouteAttrArgs {
                 break;
             }
             let key: Ident = input.parse()?;
+            // `seo(...)` is the one call-shaped argument; everything else is
+            // `key = value`, so branch before consuming the `=`.
+            if key == "seo" {
+                if !input.peek(syn::token::Paren) {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`seo` takes parenthesized keys, e.g. \
+                         `seo(title = \"About\", description = \"…\")`.",
+                    ));
+                }
+                if seen_seo {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "duplicate `seo(...)` argument. Declare all SEO keys in one `seo(...)`.",
+                    ));
+                }
+                seen_seo = true;
+                seo = SeoAttrArgs::parse_group(input)?;
+                continue;
+            }
             let _eq: Token![=] = input.parse()?;
             if key == "name" {
                 name_override = Some(input.parse::<LitStr>()?);
@@ -91,7 +252,7 @@ impl syn::parse::Parse for RouteAttrArgs {
                     key.span(),
                     format!(
                         "unknown route attribute key `{key}`. Supported keys: `name`, \
-                         `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout`."
+                         `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout`, `seo(...)`."
                     ),
                 ));
             }
@@ -103,6 +264,7 @@ impl syn::parse::Parse for RouteAttrArgs {
             api_version,
             sunset_opt_out,
             timeout,
+            seo,
         })
     }
 }

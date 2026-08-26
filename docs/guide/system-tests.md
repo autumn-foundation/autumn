@@ -45,7 +45,7 @@ In your app's `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.4", features = ["system-tests"] }
+autumn-web = { version = "0.7", features = ["system-tests"] }
 
 [features]
 system-tests = ["autumn-web/system-tests"]
@@ -115,7 +115,62 @@ All `Page` methods return `Result<&Self, SystemTestError>` and can be chained.
 | `page.expect_hx_settle()` | Explicitly wait for htmx to finish |
 | `page.expect_sse_event(id, predicate)` | Wait for SSE content in DOM |
 
-### htmx auto-waiting
+### Transient navigation errors
+
+Assertion helpers (`expect_text`, `expect_url`, `expect_attribute`,
+`expect_sse_event`) poll by evaluating JavaScript on the page. When an action
+triggers a full-page navigation — a submit button that redirects, say — Chrome
+destroys the JS execution context that an in-flight evaluation was targeting,
+and CDP reports errors such as `Cannot find context with specified id` or
+`Inspected target navigated or closed`.
+
+These are treated as "not ready yet": the helper keeps polling until its
+deadline instead of failing the test on the first unlucky tick. Genuine CDP
+errors (`No node with given id found`, for example) still surface immediately,
+so a real failure is never converted into a silent timeout.
+
+---
+
+## Custom middleware
+
+Use `.layer(...)` to register app-wide middleware on the router the test
+serves. It accepts the same Tower layers as
+[`AppBuilder::layer`](middleware.md) and applies them in the same position:
+
+```rust
+async fn scope_to_tenant(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TenantId("acme-corp"));
+    next.run(req).await
+}
+
+let runner = SystemTest::new()
+    .routes(routes![index, create_todo])
+    .layer(axum::middleware::from_fn(scope_to_tenant))
+    .build()
+    .await
+    .unwrap();
+```
+
+When `.layer()` is called more than once the **first** call is the outermost
+layer on ingress — it sees the request first and the response last, matching
+`AppBuilder::layer`.
+
+The layer sits inside Autumn's request-ID and session layers and outside
+CSRF/CORS, so middleware that reads the request ID or session finds them under
+test exactly as in production. (The CSRF layer is off by default in the
+harness, so "outside CSRF" only matters when you supply a config via
+`.state(...)` that re-enables it.) Layers apply on both the default-state path
+and the `.state(...)` override path.
+
+Without this you would have to map each layer onto individual handlers before
+passing them to `.routes()`, which tests a stack the real app never serves.
+
+---
+
+## htmx auto-waiting
 
 `click()` automatically waits for htmx to finish settling before returning.
 This is implemented by polling `document.querySelectorAll('.htmx-request').length === 0`
@@ -181,8 +236,10 @@ SystemTest::new()
 The harness looks for Chromium in this order:
 
 1. `AUTUMN_CHROMIUM` environment variable (full path)
-2. `PLAYWRIGHT_BROWSERS_PATH` directory (scans `chromium-*/chrome-linux/chrome`)
-3. Common system paths:
+2. `PLAYWRIGHT_BROWSERS_PATH` directory (scans `chromium-*/`)
+3. `PATH` lookup for `chrome`, `google-chrome`, `google-chrome-stable`,
+   `chromium`, `chromium-browser` (`.exe` on Windows)
+4. Well-known install locations:
    - `/usr/bin/chromium-browser` (Ubuntu/Debian)
    - `/usr/bin/chromium`
    - `/usr/bin/google-chrome`
@@ -190,6 +247,26 @@ The harness looks for Chromium in this order:
    - `/snap/bin/chromium`
    - `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (macOS)
    - `/Applications/Chromium.app/Contents/MacOS/Chromium` (macOS)
+   - `%ProgramFiles%`, `%ProgramFiles(x86)%` and `%LOCALAPPDATA%` under
+     `Google\Chrome\Application\chrome.exe` (and the `Chrome Beta` /
+     `Chromium` variants) on Windows
+
+On Linux and macOS each candidate is confirmed with a `--version` probe run
+against its own throwaway `--user-data-dir`, so a Chrome already running on
+the host cannot abort the probe on a locked profile directory. A binary that
+exits 0 without printing anything (a launcher shim, say) is still accepted.
+
+**Windows:** `chrome.exe` is a GUI-subsystem binary — it writes nothing to the
+parent console, and `--version` is not an early-exit switch there, so running
+it starts a real browser rather than answering. The harness therefore does not
+execute the candidate on Windows at all: an existing `.exe` at a known
+location is accepted, and `autumn doctor` reports `version unavailable`
+instead of falsely claiming no browser is installed. Windows install
+locations (`%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%` under
+`…\Application\chrome.exe`) are searched alongside the Unix ones.
+
+`autumn doctor` and the `SystemTest` runner share this resolution code, so the
+two can never disagree about whether this host can run system tests.
 
 Run `autumn doctor` to check whether a browser is detected:
 
@@ -236,7 +313,7 @@ async fn add_todo_flow() {
 }
 ```
 
-Transaction-based rollback (from [#807](https://github.com/madmax983/autumn/issues/807))
+Transaction-based rollback (from [#807](https://github.com/autumn-foundation/autumn/issues/807))
 is not yet available for system tests because the browser drives a real HTTP
 server on a separate TCP connection; per-test transaction wrapping would
 require a proxy layer not yet shipped.

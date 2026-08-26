@@ -2,7 +2,7 @@ use autumn_web::AutumnResult;
 use autumn_web::hooks::{MutationContext, MutationHooks, UpdateDraft};
 
 use crate::models::{NewPage, Page, UpdatePage};
-use crate::slugify::slugify;
+use autumn_web::slugify;
 
 #[derive(Clone, Default)]
 pub struct PageHooks;

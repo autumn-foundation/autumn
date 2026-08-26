@@ -1,0 +1,5 @@
+error: at most one `#[commentable]` per model: the generated `{Model}Comments` trait's `add_comment`/`comment_thread`/`delete_comment` methods would otherwise collide (several comment kinds per model are not supported — see https://github.com/autumn-foundation/autumn/issues/1367)
+  --> tests/compile-fail/model_commentable_duplicate.rs:16:1
+   |
+16 | #[commentable(by = User, table = notes)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

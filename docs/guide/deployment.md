@@ -27,24 +27,46 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.6.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.7.0`
 
 ---
 
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
-single Linux VPS you control — no Dockerfile, no container registry, no PaaS
-account. It uploads a single embedded binary, supervises it with systemd behind
+Linux VPS you control — no Dockerfile for your app, no registry to publish it
+to, no PaaS account. It uploads a single embedded binary, supervises it with systemd behind
 a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
 traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
 back.
 
-This is the **primary** deployment path. Two alternatives remain documented
+List several servers under `[deploy] hosts` instead of one under `[deploy] host`
+and the same command becomes a **rolling deploy across the fleet**: hosts are
+replaced one at a time in declaration order, migrations run exactly once, and a
+mid-rollout failure halts and rolls the hosts that already cut over back. See
+[Rolling deploy across a fleet](#rolling-deploy-across-a-fleet) and the
+[fleet deploys guide](fleet-deploys.md).
+
+This is the **primary** deployment path. A few alternatives remain documented
 below and are better fits in specific cases:
 
 - **[Deploy to fly.io](#deploy-to-flyio)** — a managed platform (machines,
   built-in metrics scraping, `fly deploy`).
+- **[Deploy to Azure Container Apps](#deploy-to-azure-container-apps)** —
+  Terraform-provisioned Container Apps, ACR, Postgres Flexible Server, and
+  Key Vault for Azure-heavy shops that already have the IAM/RBAC patterns in
+  place.
+- **[Deploy to AWS App Runner](#deploy-to-aws-app-runner)** — the fast,
+  minimal-Terraform AWS path: ECR, App Runner, and RDS behind a VPC
+  connector, closest AWS analog to Fly.io.
+- **[Deploy to AWS ECS Fargate](#deploy-to-aws-ecs-fargate)** — the
+  production AWS path: VPC/ALB/ECS Fargate/RDS, for AWS-experienced infra
+  teams who already have runbooks for this shape.
+- **[Deploy to GCP Cloud Run](#deploy-to-gcp-cloud-run)** —
+  Terraform-provisioned Cloud Run, Artifact Registry, Cloud SQL PostgreSQL
+  behind a Serverless VPC Access connector, and Secret Manager-backed
+  secrets, for GCP shops that already have workload identity federation in
+  place.
 - **The container path** ([Step 1](#step-1--create-the-project) through
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
@@ -72,7 +94,8 @@ below and are better fits in specific cases:
 
 ### Preconditions
 
-Everything except two host prerequisites is automated by `autumn deploy up`:
+`autumn deploy up` automates everything on the target: the only host prerequisite
+is SSH access, and the only other prerequisite is on your own machine.
 
 - **Key-based SSH access as `root` (or an equivalently privileged account) to a
   stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
@@ -86,15 +109,66 @@ Everything except two host prerequisites is automated by `autumn deploy up`:
   plain non-root SSH login passes preflight (which only checks reachability and
   secrets, not privilege) and then fails once it tries to write the unit or
   invoke `systemctl`.
-- **The `kamal-proxy` binary present at `/usr/local/bin/kamal-proxy`.** The
-  deploy writes and supervises the proxy's systemd unit, but does **not**
-  download the binary itself — install it once as part of host bootstrap. (See
-  [Limitations](#limitations-and-known-gaps).)
 - **A local Rust toolchain** to build the release binary (`autumn build
-  --embed`).
+  --embed`). This one is on *your* machine, not the target.
 
-The reverse proxy, install directories, systemd units, release layout, and the
-secret env file are all created for you.
+The reverse proxy **binary**, the reverse proxy service, install directories,
+systemd units, release layout, and the secret env file are all created for you.
+
+A host that still needs the reverse-proxy binary installed additionally needs
+**apt** (host preparation is Debian/Ubuntu-only — on another systemd distro,
+install `kamal-proxy` yourself and set `install_proxy = false`) and **outbound
+HTTPS** to your distro mirrors and to Docker Hub. Once prepared, neither is
+needed again. See [Host preparation](#host-preparation-install_proxy).
+
+#### Host preparation (`install_proxy`)
+
+`autumn deploy up` prepares the target itself. Before anything else runs it
+probes the host for a working `kamal-proxy`, and:
+
+- **a host that already has one** is left completely untouched — the probe is a
+  read-only `kamal-proxy deploy --help`, and nothing else runs;
+- **a host that has none** gets the pinned build installed at
+  `/usr/local/bin/kamal-proxy`. kamal-proxy publishes no release binaries
+  (upstream ships it as a container image), so the deploy installs the packages a
+  minimal image may lack — `curl` (the readiness gate polls `/ready` *on the
+  host*) and a container runtime — copies the binary out of the
+  `basecamp/kamal-proxy` image **pinned by digest**, and moves it into place. Only
+  genuinely missing packages are installed; the container runtime and the pulled
+  image are left on the host afterwards. The step announces itself before it runs:
+
+  ```
+  host preparation: no kamal-proxy on this host — installing v0.9.2 at
+  /usr/local/bin/kamal-proxy, from the pinned basecamp/kamal-proxy image. This also
+  installs, and leaves behind, any of `curl` and a container runtime the host is
+  missing. Decline with `[deploy] install_proxy = false`.
+  ```
+
+  The install ends by running the binary it just placed, so an install that
+  "succeeded" without producing a working proxy fails the deploy there rather than
+  at the first cutover. It also refuses outright if anything already exists at
+  `/usr/local/bin/kamal-proxy`, so it can never replace a binary the probe merely
+  failed to reach.
+
+- **a host whose kamal-proxy responds but whose CLI surface has drifted** (a
+  renamed or removed subcommand/flag) is *never* replaced — that binary may be
+  shared with something else on the host. The deploy aborts with a message naming
+  exactly what is missing and the version to pin, before touching live traffic.
+
+If the install can't be done — no outbound network, no apt, Docker Hub rate
+limits — the deploy fails fast, before anything is uploaded or cut over, with a
+message naming what the host needs and the `install_proxy = false` opt-out.
+
+To provision the proxy yourself (a pinned internal build, your own package, or a
+host you don't want a container runtime on), decline host preparation:
+
+```toml
+[deploy]
+install_proxy = false
+```
+
+A missing binary is then an actionable deploy failure instead of something the
+deploy fixes.
 
 ### First deploy: from `autumn new` to a live app
 
@@ -109,16 +183,51 @@ Point the deploy at your server by adding a `[deploy]` section to `autumn.toml`:
 ```toml
 [deploy]
 host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
+# hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+#                         # a FLEET instead of one server (see "Rolling deploy
+#                         # across a fleet"). Mutually exclusive with `host`;
+#                         # the list order IS the rollout order.
 # user = "root"           # SSH user (default: root)
 # ssh_port = 22           # SSH port (default: 22)
 # app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
 # readiness_timeout_secs = 60     # /ready window before rollback (default: 60)
 # keep_releases = 3               # prior releases retained for rollback (default: 3)
+# install_proxy = false           # decline host preparation — you install
+#                                 # kamal-proxy yourself (default: true)
 ```
 
 Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
-`AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
-host out of the file.
+`AUTUMN_DEPLOY__HOSTS`, `AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if
+you prefer to keep the host out of the file. `AUTUMN_DEPLOY__HOSTS` takes a
+comma-separated list (`AUTUMN_DEPLOY__HOSTS=10.0.0.1,10.0.0.2`) and **replaces**
+the whole `hosts` list from the file rather than appending to it. Entries are
+trimmed and blank segments are dropped, so a trailing or doubled comma is
+tolerated, and `AUTUMN_DEPLOY__HOSTS=` (empty) means *unset* — the same as
+`AUTUMN_DEPLOY__HOST=` — rather than a blank fleet entry that would refuse every
+deploy subcommand.
+
+> **`host` and `hosts` are mutually exclusive.** Setting both is refused before
+> anything runs — with both set the rollout order would be ambiguous. A blank
+> entry or a repeated entry in `hosts` is refused too (deploying the same server
+> twice would corrupt its previous-release chain). A one-entry `hosts` list is
+> byte-for-byte the historical single-server deploy.
+
+**Env wins over the file for *both* spellings.** Because the two are mutually
+exclusive, setting one spelling in the environment now **clears the other from
+`autumn.toml`**: a non-empty `AUTUMN_DEPLOY__HOSTS` retargets a `[deploy] host`
+project as a fleet, and a non-empty `AUTUMN_DEPLOY__HOST` retargets a
+`[deploy] hosts` project at a single server. Neither combination is a conflict —
+it is the documented env-over-TOML precedence applied to the spelling you did
+*not* set. Two rules bound it:
+
+- **Setting both env spellings non-empty is still refused**, naming both keys.
+  That is not a precedence question; with both set the rollout order is genuinely
+  ambiguous, so it is treated as an operator error rather than tie-broken.
+- **An empty or blank value still means *unset*** and leaves the TOML spelling
+  alone. `AUTUMN_DEPLOY__HOST=`, a whitespace-only value, `AUTUMN_DEPLOY__HOSTS=`
+  and `AUTUMN_DEPLOY__HOSTS=" , "` are the shape a CI or compose template emits
+  for an unfilled slot, so they can never silently drop a fleet list configured
+  in the file.
 
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file
@@ -161,7 +270,7 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > paths, CORS, signing-secret rotation
 > (`security.signing_secret.previous_secrets`), and so on — instead of falling
 > back to built-in defaults (fixes
-> [#1952](https://github.com/madmax983/autumn/issues/1952)). Coupling the config
+> [#1952](https://github.com/autumn-foundation/autumn/issues/1952)). Coupling the config
 > to the release (rather than a single shared dir) means a **rollback loads the
 > rolled-back release's own config** — never the latest deploy's — and **removing
 > a local override and redeploying no longer leaves a stale one loaded**, because
@@ -195,7 +304,15 @@ from pending migrations — an old destructive migration file left in the direct
 fails the check even after it has been applied. Keep `migrations/` rolling-safe
 (remove or adjust an already-applied destructive migration if it trips the scan).
 The preflight exits non-zero if anything fails, so nothing touches the server
-until it is green:
+until it is green.
+
+With a fleet (`[deploy] hosts`), **every host the run targets is graded before
+any host is touched**: SSH reachability is probed once per host and reported on
+its own line (`ssh_reachability (10.0.0.3)`), while the project-wide graders —
+signing secret, database URL, migrate-safety — run once. So an unreachable host
+in position 3 is named before host 1 is deployed, not after two hosts have
+already cut over. `autumn deploy up` and `autumn deploy rollback` re-run this
+same fleet-wide preflight and abort on any failure.
 
 ```bash
 autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
@@ -218,10 +335,14 @@ it fails, then on this first run:
 4. writes the signing secret, database URL, and `AUTUMN_ENV` (the profile,
    `prod` by default) to `app_dir/shared/autumn.env` (`0600`, sourced by
    systemd — never printed, never on a command line; rebuilt each deploy),
-5. writes the app's systemd unit (bound to a private `127.0.0.1` port),
-   points `current` at the release, and starts it,
-6. health-gates on `GET /ready` within `readiness_timeout_secs`, then
-7. routes the proxy at the freshly-ready release.
+5. writes the app's systemd unit (bound to a private `127.0.0.1` port) and
+   points `current` at the release,
+6. **runs any pending migrations** (a blocking `AUTUMN_MIGRATE=1` one-shot) —
+   before the release is started, so it never boots against a schema that was
+   never applied,
+7. starts the unit,
+8. health-gates on `GET /ready` within `readiness_timeout_secs`, then
+9. routes the proxy at the freshly-ready release.
 
 On success it prints:
 
@@ -235,6 +356,27 @@ Verify it is serving (the public port is your configured `server.port`):
 curl http://203.0.113.10:3000/health   # -> {"status":"ok", ...}
 curl http://203.0.113.10:3000/ready    # readiness probe used during cutover
 ```
+
+### Migration ordering (first deploy included)
+
+Pending migrations run **before the new version takes traffic**, on both paths:
+
+| | when the migration runs | if it fails |
+| --- | --- | --- |
+| **First deploy** | after the binary, env file and unit are in place, **before the unit is started** | the deploy aborts and the half-written release is torn down — nothing is started, nothing is routed |
+| **Redeploy** | after the candidate slot starts, **before the proxy flip** | the deploy aborts with the **old release still serving** — no flip, no drain, no promote |
+
+A first deploy migrates before it *starts* the app rather than after, because
+there is no live release to keep warm and an app booted against an unapplied
+schema can crash-loop under systemd long before the readiness gate says anything
+useful. Either way the migration is a blocking `systemd-run --wait` one-shot of
+the release binary in `AUTUMN_MIGRATE=1` mode, run from the release directory
+with the same `0600` env file the app uses, so its exit status gates everything
+that follows. An app with no database support reports "nothing to migrate" and
+exits 0, so this step is harmless for a DB-free app.
+
+This is why a `autumn new` → `autumn build --embed` → `autumn deploy up` first
+deploy needs no out-of-band `autumn migrate`.
 
 ### Zero-downtime redeploy
 
@@ -262,6 +404,374 @@ Because the run stops at the first failure, a bad migration or a candidate that
 never reports `/ready` leaves the previous version serving and tears the
 candidate down automatically — there is no half-deployed state serving traffic.
 
+### Rolling deploy across a fleet
+
+List more than one server under `[deploy] hosts` and the same `autumn deploy up`
+becomes a **rolling deploy across the fleet** — no new command, no new flags
+required:
+
+```toml
+[deploy]
+hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+```
+
+```bash
+autumn build --embed
+autumn deploy up
+```
+
+**The list order is the rollout order.** Nothing sorts or regroups it: hosts are
+replaced strictly front to back, **one at a time**, and each host must finish its
+own cutover before the next host is started. Every host runs the *same*
+zero-downtime blue/green sequence documented above, against its own kamal-proxy,
+so a host being replaced never stops serving and the hosts behind it in the
+queue are still on the old release — your load balancer always has healthy
+upstreams. See the [fleet deploys guide](fleet-deploys.md) for the load-balancer
+contract, the shared-state prerequisites, and the scale-up walkthrough.
+
+**No host is ever drained for the rollout's sake.** The host being replaced is
+not removed from your load-balancer pool and its `/ready` never goes `503`: the
+candidate comes up on that host's idle loopback slot, is health-gated there, and
+that host's own kamal-proxy flips upstreams atomically, with the old slot drained
+and stopped only afterwards. `autumn deploy` never touches your load balancer's
+membership — draining a host for a reboot or a scale-down stays your job.
+
+The whole run mints **one release id**, so every host's `current` symlink
+resolves to the same release and drift is meaningful.
+
+Abridged output for a three-host fleet:
+
+```
+Rolling release 20260821T101500Z across 3 hosts, ONE AT A TIME, in `[deploy] hosts` order:
+  1. 10.0.0.1 — zero-downtime redeploy
+  2. 10.0.0.2 — zero-downtime redeploy
+  3. 10.0.0.3 — zero-downtime redeploy
+  → migrate (10.0.0.1 only — the schema is fleet-wide; 10.0.0.2, 10.0.0.3 skip it)
+
+[1/3 10.0.0.1] deploying release 20260821T101500Z (zero-downtime redeploy)…
+✅ [1/3 10.0.0.1] serving 20260821T101500Z
+…
+Fleet state:
+  ✅ 10.0.0.1  serving 20260821T101500Z
+  ✅ 10.0.0.2  serving 20260821T101500Z
+  ✅ 10.0.0.3  serving 20260821T101500Z
+
+✅ Fleet deploy complete — all 3 hosts serving 20260821T101500Z.
+```
+
+#### Migrations run exactly once
+
+The schema is fleet-wide, so the rollout runs the pre-cutover migration on
+**exactly one host**: the **first host in rollout order**, whatever its mode,
+immediately before *its* cutover. Every other host builds with the migrate step
+omitted. Because host 1 is the earliest point in the rollout, the schema always
+moves before *any* host in the fleet takes traffic on the new release.
+
+That holds for a brand-new fleet too: a first deploy runs its pending migrations
+before it starts the release (see
+[Migration ordering](#migration-ordering-first-deploy-included)), so an
+all-first-deploy rollout migrates on host 1 exactly like an all-redeploy one. The
+rollout header states where the migration lands:
+
+```
+  → migrate (10.0.0.1 only — the schema is fleet-wide; 10.0.0.2, 10.0.0.3 skip it)
+```
+
+Once the migrating host cuts over, the rollout says so:
+
+```
+⚠️  the schema has moved; from here an automatic rollback restores BINARIES
+only — it never rolls a migration back
+```
+
+Design your migrations **expand/contract** so the old and new binaries can both
+run against the migrated schema — that is what makes the automatic rollback below
+safe. `autumn migrate check` (already part of the preflight) classifies your
+local `migrations/` by rolling-deploy risk; the
+[fleet deploys guide](fleet-deploys.md) covers the pattern in full.
+
+##### The three schema notes on the `Fleet state:` summary
+
+The same binaries-versus-schema truth is repeated once at the end of the run, on
+the `Fleet state:` table described [below](#a-failure-halts-the-rollout-and-rolls-the-fleet-back).
+The question being answered is never "did the fleet compensate" — it is **the
+schema is at the new release; where are the binaries?** So the gate is the
+migration: the summary says nothing at all unless this run actually scheduled a
+migration *and* reached the host carrying it. (Every non-empty rollout schedules
+one, so in practice the gate is whether host 1 was reached at all — a rollout that
+failed before touching it moved no schema.) Beyond that gate the fleet's shape
+only picks which sentence is true:
+
+- **Some host is still forward.** At least one host is on the new release —
+  deployed, degraded, left alone because its rollback target was in doubt, or one
+  whose compensating rollback *failed*. You get:
+
+  ```
+  ⚠️  the schema has moved; from here an automatic rollback restores BINARIES
+  only — it never rolls a migration back
+  ```
+
+  Forward-looking: it describes what a rollback you run *from here* will and will
+  not undo. It is the same sentence the rollout printed mid-run, repeated because
+  the run is ending with hosts still on the new release.
+
+- **The fleet actually put hosts back.** Compensation *restored* a host to its
+  previous release or *removed* a just-completed first deploy. You get:
+
+  ```
+  ⚠️  the compensating rollback restored BINARIES only — the migration that
+  already ran was NOT rolled back; confirm the schema still fits the release now
+  serving
+  ```
+
+  Past-tense: something already moved back underneath you. A compensation that
+  only **failed** does not count here — that host is still serving the new
+  release, so it lands in the first case instead, and claiming a rollback
+  "restored binaries" would be false.
+
+  These two are independent. A halt that compensated some hosts and left others
+  forward (a `NOT rolled back automatically` row, or a compensation that failed)
+  prints **both**.
+
+- **Nothing forward, and nothing compensated.** No host is on the new release and
+  the fleet never had anything to undo — because the migrating host itself failed
+  at a step *after* `migrate` but *before* its cutover (a `readiness-gate`
+  timeout is the ordinary shape) and tore its own candidate down, leaving every
+  later host untouched. The table is then all "previous release still serving"
+  rows with the database already moved on underneath them, so the summary says so
+  explicitly:
+
+  ```
+  ⚠️  no host is serving the new release, but the migration that already ran was
+  NOT rolled back — the binaries went back and the schema did not; confirm the
+  release now serving still fits the migrated schema
+  ```
+
+  This is the case that is easiest to misread as a clean no-op. It is not one:
+  the rollout aborted, but the migration stands.
+
+The gate is deliberately conservative. The rollout cannot prove from a failing
+step label whether the one-shot `migrate` itself succeeded, so it errs toward
+"the schema moved" — one extra line of output is cheaper than an operator rolling
+binaries back believing the schema came with them.
+
+#### A failure halts the rollout and rolls the fleet back
+
+A host that fails **stops the rollout**: the hosts behind it are never touched.
+What happens to the hosts already on the new release depends on *where* the
+failure landed relative to the **go-live step** — `proxy-flip` on a redeploy,
+`proxy-route` on a first deploy:
+
+| Where it failed | What the host is | What the fleet does |
+|---|---|---|
+| At or before go-live, on a redeploy | Previous release still serving (the candidate was torn down) | Already clean — nothing to undo |
+| At or before go-live, on a first deploy | Nothing serving (the candidate was torn down) | Already clean — nothing to undo |
+| After go-live, in housekeeping (`record-proxy-options`, `drain-old`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, at `commit-markers` | Live on the new release, markers mid-transaction | Halt, and **never** auto-roll this host back — the rollback target cannot be trusted |
+| After go-live, anything else | Live on the new release | Halt and compensate, this host included |
+
+(The redeploy sequence is `start-candidate` → `migrate` → `readiness-gate` →
+`proxy-flip` → `commit-markers` → `record-proxy-options` → `drain-old` →
+`prune`, so a failed migration or a candidate that never reports `/ready` is
+always a pre-go-live failure with the old release still serving.)
+
+Compensation walks the hosts that are on the new release in **strict reverse
+rollout order** (newest cutover first — that shrinks the mixed window from the
+newest end) and, per host, either rolls it back to its previous release with the
+same primitives `autumn deploy rollback` uses, or — for a host whose *first*
+deploy had just completed — removes that first deploy so the host returns to
+nothing-installed. It is best-effort-**continue**: a failed compensation on one
+host never stops the next, and every result is named.
+
+Two things compensation deliberately does **not** do:
+
+- **It restores binaries, never schema.** A migration that already ran stays
+  applied. The summary says so out loud — but only when compensation actually
+  *restored* a host to its previous release or *removed* a just-completed first
+  deploy. A compensation that merely **failed** leaves that host serving the new
+  release, so the summary prints the forward-looking `the schema has moved …`
+  note for it instead. Either way, confirm the schema still fits the release now
+  serving; the three notes and when each appears are spelled out under
+  [The three schema notes on the `Fleet state:` summary](#the-three-schema-notes-on-the-fleet-state-summary).
+- **It does not touch a host whose rollback target is in doubt.** Markers left
+  mid-transaction, a missing or unverifiable target release dir, or no recorded
+  previous release each produce a `NOT rolled back automatically` row plus the
+  exact read-only command to inspect that host's markers by hand (see
+  [Troubleshooting](#troubleshooting)).
+
+A **degraded** host — live and healthy on the new release, but whose post-cutover
+housekeeping failed — is worth repairing promptly: a failed `record-proxy-options`
+makes the **next** deploy of that host fail closed. A redeploy of that host
+repairs it, and the run's final line says how many hosts finished degraded.
+
+Every exit path — success, halt, or halt-plus-compensation — ends with the
+per-host `Fleet state:` table, printed **after** any compensation so it describes
+where the fleet actually is. On a halt it is your only source of truth about
+which host is running what. It names every host currently on the new release
+along with the levers for reversing them:
+
+```
+  On 20260821T101500Z: 10.0.0.2, 10.0.0.3. Roll ONE back with `autumn deploy
+  rollback --only <host>`, or the whole fleet with `autumn deploy rollback`.
+```
+
+#### `--only`: the repair lever
+
+```bash
+autumn deploy up --only 10.0.0.3          # repeatable: --only a --only b
+autumn deploy rollback --only 10.0.0.3
+```
+
+`--only` narrows `up` or `rollback` to a subset of `[deploy] hosts`. Each value
+must appear in that list **verbatim** — nothing is prefix-matched or DNS-resolved,
+so a typo can never deploy the wrong machine — and the selection keeps
+*declaration* order regardless of the order you typed the flags, so `--only c
+--only a` cannot invert a rolling deploy.
+
+It is a **repair lever, not a faster deploy.** Whenever it excludes a configured
+host the command says so before it starts:
+
+```
+⚠️  `--only` narrows this command to part of the fleet, so the hosts it skips
+keep running whatever they are running now — THE FLEET MAY END UP MIXED. This is
+a repair lever, not a faster deploy: finish with a full `autumn deploy up` (no
+`--only`) so every host converges on one release (#1621).
+   this run touches: 10.0.0.3
+   left as they are: 10.0.0.1, 10.0.0.2
+```
+
+Finish with a full `autumn deploy up`.
+
+#### `--no-rollback`: freeze a failed rollout
+
+```bash
+autumn deploy up --no-rollback
+```
+
+Halt and **freeze** instead of compensating: every host is left exactly as it is
+— including the ones already on the new release — and named in the final state
+table, so you can inspect the failure before anything else moves. Use it when you
+would rather diagnose a half-rolled fleet than automatically reverse it.
+
+#### Topologies a fleet deploy refuses
+
+Three configurations are refused in the rollout prologue, **before a single
+remote command runs**, because they cannot be deployed safely across more than
+one host. Each is gated on the number of *configured* hosts, so `--only` does not
+unlock them:
+
+| Config | Why it is refused |
+|---|---|
+| `[database] url` is a `sqlite://` target | Every host receives the same database URL, which for SQLite means N independent database *files* — no shared schema, no lock to serialize migrations, and every host serving a different dataset behind your load balancer. Point `[database] url` at a Postgres server every host can reach. |
+| `[media.mediamtx] enabled = true` | Host media provisioning has no teardown or rollback path; fanning it out would leave one MediaMTX daemon per host on identical ports with nothing to undo them with. Deploy media on a single host with `[deploy] host`. |
+| `[deploy.tls] enabled = true` | The deploy-managed kamal-proxy runs on **every** host, so each would request a certificate for the same `[deploy.tls] host` from behind your load balancer; only one can answer a given ACME challenge and the rest burn Let's Encrypt rate limits. **Terminate TLS at the load balancer that fronts the fleet** and set `[deploy.tls] enabled = false`. |
+
+One more fleet condition is a loud **warning** rather than a refusal:
+`[database] auto_migrate` (or the `auto_migrate_in_production` alias) on a
+multi-host deploy means every host applies migrations at boot, so the hosts race
+each other during the rollout and a checksum mismatch exits the process under
+`Restart=on-failure` — a crash loop mid-rollout. Turn it off for fleets and let
+the rollout's single `migrate` step own the schema.
+
+#### What fleet support changed for an existing single-host deploy
+
+`[deploy] hosts = ["x"]` behaves exactly like `[deploy] host = "x"` — one entry
+is one host, and the two spellings produce byte-identical output, uploads and
+remote commands. What that guarantee does *not* mean is that a single-host deploy
+is unchanged from the release before fleets landed. Several hardening changes
+apply to **every** deploy, one host or five. In full, so an upgrade holds no
+surprises:
+
+- **A release-directory collision is now refused, and that is a new hard
+  failure.** The release id has one-second granularity, so a fast re-run can
+  reuse it. Re-uploading into a directory that `shared/previous-release` still
+  points at would put the *new* binary there — a later rollback would roll
+  *forward*. The deploy now probes for that directory first and refuses before
+  writing anything, as it does when the probe cannot prove the directory is
+  absent. **Concretely: a second `autumn deploy up` inside the same second now
+  exits 1 with `release directory … already exists` where it previously went
+  ahead.** Wait a second and re-run, or remove the directory if you are certain
+  it is stale. The probe also costs one extra SSH round-trip per deploy, before
+  anything is mutated.
+- **SSH sessions are bounded.** Every `ssh`/`scp` invocation carries
+  `ConnectTimeout=10`, `ServerAliveInterval=15` and `ServerAliveCountMax=4`
+  alongside `BatchMode=yes`. The preflight is a TCP connect, which proves a host
+  *accepts* a connection, not that its SSH daemon will ever answer; without these
+  a wedged host would hang the deploy forever. For one server that is a stuck
+  command someone cancels — for a fleet it would be a rollout frozen mid-flight
+  with no error to compensate. Turning an infinite hang into a finite error is
+  what lets the fleet halt and roll back. A host that accepts TCP and then wedges
+  now fails the deploy instead of hanging it.
+- **The maintenance flag file moved to `shared/`.** Every slot unit is now
+  written with
+  `Environment=AUTUMN_MAINTENANCE_FLAG_FILE={app_dir}/shared/autumn-maintenance.json`,
+  so after the next deploy the app reads the flag from the shared directory
+  instead of the release directory's `tmp/`. This fixes a real bug — a cutover
+  used to orphan an active maintenance flag — but it is a behaviour change, and
+  it means the **local** `autumn maintenance on`, run on a deploy-managed host,
+  now writes a path the app no longer reads. Use `autumn deploy maintenance`
+  there; see [Maintenance mode](maintenance-mode.md#where-the-flag-file-lives).
+- **A `shared/last-deploy` marker appears.** The ops that complete a cutover
+  (`commit-markers`, and `record-proxy-options` on a first deploy) now append an
+  advisory shell fragment recording the action that completed plus the host's UTC
+  time. It is what `deploy status` reads for its `last deploy` cell.
+  The fragment can never fail the op it rides on, and it adds one small file
+  under `shared/`; the op labels and everything else those ops do are unchanged.
+  The first-deploy teardown writes it too, through one extra
+  `teardown-last-deploy` op recording `torn down`, so a host whose first deploy
+  was removed again can never keep reporting a successful one. That op runs only
+  on the first-deploy failure and compensation path — a redeploy's candidate
+  teardown leaves the marker alone, because the previous release is still serving
+  and the marker still describes it.
+- **The `detect-current` probe reads one more thing.** Its shell gained a
+  delimited section that resolves the `current` symlink, so the deployed release
+  id comes back in the same round-trip the deploy already made. Same op, same
+  label, no extra round-trip; only the remote shell text differs.
+- **The "no host configured" hint now mentions `hosts`.** A project with neither
+  key set still fails with `no target host configured`, but the remediation hint
+  gained the fleet spelling:
+
+  ```
+  no target host configured: Set `[deploy] host` in autumn.toml to your server's
+  SSH-reachable address (or `[deploy] hosts = ["<address>", …]` to deploy a fleet)
+  ```
+
+  Stderr text only; the failure and its exit code are unchanged.
+
+One further change is invisible on a single host and listed only for
+completeness: a post-cutover failure is now wrapped in an error type that records
+which step it landed on, so the fleet driver can decide whether that host may be
+auto-rolled-back. Its `Display` delegates to the wrapped error verbatim, so the
+single-host path prints byte-for-byte what it printed before.
+
+`autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
+and `--no-rollback`; no existing flag changed meaning.
+
+> **Known limitation — a single-host deploy that fails after its migration ran
+> says nothing about the schema (#2276).** On one host, a failure at any point is
+> reported as the plain per-host error and the command returns right there: the
+> single-host path deliberately keeps its pre-fleet output byte-for-byte, so it
+> renders no `Fleet state:` summary and therefore none of
+> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary).
+> If the failure landed *after* `migrate` but before the cutover — a
+> `readiness-gate` timeout is the ordinary shape — the candidate is torn down and
+> your previous release keeps serving, **against the already-migrated schema**,
+> with nothing on screen saying so. The fleet path does warn in exactly this
+> situation; the single-host path does not yet. This is tracked as
+> [#2276](https://github.com/autumn-foundation/autumn/issues/2276) and is not fixed. Until
+> it is: after any failed single-host `deploy up`, check `autumn migrate status`
+> before assuming the failure left nothing behind — and write expand/contract
+> migrations so the still-serving release fits the migrated schema either way.
+>
+> Since a **first** deploy migrates too
+> ([Migration ordering](#migration-ordering-first-deploy-included)), this now has a
+> second shape: a single-host *first* deploy that migrates and then fails its
+> readiness gate tears the release down and leaves **nothing serving at all**
+> against a schema that has already moved. The same advice applies, and more
+> sharply — `autumn migrate status` is how you find out, and the fix for the next
+> attempt is usually just re-running `autumn deploy up`, which is idempotent about
+> an already-applied migration.
+
 ### Rollback
 
 Roll back to the previous release on demand:
@@ -275,15 +785,263 @@ the proxy back to it (health-gated on `/ready`), repoints `current`, and
 re-probes `/ready`. It fails loudly and non-zero when there is no previous
 release to return to.
 
+**With `[deploy] hosts` this rolls back the whole fleet**, one host at a time, in
+**reverse** declaration order (newest cutover first — the mirror of the rollout,
+and of the automatic compensation above). It is best-effort-**continue**: a host
+that fails does not stop the others, because stopping would leave *more* hosts on
+the release you are trying to leave. Each host reports one of three outcomes:
+
+| Outcome | Meaning |
+|---|---|
+| `previous release restored` | The host is serving its previous release again. |
+| `SKIPPED — no previous release recorded on this host` | Nothing to roll back to (a first deploy clears the marker; a host just added to the fleet never had one). It keeps serving what it served before. |
+| `NOT rolled back — failed at <step>` | The attempt failed; this host still serves what it served before. |
+
+**The command exits non-zero unless *every* host rolled back** — a skip counts as
+a failure here. That is deliberate: the contract of a fleet rollback is that the
+*fleet* returns to its previous release, and a fleet where one host could not
+follow the others is mixed. The per-host table distinguishes the two cases, which
+is what your next move turns on; retry a single host with `autumn deploy rollback
+--only <host>`, or deploy the intended release to it explicitly.
+
+> **`--only` down to one host runs the single-host rollback path.** Everything
+> above describes a rollback with more than one target. Narrow it to one and you
+> get the pre-fleet behaviour instead: no per-host outcome table — just
+> `Rolling back <host> to <release>…` and `✅ Rollback complete.`, or a plain
+> error — and no benefit from the reachability softening described below, which
+> exists so that the *rest* of a fleet can still move past a dead host. With one
+> target there is no rest: a host that does not answer stops the command non-zero
+> having changed nothing. Worth knowing before an incident, because a stranded
+> host is exactly when this command gets reached for. Follow it with
+> `autumn deploy status` for the fleet-wide picture.
+
+Like the automatic compensation, a fleet rollback **restores binaries only** — no
+migration is rolled back. Confirm the schema still fits the release now serving.
+
 > **Rollback runs the same local preflight as `deploy up` first.** Before it
 > makes any remote call — before it even resolves the previous release on the
 > host — `autumn deploy rollback` runs the identical local preflight graders
-> (signing secret, database URL, migrate-safety) and aborts non-zero if any fail.
+> (signing secret, database URL, migrate-safety, and — for a fleet — SSH
+> reachability for every host it targets) and aborts non-zero if any fail.
+>
+> One class is deliberately downgraded, and only on a multi-host rollback: a
+> per-host `ssh_reachability` failure is reported and the rollback continues
+> without that host, which is then named as `NOT rolled back` and still makes the
+> command exit non-zero. Refusing to move the healthy majority off a bad release
+> because one host is dead would strand *more* hosts on the release you are
+> abandoning. Every other grader keeps the hard gate, and a single-host rollback
+> — including a fleet narrowed with `--only` to one host — keeps it for
+> reachability too.
+>
 > So it needs the same local inputs as a deploy — your project's `.env`/signing
 > secret and database URL, and the `migrations/` dir — available **wherever you
 > invoke it**: an emergency rollback from a bare CI checkout or a machine without
 > the project's secrets fails preflight before it ever reaches the host. Keep the
 > deploy inputs available where you would run a rollback.
+
+### Fleet status
+
+```bash
+autumn deploy status
+autumn deploy status --json
+autumn deploy status --strict
+```
+
+`deploy status` probes every configured host **read-only** and prints one row per
+host, in `[deploy] hosts` order. It mutates nothing, so it is safe mid-incident;
+an unreachable host becomes a row, never an abort. It works for a single
+`[deploy] host` too (one row).
+
+Each row carries: mode (`deployed` / `not deployed` / `unreachable` /
+`unknown`), the deployed release (read from the host's `current` symlink), the
+live slot, the `/ready` status code, the maintenance flag
+(`maintenance ON` / `maintenance off` / `maintenance ?`), the proxy's bound
+port, that host's last deploy result, and any per-host drift reasons.
+
+> **The maintenance cell reports the flag file that host's *running* slot unit
+> polls.** It is resolved on the host from the live slot unit's
+> `Environment=AUTUMN_MAINTENANCE_FLAG_FILE=…`, falling back to that unit's
+> `WorkingDirectory` plus the legacy relative `tmp/autumn-maintenance.json` when
+> the unit carries no override — the same rule the runtime itself applies. It is
+> deliberately *not* a fixed read of the shared path, which would report `off`
+> for a maintained host whose unit polls somewhere else, and `ON` for a host
+> still taking traffic.
+>
+> Two consequences. First, **a host deployed before this feature reports its
+> release-local flag** — its unit carries no `AUTUMN_MAINTENANCE_FLAG_FILE`, so
+> the cell tells the truth about that host while also raising the "polls a
+> release-local maintenance flag file" drift reason below; redeploy it to move
+> it onto the shared path. Second, when the live slot unit cannot be read at all
+> the cell reads `maintenance ?` rather than guessing — "we could not tell" must
+> never render as a confident `off`.
+>
+> It reports which file the running unit polls and whether that file exists. It
+> is not a guarantee about the app's in-memory state: the running process picks
+> the change up on its own 500 ms poll.
+
+> **`last deploy` is the last action that host *completed*.** It reads
+> `last deploy: deployed <UTC time>`, `last deploy: rolled back <UTC time>` or
+> `last deploy: torn down <UTC time>` —
+> the host's own `date -u` clock, from a marker written by the ops that complete
+> a cutover. A deploy that failed *before* the cutover boundary never rewrites
+> it, so the host still shows its previous action: this is a per-host fact, not
+> a verdict on the last fleet rollout (the rollout itself exits non-zero and
+> prints its own per-host outcome table). A `rolled back` host was rolled back
+> by hand or compensated after a halted rollout. A `torn down` host had its
+> first deploy removed again by a halted rollout's compensation — nothing is
+> installed on it, and the row's `not deployed` mode says so too. The cell reads
+> `last deploy: ?` when the marker is absent or unreadable — a host that has
+> never completed a cutover, or one last deployed by a CLI that predates the
+> marker — because "we could not tell" must never render as a result. It is
+> **reported, never counted as drift**.
+
+Two kinds of drift are reported, and they are deliberately separate:
+
+- **Version drift** — more than one *distinct known* release across the fleet.
+  The remedy is `autumn deploy up` to converge, or `autumn deploy rollback`.
+- **State drift** — per-host marker damage that will make a **future** deploy of
+  that host fail closed or take the wrong slot. Today's reasons are: the
+  `live-slot` marker disagrees with the slot kamal-proxy is actually serving (the
+  next redeploy would restart the *serving* slot); the `shared/proxy-options`
+  marker is unreadable (the next deploy of that host will refuse); the installed
+  proxy unit binds a different public port than `[server] port` configures; no
+  release is deployed on this host while the rest of the fleet is serving one;
+  the host has a `current` symlink but the release behind it could not be read;
+  and the two maintenance-probe reasons —
+
+  - `the live slot unit could not be read, so which maintenance flag file this
+    host's app polls is unknown — the maintenance column reports ? rather than
+    guessing`, and
+  - `this host's app polls a release-local maintenance flag file, not the shared
+    one (its slot unit predates AUTUMN_MAINTENANCE_FLAG_FILE) — redeploy it so
+    maintenance survives cutovers`.
+
+  The remedy for the second is exactly what it says: **redeploy that host**, so
+  its slot unit is rewritten with the shared flag path and its maintenance flag
+  survives the next cutover.
+
+> **"Release unknown" is never *version* drift — but a broken `current` symlink
+> is *state* drift.** The only release identity a host can be asked for is its
+> `current` symlink, and that can be missing on a never-deployed host, dangling
+> mid-incident, or unreadable because the host did not answer. Those hosts are
+> *named* in the report and explicitly excluded from the version-drift verdict —
+> reporting a mixed fleet that does not exist is worse than reporting nothing.
+>
+> A reachable host that *proved* it has a `current` symlink and still resolves to
+> no readable release is a different case, and it is now **state drift** that
+> `--strict` exits non-zero on (it was previously reported without counting).
+> That host claims to serve a release nobody can name, and deploying it next
+> would copy the unresolvable target into `previous-release` — making a later
+> rollback refuse. Repair it before the next deploy.
+
+`--strict` exits non-zero when **any** drift is found, so drift is alertable from
+cron. The default exits `0`: status is a report, not a judgement. `--json` emits
+a stable machine-readable report on stdout — `hosts[]` (with `host`, `reachable`,
+`mode`, `release`, `live_slot`, `ready`, `maintenance`, `proxy_port`,
+`last_deploy`, `drift[]`), plus `version_drift`, `state_drift[]`, and `drifted`
+(the `--strict` condition).
+
+`maintenance` is **three-valued**: `true` and `false` are proved states of the
+file the host's *running* slot unit polls, and `null` means the CLI could not
+prove which file that is — the same condition the table renders as
+`maintenance ?`. Both `false` and
+`null` are falsy, so an existing `maintenance == true` check is unaffected — no
+consumer that tests the field for truth starts matching more hosts.
+
+`last_deploy` is `{"result", "at"}`, or `null` when the host reports no readable
+marker. `result` is `"deployed"`, `"rolled back"` or `"torn down"`; `at` is the
+host's own UTC timestamp (`null` for a marker written before the timestamp field
+existed). It records the host's last **completed** action, so a deploy that
+failed before cutover never rewrites it, and it is reported rather than counted
+as drift.
+
+> **`deploy status` still runs when the app config does not validate.** It needs
+> exactly one value from your application config — `[server] port`, the public
+> port kamal-proxy binds and every loopback slot port is derived from — so an
+> unrelated invalid `[scheduler]`, `[mail]`, `[database]` or `[security]` setting
+> used to abort the fleet's only read-only incident command before a single host
+> was probed. It no longer does. When the config fails to validate under the
+> deploy profile, `status` prints a caveat **on stderr** (in both text and
+> `--json` mode, so the `--json` shape on stdout is untouched) naming the config
+> error and the declared port it is probing against, then reports the fleet. The
+> fallback port is your own declared `[server] port` for that profile, read from
+> the same TOML + `.env.<profile>`/env layers the loader would have used, just
+> without validation (or the framework default when no layer declares one) —
+> never a guess.
+>
+> **`deploy check`, `deploy up` and `deploy rollback` still refuse**, and that
+> asymmetry is deliberate: they grade and upload runtime *values* (the signing
+> secret, the database URL), so an invalid config must stop them. `status` only
+> reads. The caveat says so too.
+
+### Fleet maintenance
+
+```bash
+autumn deploy maintenance on --message "Upgrading database schema"
+autumn deploy maintenance on --readonly --allow-ips 10.0.0.0/8
+autumn deploy maintenance off
+```
+
+`autumn deploy maintenance` turns [maintenance mode](maintenance-mode.md) on or
+off on **every deploy-configured host over SSH**, writing the same JSON flag file
+the local `autumn maintenance on` writes and taking the same flags
+(`--message`, `--allow-ips`, `--readonly`, `--bypass-header`). The running apps
+react within their 500 ms poll interval — no restart, no deploy.
+
+The distinction from the top-level `autumn maintenance` matters: that command
+writes **this machine's own working directory**, which is useless for a host you
+deploy to over SSH. Deploy-managed hosts get their flag file at
+`{app_dir}/shared/autumn-maintenance.json` — a path in the shared directory that
+survives cutovers, rollbacks and pruning and is visible to *both* blue and green
+slots — because `autumn deploy` stamps `AUTUMN_MAINTENANCE_FLAG_FILE` into every
+slot unit it writes. The shared path is written **first**, because it is the
+authoritative one: a host running a current slot unit reacts within its next
+500 ms poll even if anything after it fails.
+
+For a host still running a unit deployed *before* that override existed,
+`maintenance on` then also writes the release-relative file that unit polls —
+resolved from the host's **live slot unit**, the slot the proxy is actually
+serving, and never from the `current` symlink (which is rewritten only after the
+proxy flip, so the two disagree exactly when a flip landed and the marker commit
+did not). `autumn deploy status` names those hosts as state drift — "polls a
+release-local maintenance flag file, not the shared one" — because their flag is
+orphaned by the next cutover until they are redeployed.
+
+The fan-out is **best-effort-and-aggregate**, deliberately the opposite of the
+rollout: every host is attempted, the per-host table names what changed, and the
+command exits non-zero if any host failed. Hosts that *did* change are **not**
+reversed automatically — reversing them would push users back into the very
+window you are closing — so the summary names them explicitly (the
+"Changed anyway: …" line, fully-changed hosts only), and reversing by hand is
+your call.
+
+Two per-host rows are worth recognising:
+
+- `maintenance enabled (shared flag only — no release is promoted on this host,
+  so no running unit polls a release-local flag)` — a **success**. Nothing is
+  promoted, so no unit is running and the shared write was the whole job.
+- `PARTIAL — shared flag written, but the file this host's RUNNING unit polls was
+  NOT (failed at …), so this host may still be serving traffic` — a **failure**,
+  and the command exits non-zero on it. The live slot unit could not be read (or
+  the write to its file failed), so which file the app polls was never proved.
+  `on` will not claim a host is maintained it could not prove, and `off` will not
+  claim to have released one (there the row ends `so this host may still be in
+  maintenance`).
+
+Like `deploy status`, `deploy maintenance` **still runs when the app config does
+not validate** — a maintenance window gets closed mid-incident, and an unrelated
+invalid setting must not stand in the way. It prints the same caveat on stderr
+naming the config error, and continues against the declared `[server] port` for
+that profile read without validation; it uses that port only to identify which
+slot unit each host is running. `autumn deploy check`/`up` still refuse until the
+config is fixed.
+
+> **Maintenance mode does not drain a host from your load balancer.** `/ready`
+> stays `200` while maintenance is on, by design: gating it would eject every
+> host from the pool the moment maintenance was enabled. A maintained host keeps
+> taking traffic and answers it with `503` + `Retry-After`. Drain at the load
+> balancer if you need a host out of rotation. This is why `deploy status`
+> reports readiness and maintenance in separate columns.
 
 ### Inspect the plan without touching the server
 
@@ -308,6 +1066,15 @@ redeploy starts the candidate first and then runs the pre-cutover migration. Use
 `plan` to review the shape and what happens, not as a byte-exact order or unit
 reference.
 
+With `[deploy] hosts` set, `plan` adds a **fleet rollout** section listing the
+hosts in rollout order and stating the migrate-placement rule. That section is
+descriptive for the same reason: `plan` contacts no host, so it cannot know which
+hosts are first deploys and which are redeploys. It therefore renders the
+migration as the *rule* `autumn deploy up` applies after probing every host —
+"`[migrate]` runs once, on the first host in rollout order, before its
+cutover — hosts 2..N skip it" — never as a named host. `deploy up` names the
+actual host once it has probed the fleet.
+
 ### Where secrets live
 
 The signing secret and database URL are written **only** to
@@ -329,13 +1096,41 @@ or error messages.
   up` uploads the pre-built binary, it does not build for you.
 - **Nothing answers on the public port** — confirm the app's `server.port`
   matches the port you are curling, and that the host firewall allows it.
+- **A fleet rollout halted part-way.** Read the `Fleet state:` table it printed —
+  it describes where the fleet actually *is*, after any automatic compensation.
+  Then run `autumn deploy status` for an independent read-only view. To converge,
+  either re-run `autumn deploy up` (fix the cause first) or `autumn deploy
+  rollback` to take the whole fleet back. Remember that a migration which already
+  ran is still applied.
+- **One host is stranded on the new release.** Roll just that host back with
+  `autumn deploy rollback --only <host>`, then finish with a full `autumn deploy
+  up` (no `--only`) so the fleet converges on one release. `autumn deploy status
+  --strict` exits non-zero while the fleet is still mixed, which makes a good
+  gate for the "am I done?" question.
+- **A host says `NOT rolled back automatically`.** The fleet declined to touch it
+  because its rollback *target* is in doubt — release markers left
+  mid-transaction by `commit-markers`, a missing or unverifiable target release
+  dir, or no previous release recorded at all. Deliberately, the guidance is
+  **not** "run `deploy rollback --only <host>`": that command trusts the very
+  target that is in question. Read the markers first — the deploy prints the exact
+  read-only command for that host:
+
+  ```bash
+  ssh root@10.0.0.2 'cat /srv/autumn/myapp/shared/previous-release /srv/autumn/myapp/shared/live-slot; ls /srv/autumn/myapp/releases'
+  ```
+
+  The `previous-release` marker names the release dir, slot and port the host
+  should return to. Restore it by hand before deploying the fleet again.
+- **A host finished `DEGRADED`.** It is live and healthy on the new release; only
+  post-cutover bookkeeping failed. Repair it before the next deploy — a redeploy
+  of that host does — because a failed `record-proxy-options` makes the next
+  deploy of that host fail closed.
+- **`release directory … already exists`** — the one-second release id was reused
+  by a fast re-run. Wait a second and re-run `autumn deploy up`, or remove that
+  directory if you are certain it is stale.
 
 ### Limitations and known gaps
 
-- **The `kamal-proxy` binary must be installed on the host** (at
-  `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
-  configures and supervises the proxy but does not download its binary —
-  provision it as part of host bootstrap.
 - **Only the signing secret, database URL, and profile selector are written to
   the host env file.** `autumn deploy` serializes just
   `AUTUMN_SECURITY__SIGNING_SECRET`, (for database-backed apps)
@@ -344,7 +1139,7 @@ or error messages.
   provisioned on the target separately. The file is rebuilt on every `deploy
   up`, so hand-added entries do not persist.
 - **Your project's `autumn.toml` is deployed**
-  ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
+  ([#1952](https://github.com/autumn-foundation/autumn/issues/1952)). `autumn deploy up`
   uploads your `autumn.toml` (and the profile sibling `autumn-<profile>.toml`
   when present) into the **per-release directory** at mode `0600` (owner-only, so
   secrets are never exposed to other local accounts) and sets
@@ -360,14 +1155,37 @@ or error messages.
   secrets never go in it — they stay in the `0600` host env file, which overrides
   `autumn.toml` at load time. When no `autumn.toml` is found locally the deploy
   prints a loud warning and the app runs built-in defaults.
-- **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
-  migration one-shot is part of the zero-downtime redeploy path; the initial
-  `deploy up` stands the release up and health-gates it. For a database-backed
-  app, ensure the schema is applied (e.g. a follow-up `autumn deploy up`, or an
-  out-of-band `autumn migrate` against the primary) before relying on DB routes.
-- **Single host.** `[deploy] host` targets one server; there is no multi-host
-  fan-out. For horizontally scaled setups behind a shared load balancer, see
-  [Multi-replica setup](#multi-replica-setup).
+- **One load balancer, many app hosts — but the load balancer is yours.**
+  `[deploy] hosts` rolls a release across as many app servers as you list, but
+  `autumn deploy` provisions no load balancer and performs no LB membership
+  changes: kamal-proxy is per host and binds that host's public port. Run your
+  load balancer on a separate host in front of the fleet, health-check `/ready`,
+  and terminate TLS there (a fleet deploy refuses `[deploy.tls]` for exactly this
+  reason). See the [fleet deploys guide](fleet-deploys.md) for the contract, and
+  [Multi-replica setup](#multi-replica-setup) for the shared state every replica
+  needs.
+- **Fleet rollback restores binaries, never schema.** Neither the automatic
+  compensation nor `autumn deploy rollback` runs a `migrate down` — an unattended
+  down-migration mid-flip would run exactly the SQL nothing reviews. Use
+  expand/contract migrations so a rolled-back binary still fits the migrated
+  schema.
+- **A failed *single-host* deploy never warns that the schema moved** (#2276) —
+  including a failed *first* deploy, which since #1607 migrates before it starts
+  the release, and so can leave a moved schema with nothing serving.
+  A fleet ends every run with a `Fleet state:` summary that names the
+  binaries-versus-schema state; the single-host path returns the per-host error
+  directly and renders no summary, so a failure after `migrate` but before the
+  cutover leaves the previous release serving against the migrated schema with
+  nothing saying so. See
+  [What fleet support changed for an existing single-host deploy](#what-fleet-support-changed-for-an-existing-single-host-deploy).
+- **A compensated first deploy leaves its proxy route behind.** When the fleet
+  removes a host's just-completed *first* deploy, that host's kamal-proxy still
+  holds a route pointing at the (now stopped) slot, so its public port answers
+  `502` instead of refusing the connection until the host is deployed again. The
+  state table names the host so this is never a surprise.
+- **Host identity is compared literally.** Duplicate `[deploy] hosts` entries are
+  refused after trimming, but two DNS names for the same machine are not detected
+  — the same limitation `autumn migrate` has for duplicate target URLs.
 - **Remote state is updated step-by-step, not transactionally** (#1938). The
   `current` symlink and the live/previous-release markers are written by
   individual SSH commands, so an interrupted deploy can leave state mid-flight;
@@ -484,9 +1302,15 @@ systemd + kamal-proxy — nothing is mocked:
 
 - **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
   deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
-  auto-rollback against a privileged systemd+sshd container. A container cannot
-  power-cycle, prep a stock host from scratch, or reproduce a real
-  pam_systemd session, so those are deferred to the real-VPS job below.
+  auto-rollback against a privileged systemd+sshd container. The same binary also
+  drives a **two-host fleet lifecycle** across two containers — rolling both
+  hosts onto one release, counting the migrate one-shot on each host to prove it
+  ran on exactly one, halting a rollout mid-fleet (the untouched host stays on
+  its old release), auto-rolling the already-cut-over host back, and asserting
+  `deploy status --json` / `--strict` — so the multi-host claims on this page are
+  covered by the same real ssh/scp + systemd + kamal-proxy harness, not by mocks.
+  A container cannot power-cycle, prep a stock host from scratch, or reproduce a
+  real pam_systemd session, so those are deferred to the real-VPS job below.
 - **Real-VPS validation (opt-in):** the
   [`Deploy real-VPS validation`](../../.github/workflows/deploy-real-vps.yml)
   GitHub Actions workflow provisions a throwaway Hetzner Cloud VM from a **stock
@@ -610,7 +1434,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.7.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the
@@ -832,6 +1656,929 @@ which would fail the first deploy of a database-free app.
 
 If you add a read replica, set `AUTUMN_DATABASE__REPLICA_URL` as a secret and
 Autumn gates `/ready` until the replica has replayed the latest migration.
+
+---
+
+## Deploy to Azure Container Apps
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target azure-container-apps
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `variables.tf` | `app_name`, `subscription_id` (required — AzureRM v4 needs it explicitly, even under `az login`), `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 0/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, `migrate_job_name`, and `app_name`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/azure-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ACR, runs the migration job to completion, and runs `az containerapp update` on a `v*` tag push (or manual dispatch). |
+
+**Redis cache is infrastructure only.** `enable_redis_cache = true`
+provisions an Azure Redis Cache and wires `AUTUMN_CACHE__BACKEND=redis` /
+`AUTUMN_CACHE__REDIS__URL` into the Container App, but Autumn's cache
+subsystem has no built-in Redis implementation — unlike sessions, channels,
+and jobs, which activate purely from config once compiled with the `redis`
+Cargo feature. Setting these env vars alone does nothing: your application
+must *also* depend on the `autumn-cache-redis` crate and register
+`.plugin(RedisCachePlugin::new())` in `main.rs`, or the config is parsed and
+silently never read — you'd pay for a Redis instance the app never talks to.
+See [Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+**Resource names are sanitized, not verbatim.** A Cargo package name may
+contain underscores or uppercase letters (both invalid in Container App
+names), so every Container Apps-family resource name (the app, its
+environment, Log Analytics, the migration job) is lowercased, any other
+character is mapped to a hyphen, runs of hyphens are collapsed to one, and a
+leading/trailing hyphen is trimmed — `my_app`/`My App`/`my--app` all become
+`my-app`. The base name is also padded up to Azure's 2-character minimum and
+capped at 24 characters, leaving headroom for the longest suffix appended to
+any of these resources (`-migrate`, 8 characters) so the full name never
+exceeds Azure's 32-character maximum. ACR, Key Vault, Postgres, and Redis use
+a stricter sanitization (no hyphens at all, since ACR forbids them).
+Sanitization happens once, in Terraform (`local.app_name_safe`) — the
+generated workflow never hardcodes a name; it reads the result back via
+`terraform output app_name` (as the `AZURE_APP_NAME` repository variable),
+so editing `app_name` in `terraform.tfvars` after scaffolding is picked up
+automatically instead of
+silently deploying under a stale name.
+
+Why Container Apps and not App Service or AKS: it is the closest managed
+analog to Fly.io — scale-to-zero capable, managed ingress with automatic TLS,
+and no cluster to operate — while Azure-heavy shops already have the
+IAM/RBAC patterns in place.
+
+Provision the infrastructure and set secrets via Terraform variables (never
+as literals in `terraform.tfvars`). A single apply is enough — there is no
+`database_url` variable to pre-compute: main.tf derives the connection
+string from the Postgres server this same apply creates, from its FQDN plus
+`database_admin_password`.
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/location/subscription_id/etc.
+# Azure's Postgres complexity policy needs 3 of {upper, lower, digit,
+# symbol} — `openssl rand -hex` is lowercase-only, and even -base64 alone
+# only samples its alphabet randomly (a small fraction of outputs could
+# still miss a category). Appending "Aa1!" guarantees all 4 regardless.
+export TF_VAR_database_admin_password="$(openssl rand -base64 18)Aa1!"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+The Container App and migration job both start from a public placeholder
+image (`bootstrap_image` — Container Apps must pull *some* image to create a
+first revision, and a brand-new ACR has none yet). The generated
+`min_replicas = 0` default is intentional: keep it at zero for the initial
+apply so the placeholder app container is not started with production secret
+refs or the app's Key Vault-capable managed identity. Build and push your
+real image, run migrations, then cut the app over:
+
+```bash
+APP_NAME="$(terraform output -raw app_name)"           # sanitized — may differ from your Cargo package name
+ACR="$(terraform output -raw acr_login_server)"
+RG="$(terraform output -raw resource_group_name)"
+# Must be unique per BUILD, not just per commit: the commit SHA alone
+# collides if you re-run this block at the same HEAD (uncommitted local
+# changes, or merely a fresh AUTUMN_BUILD_TIMESTAMP baked in below) — same
+# tag, different bytes pushed to ACR. Azure isn't guaranteed to treat a
+# re-pushed tag it already has configured on the app as a revision-scope
+# change (see the automated workflow's identical reasoning: it folds in
+# GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT for the same reason), so the old binary
+# could keep serving even after these migrations complete.
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+az acr login --name "${ACR%%.azurecr.io}"
+# The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless passed here —
+# .dockerignore excludes .git from the build context, so this is the only
+# way for /actuator/info to report real git provenance (see the Dockerfile's
+# own header comment for the full --build-arg list this mirrors).
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ACR/$APP_NAME:$TAG" .
+docker push "$ACR/$APP_NAME:$TAG"
+
+# Run migrations to completion BEFORE updating the app — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you. `az containerapp job start` only starts the
+# execution and returns immediately; it does NOT wait for it to finish, so
+# the loop below is required — proceeding straight to `az containerapp
+# update` after `job start` returns would update the app before migrations
+# have actually completed.
+#
+# `job start --image` sends an execution-TEMPLATE OVERRIDE, which Azure
+# treats as a full replacement rather than a merge: an override containing
+# only --image drops the `command` (autumn migrate) and the
+# AUTUMN_DATABASE__PRIMARY_URL secret env Terraform configured on the job,
+# so the execution would run the container's default command with no DB URL
+# instead of applying migrations. `job update --image` persists just the
+# image onto the job's STORED template, leaving command/env untouched; the
+# bare `job start` that follows then runs that complete, up-to-date
+# template.
+MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
+az containerapp job update \
+  --name "$MIGRATE_JOB" \
+  --resource-group "$RG" \
+  --image "$ACR/$APP_NAME:$TAG" \
+  --output none
+EXECUTION=$(az containerapp job start \
+  --name "$MIGRATE_JOB" \
+  --resource-group "$RG" \
+  --query name -o tsv)
+for _ in $(seq 1 66); do   # 660s — must exceed the job's own 600s replica_timeout_in_seconds
+  STATUS=$(az containerapp job execution list \
+    --name "$MIGRATE_JOB" \
+    --resource-group "$RG" \
+    --query "[?name=='$EXECUTION'].properties.status" -o tsv)
+  case "$STATUS" in
+    Succeeded) break ;;
+    Failed|Stopped) echo "migration failed: $STATUS" >&2; exit 1 ;;
+  esac
+  sleep 10
+done
+[ "$STATUS" = "Succeeded" ] || { echo "migration did not finish within the time budget" >&2; exit 1; }
+
+az containerapp update \
+  --name "$APP_NAME" \
+  --resource-group "$RG" \
+  --image "$ACR/$APP_NAME:$TAG"
+```
+
+Terraform is told to ignore both resources' image afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
+
+**Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
+runs once you add the required repository secrets and variables it documents
+in its header comment — secrets `AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/
+`AZURE_SUBSCRIPTION_ID` for OIDC login (no client secret needed: the
+workflow's `id-token: write` permission plus a federated credential on the
+app registration is enough), and variables (not secrets — they're just
+config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP`/`AZURE_MIGRATE_JOB_NAME`/
+`AZURE_APP_NAME` (all four are `terraform output` values — never hand-typed)
+— until then it stays dormant. Once configured, pushing a `v*` tag builds,
+pushes to ACR, runs the migration job to completion (aborting before any
+deploy if it fails), and runs `az containerapp update` automatically.
+
+**Grant the service principal Contributor at the resource-group scope**, not
+just on the Container App: the migration job is a separate resource in the
+same group, and Azure RBAC granted on one resource does not inherit to a
+sibling — a principal scoped only to the app 403s the moment the workflow
+tries to start the migration job.
+
+**The image tag is unique per execution, not just per commit**, e.g.
+`v1.2.3-a1b2c3d4e5f6-4821903-1` — the sanitized ref, the commit SHA, the
+GitHub Actions run ID, and the run attempt number. All four matter: the
+sanitized ref alone can't be used as a Docker tag verbatim (a branch or tag
+name may contain characters Docker tags reject, like `/` in `feature/login`
+or `+` in a SemVer tag); the run ID and attempt matter beyond the commit SHA
+because re-running `workflow_dispatch` on the same branch, or clicking
+"Re-run jobs" on an existing run, reuses the identical ref *and* commit —
+yet still produces a genuinely different build (a fresh
+`AUTUMN_BUILD_TIMESTAMP`, and possibly different bytes entirely if base
+image packages updated in between). Pushing different bytes under a tag
+Azure Container Apps already has configured on the app isn't guaranteed to
+register as a revision-scope change, so without a truly unique tag the old
+binary could keep serving even after a newer run's migrations.
+
+**Overlapping runs are serialized, never interleaved.** The job sets a
+`concurrency` group per repository with `cancel-in-progress: false`, so a
+second tag push or dispatch while one is still running queues behind it
+instead of racing it — without this, the older run's `az containerapp
+update` could land after the newer one and silently roll production back.
+GitHub doesn't document strict FIFO ordering for which queued run goes next,
+though, and two *different* immutable tags (e.g. `v1` then `v2`) each
+trigger their own run against their own ref, so a same-ref check alone can't
+see a newer release land under a different tag. The workflow instead checks
+— immediately before migrating, as late as practical — whether any other run
+of this same workflow with a higher `run_number` (GitHub's own counter,
+monotonic in trigger order regardless of which ref triggered it) exists at
+all, regardless of its status or conclusion, and aborts if so. That last
+part is deliberate: filtering to only "still active" or "completed
+successfully" runs isn't enough, because a newer run can migrate — the
+actual point of no return, since the schema is advanced at that point — and
+then fail on the deploy step *after* migrating, reporting an overall
+conclusion of `failure`. There's no cheap way to tell "failed before
+migrating" apart from "failed after migrating" from a run's top-level
+status, so the guard treats the mere existence of any newer run as
+disqualifying: if a newer run failed for an unrelated CI reason before ever
+reaching migration, the fix is to re-trigger it, not to let an older run
+sneak through in the meantime.
+
+**The app's own hostname is a trusted host, automatically.** Autumn's
+`prod` profile fails fast at startup — the process never binds — when
+[`security.trusted_hosts.hosts`](#trusted-hosts-host-header-allow-list) is
+empty, and `main.tf` sets `AUTUMN_PROFILE=prod`. The Container App's default
+ingress hostname (`<app_name>.<environment default domain>`) is derived in
+Terraform (`local.app_fqdn`) and passed in as
+`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` so the first `az containerapp
+update` actually serves traffic instead of crash-looping — the same value
+`terraform output app_fqdn` prints, deliberately the *stable* ingress
+hostname rather than a revision-specific one (which would send a `Host`
+header the app doesn't trust, and would go stale the moment CI creates a new
+revision outside Terraform). Add a comma-separated custom domain to the env
+var once you bind one.
+
+**State file security.** `terraform apply` writes `database_admin_password`,
+the derived database connection string, and `signing_secret` into
+`terraform.tfstate` **in plaintext** — Terraform's `sensitive = true` only
+redacts CLI plan/apply
+output, never the state file itself. Add `*.tfstate*`, `.terraform/`, and
+`terraform.tfvars` to `.gitignore` before running `terraform init`
+(`autumn release init --target azure-container-apps` does this for you,
+merging into an existing `.gitignore` without touching unrelated lines), and
+use a remote backend (e.g. an Azure Storage container with encryption at
+rest) instead of local state for any real deployment.
+
+**Production hardening.** Two scaffold defaults trade convenience for
+recoverability and are worth revisiting before a real deploy: the Postgres
+firewall rule (`AllowAzureServices` — Azure's sentinel for "allow
+Azure-internal traffic", not the whole internet, but still broader than a
+VNet-scoped private endpoint) and the Key Vault's `purge_protection_enabled
+= false` (lets `terraform destroy` fully clean up during setup, but also
+means a purge is unrecoverable either way — flip to `true` once the vault
+holds real secrets).
+
+---
+
+## Deploy to AWS App Runner
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target aws-app-runner
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | A VPC (private subnets for RDS + the App Runner VPC connector, one public subnet + NAT gateway for the app's own outbound traffic), an ECR repository, RDS PostgreSQL, Secrets Manager entries for the database URL and signing secret, the App Runner service itself, and a minimal one-shot ECS Fargate task+cluster whose only job is running `autumn migrate` against private RDS (App Runner has no release-phase hook of its own). |
+| `variables.tf` | `app_name`, `region`, `image_tag`, `bootstrap_image`, `instance_cpu`/`instance_memory`, `db_instance_class`, `vpc_cidr`, `min_size`/`max_size` (default 1/10), and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_url`, `service_arn`, `service_name`, `ecr_repository_url`, `apprunner_access_role_arn`, plus `migrate_cluster_name`/`migrate_task_family`/`private_subnet_ids`/`vpc_connector_security_group_id` for the one-shot migration task. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+
+There is no CI workflow for this target — it's the fast/minimal path; wire
+up your own deploy automation once you outgrow the manual walkthrough
+below, or move to [`--target aws-ecs`](#deploy-to-aws-ecs-fargate).
+
+**Why App Runner and not ECS/EKS**: it is the closest managed analog to
+Fly.io — auto-TLS, auto-scale, no ALB or app-hosting cluster to manage
+(the one-shot migration task above is deliberately minimal — no service, no
+ALB, no autoscaling — and isn't in the way day to day) — good for teams
+new to AWS or doing a quick migration.
+
+**Egress routes through the VPC.** Setting
+`network_configuration.egress_configuration.egress_type = "VPC"` (required
+so the app can reach RDS privately through the VPC connector) routes ALL of
+the app's own outbound traffic through the private subnets, not just
+RDS-bound traffic — `main.tf` provisions a NAT gateway so the app still has
+general internet egress (a third-party API call, outbound mail, a webhook)
+rather than silently hanging.
+
+**Resource names are sanitized, not verbatim** — the same lowercasing/
+hyphen-collapsing scheme as Azure Container Apps (see the callout in that
+section above), capped at 20 characters here to leave headroom under the
+tightest limit this scaffold touches.
+
+Provision the infrastructure and set secrets via Terraform variables:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/region/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the App Runner service's
+`source_configuration` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running containers keep using
+the OLD values and lose database access as connections recycle.
+
+The App Runner service starts from a public ECR Public Gallery placeholder
+image (`bootstrap_image`) — App Runner must pull *some* image to create a
+first revision, and a brand-new private ECR repository has none yet. Build
+and push your real image, then cut the service over. Unlike Azure Container
+Apps (whose ingress hostname is derivable before the app exists) or ECS
+behind your own domain, **App Runner assigns its subdomain only after the
+service is created**, so the trusted-hosts env var can only be set on this
+same follow-up call, not on the first `terraform apply`:
+
+```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
+
+ECR="$(terraform output -raw ecr_repository_url)"
+SERVICE_ARN="$(terraform output -raw service_arn)"
+ACCESS_ROLE="$(terraform output -raw apprunner_access_role_arn)"
+INSTANCE_ROLE="$(terraform output -raw apprunner_instance_role_arn)"
+DATABASE_URL_ARN="$(terraform output -raw database_url_secret_arn)"
+SIGNING_SECRET_ARN="$(terraform output -raw signing_secret_secret_arn)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ECR:$TAG" .
+docker push "$ECR:$TAG"
+```
+
+**Run `autumn migrate` against the database now, before the cutover below** — the generated production config sets `auto_migrate_in_production = false`, so nothing else runs it, and App Runner has no separate release-phase hook the way ECS's one-shot migration task or Azure's migration job does. RDS is private (not publicly accessible), so `main.tf` provisions a dedicated one-shot ECS Fargate task purely to reach it — using the same private subnets and VPC-connector security group App Runner's own traffic already uses, so there's no second security group or RDS rule to keep in sync. Only proceed to the `update-service` call below once migrations have actually completed; running it first serves the new, schema-dependent code against the old schema.
+
+```bash
+MIGRATE_CLUSTER="$(terraform output -raw migrate_cluster_name)"
+MIGRATE_FAMILY="$(terraform output -raw migrate_task_family)"
+SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
+SG="$(terraform output -raw vpc_connector_security_group_id)"
+
+# Task definitions are immutable per revision — register a new one with the
+# real image, keeping every other setting Terraform declared (env, secrets,
+# logging) untouched.
+NEW_DEF=$(aws ecs describe-task-definition --task-definition "$MIGRATE_FAMILY" --query 'taskDefinition' | \
+  jq --arg IMAGE "$ECR:$TAG" ".containerDefinitions[0].image = \$IMAGE | \
+    del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, \
+        .registeredAt, .registeredBy, .deregisteredAt)")
+MIGRATE_ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+
+# run-task only starts the task and returns immediately, so poll for it to
+# stop, then check its exit code. `aws ecs wait tasks-stopped` has its own
+# fixed ~10-minute budget and exits nonzero once exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit of
+# their own — so poll manually and explicitly stop the task on timeout
+# rather than leaving it running in the background.
+TASK_ARN=$(aws ecs run-task --cluster "$MIGRATE_CLUSTER" --task-definition "$MIGRATE_ARN" \
+  --launch-type FARGATE \
+  --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
+  --query 'tasks[0].taskArn' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$MIGRATE_CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$MIGRATE_CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
+[ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
+```
+
+```bash
+APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply created the service
+# --source-configuration REPLACES the image configuration wholesale, not
+# merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
+# the real image, or the cutover silently drops
+# AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
+# app can't boot. HealthCheckConfiguration restores the real "/health" path
+# — main.tf's bootstrap revision used "/" (nginx's own default response)
+# since the bootstrap placeholder doesn't serve /health.
+OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
+  --instance-configuration "{\"InstanceRoleArn\": \"$INSTANCE_ROLE\"}" \
+  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
+  --source-configuration "{
+  \"ImageRepository\": {
+    \"ImageIdentifier\": \"$ECR:$TAG\",
+    \"ImageRepositoryType\": \"ECR\",
+    \"ImageConfiguration\": {
+      \"Port\": \"3000\",
+      \"RuntimeEnvironmentVariables\": {
+        \"AUTUMN_PROFILE\": \"prod\",
+        \"AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS\": \"${APP_URL#https://}\"
+      },
+      \"RuntimeEnvironmentSecrets\": {
+        \"AUTUMN_DATABASE__PRIMARY_URL\": \"$DATABASE_URL_ARN\",
+        \"AUTUMN_SECURITY__SIGNING_SECRET\": \"$SIGNING_SECRET_ARN\"
+      }
+    }
+  },
+  \"AuthenticationConfiguration\": { \"AccessRoleArn\": \"$ACCESS_ROLE\" },
+  \"AutoDeploymentsEnabled\": false
+}" --query 'OperationId' --output text)
+
+# update-service only STARTS an asynchronous operation — a bare successful
+# exit here just means App Runner accepted the request, not that the real
+# image actually booted. If it fails health checks, App Runner rolls the
+# service back on its own; poll list-operations for this specific
+# OperationId's terminal status rather than trusting the call's exit code.
+OP_STATUS=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  OP_STATUS=$(aws apprunner list-operations --service-arn "$SERVICE_ARN" \
+    --query "OperationSummaryList[?Id=='$OPERATION_ID'].Status | [0]" --output text)
+  [ "$OP_STATUS" = "SUCCEEDED" ] && break
+  case "$OP_STATUS" in
+    FAILED|ROLLBACK_FAILED|ROLLBACK_SUCCEEDED)
+      echo "cutover failed (status=$OP_STATUS) — App Runner may have rolled back to the bootstrap image"
+      exit 1
+      ;;
+  esac
+  sleep 10
+done
+[ "$OP_STATUS" = "SUCCEEDED" ] || { echo "cutover did not complete within the time budget (status=$OP_STATUS)"; exit 1; }
+```
+
+**State file security and `.gitignore`.** Same caveats as Azure: Terraform
+state holds every secret in plaintext regardless of `sensitive = true`;
+`autumn release init --target aws-app-runner` merges `.gitignore` entries
+for `.terraform/`, `*.tfstate*`, and `terraform.tfvars` for you.
+
+---
+
+## Deploy to AWS ECS Fargate
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target aws-ecs
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | A VPC with public/private subnets across 2 AZs, an internet-facing ALB (HTTP→HTTPS redirect, ACM certificate via Route 53 DNS validation), an ECR repository, an ECS cluster + Fargate task definition + service (deployment circuit breaker with automatic rollback), Application Auto Scaling on CPU/memory, RDS PostgreSQL in private subnets, Secrets Manager entries for the database URL and signing secret, and a one-shot migration task definition. An optional ElastiCache Redis replication group is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `variables.tf` | `app_name`, `region`, `vpc_cidr`, `domain_name`, `route53_zone_id`, `image_tag`, `bootstrap_image`, `cpu`/`memory`, `db_instance_class`, `desired_count`/`min_count`/`max_count` (default 2/1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `app_url`, `alb_dns_name`, `ecr_repository_url`, `ecs_cluster_name`, `ecs_service_name`, `app_task_family`, `migrate_task_family`, `private_subnet_ids`, `ecs_tasks_security_group_id`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/aws-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to ECR, registers new "app" and "migrate" task definition revisions, runs the migration task to completion, then updates the ECS service and waits for it to stabilize — on a `v*` tag push (or manual dispatch). |
+
+**Why ECS Fargate and not App Runner/EKS**: it maps to patterns
+AWS-experienced infra teams already have runbooks for, with full control
+over networking, scaling, and rollout behavior — the production path once
+you outgrow [`--target aws-app-runner`](#deploy-to-aws-app-runner)'s
+minimal footprint.
+
+**A domain and an existing Route 53 hosted zone are prerequisites**, not
+optional — `domain_name`/`route53_zone_id` are required variables with no
+default. The zone must already be the domain's live DNS (delegated at your
+registrar) *before* `terraform apply`, or ACM's DNS certificate validation
+will hang until Terraform's apply times out. Unlike App Runner (whose
+subdomain is only assigned once the service exists), ECS's trusted-hosts
+env var is set correctly from the very first apply, since the ALB serves
+under a domain you already own.
+
+**Redis cache is infrastructure only** — same caveat as Azure's Redis Cache
+and for the same reason: Autumn's cache subsystem has no built-in Redis
+implementation. Setting `enable_redis_cache = true` provisions ElastiCache
+and wires `AUTUMN_CACHE__BACKEND=redis`/`AUTUMN_CACHE__REDIS__URL` into the
+task, but your application must *also* depend on the `autumn-cache-redis`
+crate and register `.plugin(RedisCachePlugin::new())` in `main.rs`, or
+you'd pay for a Redis instance the app never talks to. See
+[Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+**Resource names are sanitized, not verbatim** — the same scheme as Azure
+and App Runner, capped at 20 characters here so the longest suffixed name
+(the `-migrate-tg`-style target group name, if it existed) would still fit
+under the ALB/target-group family's 32-character AWS limit — the tightest
+this scaffold touches.
+
+Provision the infrastructure and set secrets via Terraform variables:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/domain_name/route53_zone_id/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+**Generate these two values once, then persist and reuse them** — save
+them in a password manager or your CI's secret store the same way you
+would any other production secret, rather than regenerating fresh values
+on every `terraform apply`. Re-running these `openssl rand` commands in a
+later shell session and re-applying changes the live RDS password and
+Secrets Manager signing secret in place, but the ECS service's
+`task_definition` is `lifecycle`-ignored (see `main.tf`) — it never
+redeploys to pick up the change, so already-running tasks keep using the
+OLD values and lose database access as connections recycle.
+
+The "app" and "migrate" ECS task definitions both start from a public
+placeholder image (`bootstrap_image`) — Fargate must pull *some* image to
+register a task definition's first revision, and a brand-new ECR repository
+has none yet. Push your real image, migrate, then cut over — this is
+exactly what `.github/workflows/aws-deploy.yml` automates once you add its
+required repository secret (`AWS_ROLE_ARN`, an OIDC-federated IAM role — no
+long-lived access keys) and variables (all `terraform output` values —
+`AWS_REGION`, `ECR_REPOSITORY_URL`, `ECS_CLUSTER_NAME`, `ECS_SERVICE_NAME`,
+`APP_TASK_FAMILY`, `MIGRATE_TASK_FAMILY`, `ECS_TASKS_SECURITY_GROUP_ID`,
+`ECS_PRIVATE_SUBNET_IDS`). Manually, the same sequence looks like:
+
+```bash
+# Every `aws` call below must target the same region `terraform apply` used
+# — not whatever the operator's ambient AWS CLI config happens to point at.
+# AWS_REGION (not AWS_DEFAULT_REGION) is the one to set: the AWS CLI
+# documents AWS_REGION as taking precedence over AWS_DEFAULT_REGION when
+# both are set, so an operator with AWS_REGION already exported would
+# otherwise still have their ambient region win.
+export AWS_REGION="$(terraform output -raw region)"
+
+ECR="$(terraform output -raw ecr_repository_url)"
+CLUSTER="$(terraform output -raw ecs_cluster_name)"
+SERVICE="$(terraform output -raw ecs_service_name)"
+SUBNETS="$(terraform output -json private_subnet_ids | jq -c .)"
+SG="$(terraform output -raw ecs_tasks_security_group_id)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+# docker login takes a registry hostname, not a repository path — $ECR
+# includes the repository suffix (e.g. "<account>.dkr.ecr.<region>.amazonaws.com/my-app"),
+# so strip everything from the first "/" onward.
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$ECR:$TAG" .
+docker push "$ECR:$TAG"
+
+# Task definitions are immutable per revision — register a NEW one for each
+# family with the real image, keeping every other setting Terraform
+# declared (env, secrets, logging) untouched. The "app" family also strips
+# entryPoint/command: Terraform's bootstrap revision overrides both to make
+# the placeholder nginx image satisfy the ALB health check before any real
+# image exists (main.tf) — carrying that override onto the REAL image would
+# make it try to run the bootstrap's nginx script instead of its own
+# Dockerfile ENTRYPOINT/CMD (tini + the compiled binary), and the container
+# would exit immediately. The "migrate" family's own command (`autumn
+# migrate`) is intentional and permanent, not bootstrap-specific, so it's
+# left untouched.
+APP_SECRETS=$(aws ecs describe-task-definition \
+  --task-definition "$(terraform output -raw migrate_task_family)" \
+  --query 'taskDefinition.containerDefinitions[0].secrets' --output json)
+for FAMILY_OUT in app_task_family:APP migrate_task_family:MIGRATE; do
+  FAMILY="$(terraform output -raw "${FAMILY_OUT%%:*}")"
+  STRIP_ENTRYPOINT="del(.containerDefinitions[0].entryPoint, .containerDefinitions[0].command) | "
+  [ "${FAMILY_OUT##*:}" = "MIGRATE" ] && STRIP_ENTRYPOINT=""
+  NEW_DEF=$(aws ecs describe-task-definition --task-definition "$FAMILY" --query 'taskDefinition' | \
+    jq --arg IMAGE "$ECR:$TAG" --argjson SECRETS "$APP_SECRETS" ".containerDefinitions[0].image = \$IMAGE |
+      (if \"${FAMILY_OUT##*:}\" == \"APP\" then .containerDefinitions[0].secrets = \$SECRETS else . end) | ${STRIP_ENTRYPOINT}
+      del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+          .registeredAt, .registeredBy, .deregisteredAt)")
+  ARN=$(echo "$NEW_DEF" | aws ecs register-task-definition --cli-input-json file:///dev/stdin \
+    --query 'taskDefinition.taskDefinitionArn' --output text)
+  eval "${FAMILY_OUT##*:}_ARN=$ARN"
+done
+
+# Run migrations to completion BEFORE updating the service — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you. run-task only starts the task and returns
+# immediately, so poll for it to stop, then check its exit code.
+#
+# `aws ecs wait tasks-stopped` has its own fixed ~10-minute budget (100
+# checks x 6s) and exits nonzero once that's exhausted regardless of
+# whether the task is still running — and ECS tasks have no runtime limit
+# of their own, so a migration that blows this budget keeps running in the
+# background even after this script gives up. Poll manually instead so a
+# timeout can explicitly stop the task before failing; otherwise retrying
+# this walkthrough could start a second migration while the first is still
+# mutating the schema.
+TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$MIGRATE_ARN" \
+  --launch-type FARGATE \
+  --network-configuration "{\"awsvpcConfiguration\":{\"subnets\":$SUBNETS,\"securityGroups\":[\"$SG\"],\"assignPublicIp\":\"DISABLED\"}}" \
+  --query 'tasks[0].taskArn' --output text)
+[ -n "$TASK_ARN" ] && [ "$TASK_ARN" != "None" ] || { echo "failed to start the migration task"; exit 1; }
+
+EXIT_CODE=""
+for _ in $(seq 1 60); do   # 10 minutes (60 x 10s)
+  STATUS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+    --query 'tasks[0].lastStatus' --output text)
+  if [ "$STATUS" = "STOPPED" ]; then
+    EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+      --query 'tasks[0].containers[0].exitCode' --output text)
+    break
+  fi
+  sleep 10
+done
+if [ -z "$EXIT_CODE" ]; then
+  echo "migration did not finish within the time budget — stopping it"
+  aws ecs stop-task --cluster "$CLUSTER" --task "$TASK_ARN" \
+    --reason "manual deploy: migration exceeded its polling budget" >/dev/null
+  aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+  exit 1
+fi
+[ "$EXIT_CODE" = "0" ] || { echo "migration failed"; exit 1; }
+
+aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+  --task-definition "$APP_ARN" --force-new-deployment >/dev/null
+
+# services-stable exits 255 once its own ~10-minute polling budget (100
+# checks x 6s) is exhausted, regardless of whether the deployment is still
+# genuinely in progress — without checking that explicitly, the script
+# would fall through to the PRIMARY-deployment comparison below, which can
+# still match $APP_ARN mid-rollout and report false success.
+aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" || {
+  echo "deployment did not stabilize within the waiter's time budget"
+  exit 1
+}
+
+# services-stable's predicate only requires ONE deployment to have
+# runningCount == desiredCount — if the new revision failed its health
+# checks, the deployment circuit breaker rolls the service back to the
+# PREVIOUS revision, and that older deployment satisfies the waiter just as
+# well. Without this check you could see "success" even though $APP_ARN
+# was never actually running.
+DEPLOYED_TASK_DEF=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" --output text)
+[ "$DEPLOYED_TASK_DEF" = "$APP_ARN" ] || { echo "deployment rolled back to $DEPLOYED_TASK_DEF"; exit 1; }
+```
+
+Terraform is told to ignore both the service's `task_definition` and each
+task definition's `container_definitions` afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
+
+**Automated deploys on tag push**, **overlapping-run serialization**, and
+**the unique-per-execution image tag** all follow the identical reasoning
+documented for [Azure's workflow](#deploy-to-azure-container-apps) above —
+`aws-deploy.yml` checks for a newer superseding run before migrating, uses
+a repository-scoped `concurrency` group, and folds `GITHUB_RUN_ID`/
+`GITHUB_RUN_ATTEMPT` into the image tag for the same re-run-collision
+reasons.
+
+**State file security and `.gitignore`.** Same caveats as Azure: Terraform
+state holds `database_admin_password`, the derived database connection
+string, and `signing_secret` in plaintext regardless of `sensitive = true`
+— `autumn release init --target aws-ecs` merges `.gitignore` entries for
+`.terraform/`, `*.tfstate*`, and `terraform.tfvars` for you. Use a remote
+backend (e.g. an S3 bucket with a DynamoDB lock table, or S3-native
+locking) instead of local state for any real deployment.
+
+**Production hardening.** One scaffold default trades cost for
+availability and is worth revisiting before a real deploy: `main.tf`
+provisions a single NAT gateway rather than one per AZ, so an AZ outage
+taking that gateway's own AZ down with it can interrupt egress for tasks
+in the *other* AZ too. Add a second NAT gateway (one per AZ, each private
+route table pointed at the one in its own AZ) before a real multi-AZ
+production cutover.
+
+---
+
+## Deploy to GCP Cloud Run
+
+Scaffold a Terraform configuration alongside the production Dockerfile:
+
+```bash
+autumn release init --force --target gcp-cloud-run
+```
+
+This generates:
+
+| File | Purpose |
+|---|---|
+| `main.tf` | An Artifact Registry repository, a VPC with a Serverless VPC Access connector, Cloud SQL for PostgreSQL on a private IP (no public exposure), a dedicated runtime service account scoped to `roles/cloudsql.client` plus per-secret `secretAccessor` grants, Secret Manager entries for the database URL and signing secret, the Cloud Run service itself, and a one-shot Cloud Run Job that runs `autumn migrate`. An optional Memorystore Redis instance is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `variables.tf` | `project_id` (required — no default), `app_name`, `region`, `image_tag`, `db_tier`, `vpc_connector_cidr`, `bootstrap_image`, `min_instances`/`max_instances` (default 1/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
+| `outputs.tf` | `service_url`, `service_name`, `artifact_registry_repository_url`, `migrate_job_name`, `service_account_email`, `sql_instance_connection_name`, `region`, and `project_id`. |
+| `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
+| `.github/workflows/gcp-deploy.yml` | Opt-in CI/CD: builds the release image, pushes it to Artifact Registry, updates and executes the migration job to completion, then updates the Cloud Run service — on a `v*` tag push (or manual dispatch). |
+
+**Redis cache is infrastructure only.** `enable_redis_cache = true`
+provisions a Memorystore Redis instance and wires
+`AUTUMN_CACHE__BACKEND=redis` / `AUTUMN_CACHE__REDIS__URL` into the Cloud
+Run service, but Autumn's cache subsystem has no built-in Redis
+implementation — unlike sessions, channels, and jobs, which activate purely
+from config once compiled with the `redis` Cargo feature. Setting these env
+vars alone does nothing: your application must *also* depend on the
+`autumn-cache-redis` crate and register `.plugin(RedisCachePlugin::new())`
+in `main.rs`, or the config is parsed and silently never read — you'd pay
+for a Redis instance the app never talks to. See
+[Shared Cache](cloud-native.md#shared-cache) for the three steps.
+
+**Secret access is scoped per secret, not project-wide.** The runtime
+service account is granted `roles/secretmanager.secretAccessor` on exactly
+the two (or three, with Redis) secrets it needs via
+`google_secret_manager_secret_iam_member` — never a project-wide
+`secretAccessor` binding, which would let a compromised container read
+every secret in the project.
+
+**The default `db_tier` is sized for dev, not for `max_instances` at full
+scale.** `db-f1-micro`'s Postgres `max_connections` ceiling is small (around
+25 — run `SHOW max_connections;` against your instance to confirm), while
+each Cloud Run instance opens up to `pool_size` connections
+(`autumn.production.toml.example` defaults to 10). At the default
+`max_instances` of 10, scaling out under real load can exhaust that budget
+well before hitting the instance ceiling. Before relying on autoscaling in
+production, size `db_tier` so its `max_connections` comfortably exceeds
+`max_instances * pool_size` (e.g. `db-custom-2-7680` supports roughly 200),
+or lower `pool_size`/`max_instances` to fit the tier you're on.
+
+**Rotating `database_admin_password` replaces the sole live credential in
+place.** `google_sql_user.this`'s password update is ordered before the
+`database_url` secret version (so a new Cloud Run revision never starts
+with a password Cloud SQL hasn't accepted yet), but any already-running
+revision still holds the OLD password in its resolved env until it's
+replaced by the new one — a brief reconnect window during rollout, not a
+zero-downtime rotation. A fully staged handoff would need a second
+database user, which this scaffold doesn't provision; if you need
+zero-downtime credential rotation, add one and cut over manually.
+
+**Resource names are sanitized, not verbatim.** A Cargo package name may
+contain underscores or uppercase letters (both invalid in Cloud Run/RFC
+1035-style GCP resource names), so every resource name this scaffold
+touches (the Cloud Run service and job, the Artifact Registry repository,
+the VPC/connector, the Cloud SQL instance, the service account) is
+lowercased, any other character is mapped to a hyphen, runs of hyphens are
+collapsed to one, and a leading/trailing hyphen is trimmed — `my_app`/`My
+App`/`my--app` all become `my-app`. Sanitization happens once, in Terraform
+(`local.app_name_safe`) — the generated workflow never *hardcodes* a name,
+reading `GCP_SERVICE_NAME` etc. as a repository variable instead of baking
+one into the YAML. But that variable is a snapshot you set from
+`terraform output`, not a live link to Terraform state — see the note on
+resyncing it below if you edit `app_name` after scaffolding.
+
+Why Cloud Run and not GKE or App Engine: it is the closest managed analog
+to Fly.io — fully managed, auto-TLS, managed ingress, scales to zero,
+pay-per-request — while GKE is operationally heavy and App Engine Standard
+doesn't support arbitrary binaries.
+
+Provision the infrastructure and set secrets via Terraform variables (never
+as literals in `terraform.tfvars`). A single apply is enough — there is no
+`database_url` variable to pre-compute: main.tf derives the connection
+string from the Cloud SQL instance this same apply creates, from its
+private IP plus `database_admin_password`.
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit app_name/region/project_id/etc.
+export TF_VAR_database_admin_password="$(openssl rand -hex 24)"
+export TF_VAR_signing_secret="$(openssl rand -hex 32)"
+
+terraform init
+terraform apply
+```
+
+The Cloud Run service and migration job both start from Google's public
+Cloud Run "hello" quickstart image (`bootstrap_image` — Cloud Run must have
+*some* image to create a first revision, and a brand-new Artifact Registry
+repository has none yet; unlike App Runner's nginx placeholder, this image
+already honors the `PORT` env var Cloud Run injects, so no bootstrap-port
+workaround is needed). Build and push your real image, run migrations, then
+cut the service over:
+
+```bash
+# gcloud's "current project" is whatever `gcloud config get-value project`
+# happens to be set to — not necessarily this one. Pass --project to every
+# call below explicitly, or a stale/different ambient project setting can
+# silently target the wrong project (the image push would still succeed,
+# since $AR_URL embeds the target project on its own — only for migration
+# and deployment to then fail to find the resources this apply just
+# created, or worse, update same-named resources elsewhere).
+PROJECT_ID="$(terraform output -raw project_id)"
+REGION="$(terraform output -raw region)"
+SERVICE_NAME="$(terraform output -raw service_name)"   # sanitized — may differ from your Cargo package name
+AR_URL="$(terraform output -raw artifact_registry_repository_url)"
+MIGRATE_JOB="$(terraform output -raw migrate_job_name)"
+TAG="$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+
+gcloud auth configure-docker "$(echo "$AR_URL" | cut -d/ -f1)" --quiet
+docker build \
+  --build-arg AUTUMN_BUILD_GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_SHA_SHORT="$(git rev-parse --short HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+  --build-arg AUTUMN_BUILD_GIT_DIRTY="$([ -z "$(git status --porcelain)" ] && echo false || echo true)" \
+  --build-arg AUTUMN_BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t "$AR_URL/$SERVICE_NAME:$TAG" .
+docker push "$AR_URL/$SERVICE_NAME:$TAG"
+
+# Run migrations to completion BEFORE updating the service — the generated
+# production config sets auto_migrate_in_production = false, so nothing
+# else does this for you. `gcloud run jobs update --image` persists the new
+# image onto the job's stored template (leaving its command/env untouched);
+# `gcloud run jobs execute --wait` then blocks until the execution actually
+# finishes and exits non-zero on failure — no manual poll loop needed here,
+# unlike the Azure/AWS walkthroughs above, since gcloud provides a
+# synchronous wait natively.
+gcloud run jobs update "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" \
+  --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
+gcloud run jobs execute "$MIGRATE_JOB" --project "$PROJECT_ID" --region "$REGION" --wait
+
+gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+  --image "$AR_URL/$SERVICE_NAME:$TAG" --quiet
+```
+
+Terraform is told to ignore both resources' image afterward
+(`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
+live deploy back to the bootstrap placeholder.
+
+**Automated deploys on tag push:** `.github/workflows/gcp-deploy.yml` only
+runs once you add the required repository secrets and variables it
+documents in its header comment — secrets `GCP_WORKLOAD_IDENTITY_PROVIDER`/
+`GCP_DEPLOYER_SERVICE_ACCOUNT` for OIDC login via
+`google-github-actions/auth` (no service account key needed: the workflow's
+`id-token: write` permission plus a Workload Identity Federation provider
+trusting GitHub's OIDC issuer is enough), and variables (not secrets —
+they're just config) `GCP_PROJECT_ID`/`GCP_REGION`/
+`GCP_ARTIFACT_REGISTRY_URL`/`GCP_SERVICE_NAME`/`GCP_MIGRATE_JOB_NAME` (all
+five are `terraform output` values — never hand-typed) — until then it
+stays dormant:
+
+```bash
+gh variable set GCP_PROJECT_ID --body "$(terraform output -raw project_id)"
+gh variable set GCP_REGION --body "$(terraform output -raw region)"
+gh variable set GCP_ARTIFACT_REGISTRY_URL --body "$(terraform output -raw artifact_registry_repository_url)"
+gh variable set GCP_SERVICE_NAME --body "$(terraform output -raw service_name)"
+gh variable set GCP_MIGRATE_JOB_NAME --body "$(terraform output -raw migrate_job_name)"
+```
+
+Once configured, pushing a `v*` tag builds, pushes to Artifact Registry,
+updates and executes the migration job to completion (aborting before any
+deploy if it fails), and runs `gcloud run services update` automatically.
+
+**These repository variables are a one-time snapshot, not a live link to
+Terraform state.** If you edit `app_name` (or `region`) in
+`terraform.tfvars` after the workflow is already configured, `terraform
+apply` renames the underlying Cloud Run service/job/Artifact Registry
+repository, but GitHub has no way to know that happened — the variables
+above keep pointing at the OLD names until you re-run the same
+`gh variable set` commands with fresh `terraform output` values. Skipping
+this after an `app_name` change means the next tag push builds and
+deploys against resources that may no longer exist.
+
+**Grant the deployer service account `iam.serviceAccountUser` on the
+runtime service account**, not just `run.developer` on the service: Cloud
+Run requires whoever deploys a revision to be able to act as whatever
+service account that revision runs as — a deployer scoped only to
+`run.developer` 403s the moment the workflow tries to update the service or
+execute the migration job.
+
+**The image tag is unique per execution, not just per commit** and
+**overlapping runs are serialized, never interleaved** — for the identical
+reasons documented for [Azure's workflow](#deploy-to-azure-container-apps)
+above: `gcp-deploy.yml` folds `GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT` into the
+image tag, uses a repository-scoped `concurrency` group with
+`cancel-in-progress: false`, and checks for a newer superseding run
+(`run_number`) right before migrating.
+
+**The app's own hostname is a trusted host, automatically — with no second
+apply.** Autumn's `prod` profile fails fast at startup — the process never
+binds — when [`security.trusted_hosts.hosts`](#trusted-hosts-host-header-allow-list)
+is empty, and `main.tf` sets `AUTUMN_PROFILE=prod`. Cloud Run's default URL
+format is `https://<service>-<project number>.<region>.run.app` (Google
+switched to including the project *number* in 2022, specifically so a
+deleted-and-recreated service can't be squatted at the old URL) — fully
+derivable at plan time from a `google_project` data source, unlike App
+Runner's subdomain (only assigned once the service exists) or unlike
+needing to wait for `google_cloud_run_v2_service.this.uri` to be known
+after creation. `main.tf` computes it as `local.service_url_host` and
+passes it in as `AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS`, so the very first
+`terraform apply` — before any CI has ever run — already serves traffic
+instead of crash-looping.
+
+**State file security.** `terraform apply` writes `database_admin_password`,
+the derived database connection string, and `signing_secret` into
+`terraform.tfstate` **in plaintext** — Terraform's `sensitive = true` only
+redacts CLI plan/apply output, never the state file itself. Add
+`*.tfstate*`, `.terraform/`, and `terraform.tfvars` to `.gitignore` before
+running `terraform init` (`autumn release init --target gcp-cloud-run` does
+this for you, merging into an existing `.gitignore` without touching
+unrelated lines), and use a remote backend (e.g. a Google Cloud Storage
+bucket with versioning and encryption at rest) instead of local state for
+any real deployment.
+
+**Production hardening.** Two scaffold defaults trade convenience for
+recoverability and are worth revisiting before a real deploy: Cloud SQL's
+`deletion_protection = false` and the Cloud Run service/job's own
+`deletion_protection = false` (both let `terraform destroy`/recreate cycles
+run without a manual override first, but also mean an accidental `destroy`
+isn't blocked — flip both to `true` once real data/traffic depends on
+them).
 
 ---
 

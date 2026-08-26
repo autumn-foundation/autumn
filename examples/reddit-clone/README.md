@@ -1,6 +1,6 @@
 # Reddit Clone
 
-A Reddit clone built with [Autumn](https://github.com/madmax983/autumn),
+A Reddit clone built with [Autumn](https://github.com/autumn-foundation/autumn),
 showcasing the framework's major features in a single cohesive application.
 
 ## Features Demonstrated
@@ -29,6 +29,7 @@ showcasing the framework's major features in a single cohesive application.
 | htmx interactivity (voting, deletion, logout) | `routes/votes.rs`, `routes/layout.rs` |
 | Tailwind CSS styling | All templates |
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
+| Audit logging (`AuditLogger` + `TracingAuditSink`, actor auto-attribution via `Current::actor()`) | `main.rs`, `routes/posts.rs` (`delete_post`) |
 
 ## Prerequisites
 
@@ -156,7 +157,8 @@ curl http://localhost:3000/api/posts/1
 ```
 src/
   main.rs           # App builder, route + task + job + WS registration, migrations
-  models.rs         # #[model] structs: User, Subreddit, Post, Comment, Vote
+  models.rs         # #[model] structs: User, Subreddit (commentable), Post
+                    #   (votable + commentable), Tag, Vote
   schema.rs         # Diesel table definitions
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)
@@ -169,9 +171,8 @@ src/
     mod.rs          # Module exports
     layout.rs       # Shared layout, vote controls, CSRF injection, time formatting
     auth.rs         # Register, login, logout, user profiles
-    subreddits.rs   # Community listing, creation (#[secured]), detail view
-    posts.rs        # Front page, submit, view, edit, delete
-    comments.rs     # Comment creation and lazy loading
+    subreddits.rs   # Community listing, creation (#[secured]), detail view + community discussion
+    posts.rs        # Front page, submit, view, edit, delete + the post's comment thread
     votes.rs        # htmx-powered upvote/downvote with toggle + ON CONFLICT
     live.rs         # #[ws] WebSocket feeds consuming process-local Channels
     about.rs        # #[static_get] pre-rendered about page

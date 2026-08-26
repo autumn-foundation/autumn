@@ -130,15 +130,15 @@ The island crate that produces the wasm lives in `examples/island-flock`
 
 ---
 
-### `examples/wiki` — Mutation Hooks and Revision History
+### `examples/wiki` — Mutation Hooks, Revision History, and Markdown Docs
 
 <!-- catalog:example name=wiki tier=supported -->
 
 | Field | Value |
 |-------|-------|
-| **Persona** | Developer adding audit trails and lifecycle hooks to a content model |
-| **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API |
-| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API |
+| **Persona** | Developer adding audit trails and lifecycle hooks to a content model, or serving Markdown-backed docs pages |
+| **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API. Docs: embedded `content/*.md` rendered live at `/docs/{slug}` and pre-rendered to `dist/` by the same handler |
+| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API, `markdown` feature (`MarkdownRegistry` + frontmatter + TOC) composed with `#[static_get]` SSG |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p wiki` |
 | **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
@@ -153,7 +153,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
 | **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting, `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
@@ -176,6 +176,86 @@ The island crate that produces the wasm lives in `examples/island-flock`
 This is the flagship built-in starter behind `autumn new <name> --starter saas`.
 The committed tree here is the rendered form of the embedded starter; the
 `embedded_saas_matches_example_saas` test in `autumn-cli` keeps the two in lock-step.
+
+---
+
+### `examples/teams` — Organization Membership & Email Invitations
+
+<!-- catalog:example name=teams tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a multi-user B2B SaaS who needs teammates, roles, and email invitations without hand-rolling the join table, token record, and accept route |
+| **Journey** | Team membership: sign up → get a personal organization as `Owner` → invite a teammate by email and role → they accept (signup-then-join or direct join) → a role-gated member-management screen |
+| **Key capabilities** | Row-level multi-tenancy with the active organization as tenant (`#[repository(tenant_scoped)]`, issue #695), a closed `Role` enum + hierarchy-aware `require_role` guard layered on the existing session/Policy role plumbing (issue #496), `#[mailer]` invitation email, idempotent invite-accept, last-`Owner` protection |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p teams` |
+| **Success proof** | After signing up in the browser, `GET /members` returns `200 OK` showing the signer as `owner`; inviting a teammate and following the accept link in the dev mailbox creates exactly one `Membership` row even on a double-click |
+
+---
+
+### `examples/media-room` — Live Mesh Rooms
+
+<!-- catalog:example name=media-room tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building interactive video/audio who is evaluating `autumn-media-plugin` |
+| **Journey** | Install the media plugin with rooms → create a room from an app handler via the plugin-installed `RoomService` → list the created rooms |
+| **Key capabilities** | `MediaPlugin::new().config(media).with_rooms()`, the `RoomService` `AppState` extension, the plugin-mounted room routes under `/api/media`, a shared `AppState` extension |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p media-room` |
+| **Success proof** | `curl -X POST http://localhost:3000/rooms` then `curl http://localhost:3000/api/rooms` returns the created room's JSON |
+
+Boots with no database or `MediaMTX` server; the companion narrative is
+`docs/guide/media.md`.
+
+---
+
+### `examples/invoice` — PDF Downloads
+
+<!-- catalog:example name=invoice tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building billing/reporting features who needs a downloadable PDF |
+| **Journey** | Render one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` |
+| **Key capabilities** | `autumn_web::pdf::Pdf::from_markup`, `.filename(...)`, the `Clock` extractor for deterministic rendering, `TestResponse::assert_pdf_contains` |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p invoice` |
+| **Success proof** | `curl -OJ http://localhost:3000/invoices/42/pdf` downloads `invoice-42.pdf` |
+
+Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`.
+
+---
+
+## Experimental Examples
+
+Experimental examples **are** workspace members — they compile, lint and test
+with the rest of the workspace, and a break in one fails CI like any other
+crate. What they are exempt from is the supported-fleet contract: the Chromium
+e2e fan-out in `scripts/check-examples-e2e.sh`, the README Examples table, and
+the Journey Map. An example belongs here when its proof is not "a browser can
+load a page" — it has its own dedicated CI job instead.
+
+---
+
+### `examples/edge-greeting` — Edge Capsule (wasm32-wasip1)
+
+<!-- catalog:example name=edge-greeting tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who wants a read-path route served from the CDN edge without maintaining a second codebase |
+| **Journey** | Edge lane: mark a `GET` handler `#[edge]`, register it with `edge_routes![]`, and get a portable `wasm32-wasip1` capsule out of the same `autumn build` — with the origin binary still the authority and the fallback |
+| **Key capabilities** | `#[edge]`, `#[edge(needs(kv))]`, `edge_routes![]`, `autumn_edge::serve`, `EdgeCache` over the `EdgeKv` seam, `AppBuilder::with_edge_kv`, the NDJSON capsule wire protocol |
+| **Prerequisites** | Rust 1.88.0+ and the `wasm32-wasip1` target (`rustup target add wasm32-wasip1`) |
+| **Run command** | `cargo run -p edge-greeting` (origin); `cargo build -p edge-greeting --target wasm32-wasip1 --release --bin edge-capsule` (capsule) |
+| **Success proof** | `curl http://localhost:3000/greet/ada` returns `Hello, ada!`; `cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1` proves the capsule answers a request corpus byte-identically to the origin |
+| **Rationale for the tier** | Its proof is a conformance suite against a real wasm artifact, not a Chromium smoke, and it needs a toolchain target the supported fleet does not install. The dedicated `edge-conformance` CI job runs it on every push. |
+
+Boots with no database; the companion narrative is `docs/guide/edge.md` and the
+design record is `docs/adr/0011-edge-capsule-read-lane.md`.
 
 ---
 
@@ -219,8 +299,11 @@ can pick the closest starting point without overlap.
 | Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
+| Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
+| Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
+| PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |
 
 ---
 
@@ -230,7 +313,8 @@ Before publishing `autumn-web` or `autumn-cli`, the CI `publish-gate` workflow
 runs `scripts/check-examples.sh`. The gate catches:
 
 - Any directory under `examples/` that has no catalog entry (orphan detection).
-- Any workspace `examples/*` member that is not cataloged as `supported`.
+- Any workspace `examples/*` member that is cataloged as neither `supported`
+  nor `experimental` (an `excluded` member, or none at all).
 - Any example listed in `README.md`'s Examples table that is absent from the catalog.
 - Any supported example whose `README.md` is missing required quickstart sections.
 
@@ -238,10 +322,14 @@ To add a new example:
 
 1. Create the directory under `examples/` and add a `README.md` with at least
    `## Prerequisites` and `## Quick start` sections.
-2. Add it to `[workspace] members` in `Cargo.toml` (if it participates in
-   normal validation) or mark it `tier=experimental` or `tier=excluded` here.
+2. Pick a tier. `tier=supported` is the default: a workspace member with a
+   README quickstart, a README.md table row, a Journey Map entry, and a
+   Chromium smoke in the fleet e2e gate. `tier=experimental` is a workspace
+   member that carries its own dedicated proof instead of the fleet smoke (see
+   the Experimental section above). `tier=excluded` is not a workspace member
+   at all.
 3. Add a catalog entry with the machine-readable marker to this file.
-4. Add a row to the README.md Examples table.
+4. Add a row to the README.md Examples table (supported tier only).
 5. Run `./scripts/check-examples.sh` locally to confirm zero failures.
 
 To retire an example:

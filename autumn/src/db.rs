@@ -25,6 +25,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use axum::extract::FromRequestParts;
 use diesel;
 // Named by the default Postgres pool builder/TLS connector and by the
@@ -314,10 +322,43 @@ pub(crate) fn request_query_capture_active() -> bool {
 /// (`server_timing` is a dev/off-by-default feature); apps needing both should
 /// keep it disabled in that environment.
 #[cfg(feature = "db")]
-#[derive(Default, Debug)]
 pub(crate) struct RequestQueryTimer {
     /// The currently in-flight statement (start instant + SQL text), if any.
     pending: Option<PendingQuery>,
+    /// Injected clock supplying the start/finish instants.
+    ///
+    /// Diesel's `Instrumentation::on_connection_event` signature is frozen and
+    /// carries no time, so the only way to reach the app's clock from inside it
+    /// is a field on the timer. Installed per checkout from
+    /// `DbCheckoutParams::clock`, so a `#[sim_test]` sees virtual query
+    /// latencies. It costs one `Arc` deref per statement — and only on
+    /// connections that actually carry a timer, which `Db::checkout` installs
+    /// solely while a query observer is scoped.
+    clock: std::sync::Arc<dyn crate::time::ClockSource>,
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for RequestQueryTimer {
+    // Hand-written because `dyn ClockSource` is not `Debug`; the clock is an
+    // injected handle with no useful representation here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestQueryTimer")
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "db")]
+impl Default for RequestQueryTimer {
+    /// A timer on the real system clock — the behaviour before the clock became
+    /// injectable. Used by the unit tests that drive `on_start`/`on_finish`
+    /// directly with synthetic instants and never read this field.
+    fn default() -> Self {
+        Self {
+            pending: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        }
+    }
 }
 
 /// A statement whose `StartQuery` has fired but whose `FinishQuery` has not.
@@ -328,12 +369,20 @@ pub(crate) struct RequestQueryTimer {
 #[cfg(feature = "db")]
 #[derive(Debug)]
 struct PendingQuery {
-    started_at: std::time::Instant,
+    started_at: crate::time::MonotonicInstant,
     sql: String,
 }
 
 #[cfg(feature = "db")]
 impl RequestQueryTimer {
+    /// A timer reading its instants from `clock` (the app's injected clock).
+    fn with_clock(clock: std::sync::Arc<dyn crate::time::ClockSource>) -> Self {
+        Self {
+            pending: None,
+            clock,
+        }
+    }
+
     /// Whether `sql` is a statement that must **not** be counted as an
     /// application query in the `Server-Timing` `db` metric. Two kinds reach
     /// the connection instrumentation but are not application work:
@@ -386,7 +435,7 @@ impl RequestQueryTimer {
     /// know the statement will be counted. Extracted from the event handler so
     /// the start/finish accounting is unit-testable without constructing a
     /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
-    fn on_start(&mut self, now: std::time::Instant, sql: impl FnOnce() -> String) {
+    fn on_start(&mut self, now: crate::time::MonotonicInstant, sql: impl FnOnce() -> String) {
         // Probe BOTH lanes: the timing accumulator (`server_timing`) and the
         // query-capture sink (test harness). Either being active means the
         // upcoming statement must be observed. When neither is scoped (the
@@ -414,7 +463,7 @@ impl RequestQueryTimer {
     /// Record the completion of the in-flight statement, accumulating its
     /// elapsed time into the per-request accumulator. A `FinishQuery` without
     /// a matching `StartQuery` is ignored.
-    fn on_finish(&mut self, now: std::time::Instant) {
+    fn on_finish(&mut self, now: crate::time::MonotonicInstant) {
         if let Some(p) = self.pending.take() {
             record_request_db_query(now.saturating_duration_since(p.started_at), Some(&p.sql));
         }
@@ -432,9 +481,13 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // transaction-control statements (see the type-level docs). The
                 // `to_string()` is deferred behind a closure so an installed but
                 // opted-out timer never pays the allocation — see `on_start`.
-                self.on_start(std::time::Instant::now(), || query.to_string());
+                let now = self.clock.monotonic();
+                self.on_start(now, || query.to_string());
             }
-            InstrumentationEvent::FinishQuery { .. } => self.on_finish(std::time::Instant::now()),
+            InstrumentationEvent::FinishQuery { .. } => {
+                let now = self.clock.monotonic();
+                self.on_finish(now);
+            }
             // Ignore connection-establish, prepared-statement cache, and the
             // dedicated Begin/Commit/RollbackTransaction events — see the
             // type-level docs.
@@ -608,6 +661,15 @@ where
 /// Trait to abstract the state requirement for the `Db` extractor.
 /// This breaks the circular dependency between the database extractor
 /// and the central `AppState`.
+/// Process-wide handle to the real system clock, cloned by
+/// [`DbState::clock`]'s default body and by the state-less checkout paths.
+///
+/// A fresh `Arc::new(SystemClock)` per DB extraction would heap-allocate for a
+/// zero-sized type on every request; cloning one shared handle is a relaxed
+/// refcount bump.
+static DEFAULT_SYSTEM_CLOCK: std::sync::LazyLock<std::sync::Arc<dyn crate::time::ClockSource>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(crate::time::SystemClock));
+
 pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<RuntimeConnection>>;
@@ -642,9 +704,30 @@ pub trait DbState {
     ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
         Vec::new()
     }
+
+    /// Why failure-capsule capture cannot record this app's database traffic,
+    /// when its pool topology carries a gap (see
+    /// [`DatabaseTopology::capture_gap`]). Defaults to `None`: the pools
+    /// record, or capture is off entirely.
+    #[cfg(feature = "reporting")]
+    fn db_capture_gap(&self) -> Option<std::sync::Arc<str>> {
+        None
+    }
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
         None
+    }
+
+    /// Returns the app's injected clock, used to time connection checkouts and
+    /// individual statements.
+    ///
+    /// Defaults to the real [`crate::time::SystemClock`], which is exactly what
+    /// this timing read was before the clock became injectable — so an existing
+    /// `impl DbState` needs no change. [`crate::state::AppState`] overrides it
+    /// with the clock the app was built with, which is what makes DB timings
+    /// virtual (and reproducible) under a `#[sim_test]`.
+    fn clock(&self) -> std::sync::Arc<dyn crate::time::ClockSource> {
+        std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK)
     }
 
     /// Returns the slow query threshold.
@@ -881,6 +964,11 @@ pub fn scrub_sql(sql: &str) -> String {
 /// fingerprint, record metrics, and map Postgres `57014` (statement timeout)
 /// to [`AutumnError::query_timeout`].
 ///
+/// Times the query on the **real** system clock. Prefer
+/// [`run_instrumented_with_clock`] where an injected clock is reachable, so the
+/// recorded latency follows virtual time under a
+/// [`#[sim_test]`](crate::sim_test).
+///
 /// # Parameters
 /// - `sql`: The raw SQL string for slow-query fingerprinting (scrubbed before logging).
 /// - `route_key`: Label string used for metrics, e.g. `"GET /users"`.
@@ -906,9 +994,60 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
-    let start = std::time::Instant::now();
+    run_instrumented_with_clock(
+        &crate::time::SystemClock,
+        sql,
+        route_key,
+        slow_threshold,
+        metrics,
+        query,
+    )
+    .await
+}
+
+/// [`run_instrumented`], timing the query on an injected clock.
+///
+/// The determinism-seam twin (#1797): pass `state.clock()` and the recorded
+/// latency follows virtual time under a [`#[sim_test]`](crate::sim_test)
+/// instead of the real machine clock.
+///
+/// ```rust,ignore
+/// let rows = autumn_web::db::run_instrumented_with_clock(
+///     state.clock(),
+///     "SELECT …",
+///     "GET /users",
+///     slow_threshold,
+///     state.metrics(),
+///     || users::table.load(&mut conn),
+/// )
+/// .await?;
+/// ```
+///
+/// # Parameters
+///
+/// As [`run_instrumented`], plus `clock`: the source both timing readings are
+/// taken from. Borrowed rather than owned so
+/// [`AppState::clock`](crate::state::AppState::clock) — which hands out a
+/// `&dyn ClockSource` — is directly usable; no `Arc` handle is needed.
+///
+/// # Errors
+///
+/// As [`run_instrumented`].
+pub async fn run_instrumented_with_clock<F, Fut, T>(
+    clock: &dyn crate::time::ClockSource,
+    sql: &str,
+    route_key: &str,
+    slow_threshold: std::time::Duration,
+    metrics: &crate::middleware::metrics::MetricsCollector,
+    query: F,
+) -> Result<T, AutumnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
+{
+    let start = clock.monotonic();
     let result = query().await;
-    let elapsed = start.elapsed();
+    let elapsed = clock.monotonic().saturating_duration_since(start);
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
     // Record metrics regardless of success/failure
@@ -1032,6 +1171,13 @@ pub struct DatabaseTopology {
     /// managed-Postgres provider whose socket URL is only known after boot).
     /// Scoping it to the topology keeps it per-app instead of a process global.
     migration_url: Option<String>,
+    /// Why failure-capsule capture cannot record this topology's traffic, when
+    /// the pool factory had to step aside (a TLS-required URL, a custom
+    /// provider). Scoped to the topology for the same reason as
+    /// `migration_url`: two apps in one process can disagree, and one app's
+    /// gap must never mark the other app's capsules truncated.
+    #[cfg(feature = "reporting")]
+    capture_gap: Option<String>,
 }
 
 impl DatabaseTopology {
@@ -1048,6 +1194,8 @@ impl DatabaseTopology {
             primary,
             replica,
             migration_url: None,
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
         }
     }
 
@@ -1058,6 +1206,8 @@ impl DatabaseTopology {
             primary,
             replica: None,
             migration_url: None,
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
         }
     }
 
@@ -1077,6 +1227,26 @@ impl DatabaseTopology {
     #[must_use]
     pub fn migration_url(&self) -> Option<&str> {
         self.migration_url.as_deref()
+    }
+
+    /// Record why failure-capsule capture cannot record this topology's
+    /// traffic (see [`Self::capture_gap`]).
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn with_capture_gap(mut self, reason: Option<String>) -> Self {
+        self.capture_gap = reason;
+        self
+    }
+
+    /// Why failure-capsule capture cannot record this topology's traffic, or
+    /// `None` when it can (or capture is off).
+    ///
+    /// Carried on the topology — not in process state — so two apps in one
+    /// process each note their own gap on their own capsules.
+    #[cfg(feature = "reporting")]
+    #[must_use]
+    pub fn capture_gap(&self) -> Option<&str> {
+        self.capture_gap.as_deref()
     }
 
     /// Primary/write role pool.
@@ -1837,7 +2007,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// as `Unknown`. Worse: the wrapper type diesel-async uses to carry Postgres's
 /// error fields for an `Unknown`-kind error (`PostgresDbErrorWrapper`, private
 /// to diesel-async) implements only `DatabaseErrorInformation`, not
-/// `std::error::Error` — so [`source_chain_has_sqlstate`]'s downcast walk can
+/// `std::error::Error` — so `source_chain_has_sqlstate`'s downcast walk can
 /// **never** reach the real SQLSTATE for it; there is no structural path to a
 /// deadlock's code at all through this crate boundary. The only signal
 /// available is the message, so this checks it — but with an **exact**
@@ -1856,7 +2026,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
-fn is_retryable_txn_error(err: &AutumnError) -> bool {
+pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
     fn is_retryable_sqlstate(state: &SqlState) -> bool {
@@ -2186,7 +2356,12 @@ pub struct Db {
     route_key: Option<String>,
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
-    start_time: std::time::Instant,
+    /// Checkout instant on the injected clock's monotonic timeline; `Drop`
+    /// subtracts it from a fresh reading to get the connection-hold duration.
+    start_time: crate::time::MonotonicInstant,
+    /// The app's injected clock, kept so `Drop` can take the closing reading
+    /// from the same timeline `start_time` came from.
+    clock: std::sync::Arc<dyn crate::time::ClockSource>,
     is_test_tx: bool,
 }
 
@@ -2637,6 +2812,53 @@ pub(crate) struct DbCheckoutParams<'a> {
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    /// Why this app's pools cannot record capture traffic, from the state's
+    /// topology (see [`DatabaseTopology::capture_gap`]); `None` when they can.
+    #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+    pub capture_gap: Option<std::sync::Arc<str>>,
+    /// The app's injected clock, supplying the checkout-to-release timing and
+    /// the per-statement query timer. Threaded through so connection latency is
+    /// virtual (and reproducible) under a `#[sim_test]` instead of being read
+    /// from a raw `std::time::Instant`.
+    pub clock: std::sync::Arc<dyn crate::time::ClockSource>,
+}
+
+/// The capsule attribution marker to merge into the checkout round trip, or
+/// `None` when this checkout has nothing to attribute.
+///
+/// Scope presence is per-request, per-app truth: a scope only exists under a
+/// capture-enabled router's `CaptureLayer`, so two apps with different capture
+/// settings in one process cannot disturb each other. A scope-free checkout
+/// sends nothing — stale bindings are cleared by the recording pool's own
+/// create/recycle hooks, which run before any borrower's first statement
+/// (#1598, F2). An id that would not survive interpolation yields `None`
+/// rather than a quoted-string escape (F24).
+///
+/// `capture_gap` is the app's own pool truth: when the topology could not be
+/// built with recording pools (TLS, a custom provider), the scope is noted
+/// and truncated instead — there is no recorder on the wire for a marker to
+/// reach.
+#[cfg(not(feature = "sqlite"))]
+fn capsule_checkout_marker(capture_gap: Option<&str>) -> Option<String> {
+    #[cfg(feature = "reporting")]
+    {
+        let scope = crate::capsule::current_scope()?;
+        if let Some(reason) = capture_gap {
+            // Capture had to step aside for this app's database: say so in
+            // the capsule rather than leaving a reader to wonder where the DB
+            // tape went.
+            crate::capsule::record_db::note_db_capture_unavailable(&scope, reason);
+            return None;
+        }
+        Some(scope.id().to_owned())
+            .filter(|id| crate::capsule::is_valid_scope_id(id))
+            .and_then(|id| crate::capsule::wire::marker_set_sql(&id))
+    }
+    #[cfg(not(feature = "reporting"))]
+    {
+        let _ = capture_gap;
+        None
+    }
 }
 
 impl Db {
@@ -2674,6 +2896,26 @@ impl Db {
         if let Some(shard) = params.shard {
             span.record("db.shard", shard);
         }
+
+        // Failure-capsule slice one records only the *control* topology's pools
+        // (#1598): `[[database.shards]]` pools are built by `create_shard_set`,
+        // never through the capture factory, so a request that reaches for a
+        // shard generates database traffic no capsule can hold. Flag it here —
+        // before the checkout, because whether the connection is obtained does
+        // not change the fact that this request's tape is incomplete — so the
+        // capsule says so and replay refuses it, rather than presenting a tape
+        // that silently omits the shard's effects.
+        #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+        if params.shard.is_some() {
+            crate::capsule::record_db::note_shard_capture_gap();
+        }
+
+        // The same honesty rule for a backend that has no wire capture at all:
+        // a `SQLite` build tees nothing (F18), so a capsule for a request that
+        // used the database is missing that request's effects and must be
+        // refused by replay rather than presented as complete.
+        #[cfg(all(feature = "reporting", feature = "sqlite"))]
+        crate::capsule::note_backend_capture_gap();
 
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
@@ -2745,22 +2987,44 @@ impl Db {
         {
             use diesel_async::AsyncConnection as _;
             if request_db_timing_active() || request_query_capture_active() {
-                conn.set_instrumentation(RequestQueryTimer::default());
+                conn.set_instrumentation(RequestQueryTimer::with_clock(std::sync::Arc::clone(
+                    &params.clock,
+                )));
             }
         }
 
         // Postgres-only per-checkout initialization; see the gating note above.
         // SQLite builds skip it entirely (it would 503 every `Db`-using route).
+        //
+        // When failure-capsule capture is armed (#1598), the capsule
+        // attribution marker rides along in this SAME round trip as one simple
+        // batch, so recording costs no extra latency on the checkout path. With
+        // capture off — the default — the statement issued here is byte-for-byte
+        // what it has always been.
         #[cfg(not(feature = "sqlite"))]
-        diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
-            .execute(&mut conn)
-            .await
-            .map_err(|e| {
+        {
+            #[cfg(feature = "reporting")]
+            let capture_gap = params.capture_gap.as_deref();
+            #[cfg(not(feature = "reporting"))]
+            let capture_gap = None;
+            let outcome = match capsule_checkout_marker(capture_gap) {
+                Some(marker) => {
+                    use diesel_async::SimpleAsyncConnection as _;
+                    conn.batch_execute(&format!("SET statement_timeout = {timeout_ms}; {marker}"))
+                        .await
+                }
+                None => diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
+                    .execute(&mut conn)
+                    .await
+                    .map(|_| ()),
+            };
+            outcome.map_err(|e| {
                 tracing::error!("Failed to set database statement_timeout to {timeout_ms}ms: {e}");
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
+        }
 
-        let start_time = std::time::Instant::now();
+        let start_time = params.clock.monotonic();
         let is_test_tx = params
             .interceptors
             .iter()
@@ -2775,6 +3039,7 @@ impl Db {
             metrics: params.metrics,
             slow_query_threshold: params.slow_query_threshold,
             start_time,
+            clock: params.clock,
             is_test_tx,
         })
     }
@@ -2800,6 +3065,12 @@ impl Db {
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: None,
+            // No `AppState` here by construction — this helper exists so a test
+            // can drive `Db::tx` against a bare pool. The real clock matches the
+            // behaviour this path had before the clock became injectable.
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
         })
         .await
     }
@@ -2817,6 +3088,9 @@ pub(crate) struct RequestDbContext {
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    /// The app's injected clock, carried so a shard-routed checkout times on
+    /// the same seam the plain `Db` extractor does.
+    pub clock: std::sync::Arc<dyn crate::time::ClockSource>,
 }
 
 impl RequestDbContext {
@@ -2834,7 +3108,83 @@ impl RequestDbContext {
             metrics: state.metrics().cloned(),
             slow_query_threshold: state.slow_query_threshold(),
             interceptors: state.db_interceptors(),
+            clock: state.clock(),
         }
+    }
+}
+
+/// A database checkout that has been *prepared* but not *taken*.
+///
+/// [`Db`] is a `FromRequestParts` extractor, so axum runs it before the final
+/// `FromRequest` extractor reads the request body. A handler taking both
+/// therefore holds a pooled connection for as long as the client takes to send
+/// its body — and the client controls that. A handful of slow-body requests can
+/// pin `pool_size` connections and starve unrelated database work, with no
+/// request timeout configured by default to stop them.
+///
+/// This captures what the checkout needs from the request parts — statement
+/// timeout, route key, metrics, interceptors, clock — and takes the connection
+/// only when [`DeferredDb::checkout`] is awaited, which the handler does after
+/// the body is in hand.
+///
+/// `pub(crate)` deliberately: the general answer is a lazy `Db` for every
+/// handler (#2264), and shipping a second public extractor would make that
+/// harder to land rather than easier.
+pub(crate) struct DeferredDb {
+    pool: Pool<RuntimeConnection>,
+    ctx: RequestDbContext,
+    #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+    capture_gap: Option<std::sync::Arc<str>>,
+}
+
+impl DeferredDb {
+    /// Take the connection. Called once the request body has been read.
+    pub(crate) async fn checkout(self) -> Result<Db, AutumnError> {
+        let result = Db::checkout(DbCheckoutParams {
+            pool: &self.pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: self.ctx.statement_timeout,
+            route_key: self.ctx.route_key,
+            metrics: self.ctx.metrics,
+            slow_query_threshold: self.ctx.slow_query_threshold,
+            interceptors: self.ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: self.capture_gap,
+            clock: self.ctx.clock,
+        })
+        .await;
+        // The same read-your-writes bookkeeping the eager extractor does, at
+        // the moment the connection is actually taken.
+        if result.is_ok() {
+            crate::read_your_writes::mark_write();
+        }
+        result
+    }
+}
+
+impl<S> FromRequestParts<S> for DeferredDb
+where
+    S: DbState + Send + Sync,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // The pool is resolved here, so a misconfigured app still fails at
+        // extraction exactly as it does with `Db`. Only the checkout moves.
+        let pool = state
+            .pool()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?
+            .clone();
+        Ok(Self {
+            pool,
+            ctx: RequestDbContext::from_parts(parts, state),
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: state.db_capture_gap(),
+        })
     }
 }
 
@@ -2862,6 +3212,9 @@ where
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
+            #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
+            capture_gap: state.db_capture_gap(),
+            clock: ctx.clock,
         })
         .await;
         // Notify the RYWW task-local that a primary connection was checked out.
@@ -2876,7 +3229,10 @@ where
 impl Drop for Db {
     fn drop(&mut self) {
         if let (Some(route_key), Some(metrics)) = (&self.route_key, &self.metrics) {
-            let elapsed = self.start_time.elapsed();
+            let elapsed = self
+                .clock
+                .monotonic()
+                .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
             // Record DB query metric
@@ -3081,17 +3437,17 @@ mod tests {
                 let mut timer = RequestQueryTimer::default();
 
                 // Query 1: 1200µs.
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "SELECT 1".to_string());
-                timer.on_finish(t0 + Duration::from_micros(1_200));
+                timer.on_finish(t0.saturating_add(Duration::from_micros(1_200)));
 
                 // Query 2: 800µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "UPDATE users SET name = $1".to_string());
-                timer.on_finish(t1 + Duration::from_micros(800));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(800)));
 
                 // A stray FinishQuery with no matching StartQuery is ignored.
-                timer.on_finish(std::time::Instant::now());
+                timer.on_finish(crate::time::MonotonicInstant::ORIGIN);
             })
             .await;
 
@@ -3113,10 +3469,10 @@ mod tests {
     #[tokio::test]
     async fn request_query_timer_is_noop_off_request() {
         let mut timer = RequestQueryTimer::default();
-        let t0 = std::time::Instant::now();
+        let t0 = crate::time::MonotonicInstant::ORIGIN;
         timer.on_start(t0, || "SELECT 1".to_string());
         // Must not panic even though no task-local accumulator is scoped.
-        timer.on_finish(t0 + Duration::from_micros(500));
+        timer.on_finish(t0.saturating_add(Duration::from_micros(500)));
     }
 
     /// Approach-(b) guarantee: when no `REQUEST_DB_TIMINGS` scope is active,
@@ -3129,7 +3485,7 @@ mod tests {
     async fn request_query_timer_on_start_is_cheap_noop_off_request() {
         let mut timer = RequestQueryTimer::default();
         let invoked = std::cell::Cell::new(false);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::time::MonotonicInstant::ORIGIN;
         timer.on_start(t0, || {
             invoked.set(true);
             "SELECT 1".to_string()
@@ -3139,7 +3495,7 @@ mod tests {
             "off-request, on_start must not format the SQL (no allocation)"
         );
         // No in-flight statement was recorded, so on_finish is a no-op.
-        timer.on_finish(t0 + Duration::from_micros(500));
+        timer.on_finish(t0.saturating_add(Duration::from_micros(500)));
     }
 
     /// Regression for the stale-timer / housekeeping-`SET` bug: a pooled
@@ -3159,9 +3515,9 @@ mod tests {
                 let mut timer = RequestQueryTimer::default();
 
                 // Checkout housekeeping `SET` — must not be counted.
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "SET statement_timeout = 5000".to_string());
-                timer.on_finish(t0 + Duration::from_millis(3));
+                timer.on_finish(t0.saturating_add(Duration::from_millis(3)));
 
                 assert_eq!(
                     timings.query_count.load(Ordering::Relaxed),
@@ -3175,9 +3531,9 @@ mod tests {
                 );
 
                 // First real application query: 600µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "SELECT * FROM users".to_string());
-                timer.on_finish(t1 + Duration::from_micros(600));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(600)));
 
                 assert_eq!(
                     timings.query_count.load(Ordering::Relaxed),
@@ -3248,19 +3604,19 @@ mod tests {
 
                 // BEGIN — must not be counted (10_000µs, would dominate if it
                 // leaked into the total).
-                let t0 = std::time::Instant::now();
+                let t0 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t0, || "BEGIN".to_string());
-                timer.on_finish(t0 + Duration::from_millis(10));
+                timer.on_finish(t0.saturating_add(Duration::from_millis(10)));
 
                 // The single real query: 700µs.
-                let t1 = std::time::Instant::now();
+                let t1 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t1, || "SELECT * FROM users".to_string());
-                timer.on_finish(t1 + Duration::from_micros(700));
+                timer.on_finish(t1.saturating_add(Duration::from_micros(700)));
 
                 // COMMIT — must not be counted.
-                let t2 = std::time::Instant::now();
+                let t2 = crate::time::MonotonicInstant::ORIGIN;
                 timer.on_start(t2, || "COMMIT".to_string());
-                timer.on_finish(t2 + Duration::from_millis(10));
+                timer.on_finish(t2.saturating_add(Duration::from_millis(10)));
             })
             .await;
 
@@ -4936,7 +5292,10 @@ mod tests {
 /// silently ignoring the CA file: `libpq` documents that combination as
 /// upgrading to certificate verification, so dropping the file would
 /// silently weaken what the operator asked for.
-mod tls {
+// `pub(crate)` so the failure-capsule recording pool can reuse the same
+// `sslmode` classification when deciding whether a database URL can be teed
+// (#1598) instead of re-implementing the parse.
+pub(crate) mod tls {
     use std::sync::Arc;
 
     use diesel::{ConnectionError, ConnectionResult};
@@ -4952,7 +5311,7 @@ mod tls {
     /// TLS posture derived from the connection string's `sslmode` (and
     /// `sslrootcert`). See the [module docs](self) for the full table.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) enum TlsPosture {
+    pub enum TlsPosture {
         /// No TLS machinery: keep diesel-async's default `NoTls` setup path.
         Off,
         /// Encrypt without verifying the server certificate chain
@@ -4971,7 +5330,7 @@ mod tls {
 
     impl TlsPosture {
         /// Classify a database URL / keyword-value connection string.
-        pub(super) fn from_database_url(database_url: &str) -> Self {
+        pub fn from_database_url(database_url: &str) -> Self {
             let params = ssl_params(database_url);
             // Last occurrence wins, matching libpq/tokio-postgres semantics.
             let get = |key: &str| {
@@ -5547,12 +5906,19 @@ pub(crate) enum MigrationConnection {
     Native(diesel::PgConnection),
     /// rustls-backed sync wrapper (TLS posture `Require`/`VerifyFull`).
     Rustls {
-        /// Runtime owning the connection's tokio driver task when none was
-        /// ambient (plain sync contexts like the CLI); `None` when an
-        /// ambient runtime drives it (`spawn_blocking` contexts). Callers
-        /// must keep this alive as long as `conn` — dropping the runtime
-        /// kills the driver and every query after that hangs or errors.
-        runtime: Option<tokio::runtime::Runtime>,
+        /// Dedicated runtime owning the connection's tokio driver task —
+        /// always present, never the caller's ambient runtime (see
+        /// [`establish_migration_connection`] for why). Callers must keep
+        /// this alive as long as `conn` — dropping it kills the driver and
+        /// every query after that hangs or errors. It is safe to drop
+        /// normally (no deferred-shutdown wrapper needed): every caller of
+        /// [`establish_migration_connection`] reaches it only from a thread
+        /// that has never entered any runtime (see that function's doc
+        /// comment), and stays off any runtime's "entered" state except
+        /// during each individual `block_on` call this connection or `conn`
+        /// makes — so a drop between those calls is never "from within an
+        /// asynchronous context" the way tokio forbids.
+        runtime: tokio::runtime::Runtime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper<AsyncPgConnection>,
     },
 }
@@ -5570,9 +5936,32 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 
 /// Establish a [`MigrationConnection`] for `database_url`.
 ///
-/// **Never call from an async executor thread**: the rustls arm `block_on`s
-/// connection setup. Sync contexts (the CLI) and `spawn_blocking` tasks (the
-/// startup migration path) are both fine.
+/// # Thread-safety contract — read before adding a new caller
+///
+/// This function itself is unconditionally safe to call from any thread: it
+/// only ever enters/exits a runtime it just built, on the thread it is
+/// running on, never touching an ambient one. But the connection it returns
+/// is NOT fully self-contained for the rustls arm — the returned
+/// [`AsyncConnectionWrapper`] bridges every subsequent sync diesel call
+/// (`MigrationHarness::run_pending_migrations`, plain queries, ...) through
+/// its OWN internal `block_on`, and that bridging still panics
+/// ("Cannot start a runtime from within a runtime") if invoked from a thread
+/// that is itself already inside some OTHER ambient runtime's context — the
+/// exact shape of an app's own `.on_startup(|state| async move { ... })`
+/// hook calling a migration function directly (TLS-enabled migrations used
+/// to panic in production this way; TLS off never hit this arm, so it never
+/// surfaced in dev). So this function alone does not make that case safe —
+/// **every caller must ensure the connection is established AND used
+/// entirely on a thread that has never entered any runtime**, e.g. via
+/// [`with_migration_connection!`]/`with_sync_pg_connection!`, which dispatch
+/// their whole body (this call plus every query `$body` makes) onto a
+/// freshly spawned [`std::thread::scope`] thread. [`hold_migration_lock`]'s
+/// caller (the CLI's `autumn migrate`) satisfies this by construction — it
+/// never runs inside a tokio runtime at all.
+///
+/// [`AsyncConnectionWrapper`]:
+///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+/// [`with_migration_connection!`]: crate::migrate
 ///
 /// # Errors
 ///
@@ -5589,26 +5978,25 @@ pub(crate) fn establish_migration_connection(
         return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
     }
     let posture = tls::TlsPosture::from_database_url(database_url);
-    // The driver task tokio::spawn()ed during establish must stay driven for
-    // the connection's lifetime: reuse the ambient runtime when there is one
-    // (spawn_blocking context), otherwise create one and keep it alive
-    // alongside the connection.
-    let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        (None, handle)
-    } else {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                diesel::ConnectionError::BadConnection(format!(
-                    "failed to build a tokio runtime for the TLS migration connection: {e}"
-                ))
-            })?;
-        let handle = runtime.handle().clone();
-        (Some(runtime), handle)
-    };
-    let inner = handle.block_on(tls::establish(database_url, posture))?;
+    // Build a dedicated runtime and connect ON THE CALLING THREAD directly
+    // (no further nested thread-spawn needed here): per this function's own
+    // contract above, every caller already guarantees the calling thread has
+    // never entered any runtime, so entering this freshly built one is
+    // always safe. It drives the connection's background I/O task for as
+    // long as `conn` is used, so it is kept alongside `conn` in
+    // [`MigrationConnection::Rustls`] — dropping it is likewise safe here,
+    // since by the time it drops (after every query `$body` makes has
+    // completed) this thread is not mid-`block_on` on anything.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            diesel::ConnectionError::BadConnection(format!(
+                "failed to build a tokio runtime for the TLS migration connection: {e}"
+            ))
+        })?;
+    let inner = runtime.block_on(tls::establish(database_url, posture))?;
     Ok(MigrationConnection::Rustls {
         runtime,
         conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper::from(inner),
@@ -5687,5 +6075,88 @@ mod migration_connection_tests {
                 "must use the rustls wrapper: {url}"
             );
         }
+    }
+
+    // Regression: TLS-enabled migrations panicked with "Cannot start
+    // a runtime from within a runtime" when called directly from an app's
+    // own async `on_startup` hook rather than from `spawn_blocking` --
+    // because the rustls arm's connect used to `block_on` on the CALLING
+    // thread, which IS one of the ambient runtime's own worker threads while
+    // an `.on_startup(|state| async move { ... })` body executes. TLS off
+    // (dev) never took this arm, so the bug only ever surfaced with
+    // `sslmode=require`/`verify-full` (prod).
+    //
+    // Exercises `crate::migrate::pending_migrations` -- the actual public
+    // entry point apps call -- rather than `establish_migration_connection`
+    // directly: that bare function is only safe when the whole connect +
+    // query sequence runs on a thread that never entered a runtime, a
+    // guarantee `with_migration_connection!` (which `pending_migrations`
+    // uses internally) provides by construction. Calling it directly, as
+    // this test used to, no longer represents how any real caller uses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_functions_do_not_panic_from_an_async_caller() {
+        const MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        // Calling this directly from an `async fn` body -- not wrapped in
+        // `spawn_blocking` -- mirrors the shape of an app's own async
+        // `on_startup` hook calling `autumn_web::migrate::run_pending(...)`.
+        // On a multi-threaded runtime (axum's default), matching production.
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = crate::migrate::pending_migrations(url, MIGRATIONS);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error \
+             (not panic on nested block_on)"
+        );
+    }
+
+    // Regression guard: `#[tokio::test]`'s default flavor is `current_thread`
+    // -- exactly one thread drives this runtime's I/O and timers, and that
+    // thread is the one about to call a migration function directly
+    // (mirroring an app's own `.on_startup` hook body, not `spawn_blocking`).
+    // If `with_migration_connection!` ever went back to running the connect
+    // (or the query) on the CALLING thread instead of a freshly spawned
+    // `thread::scope` thread, this would DEADLOCK rather than fail fast:
+    // there would be nothing left free to drive the connect's I/O. A
+    // watchdog thread bounds that -- there is no clean way to cancel a
+    // genuinely stuck OS thread, so a real regression here hard-exits the
+    // process instead of hanging the suite.
+    #[tokio::test]
+    async fn migration_functions_do_not_hang_on_a_current_thread_runtime() {
+        const MIGRATIONS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        // A plain `sleep`-then-`exit` watchdog can't be cancelled once
+        // spawned, so a detached one would keep counting down after this
+        // test returns and could later `process::exit` the shared test
+        // binary mid-suite, on an unrelated test, if the suite is still
+        // running 20s after this test passed. A channel lets the main
+        // thread signal "the call returned, stand down" so the watchdog only
+        // ever fires on a genuine hang.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .is_err()
+            {
+                eprintln!(
+                    "migration_functions_do_not_hang_on_a_current_thread_runtime: \
+                     timed out after 20s -- the TLS connect hung instead of failing fast"
+                );
+                std::process::exit(101);
+            }
+        });
+
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db?sslmode=require";
+        let result = crate::migrate::pending_migrations(url, MIGRATIONS);
+        assert!(
+            result.is_err(),
+            "an unreachable TLS-requiring host must fail with a connection error"
+        );
+
+        // Stand the watchdog down and wait for it to exit cleanly, rather
+        // than leaving a live "exit(101) in 20s" timer running in the shared
+        // test binary after this test has already passed.
+        let _ = done_tx.send(());
+        let _ = watchdog.join();
     }
 }

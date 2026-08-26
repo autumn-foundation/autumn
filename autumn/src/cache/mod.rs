@@ -104,6 +104,21 @@ pub fn clear_global_cache() {
     *GLOBAL_CACHE.write().expect("global cache lock poisoned") = None;
 }
 
+/// Serializes same-process test code that mutates [`GLOBAL_CACHE`] via
+/// [`set_global_cache`]/[`clear_global_cache`].
+///
+/// `cargo test` runs a crate's unit tests on parallel threads in one
+/// process, so two tests racing on this process-wide singleton can
+/// interleave — e.g. one test's `clear_global_cache()` landing between
+/// another's set-then-read sequence. Every same-process caller that
+/// mutates the global cache for test purposes — [`crate::test::TestApp::build`]
+/// and the `cache::fragment` unit tests — acquires this lock for the
+/// duration of its critical section so they mutually exclude each other.
+/// Poison-tolerant: acquire with `.lock().unwrap_or_else(PoisonError::into_inner)`
+/// so one panicking test doesn't cascade into failing an unrelated one. See
+/// issue #2218.
+pub(crate) static GLOBAL_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ── Cache trait ──────────────────────────────────────────────────────
 
 /// Raw JSON bytes stored by serializing cache backends (e.g. Redis).

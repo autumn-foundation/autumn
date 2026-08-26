@@ -312,10 +312,14 @@ fn generate_inner(
         // The `--api` Dockerfile carries i18n `COPY` anchors resolved by flag:
         // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
         // the anchors so a non-i18n build context (which has no `i18n/` dir)
-        // still builds. The fullstack `Dockerfile.tmpl` is used verbatim.
+        // still builds.
         inject_i18n_dockerfile_api(&render(templates::DOCKERFILE_API), opts.with_i18n)
     } else {
-        render(templates::DOCKERFILE)
+        // The fullstack `Dockerfile.tmpl` carries the same i18n `COPY` anchors:
+        // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
+        // the anchors so a non-i18n build context (which has no `i18n/` dir)
+        // still builds.
+        inject_i18n_dockerfile(&render(templates::DOCKERFILE), opts.with_i18n)
     };
     fs::write(project_dir.join("Dockerfile"), dockerfile)?;
     fs::write(
@@ -533,8 +537,8 @@ fn replace_anchor(src: &str, from: &str, to: &str) -> String {
 fn inject_i18n(main_rs: &str) -> String {
     let with_locale = replace_anchor(
         main_rs,
-        "        .routes(routes![index, hello, hello_name])",
-        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        "        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
+        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
     );
     let with_static = replace_anchor(
         &with_locale,
@@ -614,6 +618,46 @@ fn inject_i18n_dockerfile_api(dockerfile: &str, with_i18n: bool) -> String {
     } else {
         let no_builder = replace_anchor(dockerfile, DOCKERFILE_API_I18N_BUILDER_ANCHOR, "");
         replace_anchor(&no_builder, DOCKERFILE_API_I18N_RUNTIME_ANCHOR, "")
+    }
+}
+
+/// Anchor: the builder-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl` (an otherwise-inert comment line). Replaced with a
+/// `COPY i18n ./i18n` line for `--with-i18n`, or stripped entirely otherwise so
+/// a non-i18n project's build context has no missing `i18n/` dir.
+const DOCKERFILE_I18N_BUILDER_ANCHOR: &str = "# __AUTUMN_I18N_BUILDER_COPY__\n";
+/// Anchor: the runtime-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl`. Replaced with a `COPY --from=builder /app/i18n /app/i18n`
+/// line for `--with-i18n`, or stripped otherwise.
+const DOCKERFILE_I18N_RUNTIME_ANCHOR: &str = "# __AUTUMN_I18N_RUNTIME_COPY__\n";
+
+/// Resolve the two i18n `COPY` anchors in the rendered fullstack Dockerfile.
+///
+/// The default (fullstack) scaffold's `main.rs` calls `.i18n_auto()` when
+/// `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and panics if
+/// it is missing. The image must therefore ship the `i18n/` sidecar into both
+/// the builder (so `cargo build` sees it for any embed) and the runtime stage
+/// (so the running binary can read it). The `COPY` lines are gated on
+/// `with_i18n`: an unconditional `COPY i18n ./i18n` would break `docker build`
+/// for non-i18n projects, whose build context has no `i18n/` directory. When
+/// `with_i18n` is false the anchors are stripped, leaving the Dockerfile
+/// byte-for-byte as it was before this wiring (no leftover anchor markers).
+/// Mirrors [`inject_i18n_dockerfile_api`] for the `--api` scaffold.
+fn inject_i18n_dockerfile(dockerfile: &str, with_i18n: bool) -> String {
+    if with_i18n {
+        let with_builder = replace_anchor(
+            dockerfile,
+            DOCKERFILE_I18N_BUILDER_ANCHOR,
+            "COPY i18n ./i18n\n",
+        );
+        replace_anchor(
+            &with_builder,
+            DOCKERFILE_I18N_RUNTIME_ANCHOR,
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        )
+    } else {
+        let no_builder = replace_anchor(dockerfile, DOCKERFILE_I18N_BUILDER_ANCHOR, "");
+        replace_anchor(&no_builder, DOCKERFILE_I18N_RUNTIME_ANCHOR, "")
     }
 }
 
@@ -1170,6 +1214,133 @@ mod tests {
             p.join("tests/integration_test.rs").is_file(),
             "`autumn new` should generate tests/integration_test.rs"
         );
+    }
+
+    // `autumn new` must scaffold a working cookie-consent banner (issue
+    // #1214): a policy-version constant the app owner can bump to re-prompt,
+    // the auto-injecting middleware wired into the app, and the accept/reject
+    // routes it posts to.
+    #[test]
+    fn generates_consent_banner_wiring_in_main_rs() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-app", tmp.path()).unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("CONSENT_POLICY_VERSION"),
+            "generated main.rs must declare a bump-to-reprompt policy version constant: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::inject_consent_banner"),
+            "generated main.rs must wire the consent-banner middleware: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("consent_accept") && main_rs.contains("consent_reject"),
+            "generated main.rs must define consent_accept/consent_reject routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/accept\"") && main_rs.contains("\"/consent/reject\""),
+            "generated main.rs must mount the accept/reject routes at their documented paths: {main_rs}"
+        );
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "the new consent routes must be registered alongside the existing routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/manage\"")
+                && main_rs.contains("autumn_web::consent::consent_banner_markup"),
+            "generated main.rs must scaffold a preferences route reusing the consent-banner \
+             widget (GDPR Art. 7(3): withdrawing consent must be as easy as giving it): {main_rs}"
+        );
+        assert!(
+            main_rs.contains("href=\"/consent/manage\""),
+            "the shared layout's footer must link to the withdrawal route so it's \
+             reachable from every page: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME"),
+            "the middleware wiring must pass the CSRF cookie name explicitly: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_FORM_FIELD"),
+            "the middleware wiring must pass the CSRF form-field name explicitly: {main_rs}"
+        );
+    }
+
+    // `/consent/manage` must stay a side-effect-free `GET`: it renders the
+    // consent-banner widget so the visitor can make a new choice, but the
+    // actual state change goes through the existing CSRF-protected
+    // `POST /consent/accept` / `POST /consent/reject` handlers. If the GET
+    // handler itself mutated the consent cookie (e.g. by calling
+    // `expire_consent_cookie` directly), a same-origin prefetcher, browser
+    // extension, or cross-site top-level navigation following the footer
+    // link could silently reset a visitor's consent, since `GET` is
+    // CSRF-exempt by definition.
+    #[test]
+    fn consent_manage_route_does_not_mutate_state_on_get() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-manage-app", tmp.path()).unwrap();
+        let main_rs =
+            fs::read_to_string(tmp.path().join("consent-manage-app/src/main.rs")).unwrap();
+        let start = main_rs
+            .find("async fn consent_manage")
+            .expect("consent_manage handler must exist");
+        let body = &main_rs[start..];
+        let end = body[1..]
+            .find("\n#[")
+            .map_or(body.len(), |offset| offset + 1);
+        let handler_body = &body[..end];
+        assert!(
+            !handler_body.contains("expire_consent_cookie") && !handler_body.contains("SET_COOKIE"),
+            "the GET /consent/manage handler must not itself set or expire any cookie: {handler_body}"
+        );
+    }
+
+    // The JSON-first `--api` flavor has no HTML/layout to show a banner in —
+    // it must not scaffold the consent-banner wiring at all.
+    #[test]
+    fn api_flavor_does_not_scaffold_consent_banner() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-api-app",
+            tmp.path(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-api-app/src/main.rs")).unwrap();
+        assert!(
+            !main_rs.contains("inject_consent_banner"),
+            "the --api flavor ships no HTML layout, so it must not scaffold the banner: {main_rs}"
+        );
+    }
+
+    // The generated `--with-i18n` main.rs must still compile-shape correctly:
+    // the i18n injection anchors must stay in sync with the new routes! list
+    // (see `inject_i18n`'s anchor constant).
+    #[test]
+    fn with_i18n_still_wires_consent_routes() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-i18n-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-i18n-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "i18n injection must not drop the consent routes from the routes! list: {main_rs}"
+        );
+        assert!(main_rs.contains("i18n_auto"));
     }
 
     // The generated Cargo.toml must have [dev-dependencies] with tokio
@@ -1926,6 +2097,61 @@ mod tests {
         assert!(
             main.contains(".i18n_auto()"),
             "main.rs should call .i18n_auto(): {main}"
+        );
+    }
+
+    #[test]
+    fn with_i18n_copies_i18n_into_fullstack_docker_image() {
+        // The fullstack (non-`--api`) scaffold's `main.rs` calls `.i18n_auto()`
+        // for `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and
+        // panics if missing. The image must therefore ship the `i18n/` sidecar
+        // into both the builder and runtime stages (issue #1865, mirroring the
+        // `--api` fix in #1847).
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "i18n-docker-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let dockerfile = fs::read_to_string(tmp.path().join("i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("COPY i18n ./i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the builder stage:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("COPY --from=builder /app/i18n /app/i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the runtime stage:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "--with-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
+        );
+    }
+
+    #[test]
+    fn without_i18n_fullstack_docker_image_has_no_i18n_copy() {
+        // A non-i18n fullstack Dockerfile must carry NO i18n `COPY` lines (an
+        // unconditional `COPY i18n ./i18n` would break `docker build`, whose
+        // context has no `i18n/` dir) and no leftover anchor markers.
+        let tmp = TempDir::new().unwrap();
+        generate("no-i18n-docker-app", tmp.path()).unwrap();
+        let dockerfile =
+            fs::read_to_string(tmp.path().join("no-i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            !dockerfile.contains("COPY i18n ./i18n"),
+            "non-i18n fullstack Dockerfile must not copy i18n/ (build context has no i18n/ dir):\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("/app/i18n"),
+            "non-i18n fullstack Dockerfile must not reference /app/i18n:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "non-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
         );
     }
 

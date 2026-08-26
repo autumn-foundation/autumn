@@ -16,6 +16,9 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod commentable;
+mod edge;
+mod edge_routes_macro;
 mod event;
 mod feature_flag;
 mod i18n;
@@ -45,6 +48,7 @@ mod routes_macro;
 mod scheduled;
 mod secured;
 mod service;
+mod sim_test;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
@@ -73,6 +77,41 @@ use proc_macro::TokenStream;
 ///     "Hello, Autumn!"
 /// }
 /// ```
+///
+/// # Route-level SEO defaults
+///
+/// A `seo(...)` argument declares per-page meta tag values once on the route
+/// instead of rebuilding them in every handler. Take a `SeoMeta` parameter and
+/// it arrives pre-populated; the builder is consuming, so the handler refines
+/// the defaults with per-request data:
+///
+/// ```ignore
+/// use autumn_web::get;
+/// use autumn_web::seo::SeoMeta;
+///
+/// #[get("/about", seo(title = "About • My Blog", description = "Learn about us"))]
+/// async fn about(seo: SeoMeta) -> Markup {
+///     html! { head { (seo.render()) } }
+/// }
+///
+/// #[get("/posts/{slug}", seo(og_type = "article"))]
+/// async fn show(slug: Path<String>, seo: SeoMeta) -> Markup {
+///     let seo = seo.title(format!("{} • Blog", *slug));
+///     html! { head { (seo.render()) } }
+/// }
+/// ```
+///
+/// Accepted keys mirror the `SeoMeta` builder: `title`, `description`,
+/// `canonical`, `og_title`, `og_description`, `og_image`, `og_type`, `og_url`,
+/// `twitter_card`, `twitter_title`, `twitter_description`, `twitter_image`,
+/// and `robots`. Values must be string literals; an unknown, repeated, or
+/// empty `seo(...)` is a compile error. Every HTTP route macro accepts the
+/// argument, as does [`macro@static_get`]; [`macro@ws`] does not, since a
+/// WebSocket upgrade serves no crawlable document.
+///
+/// The argument supplies *values*, not markup: a handler that never takes a
+/// `SeoMeta` parameter renders nothing regardless of what the attribute
+/// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("GET", "get", attr.into(), item.into()).into()
@@ -242,6 +281,33 @@ pub fn paths(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Annotate an async function as a deterministic simulation test (S-1797, W1).
+///
+/// Expands into a synchronous `#[test]` function that reads a seed from the
+/// `AUTUMN_SIM_SEED` environment variable (hex `0x..` or decimal, default `0`),
+/// builds a paused current-thread tokio runtime, constructs a
+/// `autumn_web::sim::Sim` from the seed, runs the async body, and prints a
+/// copy-pasteable replay line on panic before re-propagating the failure.
+///
+/// The annotated function must be `async` and take exactly one argument — the
+/// [`Sim`](../autumn_web/sim/struct.Sim.html) handle.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::sim::Sim;
+/// use autumn_web::sim_test;
+///
+/// #[sim_test]
+/// async fn deterministic(mut sim: Sim) {
+///     assert_eq!(sim.seed, 0);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    sim_test::sim_test_macro(attr.into(), item.into()).into()
 }
 
 /// Annotate an async inbound mail handler function.
@@ -440,6 +506,145 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// pub struct User { /* ... */ }
 /// // -> add_follower/remove_follower and add_following/remove_following
 /// ```
+///
+/// # Votable (reactions)
+///
+/// `#[votable(by = <Reactor>)]` declares a reaction association (#1362): a
+/// `(reactor, target)`-unique edge table plus an aggregate column maintained on
+/// this model. It replaces the hand-written toggle/flip/upsert SQL and the
+/// score recompute that every voting, liking or bookmarking feature otherwise
+/// grows.
+///
+/// ```ignore
+/// #[model]
+/// #[votable(by = User, aggregate = sum)]   // signed up/down votes
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub title: String,
+///     pub score: i64,                      // the aggregate column
+/// }
+/// ```
+///
+/// Two modes: `aggregate = sum` (the default — signed values, `score =
+/// SUM(value)`) and `aggregate = count` (unary likes — no value column,
+/// `{name}_count = COUNT(*)`). Every name is inferred and every inference has
+/// an override:
+///
+/// | Key | Default | Meaning |
+/// |---|---|---|
+/// | `by` | **required** | the reactor model, e.g. `User` |
+/// | `aggregate` | `sum` | `sum` \| `count` |
+/// | `name` | `vote` | reaction name; drives `table` and the count column |
+/// | `table` | `pluralize(name)` → `votes` | the edge table |
+/// | `reactor_fk` | `{snake(by)}_id` → `user_id` | edge column → reactor |
+/// | `target_fk` | `{snake(Model)}_id` → `post_id` | edge column → this model |
+/// | `value_column` | `value` (sum only) | the edge's signed value |
+/// | `column` | `score` (sum) / `{name}_count` (count) | aggregate column |
+///
+/// A likes feature is therefore `#[votable(by = User, aggregate = count, name
+/// = like)]` → table `likes`, column `like_count`. At most one `#[votable]` per
+/// model.
+///
+/// `by` may name a hand-written struct — it is name-resolved at compile time
+/// but carries no trait bound, so the reactor's `i64` primary key is
+/// documented contract, not a compile check (the edge table binds the reactor
+/// FK as `BIGINT`; a UUID-keyed reactor fails on first use with a database
+/// type error). The **target** model's `#[id]` and aggregate column *are*
+/// compile-checked as `i64`.
+///
+/// **Write `#[votable]` *below* `#[model]`.** It is consumed by `#[model]`, not
+/// registered as an attribute in its own right, so an attribute macro written
+/// above it never sees it — an error reading `cannot find attribute `votable`
+/// in this scope` means the two lines are the wrong way round.
+///
+/// ## Required migration
+///
+/// The edge table is the user's to create, and its **composite `UNIQUE
+/// (reactor_fk, target_fk)` is load-bearing**: it is the `ON CONFLICT` arbiter
+/// the generated upsert names, and it is what makes "at most one edge per
+/// (reactor, target)" a database guarantee. The value column is `SMALLINT`, the
+/// aggregate column `BIGINT NOT NULL DEFAULT 0`, and the model's own primary key
+/// must be `BIGINT`/`i64` (both edge foreign keys are bound as `i64`; a
+/// UUID-keyed model is a compile error).
+///
+/// `NOT NULL` on both foreign keys is strongly recommended: `NULL`s are
+/// distinct in a unique constraint, so a nullable column is not covered by the
+/// arbiter. A nullable *target* FK is nevertheless tolerated when every row this
+/// association writes is non-`NULL` — the shape an XOR edge table has (reddit-
+/// clone's `votes` points at either a post or a comment), where the unique
+/// constraint still fully covers the non-`NULL` rows `react()` creates.
+///
+/// The `CHECK` on `value` is load-bearing in sum mode: **`react()` does not
+/// validate `value`** — it writes what it is given, and the sum is only
+/// meaningful because the database refuses anything outside the legal set.
+/// Never bind `value` straight from a request; map the request to `1` / `-1`
+/// yourself. A violating value surfaces as a database error (a 500), not a
+/// validation failure.
+///
+/// ```sql
+/// CREATE TABLE votes (
+///     id      BIGSERIAL PRIMARY KEY,
+///     user_id BIGINT NOT NULL REFERENCES users(id),
+///     post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+///     value   SMALLINT NOT NULL CHECK (value IN (-1, 1)),
+///     UNIQUE (user_id, post_id)          -- the ON CONFLICT arbiter
+/// );
+/// ALTER TABLE posts ADD COLUMN score BIGINT NOT NULL DEFAULT 0;
+/// -- aggregate = count: drop the `value` column entirely.
+/// ```
+///
+/// ## Generated helpers
+///
+/// A `{Model}Reactions` trait, blanket-implemented for the model's
+/// `#[repository]`:
+///
+/// ```ignore
+/// use autumn_web::repository::{Reaction, ReactionOutcome};
+///
+/// // sum mode. (count mode: `react(reactor_id, target_id)` — no value.)
+/// let r: Reaction = posts.react(user_id, post_id, 1).await?;
+/// r.value;      // Option<i16>: the reactor's reaction AFTER the call
+/// r.aggregate;  // i64: the newly persisted score, ground truth at commit
+/// r.outcome;    // Inserted | Flipped | Removed
+///
+/// let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+/// ```
+///
+/// `react()` is race-safe: the same value again toggles the edge off, a
+/// different value flips it in place, a new one inserts it — and the aggregate
+/// is recomputed from ground truth (`SUM`/`COUNT`) and persisted in the **same
+/// transaction**, so a reader never observes edge/aggregate disagreement. The
+/// target row is locked (`SELECT ... FOR NO KEY UPDATE` on Postgres — it does
+/// not conflict with the `FOR KEY SHARE` locks foreign-key checks take, so
+/// concurrent inserts referencing the target do not queue behind votes;
+/// `BEGIN IMMEDIATE` on `SQLite`) for the whole read-decide-write-recompute
+/// window, so concurrent reactions on one target converge to at most one edge
+/// per `(reactor, target)` and the persisted aggregate is exact even across
+/// *different* reactors.
+///
+/// It is **not idempotent** — it is a toggle. Retrying a call that timed out can
+/// invert the outcome, because the first attempt may have committed; callers
+/// that need retry safety dedupe above this layer (an idempotency key on the
+/// HTTP request). `reaction_of()` is a plain read: it follows the repository's
+/// read route (so a replica may serve it) and does not pin read-your-writes, so
+/// render from the `Reaction` that `react()` returned rather than re-reading.
+///
+/// When the model has a `deleted_at` field, reacting to a soft-deleted target
+/// is `NotFound` and leaves its aggregate untouched.
+///
+/// Tenant-isolated on the same terms: when the model has a `tenant_id` field
+/// **and** the repository is `#[repository(..., tenant_scoped)]`, both the
+/// target lock and the aggregate `UPDATE` carry `tenant_id = <current
+/// tenant>`, so another tenant's `target_id` is `NotFound` before any write and
+/// `reaction_of()` reports `None` for it. No tenant context is an error (as for
+/// any derived query) and `across_tenants()` opts out. A model without the
+/// column emits none of this. The m2m `add_*` / `remove_*` helpers are not
+/// covered — they remain id-scoped.
+///
+/// `react()` acquires its **own** pooled connection and does not join an
+/// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
+/// connection pool.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
@@ -627,6 +832,20 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     "About us"
 /// }
 /// ```
+///
+/// # Route-level SEO defaults
+///
+/// Accepts the same `seo(...)` argument as [`macro@get`], so pre-rendered
+/// pages carry the declared meta tags. Static generation drives the same
+/// router as the live server, so the values reach the handler identically in
+/// both modes:
+///
+/// ```ignore
+/// #[static_get("/about", seo(title = "About • My Blog", og_type = "website"))]
+/// async fn about(seo: SeoMeta) -> Markup {
+///     html! { head { (seo.render()) } }
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
     static_route::static_get_macro(attr.into(), item.into()).into()
@@ -707,6 +926,81 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
     public::public_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a read-path route as eligible to run in the edge capsule (#1790).
+///
+/// `#[edge]` injects no runtime guard and does not rewrite the handler
+/// signature — it is a compile-time *marker*, like
+/// [`#[public]`](macro@public). The route macro reads it back and emits an
+/// extra `__autumn_edge_route_{name}()` companion returning an
+/// `autumn_edge::EdgeRoute`, while gating the native (`autumn_web`) companions
+/// behind `#[cfg(not(target_arch = "wasm32"))]` so the same handler source
+/// compiles for both the origin binary and the `wasm32-wasip1` capsule.
+/// Marking a handler makes it *eligible*; listing it in
+/// [`edge_routes!`](macro@edge_routes) is what puts it in the capsule.
+///
+/// # Forms
+///
+/// - `#[edge]` — the handler needs no platform seam
+/// - `#[edge(needs(kv))]` — the handler reads the edge key-value cache
+///   (`autumn_edge::EdgeCache`), which the host must provide; a request
+///   arriving at an edge without that capability falls through to the origin
+///
+/// # Restrictions
+///
+/// The edge lane is read-path only and carries no session, auth, or database
+/// state, so these are compile errors:
+///
+/// - a method other than `#[get]`;
+/// - combining with `#[secured]`, `#[authorize]`, `#[step_up]`, or
+///   `#[throttle]` (in either attribute order);
+/// - `#[static_get]` (already pre-rendered), `#[ws]`, or `#[oauth2_callback]`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_edge::prelude::{EdgeCache, Path};
+/// use autumn_web::{edge, get};
+///
+/// #[get("/greet/{name}")]
+/// #[edge]
+/// async fn greet(Path(name): Path<String>) -> String {
+///     format!("Hello, {name}!")
+/// }
+///
+/// #[get("/note/{id}")]
+/// #[edge(needs(kv))]
+/// async fn note(Path(id): Path<String>, cache: EdgeCache) -> String {
+///     cache.get_string(&id).unwrap_or_else(|| "not cached".to_owned())
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
+    edge::edge_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
+///
+/// The edge-lane counterpart of [`routes!`](macro@routes): each entry resolves
+/// to the handler's `__autumn_edge_route_{name}()` companion, so a handler that
+/// was never marked `#[edge]` fails to resolve rather than silently vanishing
+/// from the capsule.
+///
+/// ```ignore
+/// use autumn_web::{edge, edge_routes, get};
+///
+/// #[get("/greet")]
+/// #[edge]
+/// async fn greet() -> &'static str { "hi" }
+///
+/// pub fn edge_routes() -> Vec<autumn_edge::EdgeRoute> {
+///     edge_routes![greet]
+/// }
+/// ```
+#[proc_macro]
+pub fn edge_routes(input: TokenStream) -> TokenStream {
+    edge_routes_macro::edge_routes_macro(input.into()).into()
 }
 
 /// Require fresh ("step-up") authentication before a route handler runs.

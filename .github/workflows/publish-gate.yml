@@ -117,6 +117,22 @@ jobs:
           REQUIRE_FULL_COVERAGE: "1"
         run: ./scripts/check-examples-e2e.sh
 
+      # The harness's own browser tests. They are `#[ignore]`d (they need
+      # Chromium) and live behind the `system-tests` feature, which puts them
+      # outside BOTH always-on sweeps: the `test` job never passes
+      # `--include-ignored`, and ci.yml's Docker `--ignored` sweep uses a
+      # feature list without `system-tests`, so the module does not even
+      # compile into that binary. This job is the only one that provisions a
+      # browser, so it is the only place `SystemTest`'s own end-to-end
+      # coverage (htmx settle, transient-navigation retries, `.layer()`,
+      # console-error capture, `attach()`) can actually run.
+      - name: Run the SystemTest harness browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests system_test_api -- --include-ignored
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------
@@ -214,6 +230,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: ./scripts/check-release-notes.sh
+      - name: Migration guide coverage gate
+        # Belt and braces with the same gate in ci.yml's lint job: a tag can be
+        # pushed from a commit that never went through a PR, and a release
+        # without an upgrade path is treated as a broken build (issue #1588).
+        run: ./scripts/check-migration-guides.sh
 
   # ---------------------------------------------------------------------------
   # 6. Downstream smoke test

@@ -1,0 +1,5 @@
+error: votable aggregate column `score` not found on model `Post`; add the field (e.g. `pub score: i64`) or override it with `#[votable(..., column = <field>)]`
+  --> tests/compile-fail/model_votable_missing_aggregate_column.rs:15:1
+   |
+15 | #[votable(by = User, aggregate = sum)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

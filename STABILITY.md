@@ -97,11 +97,32 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   excluded.
 - Debug output (`Debug` impls). Useful for logs, not parsable.
 - Private modules (`pub(crate)`, `pub(super)`) and the `tests` modules.
+- **The edge capsule lane (issue #1790).** The `autumn-edge` crate, the
+  `#[edge]` / `edge_routes![]` macro surface, `AppBuilder::with_edge_kv`, the
+  capsule **wire protocol** (`WIRE_VERSION`, its NDJSON frames) and the
+  reference **host API** (`autumn_edge::host`) are experimental and may change
+  in any release. The protocol carries a version field precisely so a host and
+  an artifact built from different Autumn versions degrade to origin-serving
+  instead of guessing.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.
 
 [`AppBuilder::run`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html
+
+### The edge capsule's byte-identity claim
+
+The edge lane promises that a request the capsule serves gets the same status,
+the same body bytes and the same headers (after the documented
+[projection](docs/guide/edge.md#byte-identity-what-is-actually-guaranteed)) as
+the origin binary would give — **for the origin binary and the edge artifact of
+the same build**. It is a statement about two compilations of one source tree
+agreeing with each other, proven per build by the `edge-conformance` CI job.
+
+It is explicitly *not* a promise across versions. Rendered bytes are already
+excluded from SemVer above, and that exclusion applies to both lanes equally: a
+release may change what a handler renders, so long as it changes the origin and
+the capsule together. Rebuild both from the same tree and deploy them together.
 
 ## What counts as a breaking change
 
@@ -250,6 +271,31 @@ We prefer a long deprecation ramp over abrupt removal:
 
 Deprecations never change behavior — only signal intent.
 
+### Deterministic clock/entropy seam (issue #1797)
+
+`autumn_web::time` gained a monotonic counterpart to the existing wall-clock
+seam, all of it additive:
+
+- `time::MonotonicInstant` — an instant on a clock's own monotonic timeline,
+  with `saturating_duration_since` / `saturating_add` / `checked_add`.
+- `ClockSource::monotonic` — a **defaulted** trait method, so every existing
+  `impl ClockSource` keeps compiling and keeps reading the real
+  process-monotonic clock. A custom clock whose `now()` is virtual should
+  override it.
+- `Clock::monotonic` — the request-start instant, snapshotted with the
+  extractor.
+- `AppState::monotonic` — the live reading.
+- `time::monotonic_now` — the real monotonic clock, for code with no
+  `ClockSource` in scope.
+- `DbState::clock` — a **defaulted** trait method returning the real system
+  clock, so an existing `impl DbState` needs no change.
+
+Deprecated in the same change: `scheduler::now_unix_secs` and
+`scheduler::now_unix_duration`, superseded by
+`time::clock_unix_secs(state.clock())` / `time::clock_unix_duration(state.clock())`.
+They follow the ramp above — the warning lands in a minor release and removal is
+a major-release event.
+
 ### Config-key deprecations
 
 Config key deprecations (TOML schema and `AUTUMN_*` env vars) are tracked in
@@ -275,8 +321,15 @@ UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 
 ## Migration guides
 
-Every major release ships with a migration guide under
-[`docs/migrations/`](docs/migrations/). The guide is written against the
+**Every release with a breaking change ships a migration guide** under
+[`docs/migrations/`](docs/migrations/) — pre-`1.0` that means most `0.x`
+releases, not just majors. This is enforced, not merely promised:
+`scripts/check-migration-guides.sh` fails CI when a `CHANGELOG.md` section
+declares a breaking change without a matching `docs/migrations/<version>.md`,
+or when a breaking entry does not link its guide (issue #1588). A release
+without an upgrade path is treated as a broken build.
+
+The guide is written against the
 [migration guide template](docs/migrations/TEMPLATE.md) and covers:
 
 1. The summary and scope of the breaking changes.
@@ -285,10 +338,15 @@ Every major release ships with a migration guide under
 4. Compiler-error cheat sheet — "if you see this error, do that".
 5. Dependency major bumps carried with the release.
 6. Link to the CHANGELOG section for the release.
+7. How to verify the upgrade landed, and the recorded guide-only upgrade
+   walk-through of an app scaffolded on the previous release.
 
-Draft migration guides are opened alongside the first breaking change that
-targets the next major; they are merged and polished across the prerelease
-cycle so that the `x.0.0` release ships with a complete guide on day one.
+Draft guides are opened alongside the *first* breaking change of a cycle, as
+[`docs/migrations/next.md`](docs/migrations/next.md), and grow with each
+subsequent breaking-change PR; the draft is renamed to `<version>.md` at
+release time, so the release ships with a complete guide on day one. See
+[`docs/migrations/README.md`](docs/migrations/README.md) for the process and
+the `**Breaking:**` changelog convention.
 
 ## CSV import/export (issue #808)
 
@@ -376,6 +434,47 @@ fn csv_export_row(&self, columns: &[&str], record: &Value) -> Vec<String> {
     }).collect()
 }
 ```
+
+## Team membership (issue #1261)
+
+### SemVer impact
+
+This is additive: a new opt-in `autumn generate teams` CLI subcommand plus a
+new `examples/teams` reference application. **No public API in the
+`autumn`/`autumn-web` or `autumn-macros` crates changed** — every capability
+`teams` uses already shipped and is already stable: `#[repository(...,
+tenant_scoped)]` (issue #695), the session `"role"` key convention
+(`#[secured("...")]`/`PolicyContext::has_role`, issue #496), and the Mail
+stack's `#[mailer]`/`#[mailer_preview]`. No new Cargo feature gate was
+needed for this, since nothing in the library crates' public API changed —
+`autumn-cli` alone gained the new subcommand.
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `autumn generate teams` | `autumn-cli` subcommand | No name argument — always emits the fixed `Organization`/`Membership`/`Invitation` set |
+| `autumn destroy teams` | `autumn-cli` subcommand | Reverses a matching `generate teams` (issue #1048's destroy convention) |
+
+No new public Rust API in `autumn-web`/`autumn-macros`: the generated
+`src/teams/` module is ordinary, freely-editable application code composed
+entirely from already-stable primitives, not a new library surface.
+
+### What it generates
+
+| File | Purpose |
+|------|---------|
+| `src/teams/models.rs` | `Organization`, `Membership`, `Invitation` `#[model]` structs |
+| `src/teams/role.rs` | `Role` enum (`Owner`/`Admin`/`Member`), `require_role`, `establish_org_session` |
+| `src/teams/repositories.rs` | `#[repository]` traits, `Membership`/`Invitation` `tenant_scoped` |
+| `src/teams/mailers/invitation_mailer.rs` | `InvitationMailer` (`#[mailer]`) |
+| `src/teams/routes/{organizations,invitations,members}.rs` | Route handlers, plus the `provision_default_organization` signup-integration helper |
+| `migrations/<timestamp>_create_teams/` | `organizations`/`memberships`/`invitations` tables |
+| `src/main.rs` (modified) | `mod teams;` + routes wired into `routes![...]` |
+| `Cargo.toml` (modified) | `"mail"` feature enabled on `autumn-web` |
+
+See `docs/generate-teams.md` for the two-line auth-integration seam this
+generator relies on instead of generating its own login/signup.
 
 ## Pre-1.0 notes
 

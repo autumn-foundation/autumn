@@ -40,6 +40,31 @@ jobs:
         target: [idempotency, routing, headers, session, body]
     steps:
       - uses: actions/checkout@v7
+      - name: Report and enlarge headroom for the ASAN build
+        # A COLD cargo-fuzz build of this workspace does not fit on a standard
+        # GitHub runner (4 vCPU / 16 GB). It dies partway into compiling
+        # `autumn-web` itself with exit 143 and "The runner has received a
+        # shutdown signal" — the runner agent is killed, so it takes the log
+        # with it and no OOM line survives to read.
+        #
+        # Warm caches were hiding this. Swatinem/rust-cache keys per matrix
+        # job, so each target has its own cache: whichever targets happened to
+        # restore one passed, and the cold ones died. That is why an arbitrary
+        # 2 of 5 failed per run (idempotency+headers on trunk-dev dd9e8ae3,
+        # body+routing on #2182) and why touching fuzz/Cargo.toml — a
+        # cache-key input — made all 5 fail at once.
+        #
+        # Disk is NOT the constraint: `df -h` on the failing runner reported
+        # 114 GB free (22% used). Memory is. Trade some of that idle disk for
+        # swap so a peak that would otherwise be an OOM kill just gets slower.
+        run: |
+          echo "── before ──"; free -h; df -h /
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "── after ──"; free -h
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
@@ -58,6 +83,12 @@ jobs:
         # Force the gnu host target: cargo-fuzz is installed as a musl-static binary
         # (via install-action's cargo-binstall fallback) and would otherwise default to
         # x86_64-unknown-linux-musl, where the ASAN build fails (sanitizer vs static libc).
+        # CARGO_BUILD_JOBS caps concurrent rustc processes. The default (one
+        # per core) stacks several sanitizer-instrumented codegen peaks at
+        # once, which is what tips a cold build over; 2 keeps the build
+        # parallel without racing itself to the ceiling.
+        env:
+          CARGO_BUILD_JOBS: 2
         run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=30 -timeout=10
       - name: Upload crash reproducers
         if: failure()

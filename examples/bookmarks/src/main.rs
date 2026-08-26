@@ -23,6 +23,10 @@ async fn main() {
         .routes(routes![
             home,
             routes::bookmarks::index,
+            routes::bookmarks::export_csv,
+            // Grouped-aggregate roll-up page (#1364): per-tag counts and a
+            // day-bucketed activity series, both via the aggregate API.
+            routes::bookmarks::stats,
             routes::bookmarks::search,
             routes::bookmarks::tags_autocomplete,
             routes::bookmarks::show,
@@ -45,6 +49,9 @@ async fn main() {
             wizards::add_bookmark::cancel,
         ])
         .tasks(tasks![tasks::check_links])
+        // Serves the derived spec at `/openapi.json` and a Swagger UI at
+        // `/swagger-ui`, covering the `#[repository]`-generated JSON handlers
+        // registered above. See `docs/guide/openapi.md`.
         .openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))
         .run()
         .await;

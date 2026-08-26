@@ -4,6 +4,12 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
+// Bump this when the cookie policy changes (e.g. a new analytics vendor is
+// added). A visitor's prior consent recorded under an older version is
+// treated as revoked — see `autumn_web::consent::Consent::needs_prompt` — so
+// the banner reappears and the gate closes until they decide again.
+const CONSENT_POLICY_VERSION: u32 = 1;
+
 // Embed the `static/` tree (and its fingerprint manifest) into the binary for
 // single-binary deploys. Active only when built with the `embed-assets` feature
 // (`autumn build --embed`); in dev the app serves from disk for hot-reload.
@@ -45,13 +51,23 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
                 }
                 footer role="contentinfo" {
                     p { "Built with Autumn" }
+                    // Withdrawing consent must be as easy as giving it (GDPR
+                    // Art. 7(3)): a plain GET link (no CSRF token needed, so
+                    // it needs no per-handler wiring) that re-opens the
+                    // banner by expiring the consent cookie.
+                    p { a href="/consent/manage" { "Manage cookie preferences" } }
                 }
             }
         }
     }
 }
 
+// `#[public]` marks each handler below deliberately unauthenticated — see
+// `autumn routes audit` / docs/guide/route-auth-coverage.md. Replace it with
+// `#[secured]`/`#[authorize]` on any route that should require a signed-in
+// user or a dynamic policy check.
 #[get("/")]
+#[public]
 async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
     layout("Welcome", path.as_str(), flash_messages(&flash.consume().await), maud::html! {
         h1 { "Welcome to {{project_name}}!" }
@@ -60,20 +76,111 @@ async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
 }
 
 #[get("/hello")]
+#[public]
 async fn hello() -> &'static str {
     "Hello, Autumn!"
 }
 
 #[get("/hello/{name}")]
+#[public]
 async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
     format!("Hello, {}!", *name)
+}
+
+// Cookie-consent banner (issue #1214): `inject_consent_banner` (wired below)
+// shows the banner on every HTML page until one of these routes is hit. Add
+// more categories to `accept_all_cookie`'s list as the app grows non-essential
+// cookies (e.g. `&["analytics", "marketing"]`), and gate each one at its call
+// site with `consent.allows("analytics", CONSENT_POLICY_VERSION)`. Both
+// routes redirect back to the page the visitor was on (via `Referer`, kept
+// same-origin by `redirect_target_from_referer`) rather than always bouncing
+// to the homepage.
+#[post("/consent/accept")]
+async fn consent_accept(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
+    let cookie = autumn_web::consent::accept_all_cookie(&["analytics"], CONSENT_POLICY_VERSION);
+    let target = autumn_web::consent::redirect_target_from_referer(
+        headers
+            .get(autumn_web::reexports::http::header::REFERER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    (
+        [(autumn_web::reexports::http::header::SET_COOKIE, cookie)],
+        Redirect::to(&target),
+    )
+}
+
+#[post("/consent/reject")]
+async fn consent_reject(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
+    let cookie = autumn_web::consent::reject_non_essential_cookie(CONSENT_POLICY_VERSION);
+    let target = autumn_web::consent::redirect_target_from_referer(
+        headers
+            .get(autumn_web::reexports::http::header::REFERER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    (
+        [(autumn_web::reexports::http::header::SET_COOKIE, cookie)],
+        Redirect::to(&target),
+    )
+}
+
+// A plain `GET` (reachable from a footer link on every page) that renders a
+// preferences page reusing the consent-banner widget, so withdrawing consent
+// stays as easy as giving it (GDPR Art. 7(3)) without making the withdrawal
+// itself a bare GET: `GET` is CSRF-exempt by definition, so a same-origin
+// prefetcher, browser extension, or cross-site top-level navigation
+// following this link must not be able to silently reset consent on its own.
+// The actual state change happens through the existing CSRF-protected
+// `POST /consent/accept` / `POST /consent/reject` above.
+#[get("/consent/manage")]
+async fn consent_manage(
+    flash: Flash,
+    path: CurrentPath,
+    csrf: Option<autumn_web::security::CsrfToken>,
+) -> impl IntoResponse {
+    let markup = layout(
+        "Manage cookie preferences",
+        path.as_str(),
+        flash_messages(&flash.consume().await),
+        autumn_web::consent::consent_banner_markup(
+            csrf.as_ref().map(autumn_web::security::CsrfToken::token),
+            autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
+        ),
+    );
+    // This page embeds the visitor's own live CSRF token, so — like
+    // `inject_consent_banner`'s own injected banner — it must never be
+    // shared across visitors by a cache: a shared/public cache serving this
+    // response to someone else would leak one visitor's token to another
+    // and make every other visitor's own consent forms fail CSRF
+    // validation.
+    (
+        [
+            (
+                autumn_web::reexports::http::header::CACHE_CONTROL,
+                "private, no-store",
+            ),
+            (autumn_web::reexports::http::header::VARY, "Cookie"),
+        ],
+        markup,
+    )
 }
 
 #[autumn_web::main]
 async fn main() {
     let app = autumn_web::app()
-        .routes(routes![index, hello, hello_name])
-        .migrations(MIGRATIONS);
+        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])
+        .migrations(MIGRATIONS)
+        // Strictly-necessary cookies (session, CSRF) are never gated — only
+        // this banner/non-essential-category flow depends on consent.
+        .layer(autumn_web::reexports::axum::middleware::from_fn(move |req, next| async move {
+            autumn_web::consent::inject_consent_banner(
+                req,
+                next,
+                CONSENT_POLICY_VERSION,
+                autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+                autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
+            )
+            .await
+        }));
 
     // Single-binary deploys: serve static assets (and i18n locales) from the
     // binary when built with `autumn build --embed`.

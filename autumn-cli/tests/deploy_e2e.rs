@@ -18,9 +18,9 @@
 //!
 //! ## What is real vs simulated/deferred (honest annotations)
 //!
-//! * REAL: first deploy, zero-downtime redeploy (AC-2), forced-failure
-//!   auto-rollback (AC-4), and on-demand rollback — each asserted against the
-//!   public port served through `kamal-proxy`.
+//! * REAL: first deploy (including its pre-start migration, AC-3), zero-downtime
+//!   redeploy (AC-2), forced-failure auto-rollback (AC-4), and on-demand rollback
+//!   — each asserted against the public port served through `kamal-proxy`.
 //! * SIMULATED: reboot survival (AC — "comes back after reboot") is asserted via
 //!   `systemctl is-enabled {service}-{slot}` returning `enabled` (boot
 //!   persistence), NOT a real kernel reboot of the container.
@@ -28,6 +28,15 @@
 //!   and the "<15 min / ≤3 commands" onboarding metric — neither is meaningful
 //!   against a pre-baked fixture image and both belong in a manual/where-a-real-VPS
 //!   -exists follow-up (see the report / tracking issue).
+//!
+//! ## The fleet lane (issue #1621, Slice 6a)
+//!
+//! [`fleet_rolling_deploy_lifecycle`] is the multi-server sibling: TWO fixture
+//! containers named by `[deploy] hosts`, driven through a serial rolling deploy,
+//! a forced pre-boundary halt, and a fleet auto-rollback compensation — again over
+//! real ssh, with nothing mocked. See the note on [`FleetNode`] for why it
+//! addresses its hosts by docker BRIDGE IP where the single-host tests use mapped
+//! loopback ports.
 //!
 //! Run it with:
 //! ```text
@@ -37,7 +46,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
@@ -47,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use testcontainers::core::{CgroupnsMode, ContainerPort, Mount, WaitFor};
 use testcontainers::runners::SyncRunner as _;
-use testcontainers::{GenericImage, ImageExt};
+use testcontainers::{Container, GenericImage, ImageExt};
 
 /// App name used throughout — the deploy derives every remote path and the
 /// systemd unit name from it, and uploads `target/release/{APP_NAME}`.
@@ -276,9 +285,26 @@ fn extract_kamal_proxy(dest: &Path) {
     );
 }
 
-/// Build the fixture image, writing the Dockerfile, the generated
-/// `authorized_keys`, and the extracted kamal-proxy into a fresh build context.
-/// Returns the image tag.
+/// Stable fixture-image tag for [`deploy_e2e_full_lifecycle`] (`pam_systemd` off).
+const FIXTURE_TAG_DEFAULT: &str = "autumn-deploy-e2e:test";
+/// Stable fixture-image tag for [`deploy_e2e_pam_systemd_control_socket`]
+/// (`pam_systemd` left enabled — the real-host `XDG_RUNTIME_DIR` shape).
+const FIXTURE_TAG_PAM: &str = "autumn-deploy-e2e:pam";
+/// Stable fixture-image tag for [`fleet_rolling_deploy_lifecycle`].
+///
+/// **A distinct tag is a correctness requirement, not a nicety.** Each test's
+/// [`Workspace`] mints its OWN throwaway keypair and bakes its public half into the
+/// image, and libtest runs these `#[ignore]`d tests in PARALLEL threads (the CI
+/// Docker step passes no `--test-threads=1` for this binary). Two tests sharing one
+/// stable tag would therefore race: the second `docker build` re-points the tag at an
+/// image carrying the *other* run's `authorized_keys`, and whichever test starts its
+/// container after that build cannot authenticate to it. Distinct tags also stop one
+/// test's end-of-run `docker rmi -f` from yanking the tag out from under a sibling
+/// that has not started its containers yet. The fixture shape is identical to
+/// `FIXTURE_TAG_DEFAULT`'s, so the expensive apt layer is a cache hit.
+const FIXTURE_TAG_FLEET: &str = "autumn-deploy-e2e:fleet";
+
+/// Build the fixture image under the stable tag matching `enable_pam`.
 ///
 /// `enable_pam` selects the `ENABLE_PAM_SYSTEMD` build arg (issue #1948 item 4):
 /// `false` (default fixture shape) disables `pam_systemd` so ssh sessions inherit
@@ -287,6 +313,24 @@ fn extract_kamal_proxy(dest: &Path) {
 /// control-socket regression shape. The two shapes get DISTINCT stable tags so
 /// they never clobber each other's cache.
 fn build_fixture_image(ctx: &Path, pubkey: &str, enable_pam: bool) -> String {
+    let tag = if enable_pam {
+        FIXTURE_TAG_PAM
+    } else {
+        FIXTURE_TAG_DEFAULT
+    };
+    build_fixture_image_as(ctx, pubkey, enable_pam, tag)
+}
+
+/// Build the fixture image under an EXPLICIT tag, writing the Dockerfile, the
+/// generated `authorized_keys`, and the extracted kamal-proxy into a fresh build
+/// context. Returns the image tag.
+///
+/// Tags are STABLE (rather than unique per run) so at most one fixture image per
+/// tag ever exists: each run overwrites it and reuses the cached apt layers, and the
+/// end-of-test `docker rmi` keeps disk bounded even if a previous run's cleanup
+/// raced with container teardown. Every concurrently-running test needs its OWN tag
+/// — see [`FIXTURE_TAG_FLEET`] for why.
+fn build_fixture_image_as(ctx: &Path, pubkey: &str, enable_pam: bool, tag: &str) -> String {
     std::fs::write(
         ctx.join("Dockerfile"),
         include_str!("fixtures/deploy/Dockerfile"),
@@ -295,27 +339,18 @@ fn build_fixture_image(ctx: &Path, pubkey: &str, enable_pam: bool) -> String {
     std::fs::write(ctx.join("authorized_keys"), pubkey).expect("write authorized_keys");
     extract_kamal_proxy(&ctx.join("kamal-proxy"));
 
-    // STABLE per-shape tags (rather than unique ones) so at most one fixture
-    // image per shape ever exists: each run overwrites it and reuses the cached
-    // apt layers, and the end-of-test `docker rmi` keeps disk bounded even if a
-    // previous run's cleanup raced with container teardown.
-    let tag = if enable_pam {
-        "autumn-deploy-e2e:pam".to_string()
-    } else {
-        "autumn-deploy-e2e:test".to_string()
-    };
     run_ok(
         Command::new("docker").args([
             "build",
             "--build-arg",
             &format!("ENABLE_PAM_SYSTEMD={}", u8::from(enable_pam)),
             "-t",
-            &tag,
+            tag,
             &ctx.display().to_string(),
         ]),
         "docker build fixture image",
     );
-    tag
+    tag.to_owned()
 }
 
 // ── Test-app compilation ─────────────────────────────────────────────────────
@@ -439,6 +474,31 @@ impl Workspace {
         .expect("write autumn.toml");
     }
 
+    /// Write `autumn.toml` into the project dir naming a FLEET (issue #1621):
+    /// `[deploy] hosts = [...]` in rollout order, sharing one `ssh_port`.
+    ///
+    /// `hosts` and `ssh_port` are separate parameters because `[deploy]` has exactly
+    /// ONE `ssh_port` for the whole fleet — `ResolvedFleet::from_targets` clones the
+    /// resolved config and varies only `host` — which is precisely why the fleet test
+    /// cannot address its containers by their (distinct, random) mapped loopback
+    /// ports. See the note on [`FleetNode`].
+    fn write_config_fleet(&self, hosts: &[&str], ssh_port: u16) {
+        let list = hosts
+            .iter()
+            .map(|host| format!("\"{host}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            self.project.join("autumn.toml"),
+            format!(
+                "[server]\nport = {PUBLIC_PORT}\n\n\
+                 [deploy]\nhosts = [{list}]\nuser = \"root\"\nssh_port = {ssh_port}\n\
+                 app_name = \"{APP_NAME}\"\nreadiness_timeout_secs = {READINESS_TIMEOUT_SECS}\n",
+            ),
+        )
+        .expect("write fleet autumn.toml");
+    }
+
     /// Stage `bin` as the release binary the next `autumn deploy up` uploads
     /// (`{project}/target/release/{APP_NAME}`).
     fn stage_release(&self, bin: &Path) {
@@ -475,7 +535,7 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+const fn set_mode(_path: &Path, _mode: u32) {}
 
 /// Poll `systemctl is-system-running` over ssh until the container's systemd has
 /// finished booting (returns `running`/`degraded`), tolerating the early-boot
@@ -561,6 +621,7 @@ fn deploy_e2e_full_lifecycle() {
         "first `deploy up` failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let first_deploy_log = String::from_utf8_lossy(&out.stderr).into_owned();
     let body = wait_for_http_ok(public_host_port, "/", Duration::from_secs(30));
     assert!(
         body.contains("e2eapp v1"),
@@ -584,6 +645,42 @@ fn deploy_e2e_full_lifecycle() {
         String::from_utf8_lossy(&en.stdout)
     );
     eprintln!("[e2e]    (simulated reboot survival: {APP_NAME}-blue.service is enabled)");
+
+    // AC-3 (#1607) on the FIRST deploy: pending migrations run before the new
+    // version takes traffic. The migrate one-shot writes a marker next to the
+    // release binary it was launched from (see `fixtures/deploy/app_template.rs`),
+    // so this proves the real `systemd-run --wait … AUTUMN_MIGRATE=1` one-shot ran
+    // against THIS release — not that the CLI merely planned it.
+    let migrated = ws.ssh(
+        ssh_port,
+        &format!(
+            "test -f /srv/autumn/{APP_NAME}/current/{APP_NAME}.migrated && echo present \
+             || echo missing"
+        ),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&migrated.stdout).trim(),
+        "present",
+        "the first deploy must run its pending migrations (#1607, AC-3)"
+    );
+    // …and it ran BEFORE the release was started, so the app never boots against a
+    // schema that was never applied. The deploy echoes each op as `  → {label}` as
+    // it runs; match THAT form, not a bare substring — the preflight report printed
+    // earlier in the same stream contains a `migrate_check` grader line, and
+    // searching for "migrate" would find it instead and make this assertion pass
+    // for any op ordering whatsoever.
+    let op_line = |label: &str| format!("\u{2192} {label}\n");
+    let migrate_at = first_deploy_log
+        .find(&op_line("migrate"))
+        .expect("the first deploy logs its migrate op");
+    let start_at = first_deploy_log
+        .find(&op_line("enable-now"))
+        .expect("the first deploy logs its app start");
+    assert!(
+        migrate_at < start_at,
+        "the first deploy must migrate before starting the release:\n{first_deploy_log}"
+    );
+    eprintln!("[e2e]    (#1607 AC-3: pending migrations ran before the first release started)");
 
     // AC (#1952): the project `autumn.toml` is uploaded into the per-release dir
     // (coupled to the binary) and the slot unit points AUTUMN_MANIFEST_DIR at that
@@ -783,6 +880,652 @@ fn deploy_e2e_pam_systemd_control_socket() {
     );
 
     drop(container);
+    let _ = Command::new("docker")
+        .args(["rmi", "-f", &image_tag])
+        .output();
+}
+
+// ── Fleet harness (issue #1621, Slice 6a) ────────────────────────────────────
+
+/// One booted fixture container in the fleet, with the three addresses this test
+/// needs — and the reason there are three rather than one.
+///
+/// ## Why the fleet is addressed by BRIDGE IP, not by mapped loopback port
+///
+/// `[deploy]` carries exactly ONE `ssh_port` for the whole fleet:
+/// `ResolvedFleet::from_targets` resolves the shared shape once and then varies
+/// **only** `host` per entry, and `SshTarget::from_resolved` reads `cfg.ssh_port`
+/// for every host. `[deploy] hosts` entries are bare addresses — there is no
+/// `host:port` spelling — so two containers published on two DIFFERENT random host
+/// ports simply cannot both be named in one fleet. (Extending the config to carry a
+/// per-host port is product work, deliberately out of scope for a test slice.)
+///
+/// The shape the config DOES support is N addresses at one shared port, and each
+/// container already has exactly that: its own docker-bridge IP, with sshd on the
+/// container's own port 22. So `[deploy] hosts = ["<ip-a>", "<ip-b>"]` with
+/// `ssh_port = 22`.
+///
+/// **Limitation, stated rather than hidden:** container bridge IPs are routable from
+/// the docker host only on Linux (and only when the runner IS the docker host rather
+/// than a sibling container). That is exactly the environment this test runs in —
+/// the Linux-only "Run Docker-dependent tests" CI step — and
+/// [`assert_bridge_reachable`] fails fast with an explicit message if it ever is not,
+/// instead of surfacing as an opaque ssh failure mid-rollout.
+///
+/// The HARNESS's own probes never depend on the bridge: [`Workspace::ssh`] and
+/// [`http_get`] keep using the MAPPED loopback ports, exactly like the single-host
+/// tests. Only the product's ssh/scp path uses the bridge, which is the thing under
+/// test.
+struct FleetNode {
+    /// Held for the lifetime of the test; dropping it removes the container.
+    _container: Container<GenericImage>,
+    /// Mapped host port for the container's sshd — the HARNESS's own probes only.
+    ssh_port: u16,
+    /// Mapped host port for the container's public (kamal-proxy) port — the
+    /// harness's HTTP assertions and zero-downtime probers.
+    public_port: u16,
+    /// The container's docker-bridge IP: what `[deploy] hosts` names, reached by
+    /// the product on the container's own port 22.
+    ip: String,
+}
+
+/// Read a container's docker-bridge IPv4 address.
+///
+/// Goes through the `docker` CLI (as [`extract_kamal_proxy`] already does) rather
+/// than `Container::get_bridge_ip_address`, whose implementation additionally
+/// inspects the NETWORK named by `HostConfig.NetworkMode` — a lookup that has its
+/// own failure modes. This template reads the address straight off the container.
+fn container_bridge_ip(id: &str) -> String {
+    let out = run_ok(
+        Command::new("docker").args([
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            id,
+        ]),
+        "docker inspect container bridge ip",
+    );
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        ip.parse::<std::net::Ipv4Addr>().is_ok(),
+        "expected an IPv4 bridge address for container {id}, got {ip:?} \
+         (the fleet e2e names hosts by bridge IP — see the note on FleetNode)"
+    );
+    ip
+}
+
+/// Start one fleet container from the (already built) fixture image.
+///
+/// Identical to the single-host launch except for `.with_network("bridge")`, which
+/// pins the container to docker's DEFAULT bridge — the only network whose addresses
+/// are routable from the docker host, and therefore the one the fleet's bridge-IP
+/// addressing depends on.
+fn start_fleet_node(image_tag: &str) -> FleetNode {
+    let (repo, tag) = image_tag.split_once(':').unwrap();
+    let container = GenericImage::new(repo.to_string(), tag.to_string())
+        .with_exposed_port(ContainerPort::Tcp(22))
+        .with_exposed_port(ContainerPort::Tcp(PUBLIC_PORT))
+        .with_wait_for(WaitFor::Nothing)
+        .with_privileged(true)
+        .with_cgroupns_mode(CgroupnsMode::Host)
+        .with_network("bridge")
+        .with_mount(Mount::bind_mount("/sys/fs/cgroup", "/sys/fs/cgroup"))
+        .with_mount(Mount::tmpfs_mount("/run"))
+        .with_mount(Mount::tmpfs_mount("/run/lock"))
+        .with_startup_timeout(Duration::from_secs(180))
+        .start()
+        .expect("start fleet fixture container");
+
+    let ssh_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(22))
+        .expect("mapped ssh port");
+    let public_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(PUBLIC_PORT))
+        .expect("mapped public port");
+    let ip = container_bridge_ip(container.id());
+    FleetNode {
+        _container: container,
+        ssh_port,
+        public_port,
+        ip,
+    }
+}
+
+/// Fail fast (with the reason) unless this host can reach `ip:22` directly.
+///
+/// The fleet addresses its hosts by bridge IP out of necessity (see [`FleetNode`]),
+/// and that is the one environmental assumption this test makes. Proving it up front
+/// turns an otherwise baffling `ssh: connect to host … Connection timed out` in the
+/// middle of a rollout into one sentence naming the assumption.
+fn assert_bridge_reachable(ip: &str) {
+    let addr: SocketAddr = format!("{ip}:22")
+        .parse()
+        .unwrap_or_else(|e| panic!("bad bridge address {ip}:22: {e}"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = String::from("(never attempted)");
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(_) => return,
+            Err(e) => last = e.to_string(),
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+    panic!(
+        "container bridge address {ip}:22 is not reachable from this host ({last}). The fleet \
+         e2e must address its hosts by docker bridge IP because `[deploy]` carries ONE \
+         fleet-wide `ssh_port` (see the FleetNode note); that needs a Linux docker host whose \
+         default bridge is routable, which is what the CI Docker-dependent step provides."
+    );
+}
+
+/// The release id a host is currently serving: the basename of its `current`
+/// symlink — the exact identity `deploy status` reports (`release_id_from_dir` over
+/// `readlink -f current`), so the two can be compared directly.
+fn current_release(ws: &Workspace, ssh_port: u16) -> String {
+    let out = ws.ssh(
+        ssh_port,
+        &format!("readlink -f /srv/autumn/{APP_NAME}/current 2>/dev/null || true"),
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A host's sorted release-dir listing — the "was this host touched at all?"
+/// fingerprint, used to prove a halted rollout never reached the hosts after the
+/// failing one.
+fn releases_listing(ws: &Workspace, ssh_port: u16) -> String {
+    let out = ws.ssh(
+        ssh_port,
+        &format!("ls -1 /srv/autumn/{APP_NAME}/releases 2>/dev/null | sort || true"),
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// How many times the deploy's pre-cutover migrate one-shot has actually RUN on a
+/// host.
+///
+/// The deploy runs migrations as `systemd-run --wait … --setenv=AUTUMN_MIGRATE=1
+/// {release}/{app}`, and the fixture app answers that trigger by printing
+/// `migrate: no-op (version …)` and exiting 0. The transient unit's stdout lands in
+/// the container's journal, so counting that line per host is direct evidence for
+/// AC-4 — the fleet migrates on exactly ONE host and never on hosts 2..N. Counting
+/// over the whole journal (rather than one transient unit, which `--collect` removes
+/// on exit) makes the count cumulative across scenarios, which is what the
+/// assertions want: host 2's count must stay 0 for the entire test.
+fn migrate_run_count(ws: &Workspace, ssh_port: u16) -> u32 {
+    let out = ws.ssh(
+        ssh_port,
+        "journalctl --no-pager --output=cat 2>/dev/null | grep -c 'migrate: no-op' || true",
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Assert some stderr line names `host` and contains `state` — used against both
+/// the rollout header's per-host lines and the shared fleet state table.
+///
+/// Matched line-wise rather than as one substring because `state_table_lines`
+/// pads the host column to the widest host name in the fleet, so the exact spacing
+/// between a host and its state depends on which two bridge IPs this run happened to
+/// get.
+fn assert_state_row(stderr: &str, host: &str, state: &str) {
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains(host) && line.contains(state)),
+        "expected a fleet row naming {host} with state {state:?}; full stderr:\n{stderr}"
+    );
+}
+
+// ── The fleet lifecycle ──────────────────────────────────────────────────────
+
+/// Two orchestrated containers exercise the whole FLEET lifecycle in order
+/// (issue #1621): fleet first deploy → zero-downtime rolling redeploy with
+/// exactly-once migrate → forced pre-boundary halt on host 1 (host 2 never touched)
+/// → forced failure on host 2 with host 1 auto-rolled back → `deploy status`.
+///
+/// ORDERING NOTE (the fleet analogue of the single-host test's): the two failure
+/// scenarios run in this order on purpose, and each depends on what the previous one
+/// left behind.
+///
+/// * Scenario 3 fails on the FIRST host. No earlier host has cut over, so
+///   `fleet_rollback_set` is empty and NO compensation runs — which is what makes it
+///   a clean, deterministic proof of "halt, and never touch the hosts after the
+///   failing one". Putting a first-host failure later, after other hosts were on the
+///   new release, would conflate halt with compensation.
+/// * Scenario 4 then fails on the SECOND host, which is the only way to observe
+///   compensation at all: serial rollout guarantees host 2 is touched **only after
+///   host 1's cutover completes**, so ANY pre-scripted breakage of host 2 yields a
+///   deterministic "host 1 is live on the new release when the rollout halts" — no
+///   timing, no racing `docker stop`. The injection used is a read-only bind mount
+///   over host 2's `releases` dir: every read-only probe in the all-hosts probe phase
+///   still succeeds (so the rollout is NOT refused before host 1 is touched), and the
+///   first MUTATING op of host 2's cutover — `prepare-dirs`' `mkdir -p {release_dir}`
+///   — fails with EROFS. That is pre-boundary, so host 2 tears its own candidate down
+///   and keeps serving, while host 1 is compensated back to its previous release.
+/// * Scenario 4 is also safe to run AFTER scenario 3 despite the single-host
+///   ordering hazard (a torn-down candidate leaves its slot's unit pointing at the
+///   failed release): scenario 4's own cutover rewrites host 1's candidate-slot unit
+///   before starting it, and the compensating rollback goes through `rollback_ops`,
+///   which re-renders the TARGET slot's unit from the target release dir
+///   (`write-target-unit`) rather than trusting whatever is on disk.
+#[test]
+#[ignore = "requires Docker + ssh client; run with --ignored"]
+// A single, deliberately linear orchestration (two booted containers, four ordered
+// scenarios, one status report) reads more honestly end-to-end than six fragmented
+// helpers that would each have to re-establish the same fleet state.
+#[allow(clippy::too_many_lines)]
+fn fleet_rolling_deploy_lifecycle() {
+    let ws = Workspace::build();
+
+    // Own stable tag: this test runs CONCURRENTLY with its two single-host siblings
+    // and bakes its own throwaway key into the image (see `FIXTURE_TAG_FLEET`).
+    let ctx = tempfile::tempdir().expect("ctx tempdir");
+    let image_tag = build_fixture_image_as(ctx.path(), &ws.pubkey, false, FIXTURE_TAG_FLEET);
+
+    // Both containers are started before either is waited on, so they boot in
+    // parallel rather than serially.
+    let host_a = start_fleet_node(&image_tag);
+    let host_b = start_fleet_node(&image_tag);
+    eprintln!(
+        "[fleet] host 1: ip={} ssh={} public={}",
+        host_a.ip, host_a.ssh_port, host_a.public_port
+    );
+    eprintln!(
+        "[fleet] host 2: ip={} ssh={} public={}",
+        host_b.ip, host_b.ssh_port, host_b.public_port
+    );
+    wait_for_boot(&ws, host_a.ssh_port);
+    wait_for_boot(&ws, host_b.ssh_port);
+    eprintln!("[fleet] both containers booted");
+
+    // The one environmental assumption, proved before anything else runs.
+    assert_bridge_reachable(&host_a.ip);
+    assert_bridge_reachable(&host_b.ip);
+
+    // The PRODUCT's ssh passes no `-o UserKnownHostsFile`, so it pins host keys in
+    // the ambient `~/.ssh/known_hosts` (resolved from the passwd database, not
+    // `$HOME` — see the `SshAgent` note). Bridge IPs are recycled across runs while
+    // each run's fixture image carries fresh host keys, so a PERSISTENT runner can
+    // hold a stale pin for this run's IP, and `StrictHostKeyChecking=accept-new`
+    // would then correctly refuse to connect. Drop any stale pin first; the
+    // harness's own ssh is immune (it passes a per-run known-hosts file).
+    for ip in [host_a.ip.as_str(), host_b.ip.as_str()] {
+        let _ = Command::new("ssh-keygen").args(["-R", ip]).output();
+    }
+
+    ws.write_config_fleet(&[host_a.ip.as_str(), host_b.ip.as_str()], 22);
+
+    // ── 1. Fleet FIRST deploy (v1) ──────────────────────────────────────────
+    ws.stage_release(&ws.app_v1);
+    let out = ws.autumn_deploy(&["up"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "fleet first deploy failed:\n{stderr}");
+    assert!(
+        stderr.contains("across 2 hosts, ONE AT A TIME"),
+        "the rollout header should announce a serial 2-host rollout:\n{stderr}"
+    );
+    assert_state_row(&stderr, &host_a.ip, "first deploy");
+    assert_state_row(&stderr, &host_b.ip, "first deploy");
+    assert!(
+        stderr.contains(&format!("[1/2 {}] deploying release", host_a.ip))
+            && stderr.contains(&format!("[2/2 {}] deploying release", host_b.ip)),
+        "hosts must roll out in `[deploy] hosts` declaration order:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Fleet deploy complete") && stderr.contains("all 2 hosts serving"),
+        "a clean fleet rollout should report every host serving:\n{stderr}"
+    );
+
+    let body_a = wait_for_http_ok(host_a.public_port, "/", Duration::from_secs(30));
+    let body_b = wait_for_http_ok(host_b.public_port, "/", Duration::from_secs(30));
+    assert!(
+        body_a.contains("e2eapp v1") && body_b.contains("e2eapp v1"),
+        "both hosts should serve v1 after the fleet first deploy, got {body_a:?} / {body_b:?}"
+    );
+
+    // ONE release id per fleet run: every host's `current` resolves to the same
+    // release, which is what makes drift reporting and a fleet rollback meaningful.
+    let rel_v1 = current_release(&ws, host_a.ssh_port);
+    assert!(!rel_v1.is_empty(), "host 1 should have a `current` release");
+    assert_eq!(
+        rel_v1,
+        current_release(&ws, host_b.ssh_port),
+        "a fleet run mints exactly ONE release id for every host (#1621)"
+    );
+    eprintln!("[fleet] 1. fleet first deploy OK — both hosts serve v1 as release {rel_v1}");
+
+    // ── 2. Rolling redeploy to v2, both hosts under load (AC-2 + AC-4) ──────
+    thread::sleep(Duration::from_millis(1200)); // distinct per-second release id
+    ws.stage_release(&ws.app_v2);
+    let prober_a = Prober::start(host_a.public_port);
+    let prober_b = Prober::start(host_b.public_port);
+    let out = ws.autumn_deploy(&["up"]);
+    let (total_a, failures_a) = prober_a.finish();
+    let (total_b, failures_b) = prober_b.finish();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "fleet rolling redeploy failed:\n{stderr}"
+    );
+    assert_eq!(
+        failures_a, 0,
+        "host 1 dropped {failures_a}/{total_a} requests during the rolling redeploy"
+    );
+    assert_eq!(
+        failures_b, 0,
+        "host 2 dropped {failures_b}/{total_b} requests during the rolling redeploy"
+    );
+    assert!(
+        total_a > 0 && total_b > 0,
+        "both probers must have made requests ({total_a} / {total_b})"
+    );
+    assert_state_row(&stderr, &host_a.ip, "zero-downtime redeploy");
+    assert_state_row(&stderr, &host_b.ip, "zero-downtime redeploy");
+
+    // AC-4, as the driver PLANS it: the fleet-wide schema moves exactly once, on the
+    // first host still on a previous release, and every other host is told to skip.
+    assert!(
+        stderr.contains(&format!("migrate ({} only", host_a.ip))
+            && stderr.contains("the schema is fleet-wide")
+            && stderr.contains(&format!("{} skip it", host_b.ip)),
+        "the rollout header should place the single migration on host 1 only:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the schema has moved; from here an automatic rollback restores BINARIES only"
+        ),
+        "the fleet should say out loud that a rollback will not undo the migration:\n{stderr}"
+    );
+
+    // AC-4, as it actually EXECUTED: the `AUTUMN_MIGRATE=1` one-shot ran on host 1
+    // and never on host 2.
+    let migrated_a = migrate_run_count(&ws, host_a.ssh_port);
+    let migrated_b = migrate_run_count(&ws, host_b.ssh_port);
+    eprintln!("[fleet]    migrate one-shot runs: host 1 = {migrated_a}, host 2 = {migrated_b}");
+    assert!(
+        migrated_a >= 1,
+        "the migrate one-shot must have run on host 1 (journal showed {migrated_a} runs)"
+    );
+    assert_eq!(
+        migrated_b, 0,
+        "hosts 2..N must NEVER run the fleet migration (journal showed {migrated_b} runs)"
+    );
+
+    let rel_v2 = current_release(&ws, host_a.ssh_port);
+    assert_eq!(
+        rel_v2,
+        current_release(&ws, host_b.ssh_port),
+        "both hosts must converge on the redeploy's single release id"
+    );
+    assert_ne!(rel_v2, rel_v1, "the redeploy must mint a NEW release id");
+    let body_a = wait_for_http_ok(host_a.public_port, "/", Duration::from_secs(30));
+    let body_b = wait_for_http_ok(host_b.public_port, "/", Duration::from_secs(30));
+    assert!(
+        body_a.contains("e2eapp v2") && body_b.contains("e2eapp v2"),
+        "both hosts should serve v2 after the rolling redeploy, got {body_a:?} / {body_b:?}"
+    );
+    eprintln!(
+        "[fleet] 2. rolling redeploy OK — 0/{total_a} and 0/{total_b} requests failed; \
+         both hosts serve v2 as release {rel_v2}"
+    );
+
+    // ── 3. Forced PRE-boundary failure on host 1: halt, host 2 never touched ─
+    thread::sleep(Duration::from_millis(1200));
+    let releases_b_before = releases_listing(&ws, host_b.ssh_port);
+    ws.stage_release(&ws.app_bad); // refuses /ready forever
+    let prober_a = Prober::start(host_a.public_port);
+    let prober_b = Prober::start(host_b.public_port);
+    let out = ws.autumn_deploy(&["up"]);
+    let (total_a, failures_a) = prober_a.finish();
+    let (total_b, failures_b) = prober_b.finish();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "a readiness-gate timeout on host 1 must exit non-zero:\n{stderr}"
+    );
+    assert_eq!(
+        failures_a, 0,
+        "host 1's old release must keep serving through the failed attempt \
+         ({failures_a}/{total_a} dropped)"
+    );
+    assert_eq!(
+        failures_b, 0,
+        "host 2 was never touched and must not drop a request \
+         ({failures_b}/{total_b} dropped)"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "rollout halted at {} (`readiness-gate`)",
+            host_a.ip
+        )) && stderr.contains("the remaining hosts were not touched"),
+        "the rollout must halt at host 1's readiness gate:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "fleet rollout halted at {} during `readiness-gate`",
+            host_a.ip
+        )),
+        "the process error must name the failing host and step:\n{stderr}"
+    );
+    assert_state_row(
+        &stderr,
+        &host_a.ip,
+        "previous release still serving (rolled back at `readiness-gate`)",
+    );
+    assert_state_row(&stderr, &host_b.ip, "untouched (not reached)");
+    // Host 1 is the FIRST host, so no earlier host is on the new release: the
+    // compensation set is empty and the driver must not print a compensation pass.
+    assert!(
+        !stderr.contains("Compensating"),
+        "a failure on the FIRST host has nothing to compensate:\n{stderr}"
+    );
+
+    // Host 2 is untouched at the filesystem level, not just in the report.
+    assert_eq!(
+        releases_listing(&ws, host_b.ssh_port),
+        releases_b_before,
+        "host 2 must have no release dir from the halted rollout"
+    );
+    assert_eq!(
+        current_release(&ws, host_b.ssh_port),
+        rel_v2,
+        "host 2's `current` must be unchanged by the halted rollout"
+    );
+    assert_eq!(
+        migrate_run_count(&ws, host_b.ssh_port),
+        0,
+        "host 2 must still never have migrated"
+    );
+    assert_eq!(
+        current_release(&ws, host_a.ssh_port),
+        rel_v2,
+        "host 1's candidate was torn down, so its `current` must still be the v2 release"
+    );
+    let body_a = wait_for_http_ok(host_a.public_port, "/", Duration::from_secs(15));
+    let body_b = wait_for_http_ok(host_b.public_port, "/", Duration::from_secs(15));
+    assert!(
+        body_a.contains("e2eapp v2") && body_b.contains("e2eapp v2"),
+        "both hosts must still serve v2 after the halted rollout, got {body_a:?} / {body_b:?}"
+    );
+    eprintln!(
+        "[fleet] 3. halt-on-host-1 OK — exit non-zero, host 2 untouched, both still serve v2"
+    );
+
+    // ── 4. Failure on host 2 AFTER host 1 cut over: host 1 auto-rolled back ──
+    thread::sleep(Duration::from_millis(1200));
+    // Pre-scripted, timing-free injection (see the ORDERING NOTE): make host 2's
+    // release dir read-only. Every read-only probe still succeeds, so the all-hosts
+    // probe phase passes and host 1 is genuinely deployed and cut over; host 2's
+    // first MUTATING op (`prepare-dirs`) then fails with EROFS — pre-boundary, so
+    // host 2 keeps serving and host 1 is the host that needs compensating.
+    let releases_dir = format!("/srv/autumn/{APP_NAME}/releases");
+    let mounted = ws.ssh(
+        host_b.ssh_port,
+        &format!(
+            "mount --bind {releases_dir} {releases_dir} && \
+             mount -o remount,bind,ro {releases_dir} {releases_dir}"
+        ),
+    );
+    assert!(
+        mounted.status.success(),
+        "could not remount host 2's releases dir read-only: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let writable = ws.ssh(
+        host_b.ssh_port,
+        &format!(
+            "touch {releases_dir}/.e2e-write-probe >/dev/null 2>&1 && echo writable \
+             || echo readonly"
+        ),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&writable.stdout).trim(),
+        "readonly",
+        "the scenario-4 injection is inoperative: host 2's releases dir is still writable, \
+         so host 2 would deploy successfully and nothing would be compensated"
+    );
+
+    let releases_b_before = releases_listing(&ws, host_b.ssh_port);
+    // A HEALTHY release, so host 1 genuinely cuts over before host 2 fails.
+    ws.stage_release(&ws.app_v2);
+    let out = ws.autumn_deploy(&["up"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "a failed host 2 must exit non-zero even though host 1 succeeded:\n{stderr}"
+    );
+    // Serial ordering: host 1 finished its cutover BEFORE host 2 was started.
+    assert!(
+        stderr.contains(&format!("[1/2 {}] serving", host_a.ip)),
+        "host 1 must have cut over before host 2 was touched:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("rollout halted at {} (", host_b.ip))
+            && stderr.contains(&format!("fleet rollout halted at {} during ", host_b.ip)),
+        "the halt (and the process error) must name host 2:\n{stderr}"
+    );
+    // The compensation AC-3 turns on: the host that already cut over is undone, in
+    // reverse rollout order, binaries only.
+    assert!(
+        stderr.contains("Compensating 1 host(s) in reverse rollout order"),
+        "host 1 was on the new release, so the fleet must compensate it:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "[{}] rolling back to the previous release",
+            host_a.ip
+        )),
+        "the compensation must name host 1:\n{stderr}"
+    );
+    assert_state_row(
+        &stderr,
+        &host_a.ip,
+        "previous release restored (rolled back by the fleet)",
+    );
+    assert_state_row(
+        &stderr,
+        &host_b.ip,
+        "previous release still serving (rolled back at `",
+    );
+    assert!(
+        stderr.contains("the compensating rollback restored BINARIES only"),
+        "the fleet must say the migration was NOT rolled back with the binaries:\n{stderr}"
+    );
+
+    assert_eq!(
+        current_release(&ws, host_a.ssh_port),
+        rel_v2,
+        "host 1 must be back on its pre-scenario release after the compensating rollback"
+    );
+    assert_eq!(
+        current_release(&ws, host_b.ssh_port),
+        rel_v2,
+        "host 2's `current` must be untouched by the failed cutover"
+    );
+    assert_eq!(
+        releases_listing(&ws, host_b.ssh_port),
+        releases_b_before,
+        "host 2's pre-boundary failure must leave no release dir behind"
+    );
+    let body_a = wait_for_http_ok(host_a.public_port, "/", Duration::from_secs(30));
+    let body_b = wait_for_http_ok(host_b.public_port, "/", Duration::from_secs(30));
+    assert!(
+        body_a.contains("e2eapp v2") && body_b.contains("e2eapp v2"),
+        "the fleet must converge back on v2, got {body_a:?} / {body_b:?}"
+    );
+    eprintln!("[fleet] 4. compensation OK — host 1 auto-rolled back, fleet converged on {rel_v2}");
+
+    // ── 5. `deploy status`: one converged fleet, no drift (AC-6) ────────────
+    let out = ws.autumn_deploy(&["status", "--json"]);
+    assert!(
+        out.status.success(),
+        "`deploy status --json` failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`deploy status --json` did not emit JSON on stdout ({e}):\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    let hosts = report["hosts"].as_array().expect("a `hosts` array");
+    assert_eq!(
+        hosts.len(),
+        2,
+        "status must report every fleet host: {report}"
+    );
+    assert_eq!(
+        hosts[0]["host"],
+        serde_json::json!(host_a.ip),
+        "status rows keep `[deploy] hosts` declaration order: {report}"
+    );
+    assert_eq!(hosts[1]["host"], serde_json::json!(host_b.ip));
+    for host in hosts {
+        assert_eq!(host["reachable"], serde_json::json!(true), "{report}");
+        assert_eq!(host["mode"], serde_json::json!("deployed"), "{report}");
+        assert_eq!(
+            host["release"],
+            serde_json::json!(rel_v2),
+            "both hosts must report the SAME release: {report}"
+        );
+        assert_eq!(host["ready"], serde_json::json!(200), "{report}");
+        assert_eq!(host["maintenance"], serde_json::json!(false), "{report}");
+        assert_eq!(
+            host["proxy_port"],
+            serde_json::json!(PUBLIC_PORT),
+            "{report}"
+        );
+        assert!(!host["live_slot"].is_null(), "{report}");
+        assert_eq!(host["drift"], serde_json::json!([]), "{report}");
+    }
+    assert_eq!(
+        report["version_drift"],
+        serde_json::json!(false),
+        "{report}"
+    );
+    assert_eq!(report["state_drift"], serde_json::json!([]), "{report}");
+    assert_eq!(report["drifted"], serde_json::json!(false), "{report}");
+
+    // `--strict`'s exit condition IS `drifted`, so a converged fleet exits 0.
+    let out = ws.autumn_deploy(&["status", "--strict"]);
+    assert!(
+        out.status.success(),
+        "`deploy status --strict` must exit 0 on an undrifted fleet:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("[fleet] 5. deploy status OK — 2 hosts, one release, no drift");
+    eprintln!("[fleet] all #1621 fleet rollout assertions passed");
+
+    // Best-effort image cleanup (the containers are removed on drop).
+    drop(host_a);
+    drop(host_b);
     let _ = Command::new("docker")
         .args(["rmi", "-f", &image_tag])
         .output();

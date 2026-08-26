@@ -273,10 +273,11 @@ use crate::state::AppState;
 // qualified path — so without `test-support` this import would be unused.
 #[cfg(all(feature = "db", feature = "test-support"))]
 use diesel_async::AsyncPgConnection;
-// Used by the Postgres transactional establish path and by the `test-support`
-// `TestDb`; neither is compiled in a `--features sqlite` build without
-// `test-support`, so this import would otherwise be unused there.
-#[cfg(all(feature = "db", any(not(feature = "sqlite"), feature = "test-support")))]
+// Used by the Postgres transactional establish path (the `.get_result()` on
+// `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
+// every other `RunQueryDsl` method call in this module brings the trait in via a
+// local `use`, so this import is unused under any `sqlite` build.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -772,6 +773,8 @@ pub struct TestApp {
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    /// Injected entropy source; `None` means use [`crate::entropy::OsEntropy`].
+    entropy: Option<std::sync::Arc<dyn crate::entropy::Entropy>>,
     /// Retained as `Arc<dyn Any>` so `TestClient::advance_clock` can downcast
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -849,6 +852,7 @@ impl TestApp {
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
+            entropy: None,
             clock_as_any: None,
             api_versions: Vec::new(),
             metrics_sources: Vec::new(),
@@ -913,7 +917,7 @@ impl TestApp {
     /// Enable `OpenAPI` spec generation for the test app.
     ///
     /// Mirrors [`crate::app::AppBuilder::openapi`] so integration tests
-    /// can exercise the `/v3/api-docs` and `/swagger-ui` endpoints.
+    /// can exercise the `/openapi.json` and `/swagger-ui` endpoints.
     ///
     /// Gated behind the `openapi` Cargo feature.
     #[cfg(feature = "openapi")]
@@ -1043,7 +1047,7 @@ impl TestApp {
             .push(crate::app::CustomLayerRegistration {
                 type_id: std::any::TypeId::of::<L>(),
                 type_name: std::any::type_name::<L>(),
-                apply: Box::new(move |router| layer.apply_to(router)),
+                layer: layer.erase(),
             });
         self
     }
@@ -1059,7 +1063,7 @@ impl TestApp {
             .push(crate::app::CustomLayerRegistration {
                 type_id: std::any::TypeId::of::<L>(),
                 type_name: std::any::type_name::<L>(),
-                apply: Box::new(move |router| layer.apply_to(router)),
+                layer: layer.erase(),
             });
         self
     }
@@ -1176,6 +1180,19 @@ impl TestApp {
     {
         use std::sync::Arc;
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(service);
+        }));
+        self
+    }
+
+    /// Mirrors [`crate::app::AppBuilder::with_notification_store`].
+    #[must_use]
+    pub fn with_notification_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::notifications::NotificationStore,
+    {
+        let service = crate::notifications::Notifications::new(store);
         self.state_initializers.push(Box::new(move |state| {
             state.insert_extension(service);
         }));
@@ -1465,6 +1482,32 @@ impl TestApp {
         self
     }
 
+    /// Inject a custom entropy source into the test app.
+    ///
+    /// All handlers that take a [`crate::entropy::Rng`] extractor — and every
+    /// framework-minted identifier (request ids, session ids, idempotency lock
+    /// owners, job ids) — draw from `entropy`. Pass a
+    /// [`crate::entropy::SeededEntropy`] to make the whole app's identifier
+    /// stream byte-for-byte reproducible under a fixed seed. Mirrors
+    /// [`Self::with_clock`].
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::entropy::SeededEntropy;
+    /// use autumn_web::test::TestApp;
+    ///
+    /// let _client = TestApp::new()
+    ///     .with_entropy(SeededEntropy::new(0x5eed))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_entropy<E>(mut self, entropy: E) -> Self
+    where
+        E: crate::entropy::Entropy + 'static,
+    {
+        self.entropy = Some(std::sync::Arc::new(entropy));
+        self
+    }
+
     /// Register a single API version for testing.
     #[must_use]
     pub fn api_version(mut self, version: crate::app::ApiVersion) -> Self {
@@ -1597,8 +1640,16 @@ impl TestApp {
     #[must_use]
     #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
     pub fn build(mut self) -> TestClient {
-        // Reset the global cache to prevent cross-test contamination.
-        crate::cache::clear_global_cache();
+        // Reset the global cache to prevent cross-test contamination. Briefly
+        // held so this can't land mid-flight inside another same-process
+        // test's own global-cache critical section (issue #2218) — see
+        // `GLOBAL_CACHE_TEST_LOCK`'s doc comment.
+        {
+            let _guard = crate::cache::GLOBAL_CACHE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::cache::clear_global_cache();
+        }
         // Reset the global event bus so a prior test's listeners/recorder do not
         // leak into this one (it is re-installed below).
         crate::events::clear_global_event_bus();
@@ -1730,6 +1781,15 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
+        // Resolve the injected clock BEFORE the state literal so `started_at`
+        // is stamped on the same timeline the app will read time from. A sim
+        // installs a virtual clock here, and uptime has to start at that
+        // clock's origin rather than at real process time.
+        let clock: std::sync::Arc<dyn crate::time::ClockSource> = self
+            .clock
+            .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock));
+        let started_at = clock.monotonic();
+
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -1765,15 +1825,26 @@ impl TestApp {
             #[cfg(all(feature = "db", feature = "sqlite"))]
             shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
                 .expect("test shard pools should build from config"),
-            profile: self.config.profile.clone(),
+            // The test harness attaches pools directly (`with_pool`), without
+            // a topology to carry a capture gap; a DB test that needs the gap
+            // noted asserts through the production seam instead.
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
+            profile: self.config.profile.as_deref().map(std::sync::Arc::from),
             role: self.config.role,
-            started_at: std::time::Instant::now(),
+            started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
+            // Built from the resolved clock, not `JobRegistry::new()`: the queue
+            // gauges compare ready-at marks the job runtime stamps from this
+            // same clock. This literal bypasses `AppState::with_clock`, so
+            // leaving it on the default real clock is what made a sim's delayed
+            // job read as ready the instant it was enqueued.
+            job_registry: crate::actuator::JobRegistry::new()
+                .with_clock(std::sync::Arc::clone(&clock)),
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
@@ -1788,13 +1859,25 @@ impl TestApp {
             forbidden_response: self
                 .forbidden_response_override
                 .unwrap_or(self.config.security.forbidden_response),
-            auth_session_key: self.config.auth.session_key.clone(),
+            auth_session_key: std::sync::Arc::from(self.config.auth.session_key.as_str()),
             shared_cache: None,
-            clock: self
-                .clock
-                .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            clock,
+            entropy: self
+                .entropy
+                .unwrap_or_else(|| std::sync::Arc::new(crate::entropy::OsEntropy)),
             app_id: crate::state::AppState::next_app_id(),
         };
+
+        // Mirror `App::run`'s failure-capsule clock wiring (#1598): the layer
+        // itself is installed by the shared router builder, but the recording
+        // clock replaces the state's clock, which the router never owns.
+        #[cfg(feature = "reporting")]
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
+                    as std::sync::Arc<dyn crate::time::ClockSource>;
+            state = state.with_clock(recording);
+        }
 
         for register in self.policy_registrations {
             register(state.policy_registry());
@@ -2089,29 +2172,34 @@ impl TestApp {
             },
         )
         .expect("failed to build test router");
-        // Mirror production's outermost access-log fallback (#999): in
-        // production it is applied in `apply_startup_barrier`, outside the
-        // session and exception-filter layers, and emits only for responses
-        // the primary in-stack layer never saw (e.g. session-store outage
-        // 503s), so tests observe the same access-log behavior an operator
-        // would.
-        let router = if self.config.log.access_log {
-            router.layer(crate::middleware::AccessLogLayer::fallback(
-                self.config.log.access_log_exclude.clone(),
+        // Mirror production's two outermost fallbacks, which `apply_startup_barrier`
+        // applies outside the session and exception-filter layers:
+        //
+        //  * access-log fallback (#999) — emits only for responses the primary
+        //    in-stack layer never saw (e.g. session-store outage 503s), so tests
+        //    observe the same access-log behavior an operator would;
+        //  * Server-Timing fallback (#1348) — appends a `total` only for responses
+        //    the primary never saw (short-circuits and the late-merged `/mcp`
+        //    envelope). Without it a `tools/call` would carry no outer `total` in
+        //    tests, unlike production.
+        //
+        // Composed into ONE `Router::layer` call, exactly as production does, so a
+        // test router has the same nesting depth as the real one (issue #2193).
+        // Tuple order is OUTERMOST FIRST: Server-Timing wraps the access log,
+        // matching production order.
+        let server_timing_fallback = crate::config::server_timing_enabled(&self.config)
+            .then(|| crate::middleware::ServerTimingLayer::fallback(true));
+        let access_log_fallback = self.config.log.access_log.then(|| {
+            crate::middleware::AccessLogLayer::fallback(self.config.log.access_log_exclude.clone())
+        });
+        // Guarded, because `Router::layer` re-boxes every route even when the
+        // tuple contributes no service: with both fallbacks off this would
+        // otherwise add a nesting level production does not have.
+        let router = if server_timing_fallback.is_some() || access_log_fallback.is_some() {
+            router.layer((
+                tower::util::option_layer(server_timing_fallback),
+                tower::util::option_layer(access_log_fallback),
             ))
-        } else {
-            router
-        };
-        // Mirror production's outermost Server-Timing fallback (#1348): in
-        // production it is applied in `apply_startup_barrier`, outside the
-        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
-        // `total` only for responses the primary never saw — short-circuits and
-        // the late-merged `/mcp` envelope. Without mirroring it here a
-        // `tools/call` would carry no outer `total` in tests, unlike production,
-        // so tests would not observe the real `/mcp` timing an operator sees.
-        // Applied outer to the access-log fallback, matching production order.
-        let router = if crate::config::server_timing_enabled(&self.config) {
-            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
         } else {
             router
         };
@@ -2691,8 +2779,13 @@ impl TestClient {
     /// (`dev.inspector_n_plus_one_threshold`), threaded into every
     /// [`RequestBuilder`] so the resulting [`TestResponse`] can default
     /// [`TestResponse::assert_no_n_plus_one`] to it.
+    ///
+    /// Reads through [`AppState::config_arc`]: this runs on every
+    /// `TestClient` request, so a [`AppState::config`] deep clone here would
+    /// tax the whole suite — and the committed `request_pipeline` benchmark
+    /// (issue #2198).
     fn n_plus_one_threshold(&self) -> usize {
-        self.state.config().dev.inspector_n_plus_one_threshold
+        self.state.config_arc().dev.inspector_n_plus_one_threshold
     }
 
     /// Start building a GET request.
@@ -3416,6 +3509,34 @@ impl TestResponse {
         self
     }
 
+    /// Assert a rendered PDF response's extracted text contains the given
+    /// substring — e.g. `resp.assert_pdf_contains("Total: $42.00")`.
+    ///
+    /// Extracts text via [`crate::pdf::extract_text`], which reads back
+    /// exactly what [`Pdf`](crate::pdf::Pdf) (or any well-formed PDF) wrote,
+    /// so this works against the in-process test client with no headless
+    /// browser involved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the body isn't a parseable PDF, or doesn't contain
+    /// `substring`.
+    #[cfg(feature = "pdf")]
+    #[track_caller]
+    pub fn assert_pdf_contains(&self, substring: &str) -> &Self {
+        let text = crate::pdf::extract_text(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "response body is not a parseable PDF: {e}\n{} bytes",
+                self.body.len()
+            )
+        });
+        assert!(
+            text.contains(substring),
+            "expected PDF text to contain `{substring}`.\nExtracted text: {text}"
+        );
+        self
+    }
+
     /// Assert the response body exactly equals the given string.
     #[track_caller]
     pub fn assert_body_eq(&self, expected: &str) -> &Self {
@@ -3997,6 +4118,105 @@ impl TestDb {
     }
 }
 
+/// Deterministically claims and runs up to `max_rows` ready durable repository
+/// commit hooks, returning the number of ready hooks selected for this drain
+/// pass.
+///
+/// Intended for integration tests that need to drive the real worker→drain
+/// wiring (claim → run the registered runner → ack/nack) **without** the
+/// timing-based background commit-hook worker that a served app starts. It
+/// generates its own worker id and delegates to the same backend-appropriate
+/// drain the production worker uses, so a test can enqueue a durable hook,
+/// assert its side effect has not happened, drain once, and assert the side
+/// effect deterministically — no `sleep`, no polling.
+///
+/// Pass a `max_rows` >= the number of enqueued hooks to fully drain in one
+/// call. Hooks whose `run_at` is still in the future, or whose handler runner
+/// is not registered in this process, are left untouched.
+///
+/// The returned count is the size of the ready set measured *before* the pass
+/// (`status = 'enqueued'` and due), capped at `max_rows`
+/// (`min(ready_hooks, max_rows)`). Because it is measured up front — the
+/// underlying private drains return `()` and expose no per-hook success tally —
+/// it reflects the rows *selected* for draining, not a success count. In the
+/// intended single-threaded / private-pool test (no competing worker) every
+/// selected hook runs, so this equals the number processed; a hook that fails
+/// and is re-queued with a future backoff during the pass is still counted here.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestDb;
+///
+/// let db = TestDb::shared().await;
+/// // ... enqueue a durable repository commit hook and register its runner ...
+///
+/// let processed = autumn_web::test::drain_ready_repository_commit_hooks(&db.pool(), 16).await;
+/// assert_eq!(processed, 1);
+/// // ... assert the hook's side effect now exists ...
+/// ```
+///
+/// # Panics
+///
+/// Panics if a pooled database connection cannot be acquired or the ready-hook
+/// count query fails — this helper is for tests, where surfacing such a
+/// database failure loudly is the desired behavior.
+#[cfg(feature = "db")]
+pub async fn drain_ready_repository_commit_hooks(
+    pool: &Pool<crate::db::RuntimeConnection>,
+    max_rows: usize,
+) -> usize {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct ReadyCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        ready: i64,
+    }
+
+    // The private drains return `()`, so measure the ready set up-front and
+    // report how many this pass will claim-and-run. In a single-threaded test
+    // (no competing worker) this equals the number processed, capped at
+    // `max_rows`. Predicate mirrors the claim query's readiness gate
+    // (`status = 'enqueued' AND run_at <= now`); `CURRENT_TIMESTAMP` is standard
+    // SQL on both the Postgres and SQLite backends.
+    let ready_before: usize = {
+        let mut conn = pool
+            .get()
+            .await
+            .expect("drain_ready_repository_commit_hooks: acquire pooled connection");
+        let row = diesel::sql_query(
+            "SELECT COUNT(*) AS ready \
+             FROM autumn_repository_commit_hooks \
+             WHERE status = 'enqueued' AND run_at <= CURRENT_TIMESTAMP",
+        )
+        .get_result::<ReadyCount>(&mut *conn)
+        .await
+        .expect(
+            "drain_ready_repository_commit_hooks: count ready hooks \
+             (querying autumn_repository_commit_hooks). An app mounted on a sim \
+             substrate must have the framework repository-commit-hook migrations \
+             applied — SqliteSubstrate applies them automatically, so a bare \
+             SqliteSubstrate satisfies this; a custom DB substrate must apply them \
+             too, or run_to_idle cannot drain durable commit hooks",
+        );
+        usize::try_from(row.ready).unwrap_or(0)
+    };
+
+    let worker_id = crate::repository_commit_hooks::repository_commit_hook_worker_id();
+
+    #[cfg(not(feature = "sqlite"))]
+    crate::repository_commit_hooks::drain_ready_repository_commit_hooks(pool, &worker_id, max_rows)
+        .await;
+    #[cfg(feature = "sqlite")]
+    crate::repository_commit_hooks::sqlite_drain_ready_repository_commit_hooks(
+        pool, &worker_id, max_rows,
+    )
+    .await;
+
+    ready_before.min(max_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4060,6 +4280,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4078,6 +4299,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4096,6 +4318,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -4268,6 +4491,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }];

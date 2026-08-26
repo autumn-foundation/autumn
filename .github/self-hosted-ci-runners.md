@@ -1,5 +1,11 @@
 # Self-hosted CI runners on Hetzner Cloud
 
+> **Status (2026-07-19): the Hetzner runner fleet has been decommissioned.** The
+> org GitHub plan now provides 500 concurrent hosted jobs, so the self-hosted
+> lane is no longer needed for capacity. The provisioning workflow and this
+> runbook remain in place as a dormant, opt-in capability that can be re-enabled
+> if hosted-runner capacity is ever exhausted again.
+
 Operator runbook for autumn's self-hosted GitHub Actions capacity.
 
 ## 1. Overview
@@ -66,7 +72,7 @@ close that hole. Do not weaken one without understanding the others.
   on the box.
 - **(d) Repo-scoped registration PAT, root-only.** `RUNNER_REG_PAT` is a
   fine-grained PAT scoped to **this repo only** with **Administration: Read and
-  write** — it can mint runner registration tokens for `madmax983/autumn` and
+  write** — it can mint runner registration tokens for `autumn-foundation/autumn` and
   nothing else, so its blast radius is this repo's runner registration. It is
   delivered to the VM **over SSH after boot** and stored `root:root 0600` at
   `/etc/autumn-runner/pat` — it is never placed in cloud user-data or the
@@ -120,15 +126,15 @@ and the slot would die after a single job.
 | Name | Kind | Status | Purpose |
 |------|------|--------|---------|
 | `HCLOUD_TOKEN` | Actions secret | already present (used by `deploy-real-vps.yml`) | Hetzner Cloud API token (Read & Write) — creates/deletes the VM and SSH keys. |
-| `RUNNER_REG_PAT` | Actions secret | **you must create it** | Fine-grained PAT scoped to `madmax983/autumn` with **Administration: Read and write**. Used **only** to mint short-lived runner *registration* tokens on the box — it never appears in user-data. |
+| `RUNNER_REG_PAT` | Actions secret | **you must create it** | Fine-grained PAT scoped to `autumn-foundation/autumn` with **Administration: Read and write**. Used **only** to mint short-lived runner *registration* tokens on the box — it never appears in user-data. |
 | `AUTUMN_SELF_HOSTED_HEAVY` | Actions **variable** | **you must set it to `1`** | The opt-in switch. Heavy trusted lanes route to self-hosted only while this equals `"1"`; unset/anything else ⇒ `ubuntu-latest`. |
 
 ### Create `RUNNER_REG_PAT`
 
 1. **Profile → Settings → Developer settings → Personal access tokens →
    Fine-grained tokens → Generate new token.**
-2. **Resource owner:** the account/org that owns `madmax983/autumn`.
-3. **Repository access → Only select repositories → `madmax983/autumn`.**
+2. **Resource owner:** the account/org that owns `autumn-foundation/autumn`.
+3. **Repository access → Only select repositories → `autumn-foundation/autumn`.**
 4. **Repository permissions → Administration → Read and write.** (Leave
    everything else at *No access*. Administration write is what allows minting
    runner registration tokens; nothing more is needed.)
@@ -144,8 +150,8 @@ mis-scoped or expired PAT makes registration 403/404 and the slots crash-loop �
 without any error in the provision run. The PAT **must** be:
 
 - a **fine-grained** PAT whose **resource owner** is the account/org that owns
-  `madmax983/autumn`;
-- granted **repository access** to `madmax983/autumn`;
+  `autumn-foundation/autumn`;
+- granted **repository access** to `autumn-foundation/autumn`;
 - granted **Repository permissions → Administration: Read and write**;
 - **not expired**.
 
@@ -157,7 +163,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
   -H "Authorization: Bearer <PAT>" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
-  https://api.github.com/repos/madmax983/autumn/actions/runners/registration-token
+  https://api.github.com/repos/autumn-foundation/autumn/actions/runners/registration-token
 ```
 
 The provisioner now runs this exact preflight before creating the VM (failing

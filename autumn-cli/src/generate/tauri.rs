@@ -1992,7 +1992,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2008,7 +2008,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2027,7 +2027,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"./src/main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2044,7 +2044,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/./main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2063,7 +2063,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2088,7 +2088,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{worker_name}\"\npath=\"src/worker.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2119,7 +2119,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  default-run=\"{default_run}\"\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2147,7 +2147,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  default-run=\"{default_run}\"\n\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2169,7 +2169,7 @@ mod tests {
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  autobins=false\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/{bin_name}.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2196,7 +2196,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2214,7 +2214,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion.workspace = true\nedition=\"2024\"\n\
                  \n[workspace]\n\n[workspace.package]\nversion=\"{ws_version}\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2232,7 +2232,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[features]\nembed-assets = [\"autumn-web/embed-assets\"]\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2250,7 +2250,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2272,7 +2272,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2293,7 +2293,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -3019,7 +3019,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
@@ -3046,7 +3046,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-lib\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
-             \n[lib]\nname=\"my_lib\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[lib]\nname=\"my_lib\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4846,7 +4846,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let doc: toml::Value = toml::from_str(
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\ndefault-run=\"webserver\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let result = resolve_bin_name(tmp.path(), "my-app", Some("webserver"), true, &doc);
@@ -4935,7 +4935,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"no-version-app\"\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4977,7 +4977,7 @@ mod tests {
         fs::write(
             app.join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -4999,7 +4999,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let version = resolve_workspace_version(tmp.path());
@@ -5488,7 +5488,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.3.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();

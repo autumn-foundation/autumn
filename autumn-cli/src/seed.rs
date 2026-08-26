@@ -2,7 +2,9 @@
 //!
 //! Delegates to `cargo run --bin seed` after:
 //!   1. Verifying `src/bin/seed.rs` exists.
-//!   2. Checking for pending migrations via the diesel CLI.
+//!   2. Blocking a `--count`/`--model` fake-seed request against a
+//!      `prod`/`production` profile unless `--yes-i-mean-prod` is given.
+//!   3. Checking for pending migrations via the diesel CLI.
 //!
 //! The seed binary receives the active profile through the `AUTUMN_ENV`
 //! environment variable, matching how the rest of the framework resolves
@@ -10,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::migrate::is_production_profile_name;
 
 /// Errors surfaced by the seed runner.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -29,6 +33,12 @@ pub enum SeedError {
          to run the project seed binary"
     )]
     IncompleteFakeFlags,
+
+    #[error(
+        "production profile detected; generating faked rows in production requires \
+         explicit confirmation\n  Re-run with --yes-i-mean-prod to proceed."
+    )]
+    ProductionFakeSeedBlocked,
 }
 
 /// Resolve the `--count`/`--model` pair into the fake-seed request, if any.
@@ -53,11 +63,31 @@ fn seed_binary_exists_at(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Guard against accidentally mass-inserting faked rows into a production
+/// database. Only fires for an actual fake-seed request (`--count`/`--model`
+/// both given) targeting a `prod`/`production` profile without
+/// `--yes-i-mean-prod` — a plain `autumn seed` (running the project's own
+/// seed binary) is unaffected, matching `autumn migrate`'s existing
+/// production guard scope (see `is_production_profile_name`).
+fn check_production_guard(
+    profile: &str,
+    fake_request: Option<&(usize, String)>,
+    yes_i_mean_prod: bool,
+) -> Result<(), SeedError> {
+    if fake_request.is_some() && is_production_profile_name(profile) && !yes_i_mean_prod {
+        return Err(SeedError::ProductionFakeSeedBlocked);
+    }
+    Ok(())
+}
+
 /// Locate the directory of a Cargo package by name using `cargo metadata`.
 ///
 /// Returns the directory containing the package's `Cargo.toml`, or `None` if
 /// the package cannot be found or `cargo metadata` fails.
-fn find_package_dir(package: &str) -> Option<PathBuf> {
+///
+/// Shared with `autumn console` (see `crate::console`) so both `--package`
+/// flags resolve a workspace member the same way.
+pub fn find_package_dir(package: &str) -> Option<PathBuf> {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .output()
@@ -189,7 +219,19 @@ fn check_pending_migrations(database_url: &str, migrations_dir: &str) -> Result<
 /// that many faked rows for the named model instead of running its hand-written
 /// seed body. Supplying only one of the two is an error; supplying neither
 /// preserves the original behavior (run the project seed binary).
-pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Option<&str>) {
+///
+/// A fake-seed request (`--count`/`--model`) targeting a `prod`/`production`
+/// profile is blocked unless `yes_i_mean_prod` is set, mirroring `autumn
+/// migrate`'s production guard — generating hundreds of faked rows in
+/// production by accident (e.g. a copy-pasted `--profile prod`) should require
+/// explicit confirmation, not a typo-away default.
+pub fn run(
+    profile: &str,
+    package: Option<&str>,
+    count: Option<usize>,
+    model: Option<&str>,
+    yes_i_mean_prod: bool,
+) {
     eprintln!("\u{1F342} autumn seed\n");
     eprintln!("  Profile: {profile}");
 
@@ -200,6 +242,10 @@ pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Op
             std::process::exit(1);
         }
     };
+    if let Err(e) = check_production_guard(profile, fake_request.as_ref(), yes_i_mean_prod) {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    }
     if let Some((count, model)) = &fake_request {
         // Do not claim the rows were created: this command only *delegates* the
         // request to the project's seed binary (via AUTUMN_SEED_COUNT/MODEL).
@@ -319,6 +365,64 @@ mod tests {
         assert!(
             msg.contains("pending"),
             "error should mention pending migrations, got: {msg}"
+        );
+    }
+
+    // ── check_production_guard (production-fake-seed confirmation) ──────────
+
+    #[test]
+    fn production_guard_blocks_fake_seed_without_confirmation() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("prod", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_accepts_production_spelling() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("production", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_is_case_insensitive() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(
+            check_production_guard("PROD", req.as_ref(), false),
+            Err(SeedError::ProductionFakeSeedBlocked)
+        );
+    }
+
+    #[test]
+    fn production_guard_allows_fake_seed_with_confirmation() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(check_production_guard("prod", req.as_ref(), true), Ok(()));
+    }
+
+    #[test]
+    fn production_guard_allows_non_production_profiles() {
+        let req = Some((200, "Post".to_string()));
+        assert_eq!(check_production_guard("dev", req.as_ref(), false), Ok(()));
+        assert_eq!(check_production_guard("demo", req.as_ref(), false), Ok(()));
+    }
+
+    #[test]
+    fn production_guard_ignores_plain_seed_without_fake_request() {
+        // No --count/--model: running the project's own seed binary against
+        // prod is unaffected by this guard (existing, unrelated behavior).
+        assert_eq!(check_production_guard("prod", None, false), Ok(()));
+    }
+
+    #[test]
+    fn production_fake_seed_blocked_error_mentions_flag() {
+        let msg = SeedError::ProductionFakeSeedBlocked.to_string();
+        assert!(
+            msg.contains("--yes-i-mean-prod"),
+            "error should mention --yes-i-mean-prod, got: {msg}"
         );
     }
 

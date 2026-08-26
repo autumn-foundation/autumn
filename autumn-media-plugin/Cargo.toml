@@ -6,14 +6,22 @@ rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage = "https://github.com/madmax983/autumn"
+homepage = "https://github.com/autumn-foundation/autumn"
 readme = "README.md"
 keywords = ["web", "media", "streaming", "webrtc", "axum"]
 categories = ["web-programming", "multimedia"]
 
 [dependencies]
-autumn-web = { version = "0.6.0", path = "../autumn" }
+autumn-web = { version = "0.7.0", path = "../autumn" }
 chrono = { workspace = true }
+# Diesel is used ONLY by the optional DB-backed `RoomStore` (rooms_db).
+# Backend selection (postgres / sqlite) is inherited from autumn-web's `db`
+# feature via cargo feature unification — this crate never enables a backend
+# (or the `sqlite` runtime lane) itself, so the FEATURE-UNIFICATION HAZARD in
+# `autumn/src/db.rs` does not apply. Queries are written against autumn-web's
+# `RuntimeConnection` / `RuntimeBackend` aliases so both lanes compile.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 percent-encoding = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -56,7 +64,7 @@ aws-smithy-types = ">=1.4, <1.5"
 # blanket From impl; time is already in this crate's graph via the aws
 # crates, so this only bounds resolution. Lift once upstream releases
 # are compatible.
-time = { version = ">=0.3.36, <0.3.48", default-features = false }
+time = { version = ">=0.3.36, <0.3.56", default-features = false }
 # aws-smithy-async 1.3.0 bumped its rust-version to 1.94.1, above this
 # workspace's pinned toolchains (MSRV 1.88.0; CI's semver-check runner is
 # 1.92.0). This is a transitive dep pulled in via aws-config/aws-sdk-s3, not
@@ -94,6 +102,14 @@ aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features =
 tempfile = "3"
 # Job-arg / artifact (de)serialization round-trip tests.
 serde_json = { workspace = true }
+# DB-backed `RoomStore` (rooms_db) testcontainer integration tests — spin a real
+# Postgres via testcontainers, exactly mirroring autumn-admin-plugin's
+# `tests/token_admin_db.rs`. `#[ignore]`d so a default `cargo test` never needs
+# Docker.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
 [lints]
 workspace = true

@@ -88,27 +88,50 @@ pub enum MigrationError {
 /// review). The body is expanded once per concrete connection type, so it
 /// may only use the sync diesel APIs both provide (queries, transactions,
 /// `MigrationHarness`).
+///
+/// The connect AND `$body` both run on a freshly spawned
+/// [`std::thread::scope`] thread, never the calling one. This is load-bearing,
+/// not an optimization: the rustls arm's connection bridges every sync
+/// diesel call through its own internal `block_on`
+/// (see [`crate::db::establish_migration_connection`]'s doc comment), which
+/// panics ("Cannot start a runtime from within a runtime") if run from a
+/// thread that is itself already inside some ambient runtime's context —
+/// exactly what happens when an app calls a migration function directly from
+/// its own async `.on_startup(|state| async move { ... })` hook rather than
+/// from `spawn_blocking`. A freshly spawned thread has never entered any
+/// runtime, so it is always safe regardless of the caller's own context.
+/// `scope` (rather than a plain `'static` `std::thread::spawn`) lets `$body`
+/// borrow from the enclosing function (e.g. an `Option<&HashMap<..>>`
+/// parameter) without needing to be `'static`.
 macro_rules! with_migration_connection {
     ($url:expr, |$conn:ident| $body:expr) => {
-        match crate::db::establish_migration_connection($url)
-            .map_err(|e| MigrationError::Connection(e.to_string()))?
-        {
-            crate::db::MigrationConnection::Native(mut native) => {
-                let $conn = &mut native;
-                $body
-            }
-            crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
-                let result = {
-                    let $conn = &mut conn;
-                    $body
-                };
-                // The runtime (when owned) drives the connection's tokio
-                // driver task: it must outlive every use of `conn`.
-                drop(conn);
-                drop(runtime);
-                result
-            }
-        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    match crate::db::establish_migration_connection($url)
+                        .map_err(|e| MigrationError::Connection(e.to_string()))?
+                    {
+                        crate::db::MigrationConnection::Native(mut native) => {
+                            let $conn = &mut native;
+                            $body
+                        }
+                        crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
+                            let result = {
+                                let $conn = &mut conn;
+                                $body
+                            };
+                            // The runtime drives the connection's tokio
+                            // driver task: it must outlive every use of
+                            // `conn`.
+                            drop(conn);
+                            drop(runtime);
+                            result
+                        }
+                    }
+                })
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     };
 }
 
@@ -227,7 +250,7 @@ impl<DB: diesel::backend::Backend> diesel::migration::MigrationSource<DB>
 /// or [`MigrationError::Migration`] if a migration fails.
 pub fn run_pending(
     database_url: &str,
-    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
 ) -> Result<MigrationResult, MigrationError> {
     with_migration_connection!(database_url, |conn| {
         let mut harness = HarnessWithOutput::write_to_stdout(conn);
@@ -250,7 +273,7 @@ pub fn run_pending(
 /// or [`MigrationError::Migration`] if status cannot be determined.
 pub fn pending_migrations(
     database_url: &str,
-    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
 ) -> Result<Vec<String>, MigrationError> {
     with_migration_connection!(database_url, |conn| {
         let pending = conn
@@ -325,12 +348,16 @@ where
 
 /// Run all pending migrations against a `SQLite` database URL (issue #1614, PR3).
 ///
-/// The `SQLite` counterpart to [`run_pending`]. `SQLite` is a single-writer local
-/// database, so — unlike the Postgres path — there is **no advisory lock**: no
-/// cross-process serialization is needed and `SQLite` has no `pg_advisory_lock`
-/// primitive. Establishes a synchronous `SqliteConnection` (via
-/// [`crate::db::establish_sqlite_migration_connection`]) and applies pending
-/// migrations through diesel's `MigrationHarness`.
+/// The `SQLite` counterpart to [`run_pending`]. Establishes a synchronous
+/// `SqliteConnection` (via [`crate::db::establish_sqlite_migration_connection`])
+/// and applies pending migrations through diesel's `MigrationHarness`, wrapping
+/// the whole list→apply sequence in the shared [`with_sqlite_migration_lock`]
+/// write lock (issue #2065, deferred from PR #2062) so two concurrent `autumn
+/// migrate` / `autumn schema migrate` processes against the same file cannot
+/// interleave their read-then-write windows and re-run an already-applied
+/// migration. There is still **no Postgres advisory lock** on this path —
+/// `SQLite` has no `pg_advisory_lock` primitive; the on-disk write lock held
+/// across the sequence is the entire cross-process serialization mechanism.
 ///
 /// The migration set is taken as a [`MigrationSource<Sqlite>`](diesel::migration::MigrationSource);
 /// the framework's [`EmbeddedMigrations`] (and [`EmbeddedMigrationsRef`]) satisfy
@@ -358,13 +385,87 @@ pub fn run_pending_sqlite(
     }
     let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
-    let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
-    let applied = harness
-        .run_pending_migrations(migrations)
+    let applied = with_sqlite_migration_lock(&mut conn, |conn| {
+        let mut harness = HarnessWithOutput::write_to_stdout(conn);
+        harness
+            .run_pending_migrations(migrations)
+            .map(|applied| applied.iter().map(|m| format!("{m}")).collect::<Vec<_>>())
+            .map_err(|e| MigrationError::Migration(e.to_string()))
+    })?;
+    Ok(MigrationResult { applied })
+}
+
+/// Serialize a `SQLite` migration sequence under the database's write lock.
+///
+/// The single intra-run serialization primitive shared by BOTH `SQLite`
+/// migration directions — [`run_pending_sqlite`] (up) and
+/// [`revert_user_migrations_sqlite`] (down) — and therefore by both the `autumn
+/// migrate` and `autumn schema migrate` verbs, which each route through those two
+/// functions. It takes the `SQLite` write lock up front with `BEGIN IMMEDIATE`
+/// and holds it across the whole list→plan→apply/revert sequence in `f`, then
+/// commits. Two concurrent migrators against the same file therefore cannot
+/// interleave their read-then-write windows: the second `BEGIN IMMEDIATE` queues
+/// on the connection's `busy_timeout` (set by
+/// [`crate::db::establish_sqlite_migration_connection`]) until the first commits,
+/// then re-reads an already-drained pending/applied set and cleanly no-ops
+/// instead of re-running an already-applied `up.sql` (or already-reverted
+/// `down.sql`) and reporting a false failure (issue #2065, deferred from
+/// PR #2062).
+///
+/// There is deliberately **no Postgres advisory lock** on the `SQLite` path
+/// (issue #1999 / #2036 precedent) — `SQLite` has no `pg_advisory_lock`
+/// primitive; this on-disk write lock is the whole serialization mechanism.
+///
+/// # Cooperation with diesel's per-migration transactions
+///
+/// The `BEGIN IMMEDIATE` is issued **through** diesel's `AnsiTransactionManager`
+/// (`begin_transaction_sql`), so the manager's depth counter advances 0 → 1 (the
+/// same technique as [`crate::db::scoped_immediate_transaction`]). Each migration
+/// diesel then applies/reverts inside its own `self.transaction(...)` becomes a
+/// nested `SAVEPOINT` (depth 1 → 2) rather than a raw nested `BEGIN`, which would
+/// fail with "cannot start a transaction within a transaction".
+///
+/// On any error the outer transaction is rolled back, so a mid-sequence failure
+/// leaves the applied set unchanged (the sequence is atomic) rather than
+/// partially advanced. On the success path — the only path the concurrency fix
+/// exercises, since a loser drains an already-empty set — the end state is
+/// identical to the pre-lock harness.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the write lock cannot be taken or the
+/// transaction cannot be committed, or the error returned by `f`.
+#[cfg(feature = "sqlite")]
+fn with_sqlite_migration_lock<T>(
+    conn: &mut diesel::SqliteConnection,
+    f: impl FnOnce(&mut diesel::SqliteConnection) -> Result<T, MigrationError>,
+) -> Result<T, MigrationError> {
+    use diesel::connection::{AnsiTransactionManager, TransactionManager};
+
+    // Take the write lock up front THROUGH the transaction manager so its depth
+    // counter is synced (0 → 1); diesel's per-migration `self.transaction(...)`
+    // then nests as a SAVEPOINT instead of colliding with a raw nested BEGIN.
+    AnsiTransactionManager::begin_transaction_sql(conn, "BEGIN IMMEDIATE")
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
-    Ok(MigrationResult {
-        applied: applied.iter().map(|m| format!("{m}")).collect(),
-    })
+
+    match f(conn) {
+        Ok(value) => {
+            <AnsiTransactionManager as TransactionManager<diesel::SqliteConnection>>::commit_transaction(conn)
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(rollback_err) = <AnsiTransactionManager as TransactionManager<
+                diesel::SqliteConnection,
+            >>::rollback_transaction(conn)
+            {
+                tracing::warn!(
+                    "failed to roll back SQLite migration write-lock transaction after error: {rollback_err}"
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Return names of pending (not yet applied) migrations on a `SQLite` target.
@@ -664,6 +765,308 @@ where
         versions.extend(migrations.iter().map(|m| m.name().version().to_string()));
     }
     Ok(versions)
+}
+
+/// Enumerate `(version, full_name)` for every migration in an embedded set —
+/// `version` is what `__diesel_schema_migrations` actually keys on (e.g.
+/// `"20260101000000"`); `full_name` also carries the description (e.g.
+/// `"20260101000000_create_posts"`), which is what distinguishes "the exact
+/// same migration, registered twice" from "two unrelated migrations that
+/// happen to share a version".
+///
+/// Backend-generic so it enumerates a `SQLite`-oriented embedded set too —
+/// the version/name metadata comes from the migration directory naming, not
+/// from parsing the backend-specific SQL, so which `DB` is chosen here never
+/// changes the result.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the embedded set's metadata
+/// cannot be enumerated (not expected in practice for a `const` produced by
+/// `embed_migrations!`, but the underlying Diesel API is fallible).
+pub(crate) fn migration_versions_and_names<DB>(
+    source: &EmbeddedMigrations,
+) -> Result<Vec<(String, String)>, MigrationError>
+where
+    DB: diesel::backend::Backend,
+    EmbeddedMigrations: diesel::migration::MigrationSource<DB>,
+{
+    let migrations = MigrationSource::<DB>::migrations(source)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(migrations
+        .iter()
+        .map(|m| (m.name().version().to_string(), m.name().to_string()))
+        .collect())
+}
+
+/// Compute a `full migration name -> substitute version` map that resolves
+/// every migration-version collision across `named_sets` automatically,
+/// rather than rejecting registration — see
+/// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)
+/// for the full rationale. Pure and DB-free (parses each embedded set's own
+/// version/name metadata; no connection involved), so it can run right
+/// before the apply loop, on the FINAL set of registered sources — including
+/// ones the framework itself folds in after app-wiring time (the
+/// shard-required version-history / commit-hook-queue sets, and the two
+/// standalone shard-directory / shard-map control migrations, which are
+/// otherwise applied straight from their own `const`s rather than through
+/// the app's registered `migrations`), closing the gap a purely
+/// registration-time check would miss. Callers pass borrowed `EmbeddedMigrations`
+/// (not owned) so a call site can cheaply include such standalone `const`
+/// sets alongside an already-built `Vec` of owned ones without needing
+/// `EmbeddedMigrations` to implement `Clone` (it deliberately doesn't).
+///
+/// Diesel's `__diesel_schema_migrations` table is keyed by **version
+/// alone** — it has no notion of which registered source (the framework, a
+/// plugin, the app's own `migrations/`) recorded a version. Two
+/// independently authored migrations that happen to reuse the same version
+/// — nothing coordinates timestamps across a plugin, the framework, and an
+/// app — would otherwise collide silently: whichever set's `run_pending`
+/// call runs first "wins" the version, and every other set's same-versioned
+/// migration is skipped forever as "already applied", even though its
+/// `up.sql` never actually ran.
+///
+/// For each version claimed by more than one DISTINCT full migration name,
+/// the lexicographically-first full name keeps the plain version; every
+/// other one is mapped to a bounded, deterministic substitute from
+/// [`bounded_substitute_version`], logged at `INFO` so the resolution is
+/// visible. This ordering is a pure function of the colliding migrations'
+/// own names — **not** of `named_sets`' order — so reordering
+/// `.migrations()`/`.plugin_migrations()` calls, or adding a new plugin,
+/// never flips which one already-settled collisions resolve to. The
+/// substitute itself is also salted with the LOSING migration's own full
+/// name (never a source name), which stays fixed for the migration's
+/// lifetime even as the *set* of sources registering a duplicate grows or
+/// shrinks release over release (the same bundle later folded into an
+/// additional plugin, say) — hashing on that changeable set instead would
+/// silently reassign an already-applied migration's tracked substitute the
+/// moment its registration footprint changed, even though the migration
+/// itself never did. Every generated substitute is also checked against
+/// every RAW version already in use (not just other substitutes), so it can
+/// never coincide with an unrelated migration's own plain version. A version
+/// reused under the exact SAME full name (e.g. a shard-required set folded
+/// verbatim into the full framework bundle too) is the intentional,
+/// harmless case and is left untouched — only genuinely different
+/// migrations get remapped, under the assumption that two migrations
+/// sharing both a version AND a full name are the same migration; two
+/// unrelated authors coincidentally picking both is not detected (Diesel's
+/// embedded-migration API does not expose raw `up.sql` bytes at runtime to
+/// check further).
+///
+/// This makes fresh installs and apps that have always registered the same
+/// sources together fully safe. It does NOT recover history for a source
+/// introduced after a database already has one side of the collision
+/// applied under its plain version — see
+/// [`AppBuilder::plugin_migrations`](crate::app::AppBuilder::plugin_migrations)'s
+/// doc comment for why that case is fundamentally unrecoverable from the
+/// table alone, and what to do instead.
+///
+/// Returns an empty map when nothing collides — the overwhelmingly common
+/// case — so callers can skip wrapping entirely when it's empty.
+pub(crate) fn compute_migration_disambiguation(
+    named_sets: &[(&str, &EmbeddedMigrations)],
+) -> HashMap<String, String> {
+    // version -> distinct full names claiming it. Only the DISTINCT full
+    // names matter for collision detection: the same migration folded into
+    // two bundles under different source names (the intentional, harmless
+    // case) contributes one entry, not two, regardless of how many sources
+    // register it or in what order.
+    let mut by_version: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (_, set) in named_sets {
+        let Ok(pairs) = migration_versions_and_names::<Pg>(set) else {
+            continue;
+        };
+        for (version, full_name) in pairs {
+            let entries = by_version.entry(version).or_default();
+            if !entries.contains(&full_name) {
+                entries.push(full_name);
+            }
+        }
+    }
+
+    let mut disambiguated = HashMap::new();
+    // Seed with every RAW version already claimed by some registered
+    // migration, not just substitutes handed out so far — otherwise a
+    // generated substitute could coincide with an unrelated migration's own
+    // plain version and the two would still share one Diesel tracking key.
+    let mut substitutes_in_use: std::collections::HashSet<String> =
+        by_version.keys().cloned().collect();
+    for (version, mut entries) in by_version {
+        if entries.len() <= 1 {
+            continue; // 0 or 1 distinct migration claims this version -- no collision.
+        }
+        // Deterministic, CONTENT-based order -- a pure function of the
+        // colliding migrations' own full names, independent of which
+        // `.migrations()`/`.plugin_migrations()` call happened to run
+        // first. This matters because registration order is NOT stable
+        // across builds: reordering those calls in source, or adding a new
+        // plugin, must not change which migration keeps the plain version.
+        // The lexicographically-first full name wins it; every other
+        // colliding migration is mapped to a substitute below.
+        entries.sort();
+        let kept_name = entries[0].clone();
+        for full_name in entries.into_iter().skip(1) {
+            // The substitute hash is derived from the LOSING migration's own
+            // full name -- not from which source(s) currently register it.
+            // A migration's full name is fixed by its own directory naming
+            // and never changes across releases, whereas the *set* of
+            // sources registering a duplicate can grow or shrink over time
+            // (the same bundle folded into an additional plugin, say) —
+            // hashing on that set would silently reassign an
+            // already-applied migration's tracked substitute the moment its
+            // registration footprint changed, even though the migration
+            // itself never did.
+            let mut tie_breaker = 1u32;
+            let mut substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
+            while substitutes_in_use.contains(&substitute) {
+                tie_breaker += 1;
+                substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
+            }
+            tracing::info!(
+                version = %version,
+                migration = %full_name,
+                collides_with = %kept_name,
+                substitute_version = %substitute,
+                "Migration version collision resolved automatically — both migrations will still apply"
+            );
+            substitutes_in_use.insert(substitute.clone());
+            disambiguated.insert(full_name, substitute);
+        }
+    }
+    disambiguated
+}
+
+/// Build a substitute version for a colliding migration that (a) never
+/// collides with the original version or any other substitute already
+/// handed out (`tie_breaker` bumps on a collision), and (b) always fits
+/// Diesel's `__diesel_schema_migrations.version` column (`VARCHAR(50)`)
+/// regardless of how long `version` or `salt` are.
+///
+/// `salt` should be a value that is stable for the lifetime of the migration
+/// it disambiguates — [`compute_migration_disambiguation`] passes the
+/// migration's own full name (fixed by its directory naming, never by which
+/// or how many sources currently register it). Uses a short, stable hash of
+/// `salt` (not the value itself, which could alone exceed the column width)
+/// plus a numeric tie-breaker suffix. Deterministic: the same `(version,
+/// salt, tie_breaker)` always produces the same substitute.
+fn bounded_substitute_version(version: &str, salt: &str, tie_breaker: u32) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    let short_hash = &hash[..8];
+    let suffix = if tie_breaker <= 1 {
+        format!("+{short_hash}")
+    } else {
+        format!("+{short_hash}-{tie_breaker}")
+    };
+    // Reserve room for the suffix; truncate an unusually long version rather
+    // than risk overflowing the VARCHAR(50) column.
+    let max_version_len = 50usize.saturating_sub(suffix.len());
+    let truncated_version: String = version.chars().take(max_version_len).collect();
+    format!("{truncated_version}{suffix}")
+}
+
+/// A migration whose TRACKED identity is a substitute version, while its
+/// actual behavior (`run`/`revert`/`metadata`) delegates entirely to the
+/// original. Built by [`DisambiguatedMigrations`] for an entry named in a
+/// [`compute_migration_disambiguation`] result.
+struct RenamedMigration<DB: diesel::backend::Backend + 'static> {
+    inner: Box<dyn Migration<DB>>,
+    name: RenamedMigrationName,
+}
+
+/// The [`diesel::migration::MigrationName`] a [`RenamedMigration`] reports:
+/// the same display text as the original (so logs and `autumn migrate
+/// status` still show the real migration name), but a substitute version.
+struct RenamedMigrationName {
+    display: String,
+    version: String,
+}
+
+impl std::fmt::Display for RenamedMigrationName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl diesel::migration::MigrationName for RenamedMigrationName {
+    fn version(&self) -> diesel::migration::MigrationVersion<'_> {
+        diesel::migration::MigrationVersion::from(self.version.as_str())
+    }
+}
+
+impl<DB: diesel::backend::Backend + 'static> Migration<DB> for RenamedMigration<DB> {
+    fn run(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.inner.run(conn)
+    }
+
+    fn revert(
+        &self,
+        conn: &mut dyn diesel::connection::BoxableConnection<DB>,
+    ) -> diesel::migration::Result<()> {
+        self.inner.revert(conn)
+    }
+
+    fn metadata(&self) -> &dyn diesel::migration::MigrationMetadata {
+        self.inner.metadata()
+    }
+
+    fn name(&self) -> &dyn diesel::migration::MigrationName {
+        &self.name
+    }
+}
+
+/// Wraps an [`EmbeddedMigrations`] set, transparently substituting the
+/// tracked version of any migration named in `disambiguated` (full name ->
+/// substitute version — see [`compute_migration_disambiguation`]). Every
+/// other migration in the set passes through completely unchanged — this is
+/// a no-op wrapper when `disambiguated` is empty, the overwhelmingly common
+/// case (no collision was ever detected).
+pub(crate) struct DisambiguatedMigrations<'a> {
+    inner: &'a EmbeddedMigrations,
+    disambiguated: &'a HashMap<String, String>,
+}
+
+impl<'a> DisambiguatedMigrations<'a> {
+    pub(crate) const fn new(
+        inner: &'a EmbeddedMigrations,
+        disambiguated: &'a HashMap<String, String>,
+    ) -> Self {
+        Self {
+            inner,
+            disambiguated,
+        }
+    }
+}
+
+impl<DB> MigrationSource<DB> for DisambiguatedMigrations<'_>
+where
+    DB: diesel::backend::Backend + 'static,
+    EmbeddedMigrations: MigrationSource<DB>,
+{
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
+        let migrations = MigrationSource::<DB>::migrations(self.inner)?;
+        Ok(migrations
+            .into_iter()
+            .map(|m| {
+                let full_name = m.name().to_string();
+                match self.disambiguated.get(&full_name) {
+                    Some(substitute) => Box::new(RenamedMigration {
+                        name: RenamedMigrationName {
+                            display: full_name,
+                            version: substitute.clone(),
+                        },
+                        inner: m,
+                    }) as Box<dyn Migration<DB>>,
+                    None => m,
+                }
+            })
+            .collect())
+    }
 }
 
 /// SHA-256 content hash of a migration's `up.sql`, used to detect the case
@@ -1621,8 +2024,8 @@ pub fn revert_user_migrations_locked<P, F>(
     mut on_reverted: F,
 ) -> Result<usize, MigrationError>
 where
-    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError>,
-    F: FnMut(&RevertedMigration),
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError> + Send,
+    F: FnMut(&RevertedMigration) + Send,
 {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
@@ -1776,10 +2179,15 @@ pub fn applied_user_migrations_sqlite(
 /// `SQLite` counterpart to [`revert_user_migrations_locked`]: plan and execute a
 /// user-migration rollback against a `SQLite` database.
 ///
-/// `SQLite` is a single-writer local database, so there is **no advisory lock**
-/// (issue #1999 / #2036 precedent): the applied set is listed, `plan` chooses the
-/// newest-first versions to revert, and each is reverted through diesel's
-/// `MigrationHarness`. There is likewise **no content-checksum bookkeeping** — the
+/// The applied set is listed, `plan` chooses the newest-first versions to revert,
+/// and each is reverted through diesel's `MigrationHarness` — the whole
+/// list→plan→revert sequence held under the shared [`with_sqlite_migration_lock`]
+/// write lock (issue #2065, deferred from PR #2062) so a concurrent migrator
+/// cannot interleave and re-revert an already-reverted `down.sql`. There is
+/// deliberately **no Postgres advisory lock** on this path (issue #1999 / #2036
+/// precedent) — `SQLite` has no `pg_advisory_lock` primitive; the on-disk write
+/// lock is the whole cross-process serialization mechanism. There is likewise
+/// **no content-checksum bookkeeping** — the
 /// `SQLite` `autumn migrate up` path applies through the unlocked harness and
 /// records no `autumn_migration_checksums` rows (that table's DDL is
 /// Postgres-specific), so there is nothing to delete on revert.
@@ -1801,8 +2209,8 @@ pub fn revert_user_migrations_sqlite<P, F>(
     mut on_reverted: F,
 ) -> Result<usize, MigrationError>
 where
-    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError>,
-    F: FnMut(&RevertedMigration),
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError> + Send,
+    F: FnMut(&RevertedMigration) + Send,
 {
     let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
@@ -1812,37 +2220,39 @@ where
         .migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let applied_user =
-        resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir)?;
-    let versions = plan(&applied_user)?;
+    with_sqlite_migration_lock(&mut conn, |conn| {
+        let applied_user =
+            resolve_applied_user_migrations_sqlite(conn, &all_migrations, migrations_dir)?;
+        let versions = plan(&applied_user)?;
 
-    let mut count = 0;
-    for version in &versions {
-        let target = diesel::migration::MigrationVersion::from(version.as_str());
-        let migration = all_migrations
-            .iter()
-            .find(|m| m.name().version() == target)
-            .ok_or_else(|| {
-                MigrationError::Migration(format!(
-                    "migration version {version} is applied but not present in {} — \
-                     cannot revert (its down.sql is unavailable)",
-                    migrations_dir.display()
-                ))
-            })?;
+        let mut count = 0;
+        for version in &versions {
+            let target = diesel::migration::MigrationVersion::from(version.as_str());
+            let migration = all_migrations
+                .iter()
+                .find(|m| m.name().version() == target)
+                .ok_or_else(|| {
+                    MigrationError::Migration(format!(
+                        "migration version {version} is applied but not present in {} — \
+                         cannot revert (its down.sql is unavailable)",
+                        migrations_dir.display()
+                    ))
+                })?;
 
-        let started = std::time::Instant::now();
-        conn.revert_migration(migration.as_ref())
-            .map_err(|e| MigrationError::Migration(e.to_string()))?;
-        let duration = started.elapsed();
+            let started = std::time::Instant::now();
+            conn.revert_migration(migration.as_ref())
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            let duration = started.elapsed();
 
-        on_reverted(&RevertedMigration {
-            version: version.clone(),
-            name: migration.name().to_string(),
-            duration,
-        });
-        count += 1;
-    }
-    Ok(count)
+            on_reverted(&RevertedMigration {
+                version: version.clone(),
+                name: migration.name().to_string(),
+                duration,
+            });
+            count += 1;
+        }
+        Ok(count)
+    })
 }
 
 // ── Startup wait-for-database ─────────────────────────────────────────────────
@@ -2171,7 +2581,7 @@ pub fn hold_migration_lock(
 /// fails to apply.
 pub fn run_pending_locked(
     database_url: &str,
-    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     wait_timeout: Option<std::time::Duration>,
 ) -> Result<MigrationResult, MigrationError> {
     run_pending_locked_inner(database_url, migrations, wait_timeout, None)
@@ -2218,7 +2628,7 @@ pub fn run_pending_locked(
 /// steps rather than failing the migration run.
 fn run_pending_locked_inner(
     database_url: &str,
-    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     wait_timeout: Option<std::time::Duration>,
     up_sql_by_version: Option<&HashMap<String, String>>,
 ) -> Result<MigrationResult, MigrationError> {
@@ -2379,18 +2789,43 @@ pub fn pending_shard_framework_migrations(
     }
 }
 
-fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
+/// Decide whether pending migrations are auto-applied at startup (issue #1903).
+///
+/// Profile-agnostic, convention-over-configuration:
+///
+/// 1. An explicit `database.auto_migrate` (`auto_migrate = Some(_)`) overrides
+///    everything on **any** profile — `Some(true)` forces apply, `Some(false)`
+///    forces report-only.
+/// 2. Otherwise `dev`/`development` auto-applies by convention.
+/// 3. Otherwise the back-compat `auto_migrate_in_production` alias enables
+///    auto-apply on **any** non-`dev` profile — `prod`/`production` **and**
+///    custom names like `fly`/`staging` (the previous name-gated check silently
+///    skipped custom profiles, so their opt-in was ignored: the bug).
+/// 4. Otherwise report-only.
+fn should_auto_apply(
+    profile: Option<&str>,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
+) -> bool {
+    if let Some(explicit) = auto_migrate {
+        return explicit;
+    }
     let profile_name = profile.unwrap_or("none");
-    matches!(profile_name, "dev" | "development")
-        || (matches!(profile_name, "prod" | "production") && allow_auto_migrate_in_production)
+    if matches!(profile_name, "dev" | "development") {
+        return true;
+    }
+    auto_migrate_in_production
 }
 
-/// Run migrations according to the active profile and migration policy.
+/// Run migrations according to the active profile and migration policy
+/// (decision by [`should_auto_apply`], issue #1903).
 ///
 /// - **dev/development**: runs all pending migrations automatically and logs each one.
-/// - **prod/production**: logs pending migrations unless
-///   `allow_auto_migrate_in_production` is enabled.
-/// - **other profiles**: logs pending migrations without auto-applying.
+/// - **any other profile** (`prod`/`production` **and** custom names like
+///   `fly`/`staging`): logs pending migrations unless auto-apply is explicitly
+///   opted into via `auto_migrate = true` or the `auto_migrate_in_production`
+///   alias.
+/// - An explicit `auto_migrate = Some(false)` forces report-only on any profile.
 ///
 /// `target` labels the database being migrated (`"control"` or
 /// `"shard:<name>"`) so a failing target is unambiguous in sharded
@@ -2404,23 +2839,34 @@ fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bo
 pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,
-    allow_auto_migrate_in_production: bool,
-    migrations: &EmbeddedMigrations,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
+    migrations: impl MigrationSource<Pg> + Send,
     target: &str,
 ) {
     let profile_name = profile.unwrap_or("none");
     let is_dev = matches!(profile_name, "dev" | "development");
-    let is_prod = matches!(profile_name, "prod" | "production");
-    let should_auto_apply = should_auto_apply(profile, allow_auto_migrate_in_production);
+    let should_auto_apply = should_auto_apply(profile, auto_migrate, auto_migrate_in_production);
 
     if should_auto_apply {
         if is_dev {
             tracing::info!(target = %target, "Development profile: running pending database migrations...");
         } else {
+            // Non-dev auto-apply is always an explicit opt-in (issue #1903):
+            // either `database.auto_migrate = true` or the
+            // `auto_migrate_in_production` alias. Name the profile and the key
+            // that enabled it so a custom-profile operator (`fly`, `staging`, …)
+            // sees clearly that their opt-in was honored.
+            let key = if auto_migrate.is_some() {
+                "database.auto_migrate"
+            } else {
+                "database.auto_migrate_in_production"
+            };
             tracing::warn!(
                 profile = profile_name,
+                key,
                 target = %target,
-                "Production auto-migration is enabled; running pending database migrations"
+                "Auto-migration is explicitly enabled for this profile; running pending database migrations"
             );
         }
 
@@ -2459,12 +2905,7 @@ pub(crate) fn auto_migrate(
             None
         };
 
-        match run_pending_locked_inner(
-            database_url,
-            EmbeddedMigrationsRef(migrations),
-            None,
-            up_by_version.as_ref(),
-        ) {
+        match run_pending_locked_inner(database_url, migrations, None, up_by_version.as_ref()) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -2505,19 +2946,26 @@ pub(crate) fn auto_migrate(
         }
     } else {
         // In non-dev modes, just report status
-        match pending_migrations(database_url, EmbeddedMigrationsRef(migrations)) {
+        match pending_migrations(database_url, migrations) {
             Ok(pending) if pending.is_empty() => {
                 tracing::info!(target = %target, "Database migrations are up to date");
             }
             Ok(pending) => {
-                if is_prod {
+                if !is_dev {
+                    // Any non-dev profile (prod/production AND custom names like
+                    // `fly`/`staging`) is opt-in (issue #1903). Name the profile
+                    // and the key an operator would set so a custom-profile
+                    // deploy is not left with only the generic "Run `autumn
+                    // migrate`" line as its signal.
                     tracing::warn!(
-                        "Production profile detected: automatic migrations are disabled by default. \
-                         Run `autumn migrate check` to review safety before applying, then \
-                         `autumn migrate` in your deployment job. \
-                         Set database.auto_migrate_in_production=true only for single-process \
-                         deployments after confirming all pending migrations are safe for a \
-                         rolling deploy (expand/contract pattern)."
+                        profile = profile_name,
+                        target = %target,
+                        "Profile is opt-in for startup migrations: automatic migrations are \
+                         disabled by default. Run `autumn migrate check` to review safety before \
+                         applying, then `autumn migrate` in your deployment job. Set \
+                         database.auto_migrate=true (or the auto_migrate_in_production alias) only \
+                         for single-process deployments after confirming all pending migrations \
+                         are safe for a rolling deploy (expand/contract pattern)."
                     );
                 }
                 tracing::warn!(
@@ -2539,10 +2987,11 @@ pub(crate) fn auto_migrate(
 /// Run migrations against a `SQLite` control target at startup (issue #1614, PR3).
 ///
 /// The `SQLite` counterpart to [`auto_migrate`]: it honors the same profile
-/// policy via [`should_auto_apply`] (dev / development auto-applies; prod /
-/// production applies only when `allow_auto_migrate_in_production` is set;
-/// otherwise it reports pending work), and fails fast (`process::exit(1)`) on an
-/// apply error exactly like the Postgres path.
+/// policy via [`should_auto_apply`] (dev / development auto-applies; every other
+/// profile — prod/production and custom — applies only when `auto_migrate` or
+/// the `auto_migrate_in_production` alias opts in; otherwise it reports pending
+/// work), and fails fast (`process::exit(1)`) on an apply error exactly like the
+/// Postgres path.
 ///
 /// It deliberately omits the two Postgres-specific mechanisms
 /// [`auto_migrate`] relies on:
@@ -2562,8 +3011,9 @@ pub(crate) fn auto_migrate(
 pub(crate) fn auto_migrate_sqlite(
     database_url: &str,
     profile: Option<&str>,
-    allow_auto_migrate_in_production: bool,
-    migrations: &EmbeddedMigrations,
+    auto_migrate: Option<bool>,
+    auto_migrate_in_production: bool,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> + Send,
     target: &str,
 ) {
     // An in-memory target (private OR shared-cache) with registered migrations
@@ -2573,8 +3023,7 @@ pub(crate) fn auto_migrate_sqlite(
     // with an actionable message — in both the auto-apply and report-pending
     // profiles — rather than booting into a schema-less pool whose every
     // DB-backed request 500s (issue #1614 follow-up).
-    if let Some(err) = reject_in_memory_migrations(database_url, &EmbeddedMigrationsRef(migrations))
-    {
+    if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         tracing::error!(
             target = %target,
             error = %err,
@@ -2582,9 +3031,9 @@ pub(crate) fn auto_migrate_sqlite(
         );
         std::process::exit(1);
     }
-    if should_auto_apply(profile, allow_auto_migrate_in_production) {
+    if should_auto_apply(profile, auto_migrate, auto_migrate_in_production) {
         tracing::info!(target = %target, "Running pending SQLite database migrations...");
-        match run_pending_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+        match run_pending_sqlite(database_url, migrations) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -2604,7 +3053,7 @@ pub(crate) fn auto_migrate_sqlite(
             }
         }
     } else {
-        match pending_migrations_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+        match pending_migrations_sqlite(database_url, migrations) {
             Ok(pending) if pending.is_empty() => {
                 tracing::info!(target = %target, "Database migrations are up to date");
             }
@@ -2628,6 +3077,250 @@ pub(crate) fn auto_migrate_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Migration-version collision auto-resolution (plugin/app/framework) ─
+
+    #[test]
+    fn no_disambiguation_when_versions_are_disjoint() {
+        const A: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const B: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let disambiguated = compute_migration_disambiguation(&[("app", &A), ("test-plugin", &B)]);
+        assert!(
+            disambiguated.is_empty(),
+            "disjoint version sets must not be touched: {disambiguated:?}"
+        );
+    }
+
+    #[test]
+    fn no_disambiguation_when_same_set_registered_twice() {
+        // The intentional, harmless case: the exact same migration set
+        // registered from two different call sites (e.g. two plugins that
+        // both depend on a shared migrations bundle) reuses the same
+        // versions AND full names.
+        const A: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        let disambiguated = compute_migration_disambiguation(&[("plugin-a", &A), ("plugin-b", &A)]);
+        assert!(
+            disambiguated.is_empty(),
+            "re-registering the identical set must not be treated as a collision: {disambiguated:?}"
+        );
+    }
+
+    #[test]
+    fn disambiguates_a_real_version_collision() {
+        // Real-world shape: a framework migration and an app's own first
+        // migration both picking the all-zero placeholder version — exactly
+        // what `examples/todo-app` hits against the framework's legacy
+        // `create_api_tokens` migration.
+        const APP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const COLLIDING: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
+
+        let disambiguated =
+            compute_migration_disambiguation(&[("app", &APP), ("test-plugin", &COLLIDING)]);
+
+        // Deterministic, content-based order (lexicographic full name):
+        // "00000000000000_create_gadgets" < "00000000000000_create_todos",
+        // so the plugin's migration keeps the plain version regardless of
+        // registration order.
+        assert!(
+            !disambiguated.contains_key("00000000000000_create_gadgets"),
+            "the lexicographically-first migration must keep its original version: {disambiguated:?}"
+        );
+        let substitute = disambiguated
+            .get("00000000000000_create_todos")
+            .expect("the other colliding migration must be disambiguated");
+        assert_eq!(
+            substitute,
+            &bounded_substitute_version("00000000000000", "00000000000000_create_todos", 1)
+        );
+        assert!(
+            substitute.len() <= 50,
+            "must fit __diesel_schema_migrations.version (VARCHAR(50)): {substitute}"
+        );
+    }
+
+    #[test]
+    fn duplicate_migrations_substitute_hash_is_independent_of_registration_order() {
+        // A migration folded into two bundles under different source names
+        // (the intentional, harmless "same set registered twice" case) that
+        // ALSO collides at its version with a third, differently-named
+        // migration: the duplicate is the one that must be substituted
+        // ("20260101000000_a_third_migration" < "20260101000000_create_gizmos"
+        // lexicographically). The substitute hash is derived from the
+        // duplicate's own full name, not from which source(s) register it,
+        // so it must be identical regardless of registration order --
+        // and, more importantly, regardless of whether it's EVER registered
+        // under a second name at all (see the next test).
+        const DUP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        const OTHER: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision_2");
+
+        let order_a = compute_migration_disambiguation(&[
+            ("other", &OTHER),
+            ("zzz-plugin", &DUP),
+            ("aaa-plugin", &DUP),
+        ]);
+        let order_b = compute_migration_disambiguation(&[
+            ("other", &OTHER),
+            ("aaa-plugin", &DUP),
+            ("zzz-plugin", &DUP),
+        ]);
+
+        let substitute_a = order_a
+            .get("20260101000000_create_gizmos")
+            .expect("the duplicate must be disambiguated in registration order A");
+        let substitute_b = order_b
+            .get("20260101000000_create_gizmos")
+            .expect("the duplicate must be disambiguated in registration order B");
+        assert_eq!(
+            substitute_a, substitute_b,
+            "the substitute must not depend on which of the duplicate's two \
+             registrations happened to run first"
+        );
+        assert_eq!(
+            substitute_a,
+            &bounded_substitute_version("20260101000000", "20260101000000_create_gizmos", 1),
+            "the substitute is salted with the duplicate's own full name, not any source name"
+        );
+    }
+
+    #[test]
+    fn duplicate_migrations_substitute_hash_is_stable_as_registrations_change() {
+        // The stronger guarantee `duplicate_migrations_substitute_hash_is_independent_of_registration_order`
+        // only hints at: an ALREADY-APPLIED migration's substitute must not
+        // change merely because the set of sources registering it grows or
+        // shrinks across releases (e.g. the same bundle later folded into an
+        // additional plugin too) -- only the migration's own, permanently
+        // fixed full name may drive the hash. Registered once vs. registered
+        // twice (under an entirely different second name) must produce the
+        // SAME substitute for the losing migration.
+        const DUP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
+        const OTHER: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision_2");
+
+        let registered_once =
+            compute_migration_disambiguation(&[("other", &OTHER), ("only-plugin", &DUP)]);
+        let registered_twice = compute_migration_disambiguation(&[
+            ("other", &OTHER),
+            ("only-plugin", &DUP),
+            ("a-brand-new-plugin-added-later", &DUP),
+        ]);
+
+        assert_eq!(
+            registered_once.get("20260101000000_create_gizmos"),
+            registered_twice.get("20260101000000_create_gizmos"),
+            "adding a second registration of an already-duplicated migration must not \
+             change the substitute already assigned to it"
+        );
+    }
+
+    #[test]
+    fn substitute_never_collides_with_an_unrelated_raw_version() {
+        // If a generated substitute happened to equal some OTHER, unrelated
+        // migration's own plain version, the two would share one Diesel
+        // tracking key -- exactly the bug this guard exists to prevent.
+        // Regression-guard the underlying invariant directly: no output
+        // substitute may equal any INPUT raw version.
+        const APP: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        const COLLIDING: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
+        let raw_versions: std::collections::HashSet<String> =
+            migration_versions_and_names::<Pg>(&APP)
+                .unwrap()
+                .into_iter()
+                .map(|(v, _)| v)
+                .chain(
+                    migration_versions_and_names::<Pg>(&COLLIDING)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(v, _)| v),
+                )
+                .collect();
+
+        let disambiguated =
+            compute_migration_disambiguation(&[("app", &APP), ("test-plugin", &COLLIDING)]);
+        for substitute in disambiguated.values() {
+            assert!(
+                !raw_versions.contains(substitute),
+                "substitute {substitute:?} must never coincide with an unrelated migration's own raw version"
+            );
+        }
+    }
+
+    #[test]
+    fn disambiguates_a_collision_against_the_standalone_shard_control_migrations() {
+        // `SHARD_DIRECTORY_MIGRATIONS`/`SHARD_MAP_MIGRATIONS` are applied
+        // straight from their own `const`s (not through the app's
+        // `migrations`), so callers must pass them into
+        // `compute_migration_disambiguation` explicitly alongside the
+        // registered set -- this fixture's version
+        // ("20260612000000") matches the real shard-directory migration's,
+        // under a different name, exactly the scenario a plugin could hit.
+        const PLUGIN: EmbeddedMigrations = diesel_migrations::embed_migrations!(
+            "tests/fixtures/plugin_migrations_collision_shard_directory"
+        );
+        let disambiguated = compute_migration_disambiguation(&[
+            ("test-plugin", &PLUGIN),
+            (
+                "shard-directory",
+                &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+            ),
+        ]);
+        // "20260612000000_a_plugin_thing" < "20260612000000_create_shard_directory"
+        // lexicographically, so the PLUGIN keeps the plain version and the
+        // framework's own shard-directory migration is the one substituted.
+        assert!(
+            !disambiguated.contains_key("20260612000000_a_plugin_thing"),
+            "the lexicographically-first migration must keep its original version: {disambiguated:?}"
+        );
+        assert!(
+            disambiguated.contains_key("20260612000000_create_shard_directory"),
+            "the collision against the standalone shard-directory set must be caught: {disambiguated:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_substitute_version_fits_varchar_50_even_with_a_long_source_name() {
+        // `plugin_migrations` accepts an arbitrary `&'static str` name --
+        // an unbounded "{version}+{name}" would overflow
+        // __diesel_schema_migrations.version (VARCHAR(50)) and fail the
+        // INSERT at migration time.
+        let long_name = "a-plugin-with-a-very-long-descriptive-crate-name-that-keeps-going";
+        let substitute = bounded_substitute_version("20260101000000", long_name, 1);
+        assert!(
+            substitute.len() <= 50,
+            "must fit VARCHAR(50): {substitute} ({} chars)",
+            substitute.len()
+        );
+        assert!(substitute.starts_with("20260101000000"));
+    }
+
+    #[test]
+    fn bounded_substitute_version_tie_breaker_changes_the_result() {
+        let first = bounded_substitute_version("20260101000000", "same-name", 1);
+        let second = bounded_substitute_version("20260101000000", "same-name", 2);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn migration_versions_and_names_enumerates_todo_app_fixture() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let pairs = migration_versions_and_names::<Pg>(&MIGRATIONS).unwrap();
+        assert!(
+            pairs
+                .iter()
+                .any(|(v, n)| v == "00000000000000" && n == "00000000000000_create_todos"),
+            "expected the todo-app fixture's first migration, got {pairs:?}"
+        );
+    }
 
     // ── Per-attempt connect_timeout injection (`--wait`) ───────────────────
 
@@ -3401,13 +4094,46 @@ mod tests {
 
     #[test]
     fn profile_aliases_are_recognized() {
-        assert!(should_auto_apply(Some("dev"), false));
-        assert!(should_auto_apply(Some("development"), false));
-        assert!(!should_auto_apply(Some("prod"), false));
-        assert!(!should_auto_apply(Some("production"), false));
-        assert!(should_auto_apply(Some("prod"), true));
-        assert!(should_auto_apply(Some("production"), true));
-        assert!(!should_auto_apply(Some("staging"), true));
+        // `auto_migrate` unset (None) — decision falls to convention + alias.
+        assert!(should_auto_apply(Some("dev"), None, false));
+        assert!(should_auto_apply(Some("development"), None, false));
+        assert!(!should_auto_apply(Some("prod"), None, false));
+        assert!(!should_auto_apply(Some("production"), None, false));
+        assert!(should_auto_apply(Some("prod"), None, true));
+        assert!(should_auto_apply(Some("production"), None, true));
+    }
+
+    /// Issue #1903: a CUSTOM profile (`fly`, `staging`, …) that opts in via the
+    /// `auto_migrate_in_production` alias must auto-apply — the old name-gated
+    /// check only honored `prod`/`production`, silently skipping custom profiles
+    /// (the reported bug). And a custom profile with nothing set stays off.
+    #[test]
+    fn should_auto_apply_is_profile_agnostic_for_the_alias() {
+        // THE bug: custom profile + alias opt-in => auto-apply.
+        assert!(should_auto_apply(Some("fly"), None, true));
+        assert!(should_auto_apply(Some("staging"), None, true));
+        // Custom profile, nothing set => opt-in only, stays off.
+        assert!(!should_auto_apply(Some("fly"), None, false));
+        assert!(!should_auto_apply(Some("staging"), None, false));
+    }
+
+    /// Issue #1903: the profile-agnostic `auto_migrate` override wins on ANY
+    /// profile — `Some(true)` forces apply, `Some(false)` forces report-only,
+    /// even on dev.
+    #[test]
+    fn explicit_auto_migrate_overrides_convention_on_any_profile() {
+        // dev/development => auto-apply by default (alias irrelevant).
+        assert!(should_auto_apply(Some("dev"), None, false));
+        assert!(should_auto_apply(Some("development"), None, false));
+        // Explicit false on dev => report-only (override beats convention).
+        assert!(!should_auto_apply(Some("dev"), Some(false), false));
+        assert!(!should_auto_apply(Some("development"), Some(false), true));
+        // Explicit true forces apply on a custom/prod profile with no alias.
+        assert!(should_auto_apply(Some("fly"), Some(true), false));
+        assert!(should_auto_apply(Some("prod"), Some(true), false));
+        // Explicit `auto_migrate` wins even when the alias disagrees.
+        assert!(should_auto_apply(Some("prod"), Some(true), false));
+        assert!(!should_auto_apply(Some("prod"), Some(false), true));
     }
 
     #[test]
@@ -3483,8 +4209,12 @@ mod tests {
 
     #[test]
     fn should_auto_apply_returns_false_for_none_profile() {
-        assert!(!should_auto_apply(None, false));
-        assert!(!should_auto_apply(None, true));
+        // No profile is treated as a non-dev, opt-in profile: off unless an
+        // explicit override or the alias enables it.
+        assert!(!should_auto_apply(None, None, false));
+        assert!(should_auto_apply(None, None, true));
+        assert!(should_auto_apply(None, Some(true), false));
+        assert!(!should_auto_apply(None, Some(false), true));
     }
 
     // ── startup wait-for-DB (red phase) ───────────────────────────────────────

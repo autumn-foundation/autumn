@@ -1,37 +1,219 @@
 # Migration Guides
 
-Every **major** release of Autumn ships with a migration guide describing
-what changed and how to update application code. Minor and patch releases
-are backwards-compatible per the [Stability Policy](../../STABILITY.md) and
-do not need a dedicated guide — their changes are called out in the
-[CHANGELOG](../../CHANGELOG.md).
+**Every release with a breaking change ships a migration guide.** Pre-1.0 that
+means most releases: Autumn ships every 2–4 weeks and, until `1.0.0`, a minor
+bump may break existing apps (see the [Stability Policy](../../STABILITY.md)).
+A release without an upgrade path is treated as a broken build — the guide is a
+gate, not a courtesy (issue #1588).
+
+The gate is `scripts/check-migration-guides.sh`, which runs on every pull
+request and in the publish gate. See
+[Enforcement](#enforcement-scriptscheck-migration-guidessh) below.
 
 ## Index
 
-- [`0.4.0.md`](0.4.0.md) - `autumn-web 0.3.x -> 0.4.0`
-- [`0.6.0.md`](0.6.0.md) - `autumn-web 0.5.x -> 0.6.0`
+- [`0.4.0.md`](0.4.0.md) — `autumn-web 0.3.x → 0.4.0`
+- [`0.5.0.md`](0.5.0.md) — `autumn-web 0.4.x → 0.5.0`
+- [`0.6.0.md`](0.6.0.md) — `autumn-web 0.5.x → 0.6.0`
+- [`0.7.0.md`](0.7.0.md) — `autumn-web 0.6.x → 0.7.0`
+- [`next.md`](next.md) — rolling draft for `## [Unreleased]`, renamed to
+  `<version>.md` at release time
 
-- [`TEMPLATE.md`](TEMPLATE.md) — template for new migration guides. Copy
-  this when drafting the guide for the next major release.
+- [`TEMPLATE.md`](TEMPLATE.md) — template for new migration guides. Copy this
+  when starting the guide for the next release.
 
-As Autumn ships `1.0.0` and beyond, each release will be indexed here, for
-example:
+Guides are not backfilled for releases earlier than `0.4.0`.
 
-- `1.x-to-2.0.md` — `autumn-web 1.x → 2.0.0`
-- `2.x-to-3.0.md` — `autumn-web 2.x → 3.0.0`
+## Declaring a breaking change in the CHANGELOG
 
-## Process for a new major release
+A breaking change is declared **either** with the inline `**Breaking:**` token
+**or** under a `### Breaking Changes` heading — that exact heading, not any
+heading starting with the word. Nothing else counts: the gate reads the
+changelog, and prose it cannot see strands users.
 
-1. **Open a draft guide early.** The first PR that lands a breaking change
-   targeting the next major copies `TEMPLATE.md` to
-   `docs/migrations/<from>-to-<to>.md` and links it from this index.
+The token is what declares, not the bullet: a marked *paragraph* is an entry
+too, and needs its own guide and link exactly as a marked bullet does. The same
+holds under a `### Breaking Changes` heading, where the heading does the
+declaring and the prose beneath it need not repeat the token — but only when
+there is no list for that prose to introduce. A sentence like "The following
+changes require action:" above a list is an introduction, and so is a block
+quote anywhere in the section, which is how the sections in this changelog
+carry their backfill notes. With no list at all, the prose *is* the entry.
+
+```markdown
+- **repository:** **Breaking:** `with_pool` is renamed to `with_pool_untracked`.
+  Uses on generated repositories must be updated (only the name changes). See
+  the [migration guide](docs/migrations/0.6.0.md).
+```
+
+Every breaking entry must link its own guide, so a reader lands on the fix path
+straight from the changelog line. Entries under `## [Unreleased]` link
+[`next.md`](next.md).
+
+If a change is *not* breaking, say so in the words the gate recognises —
+"non-breaking", "no breaking change", "without breaking …" — and the line
+passes untouched. A `**Breaking:**` token inside a code span is a mention, not
+a declaration, so documenting the convention costs nothing.
+
+A bullet parked inside `<!-- ... -->` renders nowhere, so it is not an entry and
+declares nothing. The one HTML comment the gate *does* read is the suppression
+token below — deliberately, so it stays invisible to readers and visible in the
+diff.
+
+For an entry that talks *about* breaking changes without being one — release
+tooling, policy docs — append an explicit suppression naming its reason:
+
+```markdown
+- **release:** the gate fails when a section declares a breaking change with no
+  guide. <!-- migration-guide-gate: describes the gate itself -->
+```
+
+It is greppable and shows up in the diff, so using it on a real break is a
+reviewable act rather than a silent one.
+
+## Classifying a breaking change: the automation label
+
+Every breaking change in a guide carries one line saying how much of it a
+machine can apply, so a reader knows before starting whether the upgrade is a
+command or an afternoon (issue #1629):
+
+```markdown
+**Automation:** `auto` — `autumn upgrade` rewrites every call site; codemod
+`0.6.0-repository-with-pool-untracked`.
+```
+
+| Label | Meaning | What the reader does |
+|-------|---------|----------------------|
+| `auto` | Safe by construction — a rename or an import move. `autumn upgrade` rewrites every reachable call site. | Run `autumn upgrade --apply` and read the diff. |
+| `review` | `autumn upgrade` rewrites it, and flags **every** rewritten site in the summary. | Run it, then read each flagged site. |
+| `manual` | No mechanical rewrite. This guide section is the fix path. | Follow the section. |
+
+An `auto`/`review` entry names the shipped codemod id from the registry in
+[`autumn-cli/src/upgrade/migrations.rs`](../../autumn-cli/src/upgrade/migrations.rs);
+that registry is what `autumn upgrade` actually runs, so the guide cannot
+promise a codemod nobody wrote. A `manual` label on a *rename-level* change —
+the class the tool can apply safely — has to say why it stays manual. Semantic
+and behavioural changes need no justification: the label is the whole answer.
+
+Nothing is silently skipped at either end. A change the codemod cannot reach —
+a call site inside a macro invocation, a generated file — is reported by
+`autumn upgrade` with `file:line` under `manual`, pointing at the guide section
+named in the registry entry.
+
+## Process for a breaking release
+
+1. **Open the draft with the first breaking change.** The first PR that lands a
+   breaking change after a release copies [`TEMPLATE.md`](TEMPLATE.md) to
+   [`next.md`](next.md) and links it from its changelog entry.
 2. **Grow the guide with each breaking change.** Every subsequent
-   breaking-change PR appends a section with *before* / *after* snippets
-   and the compiler error users will see.
-3. **Polish during the prerelease window.** The `x.0.0-rc.*` tags exist so
-   we can dogfood the guide against real user upgrades and fill gaps.
-4. **Ship on day one.** `x.0.0` does not go out unless its migration guide
-   is complete and the index above points to it.
+   breaking-change PR appends a section with *before* / *after* snippets and the
+   compiler error the user will see. For a contributor opening a
+   breaking-change PR, that section is part of "done".
+3. **Perform the walk-through before publishing, codemod-first.** Upgrade an
+   app scaffolded with `autumn new` on the *previous* release: run
+   `autumn upgrade` **before any manual step**, then follow the guide — and
+   only the guide, no changelog, no source reading — for the changes labelled
+   `review` and `manual`. Record both the codemod invocation and the result in
+   the guide's `### Guide-only upgrade walkthrough` section. See
+   [`docs/release-checklist.md`](../release-checklist.md).
+4. **Rename at release.** `next.md` becomes `<version>.md`, its version
+   placeholders are filled in, the index above is updated, and the changelog
+   links are repointed from `next.md` to `<version>.md`.
 
-If you are a contributor opening a breaking-change PR, adding the matching
-entry to the in-flight migration guide is part of "done."
+## Enforcement (`scripts/check-migration-guides.sh`)
+
+```bash
+./scripts/check-migration-guides.sh          # the gate
+./scripts/check-migration-guides.sh --list   # inventory per changelog section
+```
+
+It fails when:
+
+- a changelog entry describes breaking something without the marker (so an
+  unmarked break cannot hide from the coverage check). Bullets and ordinary
+  paragraphs are both read — prose is not a way around the convention;
+- a section with a breaking entry has no guide at `docs/migrations/<version>.md`
+  (or `next.md` for `## [Unreleased]`). A release candidate section
+  (`## [0.7.0-rc.1]`) is gated against its release's guide, `0.7.0.md`;
+- a breaking entry does not *link* its guide — a bare path mention is not a
+  link, the reader has to be able to click through. The destination is parsed,
+  not searched for, so `[guide](next.md "why")` and `[guide](<next.md>)` both
+  count and a path named only in a link *title* does not. Reference-style links
+  work too — `[guide][upgrade]` with `[upgrade]: next.md` anywhere in the file,
+  plus the collapsed and shortcut forms — as long as the definition itself
+  renders, which one shown inside a fenced sample does not;
+- a guide is missing a required section — *At a glance*, *Summary*, *Before you
+  start*, *Breaking changes*, *How to verify*, and *Guide-only upgrade
+  walkthrough* — or has a heading with nothing under it, still carries
+  `TEMPLATE.md`'s banner or any placeholder token `TEMPLATE.md` itself emits
+  (an HTML comment is not content — `<!-- TODO -->` under a heading is a stub,
+  and neither is a link reference definition or a bare `<span></span>`, which
+  render nothing at all; the words *between* tags do count)
+  (the vocabulary is read from the template, so `{:?}` and `Route { .. }` in a
+  guide are fine and `{X.Y.Z}` in a code sample is not), or is not linked from
+  the Index above (a mention elsewhere in this file is not an index entry);
+- a released guide's walk-through status does not **begin** with
+  `performed YYYY-MM-DD` or `backfilled`; `pending` is allowed only on
+  `next.md`. The whole value is checked, not searched — `not performed
+  2026-08-11` says the opposite of what a substring match would conclude;
+
+  `next.md` is a **draft**, so it is also exempt from the placeholder and
+  empty-section checks — the release checklist recreates it from
+  `TEMPLATE.md` after every release, and the template ships placeholders by
+  design. Every exemption lapses the moment it is renamed to `<version>.md`.
+- a change in a guide that reads as a rename or an import move carries no
+  `**Automation:**` label; any label whose value is not `auto`/`review`/`manual`
+  (a bare `auto` outside a code span is not a label); an `auto`/`review` label
+  that names no codemod id shipped in
+  `autumn-cli/src/upgrade/migrations.rs` **for that release** (an id from an
+  earlier release does not cover a later one, and an id shown only inside a
+  fenced sample is a sample); or a rename-level change labelled `manual` with no
+  reason given (issue #1629). Entries are read under every `## ` section, not
+  only `## Breaking changes`, and rename detection is textual and errs toward
+  asking: a false positive costs one sentence, a false negative strands users on
+  a hand-edit the tool could have done. A released guide that ships an
+  `auto`/`review` codemod must also record a `- **Codemod:**` line under
+  `### Guide-only upgrade walkthrough`, because the walk-through is performed
+  codemod-first. An entry carrying the `migration-guide-gate` suppression is
+  exempt from all of this, exactly as for the changelog checks above.
+
+  That *every* breaking change carries a label — not only the rename-level ones
+  the shell gate insists on — is asserted over this repository's guides as a set
+  by `autumn-cli`'s `upgrade_codemod` test suite;
+- `next.md` is missing. The rolling draft is permanent, not conditional on
+  there being an unreleased break: this file and `STABILITY.md` both link it by
+  name, and nothing here checks markdown links;
+- it cannot read the changelog: a `## ` heading it fails to parse, an unclosed
+  code fence, an unclosed HTML comment, and an unclosed `<script>`, `<?`, `<!`
+  or CDATA block are all hard errors, because each one silently removes whole
+  sections from every check above. A `<div>` still open at end of file is not
+  an error — that kind of block legitimately ends there.
+
+Details that save a round trip: `**Breaking:**` is matched case-insensitively,
+and `- ` and `* ` are both bullets. A marker inside an inline code span (any
+backtick-run length) is a mention — but if a marker survives *only* inside a
+span, the gate stops and asks, because a stray backtick swallowing a real
+marker looks exactly the same. Add the suppression to say "mention", or fix the
+backticks to say "declaration".
+Fenced code blocks (``` or `~~~`) are skipped wholesale in both the changelog
+and the guides — a `breaking` key in a config sample is not a breaking change,
+and a guide cannot satisfy its own required headings from inside an example.
+Raw HTML blocks are skipped for the same reason. They open on one of
+CommonMark's block tag names — with or without trailing content, so `<div>` and
+`<div>example` both start one — on any other complete tag standing alone on its
+line — but that last kind cannot interrupt an open paragraph, so `<MyWidget>`
+directly under an entry's first line stays inline and the markdown below it
+still counts — or on the non-tag forms `<?`, `<!CDATA[`-style sections and
+`<!DECLARATION`. Indentation
+is measured from the enclosing list item content column, so four spaces under a
+`- ` item is a two-space indent and opens a block, exactly as for a fence.
+
+They end where CommonMark ends them: a `<script>`, `<style>`, `<pre>` or
+`<textarea>` block at its end tag (any of the four — the spec says it need not
+match the opener), a non-tag block at its own terminator, anything else at the
+next blank line. The end-condition line belongs to the block, so a link on the
+line after `</script>` counts and one sharing that line with it does not.
+
+The lint is textual, so it removes the *silent* failure mode rather than
+replacing review: a break described without the word "breaking" and without the
+marker still needs a reviewer to catch it.

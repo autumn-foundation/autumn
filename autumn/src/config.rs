@@ -63,6 +63,7 @@
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
@@ -86,6 +87,7 @@
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
 //! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
+//! | `AUTUMN_HEALTH__ENABLED` | `health.enabled` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
@@ -155,6 +157,20 @@
 //! | `AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES` | `auth.magic_link.ttl_minutes` | `u64` |
 //! | `AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS` | `auth.magic_link.email_cooldown_secs` | `u64` |
 //! | `AUTUMN_TIME_ZONE__IDENTIFIER` | `time_zone.identifier` | IANA id `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__ENABLED` | `failure_capture.enabled` | `bool` |
+//! | `AUTUMN_FAILURE_CAPTURE__DIR` | `failure_capture.dir` | `String` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES` | `failure_capture.max_body_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES` | `failure_capture.max_capsule_bytes` | `usize` |
+//! | `AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES` | `failure_capture.max_capsules` | `usize` |
+//! | `AUTUMN_CLUSTER__ENABLED` | `cluster.enabled` | `bool` |
+//! | `AUTUMN_CLUSTER__SECRET` | `cluster.secret` | `SecretString` |
+//! | `AUTUMN_CLUSTER__CLUSTER_NAME` | `cluster.cluster_name` | `String` |
+//! | `AUTUMN_CLUSTER__BIND_ADDR` | `cluster.bind_addr` | `String` |
+//! | `AUTUMN_CLUSTER__ADVERTISE_ADDR` | `cluster.advertise_addr` | `String` |
+//! | `AUTUMN_CLUSTER__SEED_PEERS` | `cluster.seed_peers` | comma-separated addresses |
+//! | `AUTUMN_CLUSTER__NODE_ID` | `cluster.node_id` | `String` |
+//! | `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` | `cluster.push_interval_ms` | `u64` |
+//! | `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` | `cluster.suspicion_timeout_ms` | `u64` |
 
 use std::path::{Path, PathBuf};
 
@@ -1013,6 +1029,47 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Deterministic replay capsule settings (`[failure_capture]` section,
+    /// issue #1598).
+    ///
+    /// Off by default. When enabled, each failing request is written to disk
+    /// as a replayable capsule; see [`FailureCaptureConfig`] and
+    /// `docs/guide/failure-capsules.md` (capsules contain real request data —
+    /// read the security section before turning this on).
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) is: `DatabaseConfig`'s `deserialize_with`
+    /// duration field aborts the `SchemaDeserializer` traversal, so a section
+    /// declared after it is recorded only as an opaque root leaf and strict
+    /// unknown-key validation never descends into its children. The regression
+    /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
+    /// ordering breaks.
+    #[cfg(feature = "reporting")]
+    #[serde(default)]
+    pub failure_capture: FailureCaptureConfig,
+
+    /// Embedded self-clustering control plane (`[cluster]` section, issue
+    /// #1762).
+    ///
+    /// Off by default. See [`ClusterConfig`] and `docs/guide/clustering.md`.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
+    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[cluster] seed_peer = […]` would then be silently accepted. The
+    /// regression guard `cluster_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1289,6 +1346,9 @@ pub struct DeployTlsConfig {
 /// ```toml
 /// [deploy]
 /// host = "203.0.113.10"      # required at deploy time; SSH-reachable address
+/// # hosts = ["10.0.0.1", "10.0.0.2"]  # fleet alternative to `host` (#1621);
+/// #                                   # mutually exclusive with it, and the
+/// #                                   # order is the rollout order
 /// user = "deploy"            # SSH user (default: "root")
 /// ssh_port = 22              # SSH port (default: 22)
 /// app_name = "myapp"         # default: the crate's package name
@@ -1297,6 +1357,7 @@ pub struct DeployTlsConfig {
 /// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
 /// keep_releases = 3          # releases retained on the host (default: 3)
 /// profile = "prod"           # profile the deployed app runs under (default: "prod")
+/// install_proxy = true       # install the reverse proxy on a bare host (default: true)
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployConfig {
@@ -1307,6 +1368,25 @@ pub struct DeployConfig {
     /// [`validate`](Self::validate).
     #[serde(default)]
     pub host: Option<String>,
+
+    /// SSH-reachable addresses of the target fleet, in rollout order (#1621).
+    ///
+    /// Mutually exclusive with [`host`](Self::host): a single-entry `hosts` list
+    /// is byte-for-byte the historical single-server deploy, and the order of the
+    /// list **is** the rollout order (a documented operator contract, not an
+    /// implementation detail — the fleet driver never sorts or regroups it).
+    /// Empty by default, so every pre-#1621 `[deploy]` table is unchanged.
+    ///
+    /// `[deploy.tls] host` stays fleet-singular: it is the PUBLIC DNS name the
+    /// certificate is issued for, semantically distinct from these SSH targets.
+    ///
+    /// Blank entries and duplicates (compared after trimming) are rejected, as is
+    /// setting this alongside `host`. The enforcing seam is the CLI's
+    /// `ResolvedFleet::resolve` — the only validation a deploy actually calls;
+    /// [`validate`](Self::validate) mirrors the same rules so the two never
+    /// disagree about what a valid `[deploy]` table looks like.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 
     /// SSH user to connect as. Default: `"root"`.
     #[serde(default = "default_deploy_user")]
@@ -1352,12 +1432,37 @@ pub struct DeployConfig {
     /// the historical HTTP-only behavior. See [`DeployTlsConfig`].
     #[serde(default)]
     pub tls: DeployTlsConfig,
+
+    /// Whether `autumn deploy` may PREPARE the target host by installing the
+    /// reverse-proxy binary when the host has none. Default: `true` (issue #1607,
+    /// AC-1 — the documented target-host precondition is at most a stock Ubuntu
+    /// LTS with SSH access, so the command performs the remaining host preparation
+    /// itself).
+    ///
+    /// Probe-gated and idempotent: a host that already has a working proxy binary
+    /// is never touched, and a binary that responds but whose CLI surface has
+    /// drifted is never replaced (that stays a hard, actionable refusal).
+    ///
+    /// Set to `false` when you provision the proxy yourself — a pinned internal
+    /// build, your own package, or a host you do not want a container runtime
+    /// installed on. A missing binary is then an actionable deploy failure instead
+    /// of something the deploy fixes.
+    #[serde(default = "default_deploy_install_proxy")]
+    pub install_proxy: bool,
+}
+
+/// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
+const fn default_deploy_install_proxy() -> bool {
+    true
 }
 
 impl Default for DeployConfig {
     fn default() -> Self {
         Self {
             host: None,
+            // #1621: empty, so an existing single-host `[deploy]` table (and the
+            // type default) is byte-for-byte unchanged.
+            hosts: Vec::new(),
             user: default_deploy_user(),
             ssh_port: default_deploy_ssh_port(),
             app_name: None,
@@ -1367,6 +1472,7 @@ impl Default for DeployConfig {
             keep_releases: default_deploy_keep_releases(),
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
+            install_proxy: default_deploy_install_proxy(),
         }
     }
 }
@@ -1378,18 +1484,75 @@ impl DeployConfig {
     /// this rejects a missing or blank `host` with an actionable message so the
     /// operator knows exactly which key to set.
     ///
+    /// Since #1621 it also mirrors the fleet rules the CLI's
+    /// `ResolvedFleet::resolve` enforces — `host`/`hosts` mutual exclusion, no
+    /// blank entry, no duplicate entry — in the same order, so the two surfaces
+    /// never disagree about what a valid `[deploy]` table looks like.
+    ///
+    /// **This method has no production call site** (it is not reached from
+    /// [`AutumnConfig::validate`]); the CLI's resolve step is the enforcing seam.
+    /// Keep the rules here in sync anyway: a future wiring must not change
+    /// behavior.
+    ///
     /// # Errors
     ///
-    /// Returns a message when `host` is unset or empty.
+    /// Returns a message when `host` and `hosts` are both set, when a `hosts`
+    /// entry is blank or duplicated, or when neither key provides a target.
     pub fn validate(&self) -> Result<(), String> {
-        match self.host.as_deref() {
-            Some(host) if !host.trim().is_empty() => Ok(()),
-            _ => Err(
-                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
-                      autumn.toml to the SSH-reachable hostname or IP of your server"
+        let host = self
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty());
+
+        // 1. Mutual exclusion: with both spellings set the rollout order is
+        //    ambiguous, so name BOTH keys and let the operator pick one.
+        if host.is_some() && !self.hosts.is_empty() {
+            return Err(
+                "[deploy] host and [deploy] hosts are mutually exclusive: keep the \
+                 single-server `[deploy] host = \"<address>\"` or the fleet list \
+                 `[deploy] hosts = [\"<address>\", …]` in autumn.toml, not both (#1621)"
                     .to_owned(),
-            ),
+            );
         }
+
+        // 2. A blank entry would resolve to a hostless SSH target mid-rollout.
+        for (index, entry) in self.hosts.iter().enumerate() {
+            if entry.trim().is_empty() {
+                return Err(format!(
+                    "[deploy] hosts entry {index} is blank: every fleet entry must be an \
+                     SSH-reachable hostname or IP (#1621)"
+                ));
+            }
+        }
+
+        // 3. A duplicate would deploy the same server twice — the second pass sees
+        //    its own new release as live and corrupts the previous-release chain a
+        //    rollback depends on. Compared after trimming; DNS aliases are a
+        //    documented limitation.
+        let mut seen: Vec<&str> = Vec::with_capacity(self.hosts.len());
+        for entry in &self.hosts {
+            let trimmed = entry.trim();
+            if seen.contains(&trimmed) {
+                return Err(format!(
+                    "[deploy] hosts lists `{trimmed}` more than once: each fleet host must \
+                     appear exactly once (#1621)"
+                ));
+            }
+            seen.push(trimmed);
+        }
+
+        // 4. Neither spelling provides a target.
+        if host.is_none() && self.hosts.is_empty() {
+            return Err(
+                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
+                      autumn.toml to the SSH-reachable hostname or IP of your server, or \
+                      `[deploy] hosts = [\"<address>\", …]` for a fleet (#1621)"
+                    .to_owned(),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -1547,6 +1710,99 @@ const fn default_reporting_enabled() -> bool {
 #[cfg(feature = "reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
+}
+
+/// Deterministic replay capsule settings (`[failure_capture]` section in
+/// `autumn.toml`, issue #1598).
+///
+/// # Example `autumn.toml`
+///
+/// ```toml
+/// [failure_capture]
+/// enabled = true                  # record capsules for failing requests (default: false)
+/// dir = "tmp/autumn-capsules"     # where capsules are written (project-relative)
+/// max_body_bytes = 65536          # largest request body copied into a capsule
+/// max_capsule_bytes = 1048576     # effect budget before a capsule is marked truncated
+/// max_capsules = 50               # retained capsules; oldest are pruned
+/// ```
+///
+/// **A capsule holds real production request data and real database rows.**
+/// Sensitive headers, query parameters and structured body fields are masked
+/// through `[log] filter_parameters`, but unstructured bodies, URL paths and
+/// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
+/// this outside development.
+#[cfg(feature = "reporting")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailureCaptureConfig {
+    /// Whether failing requests are recorded as capsules.
+    ///
+    /// Defaults to `false` — capture costs a teed request body and a
+    /// teed database stream on every request, and the artifacts contain
+    /// production data.
+    #[serde(default = "default_failure_capture_enabled")]
+    pub enabled: bool,
+
+    /// Directory capsules are written to, project-relative by default
+    /// (mirroring `tmp/autumn-maintenance.json`).
+    #[serde(default = "default_failure_capture_dir")]
+    pub dir: String,
+
+    /// Largest request body copied into a capsule, in bytes.
+    ///
+    /// A body larger than this is never consumed at all — the handler still
+    /// receives it intact and the capsule records it as skipped.
+    #[serde(default = "default_failure_capture_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    /// Budget for recorded effects before a capsule is marked truncated.
+    ///
+    /// Recording stops at the ceiling; the capsule is still written (so the
+    /// failure is not lost) but replay refuses it.
+    #[serde(default = "default_failure_capture_max_capsule_bytes")]
+    pub max_capsule_bytes: usize,
+
+    /// How many capsules to retain in `dir`; the oldest beyond this are
+    /// pruned after each write so an error storm cannot fill a disk.
+    #[serde(default = "default_failure_capture_max_capsules")]
+    pub max_capsules: usize,
+}
+
+#[cfg(feature = "reporting")]
+impl Default for FailureCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_failure_capture_enabled(),
+            dir: default_failure_capture_dir(),
+            max_body_bytes: default_failure_capture_max_body_bytes(),
+            max_capsule_bytes: default_failure_capture_max_capsule_bytes(),
+            max_capsules: default_failure_capture_max_capsules(),
+        }
+    }
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "reporting")]
+fn default_failure_capture_dir() -> String {
+    "tmp/autumn-capsules".to_owned()
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_body_bytes() -> usize {
+    65_536
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsule_bytes() -> usize {
+    1_048_576
+}
+
+#[cfg(feature = "reporting")]
+const fn default_failure_capture_max_capsules() -> usize {
+    50
 }
 
 /// Developer-experience settings (`[dev]` section in `autumn.toml`).
@@ -1784,6 +2040,307 @@ const fn default_channel_replay_buffer() -> usize {
 
 fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
+}
+
+// ── Cluster configuration ────────────────────────────────────────────────────
+
+/// Embedded self-clustering control plane (`[cluster]` section, issue #1762).
+///
+/// Off by default. When enabled, the node binds a small authenticated gossip
+/// listener, discovers the peers named in `seed_peers`, and exposes a
+/// cluster-wide counter through
+/// [`ClusterHandle`](crate::cluster::ClusterHandle). No external coordination
+/// service is involved — see `docs/guide/clustering.md`.
+///
+/// The transport is **authenticated (HMAC-SHA256), not encrypted**: run it on a
+/// trusted network.
+///
+/// Unrelated to [`crate::sharding`]'s database-"cluster" vocabulary.
+///
+/// # Examples
+///
+/// ```toml
+/// [cluster]
+/// enabled = true
+/// secret = "a-shared-secret-at-least-16-bytes"
+/// bind_addr = "0.0.0.0:7946"
+/// advertise_addr = "10.0.0.4:7946"
+/// seed_peers = ["10.0.0.5:7946"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    /// Master switch. When `false` (the default) nothing is bound, nothing is
+    /// spawned, and `state.extension::<ClusterHandle>()` is `None`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Shared secret every member signs its frames with (minimum 16 bytes).
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted from
+    /// `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
+    #[serde(default)]
+    pub secret: Option<secrecy::SecretString>,
+
+    /// Cluster name. Signed into every frame, so two clusters that share a
+    /// secret still refuse each other's traffic.
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
+
+    /// Address the cluster listener binds. Port `0` takes an OS-assigned
+    /// ephemeral port, readable back through `ClusterHandle::local_addr`.
+    #[serde(default = "default_cluster_bind_addr")]
+    pub bind_addr: String,
+
+    /// Address advertised to peers when it differs from `bind_addr` (NAT,
+    /// container port mapping). Defaults to the bound address.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+
+    /// Peer addresses to dial on startup. One reachable seed is enough.
+    #[serde(default)]
+    pub seed_peers: Vec<String>,
+
+    /// Explicit node id. Entropy-derived when absent (never hostname-derived).
+    #[serde(default)]
+    pub node_id: Option<String>,
+
+    /// Base interval between state pushes, in milliseconds. The push is also
+    /// the heartbeat, so this is the failure-detector's sampling rate.
+    #[serde(default = "default_cluster_push_interval_ms")]
+    pub push_interval_ms: u64,
+
+    /// How long without a push before a peer is suspected, in milliseconds.
+    /// Must be at least three push intervals (anti-flap hysteresis).
+    #[serde(default = "default_cluster_suspicion_timeout_ms")]
+    pub suspicion_timeout_ms: u64,
+}
+
+fn default_cluster_name() -> String {
+    "autumn".to_owned()
+}
+
+fn default_cluster_bind_addr() -> String {
+    "127.0.0.1:0".to_owned()
+}
+
+const fn default_cluster_push_interval_ms() -> u64 {
+    500
+}
+
+const fn default_cluster_suspicion_timeout_ms() -> u64 {
+    2_500
+}
+
+/// Shortest secret accepted when `[cluster] enabled = true`.
+pub(crate) const MIN_CLUSTER_SECRET_LEN: usize = 16;
+
+/// Shortest push interval accepted, in milliseconds.
+pub(crate) const MIN_CLUSTER_PUSH_INTERVAL_MS: u64 = 10;
+
+/// The suspicion timeout must be at least this many push intervals.
+pub(crate) const MIN_CLUSTER_SUSPICION_MULTIPLE: u64 = 3;
+
+/// Longest `node_id` / `cluster_name` accepted, in bytes.
+///
+/// Both travel in every frame and are covered by the MAC, so the bound keeps
+/// the fixed overhead of a state push small and predictable.
+pub(crate) const MAX_CLUSTER_IDENT_LEN: usize = 64;
+
+/// Separator between node id and incarnation in a counter cell key
+/// (`"{node_id}#{incarnation}"`). Reserved: an id containing it would make
+/// cell keys ambiguous, so validation refuses one.
+pub(crate) const CLUSTER_CELL_KEY_SEPARATOR: char = '#';
+
+/// Validate one identity string (`cluster.node_id`, `cluster.cluster_name`).
+///
+/// `field` is the dotted config path, used verbatim in the message so an
+/// operator can fix the offending key without reading the source.
+fn validate_cluster_ident(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not be empty: it identifies this node (or its cluster) in every frame"
+        )));
+    }
+    let len = value.len();
+    if len > MAX_CLUSTER_IDENT_LEN {
+        return Err(ConfigError::Validation(format!(
+            "{field} must be at most {MAX_CLUSTER_IDENT_LEN} bytes, got {len} ({value:?}); it \
+             travels in every cluster frame and is covered by the MAC"
+        )));
+    }
+    if value.contains(CLUSTER_CELL_KEY_SEPARATOR) {
+        return Err(ConfigError::Validation(format!(
+            "{field} must not contain {CLUSTER_CELL_KEY_SEPARATOR:?} ({value:?}): it separates \
+             the node id from the incarnation in counter cell keys, and an id containing it \
+             would make two different cells collide"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a cluster address, rejecting anything that is not a `host:port` pair
+/// with an IP literal (hostnames are never resolved).
+fn parse_cluster_addr(field: &str, value: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    value.parse::<std::net::SocketAddr>().map_err(|error| {
+        ConfigError::Validation(format!(
+            "{field} must be a socket address of the form host:port with an IP literal \
+             (hostnames are not resolved), got {value:?}: {error}"
+        ))
+    })
+}
+
+/// Reject port `0` on an address somebody has to *dial*.
+///
+/// Port `0` is only meaningful on `bind_addr`, where it means "let the OS pick"
+/// and the node then advertises the port it actually got. Everywhere else it is
+/// undialable: a peer would connect to port 0 and fail forever, and the mistake
+/// looks exactly like a network problem from the other side.
+fn reject_ephemeral_cluster_port(
+    field: &str,
+    value: &str,
+    addr: std::net::SocketAddr,
+) -> Result<(), ConfigError> {
+    if addr.port() == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{field} is {value:?}, which no peer can dial: port 0 means \"any free port\" and is \
+             only meaningful on cluster.bind_addr, where the node advertises the port it was \
+             actually given (see docs/guide/clustering.md)"
+        )));
+    }
+    Ok(())
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: None,
+            cluster_name: default_cluster_name(),
+            bind_addr: default_cluster_bind_addr(),
+            advertise_addr: None,
+            seed_peers: Vec::new(),
+            node_id: None,
+            push_interval_ms: default_cluster_push_interval_ms(),
+            suspicion_timeout_ms: default_cluster_suspicion_timeout_ms(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Fail fast on a `[cluster]` section that would boot an insecure or
+    /// flapping cluster.
+    ///
+    /// Checked when `enabled` — these are about a node that will really bind
+    /// and gossip:
+    /// - `secret` must be present and at least 16 bytes. There is no lenient
+    ///   unauthenticated mode.
+    /// - The address peers are told to dial (`advertise_addr`, or `bind_addr`
+    ///   when it is unset) must not be a wildcard: nobody can dial `0.0.0.0`.
+    ///
+    /// Checked always, enabled or not — a section that is wrong is wrong
+    /// before the switch is flipped:
+    /// - `push_interval_ms` must be at least 10ms.
+    /// - `suspicion_timeout_ms` must be at least 3 × `push_interval_ms`: the
+    ///   anti-flap hysteresis, below which one delayed push evicts a healthy
+    ///   peer.
+    /// - `bind_addr`, `advertise_addr` and every `seed_peers` entry must parse
+    ///   as a [`std::net::SocketAddr`] (IP literal — hostnames are not
+    ///   resolved).
+    /// - `cluster_name`, and `node_id` when set, must be non-empty, at most 64
+    ///   bytes, and free of the `#` counter cell-key separator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] describing the first violated rule.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Operational rules: only meaningful for a node that will actually
+        // bind and gossip.
+        if self.enabled {
+            self.validate_secret()?;
+        }
+
+        if self.push_interval_ms < MIN_CLUSTER_PUSH_INTERVAL_MS {
+            return Err(ConfigError::Validation(format!(
+                "cluster.push_interval_ms must be at least {MIN_CLUSTER_PUSH_INTERVAL_MS}ms, \
+                 got {}",
+                self.push_interval_ms
+            )));
+        }
+        // Saturating: a push interval near u64::MAX would overflow the
+        // multiply, and an overflow must not turn into an accidental pass.
+        let min_suspicion = self
+            .push_interval_ms
+            .saturating_mul(MIN_CLUSTER_SUSPICION_MULTIPLE);
+        if self.suspicion_timeout_ms < min_suspicion {
+            return Err(ConfigError::Validation(format!(
+                "cluster.suspicion_timeout_ms ({}) must be at least \
+                 {MIN_CLUSTER_SUSPICION_MULTIPLE}x cluster.push_interval_ms ({}), i.e. at least \
+                 {min_suspicion}ms: below that ratio one delayed push evicts a healthy peer and \
+                 the view flaps",
+                self.suspicion_timeout_ms, self.push_interval_ms
+            )));
+        }
+
+        validate_cluster_ident("cluster.cluster_name", &self.cluster_name)?;
+        if let Some(node_id) = self.node_id.as_deref() {
+            validate_cluster_ident("cluster.node_id", node_id)?;
+        }
+
+        // `bind_addr` may keep port 0 — that is the documented "ephemeral bind"
+        // spelling, read back through `ClusterHandle::local_addr`.
+        let bind_addr = parse_cluster_addr("cluster.bind_addr", &self.bind_addr)?;
+        let advertise_addr = match self.advertise_addr.as_deref() {
+            Some(addr) => {
+                let parsed = parse_cluster_addr("cluster.advertise_addr", addr)?;
+                reject_ephemeral_cluster_port("cluster.advertise_addr", addr, parsed)?;
+                parsed
+            }
+            None => bind_addr,
+        };
+        for (index, peer) in self.seed_peers.iter().enumerate() {
+            let field = format!("cluster.seed_peers[{index}]");
+            let parsed = parse_cluster_addr(&field, peer)?;
+            reject_ephemeral_cluster_port(&field, peer, parsed)?;
+        }
+
+        // A wildcard bind is legal, advertising one is not: peers copy the
+        // advertised address out of the pushed state and dial it verbatim.
+        if self.enabled && advertise_addr.ip().is_unspecified() {
+            let source = if self.advertise_addr.is_some() {
+                "cluster.advertise_addr"
+            } else {
+                "cluster.bind_addr"
+            };
+            return Err(ConfigError::Validation(format!(
+                "{source} advertises {advertise_addr}, which no peer can dial: binding a \
+                 wildcard address is fine, but it requires an explicit, non-wildcard \
+                 cluster.advertise_addr (see docs/guide/clustering.md)"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// The shared HMAC key: required, and long enough to be a key.
+    fn validate_secret(&self) -> Result<(), ConfigError> {
+        let Some(secret) = self.secret.as_ref() else {
+            return Err(ConfigError::Validation(
+                "cluster.secret is required when cluster.enabled = true: the cluster transport \
+                 is authenticated (HMAC-SHA256) and has no unauthenticated mode — set it with \
+                 AUTUMN_CLUSTER__SECRET"
+                    .to_owned(),
+            ));
+        };
+        let len = secrecy::ExposeSecret::expose_secret(secret).len();
+        if len < MIN_CLUSTER_SECRET_LEN {
+            return Err(ConfigError::Validation(format!(
+                "cluster.secret must be at least {MIN_CLUSTER_SECRET_LEN} bytes, got {len}: a \
+                 short shared key is a guessable one, and every member signs every frame with it"
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ── Cache configuration ──────────────────────────────────────────────────────
@@ -3651,15 +4208,18 @@ impl AutumnConfig {
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         self.time_zone.validate()?;
+        // Fail fast on an insecure or flapping [cluster] section: a node that
+        // would boot without a shared secret must not boot at all.
+        self.cluster.validate()?;
         // Session backend validation deliberately lives in
-        // `crate::session::apply_session_layer`, not here. That function
+        // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
         // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
         // `session.backend = "redis"` config without a redis URL doesn't
         // need to fail the boot. Validating the same thing here would
         // defeat the override and exit the app before the custom store
         // ever gets a chance to apply. The "prod profile + memory backend"
-        // warning lives in `apply_session_layer` for the same reason.
+        // warning lives in `build_session_layer` for the same reason.
         Ok(())
     }
 
@@ -3684,6 +4244,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
     /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE` -> `database.auto_migrate` (`Option<bool>`)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
@@ -3706,6 +4267,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
+    /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
@@ -3724,6 +4286,17 @@ impl AutumnConfig {
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` -> `security.webhooks.replay.redis.url` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` -> `security.webhooks.replay.redis.key_prefix` (`String`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` -> `security.webhooks.replay.allow_memory_in_production` (`bool`)
+    ///
+    /// # Cluster
+    /// - `AUTUMN_CLUSTER__ENABLED` → `cluster.enabled` (`bool`)
+    /// - `AUTUMN_CLUSTER__SECRET` → `cluster.secret` (`SecretString`)
+    /// - `AUTUMN_CLUSTER__CLUSTER_NAME` → `cluster.cluster_name` (`String`)
+    /// - `AUTUMN_CLUSTER__BIND_ADDR` → `cluster.bind_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__ADVERTISE_ADDR` → `cluster.advertise_addr` (`String`)
+    /// - `AUTUMN_CLUSTER__SEED_PEERS` → `cluster.seed_peers` (comma-separated addresses)
+    /// - `AUTUMN_CLUSTER__NODE_ID` → `cluster.node_id` (`String`)
+    /// - `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` → `cluster.push_interval_ms` (`u64`)
+    /// - `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` → `cluster.suspicion_timeout_ms` (`u64`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -3753,6 +4326,8 @@ impl AutumnConfig {
         self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
+        #[cfg(feature = "reporting")]
+        self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         self.apply_backup_env_overrides_with_env(env);
@@ -3764,6 +4339,43 @@ impl AutumnConfig {
         self.apply_time_zone_env_overrides_with_env(env);
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
+        self.apply_cluster_env_overrides_with_env(env);
+    }
+
+    fn apply_cluster_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_CLUSTER__ENABLED", &mut self.cluster.enabled);
+        parse_env_option_secret(env, "AUTUMN_CLUSTER__SECRET", &mut self.cluster.secret);
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__CLUSTER_NAME",
+            &mut self.cluster.cluster_name,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_CLUSTER__BIND_ADDR",
+            &mut self.cluster.bind_addr,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_CLUSTER__ADVERTISE_ADDR",
+            &mut self.cluster.advertise_addr,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CLUSTER__SEED_PEERS",
+            &mut self.cluster.seed_peers,
+        );
+        parse_env_option_string(env, "AUTUMN_CLUSTER__NODE_ID", &mut self.cluster.node_id);
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__PUSH_INTERVAL_MS",
+            &mut self.cluster.push_interval_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS",
+            &mut self.cluster.suspicion_timeout_ms,
+        );
     }
 
     fn apply_tenancy_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3933,6 +4545,35 @@ impl AutumnConfig {
             env,
             "AUTUMN_REPORTING__SAMPLE_RATE",
             &mut self.reporting.sample_rate,
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__ENABLED",
+            &mut self.failure_capture.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__DIR",
+            &mut self.failure_capture.dir,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES",
+            &mut self.failure_capture.max_body_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES",
+            &mut self.failure_capture.max_capsule_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES",
+            &mut self.failure_capture.max_capsules,
         );
     }
 
@@ -4152,6 +4793,11 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__STARTUP_WAIT_SECS",
             &mut self.database.startup_wait_secs,
         );
+        parse_env_option_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE",
+            &mut self.database.auto_migrate,
+        );
         parse_env_bool(
             env,
             "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
@@ -4291,6 +4937,7 @@ impl AutumnConfig {
             &mut self.health.startup_path,
         );
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+        parse_env_bool(env, "AUTUMN_HEALTH__ENABLED", &mut self.health.enabled);
     }
 
     fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -4986,8 +5633,7 @@ impl AutumnConfig {
         let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
         let auto_upload_truthy = env
             .var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
-            .ok()
-            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
         if self.backup.offsite.is_none() && !has_dest_key && !auto_upload_truthy {
             return;
         }
@@ -5892,6 +6538,7 @@ fn is_sqlite_target(s: &str) -> bool {
 /// | `replica_pool_size` | `None` |
 /// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate` | `None` |
 /// | `auto_migrate_in_production` | `false` |
 /// | `shards` | `[]` |
 ///
@@ -5988,8 +6635,28 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub startup_wait_secs: u64,
 
-    /// When true, permits automatic migration application while running with
-    /// `prod`/`production` profile. Default: `false`.
+    /// Profile-agnostic explicit override for startup migration auto-apply
+    /// (issue #1903). `None` (the default, when the key is absent) leaves the
+    /// decision to convention: `dev`/`development` auto-apply, every other
+    /// profile (`prod`/`production` **and** custom names like `fly`/`staging`)
+    /// is opt-in. `Some(true)` / `Some(false)` overrides that convention on
+    /// **any** profile.
+    ///
+    /// This supersedes [`Self::auto_migrate_in_production`], which is retained
+    /// as a back-compat alias: when `auto_migrate` is unset but
+    /// `auto_migrate_in_production = true`, auto-apply is enabled on any
+    /// non-`dev` profile (so a custom-profile operator's existing config finally
+    /// takes effect). `auto_migrate` wins when both are set.
+    ///
+    /// Override via `AUTUMN_DATABASE__AUTO_MIGRATE`.
+    #[serde(default)]
+    pub auto_migrate: Option<bool>,
+
+    /// Back-compat alias for [`Self::auto_migrate`] (issue #1903). When `true`,
+    /// permits automatic migration application on any non-`dev` profile (not
+    /// just `prod`/`production` — the old name-gated behavior silently skipped
+    /// custom profiles). Default: `false`. Prefer setting `auto_migrate`
+    /// directly; this key is honored only when `auto_migrate` is unset.
     ///
     /// Keep this disabled for multi-replica production fleets and use an
     /// explicit migration job (`autumn migrate`) instead.
@@ -6673,6 +7340,7 @@ impl TelemetryProtocol {
 /// use autumn_web::config::HealthConfig;
 ///
 /// let health = HealthConfig::default();
+/// assert!(health.enabled);
 /// assert_eq!(health.path, "/health");
 /// assert_eq!(health.live_path, "/live");
 /// assert_eq!(health.ready_path, "/ready");
@@ -6681,6 +7349,13 @@ impl TelemetryProtocol {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
+    /// When `true` (the default), the framework auto-mounts the built-in
+    /// probe endpoints (health/live/ready/startup). Set to `false` to
+    /// suppress all built-in probes so an app can own those paths entirely
+    /// (or expose none at all). Default: `true` (issue #1971).
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+
     /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
     /// Common alternatives: `"/healthz"`, `"/_health"`.
@@ -6939,8 +7614,14 @@ pub struct CompressionConfig {
 // Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
 #[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
-    const KEYS: [&str; 11] = [
+    // This array is a PRESENCE PROBE gating materialization of the ENTIRE
+    // `[deploy]` table: a key missing from it means an env-only config that sets
+    // only that key produces no deploy section at all — a silent skip, not an
+    // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
+    // below MUST appear here.
+    const KEYS: [&str; 13] = [
         "AUTUMN_DEPLOY__HOST",
+        "AUTUMN_DEPLOY__HOSTS",
         "AUTUMN_DEPLOY__USER",
         "AUTUMN_DEPLOY__SSH_PORT",
         "AUTUMN_DEPLOY__APP_NAME",
@@ -6951,12 +7632,57 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__PROFILE",
         "AUTUMN_DEPLOY__TLS__ENABLED",
         "AUTUMN_DEPLOY__TLS__HOST",
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
     }
     let deploy = deploy.get_or_insert_with(DeployConfig::default);
+    // #1621 review round 1: `host` and `hosts` are MUTUALLY EXCLUSIVE downstream,
+    // so applying one spelling from the environment on top of the OTHER spelling in
+    // TOML produced a config that refuses every `autumn deploy` subcommand — even
+    // though `AUTUMN_DEPLOY__*` is documented to WIN over TOML. Whether each
+    // spelling was set NON-EMPTY in the environment is therefore captured BEFORE
+    // either is applied, so a non-empty env value can clear the TOML alternate
+    // below.
+    //
+    // "Non-empty" is judged conservatively — a value that is blank AFTER TRIMMING
+    // never clears the other spelling — so the established empty-means-unset
+    // semantics survive: `AUTUMN_DEPLOY__HOST=` / ` ` and `AUTUMN_DEPLOY__HOSTS=` /
+    // `,` / ` , ` are the shape a CI or compose template emits for an unfilled
+    // slot. They say NOTHING about the other spelling. (`parse_env_option_string`
+    // below still applies its own, unchanged, `is_empty()` rule to `host` itself;
+    // trimming here only makes the CLEARING decision stricter, so a whitespace-only
+    // value can never silently drop a configured fleet list.)
+    let env_set_host = env
+        .var("AUTUMN_DEPLOY__HOST")
+        .is_ok_and(|value| !value.trim().is_empty());
+    let env_set_hosts = env
+        .var("AUTUMN_DEPLOY__HOSTS")
+        .is_ok_and(|value| value.split(',').any(|entry| !entry.trim().is_empty()));
     parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
+    // #1621: the fleet host list, as CSV. It REPLACES the whole TOML list (a
+    // fleet-level retarget), matching every other `AUTUMN_DEPLOY__*` override.
+    // Entries are trimmed by `parse_env_csv_non_empty`, which also DROPS blank
+    // segments: `AUTUMN_DEPLOY__HOSTS=` means unset (as `AUTUMN_DEPLOY__HOST=`
+    // does) and a trailing/doubled comma is tolerated, rather than reaching the
+    // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
+    // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
+    parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
+    // Env-over-TOML precedence, applied to the spelling the operator did NOT set:
+    // retargeting a `[deploy] host` project as a fleet (or a `[deploy] hosts`
+    // project at a single server) is a legitimate env override, not a conflict.
+    //
+    // It is deliberately NOT a tie-break: when BOTH env spellings are set
+    // non-empty the rollout order is genuinely ambiguous — an operator error, not a
+    // precedence question — so both survive and the existing mutual-exclusion
+    // refusal (`DeployConfig::validate` / the CLI's `deploy_host_list`) still fires
+    // naming both keys.
+    if env_set_hosts && !env_set_host {
+        deploy.host = None;
+    } else if env_set_host && !env_set_hosts {
+        deploy.hosts.clear();
+    }
     parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
     parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
     parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
@@ -6977,6 +7703,14 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // every other deploy override above.
     parse_env_bool(env, "AUTUMN_DEPLOY__TLS__ENABLED", &mut deploy.tls.enabled);
     parse_env_option_string(env, "AUTUMN_DEPLOY__TLS__HOST", &mut deploy.tls.host);
+    // Host preparation opt-out (#1607). Env wins over TOML, like every other deploy
+    // override above, so a CI pipeline deploying to pre-provisioned hosts can
+    // decline it without editing `autumn.toml`.
+    parse_env_bool(
+        env,
+        "AUTUMN_DEPLOY__INSTALL_PROXY",
+        &mut deploy.install_proxy,
+    );
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -7052,6 +7786,33 @@ fn parse_env_option_bool(env: &dyn Env, key: &str, target: &mut Option<bool>) {
 fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
     if let Ok(val) = env.var(key) {
         *target = val.split(',').map(|s| s.trim().to_owned()).collect();
+    }
+}
+
+/// CSV env override that drops blank segments (issue #1621).
+///
+/// Same shape as [`parse_env_csv`], but an empty/whitespace-only segment is not a
+/// list entry. Two consequences, both deliberate:
+///
+/// * `KEY=` (or `KEY="   "`) means **unset**, i.e. the list is cleared rather than
+///   set to a one-element vector holding a blank string. That is the shape a CI or
+///   compose env template produces for a not-yet-filled-in value, and it matches
+///   [`parse_env_option_string`]'s empty-is-unset rule for the sibling scalar keys
+///   (and `crate::maintenance::flag_file_path_from`'s blank-is-unset rule).
+/// * A trailing or doubled comma — routine in generated env lists — is tolerated
+///   instead of surfacing downstream as a blank entry.
+///
+/// Used only for `AUTUMN_DEPLOY__HOSTS`, whose downstream consumer turns a blank
+/// entry into a hard refusal of every `autumn deploy` subcommand; the other CSV
+/// overrides keep [`parse_env_csv`]'s long-standing behaviour.
+fn parse_env_csv_non_empty(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = val
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
     }
 }
 
@@ -7183,6 +7944,10 @@ const fn default_acme_renew_before_days() -> u32 {
     30
 }
 
+const fn default_health_enabled() -> bool {
+    true
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
 }
@@ -7232,6 +7997,7 @@ impl Default for DatabaseConfig {
             pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
+            auto_migrate: None,
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
@@ -7274,6 +8040,7 @@ impl Default for TelemetryConfig {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
+            enabled: default_health_enabled(),
             path: default_health_path(),
             live_path: default_live_path(),
             ready_path: default_ready_path(),
@@ -9135,7 +9902,7 @@ mod tests {
         // `session.backend_plan(profile)` which returned an error for
         // `backend = "redis"` without `redis.url`, exiting the boot before
         // a `with_session_store(...)` override could apply. Session
-        // backend validation now lives in `apply_session_layer`, which
+        // backend validation now lives in `build_session_layer`, which
         // short-circuits when a custom store is installed. `validate()`
         // is config-shape-only and must accept this combination.
         let mut config = AutumnConfig::default();
@@ -9872,12 +10639,12 @@ slots = ["8194-16383"]
 
     #[test]
     fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
-        // Session backend validation moved to `apply_session_layer` so a
+        // Session backend validation moved to `build_session_layer` so a
         // custom store installed via `AppBuilder::with_session_store(...)`
         // can override an otherwise-invalid backend config without the boot
         // exiting first. `validate()` is config-shape-only now; runtime
         // session selection (and the backend error) lives in
-        // `apply_session_layer`, which short-circuits when a custom store
+        // `build_session_layer`, which short-circuits when a custom store
         // is installed. `crate::session::tests::session_backend_plan_*`
         // still cover the underlying error cases directly on
         // `SessionConfig::backend_plan`.
@@ -10218,6 +10985,405 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert!(!config.reporting.enabled);
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_defaults_are_off() {
+        let config = AutumnConfig::default();
+        assert!(
+            !config.failure_capture.enabled,
+            "capture writes production request data to disk; it must be opt-in"
+        );
+        assert_eq!(config.failure_capture.dir, "tmp/autumn-capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 65_536);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 1_048_576);
+        assert_eq!(config.failure_capture.max_capsules, 50);
+    }
+
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_FAILURE_CAPTURE__ENABLED", "true")
+            .with("AUTUMN_FAILURE_CAPTURE__DIR", "/var/tmp/capsules")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_BODY_BYTES", "1024")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULE_BYTES", "2048")
+            .with("AUTUMN_FAILURE_CAPTURE__MAX_CAPSULES", "5");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.failure_capture.enabled);
+        assert_eq!(config.failure_capture.dir, "/var/tmp/capsules");
+        assert_eq!(config.failure_capture.max_body_bytes, 1024);
+        assert_eq!(config.failure_capture.max_capsule_bytes, 2048);
+        assert_eq!(config.failure_capture.max_capsules, 5);
+    }
+
+    /// Regression guard for the `[failure_capture]` field ordering.
+    ///
+    /// Mirrors `deploy_child_keys_are_strictly_validated`: the strict
+    /// unknown-key validator only descends into a config.rs-internal section
+    /// declared *before* `database`, because `DatabaseConfig`'s
+    /// `deserialize_with` duration field aborts the schema walk. If someone
+    /// moves `failure_capture` below `database`, its child keys silently
+    /// vanish from the schema and this fails.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn failure_capture_child_keys_are_strictly_validated() {
+        let leaves = AutumnConfig::schema_leaf_paths();
+        for key in [
+            "failure_capture.enabled",
+            "failure_capture.dir",
+            "failure_capture.max_body_bytes",
+            "failure_capture.max_capsule_bytes",
+            "failure_capture.max_capsules",
+        ] {
+            assert!(
+                leaves.contains(key),
+                "{key} must be a schema leaf so strict validation descends into \
+                 [failure_capture]; if this fails, the section was likely moved below \
+                 `database` in AutumnConfig"
+            );
+        }
+
+        let schema = AutumnConfig::get_schema_keys();
+        let errors = AutumnConfig::validate_toml("[failure_capture]\nenabledd = true\n", &schema);
+        assert!(
+            errors
+                .iter()
+                .any(|(path, _)| path == "failure_capture.enabledd"),
+            "a bogus [failure_capture] child key must be rejected by strict validation, \
+             got: {errors:?}"
+        );
+    }
+
+    // ── [cluster] (issue #1762) ──────────────────────────────────────────
+
+    /// A cluster with no shared secret is an unauthenticated cluster: anyone
+    /// who can reach the port can inject state. Boot must fail, not warn.
+    #[test]
+    fn cluster_enabled_requires_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = None;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "[cluster] enabled = true with no secret must fail validation, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("secret"),
+            "the error must name the missing key so an operator can fix it; got {message:?}"
+        );
+
+        // Disabled clusters need nothing: the default config must still boot.
+        assert!(
+            AutumnConfig::default().cluster.validate().is_ok(),
+            "a disabled [cluster] section must validate with no secret at all"
+        );
+    }
+
+    #[test]
+    fn cluster_rejects_short_secret() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from("too-short".to_owned()));
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a secret shorter than {MIN_CLUSTER_SECRET_LEN} bytes must be refused, got {result:?}"
+        );
+
+        // …and a long-enough secret must be accepted, or the rule is vacuous.
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a secret of at least {MIN_CLUSTER_SECRET_LEN} bytes must be accepted"
+        );
+    }
+
+    /// Anti-flap hysteresis: a suspicion timeout under three push intervals
+    /// turns one lost packet into a membership change.
+    #[test]
+    fn cluster_rejects_suspicion_below_3x_push_interval() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+        config.cluster.push_interval_ms = 500;
+        config.cluster.suspicion_timeout_ms = 1_000;
+
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "suspicion_timeout_ms must be at least {MIN_CLUSTER_SUSPICION_MULTIPLE}x \
+             push_interval_ms, got {result:?}"
+        );
+
+        config.cluster.suspicion_timeout_ms = 1_500;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MIN_CLUSTER_SUSPICION_MULTIPLE}x the push interval must be accepted"
+        );
+
+        // A push interval below the floor is refused too.
+        config.cluster.push_interval_ms = 1;
+        config.cluster.suspicion_timeout_ms = 3;
+        assert!(
+            config.cluster.validate().is_err(),
+            "push_interval_ms below {MIN_CLUSTER_PUSH_INTERVAL_MS}ms must be refused"
+        );
+    }
+
+    /// Counter cells are keyed `"{node_id}#{incarnation}"`, so a `#` in a node
+    /// id (or a cluster name, which is signed alongside it) makes the key
+    /// ambiguous. Validation refuses it rather than shipping a counter whose
+    /// cells can collide.
+    #[test]
+    fn cluster_rejects_node_id_with_cell_separator() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        config.cluster.node_id = Some("node#1".to_owned());
+        assert!(
+            config.cluster.validate().is_err(),
+            "a node_id containing '#' must be refused: it is the counter cell-key separator"
+        );
+
+        config.cluster.node_id = Some("node-1".to_owned());
+        config.cluster.cluster_name = "orch#ard".to_owned();
+        assert!(
+            config.cluster.validate().is_err(),
+            "a cluster_name containing '#' must be refused for the same reason"
+        );
+
+        config.cluster.cluster_name = "orchard".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and separator-free names must be accepted, or the rule is vacuous"
+        );
+    }
+
+    /// Port `0` means "any free port". That is a legal *bind*, because the node
+    /// advertises the port it was actually given — but it is never a legal
+    /// thing to publish or to dial, and a peer pointed at port 0 fails in a way
+    /// that reads as a network fault rather than as a typo.
+    #[test]
+    fn cluster_rejects_ephemeral_port_where_a_peer_must_dial() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // An ephemeral BIND is the documented default and must keep working.
+        config.cluster.bind_addr = "127.0.0.1:0".to_owned();
+        assert!(
+            config.cluster.validate().is_ok(),
+            "bind_addr with port 0 is the ephemeral-bind spelling and must be accepted"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:0".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit advertise_addr on port 0 must be refused: peers dial it verbatim, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.advertise_addr = Some("10.0.0.4:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a real advertised port must be accepted, or the rule is vacuous"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:0".to_owned()];
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a seed peer on port 0 is equally undialable and must be refused, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.seed_peers[1]"),
+            "the error must name which seed is wrong; got {message:?}"
+        );
+
+        config.cluster.seed_peers = vec!["10.0.0.5:7946".to_owned()];
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and dialable seeds must be accepted"
+        );
+    }
+
+    /// `0.0.0.0` is a bind, never a dial address. A node that gossips it hands
+    /// its peer an address nothing can reach — the one-way cluster the guide's
+    /// "Choosing addresses" section warns about, which then looks exactly like
+    /// a network fault from the other side rather than like the typo it is.
+    #[test]
+    fn cluster_rejects_a_wildcard_advertised_address() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        // A wildcard bind with nothing to advertise: the bound address IS what
+        // peers would be told to dial.
+        config.cluster.bind_addr = "0.0.0.0:7946".to_owned();
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "binding a wildcard with no advertise_addr must be refused: the node \
+             would gossip 0.0.0.0 as its dial address, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.bind_addr"),
+            "the error must name the key the operator has to fix; got {message:?}"
+        );
+
+        // An EXPLICIT wildcard advertise is the same mistake, spelled out.
+        config.cluster.advertise_addr = Some("0.0.0.0:7946".to_owned());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an explicit wildcard advertise_addr must be refused too, got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.advertise_addr"),
+            "…and must blame advertise_addr, not the (legal) wildcard bind; \
+             got {message:?}"
+        );
+
+        // …while a wildcard bind WITH a concrete advertised address — the
+        // documented container spelling — must pass, or the rule is a ban on
+        // the very deployment shape the guide recommends.
+        config.cluster.advertise_addr = Some("10.0.1.7:7946".to_owned());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "0.0.0.0 bind + explicit advertise_addr is the documented spelling \
+             and must be accepted"
+        );
+
+        // The rule is scoped to enabled sections: a disabled one binds nothing.
+        config.cluster.enabled = false;
+        config.cluster.advertise_addr = None;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "a disabled section advertises nothing, so the wildcard rule must \
+             not fire on it"
+        );
+    }
+
+    /// `node_id` and `cluster_name` travel in every frame and are covered by
+    /// the MAC, so the 64-byte cap keeps a push's fixed overhead predictable.
+    #[test]
+    fn cluster_rejects_over_long_idents() {
+        let mut config = AutumnConfig::default();
+        config.cluster.enabled = true;
+        config.cluster.secret = Some(secrecy::SecretString::from(
+            "a-perfectly-adequate-cluster-secret".to_owned(),
+        ));
+
+        let at_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN);
+        let over_cap = "n".repeat(MAX_CLUSTER_IDENT_LEN.saturating_add(1));
+
+        config.cluster.node_id = Some(at_cap.clone());
+        assert!(
+            config.cluster.validate().is_ok(),
+            "exactly {MAX_CLUSTER_IDENT_LEN} bytes must be accepted, or the cap \
+             is off by one"
+        );
+
+        config.cluster.node_id = Some(over_cap.clone());
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "a node_id one byte over {MAX_CLUSTER_IDENT_LEN} must be refused, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.node_id"),
+            "the error must name the offending key; got {message:?}"
+        );
+
+        config.cluster.node_id = Some("node-a".to_owned());
+        config.cluster.cluster_name = over_cap;
+        let result = config.cluster.validate();
+        assert!(
+            result.is_err(),
+            "an over-long cluster_name must be refused for the same reason, \
+             got {result:?}"
+        );
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("cluster.cluster_name"),
+            "…naming cluster_name this time; got {message:?}"
+        );
+
+        config.cluster.cluster_name = at_cap;
+        assert!(
+            config.cluster.validate().is_ok(),
+            "…and a cluster_name at the cap must be accepted, or the rule is vacuous"
+        );
+    }
+
+    #[test]
+    fn cluster_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CLUSTER__ENABLED", "true")
+            .with("AUTUMN_CLUSTER__SECRET", "a-shared-cluster-secret-value")
+            .with("AUTUMN_CLUSTER__CLUSTER_NAME", "orchard")
+            .with("AUTUMN_CLUSTER__BIND_ADDR", "0.0.0.0:7946")
+            .with("AUTUMN_CLUSTER__ADVERTISE_ADDR", "10.0.0.4:7946")
+            .with("AUTUMN_CLUSTER__SEED_PEERS", "10.0.0.5:7946, 10.0.0.6:7946")
+            .with("AUTUMN_CLUSTER__NODE_ID", "node-a")
+            .with("AUTUMN_CLUSTER__PUSH_INTERVAL_MS", "250")
+            .with("AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.cluster.enabled);
+        assert_eq!(
+            config
+                .cluster
+                .secret
+                .as_ref()
+                .map(|s| secrecy::ExposeSecret::expose_secret(s).to_owned()),
+            Some("a-shared-cluster-secret-value".to_owned())
+        );
+        assert_eq!(config.cluster.cluster_name, "orchard");
+        assert_eq!(config.cluster.bind_addr, "0.0.0.0:7946");
+        assert_eq!(
+            config.cluster.advertise_addr.as_deref(),
+            Some("10.0.0.4:7946")
+        );
+        assert_eq!(
+            config.cluster.seed_peers,
+            vec!["10.0.0.5:7946".to_owned(), "10.0.0.6:7946".to_owned()],
+            "AUTUMN_CLUSTER__SEED_PEERS must split on commas and trim"
+        );
+        assert_eq!(config.cluster.node_id.as_deref(), Some("node-a"));
+        assert_eq!(config.cluster.push_interval_ms, 250);
+        assert_eq!(config.cluster.suspicion_timeout_ms, 1_500);
     }
 
     #[test]
@@ -10625,6 +11791,29 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.database.auto_migrate_in_production);
+    }
+
+    #[test]
+    fn database_auto_migrate_defaults_to_none() {
+        // Issue #1903: the profile-agnostic override is unset by default, so the
+        // decision falls to convention (dev on, everything else opt-in).
+        assert_eq!(DatabaseConfig::default().auto_migrate, None);
+    }
+
+    #[test]
+    fn env_override_database_auto_migrate() {
+        // Issue #1903: AUTUMN_DATABASE__AUTO_MIGRATE flips the profile-agnostic
+        // override to an explicit Some(_) on any profile.
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "true");
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.database.auto_migrate, None);
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.auto_migrate, Some(true));
+
+        let env_false = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "false");
+        let mut config_false = AutumnConfig::default();
+        config_false.apply_env_overrides_with_env(&env_false);
+        assert_eq!(config_false.database.auto_migrate, Some(false));
     }
 
     #[test]
@@ -11545,6 +12734,11 @@ path = "/healthz"
         assert_eq!(deploy.service_name, None);
         assert_eq!(deploy.readiness_timeout_secs, 60);
         assert_eq!(deploy.keep_releases, 3);
+        // #1607: host preparation is ON by default, so the documented "target host
+        // precondition is at most a stock Ubuntu LTS" holds for a bare table. A
+        // plain `#[serde(default)]` here would silently deserialize `false` for
+        // every real user while `DeployConfig::default()` stayed `true`.
+        assert!(deploy.install_proxy);
     }
 
     #[test]
@@ -11560,6 +12754,7 @@ path = "/healthz"
             service_name = "myapp-web"
             readiness_timeout_secs = 90
             keep_releases = 5
+            install_proxy = false
             "#,
         )
         .expect("full [deploy] table should parse");
@@ -11572,6 +12767,10 @@ path = "/healthz"
         assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
         assert_eq!(deploy.readiness_timeout_secs, 90);
         assert_eq!(deploy.keep_releases, 5);
+        assert!(
+            !deploy.install_proxy,
+            "the host-prep opt-out parses (#1607)"
+        );
         assert!(deploy.validate().is_ok());
     }
 
@@ -11630,6 +12829,26 @@ path = "/healthz"
         assert_eq!(deploy.keep_releases, 5);
         assert_eq!(deploy.profile, "staging");
         assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_declines_deploy_host_preparation() {
+        // #1607: a CI pipeline deploying to pre-provisioned hosts must be able to
+        // decline host preparation without editing `autumn.toml`. The key is also in
+        // the presence probe, so setting only it materializes `[deploy]` — otherwise
+        // the override would be silently skipped for an env-only config.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__INSTALL_PROXY", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert!(!deploy.install_proxy);
+
+        // …and it wins over TOML, like every other deploy override.
+        let mut from_toml: AutumnConfig =
+            toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
+        from_toml.apply_env_overrides_with_env(&env);
+        assert!(!from_toml.deploy.expect("deploy configured").install_proxy);
     }
 
     #[test]
@@ -11766,6 +12985,395 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.deploy.is_none());
+    }
+
+    // ── deploy fleet hosts (#1621) ────────────────────────────────
+
+    #[test]
+    fn deploy_hosts_list_parses_in_declaration_order_and_defaults_to_empty() {
+        // #1621 (AC-1): `[deploy] hosts` is the fleet spelling of the target
+        // list. Declaration order IS the rollout order, so parsing must preserve
+        // it verbatim, and a `[deploy]` table without the key stays empty so
+        // every pre-#1621 config is unchanged.
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["web-1.example.com", "web-2.example.com", "web-3.example.com"]
+            "#,
+        )
+        .expect("[deploy] hosts list should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+                "web-3.example.com".to_owned(),
+            ],
+            "hosts must parse in declaration order (the documented rollout order), got: {:?}",
+            deploy.hosts
+        );
+        assert_eq!(
+            deploy.host, None,
+            "the fleet spelling must not populate the legacy scalar, got: {:?}",
+            deploy.host
+        );
+
+        let bare: AutumnConfig =
+            toml::from_str("[deploy]\nhost = \"203.0.113.10\"\n").expect("legacy table parses");
+        let bare_deploy = bare.deploy.expect("deploy configured");
+        assert!(
+            bare_deploy.hosts.is_empty(),
+            "a pre-#1621 [deploy] table must resolve to an empty hosts list, got: {:?}",
+            bare_deploy.hosts
+        );
+        assert!(
+            DeployConfig::default().hosts.is_empty(),
+            "the hand-written Default impl must seed an empty hosts list, got: {:?}",
+            DeployConfig::default().hosts
+        );
+    }
+
+    #[test]
+    fn deploy_validate_rejects_host_and_hosts_set_together() {
+        // #1621 (AC-1): `host` and `hosts` are mutually exclusive — with both set
+        // there is no unambiguous rollout order. `DeployConfig::validate` is not
+        // wired into `AutumnConfig::validate` (the CLI's `ResolvedFleet::resolve`
+        // is the enforcing seam), but it must MIRROR the same rules so the two
+        // never disagree about what a valid `[deploy]` table looks like.
+        let cfg = DeployConfig {
+            host: Some("203.0.113.10".to_owned()),
+            hosts: vec!["web-1.example.com".to_owned()],
+            ..DeployConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("host + hosts together must be rejected");
+        assert!(
+            err.contains("[deploy] host") && err.contains("[deploy] hosts"),
+            "the mutual-exclusion error must name BOTH keys so the operator knows \
+             which one to delete, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deploy_validate_rejects_blank_and_duplicate_hosts_entries() {
+        // #1621 (AC-1): a blank entry is a typo that would otherwise resolve to a
+        // hostless SSH target mid-rollout, and a duplicate entry would deploy the
+        // same machine twice (the second pass sees its own new release as live and
+        // corrupts the blue/green previous-release chain).
+        let blank = DeployConfig {
+            hosts: vec!["web-1.example.com".to_owned(), "   ".to_owned()],
+            ..DeployConfig::default()
+        };
+        let blank_err = blank
+            .validate()
+            .expect_err("a blank hosts entry must be rejected");
+        assert!(
+            blank_err.contains("hosts") && blank_err.contains('1'),
+            "the blank-entry error must name `hosts` and the 0-based index, got: {blank_err}"
+        );
+
+        let duplicate = DeployConfig {
+            hosts: vec![
+                "web-1.example.com".to_owned(),
+                " web-1.example.com ".to_owned(),
+            ],
+            ..DeployConfig::default()
+        };
+        let duplicate_err = duplicate
+            .validate()
+            .expect_err("a duplicate hosts entry must be rejected");
+        assert!(
+            duplicate_err.contains("web-1.example.com"),
+            "the duplicate error must name the repeated value, got: {duplicate_err}"
+        );
+
+        let ok = DeployConfig {
+            hosts: vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+            ],
+            ..DeployConfig::default()
+        };
+        assert!(
+            ok.validate().is_ok(),
+            "a well-formed fleet list must validate, got: {:?}",
+            ok.validate()
+        );
+    }
+
+    #[test]
+    fn env_override_materializes_deploy_from_hosts_only() {
+        // #1621: `KEYS` in `apply_deploy_env_overrides` is a PRESENCE PROBE that
+        // gates materialisation of the ENTIRE `[deploy]` table. If
+        // `AUTUMN_DEPLOY__HOSTS` is missing from that array, an env-only fleet
+        // config produces no deploy section at all — a silent skip, not an error,
+        // in both `AutumnConfig::load` and `autumn doctor`. This is the trap test.
+        let env = MockEnv::new().with(
+            "AUTUMN_DEPLOY__HOSTS",
+            "web-1.example.com,web-2.example.com",
+        );
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config
+            .deploy
+            .expect("AUTUMN_DEPLOY__HOSTS alone must materialize the [deploy] table");
+        assert_eq!(
+            deploy.hosts,
+            vec![
+                "web-1.example.com".to_owned(),
+                "web-2.example.com".to_owned(),
+            ],
+            "the CSV env value must parse into the ordered fleet list, got: {:?}",
+            deploy.hosts
+        );
+        // Every other key falls back to its documented default.
+        assert_eq!(deploy.host, None, "got: {:?}", deploy.host);
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+    }
+
+    #[test]
+    fn env_override_hosts_replaces_the_whole_toml_list() {
+        // #1621: `AUTUMN_DEPLOY__HOSTS` is a fleet-level RETARGET — it replaces
+        // the TOML list wholesale rather than appending, matching every other
+        // `AUTUMN_DEPLOY__*` override (env wins).
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["toml-1", "toml-2", "toml-3"]
+            "#,
+        )
+        .expect("[deploy] hosts list should parse");
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", "env-1, env-2");
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec!["env-1".to_owned(), "env-2".to_owned()],
+            "env must REPLACE the TOML fleet list (and trim each entry), got: {:?}",
+            deploy.hosts
+        );
+    }
+
+    #[test]
+    fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
+        // #1621 review finding 13. `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or
+        // compose env template produces for "fill in for a fleet" — exactly what
+        // the sibling `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
+        // unconditionally yielded `[""]`, a NON-empty fleet list holding a blank
+        // string, so a project keeping `[deploy] host` in autumn.toml hard-failed
+        // every `autumn deploy` subcommand (and `autumn doctor`) with "`[deploy]
+        // host` and `[deploy] hosts` are mutually exclusive" — naming a key the
+        // operator never set.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert!(
+                deploy.hosts.is_empty(),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must behave as unset, got: {:?}",
+                deploy.hosts
+            );
+            assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+            assert!(
+                deploy.validate().is_ok(),
+                "a blank fleet override must not trip the mutual-exclusion refusal, got: {:?}",
+                deploy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
+        // #1621 review finding 13. Generated env lists routinely carry a trailing
+        // (or doubled) comma; the blank segment it produces used to reach the CLI
+        // as a blank fleet entry and refuse the whole command. Blank segments are
+        // dropped, so the list is exactly the addresses the operator wrote.
+        for (value, expected) in [
+            ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
+            ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),
+            (" 10.0.0.1 , 10.0.0.2 , ", vec!["10.0.0.1", "10.0.0.2"]),
+        ] {
+            let mut config = AutumnConfig::default();
+            let env = MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", value);
+            config.apply_env_overrides_with_env(&env);
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                expected
+                    .iter()
+                    .map(|h| (*h).to_owned())
+                    .collect::<Vec<String>>(),
+                "AUTUMN_DEPLOY__HOSTS={value:?} must drop blank segments, got: {:?}",
+                deploy.hosts
+            );
+            assert!(
+                deploy.validate().is_ok(),
+                "a tolerated trailing comma must not refuse the fleet, got: {:?}",
+                deploy.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_empty_deploy_host_env_override_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). `host` and `hosts` are MUTUALLY
+        // EXCLUSIVE downstream, so an env override that sets one spelling while the
+        // TOML still holds the other produced a config that refuses every `autumn
+        // deploy` subcommand — even though `AUTUMN_DEPLOY__*` is documented to WIN
+        // over TOML. Retargeting a `[deploy] host` project as a fleet with
+        // `AUTUMN_DEPLOY__HOSTS=a,b` (and the reverse) must simply work.
+        let mut fleet_over_scalar: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            "#,
+        )
+        .expect("[deploy] host should parse");
+        fleet_over_scalar.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", "web-1,web-2"),
+        );
+        let deploy = fleet_over_scalar.deploy.expect("deploy configured");
+        assert_eq!(
+            deploy.hosts,
+            vec!["web-1".to_owned(), "web-2".to_owned()],
+            "the env fleet list must win, got: {:?}",
+            deploy.hosts
+        );
+        assert_eq!(
+            deploy.host, None,
+            "a non-empty AUTUMN_DEPLOY__HOSTS must CLEAR the TOML `host`, got: {:?}",
+            deploy.host
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML retarget must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+
+        let mut scalar_over_fleet: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            hosts = ["toml-1", "toml-2"]
+            "#,
+        )
+        .expect("[deploy] hosts should parse");
+        scalar_over_fleet
+            .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", "single-1"));
+        let deploy = scalar_over_fleet.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("single-1"));
+        assert!(
+            deploy.hosts.is_empty(),
+            "a non-empty AUTUMN_DEPLOY__HOST must CLEAR the TOML `hosts`, got: {:?}",
+            deploy.hosts
+        );
+        assert!(
+            deploy.validate().is_ok(),
+            "env-over-TOML narrowing must not trip mutual exclusion, got: {:?}",
+            deploy.validate()
+        );
+    }
+
+    #[test]
+    fn two_conflicting_non_empty_deploy_host_env_overrides_are_still_refused() {
+        // #1621 review round 1 (Codex 1), the other half: env-over-TOML precedence
+        // is NOT a licence to pick a winner between two conflicting env vars. Both
+        // spellings set NON-EMPTY in the environment is a genuine operator error —
+        // the rollout order is ambiguous — so both survive and the downstream
+        // mutual-exclusion refusal still fires.
+        for toml_src in [
+            "[deploy]\n",
+            "[deploy]\nhost = \"toml-host\"\n",
+            "[deploy]\nhosts = [\"toml-1\"]\n",
+        ] {
+            let mut config: AutumnConfig =
+                toml::from_str(toml_src).expect("[deploy] table should parse");
+            config.apply_env_overrides_with_env(
+                &MockEnv::new()
+                    .with("AUTUMN_DEPLOY__HOST", "env-single")
+                    .with("AUTUMN_DEPLOY__HOSTS", "env-1,env-2"),
+            );
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("env-single"),
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert_eq!(
+                deploy.hosts,
+                vec!["env-1".to_owned(), "env-2".to_owned()],
+                "both env spellings must survive so the conflict is visible ({toml_src:?})"
+            );
+            assert!(
+                deploy.validate().is_err(),
+                "two conflicting NON-EMPTY env spellings must still be refused ({toml_src:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_deploy_host_env_override_never_clears_the_toml_alternate_spelling() {
+        // #1621 review round 1 (Codex 1). The established empty-means-unset
+        // semantics must survive the clearing rule above: `AUTUMN_DEPLOY__HOST=`
+        // and `AUTUMN_DEPLOY__HOSTS=` (the shape a CI/compose template emits for an
+        // unfilled slot) say NOTHING about the alternate spelling, so the TOML value
+        // stands.
+        for blank in ["", "   ", ",", " , "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                host = "203.0.113.10"
+                "#,
+            )
+            .expect("[deploy] host should parse");
+            config
+                .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOSTS", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.host.as_deref(),
+                Some("203.0.113.10"),
+                "AUTUMN_DEPLOY__HOSTS={blank:?} must not clear the TOML `host`"
+            );
+            assert!(deploy.hosts.is_empty());
+        }
+
+        for blank in ["", "   "] {
+            let mut config: AutumnConfig = toml::from_str(
+                r#"
+                [deploy]
+                hosts = ["toml-1", "toml-2"]
+                "#,
+            )
+            .expect("[deploy] hosts should parse");
+            config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", blank));
+            let deploy = config.deploy.expect("deploy configured");
+            assert_eq!(
+                deploy.hosts,
+                vec!["toml-1".to_owned(), "toml-2".to_owned()],
+                "AUTUMN_DEPLOY__HOST={blank:?} must not clear the TOML `hosts`"
+            );
+        }
+        // `AUTUMN_DEPLOY__HOST=` (truly empty) keeps its own documented
+        // clears-the-scalar meaning — the clearing rule above changes nothing here.
+        let mut config = AutumnConfig {
+            deploy: Some(DeployConfig {
+                host: Some("toml-host".to_owned()),
+                ..DeployConfig::default()
+            }),
+            ..AutumnConfig::default()
+        };
+        config.apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_DEPLOY__HOST", ""));
+        assert_eq!(config.deploy.expect("deploy configured").host, None);
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────
@@ -13135,6 +14743,24 @@ path = "/healthz"
         config.health.detailed = true;
         config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn health_enabled_defaults_true() {
+        // Issue #1971: the probe off-switch is opt-in — enabled by default so
+        // behavior is byte-identical to before the field existed.
+        assert!(HealthConfig::default().enabled);
+    }
+
+    #[test]
+    fn env_override_health_enabled_false() {
+        // Issue #1971: AUTUMN_HEALTH__ENABLED=false flips the built-in probe
+        // off-switch via env, mirroring the AUTUMN_HEALTH__DETAILED wiring.
+        let env = MockEnv::new().with("AUTUMN_HEALTH__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        assert!(config.health.enabled); // starts true (default)
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.health.enabled);
     }
 
     #[test]

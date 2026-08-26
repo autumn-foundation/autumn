@@ -234,6 +234,26 @@ pub(super) fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Navigation",
+            "Locale switcher",
+            {
+                use autumn_web::widgets::{locale_switcher, localized_path};
+
+                maud::html! {
+                    p { "Current page: " code { "/posts" } }
+                    (locale_switcher(
+                        "/posts",
+                        "en",
+                        &["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+                    ))
+                    p class="text-xs text-stone-500" {
+                        "Each link is built with " code { "localized_path" }
+                        " — e.g. " code { (localized_path("/posts", "es")) }
+                    }
+                }
+            }
+        },
+        story! {
             "Marketing",
             "Hero",
             {
@@ -428,6 +448,187 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     None,
                     None,
                 )
+            }
+        },
+        story! {
+            "Display",
+            "Comment thread",
+            {
+                use autumn_web::widgets::{CommentThread, CommentView, comment_dom_id, comment_thread};
+
+                // The view half of `#[commentable]`. The router hands back a
+                // nested thread; this renders it with an inline reply form per
+                // node. Plain POST forms, swapped in place by htmx when it is
+                // present and a full page load when it is not.
+                let thread = vec![
+                    CommentView {
+                        id: 7,
+                        author: "ada".to_owned(),
+                        body: "Does this nest?".to_owned(),
+                        datetime: Some("2026-08-21T09:30:00Z".to_owned()),
+                        timestamp: "2026-08-21 09:30".to_owned(),
+                        replies: vec![CommentView {
+                            id: 8,
+                            author: "grace".to_owned(),
+                            body: "It does — up to `max_depth`,\nafter which the reply form stops rendering.".to_owned(),
+                            datetime: Some("2026-08-21T09:41:00Z".to_owned()),
+                            timestamp: "2026-08-21 09:41".to_owned(),
+                            replies: Vec::new(),
+                        }],
+                    },
+                    CommentView {
+                        id: 9,
+                        author: "linus".to_owned(),
+                        body: "A second top-level comment.".to_owned(),
+                        datetime: None,
+                        timestamp: String::new(),
+                        replies: Vec::new(),
+                    },
+                ];
+
+                let signed_in = CommentThread::new("comments-post-42", "/comments/Post/42")
+                    .label("Post comments")
+                    .csrf_token("story-token")
+                    .return_to("/posts/42");
+
+                // Anything linking to one comment — a notification, an email —
+                // needs the id the widget actually renders, so the convention
+                // has one definition rather than a copy per caller.
+                let deep_link = comment_dom_id("comments-post-42", 8);
+
+                maud::html! {
+                    (comment_thread(&signed_in, &thread))
+
+                    // Signed out: the thread still reads, the form is replaced
+                    // by a prompt rather than a control that would 401.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-43", "/comments/Post/43")
+                            .label("Signed-out view")
+                            .read_only()
+                            .sign_in_prompt("Log in to comment."),
+                        &thread,
+                    ))
+
+                    // Empty, and a rejected submission re-rendered inline —
+                    // a bare 422 would be swallowed by htmx.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-44", "/comments/Post/44")
+                            .label("Empty and errored")
+                            .empty_text("No comments yet. Start the conversation!")
+                            .csrf_token("story-token")
+                            .error("Comment cannot be empty."),
+                        &[],
+                    ))
+
+                    p class="text-sm text-gray-500" {
+                        "Deep link to the nested reply: #" (deep_link)
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Reaction controls",
+            {
+                use autumn_web::widgets::{ReactionControls, reaction_controls};
+
+                // The view half of `#[votable]`: `react()` returns the new
+                // aggregate and the viewer's own reaction, which is all this
+                // widget needs. Plain POST forms, upgraded in place by htmx.
+                maud::html! {
+                    // Sum mode -- signed up/down votes. The viewer has already
+                    // upvoted, so the up arrow renders as a pressed toggle.
+                    (reaction_controls(
+                        &ReactionControls::votes(
+                            "votes-42",
+                            "/posts/42/upvote",
+                            "/posts/42/downvote",
+                        )
+                        .aggregate(7)
+                        .current(Some(1))
+                        .label("Post score"),
+                    ))
+                    // Count mode -- one membership toggle, not yet pressed.
+                    (reaction_controls(
+                        &ReactionControls::likes("likes-42", "/posts/42/like")
+                            .aggregate(3)
+                            .label("Likes"),
+                    ))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Bulk actions",
+            {
+                use autumn_web::widgets::{
+                    BulkActionsConfig, Column, DataTableConfig, bulk_actions_form,
+                    bulk_actions_toolbar, bulk_select_checkbox, data_table,
+                };
+
+                struct Post {
+                    id: i64,
+                    title: &'static str,
+                }
+                let rows = vec![
+                    Post { id: 1, title: "First post" },
+                    Post { id: 2, title: "Second post" },
+                ];
+
+                // `action` is the bulk endpoint -- `paths::bulk_delete()` in a
+                // scaffolded app. The flow is entirely unscripted, so it works
+                // with JavaScript disabled.
+                let config = BulkActionsConfig::new("/posts/bulk_delete");
+
+                // The checkbox goes in the row's first cell, so every row can be
+                // selected. Each one submits as a repeated `ids=<id>` pair.
+                let columns: Vec<Column<Post>> = vec![
+                    Column::new("", |row: &Post| {
+                        maud::html! { (bulk_select_checkbox(row.id, &config)) }
+                    }),
+                    Column::new("Title", |row: &Post| maud::html! { (row.title) }),
+                ];
+
+                // A second bulk action, driving a hand-rolled list instead of a
+                // `data_table`. `bulk_actions_form` already appends a toolbar, so
+                // `bulk_actions_toolbar` is called directly only here, where the
+                // surrounding <form> is hand-built -- a bare toolbar outside any
+                // form would render a submit button that does nothing.
+                let archive = BulkActionsConfig::new("/posts/bulk_archive")
+                    .submit_label("Archive selected");
+
+                maud::html! {
+                    // Page furniture stays OUTSIDE the form -- anything inside is
+                    // submitted along with the selection.
+                    a href="/posts/new" { "New Post" }
+                    (bulk_actions_form(
+                        &config,
+                        Some("demo-csrf-token"),
+                        None,
+                        Some("demo-submit-token"),
+                        None,
+                        maud::html! {
+                            (data_table(&rows, &columns, &DataTableConfig::new("No posts yet.")))
+                        },
+                    ))
+                    form method="post" action="/posts/bulk_archive" class="autumn-bulk-form" {
+                        // Hand-built forms carry the same hidden fields
+                        // `bulk_actions_form` emits, and for the same reason: both
+                        // lead the body, ahead of the checkboxes, because
+                        // `SubmitTokenLayer` only scans its first chunk.
+                        input type="hidden" name="_submit_token" value="demo-archive-token";
+                        input type="hidden" name="_csrf" value="demo-csrf-token";
+                        ul {
+                            @for row in &rows {
+                                li {
+                                    (bulk_select_checkbox(row.id, &archive))
+                                    " " (row.title)
+                                }
+                            }
+                        }
+                        (bulk_actions_toolbar(&archive))
+                    }
+                }
             }
         },
     ]

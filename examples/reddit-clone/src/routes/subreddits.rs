@@ -8,10 +8,11 @@ use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::NewSubreddit;
+use crate::models::{NewSubreddit, Subreddit, SubredditComments as _};
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::users;
-use crate::slugify::slugify;
+use autumn_web::slugify;
+use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 
 use super::layout::{layout, time_ago};
 
@@ -183,6 +184,9 @@ pub async fn show(
     Path(slug): Path<String>,
     session: Session,
     csrf: CsrfToken,
+    // Same as the post detail page: the widget's hidden input must be named
+    // whatever `security.csrf.form_field` configured, or the first submit 403s.
+    csrf_field: CsrfFormField,
     repo: PgSubredditRepository,
     mut db: Db,
     flash: Flash,
@@ -212,6 +216,45 @@ pub async fn show(
             ))
             .load(&mut *db)
             .await?;
+
+    // Release this request's pooled connection before the comment read. The
+    // repository helper takes its OWN connection from the pool -- it does not
+    // join an enclosing `Db` checkout -- so holding both across the await lets
+    // `pool_size` concurrent requests each pin one connection while waiting for
+    // a second that can never arrive. Every route that pairs a `Db` query with
+    // a repository helper has to drop first; the post-detail route does the
+    // same a few lines above its own `comment_thread` call.
+    drop(db);
+
+    // AC5 of #1367, in full: `Subreddit` is the SECOND commentable model, and
+    // this is *all* it took -- the `#[commentable]` attribute on the model, its
+    // `comment_count` column, and these few lines of rendering. No comments
+    // table of its own, no route, no threading query: the framework router
+    // `main.rs` already mounts for `Post` serves this too, keyed on
+    // `Subreddit::COMMENTABLE_TYPE`.
+    let thread = repo.comment_thread(sub.id).await?;
+    let comments_config = autumn_web::commentable::CommentsConfig::default();
+    let mut comment_config = CommentThread::from_spec(
+        autumn_web::commentable::thread_dom_id(Subreddit::COMMENTABLE_TYPE, sub.id),
+        autumn_web::commentable::thread_action(
+            &comments_config,
+            Subreddit::COMMENTABLE_TYPE,
+            sub.id,
+        ),
+        Subreddit::commentable_spec(),
+    )
+    .label("Community discussion")
+    .empty_text("No community discussion yet.")
+    .return_to(__autumn_path_show(&sub.slug));
+    if current_user.is_some() {
+        comment_config = comment_config
+            .csrf_token(csrf.token())
+            .csrf_field(csrf_field.0.clone());
+    } else {
+        comment_config = comment_config
+            .read_only()
+            .sign_in_prompt("Log in to join the discussion.");
+    }
 
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
@@ -252,7 +295,10 @@ pub async fn show(
                         div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                             div class="flex items-start gap-3 p-4" {
                                 // Vote controls
-                                (super::layout::vote_controls(*post_id, *score))
+                                // Feed: `None` current (see the front page) —
+                                // no per-row `reaction_of` lookup. The CSRF
+                                // token is threaded so the no-JS form POSTs.
+                                (super::layout::vote_controls(*post_id, *score, None, Some(&csrf)))
 
                                 // Post info
                                 div class="flex-1 min-w-0" {
@@ -281,6 +327,16 @@ pub async fn show(
                         "No posts yet. Be the first!"
                     }
                 }
+            }
+
+            // Community discussion -- the second `#[commentable]` model (#1367).
+            div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mt-6" {
+                // No count, for the same reason as the post detail page: an
+                // htmx reply swaps only the widget's own region, so a number
+                // rendered outside it would go stale the moment someone
+                // replies.
+                h2 class="font-semibold text-gray-700 mb-2" { "Community discussion" }
+                (comment_thread(&comment_config, &CommentView::from_thread(&thread)))
             }
         },
     ))

@@ -103,10 +103,83 @@ CRATES=(
   autumn-admin-plugin
   autumn-storage-s3
   autumn-cache-redis
+  autumn-search
 )
 
 breaking_failures=0
 tool_failures=0
+
+# Classify ONE cargo-semver-checks invocation and record its verdict.
+#
+# autumn-web runs two independent passes (Postgres and SQLite surfaces), and
+# each must be classified on its OWN output. Concatenating them and running this
+# chain once lets a skip-worthy signal from one pass mask a real break in the
+# other — e.g. the SQLite pass hitting the handled upstream `time` E0119 while
+# the Postgres pass reports "checks failed" would match the E0119 SKIP branch
+# first and wave the break through. The branches below are ordered by
+# specificity, not severity, so that precedence bug is structural: the fix is to
+# never hand this function more than one pass's output.
+#
+# Args: $1 crate, $2 pass label (empty for single-pass crates), $3 exit code,
+# $4 captured output. Increments the global `breaking_failures` /
+# `tool_failures` counters.
+classify_semver_pass() {
+  local crate="$1" pass_label="$2" pass_exit_code="$3" pass_output="$4"
+  echo "$pass_output"
+
+  if [[ $pass_exit_code -eq 0 ]]; then
+    echo "  PASS: $crate$pass_label API is semver-compatible with crates.io baseline"
+  elif echo "$pass_output" | grep -q "no crates with library targets selected"; then
+    # Proc-macro or binary-only crate — no public API surface to semver-check.
+    echo "  SKIP: $crate$pass_label has no library targets (proc-macro or binary)"
+  elif echo "$pass_output" | grep -q "not found in registry"; then
+    # Crate has never been published on crates.io; nothing to compare against.
+    echo "  SKIP: $crate$pass_label not yet published on crates.io"
+  elif echo "$pass_output" | grep -qE "error\[E0282\]" && echo "$pass_output" | grep -q "aws-runtime"; then
+    # aws-runtime has a type-inference regression (E0282) on Rust 1.92.x that
+    # affects every published version of the crate.  This is an upstream bug
+    # unrelated to our public API surface; skip rather than hard-fail so the
+    # gate remains actionable for real semver breaks.
+    echo "  SKIP: $crate$pass_label — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
+  elif echo "$pass_output" | grep -qE "error\[E0119\]" && echo "$pass_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
+    # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
+    # coherence (E0119) in downstream crates with their own blanket From
+    # impls — bollard 0.20.x, aws-smithy-types 1.4.x, and ratatui-widgets
+    # are all affected. The isolated workspace used by cargo-semver-checks
+    # resolves time fresh, so it picks up the broken release even though
+    # the workspace pins time below it (<0.3.48). Upstream breakage, not a
+    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
+    # crates ship releases compatible with it.
+    echo "  SKIP: $crate$pass_label — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
+  elif echo "$pass_output" | grep -qE "checks failed|semver requires"; then
+    # Exit 1 with semver-violation output → actual breaking API changes found.
+    # Allow them through only when BOTH conditions hold:
+    #   1. A migration guide exists (explicit acknowledgement).
+    #   2. The version bump type permits breaking changes per release policy
+    #      (post-1.0 major bump X.0.0, or pre-1.0 minor bump 0.Y.0).
+    # A patch release or a post-1.0 minor release must never break even if a
+    # migration stub is present, to prevent an accidental regression slipping
+    # through because an old migration document was lying around.
+    if [[ -f "$migration_guide" ]] && is_breaking_release_type; then
+      echo "  ADVISORY: $crate$pass_label has breaking API changes; intentional — migration guide found at $migration_guide"
+    elif [[ -f "$migration_guide" ]]; then
+      echo "  FAIL: $crate$pass_label has breaking API changes but $workspace_version is a patch/minor release." >&2
+      echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
+      breaking_failures=$((breaking_failures + 1))
+    else
+      echo "  FAIL: $crate$pass_label has unacknowledged breaking API changes." >&2
+      echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
+      echo "        or fix the API regression before releasing." >&2
+      breaking_failures=$((breaking_failures + 1))
+    fi
+  else
+    # Exit 1 with unrecognised output → tool/invocation error (compilation
+    # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
+    # error is investigated rather than silently skipped.
+    echo "  FAIL: $crate$pass_label — cargo-semver-checks failed with an unexpected error (exit $pass_exit_code)." >&2
+    tool_failures=$((tool_failures + 1))
+  fi
+}
 
 for crate in "${CRATES[@]}"; do
   echo ""
@@ -118,9 +191,12 @@ for crate in "${CRATES[@]}"; do
   # exit codes alone.
   set +e
   if [[ "$crate" == "autumn-web" ]]; then
-    # autumn-web special case: run ONE explicit-feature pass over the crate's
-    # documented Postgres public-API surface, with cargo-semver-checks'
-    # "enable (almost) all features" heuristic disabled.
+    # autumn-web special case: run TWO explicit-feature passes — one over the
+    # crate's documented Postgres public-API surface and one over the SQLite
+    # backend — with cargo-semver-checks' "enable (almost) all features"
+    # heuristic disabled. The two DB backends are mutually exclusive at the
+    # type level (see below), so neither pass alone covers the whole surface
+    # and they cannot be merged into one.
     #
     # Why: as of 0.6.0 autumn-web gained the mutually-incompatible feature pair
     # `sqlite` × `managed-pg`/`managed-pg-bundled`. `sqlite` flips the
@@ -149,8 +225,11 @@ for crate in "${CRATES[@]}"; do
     #      baseline and current builds cleanly.
     #
     # The list = the STABILITY.md stable public-API feature surface INTERSECTED
-    # with the published 0.5.0 baseline's `[features]` keys — i.e. the MAXIMAL
-    # baseline-safe coverage. This deliberately supersedes the earlier
+    # with the published 0.6.0 baseline's `[features]` keys — i.e. the MAXIMAL
+    # baseline-safe coverage. Recomputed for the 0.7.0 release: 0.6.0 is now
+    # the crates.io baseline, so `tls`, `acme`, `offline-sync` and
+    # `embed-assets` — 0.6.0-only when this list was last computed, and
+    # therefore excluded then — are intersection-eligible and have been ADDED. This deliberately supersedes the earlier
     # docs.rs-only list, which silently DROPPED feature-gated public modules that
     # already exist in the 0.5.0 baseline (e.g. `presence`, `webauthn`,
     # `inbound-mail`/`inbound-mailgun`/`inbound-ses`, `telemetry-otlp`) — so a
@@ -159,18 +238,27 @@ for crate in "${CRATES[@]}"; do
     # feature part of the public API, so all of them are restored here.
     #
     # It cannot equal either set alone: cargo-semver-checks enables `--features`
-    # symmetrically on the 0.5.0 baseline build too, so any feature the baseline
+    # symmetrically on the 0.6.0 baseline build too, so any feature the baseline
     # lacks would error there.
-    #   - EXCLUDES the 0.6.0-only features `sqlite`, `managed-pg`,
-    #     `managed-pg-bundled`, `embed-assets`, `offline-sync`, `tls`, `acme`:
-    #     all are NEW in 0.6.0 and absent from the 0.5.0 baseline, so the
-    #     symmetric enable would fail the baseline build ("v0.5.0 does not have
-    #     feature ...") and re-break the gate. This intersection also
-    #     AUTOMATICALLY drops the DB-backend type-incompatible pair
-    #     `sqlite` × `managed-pg`/`managed-pg-bundled` (co-enabling them is the
-    #     E0271 rustdoc failure this special-case originally fixed), since none
-    #     of them are baseline-present. Add each once a future baseline carries
-    #     it.
+    #   - EXCLUDES the 0.7.0-only features `sim-testing`, `pdf` and `edge`: all
+    #     are NEW in 0.7.0 and absent from the 0.6.0 baseline, so the symmetric
+    #     enable would fail the baseline build ("v0.6.0 does not have feature
+    #     ...") and re-break the gate. Add each once a future baseline carries
+    #     it — this is the same rule that gated `tls`/`acme`/`offline-sync`/
+    #     `embed-assets` out of the previous revision of this list.
+    #   - EXCLUDES `sqlite`, which IS baseline-present in 0.6.0, because it
+    #     flips `db::RuntimeConnection` to a SQLite connection and is therefore
+    #     type-incompatible with the Postgres surface this pass covers. It is
+    #     no longer dropped silently: the dedicated sqlite-vs-sqlite pass below
+    #     covers it symmetrically.
+    #   - EXCLUDES `managed-pg`/`managed-pg-bundled`, also baseline-present,
+    #     for the same STABILITY.md "Unsupported feature combinations (CI
+    #     excluded)" reason as `system-tests`/`test-support` below (they
+    #     download or embed Postgres binaries). Keeping them out ALSO keeps the
+    #     DB-backend type-incompatible pair `sqlite` × `managed-pg` from ever
+    #     being co-enabled — the E0271 rustdoc failure this special-case
+    #     originally fixed — now that the intersection no longer drops them
+    #     automatically.
     #   - EXCLUDES `system-tests` and `test-support` even though both ARE in the
     #     0.5.0 baseline: STABILITY.md's "Unsupported feature combinations (CI
     #     excluded)" table names both (alongside `managed-pg`/`managed-pg-bundled`)
@@ -196,13 +284,13 @@ for crate in "${CRATES[@]}"; do
     # is forced to recompute the intersection (and add the deferred
     # sqlite-vs-sqlite pass, see below) before the target is bumped.
     #
-    # Deferred: a genuine apples-to-apples sqlite-vs-sqlite pass
-    # (`--only-explicit-features --features sqlite`) is
-    # intentionally NOT added this release — the 0.5.x baseline has no `sqlite`
-    # feature (a symmetric enable would hard-error on the baseline), and a
-    # sqlite-vs-Postgres comparison yields false-positive breaks because
-    # `sqlite` flips `RuntimeConnection`'s type. Add that pass in a release
-    # after 0.6.0 is published (when a sqlite baseline exists).
+    # The sqlite-vs-sqlite pass, deferred at 0.6.0, is now ADDED (see
+    # `autumn_web_semver_sqlite_features` below). It was deferred because the
+    # 0.5.x baseline had no `sqlite` feature, so a symmetric enable would
+    # hard-error on the baseline, while a sqlite-vs-Postgres comparison yields
+    # false-positive breaks because `sqlite` flips `RuntimeConnection`'s type.
+    # 0.6.0 carries `sqlite`, so an apples-to-apples symmetric enable is finally
+    # possible and the SQLite public surface is no longer unchecked.
     #
     # NOTE: `telemetry-otlp` pulls prost/tonic, which need `protoc` at build
     # time. The SemVer job in .github/workflows/publish-gate.yml installs
@@ -218,78 +306,64 @@ for crate in "${CRATES[@]}"; do
     # cargo-semver-checks is exactly `workspace_package_value "version"` — parsed
     # with the SAME method used for `workspace_version` above; if it cannot be
     # parsed at all, FAIL CLOSED (a release gate must be conservative).
-    SEMVER_ALLOWLIST_TARGET_VERSION="0.6.0"
+    SEMVER_ALLOWLIST_TARGET_VERSION="0.7.0"
     autumn_web_current_version="$(workspace_package_value "version")"
     [[ -n "$autumn_web_current_version" ]] || \
       die "could not determine autumn-web version for the SemVer allowlist guard"
     if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
-      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.5.0-baseline ∩ 0.6.0 feature set). cargo-semver-checks now compares against a newer baseline that has tls/acme/sqlite/managed-pg/embed-assets/offline-sync — recompute the allowlist as (new-baseline ∩ current) features (and add the deferred sqlite-vs-sqlite pass) before releasing. See the comment above this block."
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp"
-    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
+    # The SQLite backend surface: the SAME list plus `sqlite`.
+    #
+    # It was `sqlite` alone at first, on the theory that a minimal set is the
+    # safe one. That left a hole: an item gated on `sqlite` AND another stable
+    # feature was compiled by NEITHER pass, so a break in it would sail through
+    # this gate. `repository_commit_hooks.rs` is the concrete case — four
+    # `start_repository_commit_hook_worker` variants across the ws x sqlite
+    # matrix, of which `cfg(all(feature = "ws", feature = "sqlite"))` was
+    # invisible: the Postgres pass has `ws` but no `sqlite`, the minimal SQLite
+    # pass had `sqlite` but no `ws`.
+    #
+    # Reusing the Postgres list is safe precisely because that list already
+    # excludes `managed-pg`/`managed-pg-bundled` — the features that hard-code
+    # `AsyncPgConnection` and are therefore the ones `sqlite` cannot co-exist
+    # with. Verified by compiling it before wiring it in:
+    #   cargo check -p autumn-web --no-default-features \
+    #     --features "<this list>,sqlite"      # Finished, exit 0
+    # Keep the two lists in step: a feature added to the Postgres list belongs
+    # here too, against the same demonstrated compile.
+    autumn_web_semver_sqlite_features="${autumn_web_semver_features},sqlite"
+
+    echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
+    pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_features" 2>&1)"
-  else
-    crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
+    pg_exit_code=$?
+
+    # Run the SQLite pass regardless of pass 1's outcome, so one report names
+    # every break rather than the maintainer fixing Postgres and rediscovering
+    # SQLite on the next push.
+    echo "  pass 2/2: SQLite surface (--features $autumn_web_semver_sqlite_features)"
+    sqlite_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
+      --only-explicit-features \
+      --features "$autumn_web_semver_sqlite_features" 2>&1)"
+    sqlite_exit_code=$?
+    set -e
+
+    # Classify each pass on its OWN output — never concatenated. See the
+    # comment on classify_semver_pass for why merging them is unsafe.
+    classify_semver_pass "$crate" " (Postgres surface)" "$pg_exit_code" "$pg_output"
+    classify_semver_pass "$crate" " (SQLite surface)" "$sqlite_exit_code" "$sqlite_output"
+    continue
   fi
+
+  crate_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" 2>&1)"
   exit_code=$?
   set -e
 
-  echo "$crate_output"
-
-  if [[ $exit_code -eq 0 ]]; then
-    echo "  PASS: $crate API is semver-compatible with crates.io baseline"
-  elif echo "$crate_output" | grep -q "no crates with library targets selected"; then
-    # Proc-macro or binary-only crate — no public API surface to semver-check.
-    echo "  SKIP: $crate has no library targets (proc-macro or binary)"
-  elif echo "$crate_output" | grep -q "not found in registry"; then
-    # Crate has never been published on crates.io; nothing to compare against.
-    echo "  SKIP: $crate not yet published on crates.io"
-  elif echo "$crate_output" | grep -qE "error\[E0282\]" && echo "$crate_output" | grep -q "aws-runtime"; then
-    # aws-runtime has a type-inference regression (E0282) on Rust 1.92.x that
-    # affects every published version of the crate.  This is an upstream bug
-    # unrelated to our public API surface; skip rather than hard-fail so the
-    # gate remains actionable for real semver breaks.
-    echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
-  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
-    # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
-    # coherence (E0119) in downstream crates with their own blanket From
-    # impls — bollard 0.20.x, aws-smithy-types 1.4.x, and ratatui-widgets
-    # are all affected. The isolated workspace used by cargo-semver-checks
-    # resolves time fresh, so it picks up the broken release even though
-    # the workspace pins time below it (<0.3.48). Upstream breakage, not a
-    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
-    # crates ship releases compatible with it.
-    echo "  SKIP: $crate — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
-  elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
-    # Exit 1 with semver-violation output → actual breaking API changes found.
-    # Allow them through only when BOTH conditions hold:
-    #   1. A migration guide exists (explicit acknowledgement).
-    #   2. The version bump type permits breaking changes per release policy
-    #      (post-1.0 major bump X.0.0, or pre-1.0 minor bump 0.Y.0).
-    # A patch release or a post-1.0 minor release must never break even if a
-    # migration stub is present, to prevent an accidental regression slipping
-    # through because an old migration document was lying around.
-    if [[ -f "$migration_guide" ]] && is_breaking_release_type; then
-      echo "  ADVISORY: $crate has breaking API changes; intentional — migration guide found at $migration_guide"
-    elif [[ -f "$migration_guide" ]]; then
-      echo "  FAIL: $crate has breaking API changes but $workspace_version is a patch/minor release." >&2
-      echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
-      breaking_failures=$((breaking_failures + 1))
-    else
-      echo "  FAIL: $crate has unacknowledged breaking API changes." >&2
-      echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
-      echo "        or fix the API regression before releasing." >&2
-      breaking_failures=$((breaking_failures + 1))
-    fi
-  else
-    # Exit 1 with unrecognised output → tool/invocation error (compilation
-    # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
-    # error is investigated rather than silently skipped.
-    echo "  FAIL: $crate — cargo-semver-checks failed with an unexpected error (exit $exit_code)." >&2
-    tool_failures=$((tool_failures + 1))
-  fi
+  classify_semver_pass "$crate" "" "$exit_code" "$crate_output"
 done
 
 echo ""

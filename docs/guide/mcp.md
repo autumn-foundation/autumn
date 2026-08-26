@@ -23,7 +23,7 @@ The `mcp` feature builds on the OpenAPI schema machinery, so it implies the
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.5", features = ["mcp"] }
+autumn-web = { version = "0.7", features = ["mcp"] }
 ```
 
 ---
@@ -120,32 +120,55 @@ Because every piece comes from the same `SchemaEntry` data the OpenAPI
 generator uses, **there is no second schema to maintain** and no way for the
 tool catalog to drift from the handler.
 
-The per-tool `inputSchema` is generated from the request types via the `OpenApiSchema` derive, so there is no second schema to hand-maintain; serde `rename`s are honoured, tool identity is collision-proof, and a build-time guard warns when a nested `Query<T>` field should instead be carried as a `Json<T>` body.
+The per-tool `inputSchema` is generated from the request types via the `OpenApiSchema` derive, so there is no second schema to hand-maintain; serde `rename`s are honoured and tool identity is collision-proof.
 
-### Query is flat — put structured input in the body
+### Structured query arguments round-trip
 
-`Query<T>` deserializes with
-[`serde_urlencoded`](https://docs.rs/serde_urlencoded), which is **strictly
-flat**: it can decode scalars (`?q=foo&page=2`) and repeated keys for a
-sequence field (`?tags=a&tags=b`), but it **cannot** deserialize a nested
-struct by any encoding — not `key[sub]=`, not JSON-in-a-string. MCP `tools/call`
-dispatch honors this: query values are rendered as flat `key=value` pairs
-(arrays expand to repeated keys), so a query field that is itself an object or
-an array of objects could never round-trip back to the handler.
+A `Query<T>` field does **not** have to be a scalar. `Query<T>` decodes a
+superset of the flat `key=value` form — a bracketed dialect whose
+`items[0][sku]` shape matches the rows `NestedChangesetForm` renders,
+generalized to arbitrary objects, sequences and depths — and `tools/call`
+dispatch renders the tool's `query` object into exactly that format:
 
-So keep query parameters flat and **steer structured/nested input to a JSON
-body** (`Json<T>`), which round-trips losslessly through the tool's `body`
-property. When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for
-a tool whose:
+| Tool argument | Decoded query keys | Handler field |
+| --- | --- | --- |
+| `{"page": 2}` | `page=2` | `u32` |
+| `{"tags": ["a","b"]}` | `tags=a&tags=b` | `Vec<String>` |
+| `{"filter": {"status":"open"}}` | `filter[status]=open` | a nested struct |
+| `{"items": [{"sku":"A"}]}` | `items[0][sku]=A` | `Vec<Item>` |
 
-- `query` or `body` resolves to a bare `{"type":"object"}` placeholder — the
-  arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
-  deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
-  arg type.
-- `query` advertises a nested object / array-of-object field — move that input
-  to a `Json<T>` body.
+(The keys are percent-encoded on the wire — `filter%5Bstatus%5D=open` — and
+decoded before the brackets are parsed, so the two forms are equivalent.)
 
-These are warnings, not errors: the app still builds and the tool is still
+So an agent can pass structured arguments directly, instead of the
+comma-separated strings and JSON-in-a-string fields the flat form used to
+force. What the encoding cannot carry, dispatch **refuses** rather than quietly
+altering:
+
+- A `null` **field** renders no query parameter — a query string has no null, so
+  an explicitly-null optional argument arrives as absent (`None`) rather than as
+  the literal text `null`. That is the one silent conversion, and it matches
+  what the caller meant.
+- An **empty** array or object, a `null` **array element**, and an object field
+  name that is empty or contains `[` / `]` are all invalid-params errors: each
+  would otherwise vanish a field, shorten a sequence, or invent a nesting level.
+  A field that must distinguish "empty" from "absent" belongs in a JSON body.
+- Nesting is depth-capped (`autumn_web::query_string::MAX_DEPTH`) and one call's
+  query expansion is bounded, on both the encode and decode side.
+
+For genuinely large or deeply structured input, a JSON body (`Json<T>`) is
+still the better contract: it round-trips losslessly through the tool's `body`
+property and carries real JSON types rather than coerced text.
+
+### Build-time warning
+
+When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for a tool
+whose `query` or `body` resolves to a bare `{"type":"object"}` placeholder —
+the arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
+deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
+arg type.
+
+It is a warning, not an error: the app still builds and the tool is still
 exposed.
 
 ### Safety annotations
@@ -639,7 +662,7 @@ This slice is **tools-only**. Tool results are buffered by default, with
 scope** and are tracked as follow-ups:
 
 - **Daemon lifetime** for long-running, session-surviving work —
-  [#1119](https://github.com/madmax983/autumn/issues/1119).
+  [#1119](https://github.com/autumn-foundation/autumn/issues/1119).
 - **Durable workflow tools** — exposing Harvest `#[workflow]`s as
   start/status/signal MCP tools on top of this layer
   ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the
@@ -654,6 +677,7 @@ scope** and are tracked as follow-ups:
 - **LLM-assisted tool descriptions** — descriptions come from `#[api_doc]`;
   garbage-in/garbage-out is the author's call.
 
-For the typed JSON-Schema derivation this builds on, see the OpenAPI support
-in [`openapi.rs`](../../autumn/src/openapi.rs); for the in-process dispatch
+For the typed JSON-Schema derivation this builds on, see the
+[OpenAPI guide](openapi.md) (and
+[`openapi.rs`](../../autumn/src/openapi.rs)); for the in-process dispatch
 path, see the [Testing guide](testing.md).

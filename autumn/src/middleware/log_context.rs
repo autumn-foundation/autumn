@@ -304,7 +304,7 @@ mod tests {
                     }),
                 )
                 .layer(LogContextLayer::new(filter()))
-                .layer(RequestIdLayer);
+                .layer(RequestIdLayer::default());
 
             // `with_default` is sync; drive the request to completion on a local
             // runtime so the captured events are observed under this subscriber.
@@ -390,7 +390,7 @@ mod tests {
                 }),
             )
             .layer(LogContextLayer::new(filter()))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         for _ in 0..2 {
             let resp = app
@@ -421,7 +421,7 @@ mod tests {
                     }),
                 )
                 .layer(LogContextLayer::new(filter()))
-                .layer(RequestIdLayer);
+                .layer(RequestIdLayer::default());
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -499,7 +499,7 @@ mod tests {
                     }),
                 )
                 .layer(LogContextLayer::new(filter()))
-                .layer(RequestIdLayer);
+                .layer(RequestIdLayer::default());
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -530,7 +530,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(handler))
             .layer(LogContextLayer::new(filter()))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

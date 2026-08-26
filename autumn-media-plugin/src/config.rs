@@ -216,6 +216,36 @@ impl MediaStorageBackend {
     }
 }
 
+/// Which backend holds mesh-room state (rosters, seats, liveness clocks).
+///
+/// [`Memory`](Self::Memory) is the single-process default — rooms live in one
+/// process's [`InMemoryRoomStore`](crate::rooms::InMemoryRoomStore) and do not
+/// survive a restart or span multiple app processes. [`Db`](Self::Db) selects
+/// the shared, Postgres/SQLite-backed
+/// [`DbRoomStore`](crate::rooms_db::DbRoomStore), so rooms are durable and every
+/// app process/instance sees the same rooms — the correct choice for any
+/// multi-process or horizontally-scaled deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomStoreBackend {
+    /// Single-process, in-memory room state (the default).
+    #[default]
+    Memory,
+    /// Shared, database-backed room state (multi-process safe).
+    Db,
+}
+
+impl RoomStoreBackend {
+    /// Stable lowercase label for logs/summaries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Db => "db",
+        }
+    }
+}
+
 /// Media object storage settings (local filesystem or S3-compatible).
 ///
 /// `secret_access_key` and `session_token` are redacted by the hand-written
@@ -351,6 +381,11 @@ pub struct MediaConfig {
     /// (empty / `None` inserts no namespace segment).
     #[serde(default)]
     pub room_namespace: Option<String>,
+    /// Which backend holds mesh-room state. Defaults to
+    /// [`RoomStoreBackend::Memory`] (single-process); set to `db` for a shared,
+    /// multi-process-safe [`DbRoomStore`](crate::rooms_db::DbRoomStore).
+    #[serde(default)]
+    pub room_store_backend: RoomStoreBackend,
 }
 
 impl Default for MediaConfig {
@@ -363,6 +398,7 @@ impl Default for MediaConfig {
             room_max_participants: default_room_max_participants(),
             room_token_ttl_seconds: default_room_token_ttl_seconds(),
             room_namespace: None,
+            room_store_backend: RoomStoreBackend::default(),
         }
     }
 }
@@ -446,6 +482,117 @@ impl MediaConfig {
         Ok(config)
     }
 
+    /// Load a **profile-aware** [`MediaConfig`] from an Autumn project
+    /// directory, reading the process environment for both profile selection
+    /// and `AUTUMN_MEDIA__*` overrides.
+    ///
+    /// This is the runtime counterpart to the deploy CLI's profile-aware
+    /// `[media]` resolution: unlike [`from_autumn_toml`](Self::from_autumn_toml)
+    /// (which reads a single file and ignores profiles), it resolves the active
+    /// profile and merges the base `autumn.toml`'s `[media]` with the inline
+    /// `[profile.<name>].media` section and the `autumn-<profile>.toml`
+    /// override file — so a `[profile.prod.media]` block (or a `[media]` table
+    /// living only in `autumn-prod.toml`) is honored at runtime under
+    /// `AUTUMN_ENV=prod`, exactly as a deploy resolves it.
+    ///
+    /// The pure, testable core is
+    /// [`from_autumn_dir_with_env`](Self::from_autumn_dir_with_env).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaConfigError::Io`] on a read error other than
+    /// "not found", and [`MediaConfigError::Toml`] when a contributing file (or
+    /// the merged `[media]` subtree) does not parse/deserialize.
+    pub fn from_autumn_dir(dir: impl AsRef<Path>) -> Result<Self, MediaConfigError> {
+        let env: HashMap<String, String> = std::env::vars().collect();
+        Self::from_autumn_dir_with_env(dir, &env)
+    }
+
+    /// Pure core of [`from_autumn_dir`](Self::from_autumn_dir): build the
+    /// effective `[media]` config for the active profile from `dir` and an
+    /// explicit environment map, without touching process-global environment
+    /// (mirrors [`from_toml_str_with_env`](Self::from_toml_str_with_env)).
+    ///
+    /// Layering mirrors Autumn's core config loader
+    /// (`AutumnConfig::load_with_env`) and the deploy CLI's
+    /// `load_media_host_config_in`, restricted to the `[media]` subtree:
+    ///
+    /// 1. base `autumn.toml` `[media]` (optional — an absent base skips only
+    ///    this layer),
+    /// 2. inline `[profile.<name>].media` (alias-then-canonical order, so the
+    ///    canonical spelling wins),
+    /// 3. `autumn-<profile>.toml` `[media]` (first existing in the shared
+    ///    [`profile_override_file_lookup_names`] order wins),
+    ///
+    /// deep-merged in that order, then finally the runtime's own `${VAR}`
+    /// interpolation and `AUTUMN_MEDIA__*` env overrides. The deploy layer
+    /// deliberately omits the env-override layer; the runtime keeps it (it is
+    /// the plugin's established override mechanism), so the two agree on every
+    /// base/profile combination and the runtime additionally honors
+    /// `AUTUMN_MEDIA__*`.
+    ///
+    /// Profile precedence matches `autumn_web::config::resolve_profile`:
+    /// `AUTUMN_ENV` → `AUTUMN_PROFILE` → `--profile` CLI flag →
+    /// `AUTUMN_IS_DEBUG=0` ⇒ `prod` → `dev`.
+    ///
+    /// [`profile_override_file_lookup_names`]: autumn_web::config::profile_override_file_lookup_names
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MediaConfigError::Io`] on a read error other than
+    /// "not found", and [`MediaConfigError::Toml`] when a contributing file (or
+    /// the merged `[media]` subtree) does not parse/deserialize.
+    pub fn from_autumn_dir_with_env(
+        dir: impl AsRef<Path>,
+        env: &HashMap<String, String>,
+    ) -> Result<Self, MediaConfigError> {
+        let dir = dir.as_ref();
+        let (selected_input, canonical) = resolve_media_profile(env);
+
+        // Deep-merge each contributing layer in the same order the core loader
+        // (and the deploy CLI) does. Seeding from an empty table is faithful for
+        // the `[media]` subtree — the core loader's profile smart-defaults carry
+        // no `[media]` keys.
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+
+        // Layer 1: base `autumn.toml` — optional.
+        let base_toml = read_optional_toml(&dir.join("autumn.toml"))?;
+        if let Some(base) = &base_toml {
+            deep_merge_toml(&mut merged, base.clone());
+        }
+
+        // Layer 2: inline `[profile.<name>]` sections (only when the base
+        // parsed), alias-then-canonical so the canonical spelling wins.
+        if let Some(base) = &base_toml {
+            for name in profile_inline_lookup_names(&canonical) {
+                if let Some(section) = profile_section_from_base_toml(base, name) {
+                    deep_merge_toml(&mut merged, section);
+                }
+            }
+        }
+
+        // Layer 3: `autumn-<profile>.toml` override file (first existing wins),
+        // reusing the runtime's own override-file name resolver so the plugin
+        // reads the SAME file the host runtime loads.
+        for name in
+            autumn_web::config::profile_override_file_lookup_names(&canonical, &selected_input)
+        {
+            if let Some(overlay) = read_optional_toml(&dir.join(format!("autumn-{name}.toml")))? {
+                deep_merge_toml(&mut merged, overlay);
+                break;
+            }
+        }
+
+        // Deserialize the merged `[media]` subtree (unknown top-level keys —
+        // `server`, `log`, `profile`, … — are ignored), then apply the runtime
+        // `${VAR}` + `AUTUMN_MEDIA__*` layers last.
+        let root: AutumnTomlRoot = merged.try_into()?;
+        let mut config = root.media;
+        config.interpolate_env(env);
+        config.apply_env_overrides(env);
+        Ok(config)
+    }
+
     /// Resolve every `${VAR}` placeholder in string fields from `env`, leaving
     /// the value empty (`None` for optionals) when the variable is unset.
     fn interpolate_env(&mut self, env: &HashMap<String, String>) {
@@ -486,6 +633,12 @@ impl MediaConfig {
             env,
             "AUTUMN_MEDIA__ROOM_NAMESPACE",
         );
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_STORE_BACKEND") {
+            self.room_store_backend = match value.trim().to_ascii_lowercase().as_str() {
+                "db" => RoomStoreBackend::Db,
+                _ => RoomStoreBackend::Memory,
+            };
+        }
     }
 
     /// Apply `AUTUMN_MEDIA__<TABLE>__<FIELD>` scalar leaf overrides
@@ -791,6 +944,140 @@ fn override_opt(target: &mut Option<String>, env: &HashMap<String, String>, key:
     }
 }
 
+// ── Profile-aware layering helpers ───────────────────────────────────────────
+//
+// These mirror `autumn_web::config`'s *private* base+profile merge helpers so
+// the runtime media loader layers `[media]` identically to the core config
+// loader and the deploy CLI. The public `normalize_profile_name` /
+// `profile_override_file_lookup_names` are reused directly; the small private
+// pieces (inline lookup, section extraction, deep merge) are replicated locally
+// — exactly as `autumn-cli`'s deploy path does — because the runtime helpers are
+// not exported.
+
+/// Resolve the active profile from `env`, returning the raw selected spelling
+/// (for the alias-aware override-file lookup) and its canonical form.
+///
+/// Precedence and normalization match `autumn_web::config::resolve_profile`.
+fn resolve_media_profile(env: &HashMap<String, String>) -> (String, String) {
+    let selected = resolve_media_profile_input(env);
+    let canonical =
+        autumn_web::config::normalize_profile_name(&selected).unwrap_or_else(|| "dev".to_owned());
+    (selected, canonical)
+}
+
+/// Raw profile-selector value (before normalization), mirroring
+/// `autumn_web::config`'s private `resolve_profile_input`:
+/// `AUTUMN_ENV` → `AUTUMN_PROFILE` → `--profile` CLI flag →
+/// `AUTUMN_IS_DEBUG=0` ⇒ `prod` → `dev`.
+fn resolve_media_profile_input(env: &HashMap<String, String>) -> String {
+    if let Some(value) = env_trimmed(env, "AUTUMN_ENV") {
+        return value;
+    }
+    if let Some(value) = env_trimmed(env, "AUTUMN_PROFILE") {
+        return value;
+    }
+    // `--profile <name>` / `--profile=<name>` CLI flag (parity with the runtime,
+    // which also consults process args). In practice the env-var selectors above
+    // win for a runtime plugin load; this keeps the fallthrough faithful.
+    let args: Vec<String> = std::env::args().collect();
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--profile"
+            && let Some(profile) = args.get(index + 1)
+        {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+        if let Some(profile) = arg.strip_prefix("--profile=") {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    if env.get("AUTUMN_IS_DEBUG").map(String::as_str) == Some("0") {
+        return "prod".to_owned();
+    }
+    "dev".to_owned()
+}
+
+/// Non-blank env value view (blank values are treated as unset).
+fn env_trimmed(env: &HashMap<String, String>, key: &str) -> Option<String> {
+    env.get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Read a TOML file as a raw [`toml::Value`] table; `Ok(None)` when the file
+/// does not exist (mirrors `autumn_web::config`'s private `load_raw_toml`).
+fn read_optional_toml(path: &Path) -> Result<Option<toml::Value>, MediaConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let table = toml::from_str::<toml::Table>(&contents)?;
+            Ok(Some(toml::Value::Table(table)))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(MediaConfigError::Io(err)),
+    }
+}
+
+/// Inline `[profile.<name>]` lookup names for a canonical profile (canonical
+/// profiles also pull their legacy alias, alias-first so the canonical spelling
+/// wins). Mirrors `autumn_web::config`'s private `profile_lookup_names`.
+fn profile_inline_lookup_names(canonical: &str) -> Vec<&str> {
+    match canonical {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Extract a `[profile.<name>]` table from a parsed `autumn.toml` value as a
+/// standalone value (mirrors `autumn_web::config`'s private
+/// `profile_section_from_base_toml`).
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
+}
+
+/// Deep-merge two TOML values — tables merged recursively, non-table `overlay`
+/// values replace `base`. A faithful copy of `autumn_web::config`'s private
+/// `deep_merge` (bounded recursion mirrors the runtime's `MAX_MERGE_DEPTH`), so
+/// the runtime media layering matches the core loader exactly.
+fn deep_merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    deep_merge_toml_depth(base, overlay, 0);
+}
+
+fn deep_merge_toml_depth(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
+    /// Matches `autumn_web::config`'s `MAX_MERGE_DEPTH`.
+    const MAX_MERGE_DEPTH: usize = 16;
+    if depth > MAX_MERGE_DEPTH {
+        return;
+    }
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+    let Some(base_table) = base.as_table_mut() else {
+        return;
+    };
+    for (key, overlay_val) in overlay_table {
+        let is_recursive_merge =
+            overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
+        if is_recursive_merge {
+            if let Some(base_val) = base_table.get_mut(&key) {
+                deep_merge_toml_depth(base_val, overlay_val, depth + 1);
+            }
+        } else {
+            base_table.insert(key, overlay_val);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +1106,43 @@ mod tests {
         assert_eq!(config.room_max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
         assert_eq!(config.room_token_ttl_seconds, 300);
         assert_eq!(config.room_namespace, None);
+        // The room store defaults to the single-process in-memory backend.
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
+    }
+
+    #[test]
+    fn room_store_backend_parses_from_toml_and_env_override() {
+        // Selected via `[media]`.
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"db\"\n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Db);
+
+        // An unknown / blank value falls back to the memory default (never errors).
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"memory\"\n",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
+
+        // `AUTUMN_MEDIA__ROOM_STORE_BACKEND` overrides the file value.
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"memory\"\n",
+            &env(&[("AUTUMN_MEDIA__ROOM_STORE_BACKEND", "db")]),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Db);
+
+        // A garbage env value degrades to memory (no panic, no error).
+        let config = MediaConfig::from_toml_str_with_env(
+            "[media]\nroom_store_backend = \"db\"\n",
+            &env(&[("AUTUMN_MEDIA__ROOM_STORE_BACKEND", "nonsense")]),
+        )
+        .unwrap();
+        assert_eq!(config.room_store_backend, RoomStoreBackend::Memory);
     }
 
     #[test]
@@ -1252,5 +1576,189 @@ mod tests {
         assert_eq!(config.storage.backend, MediaStorageBackend::Local);
         assert_eq!(config.mediamtx.api_base, "http://127.0.0.1:9997");
         assert_eq!(config.ffmpeg.bin, "/usr/bin/ffmpeg");
+    }
+
+    // ── Profile-aware runtime loader (#2066) ─────────────────────────────────
+
+    /// Write `contents` to `<dir>/<name>` for a profile-layering test.
+    fn write_toml(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("write temp toml");
+    }
+
+    #[test]
+    fn profile_aware_base_only_media_applies_at_runtime() {
+        // Only a top-level `[media]` table: prod resolves to the base values
+        // (no profile section, no override file).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            "[media]\nroom_max_participants = 4\nroom_token_ttl_seconds = 120\n",
+        );
+        let vars = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.room_max_participants, 4);
+        assert_eq!(config.room_token_ttl_seconds, 120);
+    }
+
+    #[test]
+    fn profile_aware_inline_profile_only_applies_under_prod() {
+        // `[profile.prod.media]` with NO top-level `[media]`: honored at runtime
+        // under AUTUMN_ENV=prod (previously silently ignored — the #2066 gap).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            "[profile.prod.media]\nroom_max_participants = 5\n",
+        );
+
+        let prod = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &prod).unwrap();
+        assert_eq!(config.room_max_participants, 5);
+
+        // Under a non-prod profile the prod-only section must not bleed through:
+        // no `[media]` contributes, so the default is used.
+        let dev = HashMap::new();
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &dev).unwrap();
+        assert_eq!(config.room_max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
+    }
+
+    #[test]
+    fn profile_aware_base_plus_inline_profile_deep_merges() {
+        // Base `[media]` provides several fields; `[profile.prod.media]`
+        // overrides a subset. Deep-merge: prod wins per-field, base fields the
+        // profile did not touch are retained. This is the base+profile parity
+        // case — the deploy CLI resolves the identical layering (minus the
+        // env-override layer), so runtime and deploy agree on these values.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            r#"
+                [media]
+                room_max_participants = 2
+                room_token_ttl_seconds = 60
+
+                [media.mediamtx]
+                api_base = "http://base:9997"
+                rtmp_base = "rtmp://base:1935/live"
+
+                [profile.prod.media]
+                room_max_participants = 6
+
+                [profile.prod.media.mediamtx]
+                api_base = "http://prod:9997"
+            "#,
+        );
+        let vars = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        // Overridden by the prod profile:
+        assert_eq!(config.room_max_participants, 6);
+        assert_eq!(config.mediamtx.api_base, "http://prod:9997");
+        // Retained from the base (deep merge, not wholesale replace):
+        assert_eq!(config.room_token_ttl_seconds, 60);
+        assert_eq!(config.mediamtx.rtmp_base, "rtmp://base:1935/live");
+    }
+
+    #[test]
+    fn profile_aware_override_file_consumed_at_runtime() {
+        // The silent fail-open case: `[media]` present ONLY in
+        // `autumn-prod.toml`. Under AUTUMN_ENV=prod it is consumed at runtime,
+        // exactly as a deploy resolves it (previously the runtime read only the
+        // base file and booted on defaults).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            "[media]\nroom_max_participants = 4\n",
+        );
+        write_toml(
+            dir.path(),
+            "autumn-prod.toml",
+            "[media]\nroom_max_participants = 6\n",
+        );
+        let vars = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.room_max_participants, 6);
+    }
+
+    #[test]
+    fn profile_aware_override_file_media_only_in_file_boots_prod_settings() {
+        // Even with NO base `[media]` at all, a `[media]` table that lives only
+        // in `autumn-prod.toml` is honored under prod.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(dir.path(), "autumn.toml", "[server]\nport = 8080\n");
+        write_toml(
+            dir.path(),
+            "autumn-prod.toml",
+            "[media.storage]\nbackend = \"s3\"\nbucket = \"prod-bucket\"\n",
+        );
+        let vars = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.storage.backend, MediaStorageBackend::S3);
+        assert_eq!(config.storage.bucket.as_deref(), Some("prod-bucket"));
+    }
+
+    #[test]
+    fn profile_aware_dev_falls_back_to_base_no_prod_bleed_through() {
+        // Base `[media]` + `[profile.prod.media]`. Under dev (no AUTUMN_ENV) the
+        // base values apply and the prod section never bleeds through.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            r"
+                [media]
+                room_max_participants = 2
+
+                [profile.prod.media]
+                room_max_participants = 6
+            ",
+        );
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(config.room_max_participants, 2);
+    }
+
+    #[test]
+    fn profile_aware_env_override_still_wins_last() {
+        // `AUTUMN_MEDIA__*` overrides are applied AFTER the profile merge, so a
+        // runtime env override beats even a `[profile.prod.media]` value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            "[profile.prod.media]\nroom_max_participants = 6\n",
+        );
+        let vars = env(&[
+            ("AUTUMN_ENV", "prod"),
+            ("AUTUMN_MEDIA__ROOM_MAX_PARTICIPANTS", "3"),
+        ]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.room_max_participants, 3);
+    }
+
+    #[test]
+    fn profile_aware_production_alias_selects_prod_sections() {
+        // The alias `production` normalizes to `prod`, so a `[profile.prod.*]`
+        // inline section and the `autumn-prod.toml` file are both selected.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_toml(
+            dir.path(),
+            "autumn.toml",
+            "[profile.prod.media]\nroom_max_participants = 5\n",
+        );
+        let vars = env(&[("AUTUMN_ENV", "production")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.room_max_participants, 5);
+    }
+
+    #[test]
+    fn profile_aware_missing_dir_is_default() {
+        // No autumn.toml and no override file → defaults (still with env layers).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vars = env(&[("AUTUMN_ENV", "prod")]);
+        let config = MediaConfig::from_autumn_dir_with_env(dir.path(), &vars).unwrap();
+        assert_eq!(config.room_max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
+        assert_eq!(config.mediamtx.api_base, "http://127.0.0.1:9997");
     }
 }

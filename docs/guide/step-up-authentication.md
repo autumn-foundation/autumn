@@ -211,3 +211,11 @@ re-proving identity.
 
 **Rule of thumb**: if the action is irreversible, changes credentials or
 security settings, or exposes sensitive data, add `#[step_up]`.
+
+## See also
+
+- [Authentication](./authentication.md) — the session, password, and
+  `#[secured]` layer that `#[step_up]` tightens, including the remember-me
+  chains that make a "logged in" request only weakly authenticated.
+- [Authorization](./authorization.md) — `#[authorize]` for "may this user touch
+  this record?", the question orthogonal to freshness.

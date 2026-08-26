@@ -60,6 +60,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -171,6 +173,17 @@ impl ExceptionFilter for ProblemDetailsFilter {
         }
         if let Some(ctx) = context.cloned() {
             out.extensions_mut().insert(ctx);
+        }
+        // A caught panic's identity must survive the rebuild: the capsule
+        // replay driver reads it to compare panic against panic rather than
+        // accepting any response with the same status.
+        #[cfg(feature = "reporting")]
+        if let Some(caught) = response
+            .extensions()
+            .get::<crate::reporting::CaughtPanic>()
+            .cloned()
+        {
+            out.extensions_mut().insert(caught);
         }
         out.extensions_mut().insert(error.clone());
         out

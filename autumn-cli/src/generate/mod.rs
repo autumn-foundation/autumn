@@ -13,8 +13,10 @@
 pub mod admin;
 pub mod auth;
 pub mod channel;
+pub mod commentable;
 pub mod config;
 pub mod controller;
+pub mod counter_cache;
 pub mod dsl;
 pub mod emit;
 pub mod inbound_mail;
@@ -24,15 +26,20 @@ pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
+mod nested;
+pub mod notifications;
 pub mod plugin;
 pub mod policy;
 pub mod pwa;
 pub mod scaffold;
+mod scaffold_i18n;
 pub mod schema_edit;
 pub mod system_test;
 pub mod task;
 pub mod tauri;
 pub mod tauri_mobile;
+pub mod teams;
+pub mod webhook;
 pub mod wizard;
 
 use std::path::{Path, PathBuf};
@@ -108,6 +115,19 @@ fn format_collisions(paths: &[PathBuf]) -> String {
 /// that silently accepts NULL ids, generation fails here with an actionable
 /// message (AC #4).
 #[must_use]
+/// `--id uuid` cannot be combined with `comments:commentable`.
+///
+/// The shared table stores `commentable_id BIGINT` and every generated helper
+/// takes `parent_id: i64`, so a UUID-keyed parent has nowhere to go. Without
+/// this the command SUCCEEDS and writes a project that does not compile, which
+/// is the worst of both: the user is told it worked and finds out from rustc.
+pub fn uuid_pk_commentable_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+ "`comments:commentable` needs an integer primary key, so it cannot be combined with `--id uuid`. The shared `comments` table keys its rows on `commentable_id BIGINT` — one column serving every commentable model — and the generated helpers take `parent_id: i64`, so a UUID-keyed parent has no representation there. Re-run without `--id uuid` to use the default BIGINT primary key, or without `comments:commentable` and attach comments to a model that has one."
+ .to_owned(),
+ )
+}
+
 pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
     GenerateError::Config(
         "UUID primary keys (--id uuid) are not yet supported on SQLite apps; Postgres uses \
@@ -115,7 +135,7 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
          gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
          fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
          part of the deferred SQLite runtime slice, tracked in \
-         https://github.com/madmax983/autumn/issues/1905 — re-run without `--id uuid` to use \
+         https://github.com/autumn-foundation/autumn/issues/1905 — re-run without `--id uuid` to use \
          the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
             .to_owned(),
     )
@@ -177,28 +197,29 @@ pub fn sqlite_add_not_null_without_default_error(table: &str, column: &str) -> G
     ))
 }
 
-/// The generate-time rejection for a code generator that emits Postgres-only
-/// migration DDL on a `SQLite`-backed app (`SQLite` foundation, issue #1614
-/// AC #4).
+/// The generate-time rejection for `autumn generate teams` on a
+/// `SQLite`-backed app (issue #1261).
 ///
-/// `generate auth` and `generate mailer` scaffold migrations with
-/// `BIGSERIAL PRIMARY KEY` and `DEFAULT NOW()` — neither of which `SQLite`
-/// accepts — so a generated `SQLite` app's migrations would fail to apply.
-/// Making these generators backend-aware (SQLite-valid `INTEGER PRIMARY KEY`
-/// columns, `CURRENT_TIMESTAMP` defaults, and backend-aware auth/mailer runtime
-/// wiring) is a larger slice tracked in issue #1927. Rather than emit migrations
-/// that break on `SQLite`, generation fails here with an actionable message
-/// (AC #4).
+/// `teams`' migration and `#[model]`/`#[repository]` templates are fixed,
+/// hand-written Postgres DDL/Diesel code (`BIGSERIAL`, `NOW()`, `TIMESTAMP`,
+/// `diesel = { features = ["postgres", ...] }`) — unlike `generate model`,
+/// there is no per-field backend-aware rendering path to route through for
+/// `teams`' handful of hardcoded tables. Emitting it against a `SQLite`
+/// project would silently produce a migration `autumn migrate` fails to
+/// apply. Rather than do that, generation fails here with an actionable
+/// message; genuine `SQLite` support (backend-aware DDL, matching the
+/// `generate model`/`scaffold` foundation from issue #1614) is a follow-up,
+/// not attempted in this slice.
 #[must_use]
-pub fn sqlite_generator_unsupported_error(name: &str) -> GenerateError {
-    GenerateError::Config(format!(
-        "`generate {name}` is not yet supported on SQLite apps: it scaffolds migrations that \
-         emit Postgres-only DDL (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite \
-         rejects, so the generated migrations would fail to apply. Backend-aware auth/mailer \
-         generators for SQLite are tracked in \
-         https://github.com/madmax983/autumn/issues/1927 — target a Postgres database to use \
-         `generate {name}` for now."
-    ))
+pub fn sqlite_teams_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "`autumn generate teams` requires the Postgres backend: its migration and \
+         `#[model]`/`#[repository]` templates are fixed Postgres DDL/Diesel code \
+         (BIGSERIAL, NOW(), TIMESTAMP, the `diesel` \"postgres\" feature), with no \
+         SQLite-aware rendering path yet. Target a Postgres database to use \
+         `autumn generate teams`."
+            .to_owned(),
+    )
 }
 
 /// Common flags shared by every `generate` subcommand.
@@ -395,17 +416,21 @@ where
 
 /// The generate-time rejection for a DSL field kind whose rendered Rust model
 /// type has no working diesel `SQLite` `FromSql`/`ToSql` (`SQLite` foundation,
-/// issue #1614 AC #4).
+/// issue #1614 AC #4; conversions extended in #1924).
 ///
 /// The `SQLite` column/schema mapping ([`dsl::FieldKind::sqlite_schema_type`])
 /// changes the DDL and diesel sql-type, but the `#[model]` struct field still
-/// renders as its Rust type (`uuid::Uuid`, `autumn_web::storage::Blob`,
-/// `rust_decimal::Decimal`). Diesel implements no conversion for those types on
-/// its `SQLite` backend in a generated app's feature set (diesel
-/// `sqlite`+`chrono`, no `uuid`/`numeric`; `Blob` only implements `Jsonb`/`Pg`),
-/// so a generated `SQLite` app using such a field fails to compile. Rather than
-/// emit uncompilable code, generation fails here with an actionable message
-/// (AC #4). First-class support for these kinds is tracked in issue #1924.
+/// renders as its Rust type. As of #1924 `DateTime<Utc>` (via
+/// `TimestamptzSqlite`) and `Attachment` (`autumn_web::storage::Blob`, via
+/// `autumn-web`'s local `Text`/`Sqlite` impls) round-trip on `SQLite`. The
+/// still-rejected kinds are `Uuid` (`uuid::Uuid`), `Decimal`
+/// (`rust_decimal::Decimal`), and `Enum`: their Rust types are foreign to
+/// `autumn-web` (so the orphan rule forbids `autumn-web` adding the required
+/// `Sqlite` conversion) and diesel/`rust_decimal`'s own impls are
+/// Postgres-only, so a generated `SQLite` app using such a field fails to
+/// compile. Rather than emit uncompilable code, generation fails here with an
+/// actionable message (AC #4). Wrapper-based support for these remaining kinds
+/// is tracked in issue #1924.
 #[must_use]
 pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> GenerateError {
     GenerateError::Config(format!(
@@ -413,23 +438,22 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
          `{rust_type}`: diesel implements no FromSql/ToSql for that type on its SQLite \
          backend in a generated app's feature set, so a generated SQLite app using this \
          field would fail to compile. Supported SQLite field kinds are: {kinds}. \
-         First-class SQLite support for Uuid / attachments / Decimal / DateTime<Utc> / \
-         enum fields is tracked in https://github.com/madmax983/autumn/issues/1924 — use a \
+         SQLite support for the remaining Uuid / Decimal / enum fields is tracked in \
+         https://github.com/autumn-foundation/autumn/issues/1924 — use a \
          supported field kind, or target a Postgres database.",
         kinds = dsl::SQLITE_SUPPORTED_KINDS,
     ))
 }
 
 /// Reject any field whose kind lacks a working diesel `SQLite` conversion
-/// (issue #1614 AC #4) before any DDL / model / schema is emitted for a
+/// (issue #1614 AC #4; #1924) before any DDL / model / schema is emitted for a
 /// `SQLite`-backed app. Bubbles the first offending field as a
 /// [`sqlite_field_kind_unsupported_error`]. Postgres callers never invoke this,
 /// so their output is unaffected.
 ///
 /// # Errors
 /// Returns [`GenerateError::Config`] for the first field whose kind has no
-/// working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`,
-/// `DateTime<Utc>`, `Enum`).
+/// working diesel `SQLite` conversion (`Uuid`, `Decimal`, `Enum`).
 pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.sqlite_has_diesel_conversion() {

@@ -1,0 +1,331 @@
+//! Request-path proof for `#[translatable]` fields (issue #1384): the same
+//! stored record renders different content under different `Accept-Language`
+//! headers, with **zero locale arguments in the handler**.
+
+#![cfg(feature = "i18n")]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use autumn_web::i18n::{
+    AmbientLocaleLayer, Bundle, I18nConfig, LocalePrefixScopeLayer, Translated, ambient_locale,
+};
+use axum::Extension;
+use axum::body::Body;
+use axum::http::{Request, header};
+use axum::routing::get;
+use tower::ServiceExt;
+
+fn chain(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn config() -> I18nConfig {
+    I18nConfig {
+        default_locale: "en".to_owned(),
+        supported_locales: vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+        fallback_chain: vec![],
+        dir: "i18n".to_owned(),
+        locale_prefix_enabled: false,
+        locale_prefix_exclude: vec![],
+        locale_prefix_exclude_exact: vec![],
+    }
+}
+
+fn bundle() -> Arc<Bundle> {
+    Arc::new(Bundle::from_messages(HashMap::new(), &config()))
+}
+
+/// Stands in for a row loaded by a repository: one record, translations in
+/// `en` and `es`, nothing in `fr`.
+fn seeded_post() -> Translated {
+    let mut title = Translated::new();
+    title.set("en", "Hello world");
+    title.set("es", "Hola mundo");
+    title
+}
+
+/// The whole point: **no `Locale` parameter, no locale argument**. The field
+/// resolves itself.
+async fn show_title() -> String {
+    seeded_post().to_string()
+}
+
+/// Same, through the explicit `Option` surface.
+async fn show_title_opt() -> String {
+    seeded_post()
+        .resolve()
+        .map_or_else(|| "<untranslated>".to_owned(), str::to_owned)
+}
+
+async fn show_ambient() -> String {
+    ambient_locale().unwrap_or_else(|| "<none>".to_owned())
+}
+
+fn router() -> axum::Router {
+    axum::Router::new()
+        .route("/title", get(show_title))
+        .route("/title-opt", get(show_title_opt))
+        .route("/ambient", get(show_ambient))
+        .layer(AmbientLocaleLayer::new(&bundle()))
+        .layer(Extension(bundle()))
+}
+
+async fn get_with(path: &str, accept_language: Option<&str>) -> String {
+    let mut req = Request::builder().uri(path);
+    if let Some(al) = accept_language {
+        req = req.header(header::ACCEPT_LANGUAGE, al);
+    }
+    let resp = router()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// AC2 / success metric: `Accept-Language: es` serves the Spanish value.
+#[tokio::test]
+async fn spanish_accept_language_renders_the_spanish_translation() {
+    assert_eq!(get_with("/title", Some("es")).await, "Hola mundo");
+}
+
+/// AC3 / success metric: `fr` is untranslated, so resolution walks the
+/// fallback chain down to `en` — no 500, no panic.
+#[tokio::test]
+async fn untranslated_locale_falls_back_through_the_chain() {
+    assert_eq!(get_with("/title", Some("fr")).await, "Hello world");
+    assert_eq!(get_with("/title-opt", Some("fr")).await, "Hello world");
+}
+
+#[tokio::test]
+async fn default_locale_applies_without_an_accept_language_header() {
+    assert_eq!(get_with("/title", None).await, "Hello world");
+}
+
+/// The layer establishes the ambient locale for the whole handler, which is
+/// what removes the locale argument from the signature.
+#[tokio::test]
+async fn the_layer_publishes_the_negotiated_locale_as_the_ambient_one() {
+    assert_eq!(get_with("/ambient", Some("es")).await, "es");
+    assert_eq!(get_with("/ambient", Some("fr")).await, "fr");
+    // Unsupported locale negotiates down to the configured default.
+    assert_eq!(get_with("/ambient", Some("de")).await, "en");
+}
+
+/// The `?locale=` override the `Locale` extractor honours must move the
+/// ambient locale too — the two must never disagree.
+#[tokio::test]
+async fn the_layer_honours_the_same_resolution_order_as_the_extractor() {
+    assert_eq!(get_with("/title?locale=es", None).await, "Hola mundo");
+}
+
+// ── Locale-prefix routing (#1251) composition ────────────────────────────────
+
+/// A `/{locale}/…` URL must move the ambient locale too. The prefix is only
+/// visible *inside* the router's per-locale nest, so this is the case an
+/// app-wide layer alone would silently get wrong.
+#[tokio::test]
+async fn locale_prefixed_urls_set_the_ambient_locale() {
+    use autumn_web::i18n::UriPrefixedLocale;
+
+    // Mirrors the router's nest: the prefix extension is installed *outside*
+    // the ambient layer so the layer can see it.
+    let inner = axum::Router::new()
+        .route("/title", get(show_title))
+        .route("/ambient", get(show_ambient))
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"]), "en"))
+        .layer(Extension(UriPrefixedLocale("es".to_owned())));
+    let app = axum::Router::new()
+        .nest("/es", inner)
+        .layer(Extension(bundle()));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/es/title")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "Hola mundo");
+}
+
+// ── Streaming responses (#1384) ──────────────────────────────────────────────
+
+/// A deferred/streaming body is polled AFTER the handler future resolves, so
+/// without the layer's body wrapper the task-local scope would already be gone
+/// and every frame would render the default locale.
+#[tokio::test]
+async fn a_streaming_body_still_resolves_to_the_request_locale() {
+    use futures::stream;
+
+    async fn stream_titles() -> axum::response::Response {
+        let post = seeded_post();
+        // Each frame renders lazily, one poll at a time, after this function
+        // has already returned.
+        let body = axum::body::Body::from_stream(stream::iter(
+            (0..3).map(move |i| Ok::<_, std::io::Error>(format!("{i}:{post}\n"))),
+        ));
+        axum::response::Response::new(body)
+    }
+
+    let app = axum::Router::new()
+        .route("/stream", get(stream_titles))
+        .layer(AmbientLocaleLayer::new(&bundle()))
+        .layer(Extension(bundle()));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/stream")
+                .header(header::ACCEPT_LANGUAGE, "es")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text, "0:Hola mundo\n1:Hola mundo\n2:Hola mundo\n", "{text}");
+}
+
+// ── SSG/ISG layer placement (#1384) ──────────────────────────────────────────
+
+/// The ambient-locale layer must run **inside** `SessionLayer`, on the SSG/ISG
+/// path as well as the dynamic one: everything the SSG path drains out is
+/// applied outside the static-first middleware, and out there the signed
+/// session extension does not exist yet. A locale persisted by the documented
+/// session switcher would then be invisible to content while the UI chrome —
+/// which does read the session — renders the other language.
+///
+/// This asserts the placement directly: the layer resolves a session-persisted
+/// locale for a handler that takes no `Locale` argument, so no later extractor
+/// exists to correct a wrong answer.
+#[tokio::test]
+async fn the_ambient_layer_sees_a_session_persisted_locale() {
+    use autumn_web::session::{MemoryStore, Session, SessionConfig, SessionLayer};
+
+    // Writes the locale the documented switcher writes, then a second request
+    // reads it back through the ambient layer alone.
+    async fn switch(session: Session) -> String {
+        session.insert("autumn_locale", "es").await;
+        "switched".to_owned()
+    }
+
+    let app = axum::Router::new()
+        .route("/switch", get(switch))
+        .route("/title", get(show_title))
+        // Ambient layer INSIDE the session layer, which is the placement
+        // `apply_middleware` produces on both router paths.
+        .layer(AmbientLocaleLayer::new(&bundle()))
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig::default(),
+        ))
+        .layer(Extension(bundle()));
+
+    let switched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/switch")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = switched
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("session cookie set")
+        .to_str()
+        .expect("ascii cookie")
+        .to_owned();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/title")
+                // No Accept-Language at all: only the session says `es`.
+                .header(header::COOKIE, cookie.split(';').next().unwrap_or_default())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "Hola mundo",
+        "the session-persisted locale must reach a handler that takes no Locale"
+    );
+}
+
+/// #1384 (Codex round 3): the per-nest prefix layer must **refine** the
+/// app-wide scope, not replace it with a chain rebuilt from router config.
+///
+/// An app can supply `.i18n(bundle)` whose fallback chain differs from
+/// `AutumnConfig.i18n` — here the bundle falls back `fr -> en` while the
+/// router config would fall back to `en` only. If the nest rebuilt the chain,
+/// `/es/...` would resolve `#[translatable]` content down the router's chain
+/// while `Locale::t` walked the bundle's, breaking the "one mental model"
+/// promise. Refining keeps one chain for both.
+#[tokio::test]
+async fn a_locale_prefixed_nest_inherits_the_bundles_fallback_chain() {
+    use autumn_web::i18n::UriPrefixedLocale;
+
+    // Only `fr` is translated. Under `/es/...` (untranslated) resolution must
+    // walk the BUNDLE's chain, whose first link is `fr`.
+    async fn show_fr_only() -> String {
+        Translated::from_pairs([("fr", "Bonjour le monde"), ("en", "Hello world")]).to_string()
+    }
+
+    let bundle_config = I18nConfig {
+        default_locale: "en".to_owned(),
+        supported_locales: vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+        // The bundle's chain: `fr` before `en`.
+        fallback_chain: vec!["fr".to_owned(), "en".to_owned()],
+        dir: "i18n".to_owned(),
+        locale_prefix_enabled: true,
+        locale_prefix_exclude: vec![],
+        locale_prefix_exclude_exact: vec![],
+    };
+    let rich = std::sync::Arc::new(Bundle::from_messages(HashMap::new(), &bundle_config));
+    assert_eq!(
+        rich.fallback_chain(),
+        ["fr", "en"],
+        "bundle chain precondition"
+    );
+
+    let inner = axum::Router::new()
+        .route("/title", get(show_fr_only))
+        // The nest carries the ROUTER's chain (`en` only) as its no-outer-scope
+        // fallback — which must not be what wins here.
+        .layer(LocalePrefixScopeLayer::new("es", chain(&["en"]), "en"))
+        .layer(Extension(UriPrefixedLocale("es".to_owned())));
+    let app = axum::Router::new()
+        .nest("/es", inner)
+        // App-wide layer built from the bundle, outside the nest.
+        .layer(AmbientLocaleLayer::new(&rich))
+        .layer(Extension(rich));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/es/title")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "Bonjour le monde",
+        "the nest must inherit the bundle's chain, not rebuild the router's"
+    );
+}

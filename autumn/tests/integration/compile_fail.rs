@@ -13,10 +13,30 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
 
+    // Route-level `seo(...)` defaults (#1182): typos and repeated keys are
+    // compile errors rather than silently-ignored metadata.
+    t.compile_fail("tests/compile-fail/route_seo_unknown_key.rs");
+    t.compile_fail("tests/compile-fail/route_seo_duplicate_key.rs");
+    t.compile_fail("tests/compile-fail/route_seo_empty_group.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
+    t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
+
+    // Edge-lane refusals (#1790). Always available: `#[edge]` is re-exported
+    // unconditionally (a route can be *marked* without the `edge` feature), and
+    // each of these is rejected inside the route macro before any code is
+    // emitted, so the fixtures never name `autumn_edge` and compile the same way
+    // with or without the feature. The edge lane is read-path only, carries no
+    // session or auth state, and adds nothing to a page that is already
+    // pre-rendered CDN-side.
+    t.compile_fail("tests/compile-fail/edge_on_post.rs");
+    t.compile_fail("tests/compile-fail/edge_with_secured.rs");
+    t.compile_fail("tests/compile-fail/edge_with_intercept.rs");
+    t.compile_fail("tests/compile-fail/edge_with_extension.rs");
+    t.compile_fail("tests/compile-fail/edge_on_static_get.rs");
 
     // Lifecycle macro failures (always available — the `lifecycle` macro is not
     // feature-gated). Firing an undeclared transition, leaving a terminal
@@ -38,6 +58,54 @@ fn compile_fail_tests() {
     // override collide on their target-derived mutation helpers (#1785).
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
+
+    // `#[commentable]` compile-time guards (#1367). The counter is maintained
+    // with `SET c = c + 1` and read back as `i64`, `commentable_id` is one
+    // column, the emitted `{Model}Comments` trait can only exist once, and the
+    // depth cap has to stay measurable by the runtime's recursive probe — each
+    // is a directed error rather than a runtime surprise.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_missing_counter_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_counter_not_i64.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_duplicate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_composite_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_max_depth_too_large.rs");
+    // `author_id` is `i64` everywhere in the comments API, so a non-integer
+    // author key is a compile error rather than a 401 from every POST.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_commentable_author_key_not_integer.rs");
+
+    // Declarative reactions (#1362): every `#[votable(...)]` misuse is a
+    // directed compile error rather than a runtime surprise on the first vote.
+    // `by =` is required (no positional head); only one `#[votable]` per model
+    // (the `{Model}Reactions` methods would collide); `sum`/`count` are the
+    // only aggregates; the aggregate column must exist on the model (otherwise
+    // a runtime `42703`); and `value_column` is meaningless in count mode.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_missing_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_duplicate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_unknown_aggregate.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_missing_aggregate_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_votable_value_column_in_count_mode.rs");
+
+    // Counter caches (#1325): `counter_cache` is a `belongs_to` option (the
+    // child owns the foreign key and runs the maintenance), the column name is
+    // spliced into generated SQL so it must be a plain identifier, and two legs
+    // resolving onto one column would double-count every insert.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_on_has_many.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_bad_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
 
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
@@ -154,6 +222,19 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_m2m_helper_override.rs");
 
+    // Declarative reactions (#1362): `#[votable]` with every override key set,
+    // and again on a soft-deleted target — both emitter branches build, and
+    // the attribute is stripped before the Diesel struct is emitted.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_votable_overrides.rs");
+
+    // Counter caches (#1325): the bare flag, an explicit column override, a
+    // nullable foreign key, a soft-deleting child, and a `belongs_to` with no
+    // counter cache at all — every branch of the spec emitter, plus the
+    // convention-derived names asserted at run time.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_counter_cache.rs");
+
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_draft_accessors.rs");
@@ -169,6 +250,14 @@ fn compile_pass_tests() {
     // Full versioned repository over an encrypted model (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted.rs");
+
+    // A HOOKS-enabled repository over an encrypted model (requires db feature).
+    // `hooks = ...` / `broadcasts = true` route updates through the hooks-aware
+    // `update_many` path, which must bind an OWNED proposed row to `.set(..)`:
+    // diesel implements `AsChangeset` only for the owned model once a field
+    // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
 
     // Sharding extractors + repository with_pool over a shard (requires db feature)
     #[cfg(feature = "db")]

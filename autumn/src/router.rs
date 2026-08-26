@@ -12,7 +12,6 @@ use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 #[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
-use crate::extract::State;
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
@@ -21,7 +20,6 @@ use crate::middleware::exception_filter::{
 };
 use crate::route::Route;
 use crate::state::AppState;
-use axum::middleware::Next;
 use axum::response::IntoResponse;
 use http::{Request, StatusCode};
 use thiserror::Error;
@@ -179,6 +177,28 @@ pub enum RouterBuildError {
         /// The original path template registered by the second handler.
         incoming_path: String,
     },
+    /// Locale-prefix routing (issue #1251) would generate a path that
+    /// collides with another route already registered at that exact path —
+    /// e.g. an app defines both `/foo` and `/en/foo` while `en` is a
+    /// supported locale: the bare-path redirect (mounted at every
+    /// locale-prefix-eligible path, claiming every HTTP method) already owns
+    /// `/en/foo`, so nesting `/foo`'s content under `/en` collides and axum
+    /// panics on the overlapping route at router-construction time. Detected
+    /// and surfaced as a build error instead (Codex review).
+    #[cfg(feature = "i18n")]
+    #[error(
+        "locale-prefix routing generates {generated:?} (locale {locale:?} + route {path:?}), \
+         which collides with another route already registered at that path — rename one of the \
+         routes, or exclude it via `[i18n] locale_prefix_exclude`"
+    )]
+    LocalePrefixPathCollision {
+        /// The supported locale whose nest produced the collision.
+        locale: String,
+        /// The original, locale-prefix-eligible route path that got nested.
+        path: String,
+        /// The resulting generated path (`/{locale}{path}`) that collides.
+        generated: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -238,7 +258,7 @@ pub struct RouterContext {
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
-    /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
+    /// When `Some`, [`build_session_layer`](crate::session::build_session_layer)
     /// uses it directly and skips the config-driven backend selection.
     pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
@@ -270,6 +290,32 @@ pub fn try_build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_layers(route_list, config, state, Vec::new())
+}
+
+/// [`try_build_router`] plus caller-supplied app-wide Tower layers.
+///
+/// The layers are handed to the same [`RouterContext::custom_layers`] slot
+/// that [`AppBuilder::layer`](crate::app::AppBuilder::layer) uses, so they
+/// land in the identical stack position (inside `RequestId` and the session
+/// layer, outside CSRF/CORS) and compose with the identical ordering
+/// contract — the first registration is the outermost layer on ingress.
+///
+/// Exists for `SystemTest::layer` (feature `system-tests`, hence no intra-doc
+/// link from this always-compiled module): a browser test that registers its
+/// app's middleware must observe exactly the stack the real app serves,
+/// otherwise the harness lies about what production does.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
+pub fn try_build_router_with_layers(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
     let router = try_build_router_inner(
         route_list,
@@ -280,7 +326,7 @@ pub fn try_build_router(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
-            custom_layers: Vec::new(),
+            custom_layers,
             static_gate_layers: Vec::new(),
             #[cfg(feature = "maud")]
             error_page_renderer: None,
@@ -555,7 +601,7 @@ fn build_router_pre_state(
 
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
-    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups);
+    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups, config);
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
@@ -571,12 +617,14 @@ fn build_router_pre_state(
     // the same path instead of panicking on an overlapping `GET` (issue #1971).
     let user_get_paths = collect_user_get_paths(&route_list, &ctx.scoped_groups);
 
-    let mut router = group_and_mount_routes(
+    let mut router = mount_user_routes(
         route_list,
+        &ctx.scoped_groups,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
         state,
-    );
+        config,
+    )?;
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
@@ -619,9 +667,7 @@ fn build_router_pre_state(
         let static_dir = crate::app::project_dir("static", &env);
         router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     }
-    router = router.layer(axum::middleware::from_fn(
-        crate::assets::asset_cache_control,
-    ));
+    router = router.layer(crate::assets::AssetCacheControlLayer);
 
     router = mount_scoped_groups(
         router,
@@ -668,9 +714,13 @@ fn build_router_pre_state(
     )?;
 
     if dev_reload_enabled {
-        router = router
-            .layer(axum::middleware::from_fn(dev::disable_static_cache))
-            .layer(axum::middleware::from_fn(dev::inject_live_reload));
+        // One `Router::layer` call, not two: tuple order is OUTERMOST FIRST, so
+        // `inject_live_reload` stays outer to `disable_static_cache` exactly as
+        // the two chained `.layer()` calls used to leave it (issue #2193).
+        router = router.layer((
+            axum::middleware::from_fn(dev::inject_live_reload),
+            axum::middleware::from_fn(dev::disable_static_cache),
+        ));
     }
 
     // Dev request inspector: mount UI and apply recording middleware.
@@ -706,18 +756,21 @@ fn build_router_pre_state(
     }
 
     #[cfg(feature = "oauth2")]
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        http_interceptor_middleware,
-    ));
+    let http_interceptor = HttpInterceptorLayer::new(state.clone());
+    #[cfg(not(feature = "oauth2"))]
+    let http_interceptor = tower::layer::util::Identity::new();
 
     // Install the request's app as the ambient event-bus context so any code in
     // the request (handlers, services) that calls the free `events::publish`
     // dispatches against this app rather than the process-global bus — keeping
     // parallel in-process apps (notably tests) isolated.
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        event_app_context_middleware,
+    //
+    // One `Router::layer` call for both: tuple order is OUTERMOST FIRST, so the
+    // event-bus context stays outer to the oauth2 interceptor exactly as the two
+    // separate `.layer()` calls used to leave it (issue #2193).
+    let router = router.layer((
+        crate::events::EventAppContextLayer::new(state.clone()),
+        http_interceptor,
     ));
 
     // Mount the MCP endpoint last so its dispatch target — a clone of the
@@ -826,7 +879,8 @@ fn build_router_pre_state(
         // same-origin browser client behind a TLS-terminating proxy. The
         // dispatch clone already carries its own copy of this layer.
         mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
-        // The MCP route is merged after `apply_upload_middleware`, so axum's
+        // The MCP route is merged after the ingress upload guards
+        // (`build_upload_layers`), so axum's
         // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
         // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
         // the same cap a direct JSON endpoint gets so larger-but-valid tool
@@ -922,11 +976,24 @@ fn build_router_pre_state(
     // middleware), so this block is a no-op there.
     let router = if defer_security_headers {
         router
-    } else {
-        let router =
-            apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
+    } else if static_gate_layers.is_empty() {
         router.layer(crate::security::SecurityHeadersLayer::from_config(
             &config.security.headers,
+        ))
+    } else {
+        // ONE application for both: a `tower-layer` tuple puts its FIRST
+        // element OUTERMOST, so `SecurityHeadersLayer` stays outside the gates
+        // — the same order the two separate `.layer()` calls produced (the
+        // gates were applied first, then security headers wrapped them). A
+        // registered gate therefore costs the framework no extra nesting level
+        // at all.
+        tracing::debug!(
+            count = static_gate_layers.len(),
+            "Pre-static gate Tower layers applied"
+        );
+        router.layer((
+            crate::security::SecurityHeadersLayer::from_config(&config.security.headers),
+            ComposedRegisteredLayers::new(static_gate_layers),
         ))
     };
 
@@ -1395,7 +1462,7 @@ fn reject_mcp_path_collisions(
 ///
 /// `axum::Router::merge` panics when the merged routers have method
 /// handlers on the same path (e.g. two `GET` handlers on
-/// `/v3/api-docs`). We surface that as a recoverable
+/// `/openapi.json`). We surface that as a recoverable
 /// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
 /// produces an actionable error instead of a crash on startup.
 ///
@@ -1700,6 +1767,34 @@ fn reject_duplicate_user_routes(
     Ok(())
 }
 
+/// Attach a route's declared SEO defaults (#1182) as a request extension so the
+/// [`SeoMeta`](crate::seo::SeoMeta) extractor can hand the handler a
+/// pre-populated builder.
+///
+/// Attaching them here — rather than inside the route macro — keeps the layer
+/// clear of the macro-ordering dance with the signature-rewriting guards
+/// (`#[secured]`, `#[throttle]`, `#[step_up]`, `#[authorize]`), and means
+/// static pre-rendering picks them up for free, since it drives this same
+/// router.
+///
+/// Called from **both** mounting paths — [`group_and_mount_routes`] and
+/// [`mount_scoped_groups`] — because a scoped route is just as entitled to its
+/// declared defaults, and the extractor's infallibility means a miss would show
+/// up as silently absent meta tags rather than an error.
+///
+/// Routes that never declared `seo(...)` skip the layer entirely and pay
+/// nothing per request. The layer is applied to the route's own
+/// `MethodRouter`, so sibling verbs mounted on the same path do not inherit it.
+fn attach_seo_defaults(
+    handler: axum::routing::MethodRouter<AppState>,
+    seo: crate::seo::SeoRouteDefaults,
+) -> axum::routing::MethodRouter<AppState> {
+    if seo.is_empty() {
+        return handler;
+    }
+    handler.layer(axum::Extension(seo))
+}
+
 fn group_and_mount_routes(
     route_list: Vec<Route>,
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
@@ -1727,6 +1822,7 @@ fn group_and_mount_routes(
         if let Some(layer) = selected_layer {
             handler = handler.layer(layer.clone());
         }
+        handler = attach_seo_defaults(handler, route.seo);
         if let Some(version) = route.api_version {
             handler = handler.layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -1753,6 +1849,557 @@ fn group_and_mount_routes(
         router = router.route(path, method_router);
     }
     router
+}
+
+/// Mount the user route table, applying locale-prefixed routing (issue
+/// #1251) when [`I18nConfig::locale_prefix_enabled`](crate::i18n::I18nConfig::locale_prefix_enabled)
+/// is enabled. Delegates straight to [`group_and_mount_routes`] otherwise, so
+/// apps that don't opt in see no behavior change.
+#[cfg(feature = "i18n")]
+fn mount_user_routes(
+    route_list: Vec<Route>,
+    scoped_groups: &[ScopedGroup],
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
+    state: &AppState,
+    config: &AutumnConfig,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
+    if !config.i18n.locale_prefix_enabled {
+        return Ok(group_and_mount_routes(
+            route_list,
+            idempotency_layers,
+            opaque_app_layers_present,
+            state,
+        ));
+    }
+
+    let (included, excluded) = partition_routes_for_locale_prefix(
+        route_list,
+        &config.i18n.locale_prefix_exclude,
+        &config.i18n.locale_prefix_exclude_exact,
+    );
+
+    let included_path_methods = route_list_path_methods(&included);
+    let excluded_path_methods = route_list_path_methods(&excluded);
+    let scoped_path_methods = scoped_group_path_methods(scoped_groups);
+    let framework_path_methods = framework_probe_path_methods(config);
+
+    let valid_locales = validated_locale_prefix_locales(&config.i18n);
+
+    if let Some(err) = detect_locale_prefix_path_collision(
+        &included_path_methods,
+        &excluded_path_methods,
+        &scoped_path_methods,
+        &framework_path_methods,
+        &valid_locales,
+    ) {
+        return Err(err);
+    }
+
+    let path_method_filters = path_method_filters(&included_path_methods);
+
+    let content_router = group_and_mount_routes(
+        included,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    );
+    let excluded_router = group_and_mount_routes(
+        excluded,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    );
+    Ok(apply_locale_prefix_routing(
+        excluded_router,
+        &content_router,
+        &path_method_filters,
+        &config.i18n,
+        &valid_locales,
+    ))
+}
+
+// This variant never actually returns `Err` (only the `i18n`-enabled sibling
+// above can, on a locale-prefix path collision) — but it must keep the same
+// `Result` signature so the single call site doesn't need its own
+// `#[cfg(feature = "i18n")]` branch.
+#[cfg(not(feature = "i18n"))]
+#[allow(clippy::unnecessary_wraps)]
+fn mount_user_routes(
+    route_list: Vec<Route>,
+    _scoped_groups: &[ScopedGroup],
+    idempotency_layers: Option<&BuiltIdempotencyLayers>,
+    opaque_app_layers_present: bool,
+    state: &AppState,
+    _config: &AutumnConfig,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
+    Ok(group_and_mount_routes(
+        route_list,
+        idempotency_layers,
+        opaque_app_layers_present,
+        state,
+    ))
+}
+
+/// Splits `route_list` into `(included, excluded)` for locale-prefix
+/// mounting: `excluded` routes either match a configured
+/// [`I18nConfig::locale_prefix_exclude`](crate::i18n::I18nConfig::locale_prefix_exclude)
+/// prefix (e.g. hand-written `/api/*` routes) or a literal
+/// [`I18nConfig::locale_prefix_exclude_exact`](crate::i18n::I18nConfig::locale_prefix_exclude_exact)
+/// path (auto-populated from `#[static_get]` routes), and mount unprefixed,
+/// exactly as they would with locale-prefix routing off. `included` routes
+/// get nested under every supported locale plus a bare-path redirect.
+///
+/// The two lists are matched differently on purpose: a prefix exclusion like
+/// `/api` also swallows `/api/users`, which is the point for a hand-excluded
+/// namespace, but the exact list must NOT do that — excluding a static route
+/// like `/posts` must not also swallow an unrelated dynamic sibling route
+/// like `/posts/{slug}` (Codex review).
+#[cfg(feature = "i18n")]
+fn partition_routes_for_locale_prefix(
+    route_list: Vec<Route>,
+    exclude_prefixes: &[String],
+    exclude_exact: &[String],
+) -> (Vec<Route>, Vec<Route>) {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    for route in route_list {
+        if exclude_exact.iter().any(|p| p == route.path)
+            || matches_locale_exclude_prefix(route.path, exclude_prefixes)
+        {
+            excluded.push(route);
+        } else {
+            included.push(route);
+        }
+    }
+    (included, excluded)
+}
+
+/// `true` when `path` equals one of `prefixes` or starts with `{prefix}/`.
+/// A trailing `/*` (or `/`) on a configured prefix is stripped before
+/// comparing, so `"/api"` and `"/api/*"` are equivalent — except a bare `"/"`
+/// (e.g. a `#[static_get("/")]` route added via
+/// `exclude_static_routes_from_locale_prefix`), which is kept as-is and
+/// matched exactly: stripping its trailing slash would normalize it to an
+/// empty prefix, which the empty-prefix guard below then silently rejects,
+/// so `"/"` would never actually get excluded (Codex review).
+///
+/// `pub` (the `router` module itself is `pub(crate)`, so this is already
+/// crate-private) so `tenancy::strip_locale_prefix_for_tenancy` can reuse the
+/// same exclusion semantics rather than a third divergent copy (`seo.rs`
+/// keeps its own, feature-independent copy to avoid a hard dependency on
+/// `i18n`-gated router internals; `tenancy.rs`'s caller is already
+/// `i18n`-gated, so reuse here doesn't add one).
+#[cfg(feature = "i18n")]
+pub fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|raw| {
+        let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
+        let prefix = if prefix == "/" {
+            prefix
+        } else {
+            prefix.strip_suffix('/').unwrap_or(prefix)
+        };
+        !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
+    })
+}
+
+/// `true` when `locale` is safe to use as a literal [`Router::nest`](axum::Router::nest)
+/// segment AND as a literal path segment in the generated redirect target
+/// (`/{locale}{path}`): non-empty (an empty string would nest at `"/"`,
+/// which axum panics on — nesting at the root isn't supported) and free of
+/// characters axum's route syntax interprets specially — `/` (would
+/// silently nest an extra sub-path instead of one opaque segment), `{`/`}`
+/// (path-parameter capture syntax), `*` (wildcard capture), and a leading
+/// `:` (axum 0.7 capture syntax — axum 0.8's `Router::route` panics on it
+/// during assembly via `validate_v07_paths`, the same restriction
+/// `InvalidMcpPath` above already guards against) — plus `?`/`#` and
+/// whitespace, which axum accepts as a literal nest string but which a
+/// client parses as a query/fragment delimiter, silently truncating the
+/// redirect target (`/en?x/foo` parses as path `/en` + query `x/foo`)
+/// (Codex review).
+#[cfg(feature = "i18n")]
+fn is_valid_locale_segment(locale: &str) -> bool {
+    !locale.is_empty()
+        && !locale.starts_with(':')
+        && !locale.contains(['/', '{', '}', '*', '?', '#'])
+        && !locale.chars().any(char::is_whitespace)
+}
+
+/// The subset of `i18n.supported_locales` that's actually valid and unique —
+/// i.e. exactly the locales [`apply_locale_prefix_routing`] nests (invalid
+/// entries are dropped by [`is_valid_locale_segment`], duplicates by
+/// order-preserving dedup). Negotiation data (`LocaleRoutingConfig`, the
+/// default-locale fallback) must be built from this validated list rather
+/// than the raw config — otherwise a request could negotiate to a locale
+/// that was silently skipped and has no nest, trading a config typo's
+/// build-time no-op for a runtime 404 (Codex review).
+#[cfg(feature = "i18n")]
+fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    i18n.supported_locales
+        .iter()
+        .filter(|locale| is_valid_locale_segment(locale) && seen.insert(locale.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Maps an HTTP method to the [`axum::routing::MethodFilter`] bit it
+/// corresponds to. Falls back to `GET` for anything unrecognized — in
+/// practice only the synthetic `WS` method, which callers must run through
+/// [`effective_mount_method`] first (converting it to `GET`) anyway; this
+/// catch-all just avoids ever silently dropping a method were that
+/// invariant somehow violated.
+#[cfg(feature = "i18n")]
+fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
+    use axum::routing::MethodFilter;
+    match method.as_str() {
+        "POST" => MethodFilter::POST,
+        "PUT" => MethodFilter::PUT,
+        "DELETE" => MethodFilter::DELETE,
+        "PATCH" => MethodFilter::PATCH,
+        "HEAD" => MethodFilter::HEAD,
+        "OPTIONS" => MethodFilter::OPTIONS,
+        "TRACE" => MethodFilter::TRACE,
+        _ => MethodFilter::GET,
+    }
+}
+
+/// For each DISTINCT path in `routes`, the effective HTTP methods actually
+/// registered there — `WS`→`GET` via [`effective_mount_method`], and
+/// `GET`→`+HEAD` (axum also serves `HEAD` through a `#[get]` handler),
+/// mirroring exactly what [`build_route_timeout_table`] already does for
+/// the same reason.
+#[cfg(feature = "i18n")]
+fn route_list_path_methods(
+    routes: &[Route],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for route in routes {
+        let effective = effective_mount_method(&route.method);
+        let methods = map.entry(route.path.to_owned()).or_default();
+        if !methods.contains(&effective) {
+            methods.push(effective.clone());
+        }
+        if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+            methods.push(http::Method::HEAD);
+        }
+    }
+    map
+}
+
+/// The same per-path method collection as [`route_list_path_methods`], but
+/// for routes mounted via `AppBuilder::scoped()` — resolved to their final
+/// `{prefix}{path}` mount point via [`join_nested_path`] (the same helper
+/// [`build_route_timeout_table`] uses), since a scoped group's routes are
+/// never part of `route_list` and so are otherwise invisible to locale-prefix
+/// collision detection even though they mount onto the SAME router
+/// (`mount_scoped_groups`, after this module returns) and can collide with a
+/// generated locale path just as easily as a top-level route (Codex review).
+#[cfg(feature = "i18n")]
+fn scoped_group_path_methods(
+    scoped_groups: &[ScopedGroup],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for group in scoped_groups {
+        for route in &group.routes {
+            let resolved = join_nested_path(&group.prefix, route.path);
+            let effective = effective_mount_method(&route.method);
+            let methods = map.entry(resolved).or_default();
+            if !methods.contains(&effective) {
+                methods.push(effective.clone());
+            }
+            if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+                methods.push(http::Method::HEAD);
+            }
+        }
+    }
+    map
+}
+
+/// Health/liveness/readiness/startup probe paths reserved by the framework
+/// (`mount_probe_endpoints`, mounted well after this module returns) — all
+/// `GET` (+`HEAD`), and only when `config.health.enabled` (matching
+/// `mount_probe_endpoints`'s own off-switch: when probes are disabled, none
+/// of these paths are reserved). Included in locale-prefix collision
+/// detection so a probe path that happens to equal a generated locale path
+/// is caught before axum panics on the later overlapping mount (Codex
+/// review).
+///
+/// Actuator/OpenAPI/MCP mount paths are a similar, currently-undetected risk
+/// (see the reply on this finding), but aren't included here: unlike the
+/// probe paths, threading `OpenApiConfig`/the MCP mount path into this
+/// function requires plumbing well beyond `AutumnConfig` alone.
+#[cfg(feature = "i18n")]
+fn framework_probe_path_methods(
+    config: &AutumnConfig,
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map = std::collections::HashMap::new();
+    if !config.health.enabled {
+        return map;
+    }
+    for path in [
+        &config.health.path,
+        &config.health.live_path,
+        &config.health.ready_path,
+        &config.health.startup_path,
+    ] {
+        if path.is_empty() {
+            continue;
+        }
+        map.entry(path.clone())
+            .or_insert_with(|| vec![http::Method::GET, http::Method::HEAD]);
+    }
+    map
+}
+
+/// Combines a path's registered methods into the single [`axum::routing::MethodFilter`]
+/// the bare-path redirect must claim there.
+#[cfg(feature = "i18n")]
+fn path_method_filter(methods: &[http::Method]) -> axum::routing::MethodFilter {
+    methods
+        .iter()
+        .map(method_filter_for)
+        .reduce(axum::routing::MethodFilter::or)
+        .unwrap_or(axum::routing::MethodFilter::GET)
+}
+
+/// For each locale-prefix-included path, the [`axum::routing::MethodFilter`]
+/// the bare-path redirect must claim there — so it claims precisely what the
+/// nested content will serve.
+///
+/// Claiming every method via `axum::routing::any` (the prior behavior)
+/// would otherwise reserve, say, GET at `/health` for the redirect even
+/// when only `POST /health` is a real included route — colliding with the
+/// framework's own auto-mounted `GET /health` probe, which mounts later
+/// (`mount_probe_endpoints`, well after this function returns) and has no
+/// visibility into methods the redirect already claimed (Codex review).
+#[cfg(feature = "i18n")]
+fn path_method_filters(
+    included_path_methods: &std::collections::HashMap<String, Vec<http::Method>>,
+) -> Vec<(String, axum::routing::MethodFilter)> {
+    let mut result: Vec<_> = included_path_methods
+        .iter()
+        .map(|(path, methods)| (path.clone(), path_method_filter(methods)))
+        .collect();
+    result.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    result
+}
+
+/// Detects a route path that collides with a path locale-prefix nesting will
+/// itself generate — e.g. an app defines both `/foo` and `/en/foo` while
+/// `en` is a supported locale: the bare-path redirect (mounted at every
+/// locale-prefix-eligible path, claiming only the methods actually
+/// registered there — see [`path_method_filters`]) already owns some methods
+/// at `/en/foo`, so nesting `/foo`'s content under `/en` collides if those
+/// methods overlap, and axum panics on the overlapping route at
+/// router-construction time. Checked against `included`, `excluded`
+/// (mounted verbatim at the top level), `scoped` (mounted later via
+/// `mount_scoped_groups`, but onto the same router), and `framework` (the
+/// health/live/ready/startup probes, mounted later still via
+/// `mount_probe_endpoints`) so any pre-existing route is caught regardless
+/// of how it was registered (Codex review).
+///
+/// Two DIFFERENT kinds of collision are distinguished, matching
+/// `reject_duplicate_user_routes`'s established model:
+///   - An EXACT path match is only a real conflict if the methods overlap —
+///     axum legally merges the SAME path template across DIFFERENT methods
+///     (`GET /foo` generating `GET /en/foo` must coexist with an existing
+///     `POST /en/foo`).
+///   - A DIFFERENT template that [`paths_conflict_under_matchit`] flags is a
+///     conflict regardless of method: two templates with different capture
+///     *names* at the same position (e.g. `/en/users/{id}` generated from
+///     `/users/{id}`, vs. an existing `/en/users/{slug}`) can never coexist,
+///     because matchit's tree rejects the shape clash before axum even gets
+///     to method-router merging.
+#[cfg(feature = "i18n")]
+fn detect_locale_prefix_path_collision(
+    included: &std::collections::HashMap<String, Vec<http::Method>>,
+    excluded: &std::collections::HashMap<String, Vec<http::Method>>,
+    scoped: &std::collections::HashMap<String, Vec<http::Method>>,
+    framework: &std::collections::HashMap<String, Vec<http::Method>>,
+    valid_locales: &[String],
+) -> Option<RouterBuildError> {
+    let all_other_paths: Vec<&String> = excluded
+        .keys()
+        .chain(scoped.keys())
+        .chain(framework.keys())
+        .chain(included.keys())
+        .collect();
+
+    for locale in valid_locales {
+        for (path, methods) in included {
+            let generated = if path == "/" {
+                format!("/{locale}")
+            } else {
+                format!("/{locale}{path}")
+            };
+
+            let exact_conflict = excluded
+                .get(&generated)
+                .into_iter()
+                .chain(scoped.get(&generated))
+                .chain(framework.get(&generated))
+                .chain(included.get(&generated))
+                .any(|other_methods| methods.iter().any(|m| other_methods.contains(m)));
+
+            let shape_conflict = all_other_paths
+                .iter()
+                .any(|p| **p != generated && paths_conflict_under_matchit(p, &generated));
+
+            if exact_conflict || shape_conflict {
+                return Some(RouterBuildError::LocalePrefixPathCollision {
+                    locale: locale.clone(),
+                    path: path.clone(),
+                    generated,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Builds the locale-prefixed router: `excluded_router` (and a bare-path
+/// redirect for every `path_method_filters` entry, claiming only the exact
+/// methods registered there — see [`path_method_filters`](fn@path_method_filters))
+/// mount at the top level; `content_router` is cloned and nested once per entry in
+/// `valid_locales` (see [`validated_locale_prefix_locales`] — already
+/// deduped and filtered to safe `Router::nest` segments).
+///
+/// Cloning `content_router` — a cheap, `Arc`-backed `axum::Router` — rather
+/// than the underlying [`Route`] list is what lets every locale share one
+/// router build: no route definition is duplicated by hand or in code.
+///
+/// When `valid_locales` is empty (a degenerate config — locale-prefix
+/// routing on with nothing valid to prefix with), no nest is created and the
+/// bare-path redirect is skipped too: redirecting to an unnested
+/// `/{default_locale}/...` target that structurally can't exist would just
+/// swap a direct 404 for a 308-then-404 round trip.
+#[cfg(feature = "i18n")]
+fn apply_locale_prefix_routing(
+    excluded_router: axum::Router<AppState>,
+    content_router: &axum::Router<AppState>,
+    path_method_filters: &[(String, axum::routing::MethodFilter)],
+    i18n: &crate::i18n::I18nConfig,
+    valid_locales: &[String],
+) -> axum::Router<AppState> {
+    let mut router = excluded_router;
+
+    if !path_method_filters.is_empty() && !valid_locales.is_empty() {
+        let mut redirect_router = axum::Router::<AppState>::new();
+        for (path, filter) in path_method_filters {
+            redirect_router = redirect_router.route(
+                path,
+                axum::routing::on(*filter, locale_prefix_redirect_handler),
+            );
+        }
+        router = router.merge(redirect_router);
+    }
+
+    // Content resolution (#1384) has to see the URL prefix, and the prefix
+    // extension is only visible INSIDE this nest — an app-wide ambient-locale
+    // layer sits outside it and would negotiate `/es/posts` from
+    // `Accept-Language` alone. So the nest gets its own scope layer.
+    //
+    // It REFINES the app-wide scope rather than building a fresh one: that
+    // layer's chain comes from the loaded `Bundle`, which an app may have
+    // supplied via `.i18n(bundle)` built from a different `I18nConfig` than the
+    // router's. Rebuilding the chain from `i18n` here would shadow it, so
+    // `/es/...` could resolve `#[translatable]` content down one chain while
+    // `Locale::t` on the same request walked another — the exact "one mental
+    // model" this feature promises. The config chain is used only as the
+    // fallback for the shape with no app-wide layer at all: locale-prefix
+    // routing enabled WITHOUT `.i18n()`/`.i18n_auto()`, where no bundle exists.
+    let prefix_chain = i18n.resolved_fallback_chain();
+    for locale in valid_locales {
+        let nested = content_router
+            .clone()
+            .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(crate::i18n::LocalePrefixScopeLayer::new(
+                locale.clone(),
+                prefix_chain.clone(),
+                &i18n.default_locale,
+            ))
+            .layer(axum::Extension(crate::i18n::UriPrefixedLocale(
+                locale.clone(),
+            )));
+        router = router.nest(&format!("/{locale}"), nested);
+    }
+
+    // Negotiation data for the `Locale` extractor (issue #1251) — covers
+    // apps that enable `locale_prefix_enabled` without also calling
+    // `.i18n()`/`.i18n_auto()`, so the bare-path redirect (and any handler
+    // under an excluded prefix that still takes a `Locale` param) negotiates
+    // against the configured `supported_locales`/`default_locale` instead of
+    // an empty list and a hard-coded `"en"`. This is authoritative for
+    // negotiation even when a `Bundle` is also installed, since the router's
+    // reachable locale segments come from `I18nConfig`, not the bundle — see
+    // `Locale::from_request_parts`. A real `Bundle`, if installed, remains
+    // authoritative only for `t()`/`t_with()` translation lookups.
+    //
+    // `default_locale` itself is only used here as the negotiation fallback,
+    // so it must name a locale that's actually nested above — a misconfigured
+    // `default_locale` absent from the validated locale set (Codex review)
+    // would otherwise negotiate to a locale with no `/{locale}` nest, and the
+    // bare-path redirect would 308 straight into a 404. Fall back to the
+    // first valid locale (i.e. the first one actually mounted) instead.
+    let effective_default_locale = if valid_locales.contains(&i18n.default_locale) {
+        i18n.default_locale.clone()
+    } else {
+        valid_locales
+            .first()
+            .cloned()
+            .unwrap_or_else(|| i18n.default_locale.clone())
+    };
+    router.layer(axum::Extension(crate::i18n::LocaleRoutingConfig {
+        supported_locales: valid_locales.to_vec(),
+        default_locale: effective_default_locale,
+    }))
+}
+
+/// Fallback handler mounted at every locale-prefix-eligible bare path:
+/// 308-redirects to the negotiated locale's prefixed path, preserving the
+/// query string. Reuses the unmodified [`Locale`](crate::i18n::Locale)
+/// extractor (no [`UriPrefixedLocale`](crate::i18n::UriPrefixedLocale) is set
+/// this far outside any locale nest) so the redirect target matches exactly
+/// what the request would have resolved to anyway.
+///
+/// **Known limitation** (Codex review): a mutating form `POSTing` directly to
+/// its bare, unprefixed path with a `[SubmitTokenLayer](crate::security::SubmitTokenLayer)`-protected
+/// `_submit_token` hits this 308 *before* reaching the real handler.
+/// `SubmitTokenLayer` caches 3xx responses so a replayed submit returns the
+/// first response verbatim — it has no way to distinguish this redirect
+/// from a handler-issued one it's deliberately designed to cache, so it
+/// records this 308 against the token. The browser then re-POSTs the same
+/// body (with the same token) to the now-current, already-prefixed URL,
+/// where the token replays the *cached 308* instead of reaching the
+/// handler. Closing this fully would mean teaching `SubmitTokenLayer` to
+/// recognize and skip caching this specific redirect — out of scope here.
+/// Forms should POST to the current (already locale-prefixed) path — e.g.
+/// via [`widgets::localized_path`](crate::widgets::localized_path) or a
+/// relative `action` — rather than a hardcoded bare path, which this
+/// framework's own `locale_switcher` already does for links.
+#[cfg(feature = "i18n")]
+async fn locale_prefix_redirect_handler(
+    locale: crate::i18n::Locale,
+    uri: axum::http::Uri,
+) -> axum::response::Redirect {
+    let path = uri.path();
+    // Axum's `nest(prefix, router)` makes the *bare* `prefix` (no trailing
+    // slash) match the inner router's own `"/"` route — `prefix/` 404s. So
+    // the root path's redirect target is `/{locale}`, not `/{locale}/`,
+    // unlike every other path, which is a plain concatenation.
+    let mut target = if path == "/" {
+        format!("/{}", locale.tag())
+    } else {
+        format!("/{}{path}", locale.tag())
+    };
+    if let Some(query) = uri.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    axum::response::Redirect::permanent(&target)
 }
 
 const fn idempotency_layer_for_route<'a>(
@@ -1998,6 +2645,16 @@ where
     // wants their handler, so the built-in steps aside and logs the override.
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
+    // Global off-switch (issue #1971): when `health.enabled = false`, the
+    // framework mounts none of the built-in probes (health/live/ready/startup),
+    // leaving those paths free for an app to own — or to expose nothing. The
+    // returned `mounted_probe_paths` set stays empty, so the actuator overlap
+    // guard treats every probe path as unclaimed by the framework.
+    if !config.health.enabled {
+        tracing::info!("health.enabled = false; built-in probe endpoints are not auto-mounted");
+        return (mounted_probe_paths, router);
+    }
+
     let mut mount_probe = |mut router: axum::Router<S>,
                            path: &str,
                            label: &'static str,
@@ -2095,6 +2752,12 @@ fn mount_actuator_endpoints(
         prefix = %config.actuator.prefix,
         "Mounted actuator endpoints"
     );
+    if !actuator_prometheus {
+        tracing::info!(
+            config_key = "actuator.prometheus",
+            "Prometheus scrape endpoint is disabled; app metrics recorded through autumn_web::metrics are still collected, and still visible as JSON under the `app` key of the actuator's metrics endpoint — only the Prometheus scrape format is gated. Set actuator.prometheus = true to expose it"
+        );
+    }
     Ok(router)
 }
 
@@ -2122,10 +2785,12 @@ fn mount_scoped_groups(
             // fail closed instead of replaying through a generated stop inside
             // the scoped route.
             let selected_layer = idempotency_layers.map(|layers| &layers.manual);
+            let seo = route.seo;
             let mut handler = route.handler;
             if let Some(layer) = selected_layer {
                 handler = handler.layer(layer.clone());
             }
+            handler = attach_seo_defaults(handler, seo);
             if let Some(version) = route.api_version {
                 handler = handler.layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -2182,6 +2847,14 @@ fn mount_raw_routers(
     router
 }
 
+/// Apply response compression, when enabled.
+///
+/// Unlike the other ingress middleware this keeps its own `Router::layer` call
+/// rather than joining a composed tuple: `CompressionLayer`'s service changes
+/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
+/// `option_layer`'s `Either` cannot — both of its branches must share one
+/// `Response` type. Compression is off by default, so the extra nesting level
+/// is only paid by apps that turn it on.
 fn apply_compression_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -2222,31 +2895,62 @@ where
     router
 }
 
-fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
+fn apply_cors_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    // CORS middleware (only applied when allowed_origins is non-empty)
-    if !config.cors.allowed_origins.is_empty() {
-        let cors = build_cors_layer(&config.cors);
-        tracing::info!(
-            origins = ?config.cors.allowed_origins,
-            credentials = config.cors.allow_credentials,
-            "CORS enabled"
-        );
-        router = router.layer(cors);
+    match build_ingress_cors_layer(config) {
+        Some(layer) => router.layer(layer),
+        None => router,
     }
-    router
 }
 
+/// Build the ingress CORS layer, or `None` when no origins are configured.
+///
+/// Split out of [`apply_cors_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_ingress_cors_layer(config: &AutumnConfig) -> Option<tower_http::cors::CorsLayer> {
+    // CORS middleware (only applied when allowed_origins is non-empty)
+    if config.cors.allowed_origins.is_empty() {
+        return None;
+    }
+    let cors = build_cors_layer(&config.cors);
+    tracing::info!(
+        origins = ?config.cors.allowed_origins,
+        credentials = config.cors.allow_credentials,
+        "CORS enabled"
+    );
+    Some(cors)
+}
+
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_csrf_middleware<S>(
-    mut router: axum::Router<S>,
+    router: axum::Router<S>,
     config: &AutumnConfig,
     signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
 ) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    match build_csrf_layer(config, signing_keys) {
+        Some(layer) => router.layer(layer),
+        None => router,
+    }
+}
+
+/// Build the CSRF layer, or `None` when CSRF is disabled.
+///
+/// Split out of [`apply_csrf_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_csrf_layer(
+    config: &AutumnConfig,
+    signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
+) -> Option<crate::security::CsrfLayer> {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         // The CSRF token scan reads only a bounded prefix of the body
@@ -2284,9 +2988,10 @@ where
             csrf_layer = csrf_layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
         }
         tracing::info!("CSRF protection enabled");
-        router = router.layer(csrf_layer);
+        Some(csrf_layer)
+    } else {
+        None
     }
-    router
 }
 
 /// Apply the one-time submit-token guard (issue #1360).
@@ -2297,17 +3002,37 @@ where
 /// `_submit_token` is still short-circuited by this guard. The store backend
 /// mirrors [`build_idempotency_layers`]; the `redis` backend reuses the
 /// `[idempotency.redis]` connection settings.
+///
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_submit_token_middleware<S>(
-    mut router: axum::Router<S>,
+    router: axum::Router<S>,
     config: &AutumnConfig,
     is_production: bool,
 ) -> Result<axum::Router<S>, RouterBuildError>
 where
     S: Clone + Send + Sync + 'static,
 {
+    Ok(match build_submit_token_layer(config, is_production)? {
+        Some(layer) => router.layer(layer),
+        None => router,
+    })
+}
+
+/// Build the one-time submit-token layer, or `None` when it is disabled.
+///
+/// Split out of [`apply_submit_token_middleware`] so the layer can join the
+/// composed ingress stack rather than costing its own nesting level
+/// (issue #2193). The production memory-backend guard still surfaces as an
+/// `Err`, before any layer is applied.
+fn build_submit_token_layer(
+    config: &AutumnConfig,
+    is_production: bool,
+) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
     if !cfg.enabled {
-        return Ok(router);
+        return Ok(None);
     }
 
     // Production guard for the resolved consumed-token backend. Submit tokens
@@ -2385,17 +3110,19 @@ where
         ttl_secs = cfg.ttl_secs,
         "One-time submit-token protection enabled"
     );
-    router = router.layer(layer);
-    Ok(router)
+    Ok(Some(layer))
 }
 
-fn apply_bot_protection_middleware<S>(
-    mut router: axum::Router<S>,
+/// Build the CAPTCHA/bot-protection layer, or `None` when it is disabled.
+///
+/// Called only by [`apply_middleware`], which places it in the composed ingress
+/// stack rather than spending its own `Router::layer` call — and therefore its
+/// own nesting level — on it (issue #2193). The former
+/// `apply_bot_protection_middleware` router wrapper was removed with its last
+/// caller.
+fn build_bot_protection_layer(
     config: &AutumnConfig,
-) -> axum::Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Option<crate::security::captcha::BotProtectionLayer> {
     if config.bot_protection.enabled {
         // Use the dedicated captcha_exempt_paths list — NOT csrf.exempt_paths —
         // so that a route exempt from CSRF for non-cookie auth reasons does not
@@ -2419,9 +3146,10 @@ where
             dev_bypass = config.bot_protection.dev_bypass,
             "Bot protection (CAPTCHA) enabled"
         );
-        router = router.layer(layer);
+        Some(layer)
+    } else {
+        None
     }
-    router
 }
 
 async fn populate_rate_limit_principal(
@@ -2452,6 +3180,9 @@ async fn populate_rate_limit_principal(
     next.run(req).await
 }
 
+/// Kept as a router-level wrapper for the `/mcp` envelope; the main ingress
+/// stack composes the layer directly (see `apply_middleware`).
+#[cfg(feature = "mcp")]
 fn apply_trusted_proxies_middleware<S>(
     router: axum::Router<S>,
     config: &AutumnConfig,
@@ -2459,8 +3190,18 @@ fn apply_trusted_proxies_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    router.layer(build_trusted_proxies_layer(config))
+}
+
+/// Build the trusted-proxy resolution layer.
+///
+/// **Unconditional** — the `if` below gates only the log line; the layer itself
+/// is always installed, because `ResolvedClientIdentity` must be stamped for
+/// every request whether or not any proxy ranges are configured. Split out of
+/// [`apply_trusted_proxies_middleware`] so the layer can join the composed
+/// ingress stack rather than costing its own nesting level (issue #2193).
+fn build_trusted_proxies_layer(config: &AutumnConfig) -> crate::security::TrustedProxiesLayer {
     let tp = &config.security.trusted_proxies;
-    let layer = crate::security::TrustedProxiesLayer::from_config(tp);
     if tp.trust_forwarded_headers || !tp.ranges.is_empty() || tp.trusted_hops.is_some() {
         tracing::info!(
             ranges = ?tp.ranges,
@@ -2468,14 +3209,46 @@ where
             "Centralized trusted-proxy resolution enabled"
         );
     }
-    router.layer(layer)
+    crate::security::TrustedProxiesLayer::from_config(tp)
 }
 
+/// Kept as a router-level wrapper for the `/mcp` envelope and this module's
+/// unit tests; the main ingress stack composes the layer directly (see
+/// `apply_middleware`).
+#[cfg(any(test, feature = "mcp"))]
 fn apply_rate_limit_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
     state: &AppState,
 ) -> axum::Router<AppState> {
+    let (limiter, principal_keying) = build_rate_limit_layers(config, state);
+    if let Some(limiter) = limiter {
+        router = router.layer(limiter);
+    }
+    // Applied second, so it is OUTER to the limiter on ingress: the principal
+    // must be populated before `extract_key` runs.
+    if principal_keying {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            populate_rate_limit_principal,
+        ));
+    }
+    router
+}
+
+/// Build the rate-limit layer, plus a flag for whether the
+/// authenticated-principal keying shim is needed.
+///
+/// Returns `(None, false)` when rate limiting is disabled. Split out of
+/// [`apply_rate_limit_middleware`] so both layers can join the composed ingress
+/// stack rather than costing two more nesting levels (issue #2193). The shim is
+/// returned as a flag rather than a layer because it is an
+/// `axum::middleware::from_fn_with_state` closure whose type cannot be named
+/// across a function boundary; the caller constructs it in place.
+fn build_rate_limit_layers(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> (Option<crate::security::RateLimitLayer>, bool) {
     if config.security.rate_limit.enabled {
         let tp = &config.security.trusted_proxies;
         let rl = &config.security.rate_limit;
@@ -2491,7 +3264,9 @@ fn apply_rate_limit_middleware(
         // envelope limiter (both built here), so it honors `RateLimitEnvelopeCounted`
         // to avoid double-counting an already-charged `tools/call`. User-installed
         // limiters don't, so MCP replays still consume their per-route buckets.
-        let mut layer = crate::security::RateLimitLayer::from_config(rl).honoring_mcp_exempt();
+        let mut layer = crate::security::RateLimitLayer::from_config(rl)
+            .honoring_mcp_exempt()
+            .with_clock(state.clock.clone());
         if has_top_level_proxy_config && !has_rate_limit_proxy_config {
             let resolver = crate::security::ProxyResolver::from_config(tp);
             layer = layer.with_proxy_resolver(resolver);
@@ -2501,24 +3276,43 @@ fn apply_rate_limit_middleware(
             burst = config.security.rate_limit.burst,
             "Rate limiting enabled"
         );
-        router = router.layer(layer);
-
-        if config.security.rate_limit.key_strategy
-            == crate::security::KeyStrategy::AuthenticatedPrincipal
-        {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                populate_rate_limit_principal,
-            ));
-        }
+        let principal_keying = config.security.rate_limit.key_strategy
+            == crate::security::KeyStrategy::AuthenticatedPrincipal;
+        (Some(layer), principal_keying)
+    } else {
+        (None, false)
     }
-    router
 }
 
+/// Kept as a router-level wrapper for this module's unit tests; the main
+/// ingress stack composes the layer directly (see `apply_middleware`).
+#[cfg(test)]
 fn apply_upload_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let (body_limit, upload_config) = build_upload_layers(config);
+    // NOTE: this REPRODUCES the relative order `apply_middleware`'s `inner_stack`
+    // encodes (extension inserter OUTER to the body limit); it does not share it.
+    // Keep the two in sync. Applied inner-first here, because consecutive
+    // `Router::layer` calls put the LAST one outermost — the opposite of a tuple.
+    router
+        .layer(body_limit)
+        .layer(axum::Extension(upload_config))
+}
+
+/// Resolve the two always-applied upload guards: the global body-size cap and
+/// the [`UploadConfig`](crate::security::config::UploadConfig) the `Multipart`
+/// extractor reads per-file limits from.
+///
+/// Split out of [`apply_upload_middleware`] so [`apply_middleware`] can place
+/// both in the composed ingress stack (issue #2193).
+fn build_upload_layers(
+    config: &AutumnConfig,
+) -> (
+    axum::extract::DefaultBodyLimit,
+    crate::security::config::UploadConfig,
+) {
     let upload_config = config.security.upload.clone();
     let max_request_size = upload_config.max_request_size_bytes;
     tracing::info!(
@@ -2527,22 +3321,17 @@ where
         allowed_mime_types = ?upload_config.allowed_mime_types,
         "Request body size limits enabled (applies to all content types)"
     );
-
-    // Apply a global body-size cap covering JSON, form, raw bytes, and multipart.
-    // The Multipart extractor further refines this per the UploadConfig extension.
-    let router = router.layer(axum::extract::DefaultBodyLimit::max(max_request_size));
-
-    // Insert UploadConfig into extensions so the Multipart extractor can read
-    // per-file limits and the allowed MIME-type list.
-    router.layer(axum::middleware::from_fn(
-        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-            let upload_config = upload_config.clone();
-            async move {
-                req.extensions_mut().insert(upload_config);
-                next.run(req).await
-            }
-        },
-    ))
+    // The global cap covers JSON, form, raw bytes, and multipart; the Multipart
+    // extractor further refines it per the UploadConfig extension. The config is
+    // handed back as a plain value: callers install it with `axum::Extension`,
+    // whose `AddExtension` service inserts it into request extensions directly —
+    // the same effect as the `axum::middleware::from_fn` that used to do it, but
+    // without that wrapper's per-request boxed future and boxed `Next`
+    // (issue #2193).
+    (
+        axum::extract::DefaultBodyLimit::max(max_request_size),
+        upload_config,
+    )
 }
 
 /// Exact-match health/probe paths that must always bypass admission-style
@@ -2584,8 +3373,11 @@ fn build_maintenance_layer(
 
 /// Build the admission-control ([`LoadShedLayer`](crate::middleware::LoadShedLayer))
 /// layer from config, or `None` when `server.max_concurrent_requests` is unset
-/// or `0` — the default, preserving today's unlimited behavior with zero
-/// overhead (the layer is simply never applied; see [`apply_middleware`]).
+/// or `0` — the default, preserving today's unlimited behavior with effectively
+/// zero overhead. In [`apply_middleware`] the `None` case goes through
+/// `tower::util::option_layer`, contributing an `Either` branch that forwards
+/// straight to the inner service: no allocation, no `Route` box, no nesting
+/// level. The `/mcp` envelope still installs nothing at all.
 ///
 /// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
 /// so health/liveness/readiness probes are never shed under load (#1006).
@@ -2663,9 +3455,14 @@ pub struct RequestDeadlineCancelled;
 /// Build the per-route timeout override table from the top-level routes and any
 /// scoped (prefixed) groups. Group routes are keyed by their nested template so
 /// the runtime lookup matches [`axum::extract::MatchedPath`].
+///
+/// `config` is only consulted (behind the `i18n` feature) to expand each
+/// locale-prefix-eligible entry under `/{locale}{path}` too — see
+/// [`expand_route_timeout_table_for_locale_prefix`].
 fn build_route_timeout_table(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
+    #[cfg_attr(not(feature = "i18n"), allow(unused_variables))] config: &AutumnConfig,
 ) -> RouteTimeoutTable {
     let mut table: std::collections::HashMap<
         String,
@@ -2679,7 +3476,7 @@ fn build_route_timeout_table(
         // Key by (path, *effective request method*) so an override on one handler
         // never bleeds onto sibling methods that share the template, while still
         // resolving when the request reaches the handler through a method alias.
-        // `request_timeout_handler` looks up `req.method()`, which differs from
+        // `RequestTimeoutService` looks up `req.method()`, which differs from
         // the declared method in two cases:
         //   - axum serves `HEAD` through a `#[get]` handler, so a GET override
         //     must also cover HEAD.
@@ -2711,7 +3508,58 @@ fn build_route_timeout_table(
             );
         }
     }
+    #[cfg(feature = "i18n")]
+    expand_route_timeout_table_for_locale_prefix(&mut table, route_list, &config.i18n);
     std::sync::Arc::new(table)
+}
+
+/// `Router::nest("/{locale}", ...)` mounts each locale under a *literal*
+/// segment (`"/en"`, `"/es"`, ...), not an axum path parameter, so axum
+/// reports `MatchedPath` for a locale-prefixed request as `/{locale}{path}`
+/// verbatim (see `join_nested_path_matches_axum_matched_path`, which pins the
+/// same literal-concatenation behavior for scoped groups). The base timeout
+/// table above is built from `route_list`'s bare, unprefixed paths, so a
+/// request that actually matched through a locale nest would never find its
+/// override there — this duplicates every locale-prefix-eligible entry under
+/// each supported locale's segment too (Codex review). Scoped-group routes are
+/// deliberately excluded: they mount after locale-prefix nesting and are never
+/// locale-prefixed themselves (see `scoped_group_routes_are_not_locale_prefixed`).
+#[cfg(feature = "i18n")]
+fn expand_route_timeout_table_for_locale_prefix(
+    table: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    >,
+    route_list: &[Route],
+    i18n: &crate::i18n::I18nConfig,
+) {
+    if !i18n.locale_prefix_enabled || i18n.supported_locales.is_empty() {
+        return;
+    }
+    for route in route_list {
+        if i18n
+            .locale_prefix_exclude_exact
+            .iter()
+            .any(|p| p == route.path)
+            || matches_locale_exclude_prefix(route.path, &i18n.locale_prefix_exclude)
+        {
+            continue;
+        }
+        let Some(by_method) = table.get(route.path).cloned() else {
+            continue;
+        };
+        for locale in &i18n.supported_locales {
+            let prefixed_path = if route.path == "/" {
+                format!("/{locale}")
+            } else {
+                format!("/{locale}{}", route.path)
+            };
+            table
+                .entry(prefixed_path)
+                .or_default()
+                .extend(by_method.clone());
+        }
+    }
 }
 
 /// Apply the built-in inbound request timeout.
@@ -2742,6 +3590,11 @@ fn build_route_timeout_table(
 /// never flows back through it; leave it off for the `/mcp` envelope, whose
 /// timeout is applied *inner* to its `CorsLayer` and whose 503 is therefore
 /// already CORS-readable.
+///
+/// Kept as a router-level wrapper for the `/mcp` envelope and this module's
+/// unit tests; the main ingress stack composes the layer directly (see
+/// `apply_middleware`).
+#[cfg(any(test, feature = "mcp"))]
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -2749,6 +3602,50 @@ fn apply_request_timeout_middleware(
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> axum::Router<AppState> {
+    let Some(settings) =
+        build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
+    else {
+        return router;
+    };
+    // Both this envelope and `apply_middleware` install the SAME layer type now,
+    // so there is nothing left to keep in sync: before #2214 each site had to
+    // build its own `axum::middleware::from_fn` closure, because the closure's
+    // type (and the opaque future it returned) could not be named across a
+    // function boundary, and the two copies could silently drift.
+    router.layer(RequestTimeoutLayer::new(settings))
+}
+
+/// Everything [`RequestTimeoutService`] needs, resolved once at
+/// router-assembly time.
+///
+/// Held behind an `Arc` by [`RequestTimeoutLayer`] because the produced service
+/// is cloned on the request path: every field is individually cheap to clone
+/// (`RouteTimeoutTable` and the CORS snapshot are already `Arc`s), but one
+/// refcount bump for the whole struct beats four.
+struct RequestTimeoutSettings {
+    global: Option<Duration>,
+    route_timeouts: RouteTimeoutTable,
+    metrics: crate::middleware::MetricsCollector,
+    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
+}
+
+/// Resolve the request-timeout settings, or `None` when no global timeout is
+/// configured and no route declares an override.
+///
+/// In that case [`apply_request_timeout_middleware`] (the `/mcp` envelope)
+/// installs no layer at all, and [`apply_middleware`] contributes an
+/// `option_layer` `Either` branch that forwards straight to the inner service —
+/// no allocation, no `Route` box, no nesting level. Either way the documented
+/// zero-overhead default holds.
+///
+/// Split out of [`apply_request_timeout_middleware`] so [`apply_middleware`] can
+/// place the layer in the composed ingress stack (issue #2193).
+fn build_request_timeout_settings(
+    config: &AutumnConfig,
+    metrics: crate::middleware::MetricsCollector,
+    route_timeouts: RouteTimeoutTable,
+    mirror_cors: bool,
+) -> Option<RequestTimeoutSettings> {
     let global = config
         .server
         .timeouts
@@ -2760,7 +3657,7 @@ fn apply_request_timeout_middleware(
         .flat_map(std::collections::HashMap::values)
         .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
     if global.is_none() && !has_override {
-        return router;
+        return None;
     }
     if let Some(duration) = global {
         tracing::info!(
@@ -2772,111 +3669,296 @@ fn apply_request_timeout_middleware(
     // any origin is configured (otherwise `CorsLayer` itself is absent).
     let cors = (mirror_cors && !config.cors.allowed_origins.is_empty())
         .then(|| std::sync::Arc::new(config.cors.clone()));
-    router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(
-            req,
-            next,
-            global,
-            route_timeouts.clone(),
-            metrics.clone(),
-            cors.clone(),
-        )
-    }))
+    Some(RequestTimeoutSettings {
+        global,
+        route_timeouts,
+        metrics,
+        cors,
+    })
 }
 
-async fn request_timeout_handler(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-    global: Option<std::time::Duration>,
-    route_timeouts: RouteTimeoutTable,
-    metrics: crate::middleware::MetricsCollector,
-    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
-) -> axum::response::Response {
-    // Internal `autumn build` / ISR regeneration renders drive a `#[static_get]`
-    // route directly via `oneshot` and tag the request with `RenderDeadlineExempt`
-    // (there is no client connection whose deadline should apply). Skip the
-    // deadline for these; live inbound requests to the same route do not carry
-    // the marker and are bounded normally below.
-    if req
-        .extensions()
-        .get::<crate::static_gen::RenderDeadlineExempt>()
-        .is_some()
-    {
-        return next.run(req).await;
-    }
+/// Tower [`Layer`](tower::Layer) applying the framework's per-request deadline.
+///
+/// Replaces the `axum::middleware::from_fn` closure both call sites used to
+/// build. `from_fn` had to `Box::pin` the async block it wrapped — one heap
+/// allocation per request, sized by the whole downstream continuation the block
+/// captured across its `.await` — and clone its inner service to move it in
+/// there. [`RequestTimeoutFuture`] holds `tokio::time::Timeout<S::Future>`
+/// (itself a named type) in place instead, so a deadline costs no allocation
+/// and an exempt route costs not even a timer (issue #2214).
+#[derive(Clone)]
+pub struct RequestTimeoutLayer {
+    settings: Arc<RequestTimeoutSettings>,
+}
 
-    // Resolve the effective deadline from the matched route template + method,
-    // using borrowed lookups so exempt/disabled routes allocate nothing.
-    let matched_path_ref = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(axum::extract::MatchedPath::as_str);
-    let route_timeout = matched_path_ref
-        .and_then(|p| route_timeouts.get(p))
-        .and_then(|by_method| by_method.get(req.method()))
-        .copied()
-        .unwrap_or(crate::route::RouteTimeout::Inherit);
-    let deadline = match route_timeout {
-        crate::route::RouteTimeout::Disabled => None,
-        crate::route::RouteTimeout::Override(d) => Some(d),
-        crate::route::RouteTimeout::Inherit => global,
-    };
-    let Some(duration) = deadline else {
-        // Exempt (disabled route, or global off with a non-Override route) —
-        // no allocation on this hot path.
-        return next.run(req).await;
-    };
-
-    // A deadline is active: now it's worth owning the path for the warn log.
-    let matched_path = matched_path_ref.map(ToOwned::to_owned);
-    let request_id = req
-        .extensions()
-        .get::<crate::middleware::RequestId>()
-        .cloned();
-    // Capture the request Origin before `req` is consumed so a timeout 503 can
-    // mirror the CORS headers `CorsLayer` would have added (only when mirroring
-    // is enabled — see `apply_request_timeout_middleware`).
-    let cors_origin = cors
-        .as_ref()
-        .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
-    let start = std::time::Instant::now();
-    match tokio::time::timeout(duration, next.run(req)).await {
-        Ok(response) => response,
-        Err(_elapsed) => {
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let route = matched_path.as_deref().unwrap_or("<unmatched>");
-            // Structured telemetry: route template + elapsed time so operators
-            // can alert on the (already-counted) timeout event.
-            tracing::warn!(
-                target: "autumn::timeout",
-                route = route,
-                elapsed_ms = elapsed_ms,
-                timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                request_id = request_id.as_ref().map(ToString::to_string),
-                "inbound request exceeded deadline"
-            );
-            metrics.record_request_timeout();
-            // Return a 503 via the standard error type so the exception-filter
-            // and error-page stack negotiate JSON vs HTML and enrich with the
-            // request id — no manual Problem Details assembly, no raw BoxError.
-            let mut response =
-                crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
-                    timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                })
-                .into_response();
-            // Tag the 503 so the outer session layer skips persisting any partial
-            // session mutation the cancelled handler made before the deadline.
-            response.extensions_mut().insert(RequestDeadlineCancelled);
-            // This layer is outside `CorsLayer` in the main stack, so the 503
-            // never passes back through it; mirror the CORS headers ourselves so
-            // cross-origin browser clients can read the Problem Details body
-            // instead of seeing an opaque CORS failure.
-            if let Some(cors) = cors.as_deref() {
-                mirror_cors_headers(cors, cors_origin.as_ref(), &mut response);
-            }
-            response
+impl RequestTimeoutLayer {
+    fn new(settings: RequestTimeoutSettings) -> Self {
+        Self {
+            settings: Arc::new(settings),
         }
     }
+}
+
+impl<S> tower::Layer<S> for RequestTimeoutLayer {
+    type Service = RequestTimeoutService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestTimeoutService {
+            inner,
+            settings: Arc::clone(&self.settings),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`RequestTimeoutLayer`].
+#[derive(Clone)]
+pub struct RequestTimeoutService<S> {
+    inner: S,
+    settings: Arc<RequestTimeoutSettings>,
+}
+
+impl<S> RequestTimeoutService<S> {
+    /// The deadline that applies to `req`, or `None` when it is exempt.
+    ///
+    /// Uses borrowed lookups throughout so an exempt or deadline-free route
+    /// allocates nothing.
+    fn deadline_for<B>(&self, req: &Request<B>) -> Option<Duration> {
+        // Internal `autumn build` / ISR regeneration renders drive a
+        // `#[static_get]` route directly via `oneshot` and tag the request with
+        // `RenderDeadlineExempt` (there is no client connection whose deadline
+        // should apply). Skip the deadline for these; live inbound requests to
+        // the same route do not carry the marker and are bounded normally.
+        if req
+            .extensions()
+            .get::<crate::static_gen::RenderDeadlineExempt>()
+            .is_some()
+        {
+            return None;
+        }
+
+        // Resolve the effective deadline from the matched route template +
+        // method.
+        let route_timeout = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str)
+            .and_then(|p| self.settings.route_timeouts.get(p))
+            .and_then(|by_method| by_method.get(req.method()))
+            .copied()
+            .unwrap_or(crate::route::RouteTimeout::Inherit);
+        match route_timeout {
+            crate::route::RouteTimeout::Disabled => None,
+            crate::route::RouteTimeout::Override(d) => Some(d),
+            crate::route::RouteTimeout::Inherit => self.settings.global,
+        }
+    }
+}
+
+impl<S> tower::Service<Request<axum::body::Body>> for RequestTimeoutService<S>
+where
+    S: tower::Service<Request<axum::body::Body>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = RequestTimeoutFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
+        let Some(duration) = self.deadline_for(&req) else {
+            // Exempt (disabled route, or global off with a non-Override route)
+            // — no timer and no allocation on this hot path.
+            return RequestTimeoutFuture::Unbounded {
+                inner: self.inner.call(req),
+            };
+        };
+
+        // A deadline is active: now it's worth owning the path for the warn log.
+        let matched_path = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|p| p.as_str().to_owned());
+        let request_id = req
+            .extensions()
+            .get::<crate::middleware::RequestId>()
+            .cloned();
+        // Capture the request Origin before `req` is consumed so a timeout 503
+        // can mirror the CORS headers `CorsLayer` would have added (only when
+        // mirroring is enabled — see `apply_request_timeout_middleware`).
+        let cors_origin = self
+            .settings
+            .cors
+            .as_ref()
+            .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
+
+        // Build the inner future FIRST, then start the clock, then arm the
+        // timer, so `start` and the deadline measure the same interval. The
+        // `from_fn` form armed both inside an async block, where the downstream
+        // `call` chain had not run yet; here that chain runs during
+        // `self.inner.call(req)`, so capturing `start` before it would leave
+        // `elapsed_ms` measuring a strictly longer span than `timeout_ms`.
+        //
+        // `tokio::time::timeout` needs a runtime handle, so this service's
+        // `call` must run inside a Tokio runtime. That is the same requirement
+        // `tower::timeout::Timeout::call` imposes (it builds its `Sleep` in
+        // `call` too), and every driver in this crate reaches it through
+        // `ServiceExt::oneshot`, which only calls `call` from inside a poll.
+        let inner = self.inner.call(req);
+        let start = std::time::Instant::now();
+
+        RequestTimeoutFuture::Bounded {
+            inner: tokio::time::timeout(duration, inner),
+            settings: Arc::clone(&self.settings),
+            duration,
+            matched_path,
+            request_id,
+            cors_origin,
+            start,
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`RequestTimeoutService`].
+    ///
+    /// `Unbounded` is the exempt path and is literally the inner service's own
+    /// future; `Bounded` wraps it in `tokio::time::Timeout`, which is a named
+    /// type, so neither variant is heap-allocated.
+    ///
+    /// `Elapsed` exists to make the deadline actually *cancel*.
+    /// `tokio::time::Timeout::poll` does not drop the future it wraps when the
+    /// timer fires — it just reports `Err(Elapsed)` — so a `Bounded` variant
+    /// that returned the `503` in place would keep the whole cancelled handler
+    /// tree (its database connection guards, its load-shed slot, its webhook
+    /// [`ReplayKeyGuard`](crate::webhook)) alive until whatever owns *this*
+    /// future is itself dropped, several response layers later. The `from_fn`
+    /// form dropped it at the deadline, because its `tokio::time::timeout(..)`
+    /// was a `match` scrutinee temporary. Transitioning to `Elapsed` restores
+    /// that: `Pin::set` drops the old variant in place, so the handler tree is
+    /// released before the `503` starts travelling back out.
+    #[project = RequestTimeoutFutureProj]
+    pub enum RequestTimeoutFuture<F> {
+        Unbounded {
+            #[pin]
+            inner: F,
+        },
+        Bounded {
+            #[pin]
+            inner: tokio::time::Timeout<F>,
+            settings: Arc<RequestTimeoutSettings>,
+            duration: Duration,
+            matched_path: Option<String>,
+            request_id: Option<crate::middleware::RequestId>,
+            cors_origin: Option<http::HeaderValue>,
+            start: std::time::Instant,
+        },
+        Elapsed {
+            response: Option<axum::response::Response>,
+        },
+    }
+}
+
+impl<F, E> std::future::Future for RequestTimeoutFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::response::Response, E>>,
+{
+    type Output = Result<axum::response::Response, E>;
+
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            let elapsed = match self.as_mut().project() {
+                RequestTimeoutFutureProj::Unbounded { inner } => return inner.poll(cx),
+                RequestTimeoutFutureProj::Bounded {
+                    inner,
+                    settings,
+                    duration,
+                    matched_path,
+                    request_id,
+                    cors_origin,
+                    start,
+                } => match std::task::ready!(inner.poll(cx)) {
+                    Ok(response) => return std::task::Poll::Ready(response),
+                    Err(_elapsed) => Self::Elapsed {
+                        response: Some(deadline_exceeded_response(
+                            settings,
+                            *duration,
+                            matched_path.as_deref(),
+                            request_id.as_ref(),
+                            cors_origin.as_ref(),
+                            *start,
+                        )),
+                    },
+                },
+                RequestTimeoutFutureProj::Elapsed { response } => {
+                    return std::task::Poll::Ready(Ok(response
+                        .take()
+                        .expect("RequestTimeoutFuture polled after completion")));
+                }
+            };
+            // Drops the `Bounded` variant — and with it the cancelled handler
+            // future the elapsed `Timeout` is still holding — before the `503`
+            // leaves this layer.
+            self.as_mut().set(elapsed);
+        }
+    }
+}
+
+/// Build the `503` a request that blew its deadline receives, recording the
+/// timeout metric and emitting the structured `autumn::timeout` warn on the way.
+///
+/// Split out of [`RequestTimeoutFuture::poll`] so that hot method stays a
+/// dispatch and nothing else.
+fn deadline_exceeded_response(
+    settings: &RequestTimeoutSettings,
+    duration: Duration,
+    matched_path: Option<&str>,
+    request_id: Option<&crate::middleware::RequestId>,
+    cors_origin: Option<&http::HeaderValue>,
+    start: std::time::Instant,
+) -> axum::response::Response {
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let route = matched_path.unwrap_or("<unmatched>");
+    // Structured telemetry: route template + elapsed time so operators
+    // can alert on the (already-counted) timeout event.
+    tracing::warn!(
+        target: "autumn::timeout",
+        route = route,
+        elapsed_ms = elapsed_ms,
+        timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        request_id = request_id.map(ToString::to_string),
+        "inbound request exceeded deadline"
+    );
+    settings.metrics.record_request_timeout();
+    // Return a 503 via the standard error type so the exception-filter
+    // and error-page stack negotiate JSON vs HTML and enrich with the
+    // request id — no manual Problem Details assembly, no raw BoxError.
+    let mut response = crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
+        timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    })
+    .into_response();
+    // Tag the 503 so the outer session layer skips persisting any partial
+    // session mutation the cancelled handler made before the deadline.
+    response.extensions_mut().insert(RequestDeadlineCancelled);
+    // This layer is outside `CorsLayer` in the main stack, so the 503
+    // never passes back through it; mirror the CORS headers ourselves so
+    // cross-origin browser clients can read the Problem Details body
+    // instead of seeing an opaque CORS failure.
+    if let Some(cors) = settings.cors.as_deref() {
+        mirror_cors_headers(cors, cors_origin, &mut response);
+    }
+    response
 }
 
 struct BuiltIdempotencyLayers {
@@ -2925,12 +4007,176 @@ fn build_idempotency_layers(
     let base = IdempotencyLayer::new(store)
         .with_ttl(ttl)
         .with_in_flight_ttl(in_flight_ttl)
-        .with_metrics(state.metrics.clone());
+        .with_metrics(state.metrics.clone())
+        .with_entropy(state.entropy_arc());
 
     Ok(Some(BuiltIdempotencyLayers {
         route: base.clone().replay_through_inner(),
         manual: base.fail_closed_on_replay(),
     }))
+}
+
+/// A run of user-registered layers ([`AppBuilder::layer`](crate::app::AppBuilder::layer),
+/// [`AppBuilder::static_gate`](crate::app::AppBuilder::static_gate), plugin
+/// layers) composed into a SINGLE `tower::Layer`, so an arbitrary number of
+/// registrations costs one application instead of one per registration.
+///
+/// # Why this type exists
+///
+/// A `tower-layer` tuple needs every member's type at compile time; a `Vec` of
+/// registrations does not have that. Erasing each registration to
+/// [`ErasedAppLayer`](crate::app::ErasedAppLayer) at registration time makes
+/// them homogeneous, and this type folds the homogeneous run by hand. The
+/// result is one `Layer` that can sit inside `apply_middleware`'s single merged
+/// tuple, so operator layers no longer deepen the framework's per-request
+/// clone cascade (#2198) — the framework's overhead becomes a constant instead
+/// of a function of how many layers an operator or plugin attached.
+///
+/// The fold costs exactly one boxing adapter for the whole run (the
+/// `ErasedAppService::new` seed), regardless of how many layers it contains.
+/// That box does NOT clone on call — `BoxCloneSyncService::call` forwards to
+/// the inner service — so it adds no traversal to the cascade either; its
+/// runtime cost is one `Box::pin` per request.
+///
+/// # Why an EMPTY run is still composed in `apply_middleware`
+///
+/// It is not dead weight there: it is the type boundary that makes the single
+/// merged application compile in reasonable time. `tower::util::option_layer`
+/// yields `Either<L::Service, S>`, in which the inner service type `S` appears
+/// TWICE — so a chain of *n* conditional layers with no erasure between them
+/// expands to a type of size `O(2ⁿ)`, and rustc proves `Router::layer`'s
+/// `Send`/`Sync`/`Clone` obligations over that expansion. The ingress stack has
+/// twelve `option_layer`s. Split at this slot they are 5 above and 7 below
+/// (`2⁵ + 2⁷`); merged into one un-erased chain they are `2¹²`, which took
+/// rustc over twenty minutes to check `apply_middleware` alone. Dropping this
+/// boundary "to save a box when no layer is registered" brings that back.
+///
+/// `apply_layers_in_registration_order` (the SSG/ISG path) does the opposite
+/// and skips an empty run: there the run is applied on its own `Router::layer`
+/// call, so there is no long chain to break and the box would buy nothing.
+#[derive(Clone)]
+struct ComposedRegisteredLayers(Vec<crate::app::ErasedAppLayer>);
+
+impl ComposedRegisteredLayers {
+    /// Compose a run of registrations, preserving their registration order.
+    fn new(registrations: Vec<crate::app::CustomLayerRegistration>) -> Self {
+        Self(registrations.into_iter().map(|reg| reg.layer).collect())
+    }
+}
+
+impl<S> tower::Layer<S> for ComposedRegisteredLayers
+where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Service = crate::app::ErasedAppService;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        // FOLD DIRECTION — the contract is "first registered ends up
+        // OUTERMOST on ingress", matching `tower::ServiceBuilder` and the
+        // behaviour of the pre-#2198 loop.
+        //
+        // Proof that `.rev()` is right here. `Layer::layer(inner)` returns a
+        // service that WRAPS `inner`, so each successive call in this fold
+        // produces something strictly more OUTER than what came before, and
+        // the LAST registration visited ends up outermost. Visiting the vec in
+        // reverse therefore visits `registrations[0]` last, putting the
+        // first-registered layer outermost. ∎
+        //
+        // This happens to be the same `.rev()` the old loop used, but for a
+        // different reason: there, `router = reg.apply(router)` made the LAST
+        // `Router::layer` CALL outermost. Both forms accumulate outward, so
+        // both reverse; a `tower-layer` TUPLE is the form that does not (its
+        // FIRST element is outermost). Getting this backwards still compiles —
+        // every layer here is `Request -> Response` with `Error = Infallible`
+        // — so only behavioural tests catch it.
+        let mut svc = crate::app::ErasedAppService::new(inner);
+        for registered in self.0.iter().rev() {
+            svc = registered.layer(svc);
+        }
+        svc
+    }
+}
+
+/// Re-normalize a group's response body back to `axum::body::Body`.
+///
+/// Every `Router::layer` call ends in `Route::new`, which maps the produced
+/// service's response through `IntoResponse::into_response` — so each of the
+/// separate `.layer()` calls this file used to make silently converted a
+/// group's exotic response body (e.g. `LogContextLayer`'s `LogContextBody`)
+/// back to `axum::body::Body` at the group boundary. Collapsing those calls
+/// into one merged tuple removes those implicit conversions, so a boundary
+/// between a body-rewrapping group and a member that demands
+/// `Response<axum::body::Body>` needs this explicit equivalent.
+///
+/// It costs nothing measurable: no box, no service clone on call, and the
+/// mapping is a fn pointer applied to the response future's output.
+///
+/// Deliberately a UNIT struct rather than a generic constructor returning
+/// `tower::util::MapResponseLayer<fn(Response<B>) -> Response>`: an inference
+/// variable for `B` sitting in the middle of the merged tuple makes rustc
+/// re-normalize the whole nested `Layer`/`Service` projection chain and pushes
+/// this function's type-check into the tens of minutes. With a unit struct,
+/// `B` is a projection out of the inner service and never an inference
+/// variable at the call site.
+#[derive(Clone, Copy)]
+struct NormalizeBodyLayer;
+
+impl<S> tower::Layer<S> for NormalizeBodyLayer {
+    type Service = NormalizeBody<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        NormalizeBody(inner)
+    }
+}
+
+/// Service half of [`NormalizeBodyLayer`].
+#[derive(Clone, Copy)]
+struct NormalizeBody<S>(S);
+
+/// Free function (not a closure) so it can be named as a `fn` pointer in
+/// `NormalizeBody::Future`, keeping the future un-boxed.
+fn into_response_result<B, E>(
+    result: Result<http::Response<B>, E>,
+) -> Result<axum::response::Response, E>
+where
+    http::Response<B>: axum::response::IntoResponse,
+{
+    result.map(axum::response::IntoResponse::into_response)
+}
+
+impl<S, B> tower::Service<axum::extract::Request> for NormalizeBody<S>
+where
+    S: tower::Service<axum::extract::Request, Response = http::Response<B>>,
+    http::Response<B>: axum::response::IntoResponse,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = futures::future::Map<
+        S::Future,
+        fn(Result<http::Response<B>, S::Error>) -> Result<axum::response::Response, S::Error>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+        futures::FutureExt::map(
+            self.0.call(req),
+            into_response_result::<B, S::Error> as fn(_) -> _,
+        )
+    }
 }
 
 #[allow(
@@ -2973,98 +4219,139 @@ fn apply_middleware(
             None
         };
 
-    router = apply_cors_middleware(router, config);
+    // ── How the ingress stack is assembled ──────────────────────────────────
+    //
+    // Each `Router::layer` call re-boxes the entire downstream stack: axum's
+    // `Route::layer` ends in `Route::new(..)`, which is
+    // `BoxCloneSyncService::new(..)`. So N sequential `.layer()` calls build N
+    // *nested* boxes, and because `Route::call` runs `self.0.clone()` — a deep
+    // clone of everything beneath it — a request descending N levels pays
+    // `N + (N-1) + … + 1` heap allocations. Measured against axum 0.8.9 the fit
+    // is `13 + N(N+1)/2 + 2N` per request, 13 being the fixed baseline at N = 0
+    // (263 at N = 20, 1388 at N = 50), while the same layers composed into ONE
+    // `Router::layer` call cost a flat 16 for any N.
+    // See issue #2193.
+    //
+    // So the layers below are composed into tuples and applied in ONE
+    // `Router::layer` call instead of ~16 (#2198 collapsed the last four:
+    // the inner group, the user layers, the middle group, and the session).
+    // `tower-layer` implements `Layer` for tuples with the FIRST element
+    // outermost, so each tuple reads top-to-bottom in ingress order — the same
+    // direction as the layer-order comments in this file.
+    //
+    // ⚠ THIS IS THE OPPOSITE of repeated `Router::layer` calls, where the LAST
+    // call ends up outermost. When moving a layer between the two forms, the
+    // order must be reversed. (The same applies to `tower::ServiceBuilder`:
+    // first-added is outermost — which is why `ComposedRegisteredLayers`, which
+    // folds a run by hand rather than as a tuple, iterates in reverse.) Getting
+    // this backwards still compiles and still type-checks, because every layer
+    // here is `Request -> Response` with `Error = Infallible`; only the
+    // behavioural tests would catch it.
+    //
+    // `tower-layer` implements `Layer` for tuples up to 16 elements; the largest
+    // group below has 13. Past 16, nest a sub-tuple as a single element —
+    // `(a, b, (c, d, e), f)` composes identically and still costs one box.
+    //
+    // Conditional members use `tower::util::option_layer`, which maps `None` to
+    // `tower::layer::util::Identity` — its `Service` is the inner service
+    // itself, wrapped in an `Either` that forwards to it. A disabled layer
+    // therefore costs one enum branch per call: no allocation, no `Route` box,
+    // no nesting level.
+
+    // Innermost group: everything from the handler out to (but not including)
+    // the user-registered layers. Listed OUTERMOST FIRST.
+    // Built FIRST: this is the first of the two builders that can fail the whole
+    // router build (here, the production memory-backend guard for submit tokens;
+    // the other is `build_session_layer` further down, on the session backend
+    // plan), and the infallible builders have side effects — `tracing::info!`
+    // lines, and a lazy Redis connection manager when the rate limiter is
+    // Redis-backed — that should not run on the way to a fail-fast `Err`.
+    let submit_token_layer = build_submit_token_layer(config, is_production)?;
+    let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config(config);
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
-        trusted_host_middleware(req, next, trusted_host_policy.clone())
-    }));
-    // Applied before (i.e. inner to) the CSRF layer so CSRF is validated first
-    // on the request path; a replayed `_submit_token` is still short-circuited
-    // even when the request carries a valid `_csrf` (issue #1360, AC #4).
-    router = apply_submit_token_middleware(router, config, is_production)?;
-    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
-    router = apply_bot_protection_middleware(router, config);
-    // Method-override rejection filter. The outer `MethodOverrideLayer`
-    // (applied at the `axum::serve` boundary so it can rewrite the
-    // request method before route matching) stamps a
-    // [`MethodOverrideRejection`] extension when the override field
-    // value is invalid or the body was too large to scan; this inner
-    // middleware converts that extension into the corresponding
-    // `400`/`413` response. Running it here means the rejection flows
-    // through the rest of the response stack (security headers,
-    // request IDs, metrics, error-page filter) rather than bypassing
-    // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
-    // doesn't get masked by a `403` from CSRF's missing-token branch,
-    // and a clear `400 invalid _method` outranks "missing CSRF".
-    router = router.layer(axum::middleware::from_fn(
-        crate::middleware::method_override_rejection_filter,
-    ));
-    router = apply_rate_limit_middleware(router, config, state);
+    let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
+    let inner_stack = (
+        // Insert UploadConfig into extensions so the Multipart extractor can
+        // read per-file limits and the allowed MIME-type list.
+        axum::Extension(upload_config),
+        // Global body-size cap covering JSON, form, raw bytes, and multipart.
+        body_limit,
+        crate::webhook::WebhookReplayCleanupLayer,
+        // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
+        // the cheap in-flight-count check runs before maintenance mode's
+        // bypass-header/IP-allowlist evaluation. `None` (the default — no
+        // `server.max_concurrent_requests` configured) contributes an `Either`
+        // branch that forwards straight to the inner service: no allocation and
+        // no extra nesting level.
+        tower::util::option_layer(load_shed_layer),
+        // Maintenance mode (shared construction with the late-mounted `/mcp`
+        // envelope — see `build_maintenance_layer`).
+        build_maintenance_layer(config, state),
+        // Populates RateLimitPrincipal from the verified session identity, so it
+        // must run BEFORE (outside) the limiter that keys on it.
+        tower::util::option_layer(rate_limit_principal_keying.then(|| {
+            axum::middleware::from_fn_with_state(state.clone(), populate_rate_limit_principal)
+        })),
+        tower::util::option_layer(rate_limit_layer),
+        // Method-override rejection filter. The outer `MethodOverrideLayer`
+        // (applied at the `axum::serve` boundary so it can rewrite the
+        // request method before route matching) stamps a
+        // [`MethodOverrideRejection`] extension when the override field
+        // value is invalid or the body was too large to scan; this inner
+        // middleware converts that extension into the corresponding
+        // `400`/`413` response. Running it here means the rejection flows
+        // through the rest of the response stack (security headers,
+        // request IDs, metrics, error-page filter) rather than bypassing
+        // them. Placed outside CSRF so a `BodyTooLarge` (empty body)
+        // doesn't get masked by a `403` from CSRF's missing-token branch,
+        // and a clear `400 invalid _method` outranks "missing CSRF".
+        crate::middleware::method_override::MethodOverrideRejectionLayer,
+        tower::util::option_layer(build_bot_protection_layer(config)),
+        tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        // Inner to the CSRF layer so CSRF is validated first on the request
+        // path; a replayed `_submit_token` is still short-circuited even when
+        // the request carries a valid `_csrf` (issue #1360, AC #4).
+        tower::util::option_layer(submit_token_layer),
+        TrustedHostLayer::new(trusted_host_policy),
+        tower::util::option_layer(build_ingress_cors_layer(config)),
+    );
 
-    // Register MaintenanceLayer automatically (shared construction with the
-    // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
-    router = router.layer(build_maintenance_layer(config, state));
-
-    // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
-    // the cheap in-flight-count check runs before maintenance mode's
-    // bypass-header/IP-allowlist evaluation. `None` (the default — no
-    // `server.max_concurrent_requests` configured) applies no layer at all,
-    // so there is no overhead when the feature is unused.
-    if let Some(load_shed) = load_shed_layer {
-        router = router.layer(load_shed);
-    }
-
-    router = router.layer(axum::middleware::from_fn(
-        crate::webhook::webhook_replay_cleanup_middleware,
-    ));
-    router = apply_upload_middleware(router, config);
-
-    // User-registered Tower layers (AppBuilder::layer). Outermost — applied
-    // last so they wrap all framework middleware.  Iterate in reverse so the
-    // first registered layer ends up outermost among user layers — matching
-    // tower::ServiceBuilder ordering.
+    // User-registered Tower layers (AppBuilder::layer) wrap the group above.
+    // They are erased at registration time and folded into
+    // `ComposedRegisteredLayers`, so however many an operator (or a plugin —
+    // `Plugin::build` receives the same `AppBuilder`) attaches, they occupy ONE
+    // slot in the single merged application below rather than one
+    // `Router::layer` call each. The `TypeId`/`type_name` that
+    // `AppBuilder::has_layer`/`get_layer_types` expose publicly ride along on
+    // the registration and are untouched by the erasure.
     //
     // When a static dist dir is active (SSG/ISG build), these layers are
     // NOT passed here — they are extracted by try_build_router_with_static_inner
     // and applied outside the static-first middleware instead, so they can
     // process pre-rendered responses without creating a session dependency.
     let custom_layer_count = custom_layers.len();
-    for registered in custom_layers.into_iter().rev() {
-        router = (registered.apply)(router);
-    }
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
     }
 
-    // TrustedProxiesLayer is applied after user layers so it is outermost in the
-    // ingress request path, stamping ResolvedClientIdentity before any user or
-    // framework middleware reads ClientAddr / ClientHost / ClientScheme.
-    router = apply_trusted_proxies_middleware(router, config);
-
-    let mut router = router;
-
-    if config.tenancy.enabled {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::tenancy::tenancy_middleware,
-        ));
-        tracing::debug!("Multi-tenancy middleware enabled");
-    }
-
+    // ── Middle group: outer to the user layers, inner to the session ────────
+    //
     // Per-request timeout (inner to RequestId so the request ID set by that
-    // layer is available when the timeout fires — see request_timeout_handler).
+    // layer is available when the timeout fires — see RequestTimeoutService).
     //
     // Full ingress layer order (outermost → innermost):
     //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
     //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
-    //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
-    //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
-    //   MethodOverride → RateLimit → CSRF → CORS → handler
-    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
-    // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
+    //   Session → SecurityHeaders → RequestId → LogContext → ServerTiming →
+    //   AccessLog-primary → FailureCapture → Reporting → Timeout → Tenancy →
+    //   TrustedProxies → [user layers] → BodyLimit/UploadConfig → MethodOverride →
+    //   RateLimit → CSRF → CORS → handler
+    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is in the
+    // inner group above, hence inner), so its timeout 503 must carry CORS
+    // headers itself.
     //
     // KNOWN LIMITATION (session store I/O is not bounded): `Session` sits outside
-    // this layer (see order above), so `store.load` runs before the timer starts
+    // this layer (see order below), so `store.load` runs before the timer starts
     // and `store.save`/`destroy` after it completes. A stalled session backend can
     // therefore tie up a worker despite `request_timeout_ms`. This placement is
     // deliberate: the timer is kept inner to `RequestId` so a timeout 503 (and its
@@ -3083,53 +4370,62 @@ fn apply_middleware(
     // `request_timeout_ms`. Moving the timer out there would again lose the
     // `X-Request-Id` correlation; bound this with a server/proxy read timeout
     // instead.
-    router = apply_request_timeout_middleware(
-        router,
-        config,
-        state.metrics.clone(),
-        route_timeouts,
-        true,
-    );
+    // `apply_request_timeout_middleware` installs the SAME layer type for the
+    // `/mcp` envelope, so the two cannot drift; before #2214 each site had to
+    // build its own `axum::middleware::from_fn` closure (whose type, and whose
+    // opaque future, could not be named across a function boundary) and a
+    // comment here asked future readers to keep the copies in sync by hand.
+    let timeout_layer =
+        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true)
+            .map(RequestTimeoutLayer::new);
 
-    // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
-    // (so the request id is available when a handler panics) and outer to the
-    // timeout, user layers, and handler (so their panics are caught and turned
-    // into a clean 500 instead of aborting the worker task). The resulting 500
-    // still flows out through the exception-filter chain for HTML negotiation.
+    // Failure-capsule capture (#1598). Outer to the reporting layer, because a
+    // request's capture scope has to exist before that layer snapshots its
+    // context — the scope is what the reporting layer seals into a capsule when
+    // the request turns out to have failed. Off unless
+    // `[failure_capture] enabled = true`; capsules hold real request data.
+    //
+    // This layer is the sole arming point for database attribution too: the
+    // connection-checkout marker fires only when a request carries a capture
+    // scope, and scopes exist only under this layer — so two apps with
+    // different capture settings in one process cannot disturb each other.
     #[cfg(feature = "reporting")]
-    {
-        router = router.layer(crate::reporting::ReportingLayer::new(
-            state.error_reporters(),
-            config.reporting.enabled,
-            config.reporting.sample_rate,
+    let capture_layer = tower::util::option_layer(config.failure_capture.enabled.then(|| {
+        // Same filter composition as the log context below, so one
+        // `[log] filter_parameters` list governs both.
+        let mut capture_filter_parameters = config.log.filter_parameters.clone();
+        capture_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        let capture_filter = Arc::new(crate::log::filter::ParameterFilter::new(
+            &capture_filter_parameters,
+            &config.log.unfilter_parameters,
         ));
-    }
-
-    // Structured per-request access log (#999), primary emitter: one INFO
-    // event (target `autumn::access`) per served request at the response
-    // boundary. Inner to RequestId (so the request id is available) and to
-    // LogContext (so the event is emitted inside the request span); outer to
-    // the reporting and timeout layers so panics-turned-500s and timeout
-    // responses are logged with the status the client receives. Emitted
-    // responses are marked so the outermost fallback (apply_startup_barrier)
-    // does not double-log; that fallback covers requests that short-circuit
-    // before this layer runs.
-    if config.log.access_log {
-        router = router.layer(crate::middleware::AccessLogLayer::new(
-            config.log.access_log_exclude.clone(),
-        ));
-    }
-
-    // Server-Timing response header (#1348). Applied outer to AccessLogLayer
-    // (it is added after, so it wraps it) — its `total` metric is therefore
-    // the outermost wall-clock measure and is `>=` the access-log
-    // `duration_ms` by a few microseconds; both share the same
-    // `Instant`-based formula. Opt-in via
-    // `[observability] server_timing`; defaults on in dev, off in prod so
-    // timings never leak to anonymous prod clients without explicit opt-in.
-    if crate::config::server_timing_enabled(config) {
-        router = router.layer(crate::middleware::ServerTimingLayer::new(true));
-    }
+        // `mut` only on builds that fill in the roles below; a sqlite (or
+        // no-`db`) build compiles that block out and records none.
+        #[cfg_attr(
+            any(not(feature = "db"), feature = "sqlite"),
+            allow(
+                unused_mut,
+                reason = "the role assignment below is compiled out on these builds"
+            )
+        )]
+        let mut capture_settings = crate::capsule::settings_from_config(config);
+        // The roles come from the pools the application actually built, not
+        // from the configured URLs: a custom `DatabasePoolProvider` may return
+        // no pool despite a `primary_url`, or ignore a configured replica (the
+        // managed-Postgres provider does exactly that). Recording a role the
+        // app does not have would have replay rebuild a shape production never
+        // ran. PostgreSQL-only, because that is all replay can reconstruct.
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
+        {
+            capture_settings.db_roles = crate::capsule::observed_db_roles(
+                state.pool().is_some(),
+                state.replica_pool().is_some(),
+            );
+        }
+        crate::capsule::CaptureLayer::new(capture_settings, capture_filter)
+    }));
+    #[cfg(not(feature = "reporting"))]
+    let capture_layer = tower::layer::util::Identity::new();
 
     // Request-scoped log context (#1169). Established for every request, inner
     // to `RequestIdLayer` (so the request id is available to seed it) and outer
@@ -3143,68 +4439,129 @@ fn apply_middleware(
         &log_context_filter_parameters,
         &config.log.unfilter_parameters,
     ));
-    let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
+
+    // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
+    // (so the request id is available when a handler panics) and outer to the
+    // timeout, user layers, and handler (so their panics are caught and turned
+    // into a clean 500 instead of aborting the worker task). The resulting 500
+    // still flows out through the exception-filter chain for HTML negotiation.
+    //
+    // NOTE: `config.reporting.enabled` is a CONSTRUCTOR ARGUMENT, not a gate —
+    // the layer is installed whenever the `reporting` feature is on, so the
+    // panic catch is never configured away.
+    #[cfg(feature = "reporting")]
+    let reporting_layer = crate::reporting::ReportingLayer::new(
+        state.error_reporters(),
+        config.reporting.enabled,
+        config.reporting.sample_rate,
+    );
+    #[cfg(not(feature = "reporting"))]
+    let reporting_layer = tower::layer::util::Identity::new();
+
+    // Structured per-request access log (#999), primary emitter: one INFO
+    // event (target `autumn::access`) per served request at the response
+    // boundary. Inner to RequestId (so the request id is available) and to
+    // LogContext (so the event is emitted inside the request span); outer to
+    // the reporting and timeout layers so panics-turned-500s and timeout
+    // responses are logged with the status the client receives. Emitted
+    // responses are marked so the outermost fallback (apply_startup_barrier)
+    // does not double-log; that fallback covers requests that short-circuit
+    // before this layer runs.
+    let access_log_layer = config
+        .log
+        .access_log
+        .then(|| crate::middleware::AccessLogLayer::new(config.log.access_log_exclude.clone()));
+
+    // Server-Timing response header (#1348). Outer to AccessLogLayer — its
+    // `total` metric is therefore the outermost wall-clock measure and is `>=`
+    // the access-log `duration_ms` by a few microseconds; both share the same
+    // `Instant`-based formula. Opt-in via `[observability] server_timing`;
+    // defaults on in dev, off in prod so timings never leak to anonymous prod
+    // clients without explicit opt-in.
+    let server_timing_layer = crate::config::server_timing_enabled(config)
+        .then(|| crate::middleware::ServerTimingLayer::new(true));
+
+    let tenancy_layer = config.tenancy.enabled.then(|| {
+        tracing::debug!("Multi-tenancy middleware enabled");
+        axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
+    });
 
     // `security_headers` is applied LATER as the framework's outermost layer
-    // (after the gate, below) so that a gate short-circuit (redirect/401) still
-    // carries HSTS/CSP/nosniff — see the application point after the gate loop.
+    // (by `build_router_pre_state`, after the gate) so that a gate short-circuit
+    // (redirect/401) still carries HSTS/CSP/nosniff.
     // RequestId stays here (inner to session) so the request id seeds the
     // session, logs, and trace context.
-    let router = router.layer(RequestIdLayer);
+    //
+    // TrustedProxiesLayer is the innermost member of this group — i.e. it sits
+    // immediately outside the user layers — so `ResolvedClientIdentity` is
+    // stamped before any user or framework middleware reads
+    // ClientAddr / ClientHost / ClientScheme.
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
+    let middle_stack = (
+        RequestIdLayer::with_entropy(state.entropy_arc()),
+        crate::middleware::LogContextLayer::new(log_context_filter),
+        tower::util::option_layer(server_timing_layer),
+        tower::util::option_layer(access_log_layer),
+        capture_layer,
+        reporting_layer,
+        tower::util::option_layer(timeout_layer),
+        tower::util::option_layer(tenancy_layer),
+        build_trusted_proxies_layer(config),
+    );
 
     // Pre-clone signing keys for the RYWW middleware (session mode needs to
     // sign/verify the `autumn.ryw` cookie; `signing_keys_opt` is consumed below).
     #[cfg(feature = "db")]
     let signing_keys_for_ryw = signing_keys_opt.clone();
 
-    let router = crate::session::apply_session_layer(
-        router,
+    // The session used to need its own `Router::layer` call — each backend
+    // produces a differently-typed `SessionLayer<Store>`, which no fixed tuple
+    // member can be. `build_session_layer` monomorphizes it to
+    // `SessionLayer<ArcSessionStore>` so it joins the merged tuple below; see
+    // that function for the boxed-future-per-store-op cost that buys the
+    // nesting level back.
+    let session_layer = crate::session::build_session_layer(
         &config.session,
         config.profile.as_deref(),
         session_store,
         signing_keys_opt,
+        &state.entropy_arc(),
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Read-your-own-writes middleware: installed only when the mode is not
     // `off`. When active, it scopes a per-request task-local `RequestPin`
     // that generated repository read methods consult at acquire time.
-    // Inner to Session so the task-local wraps the handler; the `autumn.ryw`
-    // cookie is parsed from raw `Cookie` headers and does not require the
-    // Session extractor to have run first.
+    // Outer to Session, so the task-local also wraps the session store's own
+    // reads; the `autumn.ryw` cookie is parsed from raw `Cookie` headers and
+    // does not require the Session extractor to have run first.
     #[cfg(feature = "db")]
-    let router = if config.database.read_your_writes == crate::config::ReadYourWrites::Off {
-        router
-    } else {
-        let ryw_mode = config.database.read_your_writes;
-        let window_secs = config.database.pin_after_write_secs;
-        let keys = signing_keys_for_ryw;
-        if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
-            tracing::warn!(
-                "read_your_writes = \"session\" requires a configured \
-                 security.signing_secret to sign the autumn.ryw cookie; \
-                 cross-request pinning is disabled until a secret is set"
-            );
-        }
-        let metrics = state.metrics().clone();
-        router.layer(axum::middleware::from_fn(move |req, next| {
-            crate::read_your_writes::middleware(
-                req,
-                next,
-                ryw_mode,
-                window_secs,
-                keys.clone(),
-                metrics.clone(),
-            )
-        }))
-    };
+    let ryw_layer = tower::util::option_layer(
+        (config.database.read_your_writes != crate::config::ReadYourWrites::Off).then(|| {
+            let ryw_mode = config.database.read_your_writes;
+            let window_secs = config.database.pin_after_write_secs;
+            let keys = signing_keys_for_ryw;
+            if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
+                tracing::warn!(
+                    "read_your_writes = \"session\" requires a configured \
+                     security.signing_secret to sign the autumn.ryw cookie; \
+                     cross-request pinning is disabled until a secret is set"
+                );
+            }
+            let metrics = state.metrics().clone();
+            crate::read_your_writes::ReadYourWritesLayer::new(ryw_mode, window_secs, keys, metrics)
+        }),
+    );
+    #[cfg(not(feature = "db"))]
+    let ryw_layer = tower::layer::util::Identity::new();
 
-    // Error page filter: renders HTML error pages for browser requests.
-    // Always registered (uses default renderer if no custom one is provided).
     let is_dev = config
         .profile
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
+
+    // Error page filter: renders HTML error pages for browser requests.
+    // Always registered (uses default renderer if no custom one is provided).
 
     // When the `maud` feature is enabled, an ErrorPageFilter renders styled HTML
     // error pages for browser requests. Without `maud`, only the
@@ -3237,31 +4594,9 @@ fn apply_middleware(
         "Registered exception filters (including error page filter)"
     );
 
-    // Error page context layer must be inner to the exception filter so
-    // WantsHtml is set on the response before the filter inspects it.
-    // Full ingress layer order (outermost -> innermost). NOTE: the framework's
-    // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
-    // by `build_router_pre_state` AFTER this function returns (and, crucially,
-    // after the MCP dispatch clone is taken), so they are NOT in this list:
-    //   SecurityHeaders (framework outermost — applied in build_router_pre_state) ->
-    //   [static_gate layers — applied in build_router_pre_state, after the MCP
-    //   dispatch clone, outside session and the static cache] ->
-    //   TraceContext (applied outside the startup barrier so short-circuit
-    //   responses still carry traceparent) ->
-    //   Compression (outer to ExceptionFilter — see note below) ->
-    //   [user layers, when SSG/ISG dist dir active] ->
-    //   StaticFileMiddleware (when SSG/ISG enabled) ->
-    //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   RequestId -> LogContext -> AccessLog-primary ->
-    //   [user layers, non-static build] ->
-    //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
-    //   (An AccessLog fallback sits outermost, applied in apply_startup_barrier.)
-    let router = router
-        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
-        .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
-
-    // Response compression is applied outermost (outside ExceptionFilter) so that
+    // ── Outermost group: outer to the session ───────────────────────────────
+    //
+    // Response compression is outermost (outside ExceptionFilter) so that
     // exception filters which rebuild the response body (e.g. ProblemDetailsFilter
     // normalising AutumnErrors to JSON Problem Details) do so before the body is
     // encoded. If compression were inner to ExceptionFilter, the filter would
@@ -3269,6 +4604,81 @@ fn apply_middleware(
     // causing clients to receive uncompressed bytes labeled as gzip.
     // User-registered layers (EtagLayer etc.) remain inner to Compression, so
     // ETags are still computed on the uncompressed body before encoding occurs.
+    //
+    // The error page context layer must be inner to the exception filter so
+    // WantsHtml is set on the response before the filter inspects it.
+    //
+    // Full ingress layer order (outermost -> innermost). NOTE: the framework's
+    // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
+    // by `build_router_pre_state` AFTER this function returns (and, crucially,
+    // after the MCP dispatch clone is taken), so they are NOT in this list:
+    //   [MethodOverride, TrustedProxies, loopback ConnectInfo — wrapped around
+    //   the finished Router by `App::run` at the `axum::serve` boundary, so
+    //   they are outside even the startup barrier] ->
+    //   TraceContext -> ServerTiming-fallback -> AccessLog-fallback ->
+    //   StartupBarrier   (all four applied by `apply_startup_barrier`, which
+    //   every entry point calls LAST on the finished router — so this group is
+    //   the outermost thing inside the Router) ->
+    //   SecurityHeaders (framework outermost within build_router_pre_state) ->
+    //   [static_gate layers — applied just inside SecurityHeaders and after the
+    //   MCP dispatch clone, outside session and the static cache] ->
+    //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
+    //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
+    //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
+    //   ReadYourWrites -> Session -> NormalizeBody ->
+    //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
+    //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
+    //   [user layers, non-static build — ONE slot however many are registered] ->
+    //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
+    //   Maintenance -> RateLimitPrincipal -> RateLimit ->
+    //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
+    //   TrustedHost -> CORS -> [asset cache-control] -> handler
+    //   (Everything from `Metrics` through `CORS` is ONE `Router::layer` call —
+    //   the merged tuple below; `Compression` keeps its own. `NormalizeBody` is
+    //   a body-type adapter with no request-path behaviour, listed only so this
+    //   order reads against that tuple member-for-member.)
+    //   (In the SSG/ISG path the user layers and a second compression layer are
+    //   applied outside the static-first middleware instead — see
+    //   `try_build_router_with_static_inner`.)
+    // Listed OUTERMOST FIRST — see the warning at the top of this function.
+    let outer_stack = (
+        crate::middleware::MetricsLayer::new(state.metrics.clone()),
+        ExceptionFilterLayer::new(all_filters),
+        crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
+        ryw_layer,
+    );
+
+    // ── The single merged application ───────────────────────────────────────
+    //
+    // One `Router::layer` call for the whole ingress stack. A `tower-layer`
+    // tuple puts its FIRST element OUTERMOST, so this tuple reads in ingress
+    // order — outer group, then session, then the middle group, then the
+    // operator's own layers, then the inner group — which is exactly the order
+    // the four separate `.layer()` calls this replaces produced. (They ran
+    // inner-group-first precisely BECAUSE repeated calls accumulate outward:
+    // the last call was outermost. Collapsing a run therefore reverses it; see
+    // the warning at the top of this function.)
+    //
+    // Each `.layer()` call removed here is a whole `BoxCloneSyncService`
+    // nesting level that every request above it deep-clones on every call, so
+    // the four-to-one collapse is a quadratic-to-linear change, not a
+    // constant-factor one (#2193, #2198).
+    //
+    // `ComposedRegisteredLayers` occupies the user-layer slot UNCONDITIONALLY,
+    // even when no layer is registered — see its docs for why an empty run
+    // still earns its one boxing adapter (it is the compile-time boundary that
+    // keeps this single application's type from blowing up).
+    let router = router.layer((
+        outer_stack,
+        session_layer,
+        NormalizeBodyLayer,
+        middle_stack,
+        ComposedRegisteredLayers::new(custom_layers),
+        inner_stack,
+    ));
+
+    // Compression keeps its own `Router::layer` call — see
+    // `apply_compression_middleware` for why it cannot join the tuple above.
     let router = apply_compression_middleware(router, config);
 
     // NOTE: the `static_gate` layers and the framework's outermost
@@ -3279,34 +4689,46 @@ fn apply_middleware(
     Ok(router)
 }
 
-/// Apply a set of user-registered layer registrations so that the
-/// first-registered layer ends up outermost on ingress — matching
-/// [`tower::ServiceBuilder`] ordering. Returns the wrapped router.
+/// Apply a set of user-registered layer registrations in ONE `Router::layer`
+/// call, so that the first-registered layer ends up outermost on ingress —
+/// matching [`tower::ServiceBuilder`] ordering. Returns the wrapped router.
+///
+/// An empty run returns the router untouched: no application, and therefore no
+/// `BoxCloneSyncService` nesting level and no boxing adapter.
+///
+/// Used by the SSG/ISG path, which drains the custom layers and the static
+/// gates out of `apply_middleware` and applies them outside the static-first
+/// middleware instead. The fully-dynamic path composes both runs into larger
+/// merged applications (`apply_middleware` and `build_router_pre_state`).
 fn apply_layers_in_registration_order(
-    mut router: axum::Router<AppState>,
+    router: axum::Router<AppState>,
     layers: Vec<crate::app::CustomLayerRegistration>,
     what: &str,
 ) -> axum::Router<AppState> {
     let count = layers.len();
-    for registered in layers.into_iter().rev() {
-        router = (registered.apply)(router);
+    if count == 0 {
+        return router;
     }
-    if count > 0 {
-        tracing::debug!(count, "{what} Tower layers applied");
-    }
-    router
+    tracing::debug!(count, "{what} Tower layers applied");
+    router.layer(ComposedRegisteredLayers::new(layers))
 }
 
-async fn trusted_host_middleware(
-    req: Request<axum::body::Body>,
-    next: Next,
-    policy: TrustedHostPolicy,
-) -> axum::response::Response {
+/// Decide whether `req` clears the trusted-host policy, returning the rejection
+/// response when it does not.
+///
+/// Shared by [`TrustedHostService`] and — through it — every ingress path, so
+/// the decision lives in exactly one place. Returns `None` for "let it
+/// through", which is the overwhelmingly common answer and costs no allocation
+/// at all: the host string is only owned on the branch that has to compare it.
+fn trusted_host_rejection<B>(
+    req: &Request<B>,
+    policy: &TrustedHostPolicy,
+) -> Option<axum::response::Response> {
     let path = req.uri().path();
     if (req.method() == http::Method::GET || req.method() == http::Method::HEAD)
         && policy.probe_bypass_paths.contains(path)
     {
-        return next.run(req).await;
+        return None;
     }
     let authority = req.uri().authority().map(http::uri::Authority::as_str);
     let host_header = req
@@ -3321,27 +4743,91 @@ async fn trusted_host_middleware(
         .filter(|h| !h.is_empty());
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
-        return next.run(req).await;
+        return None;
     }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
-        next.run(req).await
-    } else {
-        tracing::warn!(host = ?host, "trusted host rejected request");
-        let body = crate::error::problem_details_json_string(
-            StatusCode::BAD_REQUEST,
-            "Invalid Host header",
-            None,
-            None,
-            None,
-            None,
-            true,
-        );
+        return None;
+    }
+    tracing::warn!(host = ?host, "trusted host rejected request");
+    let body = crate::error::problem_details_json_string(
+        StatusCode::BAD_REQUEST,
+        "Invalid Host header",
+        None,
+        None,
+        None,
+        None,
+        true,
+    );
+    Some(
         (
             StatusCode::BAD_REQUEST,
             [(http::header::CONTENT_TYPE, "application/problem+json")],
             body,
         )
-            .into_response()
+            .into_response(),
+    )
+}
+
+/// Tower [`Layer`](tower::Layer) enforcing [`TrustedHostPolicy`] on the ingress
+/// path.
+///
+/// This used to be an `axum::middleware::from_fn` closure. It is a hand-rolled
+/// service now because `from_fn` `Box::pin`s the future of whatever it wraps —
+/// one heap allocation per request, sized by everything the wrapped async block
+/// captures across its `.await`, which for a layer this far out is the whole
+/// downstream continuation — plus a `self.inner.clone()` that deep-clones the
+/// erased stack beneath it. Neither cost depended on whether a request was
+/// actually rejected (issue #2214).
+#[derive(Clone, Debug)]
+pub struct TrustedHostLayer {
+    policy: TrustedHostPolicy,
+}
+
+impl TrustedHostLayer {
+    pub(crate) const fn new(policy: TrustedHostPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl<S> tower::Layer<S> for TrustedHostLayer {
+    type Service = TrustedHostService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrustedHostService {
+            inner,
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`TrustedHostLayer`].
+#[derive(Clone, Debug)]
+pub struct TrustedHostService<S> {
+    inner: S,
+    policy: TrustedHostPolicy,
+}
+
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for TrustedHostService<S>
+where
+    S: tower::Service<Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = crate::middleware::short_circuit::ShortCircuitFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::middleware::short_circuit::ShortCircuitFuture;
+        trusted_host_rejection(&req, &self.policy).map_or_else(
+            || ShortCircuitFuture::forward(self.inner.call(req)),
+            ShortCircuitFuture::short_circuit,
+        )
     }
 }
 
@@ -3536,6 +5022,36 @@ pub fn try_build_router_with_static_inner(
     );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
+    // #1384: the ambient-locale layer must NOT drain out with the rest. It runs
+    // `Locale::from_request_parts`, whose session step reads the signed session
+    // — and everything drained here is applied OUTSIDE the static-first
+    // middleware, i.e. outside `SessionLayer`. Out there the session extension
+    // does not exist yet, so a locale persisted by the documented
+    // `set_locale_in_session` switcher would be invisible and content would
+    // silently resolve from `Accept-Language` instead, disagreeing with the UI
+    // chrome on the same page. A handler that deliberately takes no `Locale`
+    // argument — the whole point of the feature — never runs an extractor later
+    // to correct it either.
+    //
+    // Putting it back on the inner router's context lands it in
+    // `apply_middleware`'s merged tuple, which is INSIDE `session_layer` on
+    // both this path and the fully-dynamic one. The bundle `Extension` still
+    // drains out and is therefore still outer, so the layer can read it.
+    //
+    // Shadowed rather than mutated in place: with the `i18n` feature off this
+    // block vanishes, and a `let mut` the remaining code never reassigns is a
+    // `-D warnings` failure in every non-unified build (`-p autumn-web`, the
+    // sqlite lane). A `--workspace` build hides that, because another member
+    // turns `i18n` on and Cargo unifies it.
+    #[cfg(feature = "i18n")]
+    let custom_layers = {
+        let (session_scoped, outside): (Vec<_>, Vec<_>) = custom_layers
+            .into_iter()
+            .partition(|r| r.type_id == std::any::TypeId::of::<crate::i18n::AmbientLocaleLayer>());
+        ctx.custom_layers = session_scoped;
+        outside
+    };
+
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
     // and applied OUTSIDE the static-first middleware (the outermost layer of
     // all), so they run before the static cache lookup serves a pre-rendered
@@ -3679,8 +5195,9 @@ pub fn try_build_router_with_static_inner(
 
     // Apply user layers OUTSIDE the static middleware so they wrap it and can
     // process both static and dynamic responses (e.g. compress the HTML on
-    // the way out). Iterate in reverse so the first registered layer ends up
-    // outermost — matching tower::ServiceBuilder ordering.
+    // the way out). The first registered layer ends up outermost — matching
+    // `tower::ServiceBuilder` ordering; the fold that gets it there lives in
+    // `apply_layers_in_registration_order` / `ComposedRegisteredLayers`.
     router = apply_layers_in_registration_order(
         router,
         custom_layers,
@@ -3722,7 +5239,7 @@ pub fn try_build_router_with_static_inner(
 }
 
 #[derive(Clone)]
-struct StartupBarrierState {
+pub struct StartupBarrierState {
     app_state: AppState,
     // Canonical exact-match probe/health paths (`probe_bypass_paths`), the
     // single source of truth shared with `TrustedHostPolicy` and the
@@ -3771,10 +5288,40 @@ fn apply_startup_barrier(
     state: &AppState,
 ) -> axum::Router {
     let barrier_state = StartupBarrierState::from_config(config, state);
-    let router = router.layer(axum::middleware::from_fn_with_state(
-        barrier_state,
-        startup_barrier,
-    ));
+
+    // These four are the OUTERMOST layers on every production build path, so
+    // they are composed into a single tuple and applied with one
+    // `Router::layer` call — four separate calls would nest four
+    // `BoxCloneSyncService` levels around every route, and axum deep-clones
+    // that nest on each request (issue #2193).
+    //
+    // ⚠ Tuple order is OUTERMOST FIRST — the opposite of consecutive
+    // `Router::layer` calls, where the last call ends up outermost.
+    //
+    // W3C Trace Context propagation wraps the startup barrier (and the
+    // static-first middleware above it) so short-circuit responses —
+    // startup 503s and pre-built static file hits — still extract the
+    // incoming `traceparent` and inject the current context into the
+    // outgoing response. Applied here rather than inside `apply_middleware`
+    // because those outer wrappers can return without ever invoking the
+    // inner router. Outer to AccessLog so the access event is emitted while
+    // the trace context is current.
+    #[cfg(feature = "telemetry-otlp")]
+    let trace_context = crate::middleware::TraceContextLayer;
+    #[cfg(not(feature = "telemetry-otlp"))]
+    let trace_context = tower::layer::util::Identity::new();
+
+    // Server-Timing fallback (#1348), applied OUTSIDE the startup barrier, the
+    // static-first (SSG/ISR) middleware, the session layer, and the late MCP
+    // merge — exactly the short-circuit paths the primary ServerTimingLayer in
+    // `apply_middleware` never sees. Gated on the same `server_timing_enabled`
+    // resolver as the primary. It appends only for responses missing the
+    // `ServerTimingEmitted` marker, so requests that reach the primary carry a
+    // single `total`; short-circuits (startup 503, pre-built static hits) get a
+    // `total` here.
+    let server_timing_fallback = crate::config::server_timing_enabled(config)
+        .then(|| crate::middleware::ServerTimingLayer::fallback(true));
+
     // Access-log fallback (#999), applied OUTSIDE the startup barrier, the
     // static-first (SSG/ISR) middleware, the session layer, and the
     // exception-filter chain — every production build path funnels through
@@ -3785,55 +5332,96 @@ fn apply_startup_barrier(
     // an access line too. Those short-circuits never ran RequestIdLayer, so
     // the fallback reads `x-request-id` from the response when present and
     // logs without a request id otherwise.
-    let router = if config.log.access_log {
-        router.layer(crate::middleware::AccessLogLayer::fallback(
-            config.log.access_log_exclude.clone(),
-        ))
-    } else {
-        router
-    };
-    // Server-Timing fallback (#1348), applied OUTSIDE the startup barrier, the
-    // static-first (SSG/ISR) middleware, the session layer, and the late MCP
-    // merge — exactly the short-circuit paths the primary ServerTimingLayer in
-    // `apply_middleware` never sees. Gated on the same `server_timing_enabled`
-    // resolver as the primary. It appends only for responses missing the
-    // `ServerTimingEmitted` marker, so requests that reach the primary carry a
-    // single `total`; short-circuits (startup 503, pre-built static hits) get a
-    // `total` here.
-    let router = if crate::config::server_timing_enabled(config) {
-        router.layer(crate::middleware::ServerTimingLayer::fallback(true))
-    } else {
-        router
-    };
-    // W3C Trace Context propagation wraps the startup barrier (and the
-    // static-first middleware above it) so short-circuit responses —
-    // startup 503s and pre-built static file hits — still extract the
-    // incoming `traceparent` and inject the current context into the
-    // outgoing response. Applied here rather than inside `apply_middleware`
-    // because those outer wrappers can return without ever invoking the
-    // inner router. Outer to AccessLog so the access event is emitted while
-    // the trace context is current.
-    #[cfg(feature = "telemetry-otlp")]
-    let router = router.layer(crate::middleware::TraceContextLayer);
-    router
+    let access_log_fallback = config.log.access_log.then(|| {
+        crate::middleware::AccessLogLayer::fallback(config.log.access_log_exclude.clone())
+    });
+
+    router.layer((
+        trace_context,
+        tower::util::option_layer(server_timing_fallback),
+        tower::util::option_layer(access_log_fallback),
+        StartupBarrierLayer::new(barrier_state),
+    ))
 }
 
-async fn startup_barrier(
-    State(state): State<StartupBarrierState>,
-    request: axum::extract::Request,
-    next: Next,
-) -> axum::response::Response {
-    if crate::app::is_static_build_mode()
-        || state.app_state.probes().is_startup_complete()
-        || state.allows_path(request.uri().path())
-    {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Service is still starting up",
-        )
-            .into_response()
+/// Tower [`Layer`](tower::Layer) for the startup readiness barrier: requests are refused with
+/// `503 Service is still starting up` until the app reports startup complete,
+/// except on the paths the barrier lets through (probes, actuator).
+///
+/// A hand-rolled service rather than an `axum::middleware::from_fn`: this is the
+/// outermost layer inside the `Router`, so `from_fn`'s per-request `Box::pin`
+/// captured the entire downstream continuation and its `self.inner.clone()`
+/// deep-cloned the whole erased stack — on every request, for a check that
+/// passes on every request after the first few seconds of process life
+/// (issue #2214).
+///
+/// The state is held behind an `Arc` because the produced service is cloned on
+/// the request path — once per traversal of the stack above it — and
+/// `StartupBarrierState` owns an `AppState` plus three `Vec<String>` path lists.
+/// Holding it by value would deep-copy all three on every one of those clones,
+/// which is the cost #2193 removed elsewhere in this stack.
+#[derive(Clone)]
+pub struct StartupBarrierLayer {
+    state: Arc<StartupBarrierState>,
+}
+
+impl StartupBarrierLayer {
+    pub(crate) fn new(state: StartupBarrierState) -> Self {
+        Self {
+            state: Arc::new(state),
+        }
+    }
+}
+
+impl<S> tower::Layer<S> for StartupBarrierLayer {
+    type Service = StartupBarrierService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StartupBarrierService {
+            inner,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`StartupBarrierLayer`].
+#[derive(Clone)]
+pub struct StartupBarrierService<S> {
+    inner: S,
+    state: Arc<StartupBarrierState>,
+}
+
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for StartupBarrierService<S>
+where
+    S: tower::Service<Request<ReqBody>, Response = axum::response::Response>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = crate::middleware::short_circuit::ShortCircuitFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::middleware::short_circuit::ShortCircuitFuture;
+        if crate::app::is_static_build_mode()
+            || self.state.app_state.probes().is_startup_complete()
+            || self.state.allows_path(req.uri().path())
+        {
+            ShortCircuitFuture::forward(self.inner.call(req))
+        } else {
+            ShortCircuitFuture::short_circuit(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service is still starting up",
+                )
+                    .into_response(),
+            )
+        }
     }
 }
 
@@ -4352,31 +5940,118 @@ fn mount_swagger_ui_routes(
     router
 }
 
-/// Scope the request's [`AppState`] as the ambient event-bus app for the
-/// duration of the request, so the free `events::publish` resolves this app.
-async fn event_app_context_middleware(
-    state: axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    crate::events::scope_event_app(state.0.clone(), async move { next.run(req).await }).await
+/// Tower [`Layer`](tower::Layer) installing the app's registered
+/// [`HttpInterceptor`](crate::interceptor::HttpInterceptor) as the ambient
+/// interceptor chain for outbound `reqwest` calls made during this request.
+///
+/// Hand-rolled rather than an `axum::middleware::from_fn_with_state` for the
+/// reason #2214 documents: `from_fn` `Box::pin`s the async block it generates
+/// on every request. `tokio::task_local!`'s `scope` returns a named
+/// `TaskLocalFuture`, so the scoped branch needs no box either — and an app
+/// with no interceptor registered (the common case) forwards the inner
+/// service's future completely untouched.
+///
+/// Like [`crate::events::EventAppContextLayer`], the inner future is built
+/// inside a `sync_scope` as well as polled inside a `scope`, so the synchronous
+/// `Service::call` chain beneath this layer also sees the interceptors.
+#[cfg(feature = "oauth2")]
+#[derive(Clone)]
+pub struct HttpInterceptorLayer {
+    state: AppState,
 }
 
 #[cfg(feature = "oauth2")]
-async fn http_interceptor_middleware(
-    state: axum::extract::State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
-    if let Some(interceptor_arc) = state.extension::<Arc<dyn HttpInterceptor>>() {
-        let interceptor = (*interceptor_arc).clone();
-        let interceptors = vec![interceptor];
-        ACTIVE_HTTP_INTERCEPTORS
-            .scope(interceptors, async move { next.run(req).await })
-            .await
-    } else {
-        next.run(req).await
+impl HttpInterceptorLayer {
+    pub(crate) const fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<S> tower::Layer<S> for HttpInterceptorLayer {
+    type Service = HttpInterceptorService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HttpInterceptorService {
+            inner,
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`HttpInterceptorLayer`].
+#[cfg(feature = "oauth2")]
+#[derive(Clone)]
+pub struct HttpInterceptorService<S> {
+    inner: S,
+    state: AppState,
+}
+
+#[cfg(feature = "oauth2")]
+pin_project_lite::pin_project! {
+    /// Future returned by [`HttpInterceptorService`].
+    #[project = HttpInterceptorFutureProj]
+    pub enum HttpInterceptorScopeFuture<F> {
+        /// No interceptor registered: the inner service's own future.
+        Plain {
+            #[pin]
+            inner: F,
+        },
+        /// The inner future, polled inside the interceptor task-local scope.
+        Scoped {
+            #[pin]
+            inner: tokio::task::futures::TaskLocalFuture<
+                Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+                F,
+            >,
+        },
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<F: std::future::Future> std::future::Future for HttpInterceptorScopeFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.project() {
+            HttpInterceptorFutureProj::Plain { inner } => inner.poll(cx),
+            HttpInterceptorFutureProj::Scoped { inner } => inner.poll(cx),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<S, ReqBody> tower::Service<Request<ReqBody>> for HttpInterceptorService<S>
+where
+    S: tower::Service<Request<ReqBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = HttpInterceptorScopeFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+        let Some(interceptor_arc) = self.state.extension::<Arc<dyn HttpInterceptor>>() else {
+            return HttpInterceptorScopeFuture::Plain {
+                inner: self.inner.call(req),
+            };
+        };
+        let interceptors = vec![(*interceptor_arc).clone()];
+        let inner =
+            ACTIVE_HTTP_INTERCEPTORS.sync_scope(interceptors.clone(), || self.inner.call(req));
+        HttpInterceptorScopeFuture::Scoped {
+            inner: ACTIVE_HTTP_INTERCEPTORS.scope(interceptors, inner),
+        }
     }
 }
 
@@ -4398,9 +6073,11 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
-            profile: Some("test".to_owned()),
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
+            profile: Some("test".into()),
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -4418,9 +6095,10 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
+            auth_session_key: "user_id".into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         }
     }
@@ -4565,6 +6243,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -4606,6 +6285,37 @@ mod tests {
                 resp.status(),
                 StatusCode::NOT_FOUND,
                 "built-in probe {path} should still be mounted"
+            );
+        }
+    }
+
+    /// Issue #1971: `health.enabled = false` is a global off-switch — the
+    /// framework auto-mounts NONE of the built-in probes (health/live/ready/
+    /// startup). The router still builds cleanly (`build_router` panics on any
+    /// `RouterBuildError`, so a successful return proves no structured error is
+    /// raised), and every probe path resolves to `404` because nothing owns it.
+    #[tokio::test]
+    async fn health_enabled_false_mounts_no_builtin_probes() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+
+        let app = build_router(vec![], &config, test_state());
+
+        for path in [
+            config.health.path.as_str(),
+            config.health.live_path.as_str(),
+            config.health.ready_path.as_str(),
+            config.health.startup_path.as_str(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "probe path {path} must not be auto-mounted when health.enabled = false"
             );
         }
     }
@@ -5085,6 +6795,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -5654,6 +7365,1002 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Locale-prefixed routing (issue #1251) ───────────────────────────────
+
+    #[cfg(feature = "i18n")]
+    mod locale_prefix_routing {
+        use super::*;
+        use crate::i18n::{Bundle, I18nConfig, Locale};
+
+        async fn locale_probe(locale: Locale) -> String {
+            locale.tag().to_owned()
+        }
+
+        async fn plain_ok() -> &'static str {
+            "ok"
+        }
+
+        fn simple_route(path: &'static str, name: &'static str, probe: bool) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: if probe {
+                    axum::routing::get(locale_probe)
+                } else {
+                    axum::routing::get(plain_ok)
+                },
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn config(supported: &[&str], exclude: &[&str]) -> AutumnConfig {
+            let mut config = AutumnConfig::default();
+            config.i18n.locale_prefix_enabled = true;
+            config.i18n.default_locale = supported.first().copied().unwrap_or("en").to_owned();
+            config.i18n.supported_locales = supported.iter().map(|s| (*s).to_owned()).collect();
+            config.i18n.locale_prefix_exclude = exclude.iter().map(|s| (*s).to_owned()).collect();
+            config
+        }
+
+        fn bundle(supported: &[&str]) -> Arc<Bundle> {
+            let cfg = I18nConfig {
+                default_locale: supported.first().copied().unwrap_or("en").to_owned(),
+                supported_locales: supported.iter().map(|s| (*s).to_owned()).collect(),
+                fallback_chain: vec![],
+                dir: "i18n".to_owned(),
+                locale_prefix_enabled: false,
+                locale_prefix_exclude: vec![],
+                locale_prefix_exclude_exact: vec![],
+            };
+            Arc::new(Bundle::from_messages(
+                std::collections::HashMap::new(),
+                &cfg,
+            ))
+        }
+
+        async fn request(
+            router: &axum::Router,
+            uri: &str,
+            headers: &[(&str, &str)],
+        ) -> axum::response::Response {
+            request_method(router, http::Method::GET, uri, headers).await
+        }
+
+        async fn request_method(
+            router: &axum::Router,
+            method: http::Method,
+            uri: &str,
+            headers: &[(&str, &str)],
+        ) -> axum::response::Response {
+            let mut req = Request::builder().method(method).uri(uri);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            router
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        async fn body_string(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        async fn uri_probe(uri: axum::http::Uri) -> String {
+            uri.path().to_owned()
+        }
+
+        async fn slug_probe(
+            locale: Locale,
+            axum::extract::Path(slug): axum::extract::Path<String>,
+        ) -> String {
+            format!("{}:{slug}", locale.tag())
+        }
+
+        fn uri_probe_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: axum::routing::get(uri_probe),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn slug_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::GET,
+                path,
+                handler: axum::routing::get(slug_probe),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        fn make_post_route(path: &'static str, name: &'static str) -> Route {
+            Route {
+                method: http::Method::POST,
+                path,
+                handler: axum::routing::post(plain_ok),
+                name,
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path,
+                    operation_id: name,
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }
+        }
+
+        /// Codex review (P1): an app that enables `locale_prefix_enabled`
+        /// without also calling `.i18n()`/`.i18n_auto()` (no `Bundle`
+        /// installed) must still redirect to — and correctly serve — its
+        /// *configured* locale, not a hard-coded `"en"` that may not even be
+        /// in `supported_locales`.
+        #[tokio::test]
+        async fn locale_prefix_redirect_works_without_an_i18n_bundle() {
+            let config = config(&["fr"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            // No `.layer(axum::Extension(bundle(...)))` — deliberately no
+            // Bundle, unlike every other test in this module.
+            let app = build_router(vec![route], &config, test_state());
+
+            let redirected = request(&app, "/posts", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/fr/posts"),
+                "must redirect to the configured locale, not a hard-coded \"en\""
+            );
+
+            let target = request(&app, "/fr/posts", &[]).await;
+            assert_eq!(
+                target.status(),
+                StatusCode::OK,
+                "the redirect target must actually resolve"
+            );
+            assert_eq!(body_string(target).await, "fr");
+        }
+
+        /// AC: default off — no behavior change for existing apps. The bare
+        /// route serves directly; no locale nest exists.
+        #[tokio::test]
+        async fn locale_prefix_routing_off_by_default() {
+            let mut config = AutumnConfig::default();
+            assert!(!config.i18n.locale_prefix_enabled);
+            config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+            let route = simple_route("/posts", "posts", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/posts", &[]).await;
+            assert_eq!(bare.status(), StatusCode::OK);
+
+            let prefixed = request(&app, "/en/posts", &[]).await;
+            assert_eq!(
+                prefixed.status(),
+                StatusCode::NOT_FOUND,
+                "no locale nest should exist when the flag is off"
+            );
+        }
+
+        /// The root path (`/`) is axum's nest-plus-root special case: `nest(
+        /// "/en", router_with_route_at("/"))` makes bare `/en` (no trailing
+        /// slash) match, while `/en/` 404s — the opposite of every other
+        /// path, where the locale segment is a plain concatenation. Both the
+        /// redirect target and direct nested access must account for this.
+        #[tokio::test]
+        async fn root_path_redirects_to_bare_locale_prefix_without_trailing_slash() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/", "root", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/", &[]).await;
+            assert_eq!(bare.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                bare.headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en"),
+                "root redirect target must have no trailing slash"
+            );
+
+            let nested = request(&app, "/en", &[]).await;
+            assert_eq!(nested.status(), StatusCode::OK);
+            assert_eq!(body_string(nested).await, "en");
+
+            let nested_with_slash = request(&app, "/en/", &[]).await;
+            assert_eq!(
+                nested_with_slash.status(),
+                StatusCode::NOT_FOUND,
+                "axum's nest-plus-root case does not also match the trailing-slash form"
+            );
+        }
+
+        /// The root path with a query string preserves the query and still
+        /// omits the trailing slash before it.
+        #[tokio::test]
+        async fn root_path_redirect_preserves_query_without_trailing_slash() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/", "root", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/?ref=newsletter", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en?ref=newsletter")
+            );
+        }
+
+        /// AC: every route is reachable under `/{locale}` for each supported
+        /// locale, with zero hand-duplicated route definitions — one `Route`
+        /// serves both `/en/posts` and `/es/posts`.
+        #[tokio::test]
+        async fn route_reachable_under_every_supported_locale() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P1): a duplicate entry in `supported_locales` must
+        /// not panic at router-construction time (axum rejects nesting the
+        /// same path twice as an overlapping route) — it should simply be
+        /// deduped, and the locale should still route normally.
+        #[tokio::test]
+        async fn duplicate_supported_locale_does_not_panic_and_still_routes() {
+            let config = config(&["en", "es", "en"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P2): an empty-string entry in `supported_locales`
+        /// must not panic at router-construction time — `.nest("/", ...)`
+        /// (an empty locale segment) is a root nest, which axum rejects.
+        /// Skip the malformed entry instead; the other, valid locale must
+        /// still route normally.
+        #[tokio::test]
+        async fn malformed_locale_segment_does_not_panic_and_valid_locale_still_routes() {
+            let config = config(&["en", "", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+
+            let es = request(&app, "/es/posts", &[]).await;
+            assert_eq!(es.status(), StatusCode::OK);
+            assert_eq!(body_string(es).await, "es");
+        }
+
+        /// Codex review (P1): an app that defines both `/foo` and the exact
+        /// path its own locale-prefix nesting would generate for it
+        /// (`/en/foo`, when `en` is supported) must not panic at
+        /// router-construction time — the bare-path redirect (mounted at
+        /// every locale-prefix-eligible path via `any()`, which claims every
+        /// HTTP method) already owns `/en/foo`, so nesting `/foo`'s content
+        /// under `/en` collides. Surfaced as a structured build error.
+        #[tokio::test]
+        async fn generated_locale_path_collision_is_a_build_error_not_a_panic() {
+            let config = config(&["en", "es"], &[]);
+            let foo = simple_route("/foo", "foo", false);
+            let en_foo = simple_route("/en/foo", "en_foo", false);
+            let err = try_build_router(vec![foo, en_foo], &config, test_state())
+                .expect_err("a generated-path collision must be a build error, not a panic");
+            match err {
+                RouterBuildError::LocalePrefixPathCollision {
+                    ref locale,
+                    ref path,
+                    ref generated,
+                } => {
+                    assert_eq!(locale, "en");
+                    assert_eq!(path, "/foo");
+                    assert_eq!(generated, "/en/foo");
+                }
+                other => panic!("expected LocalePrefixPathCollision, got {other:?}"),
+            }
+        }
+
+        /// Codex review (P1): a generated locale path can collide with an
+        /// existing route that has the SAME matchit shape but a DIFFERENT
+        /// capture name (`/en/users/{id}` generated from `/users/{id}`, vs.
+        /// an existing `/en/users/{slug}`) — axum's `Router::route` rejects
+        /// this as a conflict regardless of the capture name, exactly like
+        /// the exact-duplicate-path case, so it must be caught the same way.
+        #[tokio::test]
+        async fn generated_locale_path_collision_via_capture_name_mismatch_is_a_build_error() {
+            let config = config(&["en"], &[]);
+            let users_id = slug_route("/users/{id}", "users_id");
+            let en_users_slug = slug_route("/en/users/{slug}", "en_users_slug");
+            let err = try_build_router(vec![users_id, en_users_slug], &config, test_state())
+                .expect_err("a capture-name-mismatched shape collision must be a build error");
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
+        /// Codex review (P2): a legal cross-method exact-path match must
+        /// NOT be flagged as a collision — axum merges the SAME path
+        /// template across DIFFERENT methods. `GET /foo` generates
+        /// `GET /en/foo`, which must coexist with a separately registered
+        /// `POST /en/foo`.
+        #[tokio::test]
+        async fn exact_generated_path_with_different_method_is_not_a_collision() {
+            let config = config(&["en"], &[]);
+            let get_foo = simple_route("/foo", "foo_get", false);
+            let post_en_foo = duplicate_test_route(http::Method::POST, "/en/foo", "post_en_foo");
+
+            // Must build without panicking or erroring.
+            let app = build_router(vec![get_foo, post_en_foo], &config, test_state());
+
+            let get_resp = request(&app, "/en/foo", &[]).await;
+            assert_eq!(
+                get_resp.status(),
+                StatusCode::OK,
+                "GET /en/foo must resolve to the nested /foo content"
+            );
+        }
+
+        /// Codex review (P1): a route mounted via `AppBuilder::scoped()`
+        /// lives outside `route_list` entirely, but still mounts onto the
+        /// same router (`mount_scoped_groups`, after this module returns) —
+        /// a scoped route whose resolved path collides with a generated
+        /// locale path must be caught here too, not just top-level routes.
+        #[tokio::test]
+        async fn generated_locale_path_colliding_with_a_scoped_route_is_a_build_error() {
+            let config = config(&["en"], &[]);
+            let foo = simple_route("/foo", "foo", false);
+            let scoped_route = duplicate_test_route(http::Method::GET, "/foo", "scoped_foo");
+            let group = crate::app::ScopedGroup {
+                prefix: "/en".to_owned(),
+                routes: vec![scoped_route],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let mut ctx = duplicate_test_ctx();
+            ctx.scoped_groups.push(group);
+
+            let err = super::try_build_router_inner(vec![foo], &config, test_state(), ctx)
+                .expect_err(
+                    "a scoped route colliding with a generated locale path must be a build error",
+                );
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
+        /// Codex review (P1): a generated locale path can collide with a
+        /// framework-owned path — the health probes, mounted later via
+        /// `mount_probe_endpoints`, are invisible to `collect_user_get_paths`
+        /// (which only sees the raw, pre-locale-prefix `route_list`) and so
+        /// weren't previously checked here either.
+        #[tokio::test]
+        async fn generated_locale_path_colliding_with_a_health_probe_is_a_build_error() {
+            let mut config = config(&["en"], &[]);
+            config.health.path = "/en/foo".to_owned();
+            let foo = simple_route("/foo", "foo", false);
+
+            let err = try_build_router(vec![foo], &config, test_state()).expect_err(
+                "a health probe colliding with a generated locale path must be a build error",
+            );
+            assert!(
+                matches!(err, RouterBuildError::LocalePrefixPathCollision { .. }),
+                "expected LocalePrefixPathCollision, got {err:?}"
+            );
+        }
+
+        /// Codex review (P2): a locale segment beginning with `:` (axum 0.7
+        /// capture syntax) must not panic at router-construction time — axum
+        /// 0.8's `Router::route` rejects it during assembly (the same
+        /// restriction `InvalidMcpPath` guards for MCP mount paths).
+        #[tokio::test]
+        async fn colon_prefixed_locale_segment_does_not_panic() {
+            let config = config(&["en", ":en"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+        }
+
+        /// Codex review (P2): a locale segment containing a query/fragment
+        /// delimiter or whitespace (e.g. `"en?x"`, `"en#x"`, `"en y"`) must
+        /// be skipped rather than nested — axum accepts it as a literal
+        /// nest string, but a client parses `/en?x/foo` as path `/en` plus
+        /// query `x/foo`, silently truncating the redirect target. Router
+        /// construction must not panic, and the other, valid locale must
+        /// still route normally.
+        #[tokio::test]
+        async fn locale_segment_with_uri_delimiter_does_not_panic_and_valid_locale_still_routes() {
+            let config = config(&["en", "en?x", "en#x", "en y"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en"])));
+
+            let en = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en.status(), StatusCode::OK);
+            assert_eq!(body_string(en).await, "en");
+        }
+
+        /// Codex review (P1): the bare-path redirect must claim only the
+        /// methods actually registered at that path, not every method via
+        /// `any()`. A user route at `POST /health` (a different method than
+        /// the framework's own auto-mounted `GET /health` probe) must not
+        /// have its redirect swallow GET too — that would collide with the
+        /// probe's later auto-mount, which has no visibility into methods
+        /// the redirect already claimed.
+        #[tokio::test]
+        async fn bare_path_redirect_claims_only_registered_methods_not_every_method() {
+            async fn user_health_post() -> &'static str {
+                "posted"
+            }
+
+            let config = config(&["en"], &[]);
+            let route = Route {
+                method: http::Method::POST,
+                path: "/health",
+                handler: axum::routing::post(user_health_post),
+                name: "user_health_post",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/health",
+                    operation_id: "user_health_post",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            };
+
+            // Before the fix, the redirect's `any()` claimed GET at /health
+            // too, colliding with the framework's own auto-mounted probe and
+            // panicking inside `axum::Router::route`.
+            let app = build_router(vec![route], &config, test_state());
+
+            let health = request(&app, "/health", &[]).await;
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "the framework's own health probe must still respond at GET /health"
+            );
+
+            let redirected = request_method(&app, http::Method::POST, "/health", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/health")
+            );
+        }
+
+        /// Codex review (P2): `LocaleRoutingConfig` (and the default-locale
+        /// negotiation fallback) must be built from the validated,
+        /// deduplicated locale set — the same one actually nested — not the
+        /// raw `supported_locales`. Otherwise a skipped invalid entry could
+        /// still be selected as the negotiated locale (or as the fallback
+        /// default) and 404, since no `/{locale}` nest exists for it.
+        #[tokio::test]
+        async fn skipped_invalid_locale_is_never_selected_by_negotiation() {
+            let mut config = config(&["", "en"], &[]);
+            config.i18n.default_locale = String::new();
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state());
+
+            // The empty "default" is invalid and skipped, so the bare-path
+            // redirect must fall back to "en" — the only validly-nested
+            // locale — not attempt an unreachable "//posts".
+            let response = request(&app, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts"),
+                "must redirect to the validly-nested locale, not the skipped empty default"
+            );
+        }
+
+        /// AC: an unknown `{locale}` prefix 404s — no panic.
+        #[tokio::test]
+        async fn unknown_locale_prefix_is_404_not_panic() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/zz/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// AC: a bare (non-prefixed) path 308-redirects to the negotiated
+        /// locale's prefixed path, preserving the query string.
+        #[tokio::test]
+        async fn bare_path_redirects_preserving_query() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/posts?sort=asc", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts?sort=asc")
+            );
+
+            let response = request(
+                &app,
+                "/posts?sort=asc",
+                &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "es")],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/es/posts?sort=asc")
+            );
+        }
+
+        /// AC: the URL prefix takes precedence over cookie/session/
+        /// `Accept-Language`, with zero handler changes (the handler above
+        /// takes a plain `Locale` parameter).
+        #[tokio::test]
+        async fn url_prefix_locale_wins_over_cookie_and_accept_language() {
+            let config = config(&["en", "es"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(
+                &app,
+                "/es/posts",
+                &[
+                    (axum::http::header::COOKIE.as_str(), "autumn_locale=en"),
+                    (axum::http::header::ACCEPT_LANGUAGE.as_str(), "en"),
+                ],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es");
+        }
+
+        /// AC: configured prefixes are excluded from localization and from
+        /// the bare-path redirect, so machine endpoints stay unprefixed.
+        #[tokio::test]
+        async fn excluded_prefix_stays_unprefixed_and_unredirected() {
+            let config = config(&["en", "es"], &["/api"]);
+            let route = simple_route("/api/status", "api_status", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&app, "/api/status", &[]).await;
+            assert_eq!(
+                direct.status(),
+                StatusCode::OK,
+                "excluded route must serve directly, not redirect"
+            );
+
+            let nested = request(&app, "/en/api/status", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::NOT_FOUND,
+                "excluded route must not be nested under a locale prefix"
+            );
+        }
+
+        /// A trailing `/*` on a configured exclude prefix is equivalent to
+        /// the bare prefix — `"/api"` and `"/api/*"` behave identically.
+        #[tokio::test]
+        async fn exclude_prefix_accepts_trailing_glob_suffix() {
+            let config = config(&["en", "es"], &["/api/*"]);
+            let route = simple_route("/api/status", "api_status", false);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&app, "/api/status", &[]).await;
+            assert_eq!(direct.status(), StatusCode::OK);
+
+            let nested = request(&app, "/en/api/status", &[]).await;
+            assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// Codex review (P1): a bare `"/"` exclude entry (as
+        /// `exclude_static_routes_from_locale_prefix` adds for a
+        /// `#[static_get("/")]` route) must exclude exactly the root path,
+        /// not be normalized away to an empty, always-non-matching prefix.
+        #[tokio::test]
+        async fn root_path_exclude_prefix_excludes_exactly_the_root() {
+            let config = config(&["en", "es"], &["/"]);
+            let root = simple_route("/", "root", false);
+            let posts = simple_route("/posts", "posts", true);
+            let app = build_router(vec![root, posts], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare_root = request(&app, "/", &[]).await;
+            assert_eq!(
+                bare_root.status(),
+                StatusCode::OK,
+                "excluded root route must serve directly, not redirect"
+            );
+
+            let nested_root = request(&app, "/en", &[]).await;
+            assert_eq!(
+                nested_root.status(),
+                StatusCode::NOT_FOUND,
+                "excluded root route must not be nested under a locale prefix"
+            );
+
+            // A "/" exclude entry must not swallow every other path — only
+            // the exact root.
+            let bare_posts = request(&app, "/posts", &[]).await;
+            assert_eq!(
+                bare_posts.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "\"/\" in the exclude list must not exclude unrelated routes"
+            );
+        }
+
+        /// A path that merely starts with an exclude prefix's characters
+        /// (`/apikeys` vs the configured `/api`) is NOT a prefix match — only
+        /// an exact path or a `/`-delimited sub-path counts. Otherwise
+        /// `/apikeys` would be wrongly swept into the excluded/unprefixed
+        /// group alongside genuine `/api/*` routes.
+        #[tokio::test]
+        async fn exclude_prefix_does_not_match_unrelated_path_sharing_a_string_prefix() {
+            let config = config(&["en", "es"], &["/api"]);
+            let route = simple_route("/apikeys", "apikeys", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let bare = request(&app, "/apikeys", &[]).await;
+            assert_eq!(
+                bare.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "/apikeys must be treated as included (locale-prefixed), not excluded"
+            );
+
+            let nested = request(&app, "/en/apikeys", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::OK,
+                "/apikeys must be nested under the locale prefix like any other included route"
+            );
+        }
+
+        /// A parameterized route (`/posts/{slug}`) is reachable through a
+        /// locale nest exactly like a static path — dynamic-segment matching
+        /// works the same whether or not the route is nested.
+        #[tokio::test]
+        async fn parameterized_route_reachable_under_locale_prefix() {
+            let config = config(&["en", "es"], &[]);
+            let route = slug_route("/posts/{slug}", "posts_show");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/es/posts/hello-world", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es:hello-world");
+        }
+
+        /// Codex review (P1): an exact-match exclusion (as populated by
+        /// `exclude_static_routes_from_locale_prefix` for a `#[static_get]`
+        /// route) must not behave like a *prefix* exclusion — excluding the
+        /// literal static route `/posts` must not also swallow an unrelated
+        /// dynamic sibling like `/posts/{slug}`, which shares only a string
+        /// prefix, not a namespace.
+        #[tokio::test]
+        async fn exact_exclude_does_not_swallow_a_dynamic_sibling_route() {
+            let mut config = config(&["en", "es"], &[]);
+            config.i18n.locale_prefix_exclude_exact = vec!["/posts".to_owned()];
+            let static_index = simple_route("/posts", "posts_index", false);
+            let dynamic_child = slug_route("/posts/{slug}", "posts_show");
+            let app = build_router(vec![static_index, dynamic_child], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let excluded = request(&app, "/posts", &[]).await;
+            assert_eq!(
+                excluded.status(),
+                StatusCode::OK,
+                "the exactly-excluded static route must stay unprefixed and unredirected"
+            );
+
+            let excluded_prefixed = request(&app, "/en/posts", &[]).await;
+            assert_eq!(
+                excluded_prefixed.status(),
+                StatusCode::NOT_FOUND,
+                "the exactly-excluded static route must not be nested under a locale prefix"
+            );
+
+            let sibling_prefixed = request(&app, "/en/posts/hello-world", &[]).await;
+            assert_eq!(
+                sibling_prefixed.status(),
+                StatusCode::OK,
+                "a dynamic sibling sharing the excluded path as a string prefix must \
+                 still be locale-prefixed normally — an exact exclusion must not act \
+                 like a prefix exclusion"
+            );
+            assert_eq!(body_string(sibling_prefixed).await, "en:hello-world");
+
+            let sibling_bare = request(&app, "/posts/hello-world", &[]).await;
+            assert_eq!(
+                sibling_bare.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "the dynamic sibling's bare path must still redirect, since only the \
+                 exact literal `/posts` is excluded"
+            );
+        }
+
+        /// Core assumption underpinning `locale_switcher`/hreflang
+        /// (documented on `widgets::localized_path` and
+        /// `seo::locale_alternates`): axum's `nest()` strips the matched
+        /// locale segment before extraction, so a handler's plain `Uri`
+        /// extractor inside the nest sees the locale-stripped path — not the
+        /// `/es/posts` the client actually requested.
+        #[tokio::test]
+        async fn uri_extractor_inside_locale_nest_sees_locale_stripped_path() {
+            let config = config(&["en", "es"], &[]);
+            let route = uri_probe_route("/posts", "posts_uri_probe");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request(&app, "/es/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                body_string(response).await,
+                "/posts",
+                "Uri extractor inside a locale nest must see the prefix-stripped path"
+            );
+        }
+
+        /// The redirect handler is mounted via `any()`, so it must redirect
+        /// non-GET methods too, not just the GET case every other test uses.
+        #[tokio::test]
+        async fn bare_path_redirect_applies_to_non_get_methods() {
+            let config = config(&["en", "es"], &[]);
+            let route = make_post_route("/posts", "posts_create");
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let response = request_method(&app, http::Method::POST, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts")
+            );
+        }
+
+        /// Two routes sharing one path under different HTTP methods must
+        /// still dedup to a single bare-path redirect registration — the
+        /// `included_paths.sort_unstable(); included_paths.dedup();` step in
+        /// `mount_user_routes` exists precisely to prevent `Router::route`
+        /// panicking on the same path registered twice.
+        #[tokio::test]
+        async fn same_path_different_methods_dedups_to_one_redirect_route() {
+            let config = config(&["en", "es"], &[]);
+            let get_route = simple_route("/posts", "posts_list", true);
+            let post_route = make_post_route("/posts", "posts_create");
+            let app = build_router(vec![get_route, post_route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let get_redirect = request(&app, "/posts", &[]).await;
+            assert_eq!(get_redirect.status(), StatusCode::PERMANENT_REDIRECT);
+            let post_redirect = request_method(&app, http::Method::POST, "/posts", &[]).await;
+            assert_eq!(post_redirect.status(), StatusCode::PERMANENT_REDIRECT);
+
+            let en_get = request(&app, "/en/posts", &[]).await;
+            assert_eq!(en_get.status(), StatusCode::OK);
+            let en_post = request_method(&app, http::Method::POST, "/en/posts", &[]).await;
+            assert_eq!(en_post.status(), StatusCode::OK);
+        }
+
+        /// A region-subtagged locale code (`es-MX`) works as a literal nest
+        /// prefix like any other configured locale, and an uppercase variant
+        /// of a configured code is treated as unknown (404) — the nest
+        /// prefix is a literal path segment, not case-negotiated.
+        #[tokio::test]
+        async fn region_subtag_locale_nests_and_prefix_is_case_sensitive() {
+            let config = config(&["en", "es-MX"], &[]);
+            let route = simple_route("/posts", "posts", true);
+            let app = build_router(vec![route], &config, test_state())
+                .layer(axum::Extension(bundle(&["en", "es-MX"])));
+
+            let response = request(&app, "/es-MX/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_string(response).await, "es-MX");
+
+            let wrong_case = request(&app, "/ES-MX/posts", &[]).await;
+            assert_eq!(
+                wrong_case.status(),
+                StatusCode::NOT_FOUND,
+                "the locale nest prefix is a literal path segment, not case-negotiated"
+            );
+        }
+
+        /// `supported_locales = []` is a degenerate config (locale-prefix
+        /// routing on, nothing to prefix with): no nest is created, and the
+        /// bare-path redirect is skipped rather than 308-ing to an
+        /// unreachable `/{default_locale}/...` target — a clean 404 beats a
+        /// redirect-then-404 round trip.
+        #[tokio::test]
+        async fn empty_supported_locales_serves_clean_404_not_redirect_to_nowhere() {
+            let mut config = AutumnConfig::default();
+            config.i18n.locale_prefix_enabled = true;
+            config.i18n.supported_locales = vec![];
+
+            let route = simple_route("/posts", "posts", false);
+            let app = build_router(vec![route], &config, test_state());
+
+            let response = request(&app, "/posts", &[]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// Codex review (P2): a misconfigured `default_locale` absent from
+        /// `supported_locales` (e.g. `default_locale = "fr"`,
+        /// `supported_locales = ["en"]`) must not negotiate a bare request to
+        /// an unreachable `/fr/...` target — only `en` is actually nested.
+        /// The negotiation fallback clamps to the first supported (i.e.
+        /// actually mounted) locale instead.
+        #[tokio::test]
+        async fn misconfigured_default_locale_falls_back_to_a_mounted_locale() {
+            let mut config = config(&["en"], &[]);
+            config.i18n.default_locale = "fr".to_owned();
+
+            let route = simple_route("/posts", "posts", true);
+            // No bundle — exercises the router's own `LocaleRoutingConfig`
+            // fallback, same as `locale_prefix_redirect_works_without_an_i18n_bundle`.
+            let app = build_router(vec![route], &config, test_state());
+
+            let redirected = request(&app, "/posts", &[]).await;
+            assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                redirected
+                    .headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some("/en/posts"),
+                "must redirect to a locale that's actually mounted, not the \
+                 misconfigured default_locale"
+            );
+
+            let target = request(&app, "/en/posts", &[]).await;
+            assert_eq!(target.status(), StatusCode::OK);
+        }
+
+        /// Routes registered via `AppBuilder::scoped()` are mounted by a
+        /// separate pipeline (`mount_scoped_groups`, which runs after
+        /// locale-prefix mounting) and are therefore untouched by
+        /// locale-prefix routing — no locale nest, no bare-path redirect —
+        /// exactly as if the flag were off. This guards the framework's
+        /// documented boundary: only the top-level `routes![...]` table is
+        /// locale-prefixed.
+        #[tokio::test]
+        async fn scoped_group_routes_are_not_locale_prefixed() {
+            let config = config(&["en", "es"], &[]);
+            let scoped_route = duplicate_test_route(http::Method::GET, "/status", "scoped_status");
+            let group = crate::app::ScopedGroup {
+                prefix: "/admin".to_owned(),
+                routes: vec![scoped_route],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let mut ctx = duplicate_test_ctx();
+            ctx.scoped_groups.push(group);
+
+            let router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect("router with a scoped group under locale-prefix routing should build")
+                .layer(axum::Extension(bundle(&["en", "es"])));
+
+            let direct = request(&router, "/admin/status", &[]).await;
+            assert_eq!(
+                direct.status(),
+                StatusCode::OK,
+                "scoped route must serve directly, unprefixed"
+            );
+
+            let nested = request(&router, "/en/admin/status", &[]).await;
+            assert_eq!(
+                nested.status(),
+                StatusCode::NOT_FOUND,
+                "scoped routes are mounted after locale-prefix nesting, so no nest exists for them"
+            );
+        }
+    }
+
     /// Loads a layered `autumn.toml` for `profile` via `MockEnv` (no process
     /// env, no `set_current_dir`) and reports the status `/_stories` returns.
     #[cfg(feature = "maud")]
@@ -5935,6 +8642,7 @@ enabled = true
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -6141,6 +8849,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6208,6 +8917,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6381,6 +9091,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6459,6 +9170,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -6748,6 +9460,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -7890,6 +10603,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::default(),
             timeout: crate::route::RouteTimeout::default(),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
         // Manifest does NOT contain /dynamic, so the request falls through to
@@ -8243,6 +10957,65 @@ mod trusted_host_tests {
         );
     }
 
+    /// `/ready` must keep answering 200 while maintenance mode is ON (issue
+    /// #1621, T1.25) — this pins an EXISTING, deliberate contract that a fleet
+    /// deploy depends on, so nobody "fixes" it later.
+    ///
+    /// [`build_maintenance_layer`] wires `with_probe_paths(probe_bypass_paths(cfg))`,
+    /// which includes `health.ready_path`. The consequence operators must be told
+    /// about: **maintenance mode does not drain a host from a load balancer.** The
+    /// host stays in rotation (its `/ready` is green) and serves 503s with
+    /// `Retry-After` to real users — by design, because the alternative would make
+    /// every LB-fronted deployment eject every host the moment maintenance is
+    /// enabled. `autumn deploy status` therefore reports readiness and maintenance
+    /// as SEPARATE columns, and `autumn deploy maintenance on` says so out loud.
+    #[tokio::test]
+    async fn ready_probe_stays_green_while_maintenance_mode_is_active() {
+        let cfg = AutumnConfig::default();
+        let state = crate::state::AppState::for_test();
+        // Startup must be complete or `/ready` is 503 for an unrelated reason and
+        // the assertion below would pass vacuously.
+        state.probes().mark_startup_complete();
+        let maintenance = crate::maintenance::MaintenanceState::new();
+        maintenance.enable(crate::maintenance::MaintenanceConfig::default());
+        state.insert_extension(maintenance);
+        let router = build_router(vec![], &cfg, state);
+
+        let ready = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&cfg.health.ready_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready must BYPASS maintenance mode: it is the load balancer's health \
+             signal, and gating it would eject every host from rotation the moment \
+             maintenance is enabled (#1621)"
+        );
+
+        // …while ordinary traffic IS gated, proving the layer is actually active.
+        let app_route = router
+            .oneshot(
+                Request::builder()
+                    .uri("/some-app-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            app_route.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance mode must still gate non-probe traffic"
+        );
+    }
+
     #[tokio::test]
     async fn trusted_host_release_rejects_loopback_unless_listed() {
         let mut cfg = AutumnConfig {
@@ -8562,7 +11335,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8606,7 +11379,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state.clone());
 
         router
@@ -8644,7 +11417,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         // A live inbound request (no marker) is bounded by the deadline -> 503.
@@ -8704,7 +11477,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             true,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8767,7 +11540,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             true,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8812,7 +11585,7 @@ mod trusted_host_tests {
             no_route_timeouts(),
             false,
         )
-        .layer(RequestIdLayer)
+        .layer(RequestIdLayer::default())
         .with_state(state);
 
         let response = router
@@ -8902,7 +11675,8 @@ mod trusted_host_tests {
             }),
         );
 
-        // No RequestIdLayer — exercises the else branch in request_timeout_handler.
+        // No RequestIdLayer — exercises the `request_id: None` branch in
+        // `RequestTimeoutService`.
         let router = apply_request_timeout_middleware(
             router,
             &config,
@@ -9044,7 +11818,7 @@ mod trusted_host_tests {
         // End-to-end keying (top-level + nested groups) is covered by the
         // `request_timeout` integration tests via the macro attribute; here we
         // assert the no-route base case yields a zero-overhead empty table.
-        let table = build_route_timeout_table(&[], &[]);
+        let table = build_route_timeout_table(&[], &[], &AutumnConfig::default());
         assert!(table.is_empty(), "no routes ⇒ empty override table");
     }
 
@@ -9069,6 +11843,7 @@ mod trusted_host_tests {
             timeout,
             api_version: None,
             sunset_opt_out: false,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
         }
     }
 
@@ -9089,7 +11864,7 @@ mod trusted_host_tests {
             timeout_route(http::Method::POST, "/submit", override_10s),
         ];
 
-        let table = build_route_timeout_table(&routes, &[]);
+        let table = build_route_timeout_table(&routes, &[], &AutumnConfig::default());
 
         // GET override is reachable via both GET and HEAD.
         let export = table.get("/export").expect("/export keyed");
@@ -9135,7 +11910,8 @@ mod trusted_host_tests {
             apply_layer: Box::new(|r| r),
         };
 
-        let table = build_route_timeout_table(&[], &[make_group("/api/")]);
+        let table =
+            build_route_timeout_table(&[], &[make_group("/api/")], &AutumnConfig::default());
         assert_eq!(
             table.get("/api/").and_then(|m| m.get(&http::Method::GET)),
             Some(&override_5s),
@@ -9147,11 +11923,79 @@ mod trusted_host_tests {
         );
 
         // The no-trailing-slash form still keys at "/api".
-        let table = build_route_timeout_table(&[], &[make_group("/api")]);
+        let table = build_route_timeout_table(&[], &[make_group("/api")], &AutumnConfig::default());
         assert_eq!(
             table.get("/api").and_then(|m| m.get(&http::Method::GET)),
             Some(&override_5s),
         );
+    }
+
+    /// Codex review (P1): `Router::nest("/{locale}", ...)` mounts each locale
+    /// under a literal segment, so a locale-prefixed request's `MatchedPath`
+    /// is `/{locale}{path}` verbatim — the timeout table must carry an entry
+    /// there too, or a `timeout = "off"` long-poll route gets silently
+    /// cancelled by the global deadline once locale-prefix routing is on.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_expands_entries_under_each_locale_prefix() {
+        let disabled = crate::route::RouteTimeout::Disabled;
+        let routes = vec![timeout_route(http::Method::GET, "/events", disabled)];
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        for path in ["/events", "/en/events", "/es/events"] {
+            assert_eq!(
+                table.get(path).and_then(|m| m.get(&http::Method::GET)),
+                Some(&disabled),
+                "expected a timeout override at {path}"
+            );
+        }
+    }
+
+    /// A route excluded from locale-prefix routing never gets nested under
+    /// `/{locale}`, so its timeout table entry must stay bare-path only.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_does_not_expand_excluded_routes() {
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let routes = vec![timeout_route(http::Method::GET, "/api/keys", override_5s)];
+        let mut config = AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+        config.i18n.locale_prefix_exclude = vec!["/api".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        assert_eq!(
+            table
+                .get("/api/keys")
+                .and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s)
+        );
+        assert!(
+            table.get("/en/api/keys").is_none(),
+            "an excluded route must not gain a locale-prefixed timeout entry"
+        );
+    }
+
+    /// Locale-prefix routing off (the default) must never expand the table,
+    /// regardless of what `supported_locales` happens to contain.
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn build_route_timeout_table_does_not_expand_when_locale_prefix_disabled() {
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let routes = vec![timeout_route(http::Method::GET, "/events", override_5s)];
+        let mut config = AutumnConfig::default();
+        assert!(!config.i18n.locale_prefix_enabled);
+        config.i18n.supported_locales = vec!["en".to_owned(), "es".to_owned()];
+
+        let table = build_route_timeout_table(&routes, &[], &config);
+
+        assert_eq!(table.len(), 1, "only the bare-path entry should exist");
+        assert!(table.get("/en/events").is_none());
     }
 
     // ----------------------------------------------------------------------
@@ -9177,7 +12021,7 @@ mod trusted_host_tests {
         crate::app::CustomLayerRegistration {
             type_id: std::any::TypeId::of::<()>(),
             type_name: "redirect_gate",
-            apply: Box::new(move |router| router.layer(gate)),
+            layer: tower::util::BoxCloneSyncServiceLayer::new(gate),
         }
     }
 
@@ -9306,6 +12150,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -9401,6 +12246,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -9439,6 +12285,179 @@ mod trusted_host_tests {
         assert!(super::custom_layers_require_fail_closed_idempotency(&gate));
         // An empty set requires no fail-closed behaviour.
         assert!(!super::custom_layers_require_fail_closed_idempotency(&[]));
+    }
+
+    // ----------------------------------------------------------------------
+    // #2214: the ingress stack's middleware futures must stay unboxed
+    // ----------------------------------------------------------------------
+
+    /// The structural half of issue #2214's fix, in one assertion per converted
+    /// middleware.
+    ///
+    /// Each of these layers used to be an `axum::middleware::from_fn`, whose
+    /// `FromFn::call` must `Box::pin` the async block it generates — the block's
+    /// type cannot be named, so there is nowhere else for it to live. That was
+    /// one heap allocation per request per call site, 19.57% of every byte the
+    /// `request_pipeline` benchmark allocated.
+    ///
+    /// A hand-rolled `tower::Service` fixes it only if its `Future` associated
+    /// type is genuinely named all the way down. Writing one that still returns
+    /// `Pin<Box<dyn Future>>` — the shape `SessionService`, `LogContextService`
+    /// and `TrustedProxiesService` use — would satisfy every behavioural test in
+    /// the suite while allocating exactly as much as before. This test is what
+    /// makes that impossible to do by accident: the sibling allocation gate in
+    /// `tests/config_alloc_gate.rs` pins the *total*, and this pins *where* the
+    /// total comes from.
+    ///
+    /// What this pins precisely: that the associated `Future` type is not
+    /// literally a `Pin<Box<dyn Future>>`. `std::any::type_name` prints a type's
+    /// path and generic arguments, never its fields, so it cannot see a box
+    /// hidden inside a variant of an otherwise-named future — which is exactly
+    /// what `WebhookReplayCleanupFuture`'s rare `Releasing` branch is, and why
+    /// that one is pinned by the sibling test below (on size) instead of here.
+    #[test]
+    fn converted_ingress_middleware_futures_are_never_boxed() {
+        /// The inner service every layer under test is stacked on: its own
+        /// future is a named `Ready`, so any `Box` in the resulting type name
+        /// was contributed by the layer.
+        type Inner = tower::util::ServiceFn<
+            fn(
+                axum::extract::Request,
+            )
+                -> std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>,
+        >;
+        type Fut<Svc> = <Svc as tower::Service<axum::extract::Request>>::Future;
+
+        fn assert_unboxed<Svc: tower::Service<axum::extract::Request>>(what: &str) {
+            let name = std::any::type_name::<Fut<Svc>>();
+            assert!(
+                !name.contains("Box"),
+                "{what} must return a named, unboxed future — an \
+                 `axum::middleware::from_fn`-shaped `Box::pin` here is one heap \
+                 allocation on every request (issue #2214). Got: {name}"
+            );
+        }
+
+        assert_unboxed::<super::TrustedHostService<Inner>>("TrustedHostService");
+        assert_unboxed::<super::StartupBarrierService<Inner>>("StartupBarrierService");
+        assert_unboxed::<super::RequestTimeoutService<Inner>>("RequestTimeoutService");
+        assert_unboxed::<crate::assets::AssetCacheControlService<Inner>>(
+            "AssetCacheControlService",
+        );
+        assert_unboxed::<crate::events::EventAppContextService<Inner>>("EventAppContextService");
+        assert_unboxed::<crate::read_your_writes::ReadYourWritesService<Inner>>(
+            "ReadYourWritesService",
+        );
+        assert_unboxed::<crate::middleware::method_override::MethodOverrideRejectionService<Inner>>(
+            "MethodOverrideRejectionService",
+        );
+        #[cfg(feature = "oauth2")]
+        assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
+    }
+
+    /// `WebhookReplayCleanupFuture` is the one converted middleware that still
+    /// boxes, and that is deliberate: releasing the replay keys a failed webhook
+    /// delivery registered is genuinely async work that has to run *after* the
+    /// inner future resolves, so it cannot be folded into the inner service's
+    /// own future.
+    ///
+    /// The box lives in the `Releasing` variant, which is only ever constructed
+    /// for a `5xx` response that actually registered keys — so the happy path
+    /// (and every request that is not a webhook delivery at all) never takes it.
+    /// The sibling test above cannot pin that, because `type_name` does not
+    /// print field types; this one does, by size. `Serving` stores the scoped
+    /// inner future, the replay cell and the drop guard **inline**, so the enum
+    /// must be at least as large as all three together. Move the box to
+    /// `Serving` and the enum collapses to roughly a pointer plus the response,
+    /// and this fails.
+    #[test]
+    fn webhook_replay_cleanup_boxes_only_its_rare_release_branch() {
+        use std::mem::size_of;
+
+        type Ready = std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>;
+        type Scoped = tokio::task::futures::TaskLocalFuture<crate::webhook::ReplayStoreCell, Ready>;
+
+        let serving_inline = size_of::<Scoped>()
+            + size_of::<crate::webhook::ReplayStoreCell>()
+            + size_of::<crate::webhook::ReplayKeyGuard>();
+        let whole = size_of::<crate::webhook::WebhookReplayCleanupFuture<Ready>>();
+        assert!(
+            whole >= serving_inline,
+            "WebhookReplayCleanupFuture must hold the scoped inner future, the \
+             replay cell and the drop guard inline in its `Serving` variant \
+             ({serving_inline} bytes together), but the whole future is only \
+             {whole} bytes — the inner future has been boxed, which costs an \
+             allocation on every request rather than only on a failed webhook \
+             delivery (issue #2214)"
+        );
+    }
+
+    /// The startup barrier's short-circuit branch: until the app reports startup
+    /// complete, a request to a non-exempt path is refused with `503`.
+    ///
+    /// Driven directly over a stub inner service because `apply_startup_barrier`
+    /// is production-only — `TestApp::build` deliberately mirrors just its two
+    /// response-side fallbacks (see `crate::test`), so no end-to-end test in the
+    /// suite can reach this branch.
+    #[tokio::test]
+    async fn startup_barrier_refuses_requests_until_startup_completes() {
+        use tower::{Layer, ServiceExt};
+
+        fn ok_service() -> impl tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone {
+            tower::service_fn(|_req: axum::extract::Request| async move {
+                Ok::<_, std::convert::Infallible>("handler ran".into_response())
+            })
+        }
+
+        // `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+        // `Sync`, so this helper's future is `!Send`. It only ever runs on a
+        // `#[tokio::test]` current-thread runtime, which never moves it.
+        #[allow(clippy::future_not_send)]
+        async fn status_for(startup_complete: bool, path: &str) -> (StatusCode, String) {
+            let state = AppState::for_test().with_startup_complete(startup_complete);
+            let config = AutumnConfig::default();
+            let layer = super::StartupBarrierLayer::new(super::StartupBarrierState::from_config(
+                &config, &state,
+            ));
+            let response = layer
+                .layer(ok_service())
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("infallible");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body collects");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let (status, body) = status_for(false, "/anything").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Service is still starting up");
+
+        // Control: the same request once startup has completed reaches the
+        // handler, so the 503 above is the barrier and not a broken stub.
+        let (status, body) = status_for(true, "/anything").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "handler ran");
+
+        // Probe/actuator paths are exempt even before startup completes, so a
+        // platform readiness check can still reach them.
+        let (status, _) = status_for(false, "/actuator/health").await;
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "probe paths must bypass the startup barrier"
+        );
     }
 }
 #[derive(Clone, Debug)]
@@ -9479,8 +12498,8 @@ impl TrustedHostPolicy {
     }
 
     /// Whether a request carrying no usable `Host` is allowed through. Mirrors
-    /// `trusted_host_middleware`'s missing-host branch for callers (e.g. the MCP
-    /// envelope) that enforce the policy outside that middleware.
+    /// `trusted_host_rejection`'s missing-host branch for callers (e.g. the MCP
+    /// envelope) that enforce the policy outside [`TrustedHostService`].
     ///
     /// Only the `mcp` feature consumes this today; gated so default-feature
     /// builds don't flag it as dead code.

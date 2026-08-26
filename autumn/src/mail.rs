@@ -17,6 +17,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -1031,6 +1033,16 @@ pub enum MailError {
     /// stable if those loaders are ever enabled.
     #[error("failed to inline CSS into HTML mail body: {0}")]
     CssInline(String),
+    /// `deliver_later`/`deliver_later_eager` was called in `prod` with a
+    /// non-disabled transport, no durable [`MailDeliveryQueue`] registered, and
+    /// no explicit [`MailConfig::allow_in_process_deliver_later_in_production`]
+    /// opt-in (issue #2142). Enforced lazily at the first deferred send rather
+    /// than at boot, so applications that never call `deliver_later` are
+    /// unaffected.
+    #[error(
+        "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback"
+    )]
+    NoDurableQueueInProduction,
 }
 
 /// Escape hatch for custom transports.
@@ -1266,7 +1278,7 @@ pub mod unsubscribe {
                 plaintext(subscriber, list_id, expiry_unix).as_bytes(),
             )
             .expect("AES-GCM encryption cannot fail for valid inputs");
-        let mut blob = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+        let mut blob = Vec::with_capacity(ciphertext.len().saturating_add(1 + NONCE_LEN));
         blob.push(TOKEN_VERSION);
         blob.extend_from_slice(&nonce_bytes);
         blob.extend_from_slice(&ciphertext);
@@ -1359,6 +1371,35 @@ pub trait SuppressionStore: Send + Sync {
         subscriber: &'a str,
         list_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>>;
+
+    /// Returns the subset of `subscribers` that have unsubscribed from
+    /// `list_id`.
+    ///
+    /// The list-mail send path calls this once per outgoing message instead
+    /// of [`is_suppressed`](Self::is_suppressed) once per recipient, so a
+    /// batch backend (like the `db`-feature `DbSuppressionStore`) can
+    /// resolve the whole recipient list in a single round trip. The default
+    /// implementation loops over `is_suppressed`, calling it in `subscribers`
+    /// order and stopping at the first error — the same sequential behavior
+    /// as before this method existed — so implementors that don't override
+    /// it keep working unchanged.
+    fn is_suppressed_many<'a>(
+        &'a self,
+        subscribers: &'a [&'a str],
+        list_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<std::collections::HashSet<String>, MailError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut suppressed = std::collections::HashSet::new();
+            for &subscriber in subscribers {
+                if self.is_suppressed(subscriber, list_id).await? {
+                    suppressed.insert(subscriber.to_owned());
+                }
+            }
+            Ok(suppressed)
+        })
+    }
 
     /// Record that `subscriber` unsubscribed from `list_id` (idempotent).
     fn suppress<'a>(
@@ -1545,6 +1586,12 @@ pub struct Mailer {
     /// Default for CSS inlining of HTML bodies when a message does not set its
     /// own [`Mail::inline_css`] override. Sourced from [`MailConfig::inline_css`].
     inline_css_default: bool,
+    /// Set by `install_mailer` when running in `prod` with a non-disabled
+    /// transport but no durable [`MailDeliveryQueue`] and no explicit
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] ack
+    /// (issue #2142). Rather than failing app startup for apps that never call
+    /// `deliver_later`, the check is deferred to the first actual call.
+    block_deliver_later_without_durable_queue: bool,
 }
 
 impl Mailer {
@@ -1596,6 +1643,7 @@ impl Mailer {
             unsubscribe: None,
             suppression: None,
             inline_css_default: false,
+            block_deliver_later_without_durable_queue: false,
         }
     }
 
@@ -1790,13 +1838,32 @@ impl Mailer {
         // bare address is used for the suppression / token key so a formatted
         // `Ada <ada@example.com>` recipient matches an opt-out recorded as
         // `ada@example.com`; the display string is preserved for actual delivery.
-        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
+        //
+        // Validate every recipient's address format first (in order, so a
+        // malformed address still fails fast the same way it always has),
+        // then resolve suppression for the whole batch in one call instead of
+        // one store round trip per recipient — `is_suppressed_many` is the
+        // only DB-backed lookup in this function's hot path, and it used to
+        // scale linearly with the recipient count.
+        let mut candidates: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
         for recipient in &mail.to {
             parse_mailbox(recipient)?;
-            let subscriber = canonical_subscriber(recipient);
-            if let Some(store) = runtime.suppression.as_ref()
-                && store.is_suppressed(&subscriber, &list_id).await?
-            {
+            candidates.push((recipient.clone(), canonical_subscriber(recipient)));
+        }
+
+        let suppressed = if let Some(store) = runtime.suppression.as_ref() {
+            let subscribers: Vec<&str> = candidates
+                .iter()
+                .map(|(_, subscriber)| subscriber.as_str())
+                .collect();
+            store.is_suppressed_many(&subscribers, &list_id).await?
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+        for (recipient, subscriber) in candidates {
+            if suppressed.contains(&subscriber) {
                 tracing::info!(
                     target: "mail",
                     list_id = %list_id,
@@ -1805,7 +1872,7 @@ impl Mailer {
                 );
                 continue;
             }
-            deliveries.push((recipient.clone(), subscriber));
+            deliveries.push((recipient, subscriber));
         }
 
         for (recipient, subscriber) in deliveries {
@@ -1877,8 +1944,11 @@ impl Mailer {
     ///
     /// # Errors
     ///
-    /// Returns an error when no active Tokio runtime is available to host the
-    /// background task.
+    /// Returns [`MailError::NoDurableQueueInProduction`] when this `Mailer` was
+    /// installed in `prod` with no durable [`MailDeliveryQueue`] and no
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] opt-in (issue
+    /// #2142). Otherwise returns an error when no active Tokio runtime is
+    /// available to host the background task.
     ///
     /// # Panics
     ///
@@ -1886,6 +1956,9 @@ impl Mailer {
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
             return Ok(());
+        }
+        if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
+            return Err(MailError::NoDurableQueueInProduction);
         }
         let mut mail = mail.with_defaults(&self.defaults);
         // Resolve the CSS-inlining default onto the message once, at the top of
@@ -1952,10 +2025,17 @@ impl Mailer {
     ///
     /// # Errors
     ///
-    /// Returns an error when no active Tokio runtime is available.
+    /// Returns [`MailError::NoDurableQueueInProduction`] when this `Mailer` was
+    /// installed in `prod` with no durable [`MailDeliveryQueue`] and no
+    /// [`MailConfig::allow_in_process_deliver_later_in_production`] opt-in (issue
+    /// #2142). Otherwise returns an error when no active Tokio runtime is
+    /// available.
     pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
             return Ok(());
+        }
+        if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
+            return Err(MailError::NoDurableQueueInProduction);
         }
         let mut mail = mail.with_defaults(&self.defaults);
         self.freeze_inline_css_default(&mut mail);
@@ -2138,6 +2218,7 @@ impl MailerBuilder {
             unsubscribe: None,
             suppression: None,
             inline_css_default: self.inline_css,
+            block_deliver_later_without_durable_queue: false,
         })
     }
 }
@@ -2383,8 +2464,9 @@ fn base64_wrap76(bytes: &[u8]) -> String {
     if encoded.len() <= 76 {
         return encoded;
     }
-    let newlines = (encoded.len() - 1) / 76;
-    let mut wrapped = String::with_capacity(encoded.len() + newlines);
+    // One newline between each pair of 76-column chunks.
+    let newlines = encoded.len().div_ceil(76).saturating_sub(1);
+    let mut wrapped = String::with_capacity(encoded.len().saturating_add(newlines));
     for chunk in encoded.as_bytes().chunks(76) {
         if !wrapped.is_empty() {
             wrapped.push('\n');
@@ -2905,7 +2987,26 @@ fn parse_multipart_mixed(
 /// `filename="a;b.txt"` is not mistaken for two parameters.
 fn split_mime_params(value: &str) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut start = 0;
+    let mut rest = value;
+    // Peel one parameter off the front at a time. Quote/escape state is always
+    // "outside a quoted string" at an unquoted `;`, so restarting the scan on
+    // the remainder is equivalent to carrying the state across the whole
+    // string — and it keeps every boundary a `split_at_checked` result rather
+    // than hand-computed index arithmetic.
+    while let Some(sep) = unquoted_semicolon(rest) {
+        let Some((param, after)) = rest.split_at_checked(sep) else {
+            break;
+        };
+        parts.push(param.trim());
+        rest = after.strip_prefix(';').unwrap_or(after);
+    }
+    parts.push(rest.trim());
+    parts
+}
+
+/// Byte offset of the first `;` in `value` that sits outside an RFC 2045
+/// quoted string, if there is one.
+fn unquoted_semicolon(value: &str) -> Option<usize> {
     let mut in_quotes = false;
     let mut escaped = false;
     for (i, ch) in value.char_indices() {
@@ -2916,15 +3017,11 @@ fn split_mime_params(value: &str) -> Vec<&str> {
         match ch {
             '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
-            ';' if !in_quotes => {
-                parts.push(value[start..i].trim());
-                start = i + ch.len_utf8();
-            }
+            ';' if !in_quotes => return Some(i),
             _ => {}
         }
     }
-    parts.push(value[start..].trim());
-    parts
+    None
 }
 
 /// Reverses RFC 2045 quoted-string escaping (`\\` → `\`, `\"` → `"`), the
@@ -3354,15 +3451,20 @@ impl MailTransport for InterceptedMailTransport {
 /// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
 /// [`AppState`] extensions when present, so plugins (Harvest, Redis-backed,
 /// etc.) can register durable delivery before this runs. In `prod` with a
-/// non-`Disabled` transport, startup fails when neither a durable queue nor
-/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set, unless
-/// `enforce_durable_guard` is `false` (used by short-lived contexts like
-/// static-site builds where `deliver_later` semantics don't apply).
+/// non-`Disabled` transport, when neither a durable queue nor
+/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set, startup
+/// still succeeds — apps that never call `deliver_later` should not be crashed
+/// for a code path they don't use (issue #2142). Instead, a startup warning is
+/// logged and the installed [`Mailer`] is marked so that
+/// [`Mailer::try_deliver_later`]/[`Mailer::try_deliver_later_eager`] fail with
+/// [`MailError::NoDurableQueueInProduction`] the first time deferred delivery
+/// is actually attempted. `enforce_durable_guard` set to `false` (used by
+/// short-lived contexts like static-site builds where `deliver_later`
+/// semantics don't apply) skips this check entirely.
 ///
 /// # Errors
 ///
-/// Returns an Autumn error when the configured transport cannot be created or
-/// when the production `deliver_later` guard is not satisfied.
+/// Returns an Autumn error when the configured transport cannot be created.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
@@ -3398,11 +3500,17 @@ pub(crate) fn install_mailer(
     if enforce_durable_guard && in_production && transport_sends_mail {
         let has_durable_queue = mailer.delivery_queue.is_some();
         if !has_durable_queue && !config.allow_in_process_deliver_later_in_production {
-            return Err(AutumnError::service_unavailable_msg(
-                "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback",
-            ));
-        }
-        if !has_durable_queue {
+            // Issue #2142: don't hard-fail app boot over an unused code path.
+            // Apps that only call `send()` are never affected; apps that do
+            // call `deliver_later` in this state find out at the call site
+            // (see `Mailer::try_deliver_later`), not by crashing at startup.
+            tracing::warn!(
+                "mail.deliver_later has no durable backend in prod: deliver_later/deliver_later_eager will fail if called; \
+                 register a MailDeliveryQueueHandle on AppState, or set mail.allow_in_process_deliver_later_in_production = true \
+                 to opt into the non-durable in-process Tokio fallback. Apps that only use mail.send() are unaffected."
+            );
+            mailer.block_deliver_later_without_durable_queue = true;
+        } else if !has_durable_queue {
             tracing::warn!(
                 "mail.deliver_later is using the in-process Tokio fallback in prod; this is acknowledged via mail.allow_in_process_deliver_later_in_production but is not durable across restarts or replicas"
             );
@@ -4179,7 +4287,6 @@ pub mod db_suppression {
     use std::pin::Pin;
 
     use diesel::prelude::*;
-    use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -4207,13 +4314,13 @@ pub mod db_suppression {
     /// `autumn generate mailer --list-unsubscribe` writes into the app.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
-        pool: Pool<AsyncPgConnection>,
+        pool: Pool<crate::db::RuntimeConnection>,
     }
 
     impl DbSuppressionStore {
         /// Create a store backed by `pool`.
         #[must_use]
-        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+        pub const fn new(pool: Pool<crate::db::RuntimeConnection>) -> Self {
             Self { pool }
         }
     }
@@ -4239,6 +4346,75 @@ pub mod db_suppression {
                         MailError::RuntimeUnavailable(format!("suppression query: {e}"))
                     })?;
                 Ok(count > 0)
+            })
+        }
+
+        fn is_suppressed_many<'a>(
+            &'a self,
+            subscribers: &'a [&'a str],
+            list_id: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<std::collections::HashSet<String>, MailError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            // Chunked, not one unbounded `= ANY(...)`, as a backstop against a
+            // truly pathological single send (hundreds of thousands of
+            // recipients) binding an unbounded array into one statement.
+            //
+            // On Postgres, `eq_any` binds the whole array as ONE parameter
+            // (`= ANY($n)`), so `CHUNK_SIZE` is deliberately large, not
+            // tight: measured against a production-shaped
+            // `mail_unsubscribes` fixture, `subscriber = ANY(...)` keeps
+            // using the `(subscriber, list_id)` index up to a few thousand
+            // array elements, then the planner switches to a `Parallel Seq
+            // Scan` of the whole table — a plan whose cost is ~flat per
+            // statement regardless of how many more elements are in the
+            // array (it's already paying for the full scan). A chunk size
+            // near that crossover would needlessly re-pay the full-scan cost
+            // once per chunk; staying well above it keeps ordinary sends —
+            // even a full-list newsletter blast — in one statement. See
+            // docs/reports/2026-08-15-ledger-mail-suppression-batch/README.md
+            // for the measurements behind the Postgres number.
+            //
+            // SQLite has no array bind type: Diesel lowers `eq_any` to
+            // `IN (?, ?, ...)`, one bind parameter per element, so a
+            // 50,000-element chunk plus the `list_id` parameter would blow
+            // past `SQLITE_MAX_VARIABLE_NUMBER` (32,766 by default) and fail
+            // the whole send with "too many SQL variables". Reuse
+            // `repository::MAX_BIND_PARAMS` — the same backend-aware limit
+            // generated bulk-write code already chunks against — minus one
+            // for the `list_id` parameter, so this never depends on a second
+            // hand-picked constant drifting out of sync with that one.
+            #[cfg(not(feature = "sqlite"))]
+            const CHUNK_SIZE: usize = 50_000;
+            #[cfg(feature = "sqlite")]
+            const CHUNK_SIZE: usize = crate::repository::MAX_BIND_PARAMS - 1;
+            Box::pin(async move {
+                let mut suppressed = std::collections::HashSet::with_capacity(subscribers.len());
+                if subscribers.is_empty() {
+                    return Ok(suppressed);
+                }
+                let mut conn =
+                    self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                for chunk in subscribers.chunks(CHUNK_SIZE) {
+                    let owned: Vec<&str> = chunk.to_vec();
+                    let hits: Vec<String> = mail_unsubscribes::table
+                        .filter(mail_unsubscribes::list_id.eq(list_id))
+                        .filter(mail_unsubscribes::subscriber.eq_any(owned))
+                        .select(mail_unsubscribes::subscriber)
+                        .load(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            MailError::RuntimeUnavailable(format!("suppression query: {e}"))
+                        })?;
+                    suppressed.extend(hits);
+                }
+                Ok(suppressed)
             })
         }
 
@@ -5898,6 +6074,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_list_mail_resolves_suppression_in_one_batched_call() {
+        use std::sync::atomic::AtomicUsize;
+
+        // A store that counts how many times each trait method is invoked, so
+        // this test proves `send_list_mail` calls `is_suppressed_many` once
+        // for the whole recipient batch instead of `is_suppressed` once per
+        // recipient (the N+1 this change eliminates).
+        struct CountingStore {
+            is_suppressed_calls: AtomicUsize,
+            is_suppressed_many_calls: AtomicUsize,
+            suppressed: std::collections::HashSet<String>,
+        }
+        impl SuppressionStore for CountingStore {
+            fn is_suppressed<'a>(
+                &'a self,
+                subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+                self.is_suppressed_calls.fetch_add(1, Ordering::SeqCst);
+                let hit = self.suppressed.contains(subscriber);
+                Box::pin(async move { Ok(hit) })
+            }
+            fn is_suppressed_many<'a>(
+                &'a self,
+                subscribers: &'a [&'a str],
+                _list_id: &'a str,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<std::collections::HashSet<String>, MailError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.is_suppressed_many_calls.fetch_add(1, Ordering::SeqCst);
+                let hits: std::collections::HashSet<String> = subscribers
+                    .iter()
+                    .filter(|s| self.suppressed.contains(**s))
+                    .map(|s| (*s).to_owned())
+                    .collect();
+                Box::pin(async move { Ok(hits) })
+            }
+            fn suppress<'a>(
+                &'a self,
+                _subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let mut suppressed = std::collections::HashSet::new();
+        suppressed.insert("banned@example.com".to_owned());
+        let store = Arc::new(CountingStore {
+            is_suppressed_calls: AtomicUsize::new(0),
+            is_suppressed_many_calls: AtomicUsize::new(0),
+            suppressed,
+        });
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport)
+            .with_unsubscribe(unsubscribe_runtime(Some(store.clone())));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("first@example.com")
+            .to("banned@example.com")
+            .to("third@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+
+        assert_eq!(
+            store.is_suppressed_many_calls.load(Ordering::SeqCst),
+            1,
+            "suppression for the whole recipient batch must resolve in exactly one call, \
+             regardless of recipient count"
+        );
+        assert_eq!(
+            store.is_suppressed_calls.load(Ordering::SeqCst),
+            0,
+            "the per-recipient is_suppressed path must not be used when a batch override exists"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "only the two non-suppressed recipients are delivered"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::significant_drop_tightening)]
     async fn send_without_scope_is_unchanged() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6334,17 +6602,36 @@ mod tests {
     }
 
     #[test]
-    fn install_mailer_rejects_in_process_fallback_in_prod_without_ack() {
+    fn install_mailer_boots_in_prod_without_ack_but_blocks_deliver_later() {
+        // Issue #2142: a missing durable queue + ack must not crash app
+        // startup — only the `deliver_later` call path should fail, and only
+        // if the app actually reaches it.
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
-        let error = install_mailer(&state, &config, true)
-            .expect_err("prod must reject in-process deliver_later fallback without ack");
+        install_mailer(&state, &config, true)
+            .expect("missing durable queue/ack must not fail app boot");
 
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+
+        let error = installed
+            .try_deliver_later(sample_mail())
+            .expect_err("deliver_later without a durable queue or ack must fail lazily in prod");
         let message = error.to_string();
         assert!(
             message.contains("allow_in_process_deliver_later_in_production"),
             "error should explain how to opt in: {message}"
+        );
+
+        let error = installed
+            .try_deliver_later_eager(sample_mail())
+            .expect_err("deliver_later_eager must fail the same way");
+        assert!(
+            error
+                .to_string()
+                .contains("allow_in_process_deliver_later_in_production")
         );
     }
 

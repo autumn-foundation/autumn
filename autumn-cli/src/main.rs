@@ -8,6 +8,7 @@ mod canary;
 mod check;
 mod cold_start_driver;
 mod config;
+mod console;
 mod credentials;
 mod data;
 mod db;
@@ -17,6 +18,7 @@ mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
@@ -35,10 +37,13 @@ mod pg;
 mod plugin_check;
 mod process;
 mod release;
+mod replay;
+mod retention;
 mod routes;
 mod routes_audit;
 mod scaling_driver;
 mod schema;
+mod search;
 mod seed;
 mod serve;
 mod setup;
@@ -48,6 +53,7 @@ mod task;
 mod test_cmd;
 mod text_width;
 mod token;
+mod upgrade;
 mod webhook;
 /// Subcommands for `autumn check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
@@ -168,6 +174,58 @@ pub enum LifecycleSubcommands {
     },
 }
 
+/// Subcommands for `autumn search`.
+#[derive(Subcommand)]
+pub enum SearchSubcommands {
+    /// Rebuild search indexes from the system of record.
+    ///
+    /// Runs the application binary with `AUTUMN_SEARCH_BACKFILL` set, which
+    /// makes `autumn-search`'s startup hook run a full backfill and exit
+    /// instead of serving traffic. Only the app knows which models are
+    /// searchable and which backend/embedder are installed, so the reindex has
+    /// to run inside it — the same technique `autumn jobs manifest` uses.
+    ///
+    /// # Examples
+    ///
+    ///   autumn search reindex
+    ///   autumn search reindex --index articles
+    ///   autumn search reindex --purge
+    ///   autumn search reindex --profile prod
+    #[command(verbatim_doc_comment)]
+    Reindex {
+        /// Index to rebuild. Omit to rebuild every registered index.
+        #[arg(long)]
+        index: Option<String>,
+
+        /// Profile whose `[search]` configuration to rebuild against
+        /// (`dev`, `prod`, or a custom name).
+        ///
+        /// The reindex runs the application binary, and that binary resolves
+        /// its own `[search]` section — including `[profile.<name>.search]`.
+        /// The CLI builds a DEBUG binary, which core reads as `dev` when no
+        /// selector is set, so rebuilding a production index requires saying
+        /// so. Forwarded as `AUTUMN_ENV`.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Clear each index before rebuilding it.
+        ///
+        /// Use after a schema change, when documents the source no longer
+        /// produces would otherwise survive. Searches return nothing until the
+        /// rebuild finishes.
+        #[arg(long)]
+        purge: bool,
+
+        /// Package to run (for workspaces).
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long)]
+        bin: Option<String>,
+    },
+}
+
 /// Subcommands for `autumn jobs`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum JobsSubcommands {
@@ -198,6 +256,38 @@ pub enum JobsSubcommands {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Arguments for [`Commands::Upgrade`].
+///
+/// A separate `Args` struct rather than inline variant fields, deliberately.
+/// clap's derive builds every inline field of every variant inside one
+/// `Commands::augment_subcommands` frame, and with this many subcommands that
+/// frame is within a kilobyte of libtest's 2 MiB thread stack — close enough
+/// that a codegen difference between two rustc builds decides whether the
+/// argument-parsing tests overflow. An `Args` struct moves this command's share
+/// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[derive(clap::Args, Debug)]
+struct UpgradeArgs {
+    /// Project directory to migrate (defaults to the current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    path: String,
+    /// Release this app is upgrading from. Defaults to the `autumn-web`
+    /// requirement recorded in the project's `Cargo.toml`.
+    #[arg(long, value_name = "VERSION")]
+    from: Option<String>,
+    /// Release to upgrade to. Defaults to this CLI's own version.
+    #[arg(long, value_name = "VERSION")]
+    to: Option<String>,
+    /// Write the rewrites. Without it the command only previews them.
+    #[arg(long)]
+    apply: bool,
+    /// Emit the machine-readable report instead of the human one.
+    #[arg(long)]
+    json: bool,
+    /// List the shipped app-code migrations and exit without scanning.
+    #[arg(long = "list-migrations")]
+    list_migrations: bool,
 }
 
 /// Available subcommands.
@@ -268,6 +358,13 @@ enum Commands {
         /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
         #[arg(long, value_name = "FEATURES")]
         features: Option<String>,
+        /// Also compile the `#[edge]` routes into a `wasm32-wasip1` edge
+        /// capsule. Release builds do this automatically when the project has
+        /// `#[edge]` routes; pass `--edge` to build it from a `--debug` build
+        /// too (the capsule itself is always compiled in release profile).
+        /// Errors when the project has no `#[edge]` routes.
+        #[arg(long)]
+        edge: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -317,6 +414,28 @@ enum Commands {
         #[command(subcommand)]
         action: AssetsCommands,
     },
+    /// Apply a release's mechanical app-code migrations to your own source.
+    ///
+    /// For each release between the `autumn-web` version this app records and
+    /// the target, `autumn upgrade` applies that release's machine-applyable
+    /// migrations -- today, API renames -- to the app's own Rust code.
+    ///
+    /// It writes nothing by default: a bare `autumn upgrade` prints a per-file
+    /// diff plus a count of affected sites, and `--apply` is the explicit write
+    /// step. Anything it cannot safely rewrite (a call site inside a macro
+    /// invocation, or a change with no mechanical form) is listed with its
+    /// location and a link to the guide section, never guessed at.
+    ///
+    /// Run it BEFORE bumping the `autumn-web` dependency: the release it
+    /// migrates *from* is the one the project manifest records. If the bump
+    /// already happened, pass `--from <previous-version>`.
+    ///
+    ///   autumn upgrade                     # preview
+    ///   autumn upgrade --apply             # write the rewrites
+    ///   autumn upgrade --list-migrations   # what ships today
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Upgrade(UpgradeArgs),
     /// Run or inspect database migrations
     Migrate {
         #[command(subcommand)]
@@ -454,6 +573,43 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment, name = "data")]
     Data(DataCommands),
 
+    /// Run a pre-wired data playground against the project's database.
+    ///
+    /// Autumn's answer to `rails console` / `manage.py shell`. Rust has no
+    /// stable `eval`, so instead of a line-by-line REPL this scaffolds an
+    /// editable binary — `src/bin/playground.rs` — already wired with the same
+    /// config and database-URL resolution `autumn dev` and `autumn seed` use
+    /// (`AUTUMN_DATABASE__*` → `DATABASE_URL` → `autumn.toml`), a constructed
+    /// async pool, and a checked-out connection. Put a query in the marked
+    /// region, re-run `autumn console`, and it compiles and executes against
+    /// the live database.
+    ///
+    /// An existing playground is never overwritten; pass `--force` to
+    /// regenerate it from the template.
+    ///
+    /// # Examples
+    ///
+    ///   autumn console
+    ///   autumn console --profile demo
+    ///   autumn console --force
+    #[command(visible_alias = "c", verbatim_doc_comment)]
+    Console {
+        /// Profile forwarded to the playground via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Overwrite an existing playground with a fresh copy of the template.
+        #[arg(long)]
+        force: bool,
+        /// Scaffold and wire the playground, then stop without building or
+        /// running it.
+        #[arg(long)]
+        scaffold_only: bool,
+    },
+
     /// Run the project's seed binary to populate the database with representative data.
     ///
     /// Requires `src/bin/seed.rs` (a Cargo binary named `seed`) to exist.
@@ -461,6 +617,9 @@ enum Commands {
     ///
     /// `autumn seed` checks for pending migrations before running and exits 1
     /// if any are found — run `autumn migrate` first.
+    ///
+    /// A `--count`/`--model` fake-seed request against a `prod`/`production`
+    /// profile is blocked unless `--yes-i-mean-prod` is also given.
     Seed {
         /// Profile forwarded to the seed binary via `AUTUMN_ENV`
         /// (default: `dev`).
@@ -479,6 +638,68 @@ enum Commands {
         /// Model to fake rows for (e.g. `Post`). Requires --count.
         #[arg(long, requires = "count")]
         model: Option<String>,
+        /// Confirm generating faked rows (`--count`/`--model`) against a
+        /// `prod`/`production` profile. Required to bypass the production
+        /// guard; has no effect otherwise.
+        #[arg(long)]
+        yes_i_mean_prod: bool,
+    },
+    /// Replay a recorded failure capsule against the application.
+    ///
+    /// A capsule is written by `[failure_capture] enabled = true` whenever a
+    /// request fails (a 5xx or a caught panic). Replaying one rebuilds the app
+    /// offline — the clock and the database are served from the capsule, no
+    /// socket is opened — drives the recorded request through it, and reports
+    /// whether the failure still happens.
+    ///
+    /// Exit codes: 0 the failure reproduced, 1 it did not (a mismatch, or the
+    /// code left the recorded database tape), 2 the capsule was refused and
+    /// nothing was replayed.
+    ///
+    /// # Examples
+    ///
+    ///   autumn replay tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn replay --package api tmp/autumn-capsules/01JB2K7Q.json
+    #[command(verbatim_doc_comment)]
+    Replay {
+        /// Path to the capsule JSON file to replay.
+        capsule: String,
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        ///
+        /// Defaults to the profile the capsule recorded, so profile-gated
+        /// routes and configuration match the failing run; falls back to
+        /// `dev` for capsules that recorded none.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Compile the replay binary with `cargo build --release`.
+        ///
+        /// Defaults to the build kind the capsule recorded, so
+        /// `cfg(debug_assertions)`-gated code and release-only behaviour
+        /// match the failing run; falls back to a debug build for capsules
+        /// that recorded none.
+        #[arg(long, conflicts_with = "debug")]
+        release: bool,
+        /// Compile the replay binary as a debug build, even when the capsule
+        /// was recorded by a release build.
+        #[arg(long)]
+        debug: bool,
+        /// Cargo features to compile the replay binary with (forwarded to
+        /// `cargo build --features`).
+        ///
+        /// The capsule does not record the recording binary's feature set;
+        /// pass the features the failing binary was built with when they
+        /// gate code the failure depends on.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
+        /// Compile without default features (forwarded to `cargo build`).
+        #[arg(long)]
+        no_default_features: bool,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -504,6 +725,38 @@ enum Commands {
         )]
         args: Vec<String>,
     },
+    /// Report what declared `#[repository(..., retention(...))]` policies
+    /// would sweep, without deleting anything.
+    ///
+    /// Validates a policy before it runs for real: every recurring sweep a
+    /// declared policy registers is otherwise fully automatic (issue #1342).
+    ///
+    /// # Examples
+    ///
+    ///   autumn retention --dry-run
+    ///   autumn retention --dry-run --model Session
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Report what would be swept without deleting anything. Currently
+        /// required — there is no separate command to trigger a real sweep.
+        #[arg(long)]
+        dry_run: bool,
+        /// Narrow the report to a single model's policy. Accepts either the
+        /// model name or the table name; if two different modules declare
+        /// same-named models with their own policy, the model name is
+        /// ambiguous and the table name is required instead.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
     /// Four subcommands collapse the repetitive five-file dance of adding
@@ -525,9 +778,22 @@ enum Commands {
     ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
     ///
+    /// # Field modifiers
+    ///
+    ///   String{encrypted}                    at-rest encrypted column
+    ///   String{encrypted:deterministic}      ...and equality-queryable
+    ///
+    /// `{encrypted}` emits `#[encrypted]` on the generated model field, so the
+    /// column is stored as an opaque base64 ciphertext envelope (unbounded
+    /// TEXT) and is redacted in the generated admin. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index. Requires key material
+    /// under `[active_record_encryption]` — run `autumn credentials edit`.
+    ///
     /// # Example
     ///
     ///   autumn generate scaffold Post title:String body:Text published:bool
+    ///   autumn generate scaffold Account 'token:String{encrypted}'
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
@@ -570,22 +836,47 @@ enum Commands {
     ///   autumn release init --force
     ///   autumn release init --target fly
     ///   autumn release init --target docker-compose
+    ///   autumn release init --target azure-container-apps
+    ///   autumn release init --target gcp-cloud-run
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
-    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    /// Push-button, zero-downtime deploys to a VPS or a fleet (issues #1607, #1621).
     ///
-    /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
-    /// SSH (cutover/rollback land in follow-ups). Configure the target under
-    /// `[deploy]` in autumn.toml.
+    /// Run from the project root. `check` runs a preflight against every configured
+    /// host, `plan` prints the dry-run plan, `up` performs a real rolling deploy over
+    /// SSH, and `rollback` returns the fleet to its previous release. Configure the
+    /// target under `[deploy] host` (one server) or `[deploy] hosts` (a fleet, in
+    /// rollout order) in autumn.toml.
+    ///
+    /// Fleet flags:
+    ///   --only <HOST>   repeatable; restrict `up`/`rollback` to these hosts. A
+    ///                   REPAIR LEVER: it leaves the skipped hosts on their current
+    ///                   release, so the fleet may end up mixed.
+    ///   --no-rollback   on `up`, halt and FREEZE a failed rollout for inspection
+    ///                   instead of automatically rolling the cut-over hosts back.
+    ///
+    /// Fleet visibility and control (issue #1621):
+    ///   status          read-only per-host state (release, readiness, maintenance,
+    ///                   proxy) plus version/state drift; `--json` for machines,
+    ///                   `--strict` exits non-zero on drift (cron-alertable).
+    ///   maintenance     turn maintenance mode on|off on EVERY configured host over
+    ///                   SSH (the local `autumn maintenance` only writes this
+    ///                   machine's working directory). NOTE: maintenance does not
+    ///                   drain a host from your load balancer — /ready stays 200.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy rollback --only web-2.example.com
     ///   autumn deploy up
+    ///   autumn deploy up --only web-2.example.com
+    ///   autumn deploy up --no-rollback
+    ///   autumn deploy status --json --strict
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance off
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -756,6 +1047,12 @@ enum Commands {
         action: JobsSubcommands,
     },
 
+    /// Operate the application's search indexes (`autumn-search`).
+    Search {
+        #[command(subcommand)]
+        action: SearchSubcommands,
+    },
+
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
@@ -832,6 +1129,11 @@ enum Commands {
     /// Writes (or removes) a JSON flag file that the running app polls every
     /// 500 ms. Within one second every replica responds 503 to non-bypassed
     /// HTTP traffic while health-check routes stay green.
+    ///
+    /// LOCAL only: the flag lands in THIS working directory. For servers
+    /// managed by `autumn deploy` (`[deploy] host`/`hosts`), use
+    /// `autumn deploy maintenance on|off`, which fans the same flag out to
+    /// every host over SSH (issue #1621).
     ///
     /// # Examples
     ///
@@ -1627,6 +1929,15 @@ enum WebhookCommands {
         /// The payload to send in the request body.
         #[arg(long)]
         payload: String,
+        /// Event type to announce, for the providers that carry it in a header
+        /// (github: `X-GitHub-Event`, generic: `X-Webhook-Event`).
+        ///
+        /// Defaults to `sim.event`, which no real handler dispatches on — pass
+        /// the event your handler expects (e.g. `--event push`) to exercise it.
+        /// Stripe and Slack read their event type from the payload's `type`
+        /// field instead, so this is ignored for those two.
+        #[arg(long, value_name = "TYPE")]
+        event: Option<String>,
     },
 }
 
@@ -1859,13 +2170,29 @@ enum ReleaseCommands {
     /// Emit production-ready deployment files at the project root.
     ///
     /// Default (no --target): Dockerfile + .dockerignore + autumn.production.toml.example.
-    /// --target fly        : also emits fly.toml.
-    /// --target docker-compose : also emits docker-compose.yml with app + Postgres.
+    /// --target fly                    : also emits fly.toml.
+    /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
+    /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/azure-deploy.yml.
+    /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
+    ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
+    ///                                   no CI workflow — fast/minimal path).
+    /// --target aws-ecs                : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/aws-deploy.yml (VPC/ALB/ECS
+    ///                                   Fargate/RDS — production path).
+    /// --target gcp-cloud-run          : also emits main.tf, variables.tf, outputs.tf,
+    ///                                   terraform.tfvars.example, and
+    ///                                   .github/workflows/gcp-deploy.yml (Artifact
+    ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
+    ///                                   connector, opt-in Memorystore Redis).
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
-        /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
+        /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
+        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -1898,7 +2225,18 @@ enum DeployCommands {
     /// Resolves the previous release on the target, brings its slot back up,
     /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
     /// Fails loudly (non-zero) when there is no previous release to roll back to.
-    Rollback,
+    ///
+    /// With `[deploy] hosts` this rolls back EVERY host, newest first, continuing
+    /// past a host that fails (each is reported) and exiting non-zero if any host
+    /// did not come back.
+    Rollback {
+        /// Roll back only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. The hosts left out keep
+        /// running whatever they are running now, so the fleet may end up mixed.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+    },
 
     /// Run the preflight, then perform a REAL deploy over SSH.
     ///
@@ -1908,7 +2246,100 @@ enum DeployCommands {
     /// installs the proxy and stands the release up behind it; a redeploy runs a
     /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
     /// failure.
-    Up,
+    ///
+    /// With `[deploy] hosts` the hosts are replaced ONE AT A TIME in declaration
+    /// order, migrations run exactly once, and a mid-rollout failure halts the
+    /// rollout and rolls the hosts that already cut over back.
+    Up {
+        /// Deploy only this host; repeat the flag for several (issue #1621).
+        ///
+        /// Each value must appear in `[deploy] hosts`. A REPAIR LEVER, not a faster
+        /// deploy: the skipped hosts keep their current release, so finish with a
+        /// full `autumn deploy up` to converge the fleet.
+        #[arg(long, value_name = "HOST")]
+        only: Vec<String>,
+
+        /// Halt and FREEZE a failed rollout instead of rolling the cut-over hosts
+        /// back (issue #1621).
+        ///
+        /// Every host is left exactly as it is — including the ones already on the
+        /// new release — and named in the final state table, so the failure can be
+        /// inspected before anything else moves.
+        #[arg(long)]
+        no_rollback: bool,
+    },
+
+    /// Report every configured host's deploy state, read-only (issue #1621).
+    ///
+    /// One row per `[deploy] hosts` entry: mode, deployed release (from the
+    /// `current` symlink), live slot, /ready status, maintenance flag, and proxy
+    /// port — plus version drift (hosts on different releases) and state drift
+    /// (per-host marker damage that will fail the NEXT deploy closed). Touches
+    /// nothing; safe mid-incident.
+    Status {
+        /// Emit the stable JSON report on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when ANY drift is detected, so drift is alertable from
+        /// cron. The default exits 0 — status is a report, not a judgement.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Fleet-wide maintenance mode over SSH (issue #1621).
+    ///
+    /// Applies to the DEPLOY-CONFIGURED host(s) — `[deploy] host` or `[deploy]
+    /// hosts` — unlike the top-level `autumn maintenance`, which only writes this
+    /// machine's own working directory. Best-effort: every host is attempted, the
+    /// per-host table names what changed, and the command exits non-zero if any
+    /// host failed (the changed hosts are NOT reversed).
+    ///
+    /// Maintenance mode does NOT drain a host from your load balancer: /ready
+    /// stays 200 by design, so a maintained host keeps taking traffic and answers
+    /// it with 503. Drain at the load balancer if you need a host out of rotation.
+    #[command(subcommand)]
+    Maintenance(DeployMaintenanceCommands),
+}
+
+/// Subcommands for `autumn deploy maintenance` (issue #1621).
+#[derive(Subcommand)]
+enum DeployMaintenanceCommands {
+    /// Enable maintenance mode on every configured deploy host.
+    ///
+    /// Writes the same flag file the local `autumn maintenance on` writes, to the
+    /// per-app shared dir on each host (and, for hosts still running pre-#1621
+    /// units, to the current release's tmp/ dir), so running apps react within
+    /// 500 ms without a restart.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy maintenance on
+    ///   autumn deploy maintenance on --message "Upgrading database schema"
+    ///   autumn deploy maintenance on --readonly
+    ///   autumn deploy maintenance on --allow-ips 10.0.0.0/8 --bypass-header X-Dev-Bypass:mytoken
+    #[command(verbatim_doc_comment)]
+    On {
+        /// Human-readable message shown to users in the 503 response body.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// CIDR block or IP address whose requests bypass maintenance.
+        /// Repeatable: `--allow-ips 10.0.0.0/8 --allow-ips 172.16.0.1`
+        #[arg(long, value_name = "CIDR")]
+        allow_ips: Vec<String>,
+        /// Allow GET, HEAD, OPTIONS through while blocking writes.
+        #[arg(long)]
+        readonly: bool,
+        /// Bypass header in NAME:VALUE format.
+        /// Requests carrying this header+value bypass the 503.
+        /// Example: `--bypass-header X-Autumn-Maintenance-Bypass:mytoken`
+        #[arg(long, value_name = "NAME:VALUE")]
+        bypass_header: Option<String>,
+    },
+    /// Disable maintenance mode on every configured deploy host.
+    ///
+    /// Removes the flag file(s); a host where maintenance was already off is a
+    /// success, not an error.
+    Off,
 }
 
 /// Subcommands for `autumn generate`.
@@ -1942,12 +2373,23 @@ enum GenerateCommands {
     /// Each `from -> to` edge may carry an optional `: guard` plain method
     /// name. Quote the token in bash/zsh so the shell doesn't split it.
     ///
+    /// `field:String{encrypted}` stores the column encrypted at rest: it emits
+    /// `#[encrypted]` on the model field, so the value is a base64 AES-256-GCM
+    /// envelope on disk and a plain `String` in Rust. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index — randomized ciphertext
+    /// can never match an equality predicate, so those combinations are
+    /// refused at generate time. `String`/`Text` and non-null only. Requires
+    /// key material under `[active_record_encryption]`: run
+    /// `autumn credentials edit`. Quote the token in bash/zsh (brace expansion).
+    ///
     /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
     ///   autumn generate model Comment body:Text post:references
     ///   autumn generate model Post 'status:enum{draft,published,archived}'
     ///   autumn generate model User email:String:unique
+    ///   autumn generate model Account 'token:String{encrypted}'
     ///   autumn generate model Page 'status:String:states(draft -> published, published -> archived)'
     #[command(verbatim_doc_comment)]
     Model {
@@ -2116,6 +2558,40 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate team membership: organizations, roles (Owner/Admin/Member),
+    /// and email invitations (issue #1261).
+    ///
+    /// Composes already-stable primitives — `#[repository(tenant_scoped)]`
+    /// (issue #695), the session `"role"` key (issue #496), and the Mail
+    /// stack (`#[mailer]`) — rather than introducing a new authorization
+    /// mechanism. Takes no name: it always emits the same fixed
+    /// `Organization`/`Membership`/`Invitation` set.
+    ///
+    /// Creates:
+    ///   - `src/teams/`              — models, schema, repositories, role
+    ///     guard, invitation mailer, and route handlers
+    ///   - `migrations/<timestamp>_create_teams/` — organizations,
+    ///     memberships, invitations tables
+    ///   - `src/main.rs`             — `mod teams;` + routes wired into the
+    ///     app builder
+    ///   - `Cargo.toml`              — `"mail"` feature added to `autumn-web`
+    ///
+    /// Does NOT generate `routes/auth.rs` — your app's own login/signup
+    /// already exists. See `docs/generate-teams.md` for the two-line
+    /// integration seam, or `examples/teams` for a fully-wired reference app.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate teams
+    #[command(verbatim_doc_comment)]
+    Teams {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a real-time channel: a pub/sub handler over the built-in
     /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
     /// socket handler, `main.rs` route wiring, and an in-process smoke test.
@@ -2147,6 +2623,38 @@ enum GenerateCommands {
         /// Emit a raw `#[ws]` WebSocket handler instead of the SSE view.
         #[arg(long)]
         ws: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Scaffold the in-app notification feed: a `notifications` table
+    /// migration, notify/feed/unread-count/mark-read routes over the built-in
+    /// `Notifications` extractor, `main.rs` route wiring, and an in-process
+    /// smoke test.
+    ///
+    /// Notifications are a fixed, single-instance resource (the framework's
+    /// `Notifications` extractor reads one conventional `notifications`
+    /// table), so this command takes no name argument.
+    ///
+    /// Creates:
+    ///
+    /// - `migrations/<ts>_create_notifications/` — backend-aware table DDL
+    /// - `src/notifications.rs`  — notify / feed / unread-count / mark-read /
+    ///   mark-all-read route handlers
+    /// - `src/main.rs`           — `mod notifications;` + route registration
+    /// - `tests/notifications_feed.rs` — smoke test over the in-process
+    ///   `TestApp` (no database needed: memory-store fallback)
+    /// - `Cargo.toml`            — `serde`/`serde_json` deps and the tokio
+    ///   dev-dependency test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate notifications
+    #[command(verbatim_doc_comment)]
+    Notifications {
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2271,6 +2779,45 @@ enum GenerateCommands {
     InboundMail {
         /// Handler name (`PascalCase` or `snake_case`, e.g. `Support`).
         name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate a signed, replay-protected inbound webhook endpoint for a
+    /// third-party provider (Stripe, GitHub, Slack, or a generic HMAC source).
+    ///
+    /// The handler takes the shipped `SignedWebhook` extractor — signature
+    /// verification, raw-body capture, timestamp tolerance, replay rejection,
+    /// and secret rotation are the framework's, never hand-rolled.
+    ///
+    /// Creates:
+    ///   - `src/webhooks/<snake>.rs` — `#[post]` handler, event dispatch, and tests
+    ///   - `src/webhooks/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod webhooks;` + the route in `routes![...]`
+    ///   - `autumn.toml`             — endpoint stub, replay backend, exemptions
+    ///   - `Cargo.toml`              — `serde_json` + tokio test features
+    ///
+    /// Example:
+    ///
+    ///   autumn generate webhook stripe Payments
+    ///   autumn generate webhook github Repo --path /hooks/github
+    ///   autumn generate webhook stripe Payments --dry-run
+    #[command(verbatim_doc_comment)]
+    Webhook {
+        /// Provider preset: `stripe`, `github`, `slack`, or `generic`.
+        provider: String,
+        /// Endpoint name (`PascalCase` or `snake_case`, e.g. `Payments`).
+        name: String,
+        /// Route path for the endpoint (default: `/webhooks/<provider>`).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Environment variable holding the signing secret
+        /// (default: `<PROVIDER>_WEBHOOK_SECRET`).
+        #[arg(long, value_name = "VAR")]
+        secret_env: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2496,6 +3043,23 @@ enum GenerateCommands {
     /// UNIQUE INDEX` and the `find_by_<field>` lookup, but its JSON CRUD
     /// routes are auto-generated by `#[repository]`, and a duplicate
     /// create/update there still 500s (out of scope for this slice).
+    ///
+    /// `field:String{encrypted}` scaffolds an at-rest encrypted column: the
+    /// model field gets `#[encrypted]`, so the value is a base64 AES-256-GCM
+    /// envelope on disk and a plain `String` in Rust; the migration column is
+    /// unbounded `TEXT`, sized for the envelope. Use
+    /// `{encrypted:deterministic}` when the column still needs
+    /// `find_by`/`exists_by` lookups or a UNIQUE index — randomized ciphertext
+    /// can never match an equality predicate, so pairing it with
+    /// `:unique`/`--unique`/`--query`/`--index` is refused at generate time.
+    /// The generated admin redacts the column, the index list renders
+    /// `••••••••` (unsorted) and the CSV export omits it; the show view and
+    /// edit form still render the value. `String`/`Text` and non-null only.
+    /// Requires key material under `[active_record_encryption]`: run
+    /// `autumn credentials edit`. Quote the token in bash/zsh (brace
+    /// expansion), e.g.
+    /// `autumn generate scaffold Account 'api_token:String{encrypted}'` or
+    /// `autumn generate scaffold Account 'email:String{encrypted:deterministic}:unique'`.
     Scaffold {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
@@ -2555,12 +3119,47 @@ enum GenerateCommands {
         /// `--api` scaffolds, which never generate a policy.
         #[arg(long)]
         no_policy: bool,
+        /// Bind this resource to a parent as its child (issue #1323), e.g.
+        /// `--belongs-to Post` alongside a `post:references` column. Adds a
+        /// nested read route (`GET /posts/{post_id}/comments`), a nested create
+        /// route that takes the foreign key from the path instead of the
+        /// submitted body, a children list + inline "add" form on the parent's
+        /// generated show view, and back-links in both directions. The parent
+        /// must already be scaffolded, and must be an `id`-keyed resource whose
+        /// `show` view is the one the flat scaffold generated (not `slug`-keyed,
+        /// not carrying a `:states(...)` column, not hand-rewritten). Not
+        /// supported with `--api`, `--live`, `--live-validation`, `--sharded`,
+        /// an `Attachment` column, or a nullable/self-referential parent
+        /// reference.
+        #[arg(long, value_name = "PARENT")]
+        belongs_to: Option<String>,
+        /// Maintain a `{child}_count` column on the parent (issue #1325).
+        /// Requires `--belongs-to`. Adds `counter_cache` to the generated
+        /// child model's `#[belongs_to(...)]`, so the child repository keeps
+        /// `{parent}.{child}_count` current atomically and in the same
+        /// transaction as each insert/delete, and emits a migration adding
+        /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
+        #[arg(long)]
+        counter_cache: bool,
         /// Make these text fields full-text searchable (issue #1319): comma-
         /// separated or repeatable, e.g. `--searchable title,body`. Adds
         /// `#[searchable]` to the model, `searchable` to the repository, a
         /// `search_vector` migration, and a wired search box in the index view.
         #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
         searchable: Vec<String>,
+        /// Emit i18n-ready views (issue #1349): every page title, heading,
+        /// button, link, and field label in the generated HTML views becomes a
+        /// `t!(locale, "key")` lookup, each view handler takes the `Locale`
+        /// extractor, and the referenced keys are written to `i18n/en.ftl` with
+        /// their English values — so an `en` app renders identically and adding
+        /// a locale means translating a `.ftl`, not editing Rust. Also enables
+        /// autumn-web's `i18n` feature, adds `[i18n]` to `autumn.toml`, and
+        /// wires `.i18n_auto()` into `main.rs`. Composes with `--searchable`,
+        /// `--soft-delete`, and `--sharded`; `--api` scaffolds render no labels,
+        /// so the flag is a no-op there. Not supported with `--live`,
+        /// `--live-validation`, or `--belongs-to`.
+        #[arg(long)]
+        i18n: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2610,9 +3209,11 @@ fn run_command(command: Commands) {
             bin,
             embed,
             features,
+            edge,
         } => build::run(
             debug,
             embed,
+            edge,
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
@@ -2900,14 +3501,50 @@ fn run_command(command: Commands) {
             url,
             secret,
             payload,
-        }) => webhook::run_sim(&provider, &url, &secret, &payload),
+            event,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Console {
+            profile,
+            package,
+            force,
+            scaffold_only,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only),
         Commands::Seed {
             profile,
             package,
             count,
             model,
-        } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
+            yes_i_mean_prod,
+        } => seed::run(
+            &profile,
+            package.as_deref(),
+            count,
+            model.as_deref(),
+            yes_i_mean_prod,
+        ),
+        Commands::Replay {
+            capsule,
+            package,
+            bin,
+            profile,
+            release,
+            debug,
+            features,
+            no_default_features,
+        } => run_replay_command(
+            &capsule,
+            package.as_deref(),
+            bin.as_deref(),
+            profile.as_deref(),
+            match (release, debug) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            features.as_deref(),
+            no_default_features,
+        ),
         Commands::Task {
             package,
             bin,
@@ -2923,6 +3560,19 @@ fn run_command(command: Commands) {
             name.as_deref(),
             &args,
         ),
+        Commands::Retention {
+            package,
+            bin,
+            profile,
+            dry_run,
+            model,
+        } => retention::run(&retention::RetentionOptions {
+            package: package.as_deref(),
+            bin: bin.as_deref(),
+            profile: &profile,
+            dry_run,
+            model: model.as_deref(),
+        }),
         Commands::Setup { force } => setup::run(force),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
@@ -3037,6 +3687,26 @@ fn run_command(command: Commands) {
                 std::process::exit(1);
             }
         }
+        Commands::Upgrade(UpgradeArgs {
+            path,
+            from,
+            to,
+            apply,
+            json,
+            list_migrations,
+        }) => {
+            let code = upgrade::run_in(
+                std::path::Path::new(&path),
+                &upgrade::UpgradeOptions {
+                    from,
+                    to,
+                    apply,
+                    json,
+                    list: list_migrations,
+                },
+            );
+            std::process::exit(code);
+        }
         Commands::Doctor {
             json,
             strict,
@@ -3131,6 +3801,23 @@ fn run_command(command: Commands) {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
                     output: &path,
+                });
+            }
+        },
+        Commands::Search { action } => match action {
+            SearchSubcommands::Reindex {
+                index,
+                profile,
+                purge,
+                package,
+                bin,
+            } => {
+                search::run(&search::ReindexOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    index: index.as_deref(),
+                    profile: profile.as_deref(),
+                    purge,
                 });
             }
         },
@@ -3303,6 +3990,26 @@ fn run_command(command: Commands) {
             }
         }
     }
+}
+
+fn run_replay_command(
+    capsule: &str,
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: Option<&str>,
+    build: Option<bool>,
+    features: Option<&str>,
+    no_default_features: bool,
+) {
+    replay::run(&replay::ReplayOptions {
+        capsule,
+        package,
+        bin,
+        profile,
+        build,
+        features,
+        no_default_features,
+    });
 }
 
 fn run_task_command(
@@ -3490,14 +4197,81 @@ fn run_release_command(cmd: ReleaseCommands) {
     }
 }
 
+/// Map a `deploy` subcommand onto the (action, options) pair `deploy::run` takes.
+///
+/// [`deploy::DeployAction`] stays a fieldless `Copy` enum and the flags travel
+/// beside it in [`deploy::DeployOptions`] (issue #1621, §3.1), so adding a flag
+/// never ripples through the action enum or its call sites. Every construction here
+/// spreads `..Default::default()` for the same reason.
 fn run_deploy_command(cmd: &DeployCommands) {
-    let action = match cmd {
-        DeployCommands::Check => deploy::DeployAction::Check,
-        DeployCommands::Plan => deploy::DeployAction::Plan,
-        DeployCommands::Rollback => deploy::DeployAction::Rollback,
-        DeployCommands::Up => deploy::DeployAction::Up,
+    let (action, options) = match cmd {
+        DeployCommands::Check => (
+            deploy::DeployAction::Check,
+            deploy::DeployOptions::default(),
+        ),
+        DeployCommands::Plan => (deploy::DeployAction::Plan, deploy::DeployOptions::default()),
+        DeployCommands::Rollback { only } => (
+            deploy::DeployAction::Rollback,
+            deploy::DeployOptions {
+                only: only.clone(),
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Up { only, no_rollback } => (
+            deploy::DeployAction::Up,
+            deploy::DeployOptions {
+                only: only.clone(),
+                no_rollback: *no_rollback,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Status { json, strict } => (
+            deploy::DeployAction::Status,
+            deploy::DeployOptions {
+                json: *json,
+                strict: *strict,
+                ..deploy::DeployOptions::default()
+            },
+        ),
+        DeployCommands::Maintenance(cmd) => match cmd {
+            DeployMaintenanceCommands::On {
+                message,
+                allow_ips,
+                readonly,
+                bypass_header,
+            } => {
+                // Same parse (and same failure behavior) as the local
+                // `autumn maintenance on`, so the two surfaces reject a malformed
+                // NAME:VALUE identically.
+                let parsed_bypass = bypass_header.as_deref().map(|s| {
+                    maintenance::parse_bypass_header(s).map_or_else(
+                        |e| {
+                            eprintln!("autumn deploy maintenance on: {e}");
+                            std::process::exit(1);
+                        },
+                        |(name, value)| (name.to_owned(), value.to_owned()),
+                    )
+                });
+                (
+                    deploy::DeployAction::MaintenanceOn,
+                    deploy::DeployOptions {
+                        maintenance: Some(deploy::MaintenanceOnArgs {
+                            message: message.clone(),
+                            allow_ips: allow_ips.clone(),
+                            readonly: *readonly,
+                            bypass_header: parsed_bypass,
+                        }),
+                        ..deploy::DeployOptions::default()
+                    },
+                )
+            }
+            DeployMaintenanceCommands::Off => (
+                deploy::DeployAction::MaintenanceOff,
+                deploy::DeployOptions::default(),
+            ),
+        },
     };
-    if let Err(e) = deploy::run(action) {
+    if let Err(e) = deploy::run(action, &options) {
         eprintln!("autumn deploy: {e}");
         std::process::exit(1);
     }
@@ -3594,13 +4368,27 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::model::plan_model_with_options(
-                &std::env::current_dir().unwrap_or_default(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy model` recomputes the plan it is about to revert, so it
+            // must not be blocked by generation-only semantic checks: a model
+            // created before those checks existed still has to be removable, and
+            // the refusal would land before `Plan::revert` ever sees `--force`.
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let plan = match mode {
+                ApplyMode::Generate => generate::model::plan_model_with_options(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::model::plan_model_with_options_for_revert(
+                    &project_root,
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {
@@ -3695,6 +4483,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Teams { dry_run, force } => {
+            let plan = generate::teams::plan_teams(
+                &resolve_cwd(),
+                &generate::timestamp_now(),
+                mode == ApplyMode::Destroy,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Channel {
             name,
             sse: _,
@@ -3710,6 +4506,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Notifications { dry_run, force } => {
+            let plan = generate::notifications::plan_notifications(&resolve_cwd());
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::InboundMail {
             name,
             dry_run,
@@ -3717,6 +4517,41 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        } => {
+            let options = generate::webhook::WebhookOptions { path, secret_env };
+            let project_root = resolve_cwd();
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from
+            // the endpoint block `generate` recorded, so cleanup does not depend
+            // on the user repeating flags (issue #1366, Codex review).
+            let plan = match mode {
+                ApplyMode::Generate => {
+                    generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
+                }
+                ApplyMode::Destroy => generate::webhook::plan_webhook_for_revert(
+                    &project_root,
+                    &provider,
+                    &name,
+                    &options,
+                ),
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+            // Printed after the file list, and only for a real generate run:
+            // `apply_plan` exits on failure, and neither a dry run nor a
+            // destroy has next steps to take (issue #1366 AC #5).
+            if mode == ApplyMode::Generate
+                && !dry_run
+                && let Some(steps) = generate::webhook::next_steps(&provider, &name, &options)
+            {
+                println!("{steps}");
+            }
         }
         GenerateCommands::SystemTest {
             name,
@@ -3954,7 +4789,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live,
             live_validation,
             no_policy,
+            belongs_to,
+            counter_cache,
             searchable,
+            i18n,
             dry_run,
             force,
         } => {
@@ -4012,7 +4850,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 id.as_deref(),
                 live_validation,
                 no_policy,
+                belongs_to.as_deref(),
+                counter_cache,
                 &searchable,
+                i18n,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -4339,6 +5180,7 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
             }
         ));
     }
@@ -4354,6 +5196,21 @@ mod tests {
                 bin: None,
                 embed: false,
                 features: None,
+                edge: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_edge_flag() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--edge"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: false,
+                embed: false,
+                edge: true,
+                ..
             }
         ));
     }
@@ -5207,6 +6064,66 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
+    // ── autumn console tests (issue #1039) ─────────────────────────────────
+
+    #[test]
+    fn parse_console_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "console"]).unwrap();
+        match cli.command {
+            Commands::Console {
+                profile,
+                package,
+                force,
+                scaffold_only,
+            } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+                assert!(!force);
+                assert!(!scaffold_only);
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_short_alias_c() {
+        let cli = Cli::try_parse_from(["autumn", "c"]).unwrap();
+        assert!(matches!(cli.command, Commands::Console { .. }));
+    }
+
+    #[test]
+    fn parse_console_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--force"]).unwrap();
+        match cli.command {
+            Commands::Console { force, .. } => assert!(force),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_scaffold_only() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--scaffold-only"]).unwrap();
+        match cli.command {
+            Commands::Console { scaffold_only, .. } => assert!(scaffold_only),
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_profile_and_package() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--profile", "demo", "-p", "my-app"])
+            .unwrap();
+        match cli.command {
+            Commands::Console {
+                profile, package, ..
+            } => {
+                assert_eq!(profile, "demo");
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Console command"),
+        }
+    }
+
     // ── autumn seed tests ──────────────────────────────────────────────────
 
     #[test]
@@ -5218,12 +6135,36 @@ mod tests {
                 package,
                 count,
                 model,
+                yes_i_mean_prod,
             } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
                 assert!(count.is_none());
                 assert!(model.is_none());
+                assert!(!yes_i_mean_prod);
             }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_yes_i_mean_prod() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "seed",
+            "--count",
+            "200",
+            "--model",
+            "Post",
+            "--profile",
+            "prod",
+            "--yes-i-mean-prod",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Seed {
+                yes_i_mean_prod, ..
+            } => assert!(yes_i_mean_prod),
             _ => panic!("expected Seed command"),
         }
     }
@@ -5850,6 +6791,52 @@ mod tests {
             panic!("expected release init");
         };
         assert_eq!(target.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn parse_release_init_with_azure_container_apps_target() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "azure-container-apps",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("azure-container-apps"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_app_runner_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-app-runner"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-app-runner"));
+    }
+
+    #[test]
+    fn parse_release_init_with_aws_ecs_target() {
+        let cli =
+            Cli::try_parse_from(["autumn", "release", "init", "--target", "aws-ecs"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("aws-ecs"));
+    }
+
+    #[test]
+    fn parse_release_init_with_gcp_cloud_run_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "gcp-cloud-run"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("gcp-cloud-run"));
     }
 
     #[test]
@@ -6542,6 +7529,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_scaffold_belongs_to_flag() {
+        // Default: flat scaffold, no parent.
+        let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Comment", "body:Text"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to, None, "flat scaffolds have no parent");
+
+        // `--belongs-to Post` binds the child to its parent resource.
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(belongs_to.as_deref(), Some("Post"));
+    }
+
+    #[test]
     fn parse_generate_mailer_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
     }
@@ -6566,6 +7581,87 @@ mod tests {
     }
 
     // ── autumn generate channel tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_generate_webhook_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            name,
+            path,
+            secret_env,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+        assert!(path.is_none(), "--path defaults to /webhooks/<provider>");
+        assert!(
+            secret_env.is_none(),
+            "--secret-env defaults to <PROVIDER>_WEBHOOK_SECRET"
+        );
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_webhook_with_path_and_secret_env() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "webhook",
+            "generic",
+            "Partner",
+            "--path",
+            "/hooks/partner",
+            "--secret-env",
+            "PARTNER_WEBHOOK_SECRET",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Webhook {
+            provider,
+            path,
+            secret_env,
+            dry_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate webhook");
+        };
+        assert_eq!(provider, "generic");
+        assert_eq!(path.as_deref(), Some("/hooks/partner"));
+        assert_eq!(secret_env.as_deref(), Some("PARTNER_WEBHOOK_SECRET"));
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_generate_webhook_requires_both_provider_and_name() {
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook", "stripe"]).is_err(),
+            "the endpoint name is required"
+        );
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "webhook"]).is_err(),
+            "the provider preset is required"
+        );
+    }
+
+    #[test]
+    fn parse_destroy_webhook() {
+        let cli =
+            Cli::try_parse_from(["autumn", "destroy", "webhook", "stripe", "Payments"]).unwrap();
+        let Commands::Destroy(GenerateCommands::Webhook { provider, name, .. }) = cli.command
+        else {
+            panic!("expected destroy webhook");
+        };
+        assert_eq!(provider, "stripe");
+        assert_eq!(name, "Payments");
+    }
 
     #[test]
     fn parse_generate_channel_with_pascal_name() {
@@ -6650,6 +7746,48 @@ mod tests {
     #[test]
     fn parse_generate_channel_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "channel"]).is_err());
+    }
+
+    // ── autumn generate notifications tests ────────────────────────────────
+
+    #[test]
+    fn parse_generate_notifications_takes_no_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "notifications"]).unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(!dry_run);
+        assert!(!force);
+        // A fixed resource: a stray name argument must be rejected.
+        assert!(Cli::try_parse_from(["autumn", "generate", "notifications", "Feed"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_notifications_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "notifications",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Notifications { dry_run, force }) = cli.command
+        else {
+            panic!("expected generate notifications");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_destroy_notifications() {
+        let cli = Cli::try_parse_from(["autumn", "destroy", "notifications"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Destroy(GenerateCommands::Notifications { .. })
+        ));
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────

@@ -18,6 +18,9 @@
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
+//! | `reaction_controls` | No-JS vote/like toggle buttons + live aggregate for `#[votable]` |
+//! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
+//! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //!
 //! # Feedback widgets
 //!
@@ -33,6 +36,14 @@
 //! | Select a single related record and store its ID | `autocomplete_input` |
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
+//!
+//! # Bulk actions
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `bulk_select_checkbox` | One row's `name="ids"` select checkbox (issue #1312) |
+//! | `bulk_actions_toolbar` | `role="group"` submit button applying the selection |
+//! | `bulk_actions_form` | `POST` form wrapping a list + toolbar, with the CSRF field |
 //!
 //! # Modals & confirmation
 //!
@@ -797,6 +808,983 @@ pub fn transition_controls(
     }
 }
 
+// ── reaction_controls ──────────────────────────────────────────────────────
+
+/// Configuration for a [`reaction_controls`] widget.
+///
+/// Build with [`ReactionControls::votes`] (signed up/down voting, the
+/// `#[votable(… aggregate = sum)]` shape) or [`ReactionControls::likes`] (a
+/// single membership toggle, the `aggregate = count` shape), then chain the
+/// builder methods for optional overrides.
+///
+/// The struct owns every string it renders (no lifetimes), so a handler can
+/// build it from borrowed request data and hand it straight to the widget.
+///
+/// # `dom_id` is trusted
+///
+/// `dom_id` is rendered as the container's `id` **and** interpolated into the
+/// default `hx-target` (`#{dom_id}`), where it is read as a CSS selector
+/// fragment. Pass a value you construct — `format!("votes-{post_id}")` from a
+/// typed id is the intended shape — never a raw request parameter or any other
+/// attacker-controlled string. Maud escapes the attribute value, so this is not
+/// an injection hole; it is a correctness one: a value containing whitespace,
+/// `#`, `.` or a quote yields a selector that matches nothing and an htmx swap
+/// that silently does not land.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::ReactionControls;
+///
+/// let config = ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+///     .aggregate(7)          // the target's persisted `score`
+///     .current(Some(1))      // `repo.reaction_of(user_id, post_id).await?`
+///     .label("Post score");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionControls {
+    /// `id` of the grouping container, and the default `hx-target`.
+    dom_id: String,
+    /// Form action for the up (vote mode) or like (count mode) control.
+    up_action: String,
+    /// Form action for the down control. `None` selects like/count mode, in
+    /// which only the single `up_action` control is rendered.
+    down_action: Option<String>,
+    /// The target's persisted aggregate (`score` / `{name}_count`).
+    aggregate: i64,
+    /// The viewer's own current reaction, as returned by `reaction_of()`.
+    current: Option<i16>,
+    /// `aria-label` of the `role="group"` container.
+    label: String,
+    /// Accessible name of the up button.
+    up_label: String,
+    /// Accessible name of the down button.
+    down_label: String,
+    /// Accessible name of the like button (count mode).
+    like_label: String,
+    /// `hx-target` every form swaps; defaults to `#{dom_id}`.
+    hx_target: String,
+    /// CSRF token value; `None` renders no hidden input.
+    csrf_token: Option<String>,
+    /// CSRF hidden-input name; defaults to `_csrf`.
+    csrf_field: String,
+    /// Emit `hx-preserve="true"` on the buttons, for shared/broadcast
+    /// fragments that must not clobber a viewer's own pressed state.
+    preserve_pressed_state: bool,
+}
+
+#[cfg(feature = "maud")]
+impl ReactionControls {
+    /// Shared constructor: `down_action = None` selects like/count mode.
+    fn new(dom_id: String, up_action: String, down_action: Option<String>) -> Self {
+        let hx_target = format!("#{dom_id}");
+        Self {
+            dom_id,
+            up_action,
+            down_action,
+            aggregate: 0,
+            current: None,
+            label: "Reactions".to_owned(),
+            up_label: "Upvote".to_owned(),
+            down_label: "Downvote".to_owned(),
+            like_label: "Like".to_owned(),
+            hx_target,
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+            preserve_pressed_state: false,
+        }
+    }
+
+    /// Signed up/down controls — the `#[votable(…, aggregate = sum)]` shape.
+    ///
+    /// `dom_id` names the container the control replaces on submit;
+    /// `up_action` / `down_action` are the `POST` routes for each direction
+    /// (typically the generated `__autumn_path_*` helpers).
+    #[must_use]
+    pub fn votes(
+        dom_id: impl Into<String>,
+        up_action: impl Into<String>,
+        down_action: impl Into<String>,
+    ) -> Self {
+        Self::new(dom_id.into(), up_action.into(), Some(down_action.into()))
+    }
+
+    /// A single toggle control — the `#[votable(…, aggregate = count)]` shape.
+    ///
+    /// One `POST` route serves both directions: the generated `react()` is a
+    /// toggle, so re-submitting removes the reaction.
+    #[must_use]
+    pub fn likes(dom_id: impl Into<String>, action: impl Into<String>) -> Self {
+        Self::new(dom_id.into(), action.into(), None)
+    }
+
+    /// Set the target's aggregate — its `score` (sum) or `{name}_count`
+    /// (count). Rendered verbatim, so a downvoted target shows a negative.
+    #[must_use]
+    pub const fn aggregate(mut self, n: i64) -> Self {
+        self.aggregate = n;
+        self
+    }
+
+    /// Set the viewer's own current reaction (`reaction_of()`'s result).
+    ///
+    /// The rendered domain is `{None, Some(1), Some(-1)}`: `Some(1)` presses
+    /// the up/like button, `Some(-1)` the down button, and `None` (the
+    /// default — what a feed or a signed-out viewer passes) presses neither.
+    /// Any other value presses nothing, and in like/count mode `Some(-1)`
+    /// presses nothing either, since that mode renders no down direction.
+    /// (`reaction_of()` only ever yields those three, so this matters just for
+    /// hand-built configs.)
+    #[must_use]
+    pub const fn current(mut self, v: Option<i16>) -> Self {
+        self.current = v;
+        self
+    }
+
+    /// Set the container's `aria-label`. Default: `"Reactions"`.
+    #[must_use]
+    pub fn label(mut self, s: impl Into<String>) -> Self {
+        self.label = s.into();
+        self
+    }
+
+    /// Set the up button's accessible name. Default: `"Upvote"`.
+    #[must_use]
+    pub fn up_label(mut self, s: impl Into<String>) -> Self {
+        self.up_label = s.into();
+        self
+    }
+
+    /// Set the down button's accessible name. Default: `"Downvote"`.
+    #[must_use]
+    pub fn down_label(mut self, s: impl Into<String>) -> Self {
+        self.down_label = s.into();
+        self
+    }
+
+    /// Set the like button's accessible name. Default: `"Like"`.
+    #[must_use]
+    pub fn like_label(mut self, s: impl Into<String>) -> Self {
+        self.like_label = s.into();
+        self
+    }
+
+    /// Set the `hx-target` each form swaps. Default: `#{dom_id}` — the control
+    /// replaces itself in place. The value is a CSS selector, so it is subject
+    /// to the same "must not be attacker-controlled" rule as `dom_id`.
+    #[must_use]
+    pub fn hx_target(mut self, s: impl Into<String>) -> Self {
+        self.hx_target = s.into();
+        self
+    }
+
+    /// Set the CSRF token value rendered as a hidden input in every form.
+    ///
+    /// This is the primitive; [`ReactionControls::csrf`] is the sugar that
+    /// takes the handler's extractors. Without a token no hidden input is
+    /// rendered at all.
+    #[must_use]
+    pub fn csrf_token(mut self, token: impl Into<String>) -> Self {
+        self.csrf_token = Some(token.into());
+        self
+    }
+
+    /// Set the CSRF hidden input's `name`. Default: `"_csrf"`.
+    #[must_use]
+    pub fn csrf_field(mut self, field: impl Into<String>) -> Self {
+        self.csrf_field = field.into();
+        self
+    }
+
+    /// Emit `hx-preserve="true"` on the buttons, so an htmx swap that replaces
+    /// this control keeps the *live* button elements — and with them the
+    /// viewer's own `aria-pressed` / `.autumn-reaction-active` state.
+    ///
+    /// For **shared/broadcast fragments only** (an SSE fan-out re-rendering a
+    /// card for every subscriber, where `current` is necessarily `None`): the
+    /// swap then updates the aggregate and the rest of the card without
+    /// un-pressing the viewer's buttons. Each button carries a stable id
+    /// derived from `dom_id` (`{dom_id}-up` / `-down` / `-like`), which is
+    /// what `hx-preserve` matches on.
+    ///
+    /// Never set this on a control returned from the vote route itself — the
+    /// direct response *wants* to repaint the pressed state it just computed,
+    /// and `hx-preserve` would resurrect the stale buttons instead.
+    #[must_use]
+    pub const fn preserve_pressed_state(mut self, preserve: bool) -> Self {
+        self.preserve_pressed_state = preserve;
+        self
+    }
+
+    /// Thread the handler's `Option<&CsrfToken>` / `Option<&CsrfFormField>`
+    /// through unchanged — sugar over [`ReactionControls::csrf_token`] and
+    /// [`ReactionControls::csrf_field`].
+    ///
+    /// Both values are copied out, so the config keeps no borrow. A `None`
+    /// token renders no hidden input; a `None` field keeps the `"_csrf"`
+    /// default. Mirrors `transition_controls`' CSRF parameters.
+    #[must_use]
+    pub fn csrf(
+        mut self,
+        token: Option<&crate::security::CsrfToken>,
+        field: Option<&crate::security::CsrfFormField>,
+    ) -> Self {
+        if let Some(tok) = token {
+            self = self.csrf_token(tok.token());
+        }
+        if let Some(name) = field {
+            self = self.csrf_field(name.0.as_str());
+        }
+        self
+    }
+}
+
+/// Render a no-JS reaction control: one `POST` form per direction (CSRF-
+/// protected when a token is threaded) plus the target's live aggregate,
+/// upgraded in place by htmx.
+///
+/// This is the view half of the `#[votable]` association (issue #1362). The
+/// generated `repo.react(reactor_id, target_id, value)` returns a `Reaction`
+/// carrying everything the widget needs, so a route re-renders with no extra
+/// query:
+///
+/// ```rust,ignore
+/// let reaction = posts.react(user_id, post_id, 1).await?;
+/// Ok(reaction_controls(
+///     &ReactionControls::votes(
+///         format!("votes-{post_id}"),
+///         format!("/posts/{post_id}/upvote"),
+///         format!("/posts/{post_id}/downvote"),
+///     )
+///     .aggregate(reaction.aggregate)
+///     .current(reaction.value),
+/// ))
+/// ```
+///
+/// # Behavior
+///
+/// - The container is a `<div role="group">` carrying the config's `dom_id`
+///   and `aria-label`, so assistive tech announces the buttons as one control.
+/// - [`ReactionControls::votes`] renders an up form, the aggregate, and a down
+///   form; [`ReactionControls::likes`] renders a single like form and the
+///   aggregate.
+/// - Each direction is an independent `<form method="post" action=(action)>`
+///   carrying a single `<button type="submit">` (plus the hidden CSRF input
+///   when a token is threaded), so the control still submits with JavaScript
+///   disabled. The same form also carries `hx-post` / `hx-target` /
+///   `hx-swap="outerHTML"` and a shared `hx-sync="#{dom_id}:replace"` (a
+///   second click aborts the in-flight request, so an older response can
+///   never repaint over a newer click), so with htmx loaded the submit is
+///   intercepted and
+///   the response replaces the control in place.
+/// - **The widget emits `<form>` elements.** HTML forbids nesting a form
+///   inside another form, so never render this widget inside one — the browser
+///   drops the inner form and the buttons submit the outer one instead. Place
+///   it as a sibling.
+/// - Each button is an ARIA toggle: `aria-pressed="true"` exactly on the
+///   direction matching `current` (`Some(1)` → up/like, `Some(-1)` → down),
+///   which also gets the `autumn-reaction-active` class. `current(None)` —
+///   and, in like/count mode, `current(Some(-1))`, which has no direction to
+///   match — presses neither.
+/// - The glyph (`▲` / `▼` / `♥`) lives in a `<span aria-hidden="true">`, so
+///   the button's accessible name comes from its explicit `aria-label` — a
+///   screen reader never announces a nameless icon button.
+/// - The aggregate is rendered verbatim (negatives are not clamped) inside an
+///   `aria-live="polite"` span, so an htmx swap announces the new total.
+/// - No JavaScript, no inline styles: plain HTML forms and buttons only.
+///
+/// # CSRF — required for the no-JS path
+///
+/// Call [`ReactionControls::csrf`] with the handler's `Option<&CsrfToken>` and
+/// `Option<&CsrfFormField>` (or the [`ReactionControls::csrf_token`] /
+/// [`ReactionControls::csrf_field`] string primitives). When a token is set,
+/// every form gets a hidden `<input type="hidden">` named after the field
+/// (defaulting to `"_csrf"`), exactly like scaffolded forms. With no token,
+/// no hidden input is rendered.
+///
+/// **This is what makes the JavaScript-off fallback actually work.** With CSRF
+/// protection enabled and no token threaded, the htmx path still succeeds —
+/// the framework's `autumn-htmx-csrf.js` shim adds the token as a request
+/// header — but the plain form POST carries no token and is rejected with
+/// `403`. A control rendered without `.csrf(...)` is therefore htmx-only in a
+/// CSRF-protected app. Thread the token on every page a no-JS visitor can
+/// reach; the one place it is legitimately omitted is a fragment that only
+/// reaches JS-enabled clients (an SSE/live payload).
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-reaction-controls` | Grouping `<div role="group">` |
+/// | `.autumn-reaction` | Each per-direction `<form>` |
+/// | `.autumn-reaction-up` | The upvote `<form>` |
+/// | `.autumn-reaction-down` | The downvote `<form>` |
+/// | `.autumn-reaction-like` | The like `<form>` (count mode) |
+/// | `.autumn-reaction-button` | Each submit `<button>` |
+/// | `.autumn-reaction-active` | The button matching the viewer's reaction |
+/// | `.autumn-reaction-count` | The `aria-live` aggregate `<span>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ReactionControls, reaction_controls};
+///
+/// let markup = reaction_controls(
+///     &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+///         .aggregate(7)
+///         .current(Some(1))
+///         .label("Post score"),
+/// );
+/// let html = markup.into_string();
+/// assert!(html.contains(r#"id="votes-42""#));
+/// assert!(html.contains(r#"class="autumn-reaction-controls""#));
+/// assert!(html.contains(r##"hx-target="#votes-42""##));
+/// assert!(html.contains(r#"aria-label="Upvote""#));
+/// assert!(html.contains(r#"aria-pressed="true""#));  // the up button is the current reaction
+/// assert!(html.contains(r#"aria-pressed="false""#)); // the down button is not
+/// assert!(html.contains(">7<"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
+    // Every class is a plain string literal (never `format!`), so the
+    // widget-CSS coverage gate can extract it and prove `widgets.css` backs it.
+    let up_pressed = cfg.current == Some(1);
+    let down_pressed = cfg.current == Some(-1);
+    let like_mode = cfg.down_action.is_none();
+
+    let (primary_form_class, primary_glyph, primary_label) = if like_mode {
+        ("autumn-reaction autumn-reaction-like", "♥", &cfg.like_label)
+    } else {
+        ("autumn-reaction autumn-reaction-up", "▲", &cfg.up_label)
+    };
+    let primary_button_class = if up_pressed {
+        "autumn-reaction-button autumn-reaction-active"
+    } else {
+        "autumn-reaction-button"
+    };
+    let down_button_class = if down_pressed {
+        "autumn-reaction-button autumn-reaction-active"
+    } else {
+        "autumn-reaction-button"
+    };
+    let primary_pressed = if up_pressed { "true" } else { "false" };
+    let down_pressed_attr = if down_pressed { "true" } else { "false" };
+    // Stable per-direction button ids: what `hx-preserve` matches on when a
+    // shared/broadcast fragment must not clobber the viewer's pressed state.
+    let primary_button_id = if like_mode {
+        format!("{}-like", cfg.dom_id)
+    } else {
+        format!("{}-up", cfg.dom_id)
+    };
+    let down_button_id = format!("{}-down", cfg.dom_id);
+    let preserve = cfg.preserve_pressed_state.then_some("true");
+    // Both forms share one sync scope with the `replace` strategy: a second
+    // click (up then down before the first response lands) aborts the
+    // in-flight request, so only the LAST click's response repaints the
+    // control. Without this the two independent forms race and the older
+    // response can land second, leaving the stale direction pressed even
+    // though the database holds the newer vote — the commits themselves are
+    // already serialized by the target-row lock; this orders the *responses*.
+    let hx_sync = format!("#{}:replace", cfg.dom_id);
+
+    maud::html! {
+        div id=(cfg.dom_id) class="autumn-reaction-controls" role="group" aria-label=(cfg.label) {
+            form method="post" action=(cfg.up_action) class=(primary_form_class)
+                hx-post=(cfg.up_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                hx-sync=(hx_sync) {
+                @if let Some(token) = &cfg.csrf_token {
+                    input type="hidden" name=(cfg.csrf_field) value=(token);
+                }
+                button type="submit" id=(primary_button_id) class=(primary_button_class)
+                    aria-pressed=(primary_pressed) aria-label=(primary_label)
+                    hx-preserve=[preserve] {
+                    span aria-hidden="true" { (primary_glyph) }
+                }
+            }
+            span class="autumn-reaction-count" aria-live="polite" { (cfg.aggregate) }
+            @if let Some(down_action) = &cfg.down_action {
+                form method="post" action=(down_action) class="autumn-reaction autumn-reaction-down"
+                    hx-post=(down_action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+                    hx-sync=(hx_sync) {
+                    @if let Some(token) = &cfg.csrf_token {
+                        input type="hidden" name=(cfg.csrf_field) value=(token);
+                    }
+                    button type="submit" id=(down_button_id) class=(down_button_class)
+                        aria-pressed=(down_pressed_attr) aria-label=(cfg.down_label)
+                        hx-preserve=[preserve] {
+                        span aria-hidden="true" { "▼" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── comment_thread ─────────────────────────────────────────────────────────
+
+/// One rendered comment, plus the replies nested under it.
+///
+/// Deliberately a *view* type rather than the database
+/// [`Comment`](crate::commentable::Comment): the widget renders strings, and
+/// keeping it independent lets it be built from any source (a fixture, a cache,
+/// another store) and lets `widgets` compile without the `db` feature. Build it
+/// from a real thread with [`CommentView::from_thread`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentView {
+    /// The comment's id — rendered as part of each node's DOM id and as the
+    /// reply form's `reply_to` value.
+    pub id: i64,
+    /// The author's display name, already resolved. Escaped on render.
+    pub author: String,
+    /// The comment body. Blank-line-separated paragraphs are rendered as
+    /// separate `<p>`s; the text itself is escaped, never parsed as HTML.
+    pub body: String,
+    /// A machine-readable timestamp for `<time datetime="…">`, e.g. an RFC 3339
+    /// string. `None` renders no `<time>` element.
+    pub datetime: Option<String>,
+    /// The human-readable timestamp shown inside `<time>`. Ignored when
+    /// `datetime` is `None`.
+    pub timestamp: String,
+    /// Replies to this comment, in the order they should render.
+    pub replies: Vec<Self>,
+}
+
+#[cfg(all(feature = "maud", feature = "db"))]
+impl CommentView {
+    /// Build renderable views from a
+    /// [`comment_thread`](crate::commentable::comment_thread) result.
+    ///
+    /// `author_name` is used when the model declared
+    /// `#[commentable(author_name = <column>)]`; otherwise the author falls
+    /// back to `user #{id}`, because inventing a name would be worse than
+    /// admitting there isn't one. Timestamps render as `YYYY-MM-DD HH:MM` UTC
+    /// with a full RFC 3339 `datetime` attribute, so a client-side
+    /// relative-time enhancement has something exact to read.
+    #[must_use]
+    pub fn from_thread(nodes: &[crate::commentable::CommentNode]) -> Vec<Self> {
+        nodes
+            .iter()
+            .map(|node| Self {
+                id: node.comment.id,
+                author: node
+                    .comment
+                    .author_name
+                    .clone()
+                    .unwrap_or_else(|| format!("user #{}", node.comment.author_id)),
+                body: node.comment.body.clone(),
+                datetime: Some(
+                    node.comment
+                        .created_at
+                        .and_utc()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
+                timestamp: node.comment.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                replies: Self::from_thread(&node.replies),
+            })
+            .collect()
+    }
+}
+
+/// Configuration for a [`comment_thread`] widget.
+///
+/// Build with [`CommentThread::new`] and chain the builder methods.
+///
+/// # `dom_id` is trusted
+///
+/// `dom_id` is rendered as the container's `id`, interpolated into the default
+/// `hx-target` (`#{dom_id}`) where it is read as a CSS selector fragment, and
+/// used as the prefix of every node's own id. Pass a value you construct —
+/// `format!("comments-post-{post_id}")` from a typed id is the intended shape —
+/// never a raw request parameter. Maud escapes the attribute value, so this is
+/// not an injection hole; it is a correctness one: a value containing
+/// whitespace, `#`, `.` or a quote yields a selector that matches nothing and
+/// an htmx swap that silently does not land.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::CommentThread;
+///
+/// let config = CommentThread::new("comments-post-42", "/comments/Post/42")
+///     .csrf_token("tok")
+///     .max_depth(5);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentThread {
+    /// `id` of the region, the default `hx-target`, and each node's id prefix.
+    dom_id: String,
+    /// Form action every comment and reply posts to.
+    action: String,
+    /// CSRF token value; `None` renders no hidden input.
+    csrf_token: Option<String>,
+    /// CSRF hidden-input name; defaults to `_csrf`.
+    csrf_field: String,
+    /// Name of the textarea carrying the comment body.
+    body_field: String,
+    /// Name of the hidden input carrying the id being replied to.
+    reply_field: String,
+    /// `aria-label` of the region landmark.
+    label: String,
+    /// Shown in place of the list when the thread is empty.
+    empty_text: String,
+    /// Label of the top-level submit button.
+    submit_label: String,
+    /// Label of the per-node reply disclosure and its submit button.
+    reply_label: String,
+    /// `placeholder` of the comment textarea.
+    placeholder: String,
+    /// `hx-target` every form swaps; defaults to `#{dom_id}`.
+    hx_target: String,
+    /// Deepest level that still offers a reply form. Matches the model's
+    /// `#[commentable(max_depth = …)]`, so the UI never offers a reply the
+    /// write path would refuse.
+    max_depth: usize,
+    /// Whether to render any form at all. `false` renders a read-only thread
+    /// (plus [`CommentThread::sign_in_prompt`], when set) — the shape a signed
+    /// out visitor sees.
+    can_comment: bool,
+    /// Shown in place of the form when `can_comment` is `false`.
+    sign_in_prompt: Option<String>,
+    /// Where a **non-htmx** submit should send the browser back to, rendered as
+    /// a hidden `return_to` input. `None` leaves the handler to answer with the
+    /// re-rendered fragment.
+    return_to: Option<String>,
+    /// `maxlength` on the textarea, from the model's `max_body` — so an
+    /// over-long comment is refused in the browser rather than by a `422` htmx
+    /// would not even swap.
+    max_body_bytes: Option<usize>,
+    /// A rejection to show above the form, rendered `role="alert"`.
+    error: Option<String>,
+    /// The rejected body, re-filled into the form that submitted it.
+    ///
+    /// A 422 re-renders the whole thread, and the htmx swap is `outerHTML` — so
+    /// without this the user's typed comment is replaced by an empty textarea
+    /// and simply gone. `maxlength` does not save them: it counts CHARACTERS
+    /// while `max_body` counts BYTES, so an ordinary multibyte comment passes
+    /// the browser and is refused by the server.
+    draft: Option<String>,
+    /// Which form the [`draft`](Self::draft) belongs to — `None` for the
+    /// top-level one, `Some(id)` for the reply under that comment. A draft
+    /// re-filled into every form would duplicate it down the page.
+    draft_reply_to: Option<i64>,
+}
+
+#[cfg(feature = "maud")]
+impl CommentThread {
+    /// A thread rendered into `dom_id`, whose comments and replies all post to
+    /// `action`.
+    ///
+    /// `action` is a single endpoint for the whole thread: a reply is an
+    /// ordinary comment carrying a `reply_to` value, which is what lets one
+    /// framework route serve every commentable model.
+    #[must_use]
+    pub fn new(dom_id: impl Into<String>, action: impl Into<String>) -> Self {
+        let dom_id = dom_id.into();
+        let hx_target = format!("#{dom_id}");
+        Self {
+            dom_id,
+            action: action.into(),
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+            body_field: "body".to_owned(),
+            reply_field: "reply_to".to_owned(),
+            label: "Comments".to_owned(),
+            empty_text: "No comments yet.".to_owned(),
+            submit_label: "Post comment".to_owned(),
+            reply_label: "Reply".to_owned(),
+            placeholder: "Add a comment…".to_owned(),
+            hx_target,
+            max_depth: crate::widgets::DEFAULT_COMMENT_MAX_DEPTH,
+            can_comment: true,
+            sign_in_prompt: None,
+            return_to: None,
+            max_body_bytes: None,
+            error: None,
+            draft: None,
+            draft_reply_to: None,
+        }
+    }
+
+    /// A thread whose depth and body caps come straight from the model's
+    /// `#[commentable]` declaration.
+    ///
+    /// Prefer this over [`new`](Self::new) plus hand-copied numbers: it is the
+    /// only spelling that cannot drift from the write path, which refuses a
+    /// reply past `max_depth` and a body past `max_body` with a `422` the UI
+    /// would otherwise have invited.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn from_spec(
+        dom_id: impl Into<String>,
+        action: impl Into<String>,
+        spec: &crate::commentable::CommentableSpec,
+    ) -> Self {
+        Self::new(dom_id, action)
+            .max_depth(usize::try_from(spec.max_depth).unwrap_or(usize::MAX))
+            .max_body_bytes(spec.max_body_bytes)
+    }
+
+    /// Cap the textarea at `bytes` characters via `maxlength`.
+    ///
+    /// HTML counts UTF-16 code units where the server counts bytes, so this is
+    /// an early, approximate guard — the server's check is still the one that
+    /// decides.
+    #[must_use]
+    pub const fn max_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_body_bytes = Some(bytes);
+        self
+    }
+
+    /// Show a rejection above the form.
+    #[must_use]
+    pub fn error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
+    }
+
+    /// Re-fill a rejected submission into the form that sent it.
+    ///
+    /// `reply_to` selects the form: `None` is the top-level one, `Some(id)` the
+    /// reply under that comment — which is also opened, since a draft restored
+    /// inside a collapsed disclosure looks exactly like a lost one.
+    #[must_use]
+    pub fn draft(mut self, reply_to: Option<i64>, body: impl Into<String>) -> Self {
+        self.draft = Some(body.into());
+        self.draft_reply_to = reply_to;
+        self
+    }
+
+    /// Set the CSRF token embedded in every form.
+    #[must_use]
+    pub fn csrf_token(mut self, token: impl Into<String>) -> Self {
+        self.csrf_token = Some(token.into());
+        self
+    }
+
+    /// Override the CSRF hidden-input name (default `_csrf`).
+    #[must_use]
+    pub fn csrf_field(mut self, field: impl Into<String>) -> Self {
+        self.csrf_field = field.into();
+        self
+    }
+
+    /// Override the body textarea's `name` (default `body`).
+    #[must_use]
+    pub fn body_field(mut self, field: impl Into<String>) -> Self {
+        self.body_field = field.into();
+        self
+    }
+
+    /// Override the reply-target hidden input's `name` (default `reply_to`).
+    #[must_use]
+    pub fn reply_field(mut self, field: impl Into<String>) -> Self {
+        self.reply_field = field.into();
+        self
+    }
+
+    /// Override the region's `aria-label` (default `Comments`).
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Override the empty-thread text.
+    #[must_use]
+    pub fn empty_text(mut self, text: impl Into<String>) -> Self {
+        self.empty_text = text.into();
+        self
+    }
+
+    /// Override the top-level submit button's label.
+    #[must_use]
+    pub fn submit_label(mut self, label: impl Into<String>) -> Self {
+        self.submit_label = label.into();
+        self
+    }
+
+    /// Override the per-node reply label.
+    #[must_use]
+    pub fn reply_label(mut self, label: impl Into<String>) -> Self {
+        self.reply_label = label.into();
+        self
+    }
+
+    /// Override the textarea placeholder.
+    #[must_use]
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Override the `hx-target` (default `#{dom_id}`).
+    #[must_use]
+    pub fn hx_target(mut self, target: impl Into<String>) -> Self {
+        self.hx_target = target.into();
+        self
+    }
+
+    /// Deepest level that still offers a reply form; pass the model's
+    /// `max_depth` so the UI and the write path agree.
+    #[must_use]
+    pub const fn max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Render the thread read-only — the signed-out shape. The thread still
+    /// renders; every form disappears.
+    ///
+    /// Pair it with [`sign_in_prompt`](Self::sign_in_prompt) to say why.
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
+        self.can_comment = false;
+        self
+    }
+
+    /// What to show in place of the form when the thread is
+    /// [`read_only`](Self::read_only).
+    #[must_use]
+    pub fn sign_in_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.sign_in_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Where a submit **without** htmx should send the browser afterwards,
+    /// carried as a hidden `return_to` input.
+    ///
+    /// Pass the host page's own path (`/r/rust/posts/hello`). The framework
+    /// router honours it only when it is a relative, single-slash path, so a
+    /// tampered value cannot become an open redirect — but it is still the host
+    /// page, not the visitor, that should be choosing it.
+    #[must_use]
+    pub fn return_to(mut self, path: impl Into<String>) -> Self {
+        self.return_to = Some(path.into());
+        self
+    }
+}
+
+/// The default deepest level offering a reply form, matching
+/// `#[commentable]`'s own `max_depth` default.
+#[cfg(feature = "maud")]
+pub const DEFAULT_COMMENT_MAX_DEPTH: usize = 5;
+
+/// Render a nested comment thread with an inline reply form on every node.
+///
+/// No JavaScript is required for any of it: the reply forms are ordinary
+/// `POST` forms inside `<details>` disclosures, so the widget works with
+/// scripting off. When htmx *is* present, every form additionally carries
+/// `hx-post` / `hx-target` / `hx-swap="outerHTML"`, so submitting a reply
+/// replaces the whole `#{dom_id}` region with the re-rendered thread — no full
+/// page reload — as long as the handler responds with this same widget.
+///
+/// The handler owns the pairing: render `comment_thread` for both the initial
+/// page and the `POST` response, and the swap is seamless.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
+///
+/// let views = vec![CommentView {
+///     id: 1,
+///     author: "ada".into(),
+///     body: "first!".into(),
+///     datetime: None,
+///     timestamp: String::new(),
+///     replies: vec![CommentView {
+///         id: 2,
+///         author: "grace".into(),
+///         body: "second".into(),
+///         datetime: None,
+///         timestamp: String::new(),
+///         replies: Vec::new(),
+///     }],
+/// }];
+/// let cfg = CommentThread::new("comments-post-42", "/comments/Post/42").csrf_token("tok");
+/// let html = comment_thread(&cfg, &views).into_string();
+///
+/// assert!(html.contains(r#"id="comments-post-42""#));
+/// assert!(html.contains(r##"hx-target="#comments-post-42""##));
+/// assert!(html.contains(r#"name="reply_to" value="1""#));  // inline reply form per node
+/// assert!(html.contains(r#"name="reply_to" value="2""#));
+/// assert!(html.contains("first!"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn comment_thread(cfg: &CommentThread, comments: &[CommentView]) -> maud::Markup {
+    // Every class is a plain string literal (never `format!`), so the
+    // widget-CSS coverage gate can extract it and prove `widgets.css` backs it.
+    maud::html! {
+        section id=(cfg.dom_id) class="autumn-comments" role="region" aria-label=(cfg.label) {
+            @if let Some(error) = &cfg.error {
+                p class="autumn-comments-error" role="alert" { (error) }
+            }
+            @if comments.is_empty() {
+                p class="autumn-comments-empty" { (cfg.empty_text) }
+            } @else {
+                (comment_list(cfg, comments, 0))
+            }
+            @if cfg.can_comment {
+                (comment_form(cfg, None, None))
+            } @else if let Some(prompt) = &cfg.sign_in_prompt {
+                p class="autumn-comments-prompt" { (prompt) }
+            }
+        }
+    }
+}
+
+/// One `<ol>` level of the thread.
+///
+/// The top level is `aria-live="polite"`, so an htmx swap — which replaces the
+/// whole region without moving focus — is announced rather than silent.
+#[cfg(feature = "maud")]
+fn comment_list(cfg: &CommentThread, comments: &[CommentView], depth: usize) -> maud::Markup {
+    let live = (depth == 0).then_some("polite");
+    maud::html! {
+        ol class="autumn-comment-list" aria-live=[live] {
+            @for comment in comments {
+                (comment_node(cfg, comment, depth))
+            }
+        }
+    }
+}
+
+/// The `id` [`comment_thread`] renders on one comment's `<li>`.
+///
+/// Exposed because anything that wants to *link* to a comment — a notification,
+/// an email, a live-feed entry — needs the same string, and hand-assembling it
+/// at each call site is how a link silently stops matching the markup.
+#[must_use]
+pub fn comment_dom_id(thread_dom_id: &str, comment_id: i64) -> String {
+    format!("{thread_dom_id}-c{comment_id}")
+}
+
+/// One comment, its reply affordance, and its own replies.
+/// Split a stored comment body into paragraphs on blank lines.
+///
+/// Splitting on `"\n\n"` alone was wrong for the ordinary case: an HTML form
+/// submits a textarea with CRLF line endings, so a blank line arrives as
+/// `"\r\n\r\n"` and the whole comment rendered as ONE paragraph — the break
+/// collapsing to a space, because the CSS does not preserve whitespace.
+///
+/// `str::lines` is what makes this line-ending agnostic: it splits on `\n` and
+/// strips a trailing `\r`, so LF and CRLF bodies produce identical paragraphs.
+/// Runs of blank lines collapse to a single break rather than empty `<p>`s.
+#[cfg(feature = "maud")]
+fn comment_paragraphs(body: &str) -> Vec<String> {
+    body.lines()
+        .collect::<Vec<_>>()
+        .split(|line| line.trim().is_empty())
+        .filter(|group| group.iter().any(|line| !line.trim().is_empty()))
+        .map(|group| group.join("\n").trim().to_string())
+        .collect()
+}
+
+#[cfg(feature = "maud")]
+fn comment_node(cfg: &CommentThread, comment: &CommentView, depth: usize) -> maud::Markup {
+    let node_id = comment_dom_id(&cfg.dom_id, comment.id);
+    // The write path refuses a reply deeper than `max_depth`, so offering the
+    // form past it would be an invitation to a 422. `depth` is the parent's
+    // level, and the reply lands one below.
+    let can_reply = cfg.can_comment && depth < cfg.max_depth;
+    // Distinct accessible names per node. Without the author, every disclosure
+    // in a forty-comment thread announces the identical "Reply" and a screen
+    // reader user has no way to tell which one they are on.
+    let reply_label = format!("{} to {}", cfg.reply_label, comment.author);
+    maud::html! {
+        li id=(node_id) class="autumn-comment" {
+            div class="autumn-comment-meta" {
+                span class="autumn-comment-author" { (comment.author) }
+                @if let Some(datetime) = &comment.datetime {
+                    " · "
+                    time class="autumn-comment-time" datetime=(datetime) { (comment.timestamp) }
+                }
+            }
+            div class="autumn-comment-body" {
+                @for paragraph in comment_paragraphs(&comment.body) {
+                    p { (paragraph) }
+                }
+            }
+            @if can_reply {
+                details class="autumn-comment-reply"
+                    open[cfg.draft.is_some() && cfg.draft_reply_to == Some(comment.id)] {
+                    summary class="autumn-comment-reply-toggle" aria-label=(reply_label) {
+                        (cfg.reply_label)
+                    }
+                    (comment_form(cfg, Some(comment.id), Some(&comment.author)))
+                }
+            }
+            @if !comment.replies.is_empty() {
+                (comment_list(cfg, &comment.replies, depth + 1))
+            }
+        }
+    }
+}
+
+/// The shared comment/reply form. `reply_to` distinguishes the two.
+#[cfg(feature = "maud")]
+fn comment_form(
+    cfg: &CommentThread,
+    reply_to: Option<i64>,
+    reply_to_author: Option<&str>,
+) -> maud::Markup {
+    let textarea_id = reply_to.map_or_else(
+        || format!("{}-body", cfg.dom_id),
+        |id| format!("{}-c{id}-body", cfg.dom_id),
+    );
+    let submit_label = if reply_to.is_some() {
+        &cfg.reply_label
+    } else {
+        &cfg.submit_label
+    };
+    // Same reason as the disclosure's: one accessible name per form, so the
+    // textarea says which comment it replies to.
+    let field_label = reply_to_author.map_or_else(
+        || cfg.placeholder.clone(),
+        |author| format!("{} to {author}", cfg.reply_label),
+    );
+    let maxlength = cfg.max_body_bytes.map(|bytes| bytes.to_string());
+    // One sync scope for the whole thread, `replace`: two quick replies would
+    // otherwise race, and the older `outerHTML` response landing second would
+    // drop the newer comment from view. The commits are already ordered by the
+    // parent row lock; this orders the *responses*.
+    let hx_sync = format!("#{}:replace", cfg.dom_id);
+    maud::html! {
+        form class="autumn-comment-form" method="post" action=(cfg.action)
+            hx-post=(cfg.action) hx-target=(cfg.hx_target) hx-swap="outerHTML"
+            hx-sync=(hx_sync) {
+            @if let Some(token) = &cfg.csrf_token {
+                input type="hidden" name=(cfg.csrf_field) value=(token);
+            }
+            @if let Some(reply_to) = reply_to {
+                input type="hidden" name=(cfg.reply_field) value=(reply_to);
+            }
+            @if let Some(return_to) = &cfg.return_to {
+                input type="hidden" name="return_to" value=(return_to);
+            }
+            label class="autumn-comment-label" for=(textarea_id) { (field_label) }
+            textarea id=(textarea_id) class="autumn-comment-input" name=(cfg.body_field)
+                rows="3" required maxlength=[maxlength] placeholder=(cfg.placeholder) {
+                // Only the form that was actually submitted: `draft_reply_to`
+                // is `None` for the top-level form and `Some(id)` for a reply,
+                // which is exactly how `reply_to` identifies this one. Maud
+                // escapes the text, so a body full of markup is inert.
+                @if let Some(draft) = &cfg.draft
+                    && reply_to == cfg.draft_reply_to
+                {
+                    (draft)
+                }
+            }
+            button type="submit" class="autumn-comment-submit" { (submit_label) }
+        }
+    }
+}
+
 // ── data_table ────────────────────────────────────────────────────────────
 
 /// Sort direction for a [`data_table`] sortable column header.
@@ -1126,6 +2114,309 @@ pub fn data_table<T>(
     }
 }
 
+// ── bulk actions (#1312) ──────────────────────────────────────────────────
+
+/// Configuration for the bulk-select / bulk-actions widgets.
+///
+/// Build with [`BulkActionsConfig::new`] (the form `action` URL) and chain the
+/// builder methods for optional overrides.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct BulkActionsConfig<'a> {
+    /// Form `action` URL the bulk submit posts to (e.g. `/posts/bulk_delete`).
+    pub action: &'a str,
+    /// Name of the per-row checkbox field (default `"ids"`).
+    pub field_name: &'a str,
+    /// Label on the bulk submit button (default `"Delete selected"`).
+    pub submit_label: &'a str,
+    /// Prefix of each checkbox's `aria-label` (default `"Select row"`).
+    pub select_label: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> BulkActionsConfig<'a> {
+    /// Create a new config posting to `action`, with sensible defaults.
+    #[must_use]
+    pub const fn new(action: &'a str) -> Self {
+        Self {
+            action,
+            field_name: "ids",
+            submit_label: "Delete selected",
+            select_label: "Select row",
+        }
+    }
+
+    /// Override the per-row checkbox field name (default `"ids"`).
+    #[must_use]
+    pub const fn field_name(mut self, field_name: &'a str) -> Self {
+        self.field_name = field_name;
+        self
+    }
+
+    /// Override the bulk submit button label (default `"Delete selected"`).
+    #[must_use]
+    pub const fn submit_label(mut self, submit_label: &'a str) -> Self {
+        self.submit_label = submit_label;
+        self
+    }
+
+    /// Override the checkbox `aria-label` prefix (default `"Select row"`).
+    #[must_use]
+    pub const fn select_label(mut self, select_label: &'a str) -> Self {
+        self.select_label = select_label;
+        self
+    }
+}
+
+/// Render one row's bulk-select checkbox (issue #1312).
+///
+/// One of these goes in the first cell of every row inside a
+/// [`bulk_actions_form`]. Every checkbox shares the same `name`
+/// ([`BulkActionsConfig::field_name`], default `"ids"`), so a browser submits
+/// the checked rows as repeated `ids=<value>` pairs — no JavaScript, no
+/// per-row form. The server side reads them back with any repeated-key form
+/// parser (the scaffold's generated `parse_bulk_ids` accepts both `ids` and
+/// the `ids[]` spelling some clients emit).
+///
+/// `value` is anything [`Display`](std::fmt::Display) — typically the row's
+/// primary key. It is HTML-escaped by Maud, both in `value` and in the
+/// `aria-label` (`"{select_label} {value}"`), so a screen reader announces
+/// which row each checkbox selects rather than a wall of unlabelled controls.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-select` | The per-row `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, Column, bulk_select_checkbox};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// let mut columns: Vec<Column<Post>> = post_columns();
+/// columns.insert(
+///     0,
+///     Column::new("", |row: &Post| maud::html! { (bulk_select_checkbox(row.id, &cfg)) }),
+/// );
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_select_checkbox};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_select_checkbox(42, &cfg).into_string();
+/// assert!(html.contains(r#"type="checkbox""#));
+/// assert!(html.contains(r#"name="ids""#));
+/// assert!(html.contains(r#"value="42""#));
+/// assert!(html.contains(r#"aria-label="Select row 42""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_select_checkbox(
+    value: impl std::fmt::Display,
+    config: &BulkActionsConfig<'_>,
+) -> maud::Markup {
+    let value = value.to_string();
+    let aria_label = format!("{} {value}", config.select_label);
+    maud::html! {
+        input type="checkbox" name=(config.field_name) value=(value)
+            class="autumn-bulk-select" aria-label=(aria_label);
+    }
+}
+
+/// Render the bulk-actions toolbar — the submit button that applies the
+/// selection (issue #1312).
+///
+/// Rendered automatically at the end of a [`bulk_actions_form`]; call it
+/// directly only when hand-building the surrounding `<form>`.
+///
+/// # No-JavaScript guarantee
+///
+/// The button is a plain `<button type="submit">` — no inline handler, no
+/// scripting of any kind, so the control works with JavaScript disabled and
+/// the server stays the enforcement point.
+///
+/// # Confirming a bulk action
+///
+/// This widget deliberately emits **no** confirmation prompt. The framework's
+/// answer to `window.confirm()` is [`confirm_action`], whose dialog is
+/// server-rendered and therefore assertable from a
+/// [`TestClient`](crate::test::TestClient) test — but it submits its own
+/// single-action `<form>`, so it cannot carry a bulk form's checkbox
+/// selection (HTML forbids nesting one form in another). An inline
+/// `onclick="return confirm(..)"` is not an option either: Autumn's default
+/// CSP is `script-src 'self'` with no `'unsafe-inline'`, so the browser
+/// blocks inline handlers and the destructive form would submit with no
+/// prompt at all — worse than not promising one.
+///
+/// To confirm a batch, post the selection to an interstitial page that lists
+/// the affected rows and asks for a second, explicit submit.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+///     .submit_label("Delete selected");
+/// let toolbar = bulk_actions_toolbar(&cfg);
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_toolbar};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_toolbar(&cfg).into_string();
+/// assert!(html.contains(r#"class="autumn-bulk-actions""#));
+/// assert!(html.contains(r#"type="submit""#));
+/// assert!(html.contains("Delete selected"));
+/// // Nothing scripted: no inline handler and no prompt hook.
+/// assert!(!html.contains("onclick"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
+    maud::html! {
+        div class="autumn-bulk-actions" role="group" {
+            button type="submit" { (config.submit_label) }
+        }
+    }
+}
+
+/// Wrap a rendered list in the bulk-actions `<form>` (issue #1312).
+///
+/// This is the outer half of the no-JavaScript bulk-select flow: a plain
+/// `POST` form whose `action` is [`BulkActionsConfig::action`], containing (in
+/// order) the hidden one-time submit-token field, the hidden CSRF field, the
+/// caller's `content` — a table, list, or anything else carrying one
+/// [`bulk_select_checkbox`] per row — and the [`bulk_actions_toolbar`] submit
+/// button.
+///
+/// Keep page furniture that is *not* part of the selection (a "New record"
+/// link, a search box) outside the form: anything inside is submitted with the
+/// selection.
+///
+/// # CSRF
+///
+/// Pass the handler's token as `csrf_token` and the configured field name as
+/// `csrf_field` (both `Option<&str>`, e.g.
+/// `csrf.as_ref().map(|t| t.token())` and
+/// `csrf_field.as_ref().map(|f| f.0.as_str())`). When `csrf_token` is `None`
+/// no hidden input is rendered at all; when it is `Some`, the field name
+/// defaults to `"_csrf"`.
+///
+/// # Double-submit protection
+///
+/// Pass the handler's [`SubmitToken`](crate::security::SubmitToken) as
+/// `submit_token` and the configured field name as `submit_field` (again both
+/// `Option<&str>`). `SubmitTokenLayer` consumes the token once and replays the
+/// first response for any repeat, so a double-click or a Back→resubmit deletes
+/// the batch once instead of running the whole destructive path — including
+/// hooks and dependent deletes — twice. A request carrying *no* token passes
+/// through unguarded, so omitting this on a destructive form silently gives up
+/// the protection.
+///
+/// The token input is emitted at the very front of the form, ahead of the
+/// per-row checkboxes: `SubmitTokenLayer` only scans the first chunk of the
+/// URL-encoded body, and a large selection could otherwise push a trailing
+/// token past the scan cap.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-bulk-form` | The wrapping `<form method="post">` |
+/// | `.autumn-bulk-actions` | Grouping `<div role="group">` around the submit button |
+/// | `.autumn-bulk-select` | Each row's `<input type="checkbox">` |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form, data_table, DataTableConfig};
+///
+/// let action = paths::bulk_delete();
+/// let cfg = BulkActionsConfig::new(&action);
+/// Ok(layout("Posts", html! {
+///     a href=(paths::new()) { "New Post" } // outside the form
+///     (bulk_actions_form(
+///         &cfg,
+///         csrf.as_ref().map(|t| t.token()),
+///         csrf_field.as_ref().map(|f| f.0.as_str()),
+///         submit_token.as_ref().map(|t| t.token()),
+///         submit_field.as_ref().map(|f| f.0.as_str()),
+///         html! {
+///             (data_table(&page.content, &columns, &DataTableConfig::new("No posts yet.")))
+///         },
+///     ))
+/// }))
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{BulkActionsConfig, bulk_actions_form};
+///
+/// let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+/// let html = bulk_actions_form(
+///     &cfg,
+///     Some("tok-123"),
+///     None,
+///     Some("submit-456"),
+///     None,
+///     maud::html! { p { "rows" } },
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"method="post""#));
+/// assert!(html.contains(r#"action="/posts/bulk_delete""#));
+/// assert!(html.contains(r#"name="_csrf""#));
+/// assert!(html.contains(r#"value="tok-123""#));
+/// assert!(html.contains(r#"name="_submit_token""#));
+/// assert!(html.contains(r#"value="submit-456""#));
+/// // Tokens ahead of the rows, content next, toolbar last, all inside the form.
+/// assert!(html.find("_submit_token") < html.find("rows"));
+/// assert!(html.find("rows") < html.find("autumn-bulk-actions"));
+/// assert!(html.trim_end().ends_with("</form>"));
+/// ```
+// `content` is taken by value so `bulk_actions_form(&cfg, .., html! { .. })`
+// reads without a `&` at the call site (matching `alert_with`); Maud renders it
+// by reference, hence the allow.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bulk_actions_form(
+    config: &BulkActionsConfig<'_>,
+    csrf_token: Option<&str>,
+    csrf_field: Option<&str>,
+    submit_token: Option<&str>,
+    submit_field: Option<&str>,
+    content: maud::Markup,
+) -> maud::Markup {
+    let csrf_field_name = csrf_field.unwrap_or("_csrf");
+    let submit_field_name = submit_field.unwrap_or("_submit_token");
+    maud::html! {
+        form method="post" action=(config.action) class="autumn-bulk-form" {
+            // Both hidden fields lead the body: `SubmitTokenLayer` only scans
+            // its first chunk, so a long selection of checkboxes must not be
+            // able to push the token past the scan cap.
+            @if let Some(token) = submit_token {
+                input type="hidden" name=(submit_field_name) value=(token);
+            }
+            @if let Some(token) = csrf_token {
+                input type="hidden" name=(csrf_field_name) value=(token);
+            }
+            (content)
+            (bulk_actions_toolbar(config))
+        }
+    }
+}
+
 // ── breadcrumb ────────────────────────────────────────────────────────────
 
 /// A single crumb in a [`breadcrumb`] navigation trail.
@@ -1312,6 +2603,81 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
                 href
             };
             !href.is_empty() && crate::router::path_matches_route_prefix(current_path, href)
+        }
+    }
+}
+
+// ── locale switcher (issue #1251) ─────────────────────────────────────────────
+
+/// Rewrite a path — optionally with a query string — to point at a
+/// different locale's prefixed URL (issue #1251).
+///
+/// `path` is the current page's locale-stripped path, exactly as returned by
+/// axum's `Uri` extractor inside a `/{locale}/...` nest (nesting strips the
+/// matched locale segment before extraction reaches the handler) — e.g.
+/// `"/posts"` or `"/posts?sort=asc"`. Any query string is preserved
+/// verbatim; only the locale segment changes.
+///
+/// The root path is a special case: axum's `nest("/{locale}", router)` makes
+/// the *bare* `/{locale}` (no trailing slash) match the inner router's own
+/// `"/"` route — `/{locale}/` 404s — so `localized_path("/", "es")` returns
+/// `"/es"`, not `"/es/"`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::localized_path;
+///
+/// assert_eq!(localized_path("/posts", "es"), "/es/posts");
+/// assert_eq!(localized_path("/posts?sort=asc", "es"), "/es/posts?sort=asc");
+/// assert_eq!(localized_path("/", "es"), "/es");
+/// assert_eq!(localized_path("/?ref=newsletter", "es"), "/es?ref=newsletter");
+/// ```
+#[must_use]
+pub fn localized_path(path: &str, locale: &str) -> String {
+    let (before_query, query) = path.find('?').map_or((path, ""), |i| path.split_at(i));
+    let joined = if before_query == "/" || before_query.is_empty() {
+        format!("/{locale}")
+    } else {
+        let rest = before_query.strip_prefix('/').unwrap_or(before_query);
+        format!("/{locale}/{rest}")
+    };
+    format!("{joined}{query}")
+}
+
+/// Render links to the current page in each supported locale (issue #1251),
+/// preserving the current path and query — only the locale segment changes.
+///
+/// `path` is the current page's locale-stripped path (see [`localized_path`]).
+/// `current_locale`'s entry renders as inert text with `aria-current="true"`
+/// rather than a self-link.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::locale_switcher;
+///
+/// let html =
+///     locale_switcher("/posts", "en", &["en".to_owned(), "es".to_owned()]).into_string();
+/// assert!(html.contains(r#"href="/es/posts""#));
+/// assert!(!html.contains(r#"href="/en/posts""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn locale_switcher(
+    path: &str,
+    current_locale: &str,
+    supported_locales: &[String],
+) -> maud::Markup {
+    maud::html! {
+        nav class="autumn-locale-switcher" aria-label="Language" {
+            @for locale in supported_locales {
+                @if locale == current_locale {
+                    span class="autumn-locale-switcher__current" aria-current="true" { (locale) }
+                } @else {
+                    a href=(localized_path(path, locale)) { (locale) }
+                }
+            }
         }
     }
 }
@@ -4579,6 +5945,357 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
 mod tests {
     use super::*;
 
+    /// A browser submits a textarea with CRLF, so paragraph splitting must not
+    /// depend on the line ending. Splitting on `"\n\n"` alone rendered an
+    /// ordinary two-paragraph comment as one.
+    #[test]
+    fn comment_paragraphs_split_on_blank_lines_of_either_line_ending() {
+        let expected = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(comment_paragraphs("first\n\nsecond"), expected, "LF");
+        assert_eq!(
+            comment_paragraphs("first\r\n\r\nsecond"),
+            expected,
+            "CRLF — the case a real form submission produces"
+        );
+        // A run of blank lines is one break, not several empty paragraphs.
+        assert_eq!(comment_paragraphs("first\r\n\r\n\r\n\r\nsecond"), expected);
+        // A single newline stays INSIDE one paragraph, as before.
+        assert_eq!(
+            comment_paragraphs("one\r\ntwo"),
+            vec!["one\ntwo".to_string()]
+        );
+        // Nothing but whitespace yields no paragraphs at all.
+        assert!(comment_paragraphs("   \r\n\r\n  ").is_empty());
+        assert!(comment_paragraphs("").is_empty());
+    }
+
+    /// A 422 re-renders the thread and htmx swaps `outerHTML`, so a draft that
+    /// is not carried back is simply gone from the visitor's screen. It must
+    /// land in the form that SENT it, and nowhere else.
+    #[test]
+    fn a_rejected_draft_is_refilled_into_the_form_that_sent_it() {
+        let view = vec![CommentView {
+            id: 7,
+            author: "ada".into(),
+            body: "parent".into(),
+            datetime: None,
+            timestamp: String::new(),
+            replies: Vec::new(),
+        }];
+
+        // Top-level draft: the top-level textarea carries it, the reply does not.
+        let widget = CommentThread::new("t", "/c").draft(None, "my long draft");
+        let html = comment_thread(&widget, &view).into_string();
+        assert_eq!(
+            html.matches("my long draft").count(),
+            1,
+            "exactly one form is prefilled:\n{html}"
+        );
+
+        // Reply draft: it lands in that comment's reply form, which is OPEN —
+        // a draft restored inside a collapsed disclosure reads as a lost one.
+        let widget = CommentThread::new("t", "/c").draft(Some(7), "reply draft");
+        let html = comment_thread(&widget, &view).into_string();
+        assert_eq!(html.matches("reply draft").count(), 1, "{html}");
+        assert!(
+            html.contains("<details class=\"autumn-comment-reply\" open"),
+            "{html}"
+        );
+
+        // No draft: every textarea is empty, so a SUCCESSFUL post never invites
+        // the visitor to submit the same comment twice.
+        let widget = CommentThread::new("t", "/c");
+        let html = comment_thread(&widget, &view).into_string();
+        assert!(html.contains("></textarea>"), "{html}");
+        assert!(
+            !html.contains("<details class=\"autumn-comment-reply\" open"),
+            "{html}"
+        );
+
+        // The body is TEXT, not markup: maud escapes it.
+        let widget = CommentThread::new("t", "/c").draft(None, "<script>x</script>");
+        let html = comment_thread(&widget, &view).into_string();
+        assert!(!html.contains("<script>x</script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    // ── comment_thread (#1367) ─────────────────────────────────────────
+
+    /// A two-level fixture: one root with one reply.
+    fn comment_fixture() -> Vec<CommentView> {
+        vec![
+            CommentView {
+                id: 1,
+                author: "ada".to_owned(),
+                body: "first\n\nsecond para".to_owned(),
+                datetime: Some("2026-06-21T17:10:33Z".to_owned()),
+                timestamp: "2026-06-21 17:10".to_owned(),
+                replies: vec![CommentView {
+                    id: 2,
+                    author: "grace".to_owned(),
+                    body: "a reply".to_owned(),
+                    datetime: None,
+                    timestamp: String::new(),
+                    replies: Vec::new(),
+                }],
+            },
+            CommentView {
+                id: 3,
+                author: "hopper".to_owned(),
+                body: "unrelated".to_owned(),
+                datetime: None,
+                timestamp: String::new(),
+                replies: Vec::new(),
+            },
+        ]
+    }
+
+    /// AC4: the list nests, and **every** node carries its own inline reply
+    /// form pre-addressed to that node.
+    #[test]
+    fn comment_thread_renders_an_inline_reply_form_per_node() {
+        let cfg = CommentThread::new("comments-post-42", "/comments/Post/42").csrf_token("tok");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+
+        assert!(html.contains(r#"id="comments-post-42""#));
+        assert!(html.contains(r#"class="autumn-comments""#));
+        // One reply form per node, each naming its own target.
+        for id in [1, 2, 3] {
+            assert!(
+                html.contains(&format!(r#"name="reply_to" value="{id}""#)),
+                "no inline reply form addressed to comment {id}"
+            );
+        }
+        // Plus the top-level form, which carries no reply target.
+        assert_eq!(html.matches(r#"class="autumn-comment-form""#).count(), 4);
+        // The CSRF field is on every one of them.
+        assert_eq!(html.matches(r#"name="_csrf" value="tok""#).count(), 4);
+    }
+
+    /// AC4: submitting swaps the thread in place rather than reloading — and
+    /// the same forms are ordinary `POST`s when htmx is absent.
+    #[test]
+    fn comment_thread_forms_are_htmx_swaps_and_plain_posts() {
+        let cfg = CommentThread::new("comments-post-42", "/comments/Post/42");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+
+        assert!(html.contains(r##"hx-target="#comments-post-42""##));
+        assert!(html.contains(r#"hx-swap="outerHTML""#));
+        assert!(html.contains(r#"hx-post="/comments/Post/42""#));
+        // No-JS: the same element is a real form with a real action.
+        assert!(html.contains(r#"method="post" action="/comments/Post/42""#));
+        // ...and the disclosure is `<details>`, not a script-driven toggle.
+        assert!(html.contains("<details"));
+    }
+
+    /// Nesting is rendered as nested `<ol>`s, so depth is exposed to assistive
+    /// technology rather than being a purely visual indent.
+    #[test]
+    fn comment_thread_nests_replies_in_a_child_list() {
+        let cfg = CommentThread::new("c", "/comments/Post/1");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(html.matches(r#"class="autumn-comment-list""#).count(), 2);
+        assert!(
+            html.contains(r#"id="c-c2""#),
+            "the reply gets its own node id"
+        );
+    }
+
+    /// Blank-line-separated paragraphs render as separate `<p>`s, and the body
+    /// is escaped rather than parsed as HTML.
+    #[test]
+    fn comment_thread_escapes_bodies_and_splits_paragraphs() {
+        let views = vec![CommentView {
+            id: 1,
+            author: "<script>".to_owned(),
+            body: "<img src=x onerror=alert(1)>\n\ntwo".to_owned(),
+            datetime: None,
+            timestamp: String::new(),
+            replies: Vec::new(),
+        }];
+        let cfg = CommentThread::new("c", "/comments/Post/1");
+        let html = comment_thread(&cfg, &views).into_string();
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("&lt;img src=x"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert_eq!(html.matches("<p>").count(), 2);
+    }
+
+    /// The UI must not offer a reply the write path would reject, so the
+    /// disclosure stops at `max_depth`.
+    #[test]
+    fn comment_thread_stops_offering_replies_past_max_depth() {
+        let deep = vec![CommentView {
+            id: 1,
+            author: "ada".to_owned(),
+            body: "root".to_owned(),
+            datetime: None,
+            timestamp: String::new(),
+            replies: vec![CommentView {
+                id: 2,
+                author: "ada".to_owned(),
+                body: "child".to_owned(),
+                datetime: None,
+                timestamp: String::new(),
+                replies: Vec::new(),
+            }],
+        }];
+        let cfg = CommentThread::new("c", "/comments/Post/1").max_depth(1);
+        let html = comment_thread(&cfg, &deep).into_string();
+        assert!(html.contains(r#"name="reply_to" value="1""#));
+        assert!(
+            !html.contains(r#"name="reply_to" value="2""#),
+            "a reply to the depth-1 node would exceed max_depth = 1"
+        );
+    }
+
+    /// `from_thread` is the only bridge between the database rows and the
+    /// widget, and it carries three documented behaviours: the `user #{id}`
+    /// fallback, the RFC 3339 `datetime` attribute, and the recursive mapping.
+    #[cfg(feature = "db")]
+    #[test]
+    fn comment_view_from_thread_maps_names_timestamps_and_replies() {
+        use crate::commentable::{Comment, CommentNode};
+
+        fn node(id: i64, author_name: Option<&str>, replies: Vec<CommentNode>) -> CommentNode {
+            CommentNode {
+                comment: Comment {
+                    id,
+                    parent_id: None,
+                    author_id: 7,
+                    body: "b".to_owned(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("2026-06-21T17:10:33Z")
+                        .expect("timestamp")
+                        .naive_utc(),
+                    author_name: author_name.map(str::to_owned),
+                },
+                depth: 0,
+                replies,
+            }
+        }
+
+        let views = CommentView::from_thread(&[node(
+            1,
+            Some("ada"),
+            vec![node(2, None, vec![node(3, Some("grace"), Vec::new())])],
+        )]);
+
+        assert_eq!(views[0].author, "ada");
+        // No `author_name` column declared (or a missing author): the id, not
+        // an invented name.
+        assert_eq!(views[0].replies[0].author, "user #7");
+        // Nesting survives to arbitrary depth.
+        assert_eq!(views[0].replies[0].replies[0].author, "grace");
+        assert_eq!(
+            views[0].datetime.as_deref(),
+            Some("2026-06-21T17:10:33Z"),
+            "a machine-readable timestamp for <time datetime=…>"
+        );
+        assert_eq!(views[0].timestamp, "2026-06-21 17:10");
+    }
+
+    /// A signed-out visitor still reads the thread; the form is replaced by a
+    /// prompt, and no node offers a reply.
+    #[test]
+    fn comment_thread_read_only_hides_every_form() {
+        let cfg = CommentThread::new("c", "/comments/Post/1")
+            .read_only()
+            .sign_in_prompt("Sign in to comment.");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(!html.contains("<form"));
+        assert!(html.contains("Sign in to comment."));
+        assert!(
+            html.contains("unrelated"),
+            "the thread itself still renders"
+        );
+    }
+
+    #[test]
+    fn comment_thread_renders_the_empty_state() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").empty_text("Nothing here.");
+        let html = comment_thread(&cfg, &[]).into_string();
+        assert!(html.contains("Nothing here."));
+        assert!(html.contains(r#"class="autumn-comments-empty""#));
+        assert!(
+            html.contains("<form"),
+            "an empty thread still invites a first comment"
+        );
+    }
+
+    /// Each node's reply affordance names the comment it replies to. Without
+    /// that, forty disclosures in a thread all announce the identical "Reply"
+    /// and a screen-reader user cannot tell which one they are on.
+    #[test]
+    fn comment_thread_gives_every_reply_control_a_distinct_accessible_name() {
+        let cfg = CommentThread::new("c", "/comments/Post/1");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(html.contains(r#"aria-label="Reply to ada""#), "{html}");
+        assert!(html.contains(r#"aria-label="Reply to grace""#), "{html}");
+        assert!(html.contains(r#"aria-label="Reply to hopper""#), "{html}");
+        // The textarea's own label says it too, so the form is identifiable
+        // without the disclosure.
+        assert!(html.contains(">Reply to ada</label>"), "{html}");
+        // The swap replaces the whole region without moving focus, so the list
+        // announces politely rather than silently.
+        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        assert!(html.contains(r#"role="region""#), "{html}");
+    }
+
+    /// Two quick replies would otherwise race, and the older `outerHTML`
+    /// response landing second would drop the newer comment from view.
+    #[test]
+    fn comment_thread_forms_share_one_htmx_sync_scope() {
+        let cfg = CommentThread::new("comments-post-42", "/comments/Post/42");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(
+            html.matches(r##"hx-sync="#comments-post-42:replace""##)
+                .count(),
+            4,
+            "every form, so no pair of them can race:\n{html}"
+        );
+    }
+
+    /// The UI must not invite a body the write path would reject with a `422`
+    /// htmx would not even swap.
+    #[test]
+    fn comment_thread_caps_the_textarea_at_the_models_body_limit() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").max_body_bytes(280);
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(html.matches(r#"maxlength="280""#).count(), 4, "{html}");
+
+        // No cap declared, no attribute — the server still decides.
+        let plain = comment_thread(
+            &CommentThread::new("c", "/comments/Post/1"),
+            &comment_fixture(),
+        )
+        .into_string();
+        assert!(!plain.contains("maxlength"), "{plain}");
+    }
+
+    /// A rejected comment is shown, not swallowed: htmx does not swap a
+    /// non-2xx response, so the router re-renders with the message instead.
+    #[test]
+    fn comment_thread_renders_a_rejection_above_the_form() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").error("Comment cannot be empty");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("Comment cannot be empty"), "{html}");
+        assert!(html.contains(r#"class="autumn-comments-error""#), "{html}");
+    }
+
+    /// `return_to` is the no-JS round trip: the host page names where to come
+    /// back to, and it is carried on every form.
+    #[test]
+    fn comment_thread_carries_return_to_on_every_form() {
+        let cfg = CommentThread::new("c", "/comments/Post/1").return_to("/r/rust/posts/hello");
+        let html = comment_thread(&cfg, &comment_fixture()).into_string();
+        assert_eq!(
+            html.matches(r#"name="return_to" value="/r/rust/posts/hello""#)
+                .count(),
+            4
+        );
+    }
+
     // ── transition_controls ────────────────────────────────────────────
 
     /// A plain literal transition graph: `draft -> published` (guarded),
@@ -4760,6 +6477,55 @@ mod tests {
             |_to| true,
             Some(&token),
             Some(&field),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="csrf_custom" value="secret-token">"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    // ── reaction_controls CSRF sugar ───────────────────────────────────
+
+    /// The `.csrf(Option<&CsrfToken>, Option<&CsrfFormField>)` sugar is the
+    /// path every real handler uses (a `CsrfToken` cannot be constructed
+    /// outside this crate, so the integration tests can only exercise the
+    /// `.csrf_token(&str)` primitive). reddit-clone's `vote_controls` calls it
+    /// with the page's extractor, which is what puts the hidden input in the
+    /// post-detail markup and makes the no-JS form POST pass CSRF.
+    #[test]
+    fn reaction_controls_csrf_sugar_renders_the_hidden_input_in_every_form() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let html = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(Some(&token), None),
+        )
+        .into_string();
+        assert_eq!(
+            html.matches(r#"<input type="hidden" name="_csrf" value="secret-token">"#)
+                .count(),
+            2,
+            "{html}"
+        );
+
+        // `None` is the SSE-fragment case: htmx-only, no hidden input.
+        let anonymous = reaction_controls(
+            &ReactionControls::votes("votes-42", "/posts/42/upvote", "/posts/42/downvote")
+                .aggregate(7)
+                .csrf(None, None),
+        )
+        .into_string();
+        assert!(!anonymous.contains("_csrf"), "{anonymous}");
+    }
+
+    #[test]
+    fn reaction_controls_csrf_sugar_honors_a_custom_field_name() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let field = crate::security::CsrfFormField("csrf_custom".to_string());
+        let html = reaction_controls(
+            &ReactionControls::likes("likes-42", "/posts/42/like").csrf(Some(&token), Some(&field)),
         )
         .into_string();
         assert!(
@@ -5622,6 +7388,56 @@ mod tests {
         assert!(html.contains(">Posts<"), "{html}");
     }
 
+    // ── locale switcher (issue #1251) ─────────────────────────────────────
+
+    #[test]
+    fn localized_path_prepends_locale_segment() {
+        assert_eq!(localized_path("/posts", "es"), "/es/posts");
+    }
+
+    #[test]
+    fn localized_path_preserves_query_string() {
+        assert_eq!(
+            localized_path("/posts?sort=asc&page=2", "es"),
+            "/es/posts?sort=asc&page=2"
+        );
+    }
+
+    #[test]
+    fn localized_path_handles_root() {
+        // No trailing slash: axum's `nest("/es", router)` makes bare "/es"
+        // match the inner router's "/" route, while "/es/" 404s.
+        assert_eq!(localized_path("/", "es"), "/es");
+    }
+
+    #[test]
+    fn localized_path_handles_root_with_query() {
+        assert_eq!(
+            localized_path("/?ref=newsletter", "es"),
+            "/es?ref=newsletter"
+        );
+    }
+
+    #[test]
+    fn locale_switcher_links_every_locale_except_current() {
+        let supported = vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()];
+        let html = locale_switcher("/posts", "es", &supported).into_string();
+        assert!(html.contains(r#"href="/en/posts""#), "{html}");
+        assert!(html.contains(r#"href="/fr/posts""#), "{html}");
+        assert!(
+            !html.contains(r#"href="/es/posts""#),
+            "current locale must not self-link: {html}"
+        );
+        assert!(html.contains(r#"aria-current="true""#), "{html}");
+    }
+
+    #[test]
+    fn locale_switcher_preserves_query_string_in_every_link() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        let html = locale_switcher("/posts?sort=asc", "en", &supported).into_string();
+        assert!(html.contains(r#"href="/es/posts?sort=asc""#), "{html}");
+    }
+
     // ── nav_bar ──────────────────────────────────────────────────────────
 
     #[test]
@@ -6097,6 +7913,177 @@ mod tests {
         assert!(html.contains("q=foo"), "{html}");
         // no duplicate old sort
         assert!(!html.contains("sort=old"), "{html}");
+    }
+
+    // ── bulk actions (#1312) ───────────────────────────────────────────
+
+    #[test]
+    fn bulk_actions_config_defaults() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "ids");
+        assert_eq!(cfg.submit_label, "Delete selected");
+        assert_eq!(cfg.select_label, "Select row");
+    }
+
+    #[test]
+    fn bulk_actions_config_builders() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .submit_label("Archive selected")
+            .select_label("Select post");
+        assert_eq!(cfg.action, "/posts/bulk_delete");
+        assert_eq!(cfg.field_name, "post_ids");
+        assert_eq!(cfg.submit_label, "Archive selected");
+        assert_eq!(cfg.select_label, "Select post");
+    }
+
+    #[test]
+    fn bulk_select_checkbox_emits_name_value_and_aria_label() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_select_checkbox(42, &cfg).into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"value="42""#), "{html}");
+        assert!(html.contains("autumn-bulk-select"), "{html}");
+        assert!(html.contains(r#"aria-label="Select row 42""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_select_checkbox_honours_custom_field_name() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete")
+            .field_name("post_ids")
+            .select_label("Select post");
+        let html = bulk_select_checkbox(7, &cfg).into_string();
+        assert!(html.contains(r#"name="post_ids""#), "{html}");
+        assert!(!html.contains(r#"name="ids""#), "{html}");
+        assert!(html.contains(r#"aria-label="Select post 7""#), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_form_renders_csrf_hidden_input() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, Some("tok-123"), None, None, None, maud::html! {})
+            .into_string();
+        assert!(html.contains(r#"type="hidden""#), "{html}");
+        // The csrf field name defaults to `_csrf` when none is supplied.
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok-123""#), "{html}");
+        // A configured field name wins over the default.
+        let named = bulk_actions_form(
+            &cfg,
+            Some("tok-123"),
+            Some("authenticity"),
+            None,
+            None,
+            maud::html! {},
+        )
+        .into_string();
+        assert!(named.contains(r#"name="authenticity""#), "{named}");
+        assert!(!named.contains(r#"name="_csrf""#), "{named}");
+    }
+
+    #[test]
+    fn bulk_actions_form_omits_csrf_input_when_none() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+        assert!(!html.contains("_csrf"), "{html}");
+        // The form itself is still rendered.
+        assert!(html.contains("<form"), "{html}");
+    }
+
+    /// `SubmitTokenLayer` passes a tokenless request straight through, so the
+    /// hidden field is what stands between a double-clicked bulk delete and a
+    /// second run of the whole destructive path.
+    #[test]
+    fn bulk_actions_form_renders_submit_token_hidden_input() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_form(&cfg, None, None, Some("submit-456"), None, maud::html! {})
+            .into_string();
+        // The field name defaults to `_submit_token` when none is supplied.
+        assert!(html.contains(r#"name="_submit_token""#), "{html}");
+        assert!(html.contains(r#"value="submit-456""#), "{html}");
+        // A configured field name wins over the default, matching whatever
+        // `security.submit_token.field_name` the layer scans for.
+        let named = bulk_actions_form(
+            &cfg,
+            None,
+            None,
+            Some("submit-456"),
+            Some("_once"),
+            maud::html! {},
+        )
+        .into_string();
+        assert!(named.contains(r#"name="_once""#), "{named}");
+        assert!(!named.contains(r#"name="_submit_token""#), "{named}");
+        // Omitted entirely when the handler has no token.
+        let without = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
+        assert!(!without.contains("_submit_token"), "{without}");
+    }
+
+    /// The layer only scans the first chunk of the URL-encoded body, so a long
+    /// selection must not be able to push the token past the scan cap.
+    #[test]
+    fn bulk_actions_form_puts_submit_token_ahead_of_the_rows() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let rows = maud::html! {
+            @for id in 1..200 {
+                (bulk_select_checkbox(id, &cfg))
+            }
+        };
+        let html = bulk_actions_form(&cfg, Some("csrf-1"), None, Some("submit-456"), None, rows)
+            .into_string();
+        let token_at = html.find("_submit_token").expect("token rendered");
+        let first_row_at = html.find("autumn-bulk-select").expect("rows rendered");
+        assert!(
+            token_at < first_row_at,
+            "the submit token must lead the body: {html}"
+        );
+    }
+
+    #[test]
+    fn bulk_actions_form_posts_to_action_and_wraps_content() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let content = maud::html! { p { "row-marker" } };
+        let html = bulk_actions_form(&cfg, None, None, None, None, content).into_string();
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"action="/posts/bulk_delete""#), "{html}");
+        assert!(html.contains("autumn-bulk-form"), "{html}");
+        assert!(html.contains("row-marker"), "{html}");
+        // The toolbar is rendered inside the form, after the content.
+        let content_at = html.find("row-marker").expect("content rendered");
+        let toolbar_at = html
+            .find("autumn-bulk-actions")
+            .expect("toolbar rendered inside the form");
+        assert!(
+            content_at < toolbar_at,
+            "toolbar must follow content: {html}"
+        );
+        assert!(html.trim_end().ends_with("</form>"), "{html}");
+    }
+
+    #[test]
+    fn bulk_actions_toolbar_button_is_submit_and_labelled() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_toolbar(&cfg).into_string();
+        assert!(html.contains("autumn-bulk-actions"), "{html}");
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains(r#"type="submit""#), "{html}");
+        assert!(html.contains("Delete selected"), "{html}");
+    }
+
+    /// The framework bans `window.confirm()` in its runtime (see
+    /// `confirm_action`, the server-rendered replacement), and the default
+    /// `script-src 'self'` CSP blocks inline handlers — so this toolbar
+    /// promises no confirmation rather than one that silently never fires.
+    #[test]
+    fn bulk_actions_toolbar_emits_nothing_scripted() {
+        let cfg = BulkActionsConfig::new("/posts/bulk_delete");
+        let html = bulk_actions_toolbar(&cfg).into_string();
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("data-autumn-confirm"), "{html}");
+        assert!(!html.contains("<script"), "{html}");
     }
 
     // ── CardConfig builder ─────────────────────────────────────────────

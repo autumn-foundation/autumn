@@ -720,7 +720,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();

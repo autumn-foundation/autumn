@@ -1,0 +1,5 @@
+error: `max_depth` in `#[commentable]` must be below 1000: the runtime's depth probe stops recursing there, so a larger cap could not be enforced
+  --> tests/compile-fail/model_commentable_max_depth_too_large.rs:16:38
+   |
+16 | #[commentable(by = User, max_depth = 5000)]
+   |                                      ^^^^

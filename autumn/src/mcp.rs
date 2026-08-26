@@ -543,10 +543,6 @@ enum SchemaDegradation {
     /// The `body` property resolved to a bare `{"type":"object"}` placeholder,
     /// so the tool advertises no body fields.
     OpaqueBody,
-    /// A `query` field is itself a nested object (or an array of objects) — a
-    /// shape `serde_urlencoded` (which `Query<T>` delegates to) cannot parse,
-    /// so dispatch of such an argument could never round-trip to the handler.
-    NestedQuery,
 }
 
 /// Resolve a schema node through a single `#/$defs/X` indirection (the form
@@ -574,46 +570,6 @@ fn is_opaque_object(schema: &Value) -> bool {
             .is_none_or(|map| !map.contains_key("properties"))
 }
 
-/// True when a `oneOf`/`anyOf` branch is the `{"type":"null"}` arm the
-/// `OpenApiSchema` derive emits for the `None` case of an `Option<T>` field.
-fn is_null_branch(branch: &Value) -> bool {
-    branch.get("type").and_then(Value::as_str) == Some("null")
-}
-
-/// True when `schema` (already ref-resolved) is a nested object or an array of
-/// objects — the shapes flat `serde_urlencoded` query decoding cannot handle.
-///
-/// A nullable query field (`Option<Struct>`, `Option<Vec<Struct>>`) derives to a
-/// `oneOf`/`anyOf` with the nested-shape branch plus a `{"type":"null"}` branch
-/// and therefore carries no top-level `type`; unwrap those wrappers and treat the
-/// field as nested when ANY non-null branch is itself nested, so a nullable
-/// structured query field warns exactly like its non-nullable form (issue #1972).
-fn is_nested_query_shape(root: &Value, schema: &Value) -> bool {
-    if let Some(branches) = schema
-        .get("oneOf")
-        .or_else(|| schema.get("anyOf"))
-        .and_then(Value::as_array)
-    {
-        return branches
-            .iter()
-            .filter(|branch| !is_null_branch(branch))
-            .map(|branch| resolve_local_ref(root, branch))
-            .any(|branch| is_nested_query_shape(root, branch));
-    }
-
-    match schema.get("type").and_then(Value::as_str) {
-        // A non-placeholder object nested under a query field.
-        Some("object") => schema
-            .as_object()
-            .is_some_and(|map| map.contains_key("properties")),
-        Some("array") => schema
-            .get("items")
-            .map(|items| resolve_local_ref(root, items))
-            .is_some_and(|items| is_nested_query_shape(root, items)),
-        _ => false,
-    }
-}
-
 /// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
 ///
 /// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
@@ -633,21 +589,14 @@ fn detect_schema_degradations(
         out.push(SchemaDegradation::OpaqueBody);
     }
 
-    if has_query && let Some(query) = props.and_then(|p| p.get("query")) {
-        let resolved = resolve_local_ref(input_schema, query);
-        if is_opaque_object(resolved) {
-            out.push(SchemaDegradation::OpaqueQuery);
-        } else if let Some(fields) = resolved.get("properties").and_then(Value::as_object) {
-            // A `Query<T>` whose schema is real but has a nested/object-of-array
-            // field can't round-trip through `serde_urlencoded`.
-            let nested = fields
-                .values()
-                .map(|field| resolve_local_ref(input_schema, field))
-                .any(|field| is_nested_query_shape(input_schema, field));
-            if nested {
-                out.push(SchemaDegradation::NestedQuery);
-            }
-        }
+    // A nested/array query field is NOT a degradation: `Query<T>` decodes the
+    // bracketed dialect `build_request` renders it into (issue #1972), so the
+    // advertised structure round-trips. Only a missing field-level schema is.
+    if has_query
+        && let Some(query) = props.and_then(|p| p.get("query"))
+        && is_opaque_object(resolve_local_ref(input_schema, query))
+    {
+        out.push(SchemaDegradation::OpaqueQuery);
     }
 
     out
@@ -677,15 +626,6 @@ fn warn_on_degraded_input_schema(doc: &ApiDoc, input_schema: &Value) {
                 "MCP tool query has no field-level schema (opaque object); derive or \
                  impl `OpenApiSchema` on the `Query<T>` type so the tool advertises \
                  its real query parameters instead of a bare `{{\"type\":\"object\"}}` placeholder"
-            ),
-            SchemaDegradation::NestedQuery => tracing::warn!(
-                operation_id = doc.operation_id,
-                method = doc.method,
-                path = doc.path,
-                "MCP tool query advertises a nested object/array-of-object field; \
-                 `Query<T>` decodes with `serde_urlencoded`, which is strictly flat and \
-                 cannot parse nested query parameters — move the structured input to a \
-                 JSON request body (`Json<T>`) so it round-trips losslessly"
             ),
         }
     }
@@ -1113,14 +1053,14 @@ struct ReplayContext<'a> {
 /// before the request body is buffered.
 ///
 /// The `/mcp` envelope is merged after `apply_middleware`, so it does not pass
-/// through the global [`trusted_host_middleware`](crate::router) every direct
+/// through the global `TrustedHostLayer` in [`crate::router`] that every direct
 /// route runs; this layer restores that gate for the endpoint. Running as a
 /// layer (rather than inside `serve_mcp`) means a bad-`Host` request is rejected
 /// before the handler's `Bytes` extractor reads up to the configured
 /// `max_request_size_bytes`, exactly as a direct route rejects in middleware
 /// before handler extraction.
 ///
-/// Host resolution mirrors `trusted_host_middleware`: the proxy-resolved
+/// Host resolution mirrors `TrustedHostService`: the proxy-resolved
 /// identity first (honouring `X-Forwarded-Host` from trusted upstreams), then
 /// the HTTP/2 `:authority` carried in the request URI, then the `Host` header —
 /// so an HTTP/2 client that sends `:authority` without a `Host` header is not
@@ -1201,7 +1141,7 @@ async fn serve_mcp(
     // `mcp_host_origin_guard` layer (applied in `build_mcp_router`) rather than
     // here, so an untrusted Host or disallowed Origin is rejected *before* this
     // handler buffers `body` up to the configured `max_request_size_bytes` —
-    // mirroring how direct routes reject in `trusted_host_middleware` before
+    // mirroring how direct routes reject in `TrustedHostService` before
     // handler extraction.
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -2021,22 +1961,19 @@ fn build_request(
         let Value::Object(map) = query else {
             return Err("`query` must be a JSON object".to_owned());
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs = QueryPairs::new();
         for (key, value) in map {
-            match value {
-                // Form/explode semantics: an array field expands to repeated
-                // keys (`tags=a&tags=b`), matching the OpenAPI query model the
-                // tool schema advertises — not a single `tags=["a","b"]`.
-                Value::Array(items) => {
-                    for item in items {
-                        pairs.push((key.clone(), query_scalar(item)));
-                    }
-                }
-                other => pairs.push((key.clone(), query_scalar(other))),
+            // The tool's own `query` property names get the same rule its
+            // nested object fields do — a dynamic query object can carry an
+            // arbitrary key here, and `filter[x]` would otherwise reach the
+            // decoder as structure rather than as the name the caller sent.
+            if !is_expressible_field_name(key) {
+                return Err(inexpressible_field_name("query"));
             }
+            encode_query_arg(key, value, 1, &mut pairs)?;
         }
-        if !pairs.is_empty() {
-            let qs = serde_urlencoded::to_string(&pairs)
+        if !pairs.pairs.is_empty() {
+            let qs = serde_urlencoded::to_string(&pairs.pairs)
                 .map_err(|e| format!("invalid query arguments: {e}"))?;
             path = format!("{path}?{qs}");
         }
@@ -2102,6 +2039,259 @@ fn query_scalar(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// Upper bound on the pairs one tool call may expand its `query` object into.
+///
+/// `tools/call` arguments are client-supplied and only bounded by the request
+/// body limit (32 MiB by default), while building a bracketed key copies its
+/// whole prefix per child — quadratic in the argument size. Both this and
+/// [`MAX_QUERY_BYTES`] bail out long before that matters, and well inside the
+/// 64 KiB `http::Uri` limit the assembled request would hit anyway.
+const MAX_QUERY_PAIRS: usize = 1024;
+
+/// Upper bound on the total key+value bytes one tool call may expand into.
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Accumulator for the `key=value` pairs a tool call's `query` object expands
+/// Ceiling on **nodes visited** while flattening, whether or not a node emits a
+/// pair.
+///
+/// [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`] bound only what reaches the wire,
+/// so a container of hundreds of thousands of `null` fields paid nothing: each
+/// one still cost a formatted child key (copying the parent), and the all-null
+/// check that rejects it runs only *after* the whole subtree is walked. Charging
+/// every visit stops that traversal at a fixed bound instead, so a body inside
+/// the documented limit cannot amplify into unbounded key-copying work.
+const MAX_QUERY_NODES: usize = 4 * MAX_QUERY_PAIRS;
+
+/// into, enforcing [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
+struct QueryPairs {
+    pairs: Vec<(String, String)>,
+    bytes: usize,
+    nodes: usize,
+}
+
+impl QueryPairs {
+    const fn new() -> Self {
+        Self {
+            pairs: Vec::new(),
+            bytes: 0,
+            nodes: 0,
+        }
+    }
+
+    /// Charge one visited node against [`MAX_QUERY_NODES`].
+    ///
+    /// Called for every node the encoder descends into — including the ones
+    /// that emit nothing (`null`, and containers before their leaves are
+    /// known) — so traversal cost is bounded independently of output size.
+    fn visit(&mut self) -> Result<(), String> {
+        self.nodes += 1;
+        if self.nodes > MAX_QUERY_NODES {
+            return Err(format!(
+                "query arguments traverse more than {MAX_QUERY_NODES} values; \
+                 move the field to a JSON body"
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, key: &str, value: String) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+        if self.pairs.len() >= MAX_QUERY_PAIRS || self.bytes > MAX_QUERY_BYTES {
+            return Err(format!(
+                "query arguments expand past the dispatch limit of {MAX_QUERY_PAIRS} \
+                 parameters / {MAX_QUERY_BYTES} bytes"
+            ));
+        }
+        self.pairs.push((key.to_owned(), value));
+        Ok(())
+    }
+}
+
+/// True when a JSON field name survives the bracketed query encoding.
+///
+/// `[` and `]` are structure in that encoding and an empty name addresses the
+/// append position, so a field called any of those cannot be carried: emitting
+/// it verbatim would invent, move, or lose a nesting level on the way back in.
+/// Applied to every name the encoder introduces — the tool's top-level `query`
+/// properties as well as nested object fields.
+fn is_expressible_field_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('[') && !name.contains(']')
+}
+
+/// The error for a field name [`is_expressible_field_name`] rejects.
+fn inexpressible_field_name(owner: &str) -> String {
+    format!(
+        "query argument `{owner}` has a field name that a query string cannot carry: a name \
+         may not be empty or contain `[` or `]`, which are structure in the query encoding"
+    )
+}
+
+/// Flatten one `query` argument into the `key=value` pairs the
+/// [`Query<T>`](crate::extract::Query) extractor decodes (issue #1972).
+///
+/// The wire format is the extractor's own dialect
+/// ([`query_string`](crate::query_string)), so a tool's advertised
+/// `inputSchema` and the request dispatch actually agree:
+///
+/// * scalars render flat (`page=2`);
+/// * an array of scalars expands to repeated keys (`tags=a&tags=b`) — the
+///   `OpenAPI` `form`/`explode` shape;
+/// * an array containing any container uses explicit positions
+///   (`items[0][sku]=A-1`), so element order survives;
+/// * an object nests by key (`filter[status]=open`).
+///
+/// A `null` **field** renders no pair at all: a query string has no null, and
+/// emitting the literal text `null` would fail the handler's coercion instead
+/// of decoding as the absent/`None` the caller meant.
+///
+/// # Errors
+///
+/// Refuses, rather than silently dispatching something the caller did not ask
+/// for, when the argument cannot be expressed in a query string:
+///
+/// * an **empty** array or object — dropping it would turn a present-but-empty
+///   value into an absent one (and 400 a required field downstream);
+/// * a `null` **array element** — dropping it would shorten the sequence and
+///   shift every later element;
+/// * an object field name that is empty or contains `[` / `]` — those are
+///   structure in the bracketed dialect, so interpolating one would invent or
+///   lose a nesting level;
+/// * nesting past
+///   [`query_string::MAX_DEPTH`](crate::query_string::MAX_DEPTH), or an
+///   expansion past [`MAX_QUERY_PAIRS`] / [`MAX_QUERY_BYTES`].
+fn encode_query_arg(
+    key: &str,
+    value: &Value,
+    depth: usize,
+    out: &mut QueryPairs,
+) -> Result<(), String> {
+    if depth > crate::query_string::MAX_DEPTH {
+        return Err(format!(
+            "query argument `{key}` nests deeper than the maximum of {}",
+            crate::query_string::MAX_DEPTH
+        ));
+    }
+    // Bail before formatting any child key: a single absurd key would otherwise
+    // be copied once per descendant.
+    if key.len() > MAX_QUERY_BYTES {
+        return Err(format!(
+            "query argument key exceeds {MAX_QUERY_BYTES} bytes"
+        ));
+    }
+    // Before descending, and so before any child key is formatted: a `null`
+    // leaf emits no pair, so without this it would pay nothing for the parent
+    // key its sibling count forces the encoder to copy.
+    out.visit()?;
+    let is_container = matches!(value, Value::Array(_) | Value::Object(_));
+    let before = out.pairs.len();
+    match value {
+        Value::Null => {}
+        Value::Array(items) if items.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty array; a query string cannot express an \
+                 empty sequence — omit the argument, or move the field to a JSON body"
+            ));
+        }
+        Value::Array(items) => {
+            if let Some(position) = items.iter().position(Value::is_null) {
+                return Err(format!(
+                    "query argument `{key}[{position}]` is null; a query string cannot \
+                     express a null element — omit it, or move the field to a JSON body"
+                ));
+            }
+            let all_scalar = items
+                .iter()
+                .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
+            if all_scalar {
+                if let [only] = items.as_slice() {
+                    // Repeated keys carry a sequence only from the *second*
+                    // occurrence on: one `tags=only` pair is indistinguishable
+                    // from a scalar, so `deserialize_any` (an untyped
+                    // `serde_json::Value` target) would yield `"only"` for the
+                    // `["only"]` the caller sent — and the field would turn
+                    // back into an array on gaining a second element. The
+                    // explicit position pins the kind. A typed `Vec` target
+                    // decodes either form identically.
+                    out.push(&format!("{key}[0]"), query_scalar(only))?;
+                } else {
+                    for item in items {
+                        out.push(key, query_scalar(item))?;
+                    }
+                }
+            } else {
+                for (index, item) in items.iter().enumerate() {
+                    encode_query_arg(&format!("{key}[{index}]"), item, depth + 1, out)?;
+                }
+            }
+        }
+        Value::Object(fields) if fields.is_empty() => {
+            return Err(format!(
+                "query argument `{key}` is an empty object; a query string cannot express an \
+                 empty object — omit the argument, or move the field to a JSON body"
+            ));
+        }
+        // Every key digit-only means every segment decodes as a *position*
+        // (`query_string::classify_segment`), so the tree comes back a sequence
+        // and an untyped target (`serde_json::Value`, which takes whatever
+        // `deserialize_any` yields) receives an array where the caller sent an
+        // object — with the tell that adding one named key silently flips it
+        // back. A typed map target is unaffected, but the encoder cannot see
+        // the target, so it refuses the shape rather than dispatch a value the
+        // caller did not ask for. Mixed keys are fine: the named one forces the
+        // decoder to promote the whole node to a map.
+        // A `null` field emits no pair, so it cannot disambiguate anything: it
+        // is invisible to the decoder. Judging the shape on *declared* keys let
+        // `{"0": 5, "kind": null}` through, which reaches the wire as the bare
+        // `counts[0]=5` this arm exists to refuse. So the check runs over the
+        // fields that actually emit. An all-null object is left to fall through
+        // to the collapse check below, which describes it better.
+        Value::Object(fields)
+            if {
+                let mut emitting = fields
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .peekable();
+                emitting.peek().is_some()
+                    && emitting.all(|(field, _)| {
+                        !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
+                    })
+            } =>
+        {
+            return Err(format!(
+                "query argument `{key}` is an object whose field names are all numeric; a \
+                 query string cannot tell that from a sequence — rename a field, or move the \
+                 field to a JSON body"
+            ));
+        }
+        Value::Object(fields) => {
+            for (field, nested) in fields {
+                if !is_expressible_field_name(field) {
+                    return Err(inexpressible_field_name(key));
+                }
+                encode_query_arg(&format!("{key}[{field}]"), nested, depth + 1, out)?;
+            }
+        }
+        scalar => out.push(key, query_scalar(scalar))?,
+    }
+    // A container every one of whose leaves is `null` emits no pair at all.
+    // Left alone it would vanish — and inside an array the decoder would then
+    // compact the gap, shortening the sequence. That is the same silent
+    // alteration the empty-container and null-element checks above prevent, so
+    // it is refused here rather than dispatched. A `null` **field** is exempt by
+    // construction: it is not a container, so it stays the absent marker.
+    if is_container && out.pairs.len() == before {
+        return Err(format!(
+            "query argument `{key}` carries no value; a query string cannot express a \
+             container whose every field is null — omit it, or move the field to a JSON body"
+        ));
+    }
+    Ok(())
 }
 
 /// Replace a single `{name}` / `{name:regex}` capture in a path template.
@@ -2493,7 +2683,6 @@ mod tests {
         let degradations = detect_schema_degradations(&schema, true, true);
         assert!(degradations.contains(&SchemaDegradation::OpaqueQuery));
         assert!(degradations.contains(&SchemaDegradation::OpaqueBody));
-        assert!(!degradations.contains(&SchemaDegradation::NestedQuery));
     }
 
     #[test]
@@ -2514,9 +2703,11 @@ mod tests {
     }
 
     #[test]
-    fn detect_degradation_flags_nested_query_object_and_array() {
-        // A query field that is itself an object → nested (flat-encoding cannot
-        // round-trip). Also cover an array-of-objects field.
+    fn detect_degradation_accepts_structured_query_fields() {
+        // Nested objects, arrays of objects, `$ref`s and their nullable
+        // (`oneOf [.., {"type":"null"}]`) forms are all round-trippable now that
+        // `Query<T>` decodes the bracketed dialect `build_request` emits
+        // (issue #1972), so none of them may be reported as a degradation.
         let schema = json!({
             "type": "object",
             "properties": {
@@ -2525,69 +2716,9 @@ mod tests {
                     "properties": {
                         "filter": { "type": "object", "properties": { "min": { "type": "integer" } } },
                         "rows": { "type": "array", "items": { "type": "object", "properties": { "k": { "type": "string" } } } },
-                    },
-                },
-            },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(degradations.contains(&SchemaDegradation::NestedQuery));
-        assert!(!degradations.contains(&SchemaDegradation::OpaqueQuery));
-    }
-
-    #[test]
-    fn detect_degradation_flags_nested_query_via_ref() {
-        // A query field that is a `$ref` to an object def is still nested.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": { "filter": { "$ref": "#/$defs/Filter" } },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery)
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_nested_query_field() {
-        // `filter: Option<Filter>` derives to a nullable `oneOf` (the nested
-        // object branch + a `{"type":"null"}` branch) with no top-level `type`.
-        // The detector must still flag it — `serde_urlencoded` cannot decode the
-        // structured value whether or not the field is optional (issue #1972).
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
-                    },
-                },
-            },
-            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
-        });
-        let degradations = detect_schema_degradations(&schema, true, false);
-        assert!(
-            degradations.contains(&SchemaDegradation::NestedQuery),
-            "nullable nested query field must warn: {degradations:?}"
-        );
-    }
-
-    #[test]
-    fn detect_degradation_flags_nullable_array_of_objects_query_field() {
-        // `filter: Option<Vec<Filter>>` → `oneOf[{array of $ref}, {null}]`.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "filters": { "oneOf": [
+                        "ref_filter": { "$ref": "#/$defs/Filter" },
+                        "maybe_filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
+                        "maybe_rows": { "oneOf": [
                             { "type": "array", "items": { "$ref": "#/$defs/Filter" } },
                             { "type": "null" },
                         ] },
@@ -2597,37 +2728,251 @@ mod tests {
             "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
         });
         assert!(
-            detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable array-of-objects query field must warn"
+            detect_schema_degradations(&schema, true, false).is_empty(),
+            "structured query fields are honored, not degraded"
         );
     }
 
     #[test]
-    fn detect_degradation_ignores_nullable_scalar_query_field() {
-        // `q: Option<String>` → `oneOf[{type:string}, {type:null}]` and
-        // `tags: Option<Vec<String>>` → `oneOf[{array of scalar}, {null}]`: both
-        // are flat-encodable, so neither may produce a false positive.
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "object",
-                    "properties": {
-                        "q": { "oneOf": [ { "type": "string" }, { "type": "null" } ] },
-                        "tags": { "oneOf": [
-                            { "type": "array", "items": { "type": "string" } },
-                            { "type": "null" },
-                        ] },
-                    },
-                },
-            },
-        });
-        assert!(
-            !detect_schema_degradations(&schema, true, false)
-                .contains(&SchemaDegradation::NestedQuery),
-            "nullable scalar / scalar-array query fields must NOT warn"
+    fn encode_query_arg_renders_the_extractor_dialect() {
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("scalar array");
+        encode_query_arg("filter", &json!({ "status": "open" }), 1, &mut pairs).expect("object");
+        encode_query_arg("items", &json!([{ "sku": "A" }]), 1, &mut pairs).expect("object array");
+        assert_eq!(
+            pairs.pairs,
+            vec![
+                ("page".to_owned(), "2".to_owned()),
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned()),
+                ("filter[status]".to_owned(), "open".to_owned()),
+                ("items[0][sku]".to_owned(), "A".to_owned()),
+            ]
         );
+    }
+
+    #[test]
+    fn encode_query_arg_omits_null_fields_rather_than_stringifying_them() {
+        // A null argument is the documented "absent" marker: no pair, no error.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("page", &json!(null), 1, &mut pairs).expect("null");
+        assert!(
+            pairs.pairs.is_empty(),
+            "a null argument renders no pair: {:?}",
+            pairs.pairs
+        );
+
+        // The same holds for a null field alongside a carried one — only a
+        // container that collapses ENTIRELY is refused (see the collapse test).
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": null, "kind": "a" }),
+            1,
+            &mut pairs,
+        )
+        .expect("null field beside a carried one");
+        assert_eq!(
+            pairs.pairs,
+            vec![("filter[kind]".to_owned(), "a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_values_a_query_string_cannot_carry() {
+        // Each of these would otherwise dispatch something the caller did not
+        // ask for: a vanished field, a shortened sequence, or an invented
+        // nesting level (issue #1972 review follow-ups).
+        for (label, value) in [
+            ("empty array", json!({ "tags": [] })),
+            ("empty object", json!({ "filter": {} })),
+            ("empty nested array", json!({ "matrix": [[1], []] })),
+            ("null array element", json!({ "tags": ["a", null] })),
+            (
+                "null object-array element",
+                json!({ "items": [null, { "sku": "A" }] }),
+            ),
+            ("bracket in field name", json!({ "filter": { "a[b]": 1 } })),
+            ("empty field name", json!({ "filter": { "": 1 } })),
+        ] {
+            let mut pairs = QueryPairs::new();
+            let Value::Object(fields) = &value else {
+                unreachable!()
+            };
+            let result = fields
+                .iter()
+                .try_for_each(|(key, v)| encode_query_arg(key, v, 1, &mut pairs));
+            assert!(
+                result.is_err(),
+                "{label} must be refused, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_containers_that_collapse_to_nothing() {
+        // Codex P2: every field of an element being null emits no pair, so the
+        // element would vanish and the decoder would compact the gap — the same
+        // silent shortening a direct null element is already refused for.
+        let mut pairs = QueryPairs::new();
+        assert!(
+            encode_query_arg(
+                "items",
+                &json!([{ "note": null }, { "note": "x" }]),
+                1,
+                &mut pairs
+            )
+            .is_err(),
+            "an all-null element must not silently shorten the sequence"
+        );
+
+        // Same one level up, for an object-typed field.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "note": null }), 1, &mut pairs).is_err());
+
+        // A `null` FIELD is still the documented absent marker, not a collapse.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("filter", &json!({ "a": 1, "b": null }), 1, &mut pairs).expect("partial");
+        assert_eq!(pairs.pairs, vec![("filter[a]".to_owned(), "1".to_owned())]);
+    }
+
+    #[test]
+    fn top_level_query_keys_are_validated_like_nested_field_names() {
+        // Codex P2: a dynamic query object can carry an arbitrary top-level
+        // key, and `filter[x]` would otherwise reach the decoder as structure.
+        assert!(!is_expressible_field_name("filter[x]"));
+        assert!(!is_expressible_field_name(""));
+        assert!(!is_expressible_field_name("a]b"));
+        assert!(is_expressible_field_name("filter"));
+        assert!(is_expressible_field_name("sort_by"));
+    }
+
+    #[test]
+    fn encode_query_arg_bounds_its_expansion() {
+        // A wide array cannot be turned into an unbounded pair list: expansion
+        // stops at the dispatch limit instead of building a giant URI.
+        let wide: Vec<Value> = (0..(MAX_QUERY_PAIRS * 2)).map(|i| json!(i)).collect();
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("tags", &Value::Array(wide), 1, &mut pairs).is_err());
+
+        // A single absurd key is refused before any child key is formatted.
+        let mut pairs = QueryPairs::new();
+        let huge = "k".repeat(MAX_QUERY_BYTES + 1);
+        assert!(encode_query_arg(&huge, &json!({ "a": 1 }), 1, &mut pairs).is_err());
+    }
+
+    #[test]
+    fn encode_query_arg_charges_null_leaves_for_the_traversal_they_cost() {
+        // Codex P2: `null` emits no pair, so a container of them paid nothing
+        // against the pair/byte limits while still forcing one formatted child
+        // key per field — the all-null check only fires after the full walk.
+        // The traversal budget now stops it early.
+        let nulls: serde_json::Map<String, Value> = (0..(MAX_QUERY_NODES * 2))
+            .map(|i| (format!("f{i}"), Value::Null))
+            .collect();
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("root", &Value::Object(nulls), 1, &mut pairs)
+            .expect_err("a traversal this wide must be refused");
+        assert!(err.contains("traverse"), "{err}");
+        assert!(
+            pairs.nodes <= MAX_QUERY_NODES + 1,
+            "traversal must stop at the bound, visited {}",
+            pairs.nodes
+        );
+
+        // The budget is generous enough that ordinary nesting is unaffected.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg(
+            "filter",
+            &json!({ "status": "open", "tag": null }),
+            1,
+            &mut pairs,
+        )
+        .expect("a small object still encodes");
+    }
+
+    #[test]
+    fn encode_query_arg_refuses_an_all_numeric_keyed_object() {
+        // Codex P2: every key digit-only decodes as a sequence, so an untyped
+        // target would receive an array where the caller sent an object.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "1": 6 }), 1, &mut pairs)
+            .expect_err("an all-numeric-keyed object is ambiguous on the wire");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // One named key is enough to force map promotion on the way back in,
+        // so the mixed shape stays expressible.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "total": 6 }), 1, &mut pairs)
+            .expect("a mixed-key object round-trips as a map");
+
+        // The check is per-object, so it also catches a nested one.
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("filter", &json!({ "by": { "7": "x" } }), 1, &mut pairs).is_err());
+
+        // An empty field name still gets its own, more specific error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "": 1 }), 1, &mut pairs)
+            .expect_err("an empty field name is inexpressible");
+        assert!(err.contains("may not be empty"), "{err}");
+    }
+
+    #[test]
+    fn a_singleton_scalar_array_keeps_its_container_kind() {
+        // Codex P2: one repeated key is indistinguishable from a scalar, so a
+        // one-element array must use the explicit position instead.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["only"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![("tags[0]".to_owned(), "only".to_owned())],
+            "a singleton must pin its kind"
+        );
+
+        // Two or more still use the repeated-key (OpenAPI form/explode) shape.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("tags", &json!(["a", "b"]), 1, &mut pairs).expect("encodes");
+        assert_eq!(
+            pairs.pairs,
+            vec![
+                ("tags".to_owned(), "a".to_owned()),
+                ("tags".to_owned(), "b".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_numeric_object_check_ignores_fields_that_emit_nothing() {
+        // Codex P2: a `null` field emits no pair, so it cannot disambiguate —
+        // judging on declared keys let this reach the wire as bare `counts[0]=5`.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": 5, "kind": null }), 1, &mut pairs)
+            .expect_err("the null field cannot disambiguate");
+        assert!(err.contains("all numeric"), "{err}");
+
+        // A named field that *does* emit still disambiguates, as before.
+        let mut pairs = QueryPairs::new();
+        encode_query_arg("counts", &json!({ "0": 5, "kind": "x" }), 1, &mut pairs)
+            .expect("an emitting named key resolves the shape");
+
+        // An all-null object keeps its own, more specific collapse error.
+        let mut pairs = QueryPairs::new();
+        let err = encode_query_arg("counts", &json!({ "0": null }), 1, &mut pairs)
+            .expect_err("an all-null object carries no value");
+        assert!(err.contains("carries no value"), "{err}");
+    }
+
+    #[test]
+    fn encode_query_arg_rejects_nesting_past_the_decoder_cap() {
+        // Build an object nested one level deeper than the decoder accepts, so
+        // the encoder refuses instead of emitting keys the extractor rejects.
+        let mut value = json!("leaf");
+        for _ in 0..crate::query_string::MAX_DEPTH {
+            value = json!({ "deeper": value });
+        }
+        let mut pairs = QueryPairs::new();
+        assert!(encode_query_arg("root", &value, 1, &mut pairs).is_err());
     }
 
     #[test]

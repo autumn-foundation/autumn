@@ -2070,13 +2070,42 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
                 placeholder="Leave blank to keep current"
                 autocomplete="new-password";
         },
-        AdminFieldKind::Json => html! {
-            textarea class="form-input" name=(field.name) id=(field.name)
-                style="font-family: monospace; min-height: 150px;"
-                required[field.required] {
-                (str_val)
+        AdminFieldKind::Json => {
+            // `str_val` above unwraps a `Value::String` to its raw text (right
+            // for Text/TextArea, where the stored value *is* plain text), but a
+            // JSON textarea round-trips through `coerce_form_value`'s
+            // `serde_json::from_str`, which needs JSON syntax back — a stored
+            // top-level string like `"hello"` must render WITH its quotes, or a
+            // pure no-op resave either fails to parse (`hello` isn't valid JSON)
+            // or silently changes type (a stored string `"true"`/`"42"` reparses
+            // as a bool/number).
+            //
+            // `current_value` collapses two different situations into the same
+            // `Value::Null` — no `record` at all (CREATE: nothing to prefill,
+            // must always render blank regardless of required-ness) and a
+            // REQUIRED column's genuinely-stored JSON scalar `null` (EDIT: a
+            // NOT NULL JSONB column can still hold `null` — it just can't be
+            // SQL NULL — so blank would be wrong: it'd let the browser's
+            // `required` attribute block saving any OTHER field without the
+            // admin re-typing `null` by hand, and a programmatic blank
+            // submission would coerce into the string `""` instead of
+            // round-tripping back to `Value::Null`). So this reads `record`
+            // directly instead of reusing `current_value`, matching only a
+            // genuinely nullable-and-null EDIT to blank (Codex review finding
+            // on #1341).
+            let json_val = match record.and_then(|r| r.get(field.name)) {
+                None => String::new(),
+                Some(Value::Null) if !field.required => String::new(),
+                Some(v) => v.to_string(),
+            };
+            html! {
+                textarea class="form-input" name=(field.name) id=(field.name)
+                    style="font-family: monospace; min-height: 150px;"
+                    required[field.required] {
+                    (json_val)
+                }
             }
-        },
+        }
     }
 }
 
@@ -2394,6 +2423,82 @@ mod tests {
         assert!(
             !form.contains("••••••••"),
             "create control is an empty input, not the redaction mask: {form}"
+        );
+    }
+
+    #[test]
+    fn json_edit_form_prefills_a_stored_string_scalar_with_its_quotes() {
+        // Issue #1341 review: a stored top-level JSON string like `"hello"`
+        // must render WITH its quotes in the edit textarea. Without them, a
+        // pure no-op resave either fails `coerce_form_value`'s JSON parse
+        // (`hello` isn't valid JSON) or, worse, silently changes the value's
+        // type (a stored `"true"`/`"42"` string would reparse as a bool/number).
+        let field = AdminField::new("config", AdminFieldKind::Json);
+
+        let record = serde_json::json!({ "config": "hello" });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("&quot;hello&quot;") || form.contains("\"hello\""),
+            "stored JSON string must render with its quotes intact: {form}"
+        );
+
+        // A string that looks like another JSON literal must round-trip as
+        // the SAME string, not silently become that other type.
+        let record = serde_json::json!({ "config": "true" });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("&quot;true&quot;") || form.contains("\"true\""),
+            "a stored JSON string \"true\" must not render as the bare word true: {form}"
+        );
+
+        // Object/array values were already correct — no regression.
+        let record = serde_json::json!({ "config": {"a": 1} });
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains("{&quot;a&quot;:1}") || form.contains(r#"{"a":1}"#),
+            "object values still render as JSON: {form}"
+        );
+
+        // A NULL value on an OPTIONAL field renders as a blank textarea,
+        // matching the existing "blank means no value" convention.
+        let optional_field = AdminField::new("config", AdminFieldKind::Json).optional();
+        let record = serde_json::json!({ "config": null });
+        let form = render_form_widget(&optional_field, Some(&record)).into_string();
+        assert!(
+            !form.contains("null"),
+            "an optional NULL json value should render blank, not the literal word null: {form}"
+        );
+
+        // A NULL value on a REQUIRED field is the legitimate JSON scalar
+        // `null` (a NOT NULL JSONB column can still hold the JSON literal
+        // `null` — it just can't be SQL NULL), not an absent value, and must
+        // render as the literal text `null`. Rendering it blank would let the
+        // browser's `required` attribute block saving any other field on the
+        // record without the admin re-typing `null` by hand, and a
+        // programmatic blank submission would coerce into `""` instead of
+        // round-tripping back to `Value::Null` (Codex review finding on
+        // #1341).
+        let form = render_form_widget(&field, Some(&record)).into_string();
+        assert!(
+            form.contains(">null<") || form.contains("null"),
+            "a required NULL json value must render the literal `null`, not blank: {form}"
+        );
+    }
+
+    #[test]
+    fn json_create_form_starts_blank_even_when_required() {
+        // Issue #1341 review follow-up: `record: None` means CREATE — there is
+        // no stored value to prefill at all, which must NOT be conflated with
+        // a required field's genuinely-stored `Value::Null` (tested above).
+        // Both collapse to the same `current_value` if read through the
+        // shared default, so the widget must distinguish "no record" from "a
+        // null value in the record" directly.
+        let field = AdminField::new("config", AdminFieldKind::Json);
+        let form = render_form_widget(&field, None).into_string();
+        assert!(
+            !form.contains("null"),
+            "a brand-new required json field on the CREATE form must start blank, \
+             not prefilled with the literal word null: {form}"
         );
     }
 

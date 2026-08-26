@@ -11,6 +11,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -65,7 +67,7 @@ fn compute_body_hash(bytes: &[u8], content_type: Option<&[u8]>) -> Vec<u8> {
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
         |mut out, byte| {
             use std::fmt::Write as _;
             let _ = write!(out, "{byte:02x}");
@@ -460,11 +462,6 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
-/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
-/// `Instant + Duration`. This constant is itself always representable when
-/// added to a fresh `Instant`, so it can never re-trigger the overflow.
-const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
-
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
 /// overflow.
 ///
@@ -473,14 +470,10 @@ const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
 /// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
 /// via configured TTLs) triggers this. Instead of panicking we clamp the
 /// deadline to ~10 years out (far enough that the entry is effectively
-/// non-expiring), falling back to `now` only in the astronomically unlikely
-/// event that even the clamped horizon is not representable.
+/// non-expiring). See [`crate::time_math::saturating_deadline`], which the
+/// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(ttl).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
-            .unwrap_or(now)
-    })
+    crate::time_math::saturating_deadline(Instant::now(), ttl)
 }
 
 impl MemoryIdempotencyStore {
@@ -989,6 +982,7 @@ pub struct IdempotencyLayer {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl IdempotencyLayer {
@@ -1002,7 +996,19 @@ impl IdempotencyLayer {
             replay_through_inner: false,
             fail_closed_on_replay: false,
             metrics: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Inject the entropy source used to mint in-flight lock owner ids.
+    ///
+    /// Defaults to [`crate::entropy::OsEntropy`]; the framework threads the
+    /// app's seeded source here so lock ids replay deterministically under a
+    /// fixed simulation seed.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     #[must_use]
@@ -1050,6 +1056,7 @@ impl<S> Layer<S> for IdempotencyLayer {
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 }
@@ -1066,6 +1073,7 @@ pub struct IdempotencyService<S> {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 struct IdempotencyRequestConfig {
@@ -1075,6 +1083,7 @@ struct IdempotencyRequestConfig {
     replay_through_inner: bool,
     fail_closed_on_replay: bool,
     metrics: Option<crate::middleware::MetricsCollector>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl<S> Service<Request<Body>> for IdempotencyService<S>
@@ -1106,6 +1115,7 @@ where
             replay_through_inner: self.replay_through_inner,
             fail_closed_on_replay: self.fail_closed_on_replay,
             metrics: self.metrics.clone(),
+            entropy: self.entropy.clone(),
         };
         Box::pin(handle_idempotent_request(inner, config, req))
     }
@@ -1377,10 +1387,17 @@ fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
     (!key.is_empty()).then(|| key.to_owned())
 }
 
-fn in_flight_lock_owner() -> String {
-    uuid::Uuid::new_v4().to_string()
+fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
+    entropy.uuid_v4().to_string()
 }
 
+// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
+// 128 bytes — that is `axum::response::Response`'s own size, not something this
+// crate chose. Returning a ready-made rejection response IS the idiom here, and
+// boxing it would add an allocation to every rejection path to satisfy a size
+// heuristic. Allowed at the site rather than workspace-wide so the lint stays
+// armed for error types we do control.
+#[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
     req: Request<Body>,
@@ -1440,12 +1457,13 @@ fn stale_cookie_fallback_in_flight(
     store: &dyn IdempotencyStore,
     prepared: &PreparedIdempotencyRequest,
     in_flight_ttl: Duration,
+    entropy: &dyn crate::entropy::Entropy,
 ) -> bool {
     let Some(key) = prepared.stale_cookie_storage_key.as_deref() else {
         return false;
     };
 
-    let owner = in_flight_lock_owner();
+    let owner = in_flight_lock_owner(entropy);
     if store.try_lock_owned(key, &owner, in_flight_ttl) {
         store.unlock_owned(key, &owner);
         false
@@ -1486,6 +1504,7 @@ where
         replay_through_inner,
         fail_closed_on_replay,
         metrics,
+        entropy,
     } = config;
 
     if !is_mutating_method(req.method()) {
@@ -1525,7 +1544,7 @@ where
         }
     }
 
-    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl) {
+    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl, entropy.as_ref()) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Stale session cookie idempotency key already in flight — returning 409"
@@ -1537,7 +1556,7 @@ where
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    let lock_owner = in_flight_lock_owner();
+    let lock_owner = in_flight_lock_owner(entropy.as_ref());
     if !store.try_lock_owned(&prepared.storage_key, &lock_owner, in_flight_ttl) {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
@@ -1880,6 +1899,31 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    /// W3 (issue #1797): the in-flight lock owner id is minted from the injected
+    /// entropy source, so a fixed seed reproduces the exact lock-owner stream.
+    #[test]
+    fn in_flight_lock_owner_is_deterministic_under_seeded_entropy() {
+        use crate::entropy::SeededEntropy;
+
+        let a = SeededEntropy::new(0x5eed);
+        let b = SeededEntropy::new(0x5eed);
+        for _ in 0..5 {
+            assert_eq!(
+                in_flight_lock_owner(&a),
+                in_flight_lock_owner(&b),
+                "same seed ⇒ identical lock-owner stream"
+            );
+        }
+        // The owner is a well-formed v4 UUID string.
+        let owner = in_flight_lock_owner(&SeededEntropy::new(1));
+        assert!(uuid::Uuid::parse_str(&owner).is_ok());
+        // A different seed diverges.
+        assert_ne!(
+            in_flight_lock_owner(&SeededEntropy::new(1)),
+            in_flight_lock_owner(&SeededEntropy::new(2)),
+        );
+    }
 
     #[derive(Clone, Default)]
     struct RecordingStore {

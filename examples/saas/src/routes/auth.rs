@@ -9,6 +9,7 @@ use autumn_web::auth::{hash_password, validate_password, verify_password};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::http::{HeaderMap, HeaderValue, header::SET_COOKIE};
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::security::SubmitToken;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
@@ -43,7 +44,14 @@ const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfN
 /// Render the signup form, optionally with a validation error. The minimum
 /// length reflects the active `[auth.password]` policy so the `minlength`
 /// attribute always matches what the handler enforces.
-fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
+///
+/// `submit_token` is a fresh one-time token embedded as a hidden
+/// `_submit_token` field. The framework's `SubmitTokenLayer` consumes it on the
+/// POST so a double-clicked or browser-retried signup runs exactly once and
+/// cannot create a duplicate account — no client-side JavaScript involved. A
+/// new token is minted on every render (including this error re-render), so the
+/// corrected resubmit carries a fresh token rather than a spent one.
+fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
@@ -53,6 +61,7 @@ fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
                 p class="mb-4 text-sm text-red-600" role="alert" { (error) }
             }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
+                input type="hidden" name="_submit_token" value=(submit_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
                     input #email type="email" name="email" required autocomplete="email"
@@ -76,14 +85,22 @@ fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
 }
 
 #[get("/signup")]
-pub async fn signup_form(State(state): State<AppState>) -> Markup {
-    signup_page(state.config().auth.password.min_length, None)
+pub async fn signup_form(State(state): State<AppState>, submit_token: SubmitToken) -> Markup {
+    signup_page(
+        state.config_arc().auth.password.min_length,
+        submit_token.token(),
+        None,
+    )
 }
 
 #[post("/signup")]
 pub async fn signup(
     State(state): State<AppState>,
     session: Session,
+    // A fresh token for the error re-render below; the token that guarded THIS
+    // request has already been consumed by `SubmitTokenLayer` before the handler
+    // ran, so the re-rendered form must carry a new one.
+    submit_token: SubmitToken,
     mut db: Db,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
@@ -104,7 +121,10 @@ pub async fn signup(
     // the email, and optional HIBP breach check). On failure, re-render the form
     // with the specific message at HTTP 200 rather than accepting a weak
     // credential.
-    let password_cfg = state.config().auth.password;
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section just to read `[auth.password]` on a request path.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {
         // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
@@ -121,7 +141,12 @@ pub async fn signup(
         } else {
             messages.join("\n")
         };
-        return Ok(signup_page(password_cfg.min_length, Some(&message)).into_response());
+        return Ok(signup_page(
+            password_cfg.min_length,
+            submit_token.token(),
+            Some(&message),
+        )
+        .into_response());
     }
 
     // Each account gets its own isolated tenant; email is the unique identifier
@@ -227,14 +252,18 @@ pub async fn login(
     // Persistent "remember-me" opt-in (issue #1397): when the box is ticked and
     // the policy allows it, mint a rotating remember chain and attach its cookie
     // alongside the session cookie. Unticked → behaviour is unchanged.
-    if form.remember.is_some() && state.config().auth.remember.enabled {
+    // One shared read of the config for both the opt-in check and the resolved
+    // `[auth.remember]` section below — `config()` would deep-clone the whole
+    // config twice per login.
+    let config = state.config_arc();
+    if form.remember.is_some() && config.auth.remember.enabled {
         // Thread the resolved `[auth.remember]` config so cookie_name/duration
         // overrides are honoured (issue #1397.2).
-        let remember_cfg = state.config().auth.remember.clone();
+        let remember_cfg = &config.auth.remember;
         // `Db` derefs to the underlying connection; `&mut *db` reborrows it.
         let cookie = crate::remember::issue_remember_cookie(
             &mut db,
-            &remember_cfg,
+            remember_cfg,
             user.id,
             &user.tenant_id,
             &headers,
@@ -258,13 +287,15 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> AutumnResult<Response> {
     // Thread the resolved `[auth.remember]` config so an overridden cookie name
-    // is the one we revoke and clear (issue #1397.2).
-    let remember_cfg = state.config().auth.remember.clone();
+    // is the one we revoke and clear (issue #1397.2). Read through the shared
+    // `Arc` — a logout must not deep-clone every config section.
+    let config = state.config_arc();
+    let remember_cfg = &config.auth.remember;
 
     // Revoke this device's remember chain (issue #1397) before tearing the
     // session down, so a stolen remember cookie cannot re-establish a login
     // after logout. No-op when no remember cookie is present.
-    crate::remember::revoke_current_chain(&mut db, &remember_cfg, &headers).await;
+    crate::remember::revoke_current_chain(&mut db, remember_cfg, &headers).await;
 
     // Clear the session contents and rotate the id so the old cookie cannot be
     // replayed.
@@ -273,7 +304,7 @@ pub async fn logout(
 
     let mut response = Redirect::to("/").into_response();
     if let Ok(header_value) =
-        HeaderValue::from_str(&crate::remember::clear_remember_cookie(&remember_cfg))
+        HeaderValue::from_str(&crate::remember::clear_remember_cookie(remember_cfg))
     {
         response.headers_mut().append(SET_COOKIE, header_value);
     }

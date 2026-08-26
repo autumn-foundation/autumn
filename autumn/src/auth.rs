@@ -748,7 +748,7 @@ impl Default for SessionTrackingConfig {
 /// Passwordless magic-link login configuration (issue #1737).
 ///
 /// Read from the `[auth.magic_link]` section of `autumn.toml`. Consumed by the
-/// routes emitted by `autumn generate auth --magic-link` via `state.config()`.
+/// routes emitted by `autumn generate auth --magic-link` via `state.config_arc()`.
 /// All fields have safe production defaults.
 ///
 /// ```toml
@@ -2986,9 +2986,11 @@ mod tests {
             replica_pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(all(feature = "db", feature = "reporting"))]
+            db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
-            started_at: std::time::Instant::now(),
+            started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
@@ -3006,9 +3008,10 @@ mod tests {
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: auth_session_key.to_owned(),
+            auth_session_key: auth_session_key.into(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             app_id: crate::state::AppState::next_app_id(),
         }
     }
@@ -4990,7 +4993,7 @@ mod api_token_tests {
         let app = axum::Router::new()
             .route("/api/private", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(store))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(

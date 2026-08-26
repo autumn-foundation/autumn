@@ -1,0 +1,5 @@
+error: `#[edge]` cannot be combined with `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]` — the edge capsule has no session or auth state; serve this route from the origin
+  --> tests/compile-fail/edge_with_secured.rs:12:3
+   |
+12 | #[edge]
+   |   ^^^^

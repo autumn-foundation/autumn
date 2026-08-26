@@ -122,13 +122,16 @@ pub fn cache_fragment_global(
 #[cfg(all(test, feature = "cache-moka"))]
 mod tests {
     use std::sync::Arc;
+    use std::sync::PoisonError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use maud::{Markup, html};
 
     use super::{cache_fragment, cache_fragment_global};
-    use crate::cache::{Cache, MokaCache, clear_global_cache, set_global_cache};
+    use crate::cache::{
+        Cache, GLOBAL_CACHE_TEST_LOCK, MokaCache, clear_global_cache, set_global_cache,
+    };
 
     fn make_cache(capacity: u64) -> MokaCache {
         MokaCache::new(capacity, None)
@@ -361,6 +364,10 @@ mod tests {
 
     #[test]
     fn global_variant_hits_process_global_cache() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         clear_global_cache();
 
         let moka = Arc::new(MokaCache::new(100, None));
@@ -393,6 +400,10 @@ mod tests {
 
     #[test]
     fn global_variant_no_global_cache_renders_fallback() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         clear_global_cache();
 
         let result = cache_fragment_global("post:fallback", "v1", None, || html! { span { "ok" } });

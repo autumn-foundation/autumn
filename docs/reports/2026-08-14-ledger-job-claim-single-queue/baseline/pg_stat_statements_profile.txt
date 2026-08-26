@@ -1,0 +1,94 @@
+Output format is aligned.
+Border style is 2.
++---------------------------+
+|          section          |
++---------------------------+
+| TOP BY BUFFERS (hit+read) |
++---------------------------+
+(1 row)
+
++-------+---------------+--------------+--------------------------------------------------------------------------------------------+
+| calls | total_buffers | temp_written |                                           query                                            |
++-------+---------------+--------------+--------------------------------------------------------------------------------------------+
+|     1 |        167025 |            0 | DO $$                                                                                     +|
+|       |               |              | DECLARE                                                                                   +|
+|       |               |              |   i INT;                                                                                  +|
+|       |               |              | BEGIN                                                                                     +|
+|       |               |              |   FOR i IN 1..50 LOOP                                                                     +|
+|       |               |              |     UPDATE autumn_jobs                                                                    +|
+|       |               |              |     SET status =                                                                           |
+|    50 |        166437 |            0 | UPDATE autumn_jobs                                                                        +|
+|       |               |              |     SET status = $1, started_at = NOW(), claimed_by = $2, claimed_at =                     |
+|     1 |         11096 |            0 | DO $$                                                                                     +|
+|       |               |              | DECLARE                                                                                   +|
+|       |               |              |   i INT;                                                                                  +|
+|       |               |              |   r RECORD;                                                                               +|
+|       |               |              | BEGIN                                                                                     +|
+|       |               |              |   FOR i IN 1..5 LOOP                                                                      +|
+|       |               |              |     PERFORM (SELECT COALESCE                                                               |
+|     5 |          9535 |            0 | SELECT id FROM autumn_jobs                                                                +|
+|       |               |              |       WHERE status = $1 AND (run_at IS NULL OR run_at <= NOW())                            |
+|     5 |          1415 |            0 | SELECT (SELECT COALESCE(SUM(CASE WHEN run_at IS NULL OR run_at <= NOW() THEN $1 ELSE $2 EN |
+|     1 |           743 |            0 | DO $$                                                                                     +|
+|       |               |              | DECLARE                                                                                   +|
+|       |               |              |   i INT;                                                                                  +|
+|       |               |              | BEGIN                                                                                     +|
+|       |               |              |   FOR i IN 1..50 LOOP                                                                     +|
+|       |               |              |     INSERT INTO autumn_jobs (id, name,                                                     |
+|    50 |           709 |            0 | INSERT INTO autumn_jobs (id, name, queue, status, payload, attempt, max_attempts, enqueued |
+|     5 |           110 |            0 | SELECT id FROM autumn_jobs                                                                +|
+|       |               |              |       WHERE status = $1 AND run_at > NOW()                                                +|
+|       |               |              |       ORDER BY run_a                                                                       |
+|     1 |             0 |            0 | SELECT pg_stat_statements_reset()                                                          |
+|     1 |             0 |            0 | SELECT $1 AS section                                                                       |
++-------+---------------+--------------+--------------------------------------------------------------------------------------------+
+(10 rows)
+
++-------------------------------------+
+|               section               |
++-------------------------------------+
+| TOTAL BUFFERS ACROSS ALL STATEMENTS |
++-------------------------------------+
+(1 row)
+
++---------------+-------------+
+| total_buffers | total_calls |
++---------------+-------------+
+|        357073 |         122 |
++---------------+-------------+
+(1 row)
+
++--------------+
+|   section    |
++--------------+
+| TOP BY CALLS |
++--------------+
+(1 row)
+
++-------+---------------+--------------------------------------------------------------------------------------------+
+| calls | total_buffers |                                           query                                            |
++-------+---------------+--------------------------------------------------------------------------------------------+
+|    50 |           709 | INSERT INTO autumn_jobs (id, name, queue, status, payload, attempt, max_attempts, enqueued |
+|    50 |        166437 | UPDATE autumn_jobs                                                                        +|
+|       |               |     SET status = $1, started_at = NOW(), claimed_by = $2, claimed_at =                     |
+|     5 |           110 | SELECT id FROM autumn_jobs                                                                +|
+|       |               |       WHERE status = $1 AND run_at > NOW()                                                +|
+|       |               |       ORDER BY run_a                                                                       |
+|     5 |          1415 | SELECT (SELECT COALESCE(SUM(CASE WHEN run_at IS NULL OR run_at <= NOW() THEN $1 ELSE $2 EN |
+|     5 |          9535 | SELECT id FROM autumn_jobs                                                                +|
+|       |               |       WHERE status = $1 AND (run_at IS NULL OR run_at <= NOW())                            |
+|     3 |             0 | SELECT $1 AS section                                                                       |
+|     1 |             0 | SELECT sum(shared_blks_hit + shared_blks_read) AS total_buffers, sum(calls) AS total_calls |
+|     1 |             0 | SELECT pg_stat_statements_reset()                                                          |
+|     1 |           743 | DO $$                                                                                     +|
+|       |               | DECLARE                                                                                   +|
+|       |               |   i INT;                                                                                  +|
+|       |               | BEGIN                                                                                     +|
+|       |               |   FOR i IN 1..50 LOOP                                                                     +|
+|       |               |     INSERT INTO autumn_jobs (id, name,                                                     |
+|     1 |             3 | SELECT                                                                                    +|
+|       |               |   calls,                                                                                  +|
+|       |               |   round((shared_blks_hit + shared_blks_read)::numeric, $1) AS total_buffer                 |
++-------+---------------+--------------------------------------------------------------------------------------------+
+(10 rows)
+

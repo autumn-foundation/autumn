@@ -30,8 +30,8 @@ Enable the `storage` feature on `autumn-web` (for the Local backend and the
 
 ```toml
 [dependencies]
-autumn-web       = { version = "0.5", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.5"   # only needed when storage.backend = "s3"
+autumn-web       = { version = "0.7", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.7"   # only needed when storage.backend = "s3"
 ```
 
 The framework gives you a working `Local` backend in `dev` out of the
@@ -214,8 +214,8 @@ Add `autumn-storage-s3` to your `Cargo.toml` and wire it up in `main`:
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.5", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.5"
+autumn-web        = { version = "0.7", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.7"
 ```
 
 ```rust,ignore
@@ -262,7 +262,46 @@ The S3 plugin lives in its own crate (`autumn-storage-s3`) so apps
 that don't need S3 don't pull in the AWS SDK tree. Peer plugins for
 other providers (GCS, Azure, B2) follow the same pattern.
 
+## Scaffolded uploads (no JavaScript)
+
+You rarely need to write any of the above by hand. Give `generate scaffold` an
+`Attachment` column and the whole upload path is emitted for you:
+
+```bash
+autumn generate scaffold post title:String cover:Attachment
+```
+
+The generated form carries `enctype="multipart/form-data"` and a plain
+`<input type="file">`; the `create`/`update` handlers take an
+`autumn_web::extract::Multipart` body, stream each file part to the configured
+`BlobStore` with `save_to_blob_store`, and persist the returned `Blob` on the
+record. An edit that doesn't re-upload preserves the existing attachment. The
+show and edit views render the stored file as a signed, time-bounded download
+link. No presign endpoint, no client JavaScript.
+
+The scaffold enables the `storage` and `multipart` features on `autumn-web` for
+you, but it does **not** write your `[storage]` config — `backend` defaults to
+`disabled`, so add the block above (`backend = "local"` for development) or the
+first upload answers `500 storage not configured`. The generator prints this
+reminder when it scaffolds an `Attachment` column.
+
+Uploads are capped by `security.upload.max_file_size_bytes` (default 16 MiB,
+exceeded → `413`) and `security.upload.max_request_size_bytes` (default 32 MiB).
+CSRF adds no ceiling of its own: the generated form renders the CSRF and
+submit-token hidden inputs as its first fields, so they always land inside
+`security.csrf.token_scan_bytes`.
+
+Because the local backend serves blobs from your app's own origin with the
+content type they were uploaded under, restrict what can be stored with
+`security.upload.allowed_mime_types` (and `reject_on_content_type_mismatch`)
+whenever uploads come from untrusted users.
+
 ## Direct uploads
+
+Direct-to-storage presigned uploads are the **opt-in advanced path** — reach for
+them when files are large enough that you don't want the bytes flowing through
+the app process, not as the default. The scaffolded multipart path above needs
+no JavaScript; this one does.
 
 Large files (video, high-res images, bulk CSV) can bypass the Autumn process
 entirely and go straight from the browser to the storage backend. The pattern:

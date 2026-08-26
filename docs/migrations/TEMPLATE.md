@@ -1,15 +1,23 @@
-# Migrating from Autumn `X.Y` to `(X+1).0`
+# Migrating from Autumn `X.Y` to `X.Z`
 
-> **Template.** Copy this file to `docs/migrations/<X.Y>-to-<X+1.0>.md`
-> when drafting the guide for the next major release. Replace every
-> `{placeholder}` with concrete content and delete sections that do not
-> apply. Link the new file from
-> [`docs/migrations/README.md`](README.md).
+> **Template.** Copy this file to `docs/migrations/next.md` with the first
+> breaking change that lands after a release; it is renamed to
+> `docs/migrations/<version>.md` when that release ships.
+>
+> **Delete this banner block in the copy** — and replace every `{placeholder}`
+> with concrete content. `scripts/check-migration-guides.sh` fails on both.
+>
+> Delete sections that do not apply, **except** these six, which the gate
+> requires and which must each have content under them:
+> *At a glance*, *Summary*, *Before you start*, *Breaking changes*,
+> *How to verify*, *Guide-only upgrade walkthrough*.
+>
+> Link the new file from [`docs/migrations/README.md`](README.md).
 
 ## At a glance
 
 - **Old version:** `autumn-web {X.Y.Z}`
-- **New version:** `autumn-web {(X+1).0.0}`
+- **New version:** `autumn-web {X.Z.0}`
 - **Expected upgrade effort:** {S / M / L — one paragraph of context}
 - **MSRV delta:** `{old MSRV}` → `{new MSRV}` ({reason, or "unchanged"})
 - **Carried dependency majors:** {e.g. `axum 0.8 → 0.9`, `diesel 2 → 3`,
@@ -34,22 +42,37 @@ full commit-level picture.
 
 ## Step-by-step
 
-1. **Bump the dependency.**
+1. **Run `autumn upgrade`** — *before* the dependency bump. The release it
+   migrates from is the one your `Cargo.toml` still records, so bumping first
+   leaves nothing in range. It previews every mechanical change this release
+   can apply to your own source — a per-file diff plus a count of affected
+   sites — and writes nothing; re-run with `--apply` to take them. Anything it
+   cannot safely rewrite is listed with `file:line` and a link to the guide
+   section that explains it.
+
+   ```bash
+   cargo install autumn-cli --version {X.Z.0}
+   autumn upgrade            # preview
+   autumn upgrade --apply    # take it
+   ```
+
+2. **Bump the dependency.**
    ```toml
    # Cargo.toml
    [dependencies]
    autumn-web = "{(X+1).0}"
    ```
 
-2. **Run `cargo check`.** Work through the compiler errors section by
-   section using the cheat sheet below.
+3. **Run `cargo check`.** Work through the compiler errors section by
+   section using the cheat sheet below. Only the changes labelled `review` or
+   `manual` above should still need you.
 
-3. **Apply configuration changes** (see
+4. **Apply configuration changes** (see
    [Configuration changes](#configuration-changes)).
 
-4. **Run the test suite.**
+5. **Run the test suite.**
 
-5. **Run the application locally** and exercise each feature at least
+6. **Run the application locally** and exercise each feature at least
    once. Pay attention to the [Behavior changes](#behavior-changes)
    section.
 
@@ -75,8 +98,16 @@ care about.
 // paste the equivalent on the new version
 ```
 
-**If you are automating the upgrade:** optional `sed`/`rg` one-liner or
-note about a `cargo fix --edition`-style tool if one applies.
+**Automation:** `manual` — {why no codemod applies: it needs new arguments, it
+is a configuration or behaviour change, it is only reachable inside a macro, ….
+For a change `autumn upgrade` *does* rewrite, use `auto` (safe by construction:
+renames and import moves) or `review` (rewritten, every site flagged for a
+human) instead, and name the shipped codemod id from
+`autumn-cli/src/upgrade/migrations.rs` in this paragraph.}
+
+Every breaking change carries this label — `scripts/check-migration-guides.sh`
+fails without it, and fails an `auto`/`review` label that names no shipped
+codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
@@ -139,6 +170,42 @@ For each major dependency bump carried with this release:
 
 If no majors were carried, delete this section.
 
+## How to verify
+
+The reader's proof the upgrade landed. Keep it to concrete, checkable steps —
+commands with expected output, not "make sure everything works". Required by
+`scripts/check-migration-guides.sh`.
+
+1. `cargo check` — clean, with none of the errors in the cheat sheet above.
+2. `cargo test` — the suite is green on the new version.
+3. `autumn doctor --strict` — no findings.
+4. {one step per breaking change: the observable behaviour that proves the fix
+   was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+
+### Guide-only upgrade walkthrough
+
+(The heading keeps its historical name; the walk-through itself is
+codemod-first.) Upgrade an app scaffolded with `autumn new` on the **previous** release
+**codemod-first** — `autumn upgrade` before any manual step — using only this
+guide for what remains, and record the result here before publishing to
+crates.io. See [`docs/release-checklist.md`](../release-checklist.md),
+*Migration Guide Gate*.
+
+- **Codemod:** {the `autumn upgrade` invocation the walk-through ran first, and
+  what it covered. Required once this release ships any `auto`/`review`
+  codemod; the remaining manual steps below must be only the `review`/`manual`
+  changes.}
+- **Status:** pending
+  {the value must *begin* with `performed YYYY-MM-DD` once the walk-through is
+  done, or `backfilled` for a guide written after its release shipped;
+  `pending` is accepted only while this file is still `next.md`}
+- **From → to:** `autumn-cli {X.Y.Z}` app upgraded to `autumn-web {X.Z.0}`
+- **Elapsed:** {minutes — the budget is under 30 for a guide-only
+  walk-through, and under 10 once `autumn upgrade` covers this release's
+  rename-level changes (issue #1629)}
+- **Gaps found and fixed in this guide:** {none, or what the walk-through
+  exposed}
+
 ## Troubleshooting
 
 Known rough edges, workarounds, and known-good version combinations
@@ -148,7 +215,7 @@ Known rough edges, workarounds, and known-good version combinations
 ## Reporting problems
 
 If you hit something not covered here, please open an issue at
-<https://github.com/madmax983/autumn/issues> with:
+<https://github.com/autumn-foundation/autumn/issues> with:
 
 - The error message or unexpected behavior.
 - The old version you upgraded from.

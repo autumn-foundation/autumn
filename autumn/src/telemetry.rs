@@ -680,6 +680,29 @@ pub trait TelemetryProvider: Send + Sync + 'static {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TracingOtlpTelemetryProvider;
 
+/// Logging-only provider the capsule replay mode installs in place of both the
+/// default OTLP initializer and any custom [`TelemetryProvider`].
+///
+/// A replay is offline by construction: an OTLP batch exporter — or a custom
+/// provider's Datadog/Sentry client — would contact a live collector from a
+/// run whose whole point is touching nothing, and could abort the replay
+/// before a verdict if that infrastructure is unreachable. Log output still
+/// works (same format resolution as the full initializer), so replay warnings
+/// and handler logs remain visible.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayTelemetryProvider;
+
+impl TelemetryProvider for ReplayTelemetryProvider {
+    fn init(
+        &self,
+        log: &LogConfig,
+        _telemetry: &TelemetryConfig,
+        profile: Option<&str>,
+    ) -> Result<TelemetryGuard, TelemetryInitError> {
+        init_logging_only(log, resolve_log_format(log, profile))
+    }
+}
+
 impl TracingOtlpTelemetryProvider {
     /// Construct a new default telemetry provider.
     #[must_use]

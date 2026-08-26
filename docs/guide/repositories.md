@@ -366,6 +366,64 @@ shard with `from_shard(..)` instead.
 
 ---
 
+## 8. Declarative reactions: `#[votable]` + `react()`/`reaction_of()` *(unreleased)*
+
+Votes, likes, and favourites are the same shape every time: a
+`(reactor, target)`-unique edge table, a toggle/flip/insert on it, and a
+denormalised `score` / `{x}_count` on the target that has to stay exactly equal
+to `SUM(value)` / `COUNT(*)`. Hand-written, that is a read-then-write race on
+the edge *and* a lost-update race on the aggregate whenever two different
+reactors touch the same target.
+
+Declare it on the `#[model]` instead (issue #1362):
+
+```rust
+#[autumn_web::model]
+#[votable(by = User, aggregate = sum)]   // must be BELOW #[model]
+pub struct Post {
+    #[id]
+    pub id: i64,             // must be i64
+    pub score: i64,          // the aggregate column, must be i64
+}
+```
+
+Any `#[repository]` for that model then picks up two helpers from the emitted
+`{Model}Reactions` trait — no repository attribute needed:
+
+```rust,ignore
+use crate::models::PostReactions as _;
+
+let r = posts.react(user_id, post_id, 1).await?;  // count mode: no `value` arg
+r.value;      // Option<i16> — this reactor's reaction after the call
+r.aggregate;  // i64 — the newly persisted score, exact as of commit
+r.outcome;    // Inserted | Flipped | Removed
+
+let mine: Option<i16> = posts.reaction_of(user_id, post_id).await?;
+```
+
+`react()` is a race-safe toggle: the same value again toggles the edge off, a
+different value flips it, a new one inserts it — and the aggregate is
+recomputed from ground truth and persisted **in the same transaction**, under a
+`FOR NO KEY UPDATE` lock on the target row (weak enough not to block
+referencing inserts such as a new comment on the same post), so a reader never
+observes edge/aggregate disagreement. It is *not* idempotent: never blindly
+retry a timed-out call, or the retry toggles the reaction back off. It also
+does **not** validate `value` — put a `CHECK` on the column and never bind
+`value` from a request. Soft-deleted targets are `NotFound`. Like the m2m
+mutation helpers, `react()` acquires **its own** pooled connection and does not
+join an enclosing `Db::tx` — do not hold a `Db` extractor across the call, or
+the handler needs two connections at once and deadlocks once concurrency
+reaches the pool size. `reaction_of()` is a read: it routes through the
+repository's read route, so it is replica-eligible and does not pin
+read-your-writes.
+
+The matching no-JS htmx widget is `autumn_web::widgets::reaction_controls`.
+Full treatment — the defaults table, the required migration, the before/after
+that deletes reddit-clone's hand-written vote SQL, the race-safety proof, and
+the known limits — is in the [votable guide](votable.md).
+
+---
+
 ## Read Replicas: Automatic Read Routing
 
 When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.

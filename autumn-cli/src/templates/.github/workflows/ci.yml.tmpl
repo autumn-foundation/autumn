@@ -13,6 +13,10 @@
 # DB-dependent tests can opt in. Tests decorated `#[ignore]` are skipped by
 # default; run `cargo test -- --ignored` to include them.
 #
+# Also enforced: `autumn a11y verify` (accessibility) and
+# `autumn routes audit` (route auth-coverage security manifest), both run
+# against the prebuilt `autumn` CLI installed mid-job.
+#
 # Optional extensions (not required for green CI on a fresh scaffold):
 #   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary
 #     before `cargo build` to compile CSS in CI.
@@ -69,16 +73,23 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       # Accessibility gate: install the prebuilt `autumn` CLI matching this app's
-      # autumn-web version and scan raw html! markup for a11y violations. Non-blocking
-      # (continue-on-error) until the pinned autumn release publishes its prebuilt
-      # binaries; remove `continue-on-error` to make this an enforcing gate.
+      # autumn-web version and scan raw html! markup for a11y violations. This is an
+      # enforcing gate — it runs against the pinned autumn release's prebuilt binary,
+      # so an a11y violation fails the job.
       - name: Accessibility (a11y) verify
-        continue-on-error: true
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/madmax983/autumn/v{{autumn_version}}/scripts/install.sh" \
+          curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/autumn" a11y verify .
+
+      # Route auth-coverage gate (default-deny posture, issue #1604): every
+      # mounted route must carry a proven security classification (`gated`,
+      # `public`, or framework-owned) before it merges. A route someone forgot
+      # to annotate fails the build here instead of shipping silently. Reuses
+      # the prebuilt CLI installed by the a11y step above.
+      - name: Route auth coverage (security manifest)
+        run: autumn routes audit
 
       - name: Build
         run: cargo build

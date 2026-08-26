@@ -34,12 +34,20 @@
 //!
 //! ## What is deferred
 //!
-//! - The exact `kamal-proxy` binary provisioning (download/version pin) is left
-//!   to host bootstrap; [`KamalProxyController::ensure_installed_ops`] supervises
-//!   it via systemd and assumes the binary is on `PATH`/`/usr/local/bin`.
 //! - Live ssh is not exercised here (Slice 4's CI container harness).
+//!
+//! ## Host preparation (issue #1607, AC-1)
+//!
+//! [`ProxyController::binary_install_ops`] is how a controller PREPARES a bare
+//! host: it returns the ops that install its proxy binary, and the deploy runs
+//! them only when the compat probe reports
+//! [`ProxyCompatFailure::binary_missing`]. [`KamalProxyController`] installs the
+//! pinned [`KAMAL_PROXY_KNOWN_GOOD_VERSION`] build (see
+//! [`KamalProxyController::install_shell`] for why it comes out of the container
+//! image); a controller that ships its own binary inherits the `None` default and
+//! is never asked to prepare anything.
 
-use super::exec::{DeployOp, FileContents, RemoteCommand, shell_quote};
+use super::exec::{DeployOp, FileContents, ProxyServiceOptions, RemoteCommand, shell_quote};
 
 /// Absolute path the proxy binary is expected at on the target.
 const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
@@ -53,9 +61,35 @@ pub const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service
 /// against — the same version the real-VPS validation harness pins
 /// (`scripts/deploy-real-vps-validate.sh`, issue #2052). Named in the
 /// incompatibility message (issue #2053) so an operator knows exactly what to
-/// install on host bootstrap. kamal-proxy is otherwise consumed UNPINNED from
-/// host bootstrap, so this is the version to pin to when the compat probe fails.
+/// install when host preparation is declined. It is also the version `autumn
+/// deploy` INSTALLS itself on a host that has no kamal-proxy at all (issue #1607,
+/// AC-1) — a host that already has one keeps whatever build it has, so this stays
+/// the version to pin to when the compat probe fails on an existing install.
 pub const KAMAL_PROXY_KNOWN_GOOD_VERSION: &str = "v0.9.2";
+
+/// Content digest of the `basecamp/kamal-proxy` image
+/// [`KAMAL_PROXY_KNOWN_GOOD_VERSION`] named when this constant was last verified
+/// (an OCI image index covering linux/amd64 and linux/arm64).
+///
+/// Host preparation pulls `…:{version}@{digest}`, never the bare tag. A Docker Hub
+/// tag is MUTABLE — whatever it resolves to at pull time would become a
+/// root-executed binary at [`KAMAL_PROXY_BIN`] on every bare host — and `docker
+/// create` will happily reuse a poisoned *local* image under that tag without ever
+/// contacting the registry. Digest-pinning closes both: the daemon verifies the
+/// manifest digest on pull and on local lookup, so a re-pushed tag fails the
+/// install instead of silently replacing the binary.
+///
+/// Bump this together with [`KAMAL_PROXY_KNOWN_GOOD_VERSION`], and only after
+/// re-reading the digest from the registry for the new tag:
+///
+/// ```text
+/// T=$(curl -sS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:basecamp/kamal-proxy:pull" | jq -r .token)
+/// curl -sSI -H "Authorization: Bearer $T" \
+///   -H "Accept: application/vnd.oci.image.index.v1+json" \
+///   https://registry-1.docker.io/v2/basecamp/kamal-proxy/manifests/<tag> | grep -i docker-content-digest
+/// ```
+pub const KAMAL_PROXY_KNOWN_GOOD_DIGEST: &str =
+    "sha256:826a6f66c6ba26ac26197ac8755804403c9bb617b90cfac25c7972154c5328ab";
 
 /// The exact `deploy`-subcommand flags [`KamalProxyController::deploy_shell`]
 /// emits on every route/flip. These ARE the cutover contract: if a future
@@ -105,16 +139,32 @@ pub struct ProxyCompatProbe {
 }
 
 /// The pure verdict a [`ProxyCompatProbe`] applies to its command's combined
-/// output: `Ok(())` when compatible, `Err(message)` with an actionable operator
-/// message otherwise.
-type CompatVerdict = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// output: `Ok(())` when compatible, or a [`ProxyCompatFailure`] otherwise.
+type CompatVerdict = Box<dyn Fn(&str) -> Result<(), ProxyCompatFailure> + Send + Sync>;
+
+/// A failed compat verdict: the actionable operator message, plus whether the
+/// probe reached **no working binary at all** (issue #1607, AC-1).
+///
+/// That one bit is what separates a host the deploy can PREPARE (nothing is
+/// installed — install the pinned build and carry on) from one it must refuse (a
+/// responding binary whose CLI surface has drifted: somebody else's working
+/// install, possibly shared with another app on the host, which is not ours to
+/// replace silently).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyCompatFailure {
+    /// Clear, actionable, secret-free operator message.
+    pub message: String,
+    /// `true` when no usable proxy binary was reached — the case host preparation
+    /// can fix.
+    pub binary_missing: bool,
+}
 
 impl ProxyCompatProbe {
     /// Build a probe from its command and a pure verdict closure.
     #[must_use]
     pub fn new(
         command: RemoteCommand,
-        verdict: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+        verdict: impl Fn(&str) -> Result<(), ProxyCompatFailure> + Send + Sync + 'static,
     ) -> Self {
         Self {
             command,
@@ -126,9 +176,10 @@ impl ProxyCompatProbe {
     ///
     /// # Errors
     ///
-    /// Returns the actionable operator message when the installed proxy's CLI
-    /// surface is incompatible with what the cutover requires.
-    pub fn assess(&self, output: &str) -> Result<(), String> {
+    /// Returns the actionable operator message (and whether the binary was missing
+    /// entirely) when the installed proxy's CLI surface is incompatible with what
+    /// the cutover requires.
+    pub fn assess(&self, output: &str) -> Result<(), ProxyCompatFailure> {
         (self.verdict)(output)
     }
 }
@@ -169,6 +220,12 @@ pub trait ProxyController {
     /// (an unchanged unit must NOT restart — that preserves today's steady-state
     /// no-restart behavior).
     ///
+    /// `reregister_options` is the proxy TLS/host the still-live OLD release was
+    /// registered with (recovered from the `shared/proxy-options` marker, issue
+    /// #2074). The change-gated re-register carries THESE options — NOT the
+    /// controller's new config — so a later-op failure + rollback leaves the old
+    /// release on its own host/TLS rather than the new/removed one.
+    ///
     /// The default is exactly [`Self::ensure_installed_ops`] (write + enable, NO
     /// restart): a controller that provisions its own pinned binary/config and has
     /// nothing to "restart to adopt" — e.g. a future `CaddyController` — inherits
@@ -179,9 +236,23 @@ pub trait ProxyController {
         service: &str,
         live_upstream: &str,
         snapshot_path: &str,
+        reregister_options: &ProxyServiceOptions,
     ) -> Vec<DeployOp> {
-        let _ = (service, live_upstream, snapshot_path);
+        let _ = (service, live_upstream, snapshot_path, reregister_options);
         self.ensure_installed_ops(public_port)
+    }
+
+    /// The proxy `ServiceOptions` (TLS on/off + host) THIS controller registers on a
+    /// deploy (issue #2074), persisted to the `shared/proxy-options` marker so the
+    /// NEXT redeploy can preserve the old release's own options across the durability
+    /// re-register. The default is TLS-off (a controller that terminates no TLS —
+    /// e.g. a future `CaddyController`); [`KamalProxyController`] returns its
+    /// configured `tls_host`.
+    fn proxy_service_options(&self) -> ProxyServiceOptions {
+        ProxyServiceOptions {
+            tls: false,
+            host: None,
+        }
     }
 
     /// Op that points `service`'s public port at `upstream` (`host:port`) for the
@@ -203,6 +274,33 @@ pub trait ProxyController {
     /// unpinned external binary (kamal-proxy) returns `Some`.
     fn compat_probe(&self) -> Option<ProxyCompatProbe> {
         None
+    }
+
+    /// Ordered ops that INSTALL this controller's proxy binary on a host that has
+    /// none (issue #1607, AC-1: "target host precondition is at most a stock Ubuntu
+    /// LTS with SSH access — the command performs any remaining host preparation
+    /// itself").
+    ///
+    /// Run only when [`Self::compat_probe`]'s verdict reports
+    /// [`ProxyCompatFailure::binary_missing`], so a host that already has a working
+    /// proxy is never touched and a responding-but-drifted binary is never replaced.
+    ///
+    /// `None` (the default) means the controller cannot prepare a host — the caller
+    /// then reports the missing binary and stops. A controller whose binary ships
+    /// with the controller itself would also return `None`.
+    fn binary_install_ops(&self) -> Option<Vec<DeployOp>> {
+        None
+    }
+
+    /// One line naming what [`Self::binary_install_ops`] is about to do to the
+    /// operator's server, printed before the install runs.
+    ///
+    /// Host preparation is the one part of a deploy that changes the target beyond
+    /// the app, so it is announced rather than merely logged as an op label — and
+    /// the announcement belongs to the controller that owns the ops, not to the
+    /// driver, which knows nothing about which proxy it is driving.
+    fn binary_install_note(&self) -> String {
+        "installing the reverse-proxy binary".to_owned()
     }
 }
 
@@ -273,6 +371,27 @@ impl KamalProxyController {
     /// flip ([`Self::flip_op`]) pass `false` and STAY health-gated (unchanged): they
     /// route to a candidate whose readiness must genuinely be proven first.
     fn deploy_shell(&self, service: &str, target: &str, force: bool) -> String {
+        // The common route/flip/re-register uses THIS controller's configured
+        // `tls_host`; only the #2074 durability re-register overrides it (below).
+        self.deploy_shell_with_tls(service, target, force, self.tls_host.as_deref())
+    }
+
+    /// [`Self::deploy_shell`] with a per-call TLS host override (issue #2074).
+    ///
+    /// The durability-refresh re-register of the still-live OLD release must carry
+    /// that release's OWN `--host/--tls` (recovered from the `shared/proxy-options`
+    /// marker), NOT the controller's new config, so a rollback never strands the old
+    /// release behind the new/removed host. `tls_host = None` emits the HTTP-only
+    /// form (no `--host/--tls` — a TLS-removed re-register). The route/flip delegate
+    /// here via [`Self::deploy_shell`] with `self.tls_host`, so their output is
+    /// unchanged.
+    fn deploy_shell_with_tls(
+        &self,
+        service: &str,
+        target: &str,
+        force: bool,
+        tls_host: Option<&str>,
+    ) -> String {
         // Every string parameter is shell-quoted so a service name, upstream, or
         // health-check path carrying query params / special chars can't break out
         // of the command. The numeric timeouts need no quoting.
@@ -292,7 +411,7 @@ impl KamalProxyController {
         // TLS (opt-in): `--host <host> --tls` sits in a STABLE position between
         // the health-check path and the timeouts. When `tls_host` is `None` the
         // segment is empty and the command is byte-for-byte the HTTP-only form.
-        let tls = self.tls_host.as_deref().map_or_else(String::new, |host| {
+        let tls = tls_host.map_or_else(String::new, |host| {
             format!("--host {host} --tls ", host = shell_quote(host))
         });
         // `--force` (re-register only, issue #2071) trails the stable flag block, so
@@ -308,6 +427,92 @@ impl KamalProxyController {
             path = shell_quote(&self.health_check_path),
             deploy = self.deploy_timeout_secs,
             drain = self.drain_timeout_secs,
+        )
+    }
+
+    /// The one remote command that installs the pinned kamal-proxy on a host that
+    /// has none (issue #1607, AC-1).
+    ///
+    /// # Why the binary comes out of a container image
+    ///
+    /// kamal-proxy publishes **no release binaries** — upstream ships it only as the
+    /// `basecamp/kamal-proxy` container image (Homebrew builds from source). So the
+    /// honest way to land the same static binary the project publishes is to pull
+    /// the pinned image and copy the binary out of it, which is exactly what this
+    /// repo's real-VPS validation has always done by hand
+    /// (`scripts/deploy-real-vps-validate.sh`). Kamal itself installs a container
+    /// runtime on the target during `kamal setup` for the same reason.
+    ///
+    /// # Never replaces an existing binary
+    ///
+    /// The whole op is gated on the compat probe reporting no usable binary, but the
+    /// verdict is an INFERENCE from `--help` output: a `kamal-proxy` that resolves
+    /// through a different `PATH` entry, or a future release whose CLI surface drifted
+    /// so far that no required flag rendered, both classify as "no binary". Neither is
+    /// ours to overwrite — the binary may be shared with another service on the host —
+    /// so the invariant is ENFORCED here rather than merely inferred upstream: the op
+    /// refuses outright when anything already occupies the target path. The operator
+    /// then gets that message instead of a silently downgraded proxy.
+    ///
+    /// The test is `-e OR -L`, not `-e` alone: `-e` follows symlinks, so a DANGLING
+    /// symlink at the target path — an operator-managed install whose target is
+    /// temporarily absent, or a broken package link — reads as "nothing there" and
+    /// would be replaced by `mv -f`.
+    ///
+    /// # What it does, in order
+    ///
+    /// 1. install the two host packages a deploy needs and a minimal image may
+    ///    lack — `curl` (the readiness gate polls `/ready` **on the host**) and a
+    ///    container runtime — but ONLY the ones actually missing, refreshing the apt
+    ///    index at most once and never interactively;
+    /// 2. make sure the container daemon is up (idempotent);
+    /// 3. copy the binary out of the pinned image into a TEMP path, mark it `0755`,
+    ///    and `mv` it into place — so the supervised path is never a half-written
+    ///    file, even if the copy dies midway;
+    /// 4. remove the scratch container, then VERIFY the installed binary answers
+    ///    `kamal-proxy deploy --help` — an install that "succeeded" without landing
+    ///    a working binary must fail here, not at the first cutover.
+    ///
+    /// `set -e` makes any step's failure fail the op, which the caller turns into an
+    /// actionable abort before anything is cut over. It carries no secret, so it is
+    /// safe to log.
+    ///
+    /// Because this whole op is gated on the proxy binary being ABSENT, it is the
+    /// bare-host path: a host that already has kamal-proxy was prepared by somebody
+    /// (an earlier `autumn deploy`, or the operator) and is assumed to still have
+    /// `curl`, exactly as it was before host preparation existed.
+    fn install_shell() -> String {
+        let pin = KAMAL_PROXY_KNOWN_GOOD_VERSION;
+        let digest = KAMAL_PROXY_KNOWN_GOOD_DIGEST;
+        let bin = KAMAL_PROXY_BIN;
+        format!(
+            "( set -e; \
+             if [ -e '{bin}' ] || [ -L '{bin}' ]; then \
+             echo 'kamal-proxy is already installed at {bin}; refusing to replace it' >&2; \
+             exit 1; \
+             fi; \
+             need=''; \
+             command -v curl >/dev/null 2>&1 || need=\"$need curl\"; \
+             command -v docker >/dev/null 2>&1 || need=\"$need docker.io\"; \
+             if [ -n \"$need\" ]; then \
+             export DEBIAN_FRONTEND=noninteractive; \
+             apt-get update -qq; \
+             apt-get install -y -qq --no-install-recommends $need; \
+             fi; \
+             systemctl start docker >/dev/null 2>&1 || true; \
+             cid=$(docker create 'basecamp/kamal-proxy:{pin}@{digest}'); \
+             docker cp \"$cid:/usr/local/bin/kamal-proxy\" '{bin}.autumn-new'; \
+             docker rm -f \"$cid\" >/dev/null 2>&1 || true; \
+             chmod 755 '{bin}.autumn-new'; \
+             mv -f '{bin}.autumn-new' '{bin}'; \
+             '{bin}' deploy --help >/dev/null 2>&1 || {{ \
+             echo 'the installed kamal-proxy does not run on this host' >&2; exit 1; }} \
+             ) || {{ \
+             echo 'autumn deploy could not prepare this host with kamal-proxy {pin}. It needs \
+an apt-based (Debian/Ubuntu) host, outbound HTTPS to the distro mirrors and to Docker Hub, and \
+an SSH user that can install packages. Install kamal-proxy {pin} at {bin} yourself and set \
+`[deploy] install_proxy = false` in autumn.toml to skip this step.' >&2; \
+             exit 1; }}"
         )
     }
 
@@ -465,6 +670,7 @@ impl ProxyController for KamalProxyController {
         service: &str,
         live_upstream: &str,
         snapshot_path: &str,
+        reregister_options: &ProxyServiceOptions,
     ) -> Vec<DeployOp> {
         let unit = shell_quote(KAMAL_PROXY_UNIT_PATH);
         let snap = shell_quote(snapshot_path);
@@ -525,14 +731,19 @@ impl ProxyController for KamalProxyController {
         //   * An UNCHANGED unit (steady-state redeploy) takes NEITHER branch — today's
         //     no-restart behavior is preserved exactly, so a routine redeploy never
         //     churns the shared proxy.
-        // The re-register reuses `deploy_shell` (with `force = true`), so it keeps the
-        // `env -u XDG_RUNTIME_DIR` control-socket pin (#2019) and any `--host/--tls`
-        // segment. The `|| exit 1` fail-fast on `systemctl restart` is unchanged.
-        //
-        // Operator advisory: do not combine the one-time proxy reboot-durability
-        // upgrade with a `deploy.tls.host` change in the same deploy — the pre-flip
-        // route refresh re-registers the live release with the current TLS host, so
-        // a failed rollback could strand the previous host. Tracked in #2074.
+        // The re-register uses `deploy_shell_with_tls` (with `force = true`), so it
+        // keeps the `env -u XDG_RUNTIME_DIR` control-socket pin (#2019). It carries
+        // `reregister_options`' `--host/--tls` — the still-live OLD release's OWN
+        // options recovered from the `shared/proxy-options` marker (issue #2074), NOT
+        // this controller's new config — so a failed rollback leaves the old release
+        // on its own host/TLS instead of stranding it behind the new/removed host.
+        // The candidate flip (`flip_op`) still uses `self.tls_host` (the new config),
+        // so the new release gets the new host. The `|| exit 1` fail-fast on
+        // `systemctl restart` is unchanged. On an ABSENT marker the redeploy arm
+        // passes the new config as `reregister_options` (proceed-as-legacy: the
+        // durability-upgrade deploy's kamal-proxy table is empty, so there is nothing
+        // to preserve — refusing there would deadlock every pre-#2074 host's first
+        // redeploy); an UNREADABLE marker is refused at pre-flight before this runs.
         ops.push(DeployOp::Run(RemoteCommand::new(
             "proxy-restart-if-changed",
             format!(
@@ -549,10 +760,41 @@ impl ProxyController for KamalProxyController {
                  echo 'kamal-proxy did not accept the live route after restart' >&2; exit 1; fi; \
                  sleep 0.5; \
                  done",
-                reregister = self.deploy_shell(service, live_upstream, true),
+                reregister = self.deploy_shell_with_tls(
+                    service,
+                    live_upstream,
+                    true,
+                    reregister_options.host.as_deref()
+                ),
             ),
         )));
         ops
+    }
+
+    fn proxy_service_options(&self) -> ProxyServiceOptions {
+        // Authoritative "what did we actually register": `deploy_shell` emits
+        // `--host/--tls` iff `tls_host` is `Some`, so the marker mirrors that exactly
+        // (a configured-but-blank host resolves to `tls_host = None` upstream → TLS-off).
+        ProxyServiceOptions {
+            tls: self.tls_host.is_some(),
+            host: self.tls_host.clone(),
+        }
+    }
+
+    fn binary_install_ops(&self) -> Option<Vec<DeployOp>> {
+        Some(vec![DeployOp::Run(RemoteCommand::new(
+            "install-proxy",
+            Self::install_shell(),
+        ))])
+    }
+
+    fn binary_install_note(&self) -> String {
+        format!(
+            "no kamal-proxy on this host — installing {KAMAL_PROXY_KNOWN_GOOD_VERSION} at \
+             {KAMAL_PROXY_BIN}, from the pinned basecamp/kamal-proxy image. This also \
+             installs, and leaves behind, any of `curl` and a container runtime the host \
+             is missing. Decline with `[deploy] install_proxy = false`."
+        )
     }
 
     fn compat_probe(&self) -> Option<ProxyCompatProbe> {
@@ -563,7 +805,15 @@ impl ProxyController for KamalProxyController {
         Some(ProxyCompatProbe::new(
             Self::compat_probe_command(),
             move |output| {
-                assess_kamal_proxy_deploy_help(output, &required).map_err(|issue| issue.message())
+                assess_kamal_proxy_deploy_help(output, &required).map_err(|issue| {
+                    ProxyCompatFailure {
+                        message: issue.message(),
+                        // Only "no working binary answered at all" is a host-prep
+                        // case; a responding-but-drifted binary is not ours to
+                        // replace. See [`ProxyCompatFailure`].
+                        binary_missing: issue == KamalProxyCompatIssue::BinaryUnusable,
+                    }
+                })
             },
         ))
     }
@@ -595,9 +845,12 @@ impl KamalProxyCompatIssue {
         match self {
             Self::BinaryUnusable => format!(
                 "the kamal-proxy binary at `{KAMAL_PROXY_BIN}` did not respond to \
-                 `kamal-proxy deploy --help` (missing or not executable). Install a \
-                 known-good kamal-proxy (pin {pin}) in the target's host bootstrap \
-                 before deploying — see scripts/deploy-real-vps-validate.sh. Aborting \
+                 `kamal-proxy deploy --help` (missing or not executable). Install \
+                 kamal-proxy {pin} there — e.g. `docker create \
+                 basecamp/kamal-proxy:{pin}` then `docker cp \
+                 <id>:/usr/local/bin/kamal-proxy {KAMAL_PROXY_BIN} && chmod 755 \
+                 {KAMAL_PROXY_BIN}` — or let `autumn deploy` install it for you by \
+                 leaving `[deploy] install_proxy` at its default `true`. Aborting \
                  before any cutover, so live traffic was not touched."
             ),
             Self::DeploySubcommandMissing => format!(
@@ -741,7 +994,16 @@ mod tests {
 
         // The re-register (last op of the refresh) is forced, socket-pinned, and
         // targets the LIVE upstream.
-        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
         let DeployOp::Run(restart) = ops.last().expect("has ops") else {
             panic!("last op must be the restart/re-register");
         };
@@ -995,6 +1257,10 @@ mod tests {
             "myapp",
             "127.0.0.1:3001",
             "/tmp/autumn-kamal-proxy-unit-REL.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
         );
         assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
 
@@ -1088,11 +1354,21 @@ mod tests {
 
     #[test]
     fn refresh_installed_ops_tls_reregister_carries_host_and_tls() {
-        // With TLS enabled, the change-gated re-register carries the same
-        // `--host <h> --tls` segment as the flip, so a restarted TLS proxy re-adopts
-        // the live route with its cert config intact.
+        // With TLS, the change-gated re-register carries the PRESERVED old release's
+        // `--host <h> --tls` segment (issue #2074), so a restarted TLS proxy re-adopts
+        // the live route with its own cert config intact. Here the preserved options
+        // match the controller's config (a steady-state redeploy).
         let proxy = KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
-        let ops = proxy.refresh_installed_ops(8080, "myapp", "127.0.0.1:3001", "/tmp/snap.sha256");
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            },
+        );
         let DeployOp::Run(restart) = ops.last().expect("has ops") else {
             panic!("last op must be the restart");
         };
@@ -1104,6 +1380,94 @@ mod tests {
             ),
             "TLS re-register carries --host/--tls and --force: {}",
             restart.shell,
+        );
+    }
+
+    #[test]
+    fn refresh_reregister_preserves_old_options_while_flip_uses_new_host() {
+        // #2074 PRESERVE: the operator changed `deploy.tls.host` to `new.example.com`,
+        // but the still-live OLD release was registered under `old.example.com`. The
+        // durability re-register must carry the OLD host (recovered from the marker),
+        // while the candidate flip carries the NEW host — so a rollback leaves the old
+        // release on its own host, not the new one.
+        let proxy = KamalProxyController::new(60).with_tls_host(Some("new.example.com".to_owned()));
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: true,
+                host: Some("old.example.com".to_owned()),
+            },
+        );
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart/re-register");
+        };
+        assert!(
+            restart.shell.contains("--host 'old.example.com' --tls")
+                && !restart.shell.contains("new.example.com"),
+            "re-register of the live OLD release preserves the OLD host, not the new: {}",
+            restart.shell,
+        );
+        // The candidate flip still carries the NEW config host.
+        let DeployOp::Run(flip) = proxy.flip_op("myapp", "127.0.0.1:3002") else {
+            panic!("flip_op must be a Run op");
+        };
+        assert!(
+            flip.shell.contains("--host 'new.example.com' --tls")
+                && !flip.shell.contains("old.example.com"),
+            "the candidate flip carries the NEW host: {}",
+            flip.shell,
+        );
+    }
+
+    #[test]
+    fn refresh_reregister_can_preserve_tls_off_removing_a_host() {
+        // #2074: a removed host is representable — preserving TLS-off options emits the
+        // plain HTTP-only re-register (no `--host/--tls`), even when the controller's
+        // NEW config turned TLS on. So a redeploy that ADDS a host never strands the
+        // old (host-less) release behind the new host on a rollback.
+        let proxy = KamalProxyController::new(60).with_tls_host(Some("new.example.com".to_owned()));
+        let ops = proxy.refresh_installed_ops(
+            8080,
+            "myapp",
+            "127.0.0.1:3001",
+            "/tmp/snap.sha256",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
+        let DeployOp::Run(restart) = ops.last().expect("has ops") else {
+            panic!("last op must be the restart/re-register");
+        };
+        assert!(
+            !restart.shell.contains("--host") && !restart.shell.contains("--tls "),
+            "preserving TLS-off options emits an HTTP-only re-register: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn proxy_service_options_mirror_the_configured_tls_host() {
+        // The controller reports the options it actually registers, so the marker
+        // written at deploy time matches what kamal-proxy was told (issue #2074).
+        assert_eq!(
+            KamalProxyController::new(60).proxy_service_options(),
+            ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
+        assert_eq!(
+            KamalProxyController::new(60)
+                .with_tls_host(Some("app.example.com".to_owned()))
+                .proxy_service_options(),
+            ProxyServiceOptions {
+                tls: true,
+                host: Some("app.example.com".to_owned()),
+            },
         );
     }
 
@@ -1124,8 +1488,16 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("flip", "true"))
             }
         }
-        let refreshed =
-            PinnedController.refresh_installed_ops(80, "svc", "127.0.0.1:9001", "/tmp/x");
+        let refreshed = PinnedController.refresh_installed_ops(
+            80,
+            "svc",
+            "127.0.0.1:9001",
+            "/tmp/x",
+            &ProxyServiceOptions {
+                tls: false,
+                host: None,
+            },
+        );
         let installed = PinnedController.ensure_installed_ops(80);
         assert_eq!(refreshed.len(), installed.len());
         assert!(
@@ -1374,8 +1746,139 @@ mod tests {
             .assess(&drifted)
             .expect_err("drift must fail the verdict");
         assert!(
-            err.contains("--target"),
-            "verdict message names the flag: {err}"
+            err.message.contains("--target"),
+            "verdict message names the flag: {}",
+            err.message
+        );
+        // #1607: a RESPONDING binary is never a host-prep case, so the caller must
+        // not be told it can fix this by installing one.
+        assert!(
+            !err.binary_missing,
+            "flag drift is not a missing binary: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_verdict_reports_a_missing_binary_as_a_host_prep_case() {
+        // #1607 (AC-1): an empty capture is "nothing answered" — the one case
+        // `autumn deploy` fixes itself by installing the pinned build.
+        let probe = KamalProxyController::new(60)
+            .compat_probe()
+            .expect("kamal-proxy declares a compat probe");
+        let err = probe
+            .assess("")
+            .expect_err("no binary must fail the verdict");
+        assert!(err.binary_missing, "an unusable binary is host prep's case");
+        assert!(
+            err.message.contains("install_proxy"),
+            "the message names the opt-out that would decline the fix: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn the_install_op_lands_the_pinned_binary_atomically_at_the_supervised_path() {
+        // #1607 (AC-1): host preparation must be safe to run against a stock Ubuntu
+        // LTS host — non-interactive, idempotent about an existing container
+        // runtime, and never leaving a half-written file at the path the proxy unit
+        // executes.
+        let ops = KamalProxyController::new(60)
+            .binary_install_ops()
+            .expect("kamal-proxy can prepare a host");
+        assert_eq!(ops.len(), 1, "host prep is a single remote command");
+        let DeployOp::Run(cmd) = &ops[0] else {
+            panic!("host prep runs a command, it uploads nothing");
+        };
+        assert_eq!(cmd.label, "install-proxy");
+        let shell = &cmd.shell;
+        assert!(
+            shell.contains(KAMAL_PROXY_KNOWN_GOOD_VERSION),
+            "the image tag is pinned, never `latest`: {shell}"
+        );
+        assert!(
+            !shell.contains(":latest"),
+            "an unpinned tag would make host prep non-reproducible: {shell}"
+        );
+        assert!(
+            shell.contains("command -v docker"),
+            "an existing container runtime is reused: {shell}"
+        );
+        // The readiness gate polls `/ready` with `curl` ON THE HOST, so a minimal
+        // image without curl must be equipped here or every deploy times out at the
+        // gate. Both packages are probed individually so an equipped host installs
+        // nothing.
+        assert!(
+            shell.contains("command -v curl") && shell.contains("curl\""),
+            "host prep must ensure the readiness gate's curl: {shell}"
+        );
+        assert!(
+            shell.contains("DEBIAN_FRONTEND=noninteractive"),
+            "apt must never prompt mid-deploy: {shell}"
+        );
+        // Staged then moved: the supervised path is never a partially-copied file.
+        let staged = format!("{KAMAL_PROXY_BIN}.autumn-new");
+        assert!(
+            shell.contains(&format!("chmod 755 '{staged}'"))
+                && shell.contains(&format!("mv -f '{staged}' '{KAMAL_PROXY_BIN}'")),
+            "the binary is staged, marked executable, then moved into place: {shell}"
+        );
+        assert!(
+            shell.starts_with("( set -e;"),
+            "any failing step must fail the whole op: {shell}"
+        );
+        // Digest-pinned, so a re-pushed tag (or a poisoned local image) cannot
+        // become a root-executed binary on the target.
+        assert!(
+            shell.contains(&format!(
+                "{KAMAL_PROXY_KNOWN_GOOD_VERSION}@{KAMAL_PROXY_KNOWN_GOOD_DIGEST}"
+            )),
+            "the image is pinned by DIGEST, not just by tag: {shell}"
+        );
+        // Never clobbers: the invariant is enforced at the point of action, not
+        // merely inferred from the probe verdict upstream.
+        assert!(
+            shell.contains(&format!(
+                "if [ -e '{KAMAL_PROXY_BIN}' ] || [ -L '{KAMAL_PROXY_BIN}' ]"
+            )) && shell.contains("refusing to replace it"),
+            "the install must refuse to replace anything already occupying the \
+             target path — including a DANGLING symlink, which `-e` alone reports \
+             as absent because it follows links: {shell}"
+        );
+        // Any failure carries the remedy — this is the most likely new failure on a
+        // stock host, and the raw apt/docker stderr alone says nothing useful.
+        assert!(
+            shell.contains("install_proxy = false") && shell.contains("outbound HTTPS"),
+            "a failed install must name what the host needs and the opt-out: {shell}"
+        );
+    }
+
+    #[test]
+    fn the_install_op_is_a_valid_posix_shell_script() {
+        // The install shell is the one op with no PR-time end-to-end coverage (the
+        // container fixture bakes kamal-proxy in, so the e2e always takes the
+        // already-equipped path, and only the nightly real-VPS job runs it for
+        // real). A syntax check is cheap and catches the whole class of quoting and
+        // structure regressions on every PR.
+        let shell = KamalProxyController::install_shell();
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&shell)
+            .output()
+            .expect("spawn sh -n");
+        assert!(
+            out.status.success(),
+            "the generated install shell must parse as POSIX sh:\n{shell}\n--- sh said ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Self-verifying: an install that lands nothing usable fails HERE rather
+        // than at the first cutover.
+        assert!(
+            shell.contains(&format!(
+                "'{KAMAL_PROXY_BIN}' deploy --help >/dev/null 2>&1 ||"
+            )),
+            "the install proves the binary at the SUPERVISED path works — verifying \
+             the staging path would prove nothing about what was installed: {shell}"
         );
     }
 }

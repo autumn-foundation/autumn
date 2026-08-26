@@ -8,7 +8,6 @@ mod models;
 mod repositories;
 mod routes;
 mod schema;
-mod slugify;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
@@ -29,6 +28,12 @@ async fn main() {
             routes::pages::transition_status,
             routes::pages::history,
             routes::pages::search,
+            routes::collections::list,
+            routes::collections::new_form,
+            routes::collections::create,
+            routes::collections::show,
+            routes::collections::edit_form,
+            routes::collections::update,
             repositories::page_api_list,
             repositories::page_api_get,
             repositories::page_api_create,

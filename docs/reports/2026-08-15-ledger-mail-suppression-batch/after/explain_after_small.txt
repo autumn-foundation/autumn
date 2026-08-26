@@ -1,0 +1,15 @@
+=== AFTER: batched lookup, one chunk (up to 50,000 recipients) ===
+                                                                                                                                                                                                         ...[array elided]...                                                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- ...[array elided]... ---------------------------------------------------------------------------------------------------
+ Index Only Scan using mail_unsubscribes_subscriber_list_id_key on public.mail_unsubscribes  (cost=0.42..879.80 rows=80 width=22) (actual time=0.403..1.009 rows=60 loops=1)
+   Output: subscriber
+   Index Cond: ((mail_unsubscribes.subscriber = ANY ('{user1@example.com,user3@example.com,user4@example.com,user14@example.com,user16@example.com,user19@example.com,user22@example.com,user27@example. ...[array elided]... mple.com,active140@example.com}'::text[])) AND (mail_unsubscribes.list_id = 'weekly_digest'::text))
+   Heap Fetches: 0
+   Buffers: shared hit=592 read=12
+ Query Identifier: 5653161031852871432
+ Planning:
+   Buffers: shared hit=110 read=1
+ Planning Time: 0.285 ms
+ Execution Time: 1.025 ms
+(10 rows)
+

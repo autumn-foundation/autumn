@@ -11,6 +11,7 @@ mode fit together to give you a safe rollout in each case.
 | Rolling | Standard incremental rollout | Full — probes + drain handle it automatically |
 | Blue/green | Instant cutover with easy rollback | Full — probe drain + LB switch |
 | Canary | Gradual traffic shift with automated promotion | Framework primitives — version-labelled metrics, a canary-route extractor, and a controller-driven rollback signal (see [Canary deploys](#canary-deploys)) |
+| Rolling across your own VPS fleet | Several app servers you own, behind your own load balancer, with no orchestrator | Full — `autumn deploy up` with `[deploy] hosts` rolls the hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure); see the [fleet deploys guide](fleet-deploys.md) |
 
 ---
 
@@ -237,9 +238,15 @@ Then tear down green, diagnose the issue, and re-deploy when ready.
 - Autumn's probe contracts give you a deterministic signal for when green is
   ready (`/ready` → 200) and when blue has finished draining (process exits
   cleanly after SIGTERM).
-- The framework does not manage the LB switch — that is an operator or platform
-  concern. Autumn gives you the health signals; you decide when to pull the
-  lever.
+- **Autumn never distributes traffic between hosts.** How much traffic each
+  machine receives is a load-balancer concern — Autumn gives you the health
+  signals and you (or your platform) decide when to pull the lever. What Autumn
+  *does* manage is the blue/green switch **within** a single deploy-managed host:
+  `autumn deploy up` stands the candidate up on that host's idle slot,
+  health-gates it, and flips the host's own kamal-proxy atomically. Across
+  several hosts (`[deploy] hosts`) it repeats that host by host — still without
+  touching your load balancer's membership. See the
+  [fleet deploys guide](fleet-deploys.md).
 - Use `autumn doctor` on the green environment before switching traffic to catch
   misconfigured secrets, missing database URLs, or active maintenance flags:
 
@@ -435,6 +442,8 @@ the controller triggers.
 | High-risk release requiring fast rollback | Blue/green |
 | Incident response — stop traffic immediately | [Maintenance mode](maintenance-mode.md) |
 | Gradual rollout with automated promotion | [Canary](#canary-deploys) — platform traffic weights gated on Autumn's version-labelled metrics, with `autumn canary rollback` for a clean drain |
+| Several VPS hosts you own, no orchestrator | [`autumn deploy up` with `[deploy] hosts`](fleet-deploys.md) — serial rolling deploy driven by the CLI, per-host blue/green, one migration per fleet |
+| A whole fleet must pause writes at once | [`autumn deploy maintenance on`](fleet-deploys.md#runbook-a-fleet-wide-maintenance-window) — note it gates traffic, it does not drain hosts from the load balancer |
 
 ---
 

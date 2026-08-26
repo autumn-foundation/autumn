@@ -20,11 +20,13 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/console.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
+      - "autumn-cli/tests/integration/console.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -36,11 +38,13 @@ on:
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
+      - "autumn-cli/src/console.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
+      - "autumn-cli/tests/integration/console.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -72,7 +76,9 @@ jobs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_policy_scaffold_cargo_checks      (generate.rs)
+  #   generated_nested_scaffold_cargo_checks      (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
+  #   i18n_scaffold_*_cargo_checks                (cli_tests, #1349)
   #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
   #   controller_generates_compiles_and_lists_routes (generate.rs)
   #   controller_api_generates_json               (generate.rs)
@@ -80,6 +86,8 @@ jobs:
   #   generated_channel_cargo_checks              (generate.rs)
   #   generated_channel_ws_cargo_checks           (generate.rs)
   #   generated_channel_smoke_test_passes         (generate.rs)
+  #   generated_webhook_cargo_checks              (generate.rs, #1366)
+  #   generated_webhook_tests_pass                (generate.rs, #1366)
   #
   # Each test scaffolds a project, patches Cargo.toml to point at the local
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
@@ -123,6 +131,15 @@ jobs:
           cargo test -p autumn-cli --test generate \
             generated_policy_scaffold_cargo_checks -- --ignored --exact
 
+      - name: generated_nested_scaffold_cargo_checks
+        # Issue #1323: the only machine proof that a `--belongs-to` scaffold
+        # type-checks — including the textual patch it makes to the PARENT
+        # resource's already-generated `show` handler — and that its generated
+        # cross-parent isolation test passes.
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_nested_scaffold_cargo_checks -- --ignored --exact
+
       - name: generated_scaffold_config_cargo_checks
         run: |
           cargo test -p autumn-cli --test generate \
@@ -165,6 +182,153 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_channel_smoke_test_passes -- --ignored --exact
+
+      # ── `autumn generate webhook` (#1366) ───────────────────────────────
+      #
+      # These two are the ONLY machine proof of that generator's headline
+      # acceptance criterion — that a generated, signature-verified,
+      # replay-protected endpoint compiles and its tests pass with no manual
+      # edits. `ci.yml`'s `--ignored` sweeps never target `--test generate`,
+      # so they must be named here or they never execute anywhere.
+      - name: generated_webhook_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_webhook_cargo_checks -- --ignored --exact
+
+      - name: generated_webhook_tests_pass
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_webhook_tests_pass -- --ignored --exact
+
+      # ── `autumn console` (#1039) ────────────────────────────────────────
+      #
+      # These four are the ONLY machine proof of the console's central
+      # acceptance criterion — that the scaffolded playground compiles and
+      # runs against the resolved environment with no wiring by hand. They
+      # live in the consolidated `cli_tests` binary, whose only other CI
+      # `--ignored` invocation filters on `offsite`, so they must be named
+      # explicitly here or they never execute anywhere.
+      - name: console_bare_playground_target_compiles_untouched
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_bare_playground_target_compiles_untouched \
+            -- --ignored --exact
+
+      - name: console_playground_target_compiles_with_a_repository_round_trip
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_playground_target_compiles_with_a_repository_round_trip \
+            -- --ignored --exact
+
+      - name: console_run_exits_non_zero_when_the_database_is_unreachable
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_run_exits_non_zero_when_the_database_is_unreachable \
+            -- --ignored --exact
+
+      - name: console_run_surfaces_a_compile_error_in_the_playground
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_run_surfaces_a_compile_error_in_the_playground \
+            -- --ignored --exact
+
+      # ── zero-JS attachment uploads (#1236) ──────────────────────────────
+      #
+      # The machine proof that a scaffolded `Attachment` column actually
+      # works: the first compiles a fresh attachment scaffold with only the
+      # auto-enabled `storage` + `multipart` features (AC7), the second
+      # COMPILES AND RUNS that project's generated test binary, so the
+      # emitted multipart create / 413 / NULL-column tests (AC4, AC6) are
+      # proven to pass rather than only string-matched. Same `cli_tests`
+      # caveat as the console block above — named explicitly or they never
+      # execute anywhere.
+      - name: generated_attachment_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_attachment_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: generated_attachment_scaffold_multipart_test_passes
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
+            -- --ignored --exact
+
+      # ── translatable scaffold views (#1349) ─────────────────────────────
+      #
+      # The ONLY machine proof that `--i18n` emits Rust that COMPILES. Every
+      # other i18n test string-matches the output, and the two bugs the feature
+      # shipped with were invisible to that: a `&t!(…)` temporary borrowed into
+      # a `columns` vec that outlives it, and a `transition_<field>` handler
+      # missing the `locale` parameter its body used. Adding the `Locale`
+      # extractor also pushes handlers toward axum's 16-argument `Handler`
+      # ceiling, which no string assertion can see. Same `cli_tests` caveat as
+      # the blocks above — named explicitly or they never execute anywhere.
+      - name: i18n_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_trash_and_search_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_trash_and_search_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_owner_scoped_search_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_owner_scoped_search_cargo_checks \
+            -- --ignored --exact
+
+      - name: i18n_scaffold_with_state_machine_and_attachment_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_i18n::i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
+            -- --ignored --exact
+
+      # ── `{encrypted}` field-DSL modifier (#1340) ────────────────────────
+      #
+      # The ONLY machine proof that the emitted `#[encrypted(...)]` attribute
+      # is one the `#[model]`/`#[repository]` macros actually accept — every
+      # other assertion in that slice string-matches generated text. These
+      # also pin two facts that are invisible to a string match: diesel's
+      # `serialize_as` makes `&New{Model}` non-`Insertable` (so the scaffold
+      # must insert the OWNED record), and the raw-diesel update's
+      # `autumn_web::encryption::{Randomized,Deterministic}Text::from(..)`
+      # bind type-checks inside the `.set((..))` tuple. One leg per write
+      # path, so a failure names the shape that broke. Same `cli_tests`
+      # caveat as the blocks above — named explicitly or they never run.
+      - name: encrypted_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_api_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_api_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_live_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_live_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_nested_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_nested_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: encrypted_admin_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
+            -- --ignored --exact
 
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
@@ -299,3 +463,19 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+
+      # ── `json`/`jsonb` scaffold field type (#1341) ──────────────────────
+      #
+      # The ONLY machine proof of AC6/the Success Metric: scaffolds a
+      # `Setting` resource with a `json` and a nullable `jsonb` field,
+      # compiles the generated app, migrates it against real Postgres, and
+      # inserts/selects a JSON object and array through the exact JSONB
+      # column the generator emitted — proving the round-trip, not just the
+      # generated text. Same `cli_tests` caveat as the blocks above — named
+      # explicitly here or it never runs anywhere (autumn-cli's Docker-gated
+      # tests are not auto-swept the way autumn-web's are).
+      - name: scaffolded_json_field_generates_compiles_inserts_and_selects
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_json_postgres::scaffolded_json_field_generates_compiles_inserts_and_selects \
+            -- --ignored --exact

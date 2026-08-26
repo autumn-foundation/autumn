@@ -11,6 +11,25 @@ use quote::{format_ident, quote};
 use crate::parse;
 
 /// Check if a type pattern looks like `AppState` (bare identifier).
+/// Return a purpose-written compile error when a `#[ws]` attribute carries a
+/// `seo(...)` argument, which the other route macros accept but this one
+/// deliberately does not.
+fn reject_seo_argument(attr: &TokenStream) -> Option<TokenStream> {
+    let seo_ident = attr.clone().into_iter().find_map(|tree| match tree {
+        proc_macro2::TokenTree::Ident(ident) if ident == "seo" => Some(ident),
+        _ => None,
+    })?;
+    Some(
+        syn::Error::new(
+            seo_ident.span(),
+            "`#[ws]` does not accept a `seo(...)` argument: a WebSocket upgrade \
+             serves no crawlable document. Declare SEO defaults on the HTML route \
+             that links to this socket instead.",
+        )
+        .to_compile_error(),
+    )
+}
+
 fn is_app_state_type(ty: &syn::Type) -> bool {
     if let syn::Type::Path(type_path) = ty
         && type_path.qself.is_none()
@@ -46,7 +65,26 @@ fn is_app_state_type(ty: &syn::Type) -> bool {
 /// The user's function parameters are treated as follows:
 /// - `AppState` parameters receive the extracted app state directly
 /// - All other parameters become Axum extractors on the upgrade handler
+#[allow(clippy::too_many_lines)]
 pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // `#[ws]` takes a path and nothing else, so a stray `seo(...)` would fail
+    // with syn's bare "unexpected token" pointing at the comma. Every other
+    // misuse of `seo(...)` gets a purpose-written error; say why this one is
+    // rejected rather than leaving the user to guess.
+    if let Some(err) = reject_seo_argument(&attr) {
+        return err;
+    }
+    // `#[ws]` is not a `route_macro` path, so an `#[edge]` marker would sit
+    // inertly in the handler body and the author would believe the socket was
+    // edge-eligible. Say no instead (#1790).
+    if let Some(err) = crate::edge::reject_if_edge(
+        &item,
+        "`#[edge]` cannot be combined with `#[ws]`: a WebSocket upgrade holds a live \
+         connection against origin state, which the edge capsule has no way to serve. \
+         Serve this route from the origin.",
+    ) {
+        return err;
+    }
     let path = match parse::parse_route_path(attr) {
         Ok(p) => p,
         Err(err) => return err,
@@ -159,6 +197,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     api_version: ::core::option::Option::None,
                     public: #is_public,
                     module_path: ::core::module_path!(),
+                    source_file: ::core::file!(),
+                    source_line: ::core::line!(),
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,
@@ -185,6 +225,9 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
+                // A WebSocket upgrade serves no crawlable HTML document, so
+                // `#[ws]` does not accept the `seo(...)` route argument.
+                seo: ::autumn_web::seo::SeoRouteDefaults::EMPTY,
             }
         }
     }
@@ -241,6 +284,78 @@ mod tests {
         assert!(
             generated.contains("public : true"),
             "a ws route macro over an expanded #[public] marker must record public = true: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_seo_argument_with_a_purpose_written_error() {
+        // Every other route macro accepts `seo(...)`. `#[ws]` deliberately does
+        // not, so it must say why rather than falling through to syn's bare
+        // "unexpected token" on the comma (#1182).
+        let generated = ws_macro(
+            quote! { "/live", seo(title = "Live") },
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "seo(...) on #[ws] must be a compile error: {generated}"
+        );
+        assert!(
+            generated.contains("does not accept a `seo(...)` argument"),
+            "the error must explain why #[ws] rejects it: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_live_edge_attribute() {
+        // A socket cannot be served from the edge capsule. Without this the
+        // `#[edge]` marker would sit inertly in the body and the author would
+        // believe the route was edge-eligible (#1790).
+        let generated = ws_macro(
+            quote! { "/live" },
+            quote! {
+                #[edge]
+                async fn live() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "#[edge] on a #[ws] route must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("WebSocket"),
+            "the error must explain why a socket cannot run at the edge: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_an_expanded_edge_marker() {
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        );
+        let generated = ws_macro(quote! { "/live" }, edged).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "an already-expanded #[edge] must be rejected on #[ws] too: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_still_accepts_a_bare_path() {
+        let generated = ws_macro(
+            quote! { "/live" },
+            quote! { async fn live() -> impl WsHandler { |socket| async move {} } },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "a plain #[ws(\"/path\")] must keep compiling: {generated}"
         );
     }
 }

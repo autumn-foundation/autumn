@@ -7,3 +7,13 @@
 .DS_Store
 static/css/autumn.css
 /config/master.key
+# Terraform state holds every secret value in plaintext regardless of a
+# variable's `sensitive` flag (autumn release init --target
+# azure-container-apps). Docker's build context is whatever the positional
+# path argument points at — building from `.` after `terraform apply` would
+# otherwise upload terraform.tfstate straight into the builder/build cache
+# even though no stage ever COPYs it into the final image.
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars

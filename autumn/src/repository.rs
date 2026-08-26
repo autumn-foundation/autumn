@@ -27,6 +27,20 @@
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+// Declarative counter caches (#1325) live in their own module but are part of
+// the repository surface as far as callers are concerned — `#[model]`-emitted
+// code, generated repositories and application escape hatches all name them
+// through `autumn_web::repository::…`, next to `AutumnDependents`.
+pub use crate::counter_cache::{
+    AutumnCounterCaches, ChildState, CounterCacheSpec, TenantScope, counter_cache_after_insert,
+    counter_cache_after_insert_by_id, counter_cache_after_insert_many, counter_cache_after_update,
+    counter_cache_after_update_many, counter_cache_after_upsert_many, counter_cache_apply_delta,
+    counter_cache_apply_delta_by_child_id, counter_cache_before_delete_by_id,
+    counter_cache_before_delete_many, counter_cache_before_detach_many,
+    counter_cache_before_restore_by_id, counter_cache_capture_fks, counter_cache_capture_fks_many,
+    counter_cache_recompute,
+};
+
 /// Backend-portable `FOR UPDATE` seam for generated `#[repository]` CRUD.
 ///
 /// Postgres pessimistic-lock reads chain `.for_update()` onto a select query to
@@ -110,6 +124,78 @@ macro_rules! backend_select {
     (pg => $pg:block, sqlite => $sqlite:block $(,)?) => {
         $sqlite
     };
+}
+
+/// Take the same transaction-scoped advisory lock the `position` (issue
+/// #1358) insert-assign/delete-compact triggers take, from generated
+/// `move_to`.
+///
+/// Closes a deadlock where `move_to`'s `SELECT ... FOR UPDATE ORDER BY id`
+/// row locks and a concurrent compaction trigger's `UPDATE ... WHERE
+/// position > $1` (which Postgres may satisfy via the `(scope, position)`
+/// index, i.e. **not** in `id` order) can lock the same rows in different
+/// orders.
+///
+/// `lock_name` is the literal `"{table}_{position}_assign"` string baked
+/// into the migration's trigger SQL (see
+/// `autumn-cli`'s `position_triggers_up_sql_for`); `scope` is the row's
+/// scope column value (`Some`) or `None` for an unscoped position column —
+/// mirroring the trigger's own `hashtext(NEW."{scope}"::text)` / literal
+/// `0` key2 exactly, so `move_to` and the triggers contend on the *same*
+/// advisory lock key and fully serialize against each other.
+///
+/// **Postgres**: takes `pg_advisory_xact_lock(hashtext(lock_name),
+/// hashtext(scope::text))` (or key2 `0` when unscoped) — released
+/// automatically at transaction end.
+/// **`SQLite`**: a no-op — `SQLite` has no advisory locks and no trigger
+/// counterpart takes one either; write-write correctness there rests on
+/// the database-level write lock `scoped_immediate_transaction` already
+/// acquires via `BEGIN IMMEDIATE`.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::result::Error`] if the
+/// `pg_advisory_xact_lock` query fails (e.g. the connection was lost).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub async fn position_advisory_lock(
+    conn: &mut crate::db::RuntimeConnection,
+    lock_name: &str,
+    scope: ::core::option::Option<i64>,
+) -> ::std::result::Result<(), diesel::result::Error> {
+    use crate::reexports::diesel_async::RunQueryDsl as _;
+    match scope {
+        ::core::option::Option::Some(scope_value) => {
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+                .bind::<diesel::sql_types::Text, _>(lock_name)
+                .bind::<diesel::sql_types::Text, _>(scope_value.to_string())
+                .execute(conn)
+                .await?;
+        }
+        ::core::option::Option::None => {
+            diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1), 0)")
+                .bind::<diesel::sql_types::Text, _>(lock_name)
+                .execute(conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `SQLite` arm of [`position_advisory_lock`] — a no-op. See the Postgres
+/// definition for the full contract.
+///
+/// # Errors
+///
+/// Never returns `Err` — kept `Result`-returning to match the Postgres
+/// arm's signature, since both are called from the same generated
+/// `move_to` body regardless of backend.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub async fn position_advisory_lock(
+    _conn: &mut crate::db::RuntimeConnection,
+    _lock_name: &str,
+    _scope: ::core::option::Option<i64>,
+) -> ::std::result::Result<(), diesel::result::Error> {
+    Ok(())
 }
 
 /// Where a generated repository routes its read-only methods (`find_by_id`,
@@ -513,16 +599,26 @@ pub trait ModelPrimaryKey {
 /// than one m2m association) — each mutation trait is blanket-implemented
 /// only for `M2mConnSource<Model = TheAssociationsOwner>`.
 ///
+/// It also backs the `#[votable(by = ..., aggregate = sum|count)]` reaction
+/// helpers (#1362): the `{Model}Reactions` trait `#[model]` emits is
+/// blanket-implemented over `M2mConnSource<Model = TheVotableModel>`, and
+/// `react()` acquires its own connection through
+/// [`M2mConnSource::__autumn_m2m_write_conn`] exactly like an `add_*` does,
+/// while the read-only `reaction_of()` uses
+/// [`M2mConnSource::__autumn_m2m_read_conn`]. Both scope their **target**
+/// lookups with [`M2mConnSource::__autumn_m2m_tenant_scope`] when the target
+/// model carries a `tenant_id` column.
+///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub trait M2mConnSource: Send + Sync {
-    /// The model whose `#[has_many(..., through = ...)]` associations this
-    /// repository's mutation helpers operate on.
+    /// The model whose `#[has_many(..., through = ...)]` associations (or
+    /// `#[votable]` reactions) this repository's mutation helpers operate on.
     type Model;
 
     /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
-    /// many-to-many mutation.
+    /// many-to-many mutation, or for a `#[votable]` `react()`.
     ///
     /// Mirrors the write-connection acquisition every
     /// other mutating generated method uses (marks the read-your-writes pin
@@ -534,6 +630,159 @@ pub trait M2mConnSource: Send + Sync {
             diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
         >,
     > + Send;
+
+    /// Acquire a connection for a *read-only* association/reaction accessor —
+    /// currently `#[votable]`'s `reaction_of()`.
+    ///
+    /// Routes exactly like every other generated read: per the repository's
+    /// [`ReadRoute`] snapshot, so a configured replica serves it (and an
+    /// `Unavailable` route fails fast). Unlike
+    /// [`__autumn_m2m_write_conn`](M2mConnSource::__autumn_m2m_write_conn) it
+    /// does **not** mark the read-your-writes pin — it is a read, so it neither
+    /// pins subsequent reads to the primary nor promises to observe a write
+    /// this request has not yet committed. A caller that must see its own
+    /// just-committed `react()` on a replica-backed repository should read
+    /// through a `primary_reads` / `on_primary()` repository, or use the
+    /// `Reaction` value `react()` already returned.
+    fn __autumn_m2m_read_conn(
+        &self,
+    ) -> impl ::std::future::Future<
+        Output = crate::AutumnResult<
+            diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
+        >,
+    > + Send;
+
+    /// The tenant this repository would scope its queries to, for the
+    /// `#[votable]` reaction helpers to apply to their **target** lookups.
+    ///
+    /// Synchronous (it only reads the `CURRENT_TENANT` task-local) and
+    /// deliberately three-valued, mirroring what a derived finder on the same
+    /// repository would do:
+    ///
+    /// - `Ok(Some(tenant))` — a `#[repository(..., tenant_scoped)]` repository
+    ///   used inside a tenant context: `react()` / `reaction_of()` must filter
+    ///   the target on `tenant_id`, so a foreign-tenant target id is `NotFound`
+    ///   (respectively `None`) before any write.
+    /// - `Ok(None)` — a repository that is not `tenant_scoped`, or one used via
+    ///   `across_tenants()`: no tenant predicate, exactly like its finders.
+    /// - `Err(..)` — a `tenant_scoped` repository with no tenant context: the
+    ///   same "no tenant context was established" failure the derived queries
+    ///   raise, so the reaction surface fails closed rather than writing
+    ///   unscoped.
+    ///
+    /// Only the codegen for a model that actually has a `tenant_id` column
+    /// calls it; a model without one pays nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the repository is `tenant_scoped`, is not in
+    /// `across_tenants()` mode, and no tenant context was established.
+    fn __autumn_m2m_tenant_scope(&self) -> crate::AutumnResult<::core::option::Option<String>>;
+}
+
+/// Which of the three edge mutations a `#[votable]` `react()` call performed
+/// (#1362).
+///
+/// A reaction edge is a single `(reactor, target)` row in the edge table, so
+/// every `react()` resolves to exactly one of: create it, replace its value, or
+/// delete it. The discrimination is returned rather than inferred from
+/// [`Reaction::value`] so a route can tell "the user changed their mind"
+/// (`Flipped`) apart from "the user reacted for the first time" (`Inserted`)
+/// without a second query — useful for flash messages, analytics and
+/// notification fan-out.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::repository::ReactionOutcome;
+///
+/// // Only a signed (`aggregate = sum`) reaction can be flipped.
+/// assert_ne!(ReactionOutcome::Inserted, ReactionOutcome::Flipped);
+/// ```
+///
+/// `#[non_exhaustive]`: a future aggregate mode may add an outcome, so match
+/// arms in downstream crates must carry a `_ => …` fallback.
+#[cfg(feature = "db")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionOutcome {
+    /// The reactor had no reaction on this target; one was created.
+    Inserted,
+    /// The reactor had the *opposite* reaction; its value was replaced in
+    /// place (no second edge row is ever created).
+    ///
+    /// Never produced by an `aggregate = count` reaction: a count edge carries
+    /// no value, so a repeat click can only toggle it off.
+    Flipped,
+    /// The reactor repeated its existing reaction, so the edge was deleted
+    /// (toggle-off).
+    Removed,
+}
+
+/// The post-commit state a `#[votable]` `react()` call leaves behind (#1362).
+///
+/// `react()` toggles/flips/inserts the `(reactor, target)` edge **and**
+/// recomputes the target's aggregate column from ground truth in the same
+/// transaction. Everything a caller needs to re-render the reaction control is
+/// therefore already known when the transaction commits, and is returned here —
+/// a route never has to issue a follow-up `SELECT` for the new score or for the
+/// viewer's own reaction.
+///
+/// `#[non_exhaustive]`: `react()` is the only constructor, so a later field
+/// (say, the edge's `created_at`) is not a breaking change. Read the fields;
+/// do not struct-literal one from outside this crate.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::repository::{Reaction, ReactionOutcome};
+///
+/// // `react(user_id, post_id, 1)` on a post whose score was 6 returns
+/// // value `Some(1)`, aggregate `7`, outcome `Inserted`. Callers read those
+/// // fields — `react()` is the only constructor, and the wildcard arm is what
+/// // `#[non_exhaustive]` asks of a downstream match.
+/// fn label(reaction: &Reaction) -> String {
+///     match reaction.outcome {
+///         ReactionOutcome::Removed => format!("score {}", reaction.aggregate),
+///         _ => format!("score {} (yours: {:?})", reaction.aggregate, reaction.value),
+///     }
+/// }
+/// ```
+#[cfg(feature = "db")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// The reactor's reaction *after* the call: `Some(value)` after an insert
+    /// or a flip, `None` after a toggle-off.
+    ///
+    /// An `aggregate = count` reaction reports `Some(1)` while the membership
+    /// row exists, so view code is mode-independent.
+    pub value: Option<i16>,
+    /// The target's newly persisted aggregate (`score` for `aggregate = sum`,
+    /// `{name}_count` for `aggregate = count`) — ground truth as of this
+    /// transaction's commit, not an accumulated delta.
+    pub aggregate: i64,
+    /// Which edge mutation ran.
+    pub outcome: ReactionOutcome,
+}
+
+#[cfg(feature = "db")]
+impl Reaction {
+    /// Framework plumbing: the constructor `#[votable]`'s generated `react()`
+    /// uses.
+    ///
+    /// `Reaction` is `#[non_exhaustive]`, so the generated code — which expands
+    /// in the *application's* crate — cannot write a struct literal. Not a
+    /// public API; call `react()` instead.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __new(value: Option<i16>, aggregate: i64, outcome: ReactionOutcome) -> Self {
+        Self {
+            value,
+            aggregate,
+            outcome,
+        }
+    }
 }
 
 /// Metadata trait implemented for model structs to expose FTS configuration.

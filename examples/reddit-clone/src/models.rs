@@ -1,6 +1,7 @@
 use autumn_web::storage::Blob;
 
-use crate::schema::{comments, posts, subreddits, tags, users, votes};
+use crate::repositories::PgVoteRepository;
+use crate::schema::{posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
 
@@ -22,7 +23,7 @@ pub struct User {
 }
 
 // `User` is a hand-written model (so `password_hash` is never auto-exposed),
-// but it is the target of `#[belongs_to(User, ...)]` on `Post`/`Comment`/
+// but it is the target of `#[belongs_to(User, ...)]` on `Post`/
 // `Subreddit`. Make it a leaf preload target so `post.author()` works.
 autumn_web::impl_preloadable_leaf!(User);
 
@@ -33,9 +34,14 @@ pub struct NewUser {
     pub password_hash: String,
 }
 
+// Polymorphic comments (#1367), the SECOND commentable model. Everything that
+// makes a subreddit's about page discussable is on these two lines: the
+// attribute, and the `comment_count` column the migration added. No comments
+// table of its own, no routes, no threading query -- it shares `Post`'s.
 #[autumn_web::model]
 #[belongs_to(User, fk = creator_id)]
 #[has_many(Post)]
+#[commentable(by = User, author_name = username)]
 pub struct Subreddit {
     #[id]
     pub id: i64,
@@ -49,14 +55,45 @@ pub struct Subreddit {
     #[default]
     pub subscriber_count: i64,
     #[default]
+    pub comment_count: i64,
+    #[default]
     pub created_at: chrono::NaiveDateTime,
 }
 
+// Votable (#1362): `#[votable(by = User, aggregate = sum)]` is the whole
+// upvote/downvote feature. Every default already matches the schema this
+// example has shipped since its first migration -- table `votes`, columns
+// `user_id` / `post_id` / `value`, aggregate column `posts.score`, and the
+// load-bearing `UNIQUE (user_id, post_id)` the generated upsert names as its
+// `ON CONFLICT` arbiter -- so there are no overrides and **no migration**.
+// It emits a `PostReactions` trait (`react` / `reaction_of`) that
+// `PgPostRepository` picks up; see `crate::routes::votes`.
+//
+// Polymorphic comments (#1367): `#[commentable]` replaces what used to be a
+// `#[has_many(Comment)]` leg plus a 188-line hand-rolled `routes/comments.rs`.
+// It emits a `PostComments` trait (`add_comment` / `comment_thread` /
+// `delete_comment`) on `PgPostRepository`, registers `Post` with the
+// framework's generic comment router, and keeps `posts.comment_count` current
+// inside each comment's own transaction.
 #[autumn_web::model]
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Subreddit)]
-#[has_many(Comment)]
+// #2260 destroyed this post's comments through `#[has_many(Comment, dependent =
+// destroy)]`. That leg is gone with the `Comment` model (#1367), but the
+// behaviour is NOT: the polymorphic table cannot carry a foreign key to two
+// parent tables, so the migration installs a `posts_delete_comments` trigger
+// that deletes `(commentable_type, commentable_id)` rows when their parent goes.
+// It covers every commentable model at once rather than one leg per model.
+//
+// Votes have no deletion hooks or counter-cache leg of their own: `Post::score`
+// belongs to the row being removed. A bulk delete is therefore both safe and
+// preferable. Matching the nullable FK against this post's non-null id deletes
+// only post-targeted votes; comment votes have `post_id = NULL` and are reached
+// through their comment when the trigger removes it.
+#[has_many(Vote, fk = "post_id", name = post_votes, dependent = delete_all)]
 #[has_many(Tag, through = post_tags)]
+#[votable(by = User, aggregate = sum)]
+#[commentable(by = User, author_name = username)]
 pub struct Post {
     #[id]
     pub id: i64,
@@ -98,30 +135,36 @@ pub struct Tag {
     pub slug: String,
 }
 
-#[autumn_web::model]
-#[belongs_to(User, fk = author_id)]
-#[belongs_to(Post)]
-pub struct Comment {
-    #[id]
-    pub id: i64,
-    #[validate(length(min = 1))]
-    pub body: String,
-    #[indexed]
-    pub author_id: i64,
-    #[indexed]
-    pub post_id: i64,
-    pub parent_id: Option<i64>,
-    #[default]
-    pub score: i64,
-    #[default]
-    pub created_at: chrono::NaiveDateTime,
-}
+// The `Comment` model that used to live here is gone (#1367). Comments are now
+// a framework association: one polymorphic `comments` table keyed on
+// `(commentable_type, commentable_id)`, read back through
+// `autumn_web::commentable::Comment` and the repository helpers `#[commentable]`
+// emits. `crate::schema::comments` is kept because the table is still this
+// app's -- `votes.comment_id` references it -- but no `#[model]` maps it.
 
 // `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
 // `crate::repositories`) can expose the typed grouped-aggregate roll-up
 // `sum_value_grouped_by_post_id` (#1364), which the front-page "Top posts by
 // votes" leaderboard uses as a replica-eligible top-N read.
 // A vote references *either* a post or a comment, so both FKs are nullable.
+//
+// This model **coexists with** `Post`'s `#[votable]` above rather than being
+// replaced by it -- the two describe the same physical `votes` table from two
+// angles, deliberately:
+//
+//   * `#[votable]` emits its own edge `diesel::table!` inside a *hidden*
+//     private module (`__autumn_votable_..._post_vote`), declaring only the
+//     three columns the write path touches and declaring `post_id` as
+//     **non-nullable** `Int8`. That is what makes `ON CONFLICT (user_id,
+//     post_id)` well-typed and makes a NULL target unrepresentable on the
+//     write path. It never collides with, or redefines, `crate::schema::votes`.
+//   * `Vote` maps the *full* `crate::schema::votes` -- including the nullable
+//     `post_id` / `comment_id` XOR pair -- which is exactly what the
+//     leaderboard's `IS NOT NULL` group guard needs to exclude comment votes.
+//
+// So: reads and roll-ups go through `Vote`/`VoteRepository`; writes go through
+// `posts.react(...)`. Guarded by `leaderboard_grouped_aggregate_still_works_
+// after_react` in `tests/votable_pg_integration.rs`.
 #[autumn_web::model(table = "votes")]
 pub struct Vote {
     #[id]

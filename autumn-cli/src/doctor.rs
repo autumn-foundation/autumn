@@ -2430,7 +2430,7 @@ fn check_pg_client_tools_sqlite() -> CheckResult {
             "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required".into(),
         ),
         hint: Some(
-            "SQLite backup/restore is tracked in https://github.com/madmax983/autumn/issues/1909",
+            "SQLite backup/restore is tracked in https://github.com/autumn-foundation/autumn/issues/1909",
         ),
     }
 }
@@ -2460,31 +2460,205 @@ fn read_msrv() -> Option<String> {
 
 /// Read the `autumn-web` version requirement from the project's `Cargo.toml`.
 fn read_autumn_web_version() -> Option<String> {
-    let content = std::fs::read_to_string("Cargo.toml").ok()?;
-    let table: toml::Table = toml::from_str(&content).ok()?;
+    read_autumn_web_version_at(std::path::Path::new("."))
+}
 
-    let find_in_deps = |deps: &toml::Value| -> Option<String> {
-        let entry = deps.get("autumn-web")?;
+/// How a manifest declares `autumn-web`, if it does.
+///
+/// `autumn upgrade` needs the middle case told apart from the absent one: a
+/// `{ path = "../autumn" }` or `{ git = "..." }` dependency *is* a declaration,
+/// it just carries no version to compare. Treating it as "not declared" lets a
+/// sibling manifest pick the floor for a crate whose version is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutumnWebDependency {
+    /// The manifest does not mention `autumn-web`.
+    Absent,
+    /// Declared with a version requirement.
+    Version(String),
+    /// Declared, but with no version to read — a path or git entry.
+    WithoutVersion,
+    /// The manifest exists but could not be read or parsed.
+    ///
+    /// Distinct from [`Self::Absent`] on purpose: a crate whose manifest cannot
+    /// be read may well be the oldest in the workspace, and reading it as
+    /// "declares nothing" lets a newer sibling decide the floor while this
+    /// crate's sources are scanned and rewritten anyway.
+    Unreadable,
+    /// `{ workspace = true }`: the version lives in the enclosing workspace's
+    /// `[workspace.dependencies]`, which may be in an *ancestor* directory when
+    /// the command is pointed at a member rather than the workspace root.
+    ///
+    /// Carries the *key* the member used, because that is the only handle on
+    /// the entry: under Cargo's renamed form the member writes `autumn =
+    /// { workspace = true }` and nothing but the workspace entry it points at
+    /// says the package is `autumn-web`. Resolve it with
+    /// [`workspace_dependency_for`].
+    Inherited(String),
+}
+
+/// Read the `autumn-web` version requirement from the `Cargo.toml` at `root`.
+///
+/// The first readable version across every dependency table. Callers that need
+/// *all* of them — `autumn upgrade`, which takes the oldest floor — use
+/// [`autumn_web_declarations_at`] instead.
+pub fn read_autumn_web_version_at(root: &std::path::Path) -> Option<String> {
+    autumn_web_declarations_at(root)
+        .into_iter()
+        .find_map(|declaration| match declaration {
+            AutumnWebDependency::Version(version) => Some(version),
+            AutumnWebDependency::Absent
+            | AutumnWebDependency::Unreadable
+            | AutumnWebDependency::WithoutVersion
+            | AutumnWebDependency::Inherited(_) => None,
+        })
+}
+
+/// Every `autumn-web` declaration in the `Cargo.toml` at `root`.
+///
+/// All of them, not the first: a manifest can declare the dependency under
+/// `[dependencies]`, `[workspace.dependencies]`, and any number of
+/// `[target.'cfg(…)'.dependencies]` tables, and Cargo honours each. Returning
+/// the first match let a newer target-specific requirement hide an older one
+/// while the older target's `#[cfg]` code was still scanned and rewritten.
+///
+/// Both spellings are recognised: the literal `autumn-web` key, and Cargo's
+/// renamed form `autumn_web = { package = "autumn-web", version = "…" }`.
+///
+/// An empty result means the manifest does not mention `autumn-web` at all.
+pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDependency> {
+    /// Every dependency-table kind Cargo reads. `dev-` and `build-` count: a
+    /// crate depending on autumn-web only for its tests or its `build.rs` still
+    /// has those sources scanned and rewritten, so it gets a vote on the
+    /// version.
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    /// Whether this dependency entry is `autumn-web`, under either spelling.
+    fn is_autumn_web(key: &str, entry: &toml::Value) -> bool {
+        key == "autumn-web"
+            || entry
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|package| package == "autumn-web")
+    }
+
+    /// Whether this entry defers to the enclosing workspace.
+    fn is_inherited(entry: &toml::Value) -> bool {
+        entry
+            .get("workspace")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn classify(key: &str, entry: &toml::Value) -> AutumnWebDependency {
         match entry {
-            toml::Value::String(v) => Some(v.clone()),
-            toml::Value::Table(t) => t
-                .get("version")?
-                .as_str()
-                .map(std::borrow::ToOwned::to_owned),
-            _ => None,
+            toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+            toml::Value::Table(table) => table
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map_or_else(
+                    || {
+                        if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                            // Resolved against the enclosing workspace, which
+                            // is not necessarily inside the scanned tree.
+                            AutumnWebDependency::Inherited(key.to_owned())
+                        } else {
+                            // A path or git entry: declared, no version to read.
+                            AutumnWebDependency::WithoutVersion
+                        }
+                    },
+                    |version| AutumnWebDependency::Version(version.to_owned()),
+                ),
+            _ => AutumnWebDependency::WithoutVersion,
         }
+    }
+
+    let manifest = root.join("Cargo.toml");
+    let Ok(content) = std::fs::read_to_string(&manifest) else {
+        // No manifest at all is a directory that is not a crate. One that
+        // exists and cannot be read is a crate whose version is unknown.
+        return if manifest.exists() {
+            vec![AutumnWebDependency::Unreadable]
+        } else {
+            Vec::new()
+        };
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
+        return vec![AutumnWebDependency::Unreadable];
     };
 
-    // [dependencies] then [workspace.dependencies]
-    table
-        .get("dependencies")
-        .and_then(find_in_deps)
-        .or_else(|| {
+    // Every dependency table Cargo reads: the package's own, the workspace's,
+    // and one per target predicate — in each of the three kinds.
+    let mut tables: Vec<&toml::Value> = Vec::new();
+    for kind in KINDS {
+        tables.extend(table.get(kind));
+        tables.extend(
             table
                 .get("workspace")
-                .and_then(|w| w.get("dependencies"))
-                .and_then(find_in_deps)
+                .and_then(|workspace| workspace.get(kind)),
+        );
+    }
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            for kind in KINDS {
+                tables.extend(target.get(kind));
+            }
+        }
+    }
+
+    tables
+        .into_iter()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| {
+            deps.iter()
+                // Inherited entries come along under *any* key: a member
+                // writing `autumn = { workspace = true }` names neither
+                // `autumn-web` nor a `package`, so whether it is this
+                // dependency can only be answered by the workspace entry it
+                // points at. The caller resolves them and drops the ones that
+                // turn out to be some other crate.
+                .filter(|(key, entry)| is_autumn_web(key, entry) || is_inherited(entry))
+                .map(|(key, entry)| classify(key, entry))
         })
+        .filter(|declaration| *declaration != AutumnWebDependency::Absent)
+        .collect()
+}
+
+/// The `[workspace.dependencies]` entry named `key` in the `Cargo.toml` at
+/// `dir`, but only when that entry resolves to `autumn-web`.
+///
+/// Used to resolve `{ workspace = true }` when `autumn upgrade` is pointed at a
+/// member directory: Cargo walks up to the workspace root, and so must this.
+/// The lookup is by the member's key rather than by the crate name because a
+/// renamed workspace entry — `autumn = { package = "autumn-web", … }` — is the
+/// only place the real package is written down. `None` means the workspace does
+/// not define `key`, or defines it as a different crate.
+pub fn workspace_dependency_for(dir: &std::path::Path, key: &str) -> Option<AutumnWebDependency> {
+    let content = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let table = toml::from_str::<toml::Table>(&content).ok()?;
+    let entry = table
+        .get("workspace")?
+        .get("dependencies")?
+        .as_table()?
+        .iter()
+        .find(|(candidate, entry)| {
+            *candidate == key
+                && (key == "autumn-web"
+                    || entry
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|package| package == "autumn-web"))
+        })
+        .map(|(_, entry)| entry)?;
+    Some(match entry {
+        toml::Value::String(version) => AutumnWebDependency::Version(version.clone()),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map_or(AutumnWebDependency::WithoutVersion, |version| {
+                AutumnWebDependency::Version(version.to_owned())
+            }),
+        _ => AutumnWebDependency::WithoutVersion,
+    })
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.
@@ -3144,7 +3318,7 @@ fn check_pending_migrations_sqlite() -> CheckResult {
                 .into(),
         ),
         hint: Some(
-            "SQLite migration support is tracked in https://github.com/madmax983/autumn/issues/1906",
+            "SQLite migration support is tracked in https://github.com/autumn-foundation/autumn/issues/1906",
         ),
     }
 }
@@ -5999,6 +6173,22 @@ fn deploy_profile_config_load_check(
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
+/// Remedy printed when `[deploy] host` / `[deploy] hosts` are spelled in a way the
+/// shared validator refuses (both keys set, a blank entry, a duplicate).
+///
+/// A named constant so a unit test can pin its exact text: it is a `hint` field on
+/// `CheckResult`, so it is emitted verbatim into `autumn doctor --json` as well as
+/// the terminal, and a dropped `\` continuation would ship a run of spaces
+/// mid-sentence on a machine-readable surface (issue #1621).
+const DEPLOY_HOST_SPELLING_HINT: &str = "Fix the [deploy] host spelling in autumn.toml — \
+     set either `host` (one server) or `hosts` (a fleet), never both (see `autumn deploy \
+     check`)";
+
+/// Remedy printed on the SSH-reachability row when the host spelling itself is
+/// broken, so there is no list to probe. See [`DEPLOY_HOST_SPELLING_HINT`].
+const DEPLOY_HOST_SPELLING_REACHABILITY_HINT: &str = "Fix the [deploy] host spelling in autumn.toml before probing reachability (see \
+     `autumn deploy check`)";
+
 /// Run all doctor checks and report results.
 ///
 /// Checks are organised in two phases:
@@ -6509,27 +6699,55 @@ pub fn run(opts: DoctorOptions) {
         // --strict` must fail on it too rather than green-lighting a config the
         // deploy path rejects. Only the actual TCP connect probe is gated behind
         // `--online`.
-        let host = deploy_cfg.host.clone();
+        //
+        // #1621: the target is a LIST — `[deploy] host` (one) or `[deploy] hosts`
+        // (a fleet, in rollout order) — and doctor enumerates it exactly as
+        // `deploy check` does, through the same shared validator, so a fleet config
+        // is graded rather than reported as "no target host configured". A malformed
+        // spelling (both keys set, a blank entry, a duplicate) is the same hard
+        // refusal `deploy check` makes, surfaced here as a failing `deploy_host`.
+        //
+        // Doctor keeps ONE check per grader name even for a fleet: `CheckResult.name`
+        // is `&'static str` and an operator-visible `--json` key, so the per-host
+        // detail rides in the DETAIL text instead of multiplying names. See
+        // `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
+        let deploy_hosts = crate::deploy::deploy_host_list(&deploy_cfg);
         tasks.push(Box::new({
-            let host = host.clone();
-            move || {
-                deploy_preflight_result(
+            let deploy_hosts = deploy_hosts.clone();
+            move || match &deploy_hosts {
+                Ok(hosts) => deploy_preflight_result(
                     "deploy_host",
-                    crate::deploy::grade_deploy_host_present(host.as_deref()),
-                )
+                    crate::deploy::grade_deploy_hosts_present(hosts),
+                ),
+                Err(message) => CheckResult {
+                    name: "deploy_host",
+                    status: CheckStatus::Fail,
+                    detail: Some(message.clone()),
+                    hint: Some(DEPLOY_HOST_SPELLING_HINT),
+                },
             }
         }));
         if opts.online {
             let ssh_port = deploy_cfg.ssh_port;
-            tasks.push(Box::new(move || {
-                deploy_preflight_result(
-                    "deploy_ssh_reachability",
-                    crate::deploy::grade_ssh_reachability(
-                        host.as_deref(),
+            tasks.push(Box::new(move || match &deploy_hosts {
+                Ok(hosts) => deploy_preflight_result(
+                    crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
+                    crate::deploy::grade_fleet_ssh_reachability(
+                        hosts,
                         ssh_port,
                         std::time::Duration::from_secs(5),
                     ),
-                )
+                ),
+                // The spelling itself is broken, so there is no list to probe; the
+                // `deploy_host` check above already names the problem. Report the
+                // reachability check as failing rather than silently omitting it —
+                // omission would change the `--json` key set.
+                Err(message) => CheckResult {
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
+                    status: CheckStatus::Fail,
+                    detail: Some(message.clone()),
+                    hint: Some(DEPLOY_HOST_SPELLING_REACHABILITY_HINT),
+                },
             }));
         }
 
@@ -6537,7 +6755,7 @@ pub fn run(opts: DoctorOptions) {
             Ok(deploy_previous_signing) => {
                 tasks.push(Box::new(move || {
                     deploy_preflight_result(
-                        "deploy_signing_secret",
+                        crate::deploy::DOCTOR_PREFLIGHT_GRADERS[1],
                         crate::deploy::grade_signing_secret(
                             deploy_signing.as_deref(),
                             &deploy_previous_signing,
@@ -6555,7 +6773,7 @@ pub fn run(opts: DoctorOptions) {
                 // strong current secret green-light a config the deploy path
                 // rejects.
                 tasks.push(Box::new(move || CheckResult {
-                    name: "deploy_signing_secret",
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[1],
                     status: CheckStatus::Fail,
                     detail: Some(format!(
                         "security.signing_secret.previous_secrets is present but invalid: {msg}"
@@ -6571,7 +6789,7 @@ pub fn run(opts: DoctorOptions) {
             Ok(deploy_db_url) => {
                 tasks.push(Box::new(move || {
                     deploy_preflight_result(
-                        "deploy_database_url",
+                        crate::deploy::DOCTOR_PREFLIGHT_GRADERS[2],
                         crate::deploy::grade_database_url(
                             deploy_db_url.as_deref(),
                             std::path::Path::new("migrations"),
@@ -6586,7 +6804,7 @@ pub fn run(opts: DoctorOptions) {
                 // check instead of exiting the process, so `autumn doctor --json`
                 // still emits valid JSON with a clear, actionable failure.
                 tasks.push(Box::new(move || CheckResult {
-                    name: "deploy_database_url",
+                    name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[2],
                     status: CheckStatus::Fail,
                     detail: Some(format!("[[database.shards]] is present but invalid: {msg}")),
                     hint: Some(
@@ -6598,7 +6816,7 @@ pub fn run(opts: DoctorOptions) {
         }
         tasks.push(Box::new(|| {
             deploy_preflight_result(
-                "deploy_migrate_check",
+                crate::deploy::DOCTOR_PREFLIGHT_GRADERS[3],
                 crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
             )
         }));
@@ -6943,6 +7161,28 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(|| {
         let found = resolve_unprivate_sensitive_columns();
         check_model_private_columns_impl(&found)
+    }));
+
+    // 16. Edge capsule toolchain (issue #1790): a project with `#[edge]` routes
+    //     needs the wasm32-wasip1 std library installed or `autumn build` cannot
+    //     emit the capsule. Both the source scan and the toolchain probe run
+    //     inside the task so they overlap with the other checks.
+    tasks.push(Box::new(|| {
+        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
+        // Probe the toolchain only when the answer can matter: a project with no
+        // #[edge] routes must not pay for a `rustc` spawn on every doctor run.
+        let installed = !scan.is_empty() && crate::build::edge_target_installed();
+        check_edge_target_impl(&scan, installed)
+    }));
+
+    // 17. Edge route wiring (issue #1790): an `#[edge]` handler that also
+    //     carries an auth guard fails the build, an unregistered one is never
+    //     served at the edge, and a missing `src/bin/edge-capsule.rs` leaves
+    //     nothing to compile.
+    tasks.push(Box::new(|| {
+        let scan = crate::edge_scan::resolve_edge_scan(std::path::Path::new("."));
+        let capsule_bin_exists = std::path::Path::new(EDGE_CAPSULE_BIN).exists();
+        check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -7450,64 +7690,23 @@ pub fn check_maintenance_mode() -> CheckResult {
 // ── System-test browser check ─────────────────────────────────────────────
 
 /// Candidate paths probed for a Chromium binary, in resolution order.
+///
+/// Delegates to `autumn_web::browser_detect` so `autumn doctor` and the
+/// `SystemTest` harness can never disagree about whether this host can run
+/// system tests — they used to keep separate copies of this list and did
+/// (#1456).
 pub fn browser_candidate_paths() -> Vec<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
-    if let Ok(p) = std::env::var("AUTUMN_CHROMIUM") {
-        candidates.push(std::path::PathBuf::from(p));
-    }
-
-    if let Ok(base) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
-        let base = std::path::PathBuf::from(base);
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            let mut pw_paths: Vec<_> = entries
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("chromium-"))
-                .map(|e| {
-                    if cfg!(target_os = "macos") {
-                        e.path()
-                            .join("chrome-mac")
-                            .join("Chromium.app")
-                            .join("Contents")
-                            .join("MacOS")
-                            .join("Chromium")
-                    } else if cfg!(target_os = "windows") {
-                        e.path().join("chrome-win").join("chrome.exe")
-                    } else {
-                        e.path().join("chrome-linux").join("chrome")
-                    }
-                })
-                .collect();
-            pw_paths.sort();
-            pw_paths.reverse();
-            candidates.extend(pw_paths);
-        }
-    }
-
-    candidates.extend(
-        [
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/snap/bin/chromium",
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-        .map(std::path::PathBuf::from),
-    );
-
-    candidates
+    autumn_web::browser_detect::browser_candidates()
 }
 
-/// Run `<path> --version` and return the trimmed output on success.
+/// Probe `path` for a browser version, using the same rules as the harness.
+///
+/// Returns `None` when the candidate is not usable, and
+/// `autumn_web::browser_detect::UNKNOWN_VERSION` when it is usable but cannot
+/// report a version (Windows `chrome.exe` is a GUI-subsystem binary that
+/// prints nothing to the parent console).
 fn probe_browser_version(path: &std::path::Path) -> Option<String> {
-    std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    autumn_web::browser_detect::probe_version(path)
 }
 
 /// Check whether a Chromium binary is available for system tests.
@@ -7556,9 +7755,11 @@ fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
 pub fn check_system_test_browser() -> CheckResult {
     let candidates = browser_candidate_paths();
     for path in &candidates {
-        if path.is_file()
-            && let Some(version) = probe_browser_version(path)
-        {
+        // No `is_file()` pre-check: `probe_browser_version` owns that
+        // decision, and on Windows "the file exists" *is* the answer — a
+        // GUI-subsystem `chrome.exe` can never report a version, so gating on
+        // one here is what produced the false "no browser installed" (#1456).
+        if let Some(version) = probe_browser_version(path) {
             return CheckResult {
                 name: "system_test_browser",
                 status: CheckStatus::Pass,
@@ -7931,11 +8132,278 @@ fn parse_pub_field_name(line: &str) -> Option<String> {
     Some(name.to_owned())
 }
 
+// ─── Edge capsule preflight (#1790) ──────────────────────────────────────────
+
+/// The `src/bin/edge-capsule.rs` an app with `#[edge]` routes needs.
+const EDGE_CAPSULE_BIN: &str = "src/bin/edge-capsule.rs";
+
+/// Whether the project can compile its `#[edge]` routes at all: the
+/// `wasm32-wasip1` standard library has to be installed for the active
+/// toolchain, or `autumn build` cannot emit the edge capsule.
+///
+/// Pure and injectable: `scan` is the pre-resolved source scan and
+/// `target_installed` the pre-resolved toolchain probe (both resolved inside the
+/// task closure in [`run`]).
+pub fn check_edge_target_impl(
+    scan: &crate::edge_scan::EdgeScan,
+    target_installed: bool,
+) -> CheckResult {
+    const NAME: &str = "edge_target";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+    if target_installed {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{} #[edge] route(s); the {} target is installed",
+                scan.functions.len(),
+                crate::build::EDGE_TARGET,
+            )),
+            hint: None,
+        };
+    }
+    let mut files: Vec<&str> = scan.functions.iter().map(|f| f.file.as_str()).collect();
+    files.sort_unstable();
+    files.dedup();
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "{} #[edge] route(s) in {} need the {} target, which is not installed",
+            scan.functions.len(),
+            files.join(", "),
+            crate::build::EDGE_TARGET,
+        )),
+        hint: Some(crate::build::EDGE_TARGET_HINT),
+    }
+}
+
+/// Whether the project's `#[edge]` routes are wired the way the capsule needs.
+///
+/// Reported in precedence order, worst first, so the single line always names
+/// the most urgent problem:
+/// 1. an `#[edge]` handler that also carries an auth/rate-limit guard — the
+///    `#[edge]` macro rejects that pair, so this is a build failure caught
+///    before the build;
+/// 2. a marked handler no `edge_routes![]` registers — it compiles, but the
+///    capsule never serves it;
+/// 3. edge routes with no `src/bin/edge-capsule.rs` — nothing to compile into.
+///
+/// Pure and injectable: `capsule_bin_exists` is resolved by the caller.
+pub fn check_edge_routes_impl(
+    scan: &crate::edge_scan::EdgeScan,
+    capsule_bin_exists: bool,
+) -> CheckResult {
+    const NAME: &str = "edge_routes";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+
+    let guarded = scan.guarded();
+    if !guarded.is_empty() {
+        let lines: Vec<String> = guarded
+            .iter()
+            .map(|f| format!("{} also carries #[{}]", f.location(), f.guards.join("]/#[")))
+            .collect();
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Fail,
+            detail: Some(lines.join("\n")),
+            hint: Some(
+                "Remove #[edge] or the conflicting attribute: edge routes are unauthenticated \
+                 read-path routes served without origin middleware — the capsule has no session, \
+                 auth, or rate-limit state, and #[intercept] layers do not run there.",
+            ),
+        };
+    }
+
+    let unregistered = scan.unregistered();
+    if !unregistered.is_empty() {
+        let lines: Vec<String> = unregistered
+            .iter()
+            .map(|f| format!("{} is not registered", f.location()))
+            .collect();
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(lines.join("\n")),
+            hint: Some(
+                "Add the handler to edge_routes![] and pass it to the edge-capsule bin; \
+                 an unregistered #[edge] route is only ever served by the origin.",
+            ),
+        };
+    }
+
+    if !capsule_bin_exists {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} #[edge] route(s) registered but {EDGE_CAPSULE_BIN} is missing",
+                scan.functions.len()
+            )),
+            hint: Some(
+                "Create src/bin/edge-capsule.rs calling autumn_edge::serve(...) with your \
+                 edge_routes![] list so `autumn build` can compile the capsule.",
+            ),
+        };
+    }
+
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "{} #[edge] route(s) registered with edge_routes![]",
+            scan.registered_fns().len()
+        )),
+        hint: None,
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Edge capsule preflight (#1790) ───────────────────────────────────────
+
+    fn edge_scan_of(src: &str) -> crate::edge_scan::EdgeScan {
+        crate::edge_scan::scan_sources(&[("src/routes.rs", src)])
+    }
+
+    /// One marked, registered, guard-free handler — the healthy shape.
+    fn healthy_edge_scan() -> crate::edge_scan::EdgeScan {
+        edge_scan_of("#[edge]\nfn greet() {}\nfn wire() { edge_routes![greet]; }")
+    }
+
+    /// #1621 review finding 12. Both hints are `hint` fields on `CheckResult`, so
+    /// they are serialized verbatim into `autumn doctor --json`; a dropped `\`
+    /// line continuation bakes the source indentation into the message as a long
+    /// run of spaces mid-sentence. Pin the exact text.
+    #[test]
+    fn deploy_host_spelling_hints_carry_no_line_continuation_gutter() {
+        assert_eq!(
+            DEPLOY_HOST_SPELLING_HINT,
+            "Fix the [deploy] host spelling in autumn.toml \u{2014} set either `host` (one \
+             server) or `hosts` (a fleet), never both (see `autumn deploy check`)",
+        );
+        assert_eq!(
+            DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
+            "Fix the [deploy] host spelling in autumn.toml before probing reachability \
+             (see `autumn deploy check`)",
+        );
+        for hint in [
+            DEPLOY_HOST_SPELLING_HINT,
+            DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
+        ] {
+            assert!(
+                !hint.contains("   "),
+                "a run of spaces mid-sentence means a `\\` continuation was dropped: {hint}",
+            );
+        }
+    }
+
+    #[test]
+    fn edge_target_passes_without_edge_routes() {
+        let scan = edge_scan_of("#[get(\"/\")]\nfn home() {}");
+        // Passes whether or not the wasm target happens to be installed.
+        for installed in [true, false] {
+            let r = check_edge_target_impl(&scan, installed);
+            assert_eq!(r.status, CheckStatus::Pass);
+            assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+            assert!(r.hint.is_none());
+        }
+    }
+
+    #[test]
+    fn edge_target_passes_when_installed() {
+        let r = check_edge_target_impl(&healthy_edge_scan(), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("wasm32-wasip1"));
+    }
+
+    #[test]
+    fn edge_target_fails_with_rustup_hint_when_missing() {
+        let r = check_edge_target_impl(&healthy_edge_scan(), false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("1 #[edge] route(s)"), "{detail}");
+        assert!(detail.contains("src/routes.rs"), "{detail}");
+        assert_eq!(r.hint, Some("Run `rustup target add wasm32-wasip1`"));
+    }
+
+    #[test]
+    fn edge_routes_passes_without_edge_routes() {
+        let r = check_edge_routes_impl(&edge_scan_of("fn home() {}"), false);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+    }
+
+    #[test]
+    fn edge_routes_passes_when_registered_with_a_capsule_bin() {
+        let r = check_edge_routes_impl(&healthy_edge_scan(), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("1 #[edge] route(s) registered"));
+    }
+
+    #[test]
+    fn edge_routes_warns_on_an_unregistered_handler() {
+        let scan = edge_scan_of("#[edge]\nfn greet() {}");
+        let r = check_edge_routes_impl(&scan, true);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(
+            r.detail.unwrap().contains("greet @ src/routes.rs:2"),
+            "the warning must name the handler and its location"
+        );
+        assert!(r.hint.unwrap().contains("edge_routes![]"));
+    }
+
+    #[test]
+    fn edge_routes_fails_on_an_auth_guarded_handler() {
+        // The `#[edge]` macro rejects this pair; doctor catches it pre-build.
+        let scan =
+            edge_scan_of("#[edge]\n#[secured]\nfn dash() {}\nfn wire() { edge_routes![dash]; }");
+        let r = check_edge_routes_impl(&scan, true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
+        assert!(detail.contains("#[secured]"), "{detail}");
+        assert!(r.hint.unwrap().contains("unauthenticated read-path"));
+    }
+
+    #[test]
+    fn edge_routes_guard_failure_outranks_registration_warning() {
+        // Both problems present: the build-breaking one must be reported.
+        let scan = edge_scan_of("#[edge]\n#[authorize(\"admin\")]\nfn dash() {}");
+        assert_eq!(
+            check_edge_routes_impl(&scan, false).status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn edge_routes_warns_when_the_capsule_bin_is_missing() {
+        let r = check_edge_routes_impl(&healthy_edge_scan(), false);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(
+            r.detail.unwrap().contains("src/bin/edge-capsule.rs"),
+            "the warning must name the file to create"
+        );
+        assert!(r.hint.unwrap().contains("autumn_edge::serve"));
+    }
 
     #[test]
     fn offsite_backup_pass_when_unconfigured() {

@@ -13,9 +13,11 @@
 //! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
+
+use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 
 /// Parsed `#[model(...)]` attribute arguments.
 ///
@@ -94,6 +96,18 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                 return Err(syn::Error::new_spanned(
                     attr,
                     "`#[unique]` takes no arguments; write a bare `#[unique]`",
+                ));
+            }
+        } else if attr.path().is_ident("position") {
+            // Bare marker only (issue #1358): the column name and optional
+            // scope live in the generated `#[repository(..., position(column
+            // = "...", scope = "..."))]` attribute, not here — this marker's
+            // only job is excluding the field from `New{Model}`/`Update{Model}`
+            // (see `excluded_from_new`), the same way `#[lock_version]` does.
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[position]` takes no arguments; write a bare `#[position]`",
                 ));
             }
         } else if attr.path().is_ident("references") {
@@ -176,6 +190,36 @@ impl DependentAction {
     }
 }
 
+/// A resolved `counter_cache` declaration on a `#[belongs_to]` (#1325).
+///
+/// `#[belongs_to(Post, counter_cache)]` is the bare flag; `counter_cache =
+/// "comment_count"` names the parent column explicitly.
+#[derive(Clone, Debug)]
+struct CounterCacheDecl {
+    /// The explicitly named counter column, when given. `None` means the
+    /// convention applies: `{snake(ChildModel)}_count`.
+    ///
+    /// The convention is deliberately **singular** (`comment_count`, not Rails'
+    /// `comments_count`): it matches `#[votable(aggregate = count)]`'s
+    /// `{name}_count` and the `posts.comment_count` /
+    /// `subreddits.subscriber_count` columns autumn's own examples have shipped
+    /// since their first migration.
+    column: Option<String>,
+    /// The parent's tenant-discriminator column, from
+    /// `counter_cache_tenant = "<column>"`.
+    ///
+    /// Explicit rather than inferred: a counter update writes a parent row the
+    /// caller only had to name the id of, so on a shared multi-tenant table it
+    /// must be confined to the caller's tenant — but `#[model]` on the *child*
+    /// cannot see the parent's fields, and guessing `tenant_id` would break
+    /// every app whose tenant-scoped child hangs off a global parent with a hard
+    /// `column does not exist` error. Naming it is the author asserting the
+    /// parent really has it.
+    tenant_column: Option<String>,
+    /// Span of the `counter_cache` key, for diagnostics raised after parsing.
+    span: proc_macro2::Span,
+}
+
 /// A resolved association declaration: kind, target model, the (possibly
 /// inferred) foreign-key column, and the accessor/store name.
 struct Association {
@@ -207,6 +251,10 @@ struct Association {
     /// `following`, both through `Friendship` to `User`) without their
     /// target-derived helpers colliding.
     helper: Option<String>,
+    /// The `counter_cache` declaration on a `#[belongs_to]` (#1325). Drives the
+    /// runtime [`AutumnCounterCaches`] impl `#[model]` emits, which the child's
+    /// generated repository consults to keep `{parent}.{child}_count` current.
+    counter_cache: Option<CounterCacheDecl>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -216,6 +264,311 @@ struct ThroughSpec {
     table: String,
     /// The join table's column pointing at the target model, e.g. `tag_id`.
     target_fk: String,
+}
+
+/// How a `#[votable]` association aggregates its edges into the model's
+/// aggregate column (#1362).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoteAggregate {
+    /// Signed up/down votes: the aggregate is `SUM(value)` over the edge
+    /// table's `value_column`.
+    Sum,
+    /// Unary likes/bookmarks: the aggregate is `COUNT(*)` and the edge table
+    /// carries no value column at all.
+    Count,
+}
+
+/// A resolved `#[votable(by = <Reactor>, ...)]` declaration (#1362): the
+/// reaction edge table plus the aggregate column maintained on the model.
+///
+/// Every field except `reactor` has a convention-derived default, so the
+/// canonical declaration on a conventionally-named schema is the one-liner
+/// `#[votable(by = User, aggregate = sum)]` → `votes(user_id, post_id, value)`
+/// maintaining `posts.score`.
+struct VotableSpec {
+    /// The reactor model type named by `by = <Model>` (e.g. `User`).
+    reactor: syn::Ident,
+    /// `sum` (default) or `count`.
+    aggregate: VoteAggregate,
+    /// The reaction name, default `"vote"`. Drives `table` (pluralized) and,
+    /// in count mode, the `{name}_count` aggregate column.
+    name: String,
+    /// The edge table, default `pluralize(name)` → `votes` / `likes`.
+    table: String,
+    /// The edge column pointing at the reactor, default `{snake(by)}_id`.
+    reactor_fk: String,
+    /// The edge column pointing at this model, default `{snake(Model)}_id`.
+    target_fk: String,
+    /// The edge's signed value column, default `value` — `None` in count mode,
+    /// whose edge rows are pure membership and store no value.
+    value_column: Option<String>,
+    /// The aggregate column on *this* model, default `score` (sum) /
+    /// `{name}_count` (count).
+    column: String,
+}
+
+/// Reject a `#[votable(key = value)]` value that is not a plain Rust
+/// identifier.
+///
+/// Every name-shaped value in the attribute is spliced into generated code
+/// through `format_ident!` — as a table/column ident inside the hidden
+/// `diesel::table!` declarations, or (for `name`) as a fragment of the hidden
+/// module ident. `format_ident!` **panics** on a non-identifier, and a
+/// proc-macro panic reaches the user as an opaque "proc macro panicked" with no
+/// span pointing at the mistake. A raw identifier (`r#type`) does not panic but
+/// renders its `r#` prefix into the generated name, silently producing a
+/// column/table that cannot exist. Both are rejected here, spanned on the
+/// offending value.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] naming the value and the key it was given for.
+fn check_votable_ident_value(
+    key: &syn::Ident,
+    value: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    if !value.starts_with("r#") && syn::parse_str::<syn::Ident>(value).is_ok() {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "`{value}` is not a valid identifier for `{key} = ...` in \
+             `#[votable]`: the value is spliced verbatim into generated table, \
+             column and module names, so it must be a plain Rust identifier — \
+             no spaces or punctuation, no leading digit, no keyword, and no \
+             `r#` prefix"
+        ),
+    ))
+}
+
+/// Parse a single `#[votable(...)]` attribute into a resolved [`VotableSpec`].
+///
+/// Grammar (a `key = value` loop, each value a bare ident or a string literal;
+/// there is deliberately **no** positional head — the reactor is always named,
+/// because a bare `#[votable(User)]` reads ambiguously next to
+/// `#[has_many(Comment)]`, where the positional argument is the association
+/// *target* rather than the actor):
+///
+/// ```text
+/// #[votable(by = User, aggregate = sum | count, name = vote, table = votes,
+///           reactor_fk = user_id, target_fk = post_id,
+///           value_column = value, column = score)]
+/// ```
+// Eight independent keys, each with its own parse + validation arm, plus the
+// convention-derived defaults for the seven optional ones.
+#[allow(clippy::too_many_lines)]
+fn parse_votable_attr(attr: &syn::Attribute, model_ident: &syn::Ident) -> syn::Result<VotableSpec> {
+    use syn::parse::ParseStream;
+
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    }
+
+    let mut reactor: Option<syn::Ident> = None;
+    let mut aggregate: Option<VoteAggregate> = None;
+    let mut name: Option<String> = None;
+    let mut table: Option<String> = None;
+    let mut reactor_fk: Option<String> = None;
+    let mut target_fk: Option<String> = None;
+    let mut value_column: Option<syn::Ident> = None;
+    let mut value_column_value: Option<String> = None;
+    let mut column: Option<String> = None;
+
+    // Every key already seen in *this* attribute, mapped to the value it was
+    // given. A repeat would otherwise silently win last-write, so a typo'd
+    // `by = A, by = B` would compile against the wrong reactor.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    attr.parse_args_with(|input: ParseStream| {
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            // Accept either a bare identifier (`table = votes`) or a string
+            // literal (`table = "votes"`), exactly like the association attrs.
+            let (value_ident, value, value_span) = if input.peek(LitStr) {
+                let lit: LitStr = input.parse()?;
+                let span = lit.span();
+                (None, lit.value(), span)
+            } else {
+                let ident: syn::Ident = input.parse()?;
+                let span = ident.span();
+                (Some(ident.clone()), ident.to_string(), span)
+            };
+            if let Some(previous) = seen.insert(key.to_string(), value.clone()) {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    format!(
+                        "duplicate `{key} = ...` in `#[votable]` (was \
+                         `{previous}`, now `{value}`): each key may be given \
+                         at most once — the later value would silently win"
+                    ),
+                ));
+            }
+            if key == "by" {
+                // Every value that becomes part of a generated ident is
+                // validated, so a mistake is a directed error rather than a
+                // `format_ident!` panic (or, for `r#`, a garbage name).
+                check_votable_ident_value(&key, &value, value_span)?;
+                reactor = Some(match value_ident {
+                    Some(ident) => ident,
+                    None => syn::parse_str::<syn::Ident>(&value).map_err(|_| {
+                        syn::Error::new_spanned(
+                            &key,
+                            format!("`by = \"{value}\"` is not a valid model type name"),
+                        )
+                    })?,
+                });
+            } else if key == "aggregate" {
+                aggregate = Some(match value.as_str() {
+                    "sum" => VoteAggregate::Sum,
+                    "count" => VoteAggregate::Count,
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            format!(
+                                "unknown aggregate `{other}`; expected `sum` \
+                                 (signed up/down votes) or `count` (unary likes)"
+                            ),
+                        ));
+                    }
+                });
+            } else if key == "name" {
+                // `name` feeds `format_ident!` composites (the hidden module
+                // ident and the `{name}_count` aggregate column), so it is held
+                // to the same identifier rule as the column names.
+                check_votable_ident_value(&key, &value, value_span)?;
+                name = Some(value);
+            } else if key == "table" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                table = Some(value);
+            } else if key == "reactor_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                reactor_fk = Some(value);
+            } else if key == "target_fk" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                target_fk = Some(value);
+            } else if key == "value_column" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                value_column = Some(key.clone());
+                value_column_value = Some(value);
+            } else if key == "column" {
+                check_votable_ident_value(&key, &value, value_span)?;
+                column = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `by = <Model>`, `aggregate = sum|count`, \
+                     `name = <ident>`, `table = <table>`, \
+                     `reactor_fk = <column>`, `target_fk = <column>`, \
+                     `value_column = <column>`, or \
+                     `column = <aggregate_column>` in `#[votable]`",
+                ));
+            }
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+
+    let Some(reactor) = reactor else {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[votable]` requires `by = <ReactorModel>` \
+             (e.g. `#[votable(by = User)]`)",
+        ));
+    };
+    let aggregate = aggregate.unwrap_or(VoteAggregate::Sum);
+
+    if aggregate == VoteAggregate::Count
+        && let Some(key) = value_column
+    {
+        return Err(syn::Error::new_spanned(
+            key,
+            "`value_column = ...` has no meaning with `aggregate = count`: a \
+             count reaction's edge table stores no value column, its rows are \
+             pure membership — use `aggregate = sum` (signed values) or drop \
+             the key",
+        ));
+    }
+
+    let name = name.unwrap_or_else(|| "vote".to_owned());
+    let table = table.unwrap_or_else(|| pluralize_word(&name));
+    let reactor_fk =
+        reactor_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&reactor.to_string())));
+    let target_fk =
+        target_fk.unwrap_or_else(|| format!("{}_id", pascal_to_snake(&model_ident.to_string())));
+    let value_column = match aggregate {
+        VoteAggregate::Sum => Some(value_column_value.unwrap_or_else(|| "value".to_owned())),
+        VoteAggregate::Count => None,
+    };
+    let column = column.unwrap_or_else(|| match aggregate {
+        VoteAggregate::Sum => "score".to_owned(),
+        VoteAggregate::Count => format!("{name}_count"),
+    });
+
+    Ok(VotableSpec {
+        reactor,
+        aggregate,
+        name,
+        table,
+        reactor_fk,
+        target_fk,
+        value_column,
+        column,
+    })
+}
+
+/// Resolve the (at most one) `#[votable]` declaration on a model's outer
+/// attributes.
+///
+/// A second `#[votable]` is a directed compile error rather than a silently
+/// dropped declaration: both would generate the same `{Model}Reactions` trait
+/// with the same `react`/`reaction_of` methods.
+///
+/// # Errors
+///
+/// Returns a [`syn::Error`] when more than one `#[votable]` is declared, or
+/// when the single declaration fails [`parse_votable_attr`]'s validation.
+fn resolve_votable(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+) -> syn::Result<Option<VotableSpec>> {
+    let mut found: Option<&syn::Attribute> = None;
+    for attr in attrs {
+        if !is_votable_attr(attr) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "at most one `#[votable]` per model: the generated \
+                 `{Model}Reactions` trait's `react`/`reaction_of` methods would \
+                 otherwise collide (multiple reaction kinds per model are not \
+                 yet supported — see \
+                 https://github.com/autumn-foundation/autumn/issues/1362)",
+            ));
+        }
+        found = Some(attr);
+    }
+    found
+        .map(|attr| parse_votable_attr(attr, model_ident))
+        .transpose()
+}
+
+/// Whether an attribute is the `#[votable]` declaration consumed by `#[model]`
+/// (and therefore must not be re-emitted onto the Diesel struct, where it
+/// would fail with "cannot find attribute `votable` in this scope").
+fn is_votable_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("votable")
 }
 
 /// Resolve the foreign-key column and accessor name for an association,
@@ -314,6 +667,8 @@ fn parse_assoc_attr(
         explicit_target_fk,
         dependent,
         explicit_helper,
+        counter_cache,
+        counter_cache_tenant,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
@@ -322,11 +677,25 @@ fn parse_assoc_attr(
         let mut explicit_target_fk: Option<String> = None;
         let mut dependent: Option<DependentAction> = None;
         let mut explicit_helper: Option<String> = None;
+        let mut counter_cache: Option<CounterCacheDecl> = None;
+        let mut counter_cache_tenant: Option<(String, proc_macro2::Span)> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
-        // `through`, `target_fk`, `helper`), any order.
+        // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
+        // the one key that is also legal as a bare flag.
         while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
             let key: syn::Ident = input.parse()?;
+            // `counter_cache` may appear bare (`#[belongs_to(Post,
+            // counter_cache)]`) or with an explicit column
+            // (`counter_cache = "comment_count"`), so its `=` is optional.
+            if key == "counter_cache" && !input.peek(syn::Token![=]) {
+                counter_cache = Some(CounterCacheDecl {
+                    column: None,
+                    tenant_column: None,
+                    span: key.span(),
+                });
+                continue;
+            }
             input.parse::<syn::Token![=]>()?;
             // Accept either a bare identifier (`fk = author_id`) or a string
             // literal (`fk = "author_id"`).
@@ -335,7 +704,17 @@ fn parse_assoc_attr(
             } else {
                 input.parse::<syn::Ident>()?.to_string()
             };
-            if key == "fk" {
+            if key == "counter_cache" {
+                check_counter_cache_column(&key, &value)?;
+                counter_cache = Some(CounterCacheDecl {
+                    column: Some(value),
+                    tenant_column: None,
+                    span: key.span(),
+                });
+            } else if key == "counter_cache_tenant" {
+                check_counter_cache_column(&key, &value)?;
+                counter_cache_tenant = Some((value, key.span()));
+            } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
                 explicit_name = Some(value);
@@ -351,8 +730,11 @@ fn parse_assoc_attr(
                 return Err(syn::Error::new_spanned(
                     &key,
                     "expected `fk = <column>`, `name = <accessor>`, \
-                         `through = <join_table>`, `target_fk = <column>`, or \
-                         `helper = <singular>` in association attribute",
+                         `through = <join_table>`, `target_fk = <column>`, \
+                         `helper = <singular>`, `counter_cache` / \
+                         `counter_cache = <column>`, or \
+                         `counter_cache_tenant = <column>` in association \
+                         attribute",
                 ));
             }
         }
@@ -364,8 +746,59 @@ fn parse_assoc_attr(
             explicit_target_fk,
             dependent,
             explicit_helper,
+            counter_cache,
+            counter_cache_tenant,
         ))
     })?;
+
+    // `counter_cache_tenant` scopes the counter cache; on its own it means
+    // nothing, and silently ignoring it would leave a multi-tenant app believing
+    // it was protected.
+    let counter_cache = match (counter_cache, counter_cache_tenant) {
+        (Some(decl), Some((tenant_column, _))) => Some(CounterCacheDecl {
+            tenant_column: Some(tenant_column),
+            ..decl
+        }),
+        (decl @ Some(_), None) => decl,
+        (None, Some((_, span))) => {
+            return Err(syn::Error::new(
+                span,
+                "`counter_cache_tenant = \"<column>\"` scopes a counter cache to \
+                 the caller's tenant, so it requires `counter_cache` on the same \
+                 association",
+            ));
+        }
+        (None, None) => None,
+    };
+
+    if let Some(decl) = counter_cache.as_ref()
+        && kind != AssocKind::BelongsTo
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`counter_cache` is a `#[belongs_to]` option: the counter is \
+                 maintained by the child's repository — the side that owns the \
+                 foreign key and runs the insert/delete — so there is nothing on \
+                 this side to hang the maintenance off. Move it to the child \
+                 model's `#[belongs_to(...)]`, i.e. `#[belongs_to({model_ident}, \
+                 counter_cache)]` on `{target}`"
+            ),
+        ));
+    }
+    if let Some(decl) = counter_cache.as_ref()
+        && explicit_through.is_some()
+    {
+        return Err(syn::Error::new(
+            decl.span,
+            "`counter_cache` is not supported on a `through = <join_table>` \
+             (many-to-many) association: its foreign key names a column on the \
+             join table, not on this model, so the generated increment would \
+             read a column that does not exist. Counters over join tables are \
+             out of scope — map the join table as its own model and put \
+             `counter_cache` on its `#[belongs_to]`",
+        ));
+    }
 
     if explicit_through.is_some() && kind != AssocKind::HasMany {
         return Err(syn::Error::new_spanned(
@@ -427,7 +860,53 @@ fn parse_assoc_attr(
         through,
         dependent,
         helper: explicit_helper,
+        counter_cache,
     })
+}
+
+/// The `T` of an `Option<T>`, for any spelling of the path (`Option<T>`,
+/// `std::option::Option<T>`, `::core::option::Option<T>`).
+fn option_inner(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
+}
+
+/// Reject a `counter_cache = "<column>"` value that is not a plain identifier.
+///
+/// The value is spliced verbatim into generated SQL — `UPDATE posts SET
+/// <column> = <column> + $1 …` — so it is the one user-controlled name in the
+/// counter-cache codegen that reaches `format!`. Rejecting it here, spanned on
+/// the key, is what keeps that splice safe; the run-time
+/// `is_plain_identifier` guard in `autumn_web::counter_cache` is the backstop.
+fn check_counter_cache_column(key: &syn::Ident, value: &str) -> syn::Result<()> {
+    let plain = !value.is_empty()
+        && !value.starts_with(|c: char| c.is_ascii_digit())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        key,
+        format!(
+            "`{value}` is not a valid column name for `counter_cache = ...`: \
+             the value is spliced verbatim into the generated `UPDATE <parent> \
+             SET <column> = <column> + $1` statement, so it must be a plain \
+             identifier — ASCII letters, digits and underscores only, and no \
+             leading digit"
+        ),
+    ))
 }
 
 /// Collect all `#[belongs_to]` / `#[has_many]` / `#[has_one]` declarations from
@@ -450,7 +929,64 @@ fn resolve_associations(
         out.push(parse_assoc_attr(attr, kind, model_ident)?);
     }
     check_m2m_mutation_name_collisions(&out)?;
+    check_counter_cache_collisions(model_ident, &out)?;
     Ok(out)
+}
+
+/// The parent column a counter-cached association maintains: the explicit
+/// `counter_cache = "..."` override, else `{snake(ChildModel)}_count`.
+fn counter_cache_column(model_ident: &syn::Ident, assoc: &Association) -> Option<String> {
+    let decl = assoc.counter_cache.as_ref()?;
+    Some(
+        decl.column
+            .clone()
+            .unwrap_or_else(|| format!("{}_count", pascal_to_snake(&model_ident.to_string()))),
+    )
+}
+
+/// Reject two counter-cached legs that resolve onto the **same**
+/// `(parent table, counter column)` pair.
+///
+/// Both legs would move one column on every insert, double-counting silently
+/// and permanently. This is not a hypothetical: the default column name is
+/// derived from the *child* model, so two `belongs_to` legs to the same parent
+/// type (`Message` → `sender` / `recipient`, both `User`) collide by default.
+///
+/// Legs to *different* parent tables that happen to share a column name are
+/// fine — they are different columns on different tables — so the key is the
+/// pair, not the name.
+fn check_counter_cache_collisions(
+    model_ident: &syn::Ident,
+    assocs: &[Association],
+) -> syn::Result<()> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for assoc in assocs {
+        let Some(column) = counter_cache_column(model_ident, assoc) else {
+            continue;
+        };
+        let parent_table = infer_table_name(&assoc.target);
+        let key = (parent_table.clone(), column.clone());
+        if seen.contains(&key) {
+            let span = assoc
+                .counter_cache
+                .as_ref()
+                .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "two counter-cached associations on `{model_ident}` both \
+                     maintain `{parent_table}.{column}`, so every insert would \
+                     count twice. The column name defaults to \
+                     `{{snake(model)}}_count`, which collides whenever two \
+                     `belongs_to` legs point at the same parent — give at least \
+                     one of them an explicit `counter_cache = \"<column>\"` (and \
+                     a matching column on `{parent_table}`)"
+                ),
+            ));
+        }
+        seen.push(key);
+    }
+    Ok(())
 }
 
 /// The singular form used to derive a many-to-many association's mutation
@@ -510,7 +1046,7 @@ fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()>
                      ..., helper = \"...\")]`, so each gets a distinct \
                      `add_`/`remove_` name (the followers/following-through-a-\
                      join pattern) — see \
-                     https://github.com/madmax983/autumn/issues/1785",
+                     https://github.com/autumn-foundation/autumn/issues/1785",
                     assoc.name, assoc.target, assoc.target,
                 ),
             ));
@@ -623,6 +1159,213 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
             }
         }
     }
+}
+
+/// Emit the inherent counter-cache items on the model (#1325): the
+/// `HAS_COUNTER_CACHES` flag and the `counter_caches()` spec slice the child's
+/// generated repository consults to keep each parent's `{child}_count` column
+/// current.
+///
+/// Only produced when at least one `#[belongs_to(…, counter_cache)]` is
+/// declared; otherwise the blanket `AutumnCounterCaches` impl supplies `false` /
+/// an empty slice and this emits nothing, so a model without counter caches
+/// keeps its exact prior codegen and its repository's mutation paths stay on
+/// their existing (transaction-free, where they were) shape.
+///
+/// Both items are **inherent**, which is what shadows the blanket impl — and
+/// which is why the generated repository names them by concrete path
+/// (`Comment::counter_caches()`) rather than through a generic bound.
+///
+/// The parent's table is convention-derived from the target type
+/// (`Post` → `posts`), the same assumption the preload codegen already makes for
+/// `belongs_to`; the parent's primary key is assumed to be `id`, matching the
+/// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
+/// which doubles as the type guard: a foreign-key field that is not `i64` /
+/// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
+// One resolution + validation arm per spec field (column, tenant column, the
+// foreign key's existence and nullability, the primary key's arity), so it grows
+// past the line lint as counter-cache options are added.
+#[allow(clippy::too_many_lines)]
+fn emit_counter_caches_impl(
+    model_ident: &syn::Ident,
+    table_name: &str,
+    pk_ident: Option<&syn::Ident>,
+    has_deleted_at: bool,
+    assocs: &[Association],
+    all_fields: &[&syn::Field],
+) -> syn::Result<TokenStream> {
+    let cached: Vec<&Association> = assocs
+        .iter()
+        .filter(|a| a.counter_cache.is_some())
+        .collect();
+    if cached.is_empty() {
+        return Ok(TokenStream::new());
+    }
+
+    // A composite key cannot back a counter cache: the maintenance addresses the
+    // child by ONE value, so with two `#[id]` fields the decrement would key on
+    // whichever rows share the first component and move every one of their
+    // parents. Reject rather than silently corrupt (the same call `#[votable]`
+    // makes for the same reason).
+    let id_fields: Vec<&syn::Ident> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "id"))
+        .filter_map(|f| f.ident.as_ref())
+        .collect();
+    if id_fields.len() > 1 {
+        let listed = id_fields
+            .iter()
+            .map(|i| format!("`{i}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let span = cached[0]
+            .counter_cache
+            .as_ref()
+            .map_or_else(proc_macro2::Span::call_site, |d| d.span);
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`counter_cache` requires a single primary key: model \
+                 `{model_ident}` declares a composite key ({listed}), and the \
+                 counter maintenance identifies its child row by one id — the \
+                 decrement would key on every row sharing the first component"
+            ),
+        ));
+    }
+    let Some(pk_ident) = pk_ident else {
+        return Err(syn::Error::new_spanned(
+            model_ident,
+            "`counter_cache` requires the child model to have a primary-key \
+             field: the maintenance resolves the parent from the child row by \
+             primary key. Mark one with `#[id]`",
+        ));
+    };
+    let pk_column = pk_ident.to_string();
+
+    // One shared primary-key extractor: the bulk update path matches a
+    // post-update record back to the foreign keys captured for it before the
+    // update, and every leg keys off the same child primary key.
+    // A soft-deleted child is counted by nobody. The generated `update` does not
+    // filter `deleted_at`, so one can still be re-parented — without this the
+    // move would decrement a parent that had already dropped the row and
+    // increment another for a row that stays deleted.
+    let live_body = if has_deleted_at {
+        quote! { __autumn_cc_record.deleted_at.is_none() }
+    } else {
+        quote! { { let _ = __autumn_cc_record; true } }
+    };
+    let mut fk_fns: Vec<TokenStream> = vec![
+        quote! {
+            fn __autumn_counter_cache_pk(__autumn_cc_record: &#model_ident) -> i64 {
+                __autumn_cc_record.#pk_ident
+            }
+        },
+        quote! {
+            fn __autumn_counter_cache_live(__autumn_cc_record: &#model_ident) -> bool {
+                #live_body
+            }
+        },
+    ];
+    let mut spec_entries: Vec<TokenStream> = Vec::new();
+    for (index, assoc) in cached.iter().enumerate() {
+        let decl = assoc
+            .counter_cache
+            .as_ref()
+            .expect("filtered to Some above");
+        let column = counter_cache_column(model_ident, assoc)
+            .expect("filtered to a counter-cached association above");
+        // Explicit opt-in (`counter_cache_tenant = "<column>"`): the author is
+        // asserting the PARENT carries this column. Inferring it from the child
+        // would break every tenant-scoped child hanging off a global parent with
+        // a hard `column does not exist`, and this macro cannot see the parent's
+        // fields to check.
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
+        let parent_table = infer_table_name(&assoc.target);
+        let fk = &assoc.fk;
+        let fk_ident = format_ident!("{fk}");
+
+        // The foreign key has to be a real field: without this check the
+        // generated `fn` would fail with a bare "no field `post_id`" pointing
+        // into macro-expanded code instead of at the attribute.
+        let fk_field = all_fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == fk));
+        let Some(fk_field) = fk_field else {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`counter_cache` foreign key `{fk}` is not a field of model \
+                     `{model_ident}`; add it, or name the right column with \
+                     `#[belongs_to({}, fk = <column>, counter_cache)]`",
+                    assoc.target
+                ),
+            ));
+        };
+        // A nullable foreign key yields the field as-is; a non-null one is
+        // wrapped, so both shapes satisfy `fn(&M) -> Option<i64>` and an
+        // unparented child is a no-op rather than a `WHERE id = NULL`.
+        // `option_inner_type` matches the LAST path segment, so every spelling
+        // of the type (`Option<i64>`, `std::option::Option<i64>`,
+        // `::core::option::Option<i64>`) takes the same arm — a token-text
+        // prefix check would send the qualified spellings down the wrapping arm
+        // and fail with a type error inside macro-expanded code.
+        let fk_expr = if option_inner(&fk_field.ty).is_some() {
+            quote! { __autumn_cc_record.#fk_ident }
+        } else {
+            quote! { ::core::option::Option::Some(__autumn_cc_record.#fk_ident) }
+        };
+        let fk_fn = format_ident!("__autumn_counter_cache_fk_{index}");
+        fk_fns.push(quote! {
+            fn #fk_fn(__autumn_cc_record: &#model_ident) -> ::core::option::Option<i64> {
+                #fk_expr
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::CounterCacheSpec {
+                child_table: #table_name,
+                child_pk: #pk_column,
+                child_soft_delete: #has_deleted_at,
+                fk_column: #fk,
+                parent_table: #parent_table,
+                parent_pk: "id",
+                counter_column: #column,
+                fk_of: #fk_fn,
+                pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
+                tenant_column: #tenant_column,
+            }
+        });
+    }
+
+    Ok(quote! {
+        impl #model_ident {
+            /// Whether this model maintains any counter cache (#1325). An
+            /// inherent shadow of `AutumnCounterCaches::HAS_COUNTER_CACHES`;
+            /// framework plumbing, not a public API.
+            #[doc(hidden)]
+            pub const HAS_COUNTER_CACHES: bool = true;
+
+            /// Runtime counter-cache specs consulted by this model's generated
+            /// repository (#1325). An inherent shadow of
+            /// `AutumnCounterCaches::counter_caches`; framework plumbing, not a
+            /// public API.
+            #[doc(hidden)]
+            #[must_use]
+            pub fn counter_caches()
+                -> &'static [::autumn_web::repository::CounterCacheSpec<#model_ident>]
+            {
+                #(#fk_fns)*
+                const __AUTUMN_COUNTER_CACHES:
+                    &[::autumn_web::repository::CounterCacheSpec<#model_ident>] = &[
+                        #(#spec_entries),*
+                    ];
+                __AUTUMN_COUNTER_CACHES
+            }
+        }
+    })
 }
 
 /// Generate everything needed to make a model's associations preloadable:
@@ -1271,6 +2014,749 @@ fn emit_association_items(
     }
 }
 
+/// Emit everything a `#[votable]` declaration generates (#1362):
+///
+/// 1. a hidden, length-prefixed `mod __autumn_votable_{len}_{model}_{name}`
+///    declaring the reaction edge table *and* a minimal projection of the
+///    target table (`id`, the aggregate column, and `deleted_at` when the model
+///    soft-deletes). Projecting the target keeps the codegen self-contained: it
+///    needs no `crate::schema::*` in scope at the `#[model]` site and cannot
+///    pick up a conflicting column type;
+/// 2. a `{Model}Reactions` trait with `react` / `reaction_of`, blanket
+///    implemented over `M2mConnSource<Model = #model_ident>` exactly like the
+///    many-to-many mutation helpers, so method resolution stays unambiguous
+///    when several models' reaction traits are in scope.
+///
+/// `react()` runs S1–S5 (lock target → read edge → toggle/flip/insert →
+/// recompute the aggregate from ground truth → persist) inside one
+/// `scoped_immediate_transaction`. The Postgres `SELECT ... FOR NO KEY UPDATE`
+/// row lock is held from before the edge is read until commit, so concurrent
+/// reactions on one target are serialized and the recomputed aggregate is
+/// exact; `SQLite` gets strictly stronger mutual exclusion from `BEGIN
+/// IMMEDIATE`, which is why `for_no_key_update()` lives only in the `pg` arm of
+/// `backend_select!` (it is a parse error on `SQLite`, and the unselected arm
+/// is never type-checked).
+///
+/// `pk_ident` is the model's primary-key field (resolved by the caller exactly
+/// as the CRUD codegen resolves it). It is used both for the `i64`-primary-key
+/// compile-time guard and as the primary-key column of the hidden target
+/// projection — a model whose `#[id]` field is not named `id` (e.g. `memo_id`)
+/// has no `id` column for S1/S5 to lock and update.
+///
+/// `has_tenant_id` mirrors `has_deleted_at`: when the model carries a
+/// `tenant_id` column the projection declares it and S1/S5 (and
+/// `reaction_of`'s target probe) gain a second, tenant-filtered arm, selected
+/// at runtime from `M2mConnSource::__autumn_m2m_tenant_scope()`. A model
+/// without the column emits none of it and is byte-for-byte unchanged.
+#[allow(clippy::too_many_lines)]
+fn emit_votable_items(
+    model_ident: &syn::Ident,
+    table_ident: &syn::Ident,
+    vis: &syn::Visibility,
+    spec: &VotableSpec,
+    has_deleted_at: bool,
+    has_tenant_id: bool,
+    pk_ident: Option<&syn::Ident>,
+) -> TokenStream {
+    let model_snake = pascal_to_snake(&model_ident.to_string());
+    // Length-prefixed for the same reason as the m2m join module: it keeps two
+    // different (model, reaction name) pairs from colliding.
+    let edge_mod = format_ident!(
+        "__autumn_votable_{}_{model_snake}_{}",
+        model_snake.len(),
+        spec.name
+    );
+    let edge_table = format_ident!("{}", spec.table);
+    let reactor_fk = format_ident!("{}", spec.reactor_fk);
+    let target_fk = format_ident!("{}", spec.target_fk);
+    let agg_column = format_ident!("{}", spec.column);
+    // The target projection must name the model's real primary-key column:
+    // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
+    // hard-coded `id` would miss (or worse, hit an unrelated column on) a
+    // model whose `#[id]` field is named differently. `None` only happens for
+    // models the rest of the macro already refuses to generate CRUD for; keep
+    // the historical `id` there so the error surface is unchanged.
+    let pk_column = pk_ident.map_or_else(|| format_ident!("id"), ::std::clone::Clone::clone);
+    let trait_ident = format_ident!("{model_ident}Reactions");
+    let is_sum = spec.aggregate == VoteAggregate::Sum;
+
+    // ── Compile-time guards ──────────────────────────────────────────────
+    // The whole reaction surface is typed on `i64` ids: the hidden edge table
+    // declares both foreign keys `Int8`, and `react(reactor_id: i64, target_id:
+    // i64)` binds them directly. A UUID- or i32-keyed model would otherwise
+    // compile the trait fine and only fail deep inside a Diesel bound (or, on
+    // an i32 key, silently widen). Pin the model's own primary key here so the
+    // error points at the model.
+    let pk_guard = pk_ident.map(|pk| {
+        quote! {
+            const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+                __autumn_votable_model.#pk
+            };
+        }
+    });
+    // The aggregate field must *be* `i64`, whatever it is spelled as
+    // (`std::primitive::i64`, a type alias, …). The macro-level check only
+    // rejects the definitely-wrong spellings with a directed message; this
+    // guard is what actually enforces the type, by name resolution rather than
+    // token text.
+    let agg_ty_guard = quote! {
+        const _: fn(&#model_ident) -> i64 = |__autumn_votable_model| {
+            __autumn_votable_model.#agg_column
+        };
+    };
+    // `by = <Reactor>` is otherwise never mentioned in the generated code (the
+    // edge table stores a bare `i64` reactor fk), so a typo'd model name would
+    // compile silently. Force its name resolution the way every other
+    // association attribute does.
+    //
+    // Deliberately name-resolution only — NOT a `ModelPrimaryKey<IdType =
+    // i64>` bound: `by` accepts hand-written reactor structs (reddit-clone's
+    // `User` keeps `password_hash` out of `#[model]`'s generated surface on
+    // purpose), and those implement no framework trait to constrain. The
+    // reactor's `i64`-primary-key requirement is documented contract; a
+    // non-BIGINT reactor fk fails loudly on first use with a database type
+    // error, not silent corruption.
+    let reactor_ident = &spec.reactor;
+    let reactor_guard = quote! {
+        const _: ::core::marker::PhantomData<#reactor_ident> =
+            ::core::marker::PhantomData;
+    };
+
+    // ── The hidden module ────────────────────────────────────────────────
+    let value_column_decl = spec.value_column.as_ref().map(|value_column| {
+        let value_ident = format_ident!("{value_column}");
+        quote! { #value_ident -> Int2, }
+    });
+    let deleted_at_decl = has_deleted_at.then(|| {
+        quote! { deleted_at -> Nullable<Timestamp>, }
+    });
+    // Projected for the same reason `deleted_at` is: S1/S5 filter on it, so
+    // the column has to exist in the hidden target `table!`.
+    let tenant_id_decl = has_tenant_id.then(|| {
+        quote! { tenant_id -> Text, }
+    });
+    let hidden_module = quote! {
+        // Hidden Diesel declarations backing `#model_ident`'s `#[votable]`
+        // reactions: the `#edge_table` edge table (keyed on the composite
+        // `(#reactor_fk, #target_fk)` pair that is also the `ON CONFLICT`
+        // arbiter) and a minimal `#table_ident` projection. Scoped to its own
+        // module so it can never collide with the application's own
+        // `crate::schema::#edge_table`.
+        #[allow(
+            missing_docs,
+            unreachable_pub,
+            clippy::all,
+            clippy::pedantic,
+            clippy::nursery
+        )]
+        mod #edge_mod {
+            ::autumn_web::reexports::diesel::table! {
+                #edge_table (#reactor_fk, #target_fk) {
+                    #reactor_fk -> Int8,
+                    #target_fk -> Int8,
+                    #value_column_decl
+                }
+            }
+            ::autumn_web::reexports::diesel::table! {
+                #table_ident (#pk_column) {
+                    #pk_column -> Int8,
+                    #agg_column -> Int8,
+                    #tenant_id_decl
+                    #deleted_at_decl
+                }
+            }
+            // Lets the tenant `EXISTS` subquery on the target appear inside a
+            // query on the edge table (and any future cross-table predicate).
+            ::autumn_web::reexports::diesel::allow_tables_to_appear_in_same_query!(
+                #edge_table,
+                #table_ident,
+            );
+        }
+    };
+
+    // ── Shared query fragments ───────────────────────────────────────────
+    // `AND deleted_at IS NULL`, emitted only when the model actually has the
+    // field — a model that does not soft-delete pays nothing (AC6).
+    let live_filter = has_deleted_at.then(|| {
+        quote! { .filter(#edge_mod::#table_ident::deleted_at.is_null()) }
+    });
+    let edge_of_reactor = quote! {
+        #edge_mod::#edge_table::table
+            .filter(#edge_mod::#edge_table::#reactor_fk.eq(reactor_id))
+            .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+    };
+    let not_found_msg = format!("{model_ident} not found");
+
+    // ── Tenant isolation (PR #2177 review, P1) ───────────────────────────
+    // Through a `#[repository(..., tenant_scoped)]` repository, filtering the
+    // target by primary key alone lets a caller who can guess an id react to
+    // ANOTHER tenant's row — an edge insert plus an aggregate UPDATE across
+    // the tenant boundary. So when the model carries a `tenant_id` column the
+    // predicate the repository's own finders would apply is resolved once, up
+    // front, and threaded through S1 (the locking existence guard), S5 (the
+    // aggregate UPDATE) and `reaction_of`'s target probe.
+    //
+    // `__autumn_m2m_tenant_scope()` is three-valued and matches the finders
+    // exactly: `Some(tenant)` scopes, `None` (non-`tenant_scoped` repository,
+    // or `across_tenants()`) does not, and a `tenant_scoped` repository with
+    // no tenant context is an error before anything is read or written.
+    //
+    // Both arms stay whole, statically-typed queries rather than one boxed
+    // query with a conditional predicate: the `pg` arm of S1 carries
+    // `.for_no_key_update()`, which a `into_boxed()` query cannot express.
+    //
+    // The call is emitted UNCONDITIONALLY — even for a model with no
+    // `tenant_id` column, where the returned scope is unused — because the
+    // method also carries the cross-shard reject: on a sharded repository in
+    // `across_tenants()` mode there is no single right shard for a reaction to
+    // land on, and the guard errors before any connection is acquired.
+    let resolve_tenant = if has_tenant_id {
+        quote! {
+            let __tenant: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    } else {
+        quote! {
+            let _: ::core::option::Option<::std::string::String> =
+                self.__autumn_m2m_tenant_scope()?;
+        }
+    };
+    let tenant_filter = quote! {
+        .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+    };
+
+    // S1's existence/soft-delete guard: `lock` adds the Postgres row lock,
+    // `scoped` the tenant predicate.
+    let target_probe = |scoped: bool, lock: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        let lock_clause = lock.then(|| quote! { .for_no_key_update() });
+        quote! {
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                #tenant_predicate
+                #live_filter
+                .select(#edge_mod::#table_ident::#pk_column)
+                #lock_clause
+                .first::<i64>(conn)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s1_arm = |lock: bool| {
+        let unscoped = target_probe(false, lock);
+        if has_tenant_id {
+            let scoped = target_probe(true, lock);
+            quote! {
+                match __tenant {
+                    ::core::option::Option::Some(ref __t) => { #scoped }
+                    ::core::option::Option::None => { #unscoped }
+                }
+            }
+        } else {
+            unscoped
+        }
+    };
+    let s1_pg = s1_arm(true);
+    let s1_sqlite = s1_arm(false);
+
+    // S5: persist the recomputed aggregate. Tenant-filtered on the same terms
+    // as S1 — belt and braces, since S1 already proved the target is in this
+    // tenant and holds its lock, but a zero-row S5 is the loud failure the
+    // `__persisted == 0` guard below is there for.
+    let aggregate_update = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| tenant_filter.clone());
+        quote! {
+            ::autumn_web::reexports::diesel::update(
+                #edge_mod::#table_ident::table
+                    .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                    #tenant_predicate
+                    #live_filter
+            )
+            .set(#edge_mod::#table_ident::#agg_column.eq(__aggregate))
+            .execute(conn)
+            .await
+            .map_err(::autumn_web::AutumnError::from)?
+        }
+    };
+    let s5_persist = if has_tenant_id {
+        let scoped = aggregate_update(true);
+        let unscoped = aggregate_update(false);
+        quote! {
+            let __persisted: usize = match __tenant {
+                ::core::option::Option::Some(ref __t) => { #scoped }
+                ::core::option::Option::None => { #unscoped }
+            };
+        }
+    } else {
+        let unscoped = aggregate_update(false);
+        quote! { let __persisted: usize = #unscoped; }
+    };
+
+    // `reaction_of`'s tenant boundary. The edge table has no tenant column, so
+    // the target row *is* the boundary: a target owned by another tenant has
+    // no visible reaction here, which is `Ok(None)` — not an error, matching
+    // what the reactor would see for a target that simply has no edge. The
+    // predicate is an `EXISTS` on the target projection folded into the edge
+    // lookup itself, NOT a separate probe statement: two statements under
+    // READ COMMITTED would be a TOCTOU window where a concurrent tenant
+    // reassignment lands between them and the foreign edge leaks anyway.
+    // Deliberately unlocked and NOT soft-delete filtered, mirroring
+    // `reaction_of`'s stance of reporting the edge regardless.
+    let reaction_of_tenant_exists = quote! {
+        .filter(::autumn_web::reexports::diesel::dsl::exists(
+            #edge_mod::#table_ident::table
+                .filter(#edge_mod::#table_ident::#pk_column.eq(target_id))
+                .filter(#edge_mod::#table_ident::tenant_id.eq(__t))
+        ))
+    };
+
+    // ── S2: the reactor's current edge, S3: the three-way branch ─────────
+    let (react_value_param, read_current, branch, aggregate_query) = if is_sum {
+        let value_ident = format_ident!(
+            "{}",
+            spec.value_column
+                .as_ref()
+                .expect("sum mode always resolves a value column")
+        );
+        (
+            Some(quote! { value: i16, }),
+            quote! {
+                let __current: ::core::option::Option<i16> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // (a) toggle-off: the same value again removes the edge.
+                    ::core::option::Option::Some(__existing) if __existing == value => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    // (b) flip: replace the value in place, never a second row.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::update(#edge_of_reactor)
+                            .set(#edge_mod::#edge_table::#value_ident.eq(value))
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Flipped,
+                        )
+                    }
+                    // (c) insert. The explicit `(reactor, target)` arbiter is
+                    // load-bearing: an edge table may carry more than one
+                    // unique constraint, and a bare `ON CONFLICT DO UPDATE`
+                    // is a syntax error. Under the target-row lock the
+                    // conflict arm is unreachable; it is emitted so that a
+                    // lock-bypassing writer produces an idempotent update
+                    // rather than a `23505` escaping to the caller.
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                            #edge_mod::#edge_table::#value_ident.eq(value),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_update()
+                        .set(
+                            #edge_mod::#edge_table::#value_ident.eq(
+                                ::autumn_web::reexports::diesel::upsert::excluded(
+                                    #edge_mod::#edge_table::#value_ident
+                                )
+                            )
+                        )
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(value),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            // `sum(SmallInt)` is typed `Nullable<BigInt>` by Diesel, so no
+            // backend-specific cast is needed; the `NULL` (no edges) case is
+            // coalesced in Rust rather than in SQL.
+            quote! {
+                let __total: ::core::option::Option<i64> = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .select(::autumn_web::reexports::diesel::dsl::sum(
+                        #edge_mod::#edge_table::#value_ident
+                    ))
+                    .get_result::<::core::option::Option<i64>>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                let __aggregate: i64 = __total.unwrap_or(0);
+            },
+        )
+    } else {
+        (
+            None,
+            quote! {
+                let __current: ::core::option::Option<i64> = #edge_of_reactor
+                    .select(#edge_mod::#edge_table::#target_fk)
+                    .first::<i64>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+            quote! {
+                let (__new_value, __outcome) = match __current {
+                    // Count mode is unary membership: a repeat click can only
+                    // toggle the row off, never flip it.
+                    ::core::option::Option::Some(_) => {
+                        ::autumn_web::reexports::diesel::delete(#edge_of_reactor)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::None,
+                            ::autumn_web::repository::ReactionOutcome::Removed,
+                        )
+                    }
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::diesel::insert_into(
+                            #edge_mod::#edge_table::table
+                        )
+                        .values((
+                            #edge_mod::#edge_table::#reactor_fk.eq(reactor_id),
+                            #edge_mod::#edge_table::#target_fk.eq(target_id),
+                        ))
+                        .on_conflict((
+                            #edge_mod::#edge_table::#reactor_fk,
+                            #edge_mod::#edge_table::#target_fk,
+                        ))
+                        .do_nothing()
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        (
+                            ::core::option::Option::Some(1i16),
+                            ::autumn_web::repository::ReactionOutcome::Inserted,
+                        )
+                    }
+                };
+            },
+            quote! {
+                let __aggregate: i64 = #edge_mod::#edge_table::table
+                    .filter(#edge_mod::#edge_table::#target_fk.eq(target_id))
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            },
+        )
+    };
+
+    // One statically-typed lookup per (mode, scoped) combination, mirroring
+    // `target_probe`: the scoped arms carry the single-snapshot tenant
+    // `EXISTS`, the unscoped arms are byte-identical to the pre-tenant code.
+    let reaction_of_lookup = |scoped: bool| {
+        let tenant_predicate = scoped.then(|| reaction_of_tenant_exists.clone());
+        if is_sum {
+            let value_ident = format_ident!(
+                "{}",
+                spec.value_column
+                    .as_ref()
+                    .expect("sum mode always resolves a value column")
+            );
+            quote! {
+                #edge_of_reactor
+                    #tenant_predicate
+                    .select(#edge_mod::#edge_table::#value_ident)
+                    .first::<i16>(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+        } else {
+            quote! {
+                {
+                    let __row: ::core::option::Option<i64> = #edge_of_reactor
+                        #tenant_predicate
+                        .select(#edge_mod::#edge_table::#target_fk)
+                        .first::<i64>(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+                    // Uniform `Option<i16>` in both modes: a present membership
+                    // row reports `Some(1)`, so view/widget code is
+                    // mode-independent.
+                    ::core::result::Result::Ok(__row.map(|_| 1i16))
+                }
+            }
+        }
+    };
+    let reaction_of_body = if has_tenant_id {
+        let scoped = reaction_of_lookup(true);
+        let unscoped = reaction_of_lookup(false);
+        quote! {
+            match __tenant {
+                ::core::option::Option::Some(ref __t) => #scoped,
+                ::core::option::Option::None => #unscoped,
+            }
+        }
+    } else {
+        reaction_of_lookup(false)
+    };
+
+    // ── Docs ─────────────────────────────────────────────────────────────
+    let aggregate_word = if is_sum { "SUM(value)" } else { "COUNT(*)" };
+    // Only documented where it can apply. A model without a `tenant_id`
+    // column emits no tenant scoping at all, so promising it there would be a
+    // lie — and the shape tests use exactly that to prove the zero-cost path.
+    let (react_tenant_doc, react_tenant_not_found, react_tenant_error) = if has_tenant_id {
+        (
+            "This model has a `tenant_id` column, so a `tenant_scoped` \
+             repository matches the target on it too: another tenant's \
+             `target_id` is `NotFound` before any write. `across_tenants()` \
+             opts out; a `tenant_scoped` repository with no tenant context is \
+             an error.\n\n",
+            ", or belongs to another tenant",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    // Applies regardless of `has_tenant_id`: the scope call carrying the
+    // reject is emitted unconditionally.
+    let cross_shard_error = "- `AutumnError::bad_request` when this repository is sharded and in \
+                             `across_tenants()` mode: there is no single right shard for a \
+                             reaction, so cross-shard reactions are rejected.\n";
+    let (reaction_of_tenant_doc, reaction_of_tenant_error) = if has_tenant_id {
+        (
+            "Tenant-isolated on the same terms as `react()`: through a \
+             `tenant_scoped` repository, a target belonging to another tenant \
+             reports `None` rather than that tenant's reaction.\n\n",
+            "- An error when this repository is `tenant_scoped` and no tenant \
+             context was established.\n",
+        )
+    } else {
+        ("", "")
+    };
+    let trait_doc = format!(
+        "Reaction helpers for `{model_ident}`'s `#[votable(by = {}, aggregate \
+         = {})]` declaration: the `{}` edge table keyed on `({}, {})`, \
+         aggregated into `{}.{}`.",
+        spec.reactor,
+        if is_sum { "sum" } else { "count" },
+        spec.table,
+        spec.reactor_fk,
+        spec.target_fk,
+        table_ident,
+        spec.column,
+    );
+    let react_doc = format!(
+        "Toggle / flip / insert this reactor's reaction on `target_id`, and \
+         recompute `{}.{}` from ground truth in the **same** transaction, so a \
+         reader never observes edge/aggregate disagreement.\n\
+         \n\
+         Race-safe: the target row is locked for the whole \
+         read-decide-write-recompute window, so N concurrent calls converge to \
+         at most one edge per `({}, {})` and the persisted aggregate always \
+         equals `{aggregate_word}`.\n\
+         \n\
+         **Not idempotent — it is a toggle.** Calling it twice with the same \
+         arguments reacts and then un-reacts. In particular, blindly retrying \
+         a call that timed out (or whose response was lost) can *invert* the \
+         outcome: the first attempt may well have committed. Callers that need \
+         retry safety must dedupe above this layer — an idempotency key on the \
+         HTTP request, or re-reading `reaction_of()` before retrying.\n\
+         \n\
+         Runs on its **own** pooled connection — it does not join an enclosing \
+         `Db::tx`. Do not hold a `Db` extractor across this call on a small \
+         pool.\n\
+         \n\
+         `value` is **not** validated: it is written to the edge table as \
+         given, so the edge table's `CHECK` constraint is what keeps the sum \
+         meaningful. Never bind it straight from a request body.\n\
+         \n\
+         {react_tenant_doc}\
+         # Errors\n\
+         \n\
+         - `AutumnError::not_found` when `target_id` does not exist (or is \
+         soft-deleted{react_tenant_not_found}).\n\
+         {react_tenant_error}\
+         {cross_shard_error}\
+         - Any database error from the enclosing transaction.",
+        table_ident, spec.column, spec.reactor_fk, spec.target_fk,
+    );
+    let reaction_of_doc = format!(
+        "This reactor's current reaction on `target_id`, or `None`.\n\
+         \n\
+         A single indexed lookup on `{}`; safe to call per-row on a detail \
+         page. For feed pages prefer rendering un-highlighted controls over an \
+         N+1 — a batch accessor is tracked as a follow-up.\n\
+         \n\
+         A **read**: it routes per this repository's read route, so a \
+         configured replica serves it, and it does not pin read-your-writes. \
+         It can therefore lag a `react()` this request just committed — render \
+         from the `Reaction` that `react()` returned instead of re-reading, or \
+         use a `primary_reads` / `on_primary()` repository.\n\
+         \n\
+         {reaction_of_tenant_doc}\
+         # Errors\n\
+         \n\
+         {reaction_of_tenant_error}\
+         {cross_shard_error}\
+         - Any database error.",
+        spec.table,
+    );
+
+    quote! {
+        #hidden_module
+
+        #pk_guard
+        #agg_ty_guard
+        #reactor_guard
+
+        #[doc = #trait_doc]
+        #vis trait #trait_ident {
+            #[doc = #react_doc]
+            fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::autumn_web::repository::Reaction>
+            > + Send;
+
+            #[doc = #reaction_of_doc]
+            fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> impl ::std::future::Future<
+                Output = ::autumn_web::AutumnResult<::core::option::Option<i16>>
+            > + Send;
+        }
+
+        impl<__R> #trait_ident for __R
+        where
+            __R: ::autumn_web::repository::M2mConnSource<Model = #model_ident>
+                + ::core::marker::Sync,
+        {
+            async fn react(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+                #react_value_param
+            ) -> ::autumn_web::AutumnResult<::autumn_web::repository::Reaction> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                // Resolved before the connection is taken, so a tenant_scoped
+                // repository with no tenant context fails closed without
+                // occupying a pooled connection.
+                #resolve_tenant
+                let mut conn = self.__autumn_m2m_write_conn().await?;
+                ::autumn_web::__private::scoped_immediate_transaction::<
+                    ::autumn_web::repository::Reaction,
+                    ::autumn_web::AutumnError,
+                    _,
+                >(&mut *conn, |conn| {
+                    async move {
+                        // S1: take the row lock on the target before anything
+                        // is read, and use the same statement as the
+                        // existence/soft-delete guard. `FOR NO KEY UPDATE`, not
+                        // `FOR UPDATE`: this transaction only ever writes the
+                        // target's aggregate column, never its key, and the
+                        // weaker mode still conflicts with itself (so reactions
+                        // on one target stay serialized) while NOT conflicting
+                        // with the `FOR KEY SHARE` locks Postgres takes for
+                        // foreign-key checks — a concurrent `INSERT INTO
+                        // comments (post_id) …` therefore does not queue behind
+                        // a vote. On SQLite the enclosing `BEGIN IMMEDIATE`
+                        // already serializes writers, so the unsupported
+                        // locking clause is redundant as well as unemittable.
+                        let __target: ::core::option::Option<i64> =
+                            ::autumn_web::backend_select! {
+                                pg => { #s1_pg },
+                                sqlite => { #s1_sqlite },
+                            };
+                        if __target.is_none() {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        // S2 — safe: the target lock is held.
+                        #read_current
+
+                        // S3 — exactly one of delete / update / upsert.
+                        #branch
+
+                        // S4 — ground truth, not an accumulated delta, so any
+                        // historical drift self-heals on the next reaction.
+                        #aggregate_query
+
+                        // S5 — persist, in the same transaction as S3.
+                        #s5_persist
+
+                        // Defense in depth: unreachable while S1's lock holds —
+                        // the target existed and was live when we locked it, and
+                        // nobody can delete or soft-delete it underneath us. If
+                        // the lock strength ever regresses this fails loudly
+                        // instead of committing an edge whose aggregate was
+                        // silently dropped on the floor.
+                        if __persisted == 0 {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::not_found_msg(#not_found_msg)
+                            );
+                        }
+
+                        ::core::result::Result::Ok(
+                            ::autumn_web::repository::Reaction::__new(
+                                __new_value,
+                                __aggregate,
+                                __outcome,
+                            )
+                        )
+                    }
+                    .scope_boxed()
+                })
+                .await
+            }
+
+            async fn reaction_of(
+                &self,
+                reactor_id: i64,
+                target_id: i64,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<i16>> {
+                use ::autumn_web::reexports::diesel::result::OptionalExtension as _;
+                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                #resolve_tenant
+                // A read: routed per the repository's `ReadRoute`, and it does
+                // not mark the read-your-writes pin.
+                let mut conn = self.__autumn_m2m_read_conn().await?;
+                #reaction_of_body
+            }
+        }
+    }
+}
+
 /// Extract `#[validate(...)]` attributes from a field (verbatim pass-through).
 fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -1426,8 +2912,8 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
-/// `#[state_machine]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[position]`,
+/// `#[searchable]`, `#[state_machine]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -1450,6 +2936,11 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("position")
+                // #1384: `#[translatable]` is a marker the model macro reads;
+                // the behaviour lives in the field's `Translated` type, so the
+                // attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("translatable")
         })
         .collect()
 }
@@ -1648,9 +3139,14 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
     }
     // `#[encrypted]` columns must flow through the `serialize_as` wrapper on
     // insert. Fields excluded from the insert (`#[id]`, `#[default]`,
-    // `#[lock_version]`) would instead get a raw database value, which the
-    // decrypting reader then rejects as a malformed envelope. Reject the combo.
-    if has_attr(field, "default") || has_attr(field, "lock_version") || has_attr(field, "id") {
+    // `#[lock_version]`, `#[position]`) would instead get a raw database
+    // value, which the decrypting reader then rejects as a malformed
+    // envelope. Reject the combo.
+    if has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "id")
+        || has_attr(field, "position")
+    {
         return Err(syn::Error::new_spanned(
             field,
             "`#[encrypted]` cannot be combined with `#[default]`, `#[lock_version]`, \
@@ -1684,6 +3180,275 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ── #1384: `#[translatable]` field attribute ─────────────────────────────────
+
+/// Whether a field is declared `#[translatable]` (issue #1384): its column
+/// holds an `autumn_web::i18n::Translated` container — an independent value
+/// per locale tag — instead of a single monolingual string.
+fn field_is_translatable(field: &syn::Field) -> bool {
+    has_attr(field, "translatable")
+}
+
+/// Validate a `#[translatable]` field.
+///
+/// The attribute is a marker: the *type* carries the behaviour, so the type
+/// has to be right. Everything else rejected here is a combination whose two
+/// halves disagree about what the column contains — a JSON container is not a
+/// string to encrypt, index, normalize, or full-text search.
+fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_translatable(field) {
+        return Ok(());
+    }
+    // The type must be `Translated` (however it is spelled: bare, or fully
+    // qualified through any path). `Option<Translated>` is rejected on
+    // purpose — the container already models "no translation" as an empty
+    // map, and a nullable column would give two spellings for one state.
+    let is_translated = matches!(
+        &field.ty,
+        syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Translated")
+            && p.path.segments.last().is_some_and(|s| s.arguments.is_empty())
+    );
+    if !is_translated {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[translatable]` requires the field type `autumn_web::i18n::Translated` \
+             (a per-locale container), not a plain string. Change the field to \
+             `pub <name>: autumn_web::i18n::Translated`; it renders the active \
+             locale through `Display` and keeps every other locale intact on write. \
+             The check is syntactic — a type alias for `Translated` is not \
+             recognised, and conversely any type whose last path segment is \
+             `Translated` is accepted, so spell the real type here.",
+        ));
+    }
+    // Combinations whose two halves disagree about the column's contents.
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column stores one opaque ciphertext envelope, which has no \
+             per-locale structure to resolve",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which for a translatable field \
+             is a JSON container — the index would match locale tags and JSON \
+             punctuation, not the prose",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite a single string; they cannot see inside the per-locale \
+             container",
+        ),
+        (
+            "unique",
+            "uniqueness would compare whole JSON containers, so two records translated \
+             into different locale sets would never collide even with identical text",
+        ),
+        (
+            "indexed",
+            "an equality index over a JSON container matches whole containers, never a \
+             single locale's value",
+        ),
+        ("id", "a primary key must be a single scalar value"),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, not a per-locale container",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[translatable]` cannot be combined with `#[{marker}]`: {why}. \
+                     Keep a separate non-translatable column for that."
+                ),
+            ));
+        }
+    }
+    // The column is registered under its Rust field name, which the registry
+    // and the generated field-name-keyed accessors match against. A
+    // `#[serde(rename)]` would desync them.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[serde(rename = ...)]`: the column is \
+             registered under its Rust name, which must match the field name passed to \
+             `available_locales(..)` / `is_translated(..)`.",
+        ));
+    }
+    // `#[diesel(column_name = ...)]` is the spelling that actually renames the
+    // *database* column, so it desyncs the registry harder than a serde rename:
+    // `TranslatableColumnDescriptor` would name a column that does not exist on
+    // the table. Refuse it for the same reason, and say which one.
+    if field_has_diesel_column_name(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[translatable]` fields cannot use `#[diesel(column_name = ...)]`: the column \
+             is registered for framework surfaces under its Rust name, so a renamed database \
+             column would be advertised under a name that does not exist on the table. Name \
+             the Rust field after the column instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// An identifier's name with any raw-identifier prefix removed (`r#type` ->
+/// `type`), matching the DB column and the key callers pass to the
+/// field-name-driven accessors.
+fn unraw_ident(ident: &syn::Ident) -> String {
+    let raw = ident.to_string();
+    raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
+/// database column out from under the Rust field name.
+fn field_has_diesel_column_name(field: &syn::Field) -> bool {
+    let mut found = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
+        // Swallow any parse error: this is a detector, not a validator —
+        // diesel's own derive reports malformed input with a better message.
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("column_name") {
+                found = true;
+            }
+            let _ = meta
+                .value()
+                .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Build the `impl` block a model's `#[translatable]` fields contribute:
+/// per-field accessors plus the field-name-keyed surface an app renders a
+/// "needs translation" affordance from (issue #1384 AC5).
+///
+/// Returns an empty token stream when the model has no translatable field, so
+/// a model that never opts in expands byte-for-byte as before.
+fn emit_translatable_items(model: &syn::Ident, fields: &[&syn::Ident]) -> TokenStream {
+    if fields.is_empty() {
+        return quote! {};
+    }
+    // Strip the raw-identifier prefix (the house idiom, see `pascal_case`):
+    // `Ident`'s `Display` keeps `r#`, so a `#[translatable] pub r#type:
+    // Translated` field would be keyed as `"r#type"` — a name no `SELECT`
+    // resolves and no caller of `available_locales("type")` would ever pass.
+    let names: Vec<String> = fields.iter().map(|f| unraw_ident(f)).collect();
+    let per_field = fields.iter().map(|ident| {
+        let name = ident.to_string();
+        let localized = format_ident!("{}_localized", ident);
+        let in_locale = format_ident!("{}_in", ident);
+        let setter = format_ident!("set_{}", ident);
+        let locales = format_ident!("{}_locales", ident);
+        let is_translated = format_ident!("{}_is_translated", ident);
+        let doc_localized = format!(
+            "`{name}` resolved against the request's active locale, walking the \
+             configured fallback chain on miss. `None` once the chain is exhausted."
+        );
+        let doc_in =
+            format!("`{name}` resolved against an explicit locale, then the fallback chain.");
+        let doc_set = format!(
+            "Store `value` as `{name}`'s translation for `locale`, leaving every other \
+             locale untouched."
+        );
+        let doc_locales = format!("Every locale `{name}` has been translated into, in tag order.");
+        let doc_is_translated = format!("Whether `{name}` has its own translation for `locale`.");
+        quote! {
+            #[doc = #doc_localized]
+            #[must_use]
+            pub fn #localized(&self) -> ::core::option::Option<&str> {
+                self.#ident.resolve()
+            }
+
+            #[doc = #doc_in]
+            #[must_use]
+            pub fn #in_locale(&self, locale: &str) -> ::core::option::Option<&str> {
+                self.#ident.resolve_in(locale)
+            }
+
+            #[doc = #doc_set]
+            pub fn #setter(
+                &mut self,
+                locale: impl ::core::convert::Into<::std::string::String>,
+                value: impl ::core::convert::Into<::std::string::String>,
+            ) -> &mut Self {
+                self.#ident.set(locale, value);
+                self
+            }
+
+            #[doc = #doc_locales]
+            #[must_use]
+            pub fn #locales(&self) -> ::std::vec::Vec<&str> {
+                self.#ident.available_locales()
+            }
+
+            #[doc = #doc_is_translated]
+            #[must_use]
+            pub fn #is_translated(&self, locale: &str) -> bool {
+                self.#ident.is_translated(locale)
+            }
+        }
+    });
+    let match_arms = fields.iter().zip(names.iter()).map(|(ident, name)| {
+        quote! { #name => ::core::option::Option::Some(&self.#ident), }
+    });
+    quote! {
+        impl #model {
+            #(#per_field)*
+
+            /// Field names on this model declared `#[translatable]`.
+            #[must_use]
+            pub const fn translatable_fields() -> &'static [&'static str] {
+                Self::__AUTUMN_TRANSLATABLE_COLUMNS
+            }
+
+            /// The raw per-locale container for `field`, or `None` when the
+            /// model has no translatable field by that name.
+            #[must_use]
+            pub fn translated(
+                &self,
+                field: &str,
+            ) -> ::core::option::Option<&::autumn_web::i18n::Translated> {
+                match field {
+                    #(#match_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+
+            /// Which locales `field` has been translated into — the
+            /// "needs translation" affordance. Empty for an unknown field.
+            #[must_use]
+            pub fn available_locales(&self, field: &str) -> ::std::vec::Vec<&str> {
+                self.translated(field)
+                    .map(::autumn_web::i18n::Translated::available_locales)
+                    .unwrap_or_default()
+            }
+
+            /// Whether `field` has its own translation for `locale`.
+            #[must_use]
+            pub fn is_translated(&self, field: &str, locale: &str) -> bool {
+                self.translated(field)
+                    .is_some_and(|t| t.is_translated(locale))
+            }
+
+            /// `field` resolved against the request's active locale.
+            #[must_use]
+            pub fn localized(&self, field: &str) -> ::core::option::Option<&str> {
+                self.translated(field)
+                    .and_then(::autumn_web::i18n::Translated::resolve)
+            }
+        }
+    }
 }
 
 // ── #1379: `#[normalize(...)]` field normalization ────────────────────────
@@ -2031,36 +3796,92 @@ fn parse_model_shard_key(attrs: &[syn::Attribute]) -> syn::Result<Option<String>
     Ok(None)
 }
 
+#[derive(Debug)]
 enum FieldSearchable {
     NotSearchable,
     SearchableDefault,
     SearchableWithWeight(String),
 }
 
-/// Parse the field-level weight from `#[searchable(weight = "...")]`
-fn parse_field_searchable_weight(field: &syn::Field) -> syn::Result<FieldSearchable> {
+/// Field-level `#[searchable(...)]` configuration.
+///
+/// #842 introduced the weight; #1191 adds `embed`, which nominates the field
+/// whose text is embedded for vector / "find similar" search. The two are
+/// independent: `#[searchable(weight = "B", embed)]` both ranks the field at
+/// weight B for keyword search and embeds it for k-NN search.
+#[derive(Debug)]
+struct FieldSearchableConfig {
+    kind: FieldSearchable,
+    embed: bool,
+}
+
+/// Whether `ty` is `String` or `Option<String>` — the shape the tenancy path
+/// assumes for a `tenant_id` column.
+fn is_string_or_option_string(ty: &syn::Type) -> bool {
+    fn is_string(ty: &syn::Type) -> bool {
+        matches!(ty, syn::Type::Path(tp) if tp.path.segments.last()
+            .is_some_and(|s| s.ident == "String"))
+    }
+    if is_string(ty) {
+        return true;
+    }
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(segment) = tp.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    matches!(args.args.first(), Some(syn::GenericArgument::Type(inner)) if is_string(inner))
+}
+
+/// Parse the full field-level `#[searchable(weight = "...", embed)]` config.
+fn parse_field_searchable(field: &syn::Field) -> syn::Result<FieldSearchableConfig> {
     for attr in &field.attrs {
         if attr.path().is_ident("searchable") {
             if matches!(attr.meta, syn::Meta::Path(_)) {
-                return Ok(FieldSearchable::SearchableDefault);
+                return Ok(FieldSearchableConfig {
+                    kind: FieldSearchable::SearchableDefault,
+                    embed: false,
+                });
             }
             let mut weight = None;
+            let mut embed = false;
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("weight") {
                     let value: syn::LitStr = meta.value()?.parse()?;
                     weight = Some(value.value());
                     Ok(())
+                } else if meta.path.is_ident("embed") {
+                    if embed {
+                        return Err(meta.error("duplicate `embed` in #[searchable(...)]"));
+                    }
+                    embed = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("unsupported field searchable attribute"))
+                    Err(meta.error(
+                        "unsupported field searchable attribute (expected `weight = \"A\"` or `embed`)",
+                    ))
                 }
             })?;
-            return Ok(weight.map_or(
-                FieldSearchable::SearchableDefault,
-                FieldSearchable::SearchableWithWeight,
-            ));
+            return Ok(FieldSearchableConfig {
+                kind: weight.map_or(
+                    FieldSearchable::SearchableDefault,
+                    FieldSearchable::SearchableWithWeight,
+                ),
+                embed,
+            });
         }
     }
-    Ok(FieldSearchable::NotSearchable)
+    Ok(FieldSearchableConfig {
+        kind: FieldSearchable::NotSearchable,
+        embed: false,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2369,14 +4190,23 @@ fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     None
 }
 
-/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
-/// three are excluded from the `NewX` insert type.
+/// True if a field has `#[id]`, `#[default]`, `#[lock_version]`, or
+/// `#[position]` — all four are excluded from the `NewX` insert type (and,
+/// via `fields_for_new`, from `UpdateX` too — `#[lock_version]` is the one
+/// exception, re-added to `UpdateX` separately as a plain required field).
 ///
 /// `#[lock_version]` fields are excluded because the DB column must carry a
 /// `DEFAULT 0` constraint; the initial version is always zero and is never
-/// supplied by the caller on insert.
+/// supplied by the caller on insert. `#[position]` fields (issue #1358) are
+/// excluded because the generated repository assigns the next contiguous
+/// value on insert and only ever changes it through `move_to`/`move_before`/
+/// `move_after`/`move_up`/`move_down` — never a direct create/update payload,
+/// which would let a caller silently break the contiguous invariant.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
+    has_attr(field, "id")
+        || has_attr(field, "default")
+        || has_attr(field, "lock_version")
+        || has_attr(field, "position")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -2610,6 +4440,31 @@ fn emit_form_model_impl(
     }
 }
 
+/// Emit the JSON-Schema `TokenStream` for one model field.
+///
+/// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
+/// field (issue #1384) is described inline as a locale-tag→string map, which is
+/// exactly what its lossless `Serialize` emits. Without that, the field would
+/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
+/// referencing a component nothing registers.
+///
+/// Keyed on the **attribute**, never on the type's name: an application type
+/// that merely happens to be called `Translated` (`domain::Translated`) keeps
+/// its ordinary `$ref`, so the advertised contract cannot silently disagree
+/// with what that type actually serializes to.
+fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_translatable(field) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": "object",
+                "description": "Per-locale content, keyed by locale tag (issue #1384).",
+                "additionalProperties": { "type": "string" }
+            })
+        };
+    }
+    emit_json_schema_tokens(&field.ty)
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -2685,7 +4540,7 @@ fn emit_schema_fn_body_ext(
         .map(|f| {
             let field_name = schema_property_name(f, rename_all_rule)
                 .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens(&f.ty);
+            let schema_expr = emit_json_schema_tokens_for_field(f);
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
             }
@@ -3456,11 +5311,31 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let association_items = emit_association_items(name, &table_ident, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
+    // `#[votable(by = ..., ...)]` (#1362). Resolved here next to the
+    // associations; emitted below, once `all_fields` is known (the aggregate
+    // column must name a real field, and the soft-delete guard is emitted only
+    // when the model has a `deleted_at`).
+    let votable = match resolve_votable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
+    // `#[commentable(by = ..., ...)]` (#1367) — the polymorphic association
+    // kind. Resolved here beside `#[votable]`; emitted below, once `all_fields`
+    // is known (the counter column must name a real `i64` field, and the
+    // parent's soft-delete / tenant columns are projected into the spec).
+    let commentable = match resolve_commentable(name, outer_attrs) {
+        Ok(spec) => spec,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
         .filter(|a| {
             !a.path().is_ident("searchable")
                 && !is_association_attr(a)
+                && !is_votable_attr(a)
+                && !is_commentable_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -3500,13 +5375,298 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Validate that `#[votable]`'s aggregate column names an existing field of
+    // the right type, mirroring the shard_key check above. Without the
+    // existence check the hidden edge module declares the column regardless and
+    // the mistake only surfaces as a runtime `42703 column "score" does not
+    // exist` on the very first reaction; without the type check the column is
+    // projected as `Int8` and a real `i32`/`Option<i64>` field only fails as an
+    // opaque Diesel trait-resolution wall inside the generated `react()`.
+    let votable_items = match votable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            let aggregate_field = all_fields
+                .iter()
+                .find(|f| f.ident.as_ref().is_some_and(|i| i == &spec.column));
+            let Some(aggregate_field) = aggregate_field else {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "votable aggregate column `{}` not found on model `{name}`; \
+                         add the field (e.g. `pub {}: i64`) or override it with \
+                         `#[votable(..., column = <field>)]`",
+                        spec.column, spec.column,
+                    ),
+                )
+                .to_compile_error();
+            };
+            // The aggregate is `SUM(value)` / `COUNT(*)` — both `BIGINT` — and
+            // the generated `Reaction::aggregate` is `i64`, so anything else is
+            // a schema mismatch, not a convenience to be coerced. Two layers
+            // (PR #2177 review): a *directed* error here for the spellings that
+            // are definitely wrong (a bare non-`i64` primitive, an `Option`),
+            // and a generated `const` type guard (emit_votable_items) for
+            // everything else — so `std::primitive::i64` and aliases that
+            // really are `i64` compile, while a wrong alias still fails at the
+            // guard rather than at runtime.
+            let aggregate_ty = aggregate_field.ty.to_token_stream().to_string();
+            let definitely_not_i64: &[&str] = &[
+                "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+                "f32", "f64", "bool", "String",
+            ];
+            if definitely_not_i64.contains(&aggregate_ty.as_str())
+                || aggregate_ty.starts_with("Option <")
+            {
+                return syn::Error::new_spanned(
+                    &aggregate_field.ty,
+                    format!(
+                        "votable aggregate column `{}` on model `{name}` must be \
+                         `i64` (BIGINT), found `{aggregate_ty}`; the aggregate is \
+                         `SUM(value)` / `COUNT(*)` and is written back as an \
+                         `i64` — widen the column and the field",
+                        spec.column,
+                    ),
+                )
+                .to_compile_error();
+            }
+            let has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            // Same field-presence precedent as `deleted_at`: the column has to
+            // exist for S1/S5 to filter on it. Whether it is actually *applied*
+            // is the repository's call, resolved at runtime through
+            // `M2mConnSource::__autumn_m2m_tenant_scope()`.
+            let has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a reaction: `react(target_id)`
+            // identifies the target by ONE value, so with two `#[id]` fields
+            // S1 would lock whichever rows share the first component and S5
+            // would update all of them. Reject rather than silently keying on
+            // the first component (PR #2177 review).
+            let id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if id_fields.len() > 1 {
+                let attr = outer_attrs
+                    .iter()
+                    .find(|a| is_votable_attr(a))
+                    .expect("attribute was parsed above");
+                let listed = id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "`#[votable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `react(reactor_id, target_id)` identifies its target by \
+                         one id — the edge table and the aggregate UPDATE cannot \
+                         address a composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_votable_items(
+                name,
+                &table_ident,
+                vis,
+                spec,
+                has_deleted_at,
+                has_tenant_id,
+                pk_ident,
+            )
+        }
+    };
+
+    // ── Polymorphic comments (#[commentable], #1367) ────────────────────────
+    // Validated on the same terms as `#[votable]`'s aggregate column: the
+    // maintained counter must name a real `i64` field, or the mistake only
+    // surfaces as a runtime `42703 column "comment_count" does not exist` on
+    // the very first comment.
+    let commentable_items = match commentable {
+        None => TokenStream::new(),
+        Some(ref spec) => {
+            if let Some(counter_column) = spec.counter_column.as_deref() {
+                let counter_field = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| i == counter_column));
+                let Some(counter_field) = counter_field else {
+                    return syn::Error::new(
+                        spec.span,
+                        format!(
+                            "commentable counter column `{counter_column}` not found on \
+                             model `{name}`; add the field (e.g. `#[default] pub \
+                             {counter_column}: i64`), point the attribute at an \
+                             existing one with `#[commentable(..., counter_cache = \
+                             <field>)]`, or opt out with `#[commentable(..., \
+                             counter_cache = false)]`"
+                        ),
+                    )
+                    .to_compile_error();
+                };
+                // Two layers, exactly like `#[votable]`: a directed error for
+                // the spellings that are definitely wrong, and the generated
+                // `const` guard below for everything else — so
+                // `std::primitive::i64` and honest aliases still compile.
+                let counter_ty = counter_field.ty.to_token_stream().to_string();
+                let definitely_not_i64: &[&str] = &[
+                    "i8", "i16", "i32", "i128", "u8", "u16", "u32", "u64", "u128", "usize",
+                    "isize", "f32", "f64", "bool", "String",
+                ];
+                if definitely_not_i64.contains(&counter_ty.as_str())
+                    || counter_ty.starts_with("Option <")
+                {
+                    return syn::Error::new_spanned(
+                        &counter_field.ty,
+                        format!(
+                            "commentable counter column `{counter_column}` on model \
+                             `{name}` must be `i64` (BIGINT), found `{counter_ty}`; the \
+                             counter is maintained with `SET c = c + 1` and read back \
+                             as an `i64` — widen the column and the field"
+                        ),
+                    )
+                    .to_compile_error();
+                }
+            }
+            let cmt_has_deleted_at = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+            let cmt_has_tenant_id = all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == "tenant_id"));
+            // A composite key cannot back a polymorphic parent: `commentable_id`
+            // is ONE column, so a two-`#[id]` model has no single value to store
+            // there. Reject rather than silently keying on the first component.
+            let cmt_id_fields: Vec<&syn::Ident> = all_fields
+                .iter()
+                .filter(|f| has_attr(f, "id"))
+                .filter_map(|f| f.ident.as_ref())
+                .collect();
+            if cmt_id_fields.len() > 1 {
+                let listed = cmt_id_fields
+                    .iter()
+                    .map(|i| format!("`{i}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return syn::Error::new(
+                    spec.span,
+                    format!(
+                        "`#[commentable]` requires a single `i64` primary key: model \
+                         `{name}` declares a composite key ({listed}), and \
+                         `commentable_id` is one column — it cannot address a \
+                         composite-keyed row"
+                    ),
+                )
+                .to_compile_error();
+            }
+            let cmt_pk_ident = all_fields
+                .iter()
+                .find(|f| has_attr(f, "id"))
+                .or_else(|| {
+                    all_fields.iter().find(|f| match &f.ty {
+                        syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                        _ => false,
+                    })
+                })
+                .and_then(|f| f.ident.as_ref());
+            emit_commentable_items(
+                name,
+                vis,
+                spec,
+                &table_name,
+                &crate::commentable::ParentShape {
+                    has_deleted_at: cmt_has_deleted_at,
+                    has_tenant_id: cmt_has_tenant_id,
+                    is_sharded: shard_key_field.is_some(),
+                    pk_ident: cmt_pk_ident,
+                },
+            )
+        }
+    };
+
+    // ── Counter caches (#1325) ──────────────────────────────────────────────
+    // Resolved here (rather than beside `resolve_associations`) because the
+    // spec needs `all_fields`: the foreign key must be a real field, and its
+    // nullability decides whether `fk_of` wraps or forwards. A `deleted_at`
+    // column makes the count reflect live rows only.
+    let counter_caches_impl = {
+        let cc_has_deleted_at = all_fields
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == "deleted_at"));
+        // Same fallback every other primary-key consumer in this macro uses
+        // (`id_field_names`, the factory PK, `#[votable]`): an explicit `#[id]`,
+        // else the first integer field. Hard-requiring `#[id]` would reject
+        // models the rest of `#[model]` accepts — and, because the error
+        // short-circuits the whole macro, would bury it under a cascade of
+        // "cannot find type" errors from the paired `#[repository]`.
+        let cc_pk_ident = all_fields
+            .iter()
+            .find(|f| has_attr(f, "id"))
+            .or_else(|| {
+                all_fields.iter().find(|f| match &f.ty {
+                    syn::Type::Path(tp) => tp.path.is_ident("i32") || tp.path.is_ident("i64"),
+                    _ => false,
+                })
+            })
+            .and_then(|f| f.ident.as_ref());
+        match emit_counter_caches_impl(
+            name,
+            &table_name,
+            cc_pk_ident,
+            cc_has_deleted_at,
+            &associations,
+            &all_fields,
+        ) {
+            Ok(tokens) => tokens,
+            Err(err) => return err.to_compile_error(),
+        }
+    };
+
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
+    // #1191: the field idents backing the searchable columns, so the derived
+    // `SearchIndexed::search_document` can extract their values, plus the
+    // single `#[searchable(embed)]` field (if any) that feeds vector search.
+    let mut search_field_idents: Vec<syn::Ident> = Vec::new();
+    let mut search_embed_field: Option<String> = None;
 
     for field in &all_fields {
-        match parse_field_searchable_weight(field) {
-            Ok(FieldSearchable::NotSearchable) => {}
-            Ok(weight_type) => {
+        let cfg = match parse_field_searchable(field) {
+            Ok(cfg) => cfg,
+            Err(err) => return err.to_compile_error(),
+        };
+        match cfg.kind {
+            FieldSearchable::NotSearchable => {
+                if cfg.embed {
+                    // Unreachable through the parser (a bare `embed` still
+                    // yields a searchable kind), but keep the invariant local.
+                    return syn::Error::new_spanned(
+                        field,
+                        "`embed` requires the field to be #[searchable]",
+                    )
+                    .to_compile_error();
+                }
+            }
+            weight_type => {
                 let field_ident = field.ident.as_ref().unwrap();
                 let weight = match weight_type {
                     FieldSearchable::SearchableWithWeight(w) => w,
@@ -3529,11 +5689,34 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                     .to_compile_error();
                 }
+                if cfg.embed {
+                    if let Some(existing) = &search_embed_field {
+                        return syn::Error::new_spanned(
+                            field_ident,
+                            format!(
+                                "only one field may be marked #[searchable(embed)]; `{existing}` \
+                                 already is. A model has a single embedding per record — \
+                                 concatenate the fields you want embedded into one column."
+                            ),
+                        )
+                        .to_compile_error();
+                    }
+                    search_embed_field = Some(field_ident.to_string());
+                }
                 search_field_names.push(field_ident.to_string());
                 search_field_weights.push(weight_char);
+                search_field_idents.push(field_ident.clone());
             }
-            Err(err) => return err.to_compile_error(),
         }
+    }
+
+    if !is_searchable && search_embed_field.is_some() {
+        return syn::Error::new_spanned(
+            name,
+            "#[searchable(embed)] requires the model to be marked #[searchable] \
+             (add `#[searchable]` or `#[searchable(language = \"...\")]` above the struct)",
+        )
+        .to_compile_error();
     }
 
     let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
@@ -3591,6 +5774,173 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // ── #1191: the engine-agnostic search index definition + document ───────
+    //
+    // #842 already emits `AutumnSearchableModel` (the metadata the in-core
+    // Postgres/SQLite FTS reads). `SearchIndexed` is the *pluggable* half: it
+    // hands `autumn-search` an `IndexDefinition` and a per-record
+    // `SearchDocument` so any backend (Postgres+pgvector, Meilisearch, a
+    // vector store) can index the model with zero hand-written glue.
+    //
+    // Emitted only for a model that is actually searchable, declares at least
+    // one searchable field, and has an `i64` primary key — the id type every
+    // search index keys on (the in-core FTS `search()` already assumes it).
+    // A `#[searchable]` model with, say, a `Uuid` key keeps its #842 behaviour
+    // and simply has no plugin index.
+    let search_pk_ident: Option<&syn::Ident> = pk_field_for_factory.and_then(|(id, ty)| {
+        matches!(ty, syn::Type::Path(tp) if tp.path.is_ident("i64")).then_some(id)
+    });
+    let search_indexed_impl = match (is_searchable, search_pk_ident) {
+        (true, Some(pk_ident)) if !search_field_idents.is_empty() => {
+            // Diesel maps a struct field to the identically-named column, so
+            // the `#[id]` field's ident IS the key column name.
+            let search_pk_column = pk_ident.to_string();
+            let field_names = search_field_names.clone();
+            let field_weights = search_field_weights.clone();
+            let field_idents = search_field_idents.clone();
+            let embed_const = search_embed_field.as_ref().map_or_else(
+                || quote! { ::core::option::Option::None },
+                |field| quote! { ::core::option::Option::Some(#field) },
+            );
+            let embed_extract = search_embed_field.as_ref().map_or_else(
+                || quote! {},
+                |field| {
+                    let ident = syn::Ident::new(field, name.span());
+                    quote! {
+                        // An empty embed source stays `None`: embedding the
+                        // empty string would cost a provider call and pollute
+                        // k-NN results with a meaningless vector.
+                        let __autumn_embed =
+                            ::autumn_web::search::SearchTextValue::search_text_value(&self.#ident);
+                        if !__autumn_embed.is_empty() {
+                            __autumn_doc.embed_text = ::core::option::Option::Some(__autumn_embed);
+                        }
+                    }
+                },
+            );
+            // A model with a `tenant_id` column carries its tenant into every
+            // document, so any backend can fail closed on a cross-tenant read.
+            //
+            // Keyed on the name AND the type. An unrelated `tenant_id: i64`
+            // would otherwise stamp `tenant_id = "42"` on every document and
+            // make every real-tenant search return nothing; a `tenant_id` of
+            // some other type would fail to compile INSIDE generated code,
+            // pointing at a trait the user never mentioned. The rest of the
+            // macro's tenancy path already assumes `String`/`Option<String>`.
+            //
+            // This is the COLUMN check only. Whether the index is *scoped* to
+            // the tenant is a separate question, resolved at runtime from the
+            // repository — see `#tenant_scoped_expr` below.
+            let has_tenant_column = all_fields.iter().any(|f| {
+                f.ident.as_ref().is_some_and(|i| i == "tenant_id")
+                    && is_string_or_option_string(&f.ty)
+            });
+            // Tenant SCOPING follows `#[repository(tenant_scoped)]`, exactly as
+            // soft-delete follows `#[repository(soft_delete)]` — and for the
+            // same reason. A `tenant_id` column that is denormalized or audit
+            // data, on a repository that does not opt in, has unscoped
+            // finders; marking its index tenant-scoped anyway would make every
+            // search outside a tenant context fail with `TenantContextMissing`
+            // and every search inside one silently filter, neither of which
+            // matches what the app's own reads do.
+            //
+            // Column presence is still required: without a `tenant_id` the
+            // documents carry no tenant to filter on, so scoping would match
+            // nothing.
+            let tenant_scoped_expr = if has_tenant_column {
+                quote! { <Self>::__autumn_repo_tenant_scope() }
+            } else {
+                quote! { false }
+            };
+            let tenant_extract = if has_tenant_column {
+                quote! {
+                    let __autumn_tenant =
+                        ::autumn_web::search::SearchTextValue::search_text_value(&self.tenant_id);
+                    if !__autumn_tenant.is_empty() {
+                        __autumn_doc.tenant_id = ::core::option::Option::Some(__autumn_tenant);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
+            quote! {
+                impl ::autumn_web::search::SearchIndexed for #name {
+                    const SEARCH_INDEX: &'static str = #table_name;
+                    const SEARCH_EMBED_FIELD: ::core::option::Option<&'static str> = #embed_const;
+
+                    fn index_definition() -> ::autumn_web::search::IndexDefinition {
+                        // In scope so the blanket `false` defaults resolve for
+                        // a model whose repository is not `soft_delete` /
+                        // `tenant_scoped` (or that has no repository at all).
+                        // An inherent override emitted by `#[repository(...)]`
+                        // still wins — see the unqualified `<Self>::` calls.
+                        use ::autumn_web::preload::AutumnPreloadScopeExt as _;
+
+                        const __AUTUMN_SEARCH_INDEX_FIELDS:
+                            &[::autumn_web::search::SearchIndexField] = &[
+                            #(::autumn_web::search::SearchIndexField::new(
+                                #field_names,
+                                #field_weights,
+                            )),*
+                        ];
+                        ::autumn_web::search::IndexDefinition::new(
+                            #table_name,
+                            #search_language,
+                            __AUTUMN_SEARCH_INDEX_FIELDS,
+                            #embed_const,
+                            #tenant_scoped_expr,
+                        )
+                        // The REAL key column, not the conventional `id`: a
+                        // backend that rebuilds documents from the source table
+                        // (backfill, reindex) selects and paginates on it, and
+                        // a model keyed on `article_id` would otherwise fail at
+                        // runtime with an undefined column.
+                        .with_key_column(#search_pk_column)
+                        // Resolved at RUNTIME through the same seam preload
+                        // uses: `#[repository(soft_delete)]` overrides this
+                        // inherently on the model, and `#[model]` cannot see
+                        // the repository attribute. A `deleted_at` column
+                        // alone does NOT mean soft delete — it is often audit
+                        // history, and those rows must stay indexed because
+                        // the model's finders still return them.
+                        //
+                        // UNQUALIFIED `<Self>::`, never `<Self as Trait>::`:
+                        // the override is an *inherent* associated fn, and
+                        // naming the trait would resolve straight past it to
+                        // the blanket `false` default — silently disabling the
+                        // filter for every genuinely soft-deleted model.
+                        .with_soft_delete(<Self>::__autumn_repo_soft_delete_scope())
+                    }
+
+                    fn search_id(&self) -> i64 {
+                        self.#pk_ident
+                    }
+
+                    fn search_document(&self) -> ::autumn_web::search::SearchDocument {
+                        let mut __autumn_doc = ::autumn_web::search::SearchDocument::new(
+                            #table_name,
+                            self.#pk_ident,
+                        );
+                        #(
+                            __autumn_doc = __autumn_doc.with_field(
+                                #field_names,
+                                #field_weights,
+                                ::autumn_web::search::SearchTextValue::search_text_value(
+                                    &self.#field_idents,
+                                ),
+                            );
+                        )*
+                        #embed_extract
+                        #tenant_extract
+                        __autumn_doc
+                    }
+                }
+            }
+        }
+        _ => quote! {},
+    };
+
     // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
@@ -3635,6 +5985,43 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error(),
         }
     }
+
+    // Collect `#[translatable]` columns (issue #1384, validated to be
+    // non-null `Translated`). Each entry is the field ident; the column name is
+    // the Rust field name, which is also the key the field-name-driven
+    // `available_locales` / `is_translated` accessors match on.
+    let mut translatable_columns: Vec<&syn::Ident> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_translatable_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_translatable(f)
+            && let Some(ident) = f.ident.as_ref()
+        {
+            translatable_columns.push(ident);
+        }
+    }
+    // `unraw()` for the same reason as in `emit_translatable_items`: the column
+    // registered here must be the real DB column name.
+    let translatable_column_names: Vec<String> = translatable_columns
+        .iter()
+        .map(|i| unraw_ident(i))
+        .collect();
+    let translatable_inventory: Vec<TokenStream> = translatable_column_names
+        .iter()
+        .map(|col| {
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::i18n::TranslatableColumnDescriptor {
+                        model: stringify!(#name),
+                        table: #table_name,
+                        column: #col,
+                    }
+                }
+            }
+        })
+        .collect();
+    let translatable_items = emit_translatable_items(name, &translatable_columns);
 
     // Collect `#[normalize]` columns (validated to be non-null `String`).
     // Each entry: (field ident, lookup key, normalizer chain).
@@ -5362,9 +7749,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
                 &[#(#encrypted_column_names),*];
+
+            /// Column names on this model declared `#[translatable]` (#1384).
+            ///
+            /// Emitted for every model (empty when none are translatable) so
+            /// that surfaces without a compile-time view of the model can ask
+            /// which columns hold a per-locale container.
+            #[doc(hidden)]
+            pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
+                &[#(#translatable_column_names),*];
         }
 
         #(#encrypted_inventory)*
+
+        #translatable_items
+        #(#translatable_inventory)*
 
         impl #update_name {
             #[doc(hidden)]
@@ -5797,6 +8196,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ];
         }
 
+        // ── Pluggable search index definition + document (#1191) ────────────
+        #search_indexed_impl
+
         // ── State machine impls (one per #[state_machine] field) ────────────
         #(#state_machine_impls)*
 
@@ -5806,6 +8208,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── Model-declared dependent cascade specs (#1738) ──────────────────
         #dependents_impl
+
+        // ── Model-declared counter-cache specs (#1325) ──────────────────────
+        #counter_caches_impl
+
+        // ── Votable reactions (#[votable], #1362) ───────────────────────────
+        #votable_items
+
+        // ── Polymorphic comments (#[commentable], #1367) ────────────────────
+        #commentable_items
     }
 }
 
@@ -6125,6 +8536,163 @@ mod tests {
     // `#[has_many]` / `#[has_one]`, validates the action, and records it on the
     // association so `#[model]` can emit the runtime `AutumnDependents` dispatch.
     // An unknown action is still rejected; `#[belongs_to]` still errors.
+
+    // ── `counter_cache` on `#[belongs_to]` (#1325) ────────────────────────
+    //
+    // The attribute parses as a bare flag and as an explicit column, resolves
+    // the column by the `{snake(child)}_count` convention, and rejects the
+    // shapes that would silently produce wrong SQL: a counter on the parent's
+    // `has_many` (nothing there owns the foreign key), a counter over a
+    // `through =` join table (the foreign key is a join-table column), a
+    // non-identifier column name (it is spliced into `format!`ed SQL), and two
+    // legs resolving onto one parent column (both would move it).
+
+    /// `resolve_associations`' `Ok` type is not `Debug`, so unwrap the error by
+    /// matching rather than through `expect_err`.
+    fn expect_assoc_error(model: &syn::Ident, attrs: &[syn::Attribute]) -> String {
+        match resolve_associations(model, attrs) {
+            Ok(_) => panic!("expected the association to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn counter_cache_bare_flag_derives_the_column_from_the_child() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert!(assocs[0].counter_cache.is_some());
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("comment_count"),
+            "the default column is singular: {{snake(child)}}_count"
+        );
+    }
+
+    #[test]
+    fn counter_cache_accepts_an_explicit_column() {
+        let model: syn::Ident = syn::parse_quote!(Subscription);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Subreddit, counter_cache = "subscriber_count")])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            counter_cache_column(&model, &assocs[0]).as_deref(),
+            Some("subscriber_count")
+        );
+    }
+
+    #[test]
+    fn a_belongs_to_without_counter_cache_records_none() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[belongs_to(Post)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(assocs[0].counter_cache.is_none());
+        assert_eq!(counter_cache_column(&model, &assocs[0]), None);
+    }
+
+    #[test]
+    fn counter_cache_tenant_is_explicit_and_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .and_then(|d| d.tenant_column.clone())
+                .as_deref(),
+            Some("tenant_id")
+        );
+    }
+
+    #[test]
+    fn counter_cache_defaults_to_no_tenant_predicate() {
+        // Not inferred from the child's fields: the parent's schema is invisible
+        // here, and guessing would break a tenant-scoped child hanging off a
+        // global parent with a hard `column does not exist`.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert!(
+            assocs[0]
+                .counter_cache
+                .as_ref()
+                .expect("counter cache")
+                .tenant_column
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn counter_cache_tenant_without_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache_tenant = "tenant_id")])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("requires `counter_cache`"), "{message}");
+    }
+
+    #[test]
+    fn counter_cache_on_has_many_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, counter_cache)])];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(
+            message.contains("`#[belongs_to]` option")
+                && message.contains("Move it to the child model's"),
+            "the error must name the leg to move it to: {message}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_on_a_join_table_association_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Tag, through = post_tags, counter_cache)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn a_non_identifier_counter_cache_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, counter_cache = "comment_count; DROP TABLE posts")]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_one_parent_column_collide() {
+        // Both legs point at `User` and both default to `message_count`, so
+        // every insert would count twice.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(User, fk = recipient_id, name = recipient, counter_cache)]),
+        ];
+        let message = expect_assoc_error(&model, &attrs);
+        assert!(message.contains("users.message_count"), "{message}");
+    }
+
+    #[test]
+    fn two_legs_onto_different_parent_tables_may_share_a_column_name() {
+        // `users.message_count` and `rooms.message_count` are different columns
+        // on different tables — not a collision.
+        let model: syn::Ident = syn::parse_quote!(Message);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = sender_id, name = sender, counter_cache)]),
+            syn::parse_quote!(#[belongs_to(Room, fk = room_id, counter_cache)]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+    }
 
     #[test]
     fn has_many_dependent_destroy_is_recorded() {
@@ -6654,6 +9222,1213 @@ mod tests {
         );
     }
 
+    // ── Votable (#1362) parsing ───────────────────────────────────────────
+    //
+    // `#[votable(by = <Reactor>, ...)]` declares a reaction edge table plus an
+    // aggregate column maintained on the model. Every key except `by` is
+    // optional and inferred from conventions, so the defaults are the part
+    // most worth pinning down: they are what makes the attribute a one-liner
+    // on a conventionally-named schema.
+
+    #[test]
+    fn votable_defaults_map_onto_conventional_columns() {
+        // The canonical declaration on a conventionally-named schema: every
+        // column name is inferred, and the inference must land exactly on
+        // `votes(user_id, post_id, value)` + `posts.score`.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "User");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+        assert_eq!(spec.value_column.as_deref(), Some("value"));
+        assert_eq!(spec.column, "score");
+    }
+
+    #[test]
+    fn votable_defaults_to_sum_when_aggregate_is_omitted() {
+        // The attribute is *votable* — a vote is signed, so `sum` is the
+        // default and `count` is the opt-in.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let bare: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User)])];
+        let explicit: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum)])];
+        let bare = resolve_votable(&model, &bare)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        let explicit = resolve_votable(&model, &explicit)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(bare.aggregate, VoteAggregate::Sum);
+        assert_eq!(bare.aggregate, explicit.aggregate);
+        assert_eq!(bare.table, explicit.table);
+        assert_eq!(bare.column, explicit.column);
+        assert_eq!(bare.value_column, explicit.value_column);
+    }
+
+    #[test]
+    fn votable_count_mode_infers_name_count_column() {
+        // `aggregate = count` is unary membership: the aggregate column is
+        // `{name}_count` and the edge table has no value column at all (its
+        // rows are pure membership, like an m2m join row).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.aggregate, VoteAggregate::Count);
+        assert_eq!(spec.name, "vote");
+        assert_eq!(spec.table, "votes");
+        assert_eq!(spec.column, "vote_count");
+        assert_eq!(
+            spec.value_column, None,
+            "a count-mode edge table stores no value column"
+        );
+    }
+
+    #[test]
+    fn votable_name_override_drives_table_and_column() {
+        // `name` is the single knob a likes feature needs: it drives both the
+        // pluralized table name and the `{name}_count` aggregate column, so
+        // `name = like` yields `likes` / `like_count` with no other overrides.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)])];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.name, "like");
+        assert_eq!(spec.table, "likes");
+        assert_eq!(spec.column, "like_count");
+        assert_eq!(spec.reactor_fk, "user_id");
+        assert_eq!(spec.target_fk, "post_id");
+    }
+
+    #[test]
+    fn votable_explicit_overrides_win() {
+        // Every inferred name has an override for schemas that do not follow
+        // the convention; none of the defaults may leak through.
+        let model: syn::Ident = syn::parse_quote!(Article);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = Member, aggregate = sum, name = rating, table = ratings,
+                      reactor_fk = member_id, target_fk = piece_id,
+                      value_column = weight, column = rating_total)]
+        )];
+        let spec = resolve_votable(&model, &attrs)
+            .expect("parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(spec.reactor.to_string(), "Member");
+        assert_eq!(spec.aggregate, VoteAggregate::Sum);
+        assert_eq!(spec.name, "rating");
+        assert_eq!(spec.table, "ratings");
+        assert_eq!(spec.reactor_fk, "member_id");
+        assert_eq!(spec.target_fk, "piece_id");
+        assert_eq!(spec.value_column.as_deref(), Some("weight"));
+        assert_eq!(spec.column, "rating_total");
+    }
+
+    #[test]
+    fn votable_accepts_string_literal_values() {
+        // Like the association attributes, each value may be spelled as a bare
+        // ident or as a string literal — the two must resolve identically.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let idents: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = vote, table = votes, reactor_fk = user_id,
+                      target_fk = post_id, value_column = value, column = score)]
+        )];
+        let literals: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, name = "vote", table = "votes", reactor_fk = "user_id",
+                      target_fk = "post_id", value_column = "value", column = "score")]
+        )];
+        let idents = resolve_votable(&model, &idents)
+            .expect("bare idents parse ok")
+            .expect("a #[votable] spec");
+        let literals = resolve_votable(&model, &literals)
+            .expect("string literals parse ok")
+            .expect("a #[votable] spec");
+        assert_eq!(idents.name, literals.name);
+        assert_eq!(idents.table, literals.table);
+        assert_eq!(idents.reactor_fk, literals.reactor_fk);
+        assert_eq!(idents.target_fk, literals.target_fk);
+        assert_eq!(idents.value_column, literals.value_column);
+        assert_eq!(idents.column, literals.column);
+    }
+
+    #[test]
+    fn votable_requires_by() {
+        // There is no positional head: the reactor model is always named, so a
+        // `#[votable]` with no `by =` must say exactly what to add.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(aggregate = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires `by = <ReactorModel>`"),
+            "expected the missing-`by` error to name the key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_key() {
+        // A typo'd key must enumerate the accepted vocabulary rather than
+        // being silently ignored.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregat = sum)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        for key in [
+            "by",
+            "aggregate",
+            "name",
+            "table",
+            "reactor_fk",
+            "target_fk",
+            "value_column",
+            "column",
+        ] {
+            assert!(
+                msg.contains(key),
+                "expected the unknown-key error to enumerate `{key}`, got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("votable"),
+            "expected the unknown-key error to name the attribute, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_unknown_aggregate() {
+        // Only the two supported modes exist; `avg`/`star` style ratings are
+        // explicitly out of scope for #1362 and must not resolve to a default.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = avg)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown aggregate `avg`"),
+            "expected the offending aggregate quoted back, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both supported modes named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_value_column_in_count_mode() {
+        // A count-mode edge table has no value column, so `value_column = ...`
+        // is a category error rather than a harmless extra key.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[votable(by = User, aggregate = count, value_column = value)]
+        )];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("value_column"),
+            "expected the offending key named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = count"),
+            "expected the conflicting mode named, got: {msg}"
+        );
+        assert!(
+            msg.contains("aggregate = sum"),
+            "expected the fix (switch to sum, or drop the key) spelled out, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_attribute() {
+        // At most one `#[votable]` per model: the emitted trait is
+        // `{Model}Reactions` with `react`/`reaction_of`, so a second
+        // declaration would generate colliding methods.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[votable(by = User, aggregate = sum)]),
+            syn::parse_quote!(#[votable(by = User, aggregate = count, name = like)]),
+        ];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most one `#[votable]` per model"),
+            "expected the one-per-model rule stated, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_composite_primary_keys() {
+        // PR #2177 review (P1): with two `#[id]` fields the pk resolution
+        // would silently take the first component — S1 could lock, and S5
+        // update, every row sharing it, and distinct targets would collapse
+        // onto one edge key. A composite-keyed model must be a directed
+        // compile error, not a wrong-row runtime hazard.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Enrollment {
+                    #[id]
+                    pub course_id: i64,
+                    #[id]
+                    pub student_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for a composite-keyed votable model, \
+             got: {generated}"
+        );
+        assert!(
+            generated.contains("requires a single `i64` primary key")
+                && generated.contains("`course_id`, `student_id`"),
+            "expected the directed composite-key message naming both key \
+             components, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_non_identifier_string_values() {
+        // Every name-shaped value is spliced into a generated ident through
+        // `format_ident!`, which *panics* on a non-identifier — an opaque
+        // "proc macro panicked" with no span. Each key must instead produce a
+        // directed error naming the offending value.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        for (key, attr) in [
+            (
+                "table",
+                syn::parse_quote!(#[votable(by = User, table = "my votes")]),
+            ),
+            (
+                "name",
+                syn::parse_quote!(#[votable(by = User, name = "my vote")]),
+            ),
+            (
+                "reactor_fk",
+                syn::parse_quote!(#[votable(by = User, reactor_fk = "user id")]),
+            ),
+            (
+                "target_fk",
+                syn::parse_quote!(#[votable(by = User, target_fk = "post-id")]),
+            ),
+            (
+                "value_column",
+                syn::parse_quote!(#[votable(by = User, value_column = "1value")]),
+            ),
+            (
+                "column",
+                syn::parse_quote!(#[votable(by = User, column = "score; DROP TABLE posts")]),
+            ),
+            ("by", syn::parse_quote!(#[votable(by = "Not A Type")])),
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![attr];
+            let Err(err) = resolve_votable(&model, &attrs) else {
+                panic!("expected `{key}` with a non-identifier value to be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("is not a valid identifier") || msg.contains("valid model type name"),
+                "expected a directed identifier error for `{key}`, got: {msg}"
+            );
+            assert!(
+                msg.contains(key),
+                "expected the error to name the offending key `{key}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_rejects_raw_identifier_values() {
+        // A raw identifier parses as an `Ident` but renders its `r#` prefix
+        // into the generated table/column/module names, silently producing a
+        // column that cannot exist. Reject it with the same directed error
+        // rather than emitting garbage.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, name = r#type)])];
+        let Err(err) = resolve_votable(&model, &attrs) else {
+            panic!("expected a raw-identifier `name` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not a valid identifier"),
+            "expected the identifier error, got: {msg}"
+        );
+        assert!(
+            msg.contains("r#"),
+            "expected the error to mention the `r#` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_rejects_duplicate_key_within_one_attribute() {
+        // A repeated key silently last-writes today, so `by = User, by = Bot`
+        // would compile against the wrong reactor. Reject it, quoting both
+        // values so the mistake is obvious.
+        let model: syn::Ident = syn::parse_quote!(Post);
+
+        let by: Vec<syn::Attribute> = vec![syn::parse_quote!(#[votable(by = User, by = Bot)])];
+        let Err(err) = resolve_votable(&model, &by) else {
+            panic!("expected a duplicate `by` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `by = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("User") && msg.contains("Bot"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+
+        let aggregate: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[votable(by = User, aggregate = sum, aggregate = count)])];
+        let Err(err) = resolve_votable(&model, &aggregate) else {
+            panic!("expected a duplicate `aggregate` to be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate `aggregate = ...`"),
+            "expected the duplicate-key error to name the key, got: {msg}"
+        );
+        assert!(
+            msg.contains("sum") && msg.contains("count"),
+            "expected both the previous and the new value quoted back, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_exist_on_model() {
+        // The hidden edge module declares the aggregate column regardless, so
+        // a missing field would otherwise only surface as a runtime `42703` on
+        // the first vote. Mirror the `shard_key` field-existence check.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "expected a compile error for the missing aggregate column, got: {generated}"
+        );
+        assert!(
+            generated.contains("votable aggregate column `score` not found on model `Post`"),
+            "expected the directed missing-column message, got: {generated}"
+        );
+        assert!(
+            generated.contains("column = "),
+            "expected the error to point at the `column = <field>` override, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_aggregate_column_must_be_i64() {
+        // The aggregate is `SUM(value)` / `COUNT(*)` — BIGINT — projected as
+        // `Int8` in the hidden module and written back as an `i64`. An `i32` or
+        // `Option<i64>` field would otherwise fail as an opaque Diesel
+        // trait-resolution wall inside the generated `react()`.
+        for (ty, rendered) in [
+            (quote! { i32 }, "i32"),
+            (quote! { Option<i64> }, "Option < i64 >"),
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains("compile_error"),
+                "expected a compile error for a `{rendered}` aggregate column, got: {generated}"
+            );
+            assert!(
+                generated
+                    .contains("votable aggregate column `score` on model `Post` must be `i64`"),
+                "expected the directed wrong-type message, got: {generated}"
+            );
+            assert!(
+                generated.contains(&format!("found `{rendered}`")),
+                "expected the offending type quoted back, got: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn votable_aggregate_accepts_equivalent_i64_spellings_via_typed_guard() {
+        // PR #2177 review: the macro-level check must only reject spellings
+        // that are *definitely* wrong. `std::primitive::i64` (or an alias) IS
+        // `i64`; token-text equality would reject it. Such spellings pass the
+        // macro and are enforced by the emitted `const` guard instead — which
+        // must also be present in the plain-`i64` case as the backstop for
+        // wrong aliases.
+        for ty in [quote! { std::primitive::i64 }, quote! { i64 }] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    #[votable(by = User, aggregate = sum)]
+                    pub struct Post {
+                        #[id]
+                        pub id: i64,
+                        pub score: #ty,
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                !generated.contains("compile_error"),
+                "an i64-equivalent spelling must not be rejected, got: {generated}"
+            );
+            assert!(
+                generated.contains("__autumn_votable_model . score"),
+                "expected the aggregate-field type guard to be emitted, got: {generated}"
+            );
+        }
+    }
+
+    // ── Votable (#1362) codegen shape ─────────────────────────────────────
+    //
+    // These assert on the *shape* of the emitted token stream (substrings of
+    // `TokenStream::to_string()`, which space-separates tokens). Behaviour is
+    // covered by the Docker-gated integration tests; what matters here is that
+    // the race-safety primitives (immediate transaction, pg-only `FOR UPDATE`,
+    // explicit `ON CONFLICT` arbiter) are actually present in the codegen.
+
+    #[test]
+    fn votable_emits_hidden_edge_table_module() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("mod __autumn_votable_4_post_vote"),
+            "expected a length-prefixed hidden edge-table module, got: {generated}"
+        );
+        assert!(
+            generated.contains("votes (user_id , post_id)"),
+            "expected the edge table keyed on the composite (reactor, target) \
+             pair — the load-bearing ON CONFLICT arbiter, got: {generated}"
+        );
+        assert!(
+            generated.contains("user_id -> Int8") && generated.contains("post_id -> Int8"),
+            "expected non-nullable Int8 fk columns (a NULL target would defeat \
+             the unique arbiter), got: {generated}"
+        );
+        assert!(
+            generated.contains("value -> Int2"),
+            "expected the sum-mode value column typed SMALLINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_target_projection_in_the_hidden_module() {
+        // Deliberately self-contained: the target table is projected inside the
+        // hidden module (id + aggregate [+ deleted_at]) rather than referencing
+        // the app's `crate::schema::*`, so the codegen cannot pick up a
+        // conflicting column type and needs no schema module in scope.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("posts (id)"),
+            "expected a minimal target-table projection, got: {generated}"
+        );
+        assert!(
+            generated.contains("score -> Int8"),
+            "expected the aggregate column projected as BIGINT, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_target_projection_keys_on_the_models_real_primary_key() {
+        // PR #2177 review (P1): a model whose `#[id]` field is not named `id`
+        // (e.g. `memo_id`) has no `id` column at all — or worse, an unrelated
+        // one. The hidden projection, the S1 lock, and the S5 aggregate UPDATE
+        // must all key on the resolved primary-key column, never a hard-coded
+        // `id`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Memo {
+                    #[id]
+                    pub memo_id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("memos (memo_id)"),
+            "expected the target projection keyed on the model's real primary \
+             key, got: {generated}"
+        );
+        assert!(
+            !generated.contains("memos (id)"),
+            "no hard-coded `id` primary key may survive on the target \
+             projection, got: {generated}"
+        );
+        assert!(
+            generated
+                .matches("memos :: memo_id . eq (target_id)")
+                .count()
+                >= 3,
+            "S1 (both backend arms) and S5 must filter the target table on the \
+             resolved primary key, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_reactions_trait_and_blanket_impl() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions"),
+            "expected a per-model reactions trait, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn react"),
+            "expected the react() helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("fn reaction_of"),
+            "expected the reaction_of() accessor, got: {generated}"
+        );
+        assert!(
+            generated.contains("M2mConnSource < Model = Post >"),
+            "expected the trait blanket-implemented over the repository's \
+             connection source, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_runs_in_an_immediate_transaction() {
+        // The edge mutation and the aggregate recompute must commit together,
+        // and the SQLite arm needs `BEGIN IMMEDIATE` (single writer) rather
+        // than a deferred snapshot that upgrades mid-transaction.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("scoped_immediate_transaction"),
+            "expected react() to wrap its statements in the write-path \
+             transaction primitive, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_locks_the_target_row_on_pg_only() {
+        // A locking clause is a parse error on SQLite, so the row lock lives in
+        // the `pg` arm of `backend_select!` (the unselected arm is never
+        // type-checked); SQLite gets its mutual exclusion from BEGIN IMMEDIATE.
+        //
+        // `FOR NO KEY UPDATE`, not `FOR UPDATE`: react() only writes a
+        // non-key column, and the weaker mode still self-conflicts (reactions
+        // on one target stay serialized) without conflicting with the
+        // `FOR KEY SHARE` locks Postgres takes for foreign-key checks — so a
+        // concurrent `INSERT INTO comments (post_id) …` does not queue behind a
+        // vote.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("backend_select"),
+            "expected the per-backend split, got: {generated}"
+        );
+        // The lock must be part of the S1 locking SELECT itself (same statement
+        // as the existence/soft-delete guard), not merely present somewhere.
+        assert!(
+            generated.contains(
+                "pg => { __autumn_votable_4_post_vote :: posts :: table . filter \
+                 (__autumn_votable_4_post_vote :: posts :: id . eq (target_id)) . select \
+                 (__autumn_votable_4_post_vote :: posts :: id) . for_no_key_update ()"
+            ),
+            "expected FOR NO KEY UPDATE chained onto the pg arm's S1 target \
+             select, got: {generated}"
+        );
+        // …and it must live *only* there: the sqlite arm cannot even parse it.
+        let s1 = generated
+            .split_once("let __target")
+            .expect("the S1 locking select")
+            .1;
+        let pg_arm = s1
+            .split_once("sqlite =>")
+            .expect("the backend_select! sqlite arm")
+            .0;
+        assert!(
+            pg_arm.contains(". for_no_key_update ()"),
+            "expected the row lock inside the pg arm, got: {pg_arm}"
+        );
+        assert_eq!(
+            generated.matches("for_no_key_update").count(),
+            1,
+            "expected exactly one locking clause (pg arm only), got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_upserts_with_an_explicit_arbiter() {
+        // An `ON CONFLICT DO UPDATE` with no arbiter is a syntax error, and the
+        // wrong column list raises 42P10 on a table carrying more than one
+        // unique constraint (reddit-clone's `votes` has two).
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        // The full arbiter column list, not just "an on_conflict somewhere": a
+        // regression to a single-column arbiter (`(user_id)`) is exactly the
+        // 42P10 this pins, and would still satisfy a bare `contains`.
+        assert!(
+            generated.contains(
+                "on_conflict ((__autumn_votable_4_post_vote :: votes :: user_id , \
+                 __autumn_votable_4_post_vote :: votes :: post_id ,))"
+            ),
+            "expected the composite (reactor_fk, target_fk) ON CONFLICT \
+             arbiter, got: {generated}"
+        );
+        assert!(
+            generated.contains("do_update"),
+            "expected ON CONFLICT DO UPDATE (not DO NOTHING), got: {generated}"
+        );
+        assert!(
+            generated.contains("excluded"),
+            "expected the conflicting row to take EXCLUDED.value, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_count_mode_react_has_no_value_parameter() {
+        // A count reaction is unary membership, so `react()` drops the `value`
+        // argument entirely rather than taking an ignored one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = count)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub vote_count: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("trait PostReactions") && generated.contains("fn react"),
+            "expected the reactions trait in count mode too, got: {generated}"
+        );
+        assert!(
+            !generated.contains("value : i16"),
+            "count-mode react() must not take a value parameter, got: {generated}"
+        );
+        assert!(
+            !generated.contains("-> Int2"),
+            "a count-mode edge table has no value column, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_soft_delete_target_gates_the_lock_and_the_update() {
+        // AC6: when the model has a `deleted_at` field, both the locking SELECT
+        // and the aggregate UPDATE carry `deleted_at IS NULL`, so a
+        // soft-deleted target is NotFound and its aggregate is untouched. A
+        // model without the field pays nothing.
+        let soft = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        let hard = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        // Three sites, all load-bearing: the pg arm's locking S1 select, the
+        // sqlite arm's S1 select, and the S5 aggregate UPDATE. Dropping any one
+        // of them lets a soft-deleted target be reacted on (or its aggregate
+        // rewritten), so count them rather than accepting a single hit.
+        assert!(
+            soft.matches("deleted_at . is_null ()").count() >= 3,
+            "expected the soft-delete guard on both S1 arms and the S5 update \
+             (>= 3 sites), got {}: {soft}",
+            soft.matches("deleted_at . is_null ()").count()
+        );
+        assert!(
+            soft.contains("deleted_at -> Nullable < Timestamp >"),
+            "expected deleted_at projected into the hidden target table, got: {soft}"
+        );
+        assert!(
+            !hard.contains("is_null"),
+            "a model without deleted_at must not emit a soft-delete guard, got: {hard}"
+        );
+    }
+
+    /// The hidden `__autumn_votable_*` module and everything the `#[votable]`
+    /// declaration emits after it. Scoping the tenant assertions to this slice
+    /// keeps them from matching the *rest* of `#[model]`'s codegen, which
+    /// legitimately mentions `tenant_id` for a model that has the column
+    /// (`HasTenantIdColumn`, the insertable selector, …).
+    fn votable_slice(generated: &str) -> &str {
+        let start = generated
+            .find("mod __autumn_votable_")
+            .expect("the votable codegen starts at its hidden module");
+        &generated[start..]
+    }
+
+    #[test]
+    fn votable_tenant_scoped_target_is_filtered_in_s1_s5_and_reaction_of() {
+        // PR #2177 review (P1): through a `#[repository(..., tenant_scoped)]`
+        // repository, filtering the target by primary key alone lets a caller
+        // react to ANOTHER tenant's row — an edge insert plus an aggregate
+        // UPDATE across the tenant boundary. When the model carries a
+        // `tenant_id` column the codegen must project it and emit a
+        // tenant-filtered arm everywhere the target is touched.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            votable.contains("tenant_id -> Text"),
+            "expected tenant_id projected into the hidden target table, got: {votable}"
+        );
+        assert!(
+            votable.contains("self . __autumn_m2m_tenant_scope ()"),
+            "expected the tenant predicate resolved through the repository's \
+             M2mConnSource, not read from the task-local directly, got: {votable}"
+        );
+
+        // Exactly four tenant-filtered sites, each load-bearing and each the
+        // *scoped* half of a two-arm match (the other arm is today's unfiltered
+        // query, taken for a non-tenant_scoped repository or `across_tenants()`):
+        //
+        //   1. S1, `pg` arm     — the locking existence guard,
+        //   2. S1, `sqlite` arm — the same guard without the row lock,
+        //   3. S5              — the aggregate UPDATE,
+        //   4. `reaction_of`   — the tenant EXISTS folded into the edge lookup.
+        //
+        // The arms stay separate whole queries rather than one boxed query
+        // with a conditional predicate, because S1's `pg` arm carries
+        // `.for_no_key_update()`. Pinned exactly: a fifth would mean a
+        // duplicated statement, a fourth-minus-one that some path lost its
+        // filter and can write across the tenant boundary again.
+        assert_eq!(
+            votable.matches("tenant_id . eq").count(),
+            4,
+            "expected exactly 4 tenant-filtered target sites (S1 pg, S1 sqlite, \
+             S5, reaction_of's EXISTS), got: {votable}"
+        );
+        // reaction_of's tenant boundary must be a single-snapshot predicate —
+        // an EXISTS on the target inside the edge lookup itself — never a
+        // separate probe statement, which under READ COMMITTED is a TOCTOU
+        // window: a concurrent tenant reassignment lands between probe and
+        // lookup and the foreign edge leaks anyway (PR #2177 review).
+        assert!(
+            votable.contains(":: dsl :: exists"),
+            "reaction_of's tenant check must be an EXISTS folded into the edge \
+             lookup, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__in_tenant"),
+            "the two-statement tenant probe must not survive, got: {votable}"
+        );
+        assert!(
+            votable.contains("for_no_key_update"),
+            "the tenant-filtered pg arm must keep the row lock, got: {votable}"
+        );
+        // Both halves of each match survive: the unfiltered arm is what a
+        // non-tenant_scoped repository (and `across_tenants()`) still takes.
+        // Both halves of every match survive. The unfiltered arm is what a
+        // non-`tenant_scoped` repository — and `across_tenants()` — still
+        // takes, so the target lookup appears twice at each of S1's two
+        // backend arms and at S5, plus once in `reaction_of`'s probe: 3 * 2 + 1.
+        assert_eq!(
+            votable.matches("posts :: id . eq (target_id)").count(),
+            7,
+            "expected a tenant-filtered AND an unfiltered arm at S1 (both \
+             backends) and S5, plus reaction_of's probe, got: {votable}"
+        );
+    }
+
+    #[test]
+    fn votable_model_without_tenant_id_emits_no_tenant_scoping() {
+        // AC: zero query cost. A model with no `tenant_id` column can have no
+        // meaningful `tenant_scoped` repository (its own derived queries would
+        // not compile), so the reaction queries must carry no tenant
+        // projection, predicate, or runtime branch. The ONE tenant token that
+        // must still appear is the discarded `__autumn_m2m_tenant_scope()?`
+        // call in each method: it carries the cross-shard reject (PR #2177 —
+        // across_tenants() on a sharded repository has no single right shard
+        // for a reaction), and on a plain repository it is a constant
+        // `Ok(None)`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        let votable = votable_slice(&generated);
+
+        assert!(
+            !votable.contains("tenant_id"),
+            "a model without tenant_id must emit no tenant column, predicate, \
+             or projection anywhere in the votable items, got: {votable}"
+        );
+        assert_eq!(
+            votable
+                .matches("self . __autumn_m2m_tenant_scope ()")
+                .count(),
+            2,
+            "react() and reaction_of() must each still call the tenant-scope \
+             method (discarded) so the cross-shard reject fires before any \
+             connection is acquired, got: {votable}"
+        );
+        assert!(
+            !votable.contains("__tenant"),
+            "no tenant runtime branch may survive on a tenant-less model, \
+             got: {votable}"
+        );
+    }
+
+    #[test]
+    fn votable_emits_i64_primary_key_and_reactor_type_guards() {
+        // Two compile-time guards the rest of the codegen silently assumes:
+        //
+        // * the whole reaction surface is typed on `i64` ids (both edge fks are
+        //   `Int8`, `react(reactor_id: i64, target_id: i64)` binds them
+        //   directly), so a UUID- or i32-keyed model must fail *at the model*;
+        // * `by = <Reactor>` is otherwise never mentioned in the emitted code —
+        //   the edge stores a bare `i64` — so a typo'd model name would compile
+        //   silently unless its name resolution is forced.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("const _ : fn (& Post) -> i64"),
+            "expected the i64-primary-key guard, got: {generated}"
+        );
+        assert!(
+            generated.contains("PhantomData < User >"),
+            "expected the reactor-type name-resolution guard, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_returns_a_reaction_via_the_hidden_constructor() {
+        // `Reaction` is `#[non_exhaustive]`, so the generated code — which
+        // expands in the *application's* crate — cannot write a struct literal.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("repository :: Reaction :: __new"),
+            "expected the Reaction to be built through its hidden constructor, \
+             got: {generated}"
+        );
+        assert!(
+            !generated.contains("Reaction { value"),
+            "a struct literal would not compile downstream of #[non_exhaustive], \
+             got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_fails_loudly_when_the_aggregate_update_hits_no_row() {
+        // Defense in depth (S5): unreachable while S1's lock holds, but if the
+        // lock strength ever regresses, committing an edge whose aggregate was
+        // silently dropped is the one failure mode that leaves the two out of
+        // sync forever.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let __persisted : usize"),
+            "expected the S5 update's affected-row count to be captured, got: {generated}"
+        );
+        assert!(
+            generated.contains("if __persisted == 0"),
+            "expected a zero-row S5 update to abort the transaction, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_reaction_of_reads_on_a_read_connection() {
+        // `reaction_of` is a read: it routes per the repository's ReadRoute
+        // (replica-eligible) and must NOT mark the read-your-writes pin, which
+        // acquiring the write connection would do. `react` keeps the write one.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("self . __autumn_m2m_read_conn ()"),
+            "expected reaction_of to take a read connection, got: {generated}"
+        );
+        assert_eq!(
+            generated.matches("__autumn_m2m_write_conn").count(),
+            1,
+            "expected exactly one write-connection acquisition (react's), got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_react_doc_warns_that_a_toggle_is_not_idempotent() {
+        // A toggle is not idempotent, and the dangerous corollary is that a
+        // blind retry of a timed-out call can invert the outcome. The generated
+        // rustdoc must say so rather than claiming idempotence.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Idempotent"),
+            "react() is a toggle — the docs must not claim idempotence, got: {generated}"
+        );
+        assert!(
+            generated.contains("Not idempotent"),
+            "expected the toggle caveat in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("idempotency key"),
+            "expected the retry-safety guidance in react()'s docs, got: {generated}"
+        );
+        assert!(
+            generated.contains("does not pin read-your-writes") || generated.contains("read route"),
+            "expected reaction_of's read-routing note, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[votable]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `votable` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [votable"),
+            "the votable attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_without_votable_emits_no_reaction_items() {
+        // The reaction surface is opt-in: a model that never declares
+        // `#[votable]` must not gain a trait, a hidden module, or dead code.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("Reactions"),
+            "expected no reactions trait without #[votable], got: {generated}"
+        );
+        assert!(
+            !generated.contains("__autumn_votable"),
+            "expected no hidden edge module without #[votable], got: {generated}"
+        );
+    }
+
     #[test]
     fn lock_version_attr_detected_by_has_attr() {
         let field: syn::Field = syn::parse_quote! {
@@ -6692,6 +10467,101 @@ mod tests {
     }
 
     #[test]
+    fn position_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        assert!(has_attr(&field, "position"));
+    }
+
+    #[test]
+    fn position_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position]
+            pub rank: i64
+        };
+        // A #[position] field must be absent from NewModel/UpdateModel — the
+        // generated repository assigns and maintains it entirely (#1358).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn position_bare_attribute_with_args_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[position(scope = "board_id")]
+            pub rank: i64
+        };
+        let err = validate_field_schema_markers(&field).unwrap_err();
+        assert!(
+            err.to_string().contains("position"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn position_attribute_is_stripped_from_the_diesel_struct() {
+        // `#[position]` is consumed by `#[model]`; re-emitting it onto the
+        // generated Diesel struct would fail with "cannot find attribute
+        // `position` in this scope".
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("# [position]"),
+            "the position attribute must not leak onto the emitted struct, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn position_field_excluded_from_new_and_update_structs() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Task {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[position]
+                    pub rank: i64,
+                }
+            },
+        )
+        .to_string();
+
+        let new_struct = generated
+            .split("struct NewTask")
+            .nth(1)
+            .expect("NewTask struct should be emitted");
+        let new_struct_body = &new_struct[..new_struct.find('}').unwrap_or(new_struct.len())];
+        assert!(
+            !new_struct_body.contains("rank"),
+            "NewTask must not contain the server-managed position field, got: {new_struct_body}"
+        );
+
+        let update_struct = generated
+            .split("struct UpdateTask")
+            .nth(1)
+            .expect("UpdateTask struct should be emitted");
+        let update_struct_body =
+            &update_struct[..update_struct.find('}').unwrap_or(update_struct.len())];
+        assert!(
+            !update_struct_body.contains("rank"),
+            "UpdateTask must not contain the server-managed position field, got: {update_struct_body}"
+        );
+    }
+
+    #[test]
     fn encrypted_string_field_is_accepted() {
         let field: syn::Field = syn::parse_quote! {
             #[encrypted]
@@ -6711,6 +10581,424 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    // ── #1384: `#[translatable]` field attribute ────────────────────────────
+
+    /// #1384 (Codex round 5): the locale-map schema is keyed on the
+    /// `#[translatable]` MARKER, not on the type's leaf name. An application
+    /// type that merely happens to be called `Translated` must keep its
+    /// ordinary `$ref`, or the advertised `OpenAPI` contract would silently
+    /// disagree with what that type actually serializes to.
+    #[test]
+    fn translatable_schema_is_keyed_on_the_attribute_not_the_type_name() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    // A user's OWN type with the same leaf name, unmarked.
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+
+        // The marked field is described inline as a locale-tag -> string map,
+        // so `autumn openapi` emits no reference to a component nothing
+        // registers.
+        assert!(
+            generated.contains("additionalProperties"),
+            "translatable field should carry an inline map schema"
+        );
+        // The unmarked look-alike still gets the ordinary `$ref` branch.
+        assert!(
+            generated.contains("components/schemas"),
+            "an unmarked `Translated` look-alike must keep its $ref"
+        );
+    }
+
+    /// A model with NO translatable field emits no inline map schema at all.
+    #[test]
+    fn an_unmarked_translated_lookalike_alone_emits_no_map_schema() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub note: domain::Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("additionalProperties"),
+            "no `#[translatable]` field means no locale-map schema"
+        );
+    }
+
+    #[test]
+    fn translatable_field_is_accepted_on_a_translated_column() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Translated
+        };
+        assert!(validate_translatable_field(&field).is_ok());
+        let qualified: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: ::autumn_web::i18n::Translated
+        };
+        assert!(validate_translatable_field(&qualified).is_ok());
+    }
+
+    #[test]
+    fn translatable_on_a_plain_string_is_rejected_with_the_fix() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: String
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Translated"), "{msg}");
+    }
+
+    #[test]
+    fn translatable_option_is_rejected() {
+        // The container itself models "no translation" (an empty map), so a
+        // nullable column would give two ways to say the same thing.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            pub title: Option<Translated>
+        };
+        assert!(validate_translatable_field(&field).is_err());
+    }
+
+    #[test]
+    fn translatable_plus_encrypted_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[encrypted]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_searchable_is_rejected() {
+        // The stored column is a JSON container; a tsvector built from it
+        // would index JSON punctuation and locale tags, not the prose.
+        let field: syn::Field = syn::parse_quote! {
+            #[translatable]
+            #[searchable]
+            pub title: Translated
+        };
+        let err = validate_translatable_field(&field).unwrap_err();
+        assert!(err.to_string().contains("searchable"), "{err}");
+    }
+
+    #[test]
+    fn translatable_plus_equality_markers_are_rejected() {
+        for marker in [
+            "unique",
+            "indexed",
+            "normalize",
+            "id",
+            "lock_version",
+            "position",
+        ] {
+            let marker_ident = syn::Ident::new(marker, proc_macro2::Span::call_site());
+            let field: syn::Field = syn::parse_quote! {
+                #[translatable]
+                #[#marker_ident]
+                pub title: Translated
+            };
+            assert!(
+                validate_translatable_field(&field).is_err(),
+                "`#[{marker}]` must not combine with `#[translatable]`"
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_model_emits_accessors_and_registry() {
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: ::autumn_web::i18n::Translated,
+                    pub body: String,
+                }
+            },
+        )
+        .to_string();
+
+        // The attribute is stripped from the emitted struct (rustc has no
+        // `#[translatable]` attribute of its own).
+        let query_struct = generated
+            .split("pub struct Post")
+            .nth(1)
+            .expect("Post struct emitted");
+        let body = &query_struct[..query_struct.find('}').unwrap_or(query_struct.len())];
+        assert!(
+            !body.contains("translatable"),
+            "attr must be stripped: {body}"
+        );
+
+        // Per-field accessors (AC2 / AC5).
+        for expected in [
+            "fn title_localized",
+            "fn title_in",
+            "fn set_title",
+            "fn title_locales",
+            "fn title_is_translated",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Model-level, field-name-keyed surface (AC5 wording).
+        for expected in [
+            "fn translatable_fields",
+            "fn available_locales",
+            "fn is_translated",
+            "fn localized",
+            "__AUTUMN_TRANSLATABLE_COLUMNS",
+        ] {
+            assert!(generated.contains(expected), "missing {expected}");
+        }
+        // Registry submission (AC5 observability from outside the model).
+        assert!(generated.contains("TranslatableColumnDescriptor"));
+    }
+
+    #[test]
+    fn model_without_translatable_fields_emits_no_translatable_accessors() {
+        // AC7: purely additive — a model that opts out is untouched apart from
+        // the always-emitted (empty) column constant.
+        let generated = model_macro(
+            quote! { table = "posts" },
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(!generated.contains("TranslatableColumnDescriptor"));
+        assert!(!generated.contains("fn translatable_fields"));
+        assert!(!generated.contains("fn available_locales"));
+        assert!(generated.contains("__AUTUMN_TRANSLATABLE_COLUMNS"));
+    }
+
+    // ── #1191: `#[searchable(embed)]` parsing ───────────────────────────────
+
+    #[test]
+    fn tenant_id_detection_requires_a_string_shaped_column() {
+        assert!(is_string_or_option_string(&syn::parse_quote!(String)));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            Option<String>
+        )));
+        assert!(is_string_or_option_string(&syn::parse_quote!(
+            ::std::option::Option<::std::string::String>
+        )));
+        // An unrelated `tenant_id: i64` must NOT make the index tenant-scoped.
+        assert!(!is_string_or_option_string(&syn::parse_quote!(i64)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Option<i64>)));
+        assert!(!is_string_or_option_string(&syn::parse_quote!(Uuid)));
+    }
+
+    #[test]
+    fn a_non_string_tenant_id_column_does_not_make_the_index_tenant_scoped() {
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Reading {
+                #[id]
+                pub id: i64,
+                #[searchable]
+                pub label: String,
+                // A sensor reading's "tenant_id" that is really a device id.
+                pub tenant_id: i64,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Reading"), "{expanded}");
+        // The tenant extraction (and the tenant_scoped flag) must be absent.
+        assert!(
+            !expanded.contains("__autumn_tenant"),
+            "a non-String tenant_id must not be extracted: {expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_embed_flag_is_parsed_alongside_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "B", embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(
+            cfg.kind,
+            FieldSearchable::SearchableWithWeight(ref w) if w == "B"
+        ));
+    }
+
+    #[test]
+    fn searchable_embed_alone_defaults_the_weight() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed)]
+            pub body: String
+        };
+        let cfg = parse_field_searchable(&field).expect("parses");
+        assert!(cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::SearchableDefault));
+    }
+
+    #[test]
+    fn searchable_without_embed_leaves_the_flag_off() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(weight = "A")]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&field).expect("parses").embed);
+
+        let bare: syn::Field = syn::parse_quote! {
+            #[searchable]
+            pub title: String
+        };
+        assert!(!parse_field_searchable(&bare).expect("parses").embed);
+
+        let none: syn::Field = syn::parse_quote! {
+            pub title: String
+        };
+        let cfg = parse_field_searchable(&none).expect("parses");
+        assert!(!cfg.embed);
+        assert!(matches!(cfg.kind, FieldSearchable::NotSearchable));
+    }
+
+    #[test]
+    fn unknown_searchable_key_names_the_supported_set() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(vectorize)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("weight"), "{message}");
+        assert!(message.contains("embed"), "{message}");
+    }
+
+    #[test]
+    fn duplicate_embed_is_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[searchable(embed, embed)]
+            pub body: String
+        };
+        let err = parse_field_searchable(&field).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn two_embed_fields_are_rejected_by_the_model_macro() {
+        // A record has ONE embedding; two `embed` fields is ambiguous, so it
+        // must be a compile error rather than a silent last-wins.
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A", embed)]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("only one field may be marked"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn embed_without_a_model_level_searchable_is_rejected() {
+        // `#[searchable(embed)]` on a field of a model that is not itself
+        // `#[searchable]` would produce an index nothing ever queries.
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            expanded.contains("requires the model to be marked"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_emits_the_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            #[searchable(language = "english")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[searchable(weight = "A")]
+                pub title: String,
+                #[searchable(weight = "B", embed)]
+                pub body: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(expanded.contains("SearchIndexed for Article"), "{expanded}");
+        assert!(expanded.contains("SEARCH_EMBED_FIELD"), "{expanded}");
+    }
+
+    #[test]
+    fn non_searchable_model_emits_no_search_indexed_impl() {
+        let input: TokenStream = quote! {
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
+    }
+
+    #[test]
+    fn searchable_model_with_a_non_i64_key_emits_no_search_indexed_impl() {
+        // The plugin index keys on `i64` (as the in-core FTS already does), so
+        // a `Uuid`-keyed model keeps its #842 behaviour and simply has no
+        // pluggable index — rather than emitting an impl that cannot compile.
+        let input: TokenStream = quote! {
+            #[searchable]
+            pub struct Article {
+                #[id]
+                pub id: uuid::Uuid,
+                #[searchable]
+                pub title: String,
+            }
+        };
+        let expanded = model_macro(quote! {}, input).to_string();
+        assert!(
+            !expanded.contains("SearchIndexed for Article"),
+            "{expanded}"
+        );
     }
 
     #[test]

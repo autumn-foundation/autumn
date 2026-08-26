@@ -1,10 +1,10 @@
 # Autumn 🍂
 
-[![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
+[![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
@@ -27,13 +27,13 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
 - **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
-- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, and `autumn task`
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, `autumn console`, and `autumn task`
 
 ## Quickstart
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -55,6 +55,14 @@ autumn dev
 # cargo run
 ```
 
+Need to poke at your data? `autumn console` scaffolds and runs a pre-wired
+playground binary — same config, same database URL resolution, same pool as the
+app (see the [data playground guide](docs/guide/console.md)):
+
+```bash
+autumn console
+```
+
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
@@ -63,32 +71,32 @@ Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 Get the `autumn` CLI without compiling from source — no Rust toolchain required:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.sh | sh
 ```
 
 The installer detects your OS and architecture (macOS or Linux, x86_64 or aarch64), downloads the matching prebuilt binary, verifies its sha256 checksum, and installs it to `~/.local/bin/autumn` — printing the line to add if that directory isn't on your `PATH`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
 
 Prefer a manual download? Grab the tarball plus its `.sha256`:
 
-- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
-- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
+- Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
+- Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.7.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
 Windows ships a native `x86_64-pc-windows-msvc` build as a `.zip` (not a tarball). The POSIX `install.sh` above does not run on Windows; use the PowerShell installer instead:
 
 ```powershell
-irm https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/autumn-foundation/autumn/trunk-dev/scripts/install.ps1 | iex
 ```
 
 It downloads `autumn-x86_64-pc-windows-msvc.zip`, verifies its sha256 (`Get-FileHash`), extracts `autumn.exe` to `%LOCALAPPDATA%\autumn\bin`, and prints the line to add if that directory isn't on your `PATH`. Override the install dir with `-Dir`, or pin a version with `-Version vX.Y.Z`.
 
 Prefer a manual download? Grab the zip plus its `.sha256`:
 
-- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
-- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
+- Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
+- Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
 
 Verify with `Get-FileHash autumn-x86_64-pc-windows-msvc.zip -Algorithm SHA256` and compare against the `.sha256` file, then extract `autumn.exe` and put it on your `PATH`.
 
@@ -125,7 +133,7 @@ Autumn still distinguishes between "works on your laptop" and "safe to run in a
 multi-replica deployment":
 
 - Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, single-binary startup, and no inbound request deadline (so a debugger pause never 503s you).
-- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
+- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, an experimental zero-dependency [embedded 2-node cluster](docs/guide/clustering.md) (authenticated gossip membership plus an eventually consistent cluster-wide counter — an additional option for a shared counter without standing up Redis, not a production-safe substitute for the backends above and not a leader-election or mutual-exclusion primitive), container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
 
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
@@ -218,32 +226,48 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
 | [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
+| [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
+| [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
+| [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
 
 ## Documentation
 
+- [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [Data Playground](docs/guide/console.md) — `autumn console`, the pre-wired edit-and-run answer to `rails console`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
+- [Embedded Clustering](docs/guide/clustering.md) — zero-dependency two-node clustering: `[cluster]` config, authenticated gossip membership, the cluster-wide CRDT counter via `ClusterHandle`, and the `cluster:membership` health indicator
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Fleet Deploys](docs/guide/fleet-deploys.md) — `[deploy] hosts`: `autumn deploy up` rolls a release across several VPS hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure), plus `deploy status` drift detection, fleet maintenance, and the load-balancer contract
+- [Data-Retention Sweeps](docs/guide/retention-sweeps.md) — `retention(...)` on `#[repository(...)]`: batched, soft-delete-aware, fleet-coordinated auto-purge, plus `autumn retention --dry-run`
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Per-Tenant Memory Cells](docs/guide/tenant-cells.md) — `TenantCell` byte accounting with the `tenancy.quota_bytes` soft quota and deterministic per-tenant eviction
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
+- [OpenAPI Spec Generation](docs/guide/openapi.md) — the spec Autumn derives from your handlers, `#[api_doc(...)]`, `#[derive(OpenApiSchema)]`, Swagger UI, and the production profile gate
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
 - [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Logging & PII](docs/guide/logging-pii.md)
+- [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
+- [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code after showing you the diff; everything it cannot safely rewrite is listed with `file:line` and a guide link
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
+- [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
+- [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
+- [Threaded Comments on Anything](docs/guide/commentable.md) — `#[commentable]`, the polymorphic `(commentable_type, commentable_id)` association, `add_comment()` / `comment_thread()` / `delete_comment()`, the registry-driven comment router, and the no-JS `comment_thread` widget
 
 ## Stability
 

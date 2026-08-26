@@ -767,6 +767,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
     if ffmpeg_bin.trim().is_empty() || ffmpeg_bin.contains("${") {
         return PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
             passed: false,
             deferred: true,
             detail: format!(
@@ -783,6 +784,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
     match exec.run(&cmd) {
         Ok(out) if out.stdout.contains("ffmpeg version") => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
             passed: true,
             deferred: false,
             detail: format!("FFmpeg resolves at `{ffmpeg_bin}` and reports a version banner"),
@@ -790,6 +792,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         },
         Ok(_) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
             passed: false,
             deferred: false,
             detail: format!(
@@ -800,6 +803,7 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
         },
         Err(err) => PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
             passed: false,
             deferred: false,
             detail: format!("could not run `{ffmpeg_bin} -version` on the host: {err}"),
@@ -828,6 +832,7 @@ pub fn recordings_dir_writable(
     match exec.run(&cmd) {
         Ok(_) => PreflightCheck {
             name: CHECK_RECORDINGS_DIR_WRITABLE,
+            scope: None,
             passed: true,
             deferred: false,
             detail: format!("recordings directory `{dir}` exists and is writable"),
@@ -835,6 +840,7 @@ pub fn recordings_dir_writable(
         },
         Err(err) => PreflightCheck {
             name: CHECK_RECORDINGS_DIR_WRITABLE,
+            scope: None,
             passed: false,
             deferred: false,
             detail: format!("recordings directory `{dir}` is missing or not writable: {err}"),
@@ -1004,6 +1010,7 @@ pub fn mediamtx_ports_available(
         Err(err) => {
             return PreflightCheck {
                 name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+                scope: None,
                 passed: false,
                 deferred: false,
                 detail: format!("could not verify MediaMTX port availability (`ss` failed): {err}"),
@@ -1019,6 +1026,7 @@ pub fn mediamtx_ports_available(
     if sockets.is_empty() && !output.trim().is_empty() {
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+            scope: None,
             passed: false,
             deferred: false,
             detail: "could not verify MediaMTX port availability: `ss` output did not parse into \
@@ -1092,6 +1100,7 @@ pub fn mediamtx_ports_available(
     if !conflict_msgs.is_empty() {
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+            scope: None,
             passed: false,
             deferred: false,
             detail: conflict_msgs.join("; "),
@@ -1110,6 +1119,7 @@ pub fn mediamtx_ports_available(
     };
     PreflightCheck {
         name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        scope: None,
         passed: true,
         deferred: false,
         detail,
@@ -1160,6 +1170,7 @@ pub fn mediamtx_binary_preflight(
     match exec.run(&cmd) {
         Ok(_) => PreflightCheck {
             name: CHECK_MEDIAMTX_BINARY,
+            scope: None,
             passed: true,
             deferred: false,
             detail: format!("MediaMTX binary `{bin}` exists and is executable"),
@@ -1167,6 +1178,7 @@ pub fn mediamtx_binary_preflight(
         },
         Err(err) => PreflightCheck {
             name: CHECK_MEDIAMTX_BINARY,
+            scope: None,
             passed: false,
             deferred: false,
             detail: format!(
@@ -1222,6 +1234,7 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
     if conflicts.is_empty() {
         PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_DISTINCT,
+            scope: None,
             passed: true,
             deferred: false,
             detail: "all MediaMTX TCP listener ports are distinct".to_owned(),
@@ -1230,6 +1243,7 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
     } else {
         PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_DISTINCT,
+            scope: None,
             passed: false,
             deferred: false,
             detail: format!(

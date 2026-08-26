@@ -1,8 +1,8 @@
-# autumn-web Example Reference (published 0.5.0)
+# autumn-web Example Reference (0.7.0)
 
 Use these patterns when generating or reviewing Autumn apps. The official
 examples live under `examples/`; prefer current source when exact code matters.
-Everything here works on the published 0.5.0 crates unless marked otherwise.
+Everything here works on the published 0.7.0 crates unless marked otherwise.
 
 ## Status field with a state machine (replaces hand-rolled hook validation)
 
@@ -75,7 +75,7 @@ Published-user dependency:
 
 ```toml
 [dependencies]
-autumn-web = "0.5"
+autumn-web = "0.7"
 ```
 
 Workspace examples use `autumn-web = { path = "../../autumn" }` plus the root
@@ -189,7 +189,7 @@ async fn main() {
 Feature set:
 
 ```toml
-autumn-web = { version = "0.5", features = ["mail", "ws", "storage", "multipart", "redis"] }
+autumn-web = { version = "0.7", features = ["mail", "ws", "storage", "multipart", "redis"] }
 ```
 
 Keep Harvest out of core web examples. Use built-in jobs for app-local work and
@@ -372,8 +372,8 @@ backend = "postgres"
 Install the first-party admin UI:
 
 ```toml
-autumn-web = { version = "0.5", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.5"
+autumn-web = { version = "0.7", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.7"
 ```
 
 ```rust
@@ -390,14 +390,14 @@ async fn main() {
 ```
 
 The plugin mounts at `/admin` by default and requires the `admin` session role.
-In 0.5.0 it includes jobs, feature-flag, and experiment administration
+It includes jobs, feature-flag, and experiment administration
 surfaces.
 
 ## S3 storage plugin
 
 ```toml
-autumn-web = { version = "0.5", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.5"
+autumn-web = { version = "0.7", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.7"
 ```
 
 ```rust
@@ -462,7 +462,7 @@ read via `BlobStore::get_range` (the local backend seeks + takes off disk).
 Enable test support for integration-style app tests:
 
 ```toml
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 ```
 
 Use `TestApp`, `TestClient`, `TestResponse`, and `TestDb` from

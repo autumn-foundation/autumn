@@ -9,6 +9,7 @@ mod api_versioning_integration;
 mod api_versioning_openapi;
 mod api_versioning_unit;
 mod app_builder;
+mod app_metrics_facade;
 mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
@@ -38,6 +39,10 @@ mod chaos_session_loom;
 mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
+mod cluster_two_node;
+#[cfg(feature = "db")]
+mod commentable;
+mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
@@ -50,6 +55,12 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+// The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
+// concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
+// of the parity claim lives in the example crate's conformance suite, which
+// needs the `wasm32-wasip1` target and must never be swept in here.
+#[cfg(all(feature = "edge", feature = "cache-moka"))]
+mod edge_native;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]
@@ -60,9 +71,36 @@ mod error_reporting;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
+#[cfg(feature = "db")]
+mod export_csv_list_count_profile;
 mod extractors;
 mod factory_fake;
 mod factory_integration;
+#[cfg(feature = "reporting")]
+mod failure_capsule_capture;
+#[cfg(all(
+    feature = "reporting",
+    feature = "db",
+    feature = "test-support",
+    not(feature = "sqlite")
+))]
+mod failure_capsule_db;
+#[cfg(all(
+    feature = "reporting",
+    feature = "db",
+    feature = "test-support",
+    not(feature = "sqlite")
+))]
+mod failure_capsule_end_to_end;
+#[cfg(all(
+    feature = "reporting",
+    feature = "db",
+    feature = "test-support",
+    not(feature = "sqlite")
+))]
+mod failure_capsule_overhead;
+#[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
+mod failure_capsule_replay;
 mod fake_generators;
 mod feature_flags_integration;
 mod feed;
@@ -80,6 +118,7 @@ mod i18n_integration;
 mod idempotency_middleware;
 #[cfg(feature = "inbound-mail")]
 mod inbound_mail_integration;
+mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
@@ -115,24 +154,37 @@ mod mcp_repository;
 mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
 mod mcp_streaming;
+#[cfg(feature = "mcp")]
+mod mcp_structured_query;
 mod middleware_introspection;
 mod middleware_pipeline;
+mod middleware_stack_depth;
+mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
 #[cfg(feature = "db")]
+mod model_counter_cache;
+#[cfg(feature = "db")]
 mod model_field_attrs;
+#[cfg(feature = "db")]
+mod model_votable;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
 mod nested_form_atomic_save;
 #[cfg(feature = "maud")]
 mod nested_form_order_example;
+mod notifications;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_engine;
 #[cfg(feature = "offline-sync")]
+mod offline_sync_gc_tombstones_batching_perf;
+#[cfg(feature = "offline-sync")]
 mod offline_sync_pg;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_push_batching_perf;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
@@ -141,14 +193,19 @@ mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
 mod payload_version_integration;
+#[cfg(feature = "pdf")]
+mod pdf;
 #[cfg(feature = "db")]
 mod pg_tls;
+#[cfg(feature = "db")]
+mod position_repository_integration;
 #[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
 mod query_count_asserts;
+mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
 mod range;
@@ -165,6 +222,8 @@ mod repository_audit_actor;
 mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
+#[cfg(feature = "db")]
+mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
 #[cfg(feature = "db")]
@@ -184,11 +243,17 @@ mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
 mod request_timeout;
+#[cfg(feature = "db")]
+mod retention;
+#[cfg(all(feature = "markdown", feature = "maud"))]
+mod rich_text;
 mod route_macro;
 mod routes_macro;
 mod scheduled_coordination;
 mod schema_drift_guard;
 mod scoped_tokens;
+#[cfg(feature = "db")]
+mod search_index_definition;
 mod security;
 mod seo;
 mod server_timing;
@@ -202,6 +267,18 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_advance_to;
+mod sim_chaos_clock_skew_monotonic;
+mod sim_clock_drain;
+mod sim_delayed_enqueue;
+mod sim_deterministic_ids;
+mod sim_job_clock;
+mod sim_llm_stub;
+mod sim_monotonic_clock;
+mod sim_rate_limit_clock;
+mod sim_retry_storm;
+mod sim_strict_wall_clock;
+mod sim_test_smoke;
 #[cfg(feature = "ws")]
 mod sse_replay;
 mod static_serving;
@@ -223,6 +300,10 @@ mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_serving;
 mod transactional_test_integration;
+#[cfg(all(feature = "db", feature = "i18n"))]
+mod translatable_model;
+#[cfg(feature = "i18n")]
+mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
@@ -243,6 +324,8 @@ mod widgets_charts;
 #[cfg(feature = "maud")]
 mod widgets_infinite_feed;
 mod widgets_modal;
+#[cfg(feature = "maud")]
+mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
 mod widgets_toast;

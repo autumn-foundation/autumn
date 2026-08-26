@@ -35,6 +35,8 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default, authenticated change-password/change-email flows, and `--magic-link` passwordless login |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `policy` **(trunk-dev)** | `policy Post` | Scaffolds `<Pascal>Policy`/`<Pascal>Scope` for an EXISTING model — owner-or-admin `update`/`delete` plus an owner-scoped `list`. When no owner column (`user_id`/`author_id`/`owner_id`) is found, emits a default-deny TODO stub instead (issue #1125) |
+| `teams` **(trunk-dev)** | `teams` | Organization membership + email invitations (issue #1261): `Organization`/`Membership`/`Invitation` models + migrations, a closed `Owner`/`Admin`/`Member` role + `require_role` guard, an `InvitationMailer`, and member-management routes under `src/teams/`. Takes **no name argument** — always emits this fixed set. Composes `#[repository(tenant_scoped)]` (#695) and the session `"role"` key (#496); does not scaffold its own login/signup — see "teams" below. |
+| `webhook` **(trunk-dev)** | `webhook stripe Payments` | Signature-verified, replay-protected inbound provider webhook (issue #1366): `#[post("/webhooks/<provider>")]` handler over the shipped `SignedWebhook` extractor, event-type dispatch with `on_*` stubs, the `[[security.webhooks.endpoints]]` block in `autumn.toml` (`secret_env`, replay on — never an inline secret), and tests asserting 200/400/401/409 for valid/missing/wrong-signature/replayed deliveries. Presets: `stripe`, `github`, `slack`, `generic`; `--path`/`--secret-env` override the defaults. |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 | `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
@@ -65,12 +67,17 @@ accept aliases like `Integer` or `Boolean`.
 | `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
 | `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
-| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires the `storage` feature**. **(trunk-dev)** the scaffold auto-enables autumn-web's `storage` + `multipart` (and uuid `v4`) in the project's Cargo.toml when an Attachment field is present, so it compiles with no manual edits; on published 0.5.0 add the `storage` feature by hand. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store` (issue #1236) |
+| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires the `storage` feature**. **(trunk-dev)** the scaffold auto-enables autumn-web's `storage` + `multipart` (and uuid `v4`) in the project's Cargo.toml when an Attachment field is present, so it compiles with no manual edits; on published 0.5.0 add the `storage` feature by hand. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store`, and the show/edit views render the stored file as a signed download link (issue #1236) |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
 | `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
 | `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
 | `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
+| `slug{from:col}` **(trunk-dev)** | `TEXT NOT NULL` + implicit `:unique`'s `CREATE UNIQUE INDEX` | `String`; free `find_by_slug`; `show`/`edit`/`update`/`delete` routes and generated links key off the slug, not `id` (`GET /posts/{slug}`); blank on create auto-derives via `autumn_web::slugify(&new.<col>)` with a deterministic `-2`/`-3` collision suffix. At most one per model; not yet supported with `--live`/`--live-validation`/`--sharded`/an `Attachment` field/a `:states(...)` field. Quote the token in bash/zsh (brace expansion) |
+| `{encrypted}` / `{encrypted:deterministic}` modifier **(trunk-dev)** | `api_token:String{encrypted}` → unbounded `TEXT NOT NULL` sized for the base64 ciphertext envelope | `String` (plaintext in Rust, ciphertext at rest). Emits `#[encrypted]` / `#[encrypted(deterministic)]` on the model (issue #1340); the deterministic mode keeps `find_by`/`exists_by` lookups and a real UNIQUE index, the randomized default keeps nothing queryable. `String`/`Text` and non-null only. Randomized + `:unique`/`--unique`/`--query`/`--index` is refused at generate time pointing at `deterministic`; `--searchable`, `--default`, `--shard-key`, `:states(...)` and `slug{from:<encrypted col>}` are refused in both modes. The generated index cell shows `••••••••` (unsorted), the CSV export omits the column, and the admin redacts it. Needs key material under `[active_record_encryption]` — run `autumn credentials edit`. Quote the token in bash/zsh (brace expansion) |
+| `{translatable}` modifier **(trunk-dev)** | `title:String{translatable}` → `TEXT NOT NULL DEFAULT '{}'` holding a JSON object of locale tag → value | `autumn_web::i18n::Translated`, a per-locale container (issue #1384). Emits `#[translatable]` on the model; `Display` renders the request's **active** locale so `html! { h1 { (post.title) } }` needs no `Locale` parameter, falling back through `I18nConfig::resolved_fallback_chain` and then to a single sentinel (`None` from `resolve()`, `""` from `Display`) — never a panic or 500. Generates per-field `<f>_localized()` / `<f>_in(locale)` / `set_<f>(locale, value)` / `<f>_locales()` / `<f>_is_translated(locale)` plus field-name-keyed `available_locales("title")` / `is_translated("title", "fr")` / `Post::translatable_fields()` for a "needs translation" badge. `String`/`Text` and non-null only. **`generate scaffold` refuses it** (its single-input CRUD form would replace the whole container on save) — use `generate model`, which also enables autumn-web's non-default `i18n` feature, and write the per-locale edit view yourself. `{encrypted}`, `:unique`/`--unique`, `--index`, `--searchable`, `--shard-key`, `:states(...)`, `Option<…>` and the `{min}`/`{max}`/`{email}`/`{url}` validation fan-out are all refused. Assigning a `Translated` **replaces** every locale — use `merge_from` for a partial update. A pre-existing plain-text column upgrades in place with no data migration. Quote the token in bash/zsh (brace expansion) |
+| `lock_version` (magic column name) **(trunk-dev)** | `INTEGER`/`BIGINT NOT NULL DEFAULT 0` | Declaring a non-nullable `i32`/`i64` column literally named `lock_version` opts the model into optimistic locking (issue #1318): the model gets `#[lock_version]`, so the column is DB-managed (out of `New{Model}`, carried on `Update{Model}` as the *expected* version, conflict-checked by `#[repository]`, and JSON `PUT`/`PATCH` clients must now send it). A scaffold hides it in the edit form, turns `update` into `WHERE lock_version = $expected` + `SET lock_version = lock_version + 1`, and re-renders the form at **409** with the author's input and an inline banner when a concurrent editor got there first. On HTML scaffolds, not supported with `--live`/`--sharded`/a `slug` column/an `Attachment` field, and never as a model's only insertable column or marked `:unique` — all refused at generation time (`--api` is exempt from the variant gates: it emits no form). `--live-validation` is supported. Rename the column if you wanted a plain counter |
+| `position` / `position{scope:col}` **(trunk-dev)** | `BIGINT NOT NULL DEFAULT 0` + an auto index (composite `(scope, position)` when scoped) + insert-assign/delete-compact triggers | `i64`. Declares a user-orderable list (issue #1358, Rails' `acts_as_list`): the column is DB-managed (`#[position]`, out of `New{Model}`/`Update{Model}` entirely — it's never hand-set), new rows append to the end of their scope on insert, and deleting (or soft-deleting) a row compacts the remaining live rows so no gap is left — all via database triggers, so the invariant holds for every insert/delete path, not just the generated repository's. `#[repository]` gains transaction-safe `move_to(id, n)` / `move_before(id, other)` / `move_after(id, other)` / `move_up(id)` / `move_down(id)`, each an `O(rows shifted)` shift-then-set inside one transaction, locking the scope's rows (ordered by id — a fixed lock order, so two concurrent movers on the same scope serialize rather than deadlock) before touching them. `position{scope:board_id}` keeps a separate contiguous `0..len-1` sequence per distinct value of a sibling `references` column instead of one sequence over the whole table; the scope column must already be declared as `references`. At most one `position` field per model. The HTML scaffold's index orders by it and adds no-JS Move up/down buttons (CSRF + one-time-submit-token protected, like the trash view's Restore button) — omitted for `--api`/`--live`/`--live-validation`/`--sharded`/owner-scoped scaffolds, though `--api`/`--live`/`--live-validation`/owner-scoped repositories still get the `move_*` methods (just no buttons); `--sharded` gets neither (`#[repository(..., sharded)]` rejects `position(...)` outright — a move only reaches the pool/shard it happens to be given). Not yet supported with `tenant_scoped`/`versioned = true`/`dependent(...)`. Quote the token in bash/zsh (brace expansion) |
 
 **Foreign keys** (published 0.5.0 CLI only — no `references` token): scaffold
 an `i64` field and hand-edit the generated migration to add
@@ -86,12 +93,17 @@ by hand in the generated migration's `up.sql`. On trunk-dev, use `:unique` /
 **SQLite backend (trunk-dev, #1614)**: the generator auto-detects the target
 backend from the resolved database URL (`sqlite://…` in config / env / dotenv →
 SQLite, else Postgres) and emits SQLite-appropriate DDL (e.g. `TEXT` for
-`Decimal`, `TEXT PRIMARY KEY`/`Timestamp` remaps). Field kinds with no working
-diesel SQLite conversion in the generated app's feature set — `Uuid`,
-`Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and `enum{…}` — are
-**rejected at generate time** (with an actionable error) rather than emitting
-uncompilable code; `--searchable`, UUID primary keys, `--sharded`, and
-`generate auth` are likewise Postgres-only. First-class SQLite support for the
+`Decimal`, `TEXT PRIMARY KEY`/`Timestamp` remaps). `generate auth` and `generate
+mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
+scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
+`DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
+and the generated auth session store is typed against
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). Field
+kinds with no working diesel SQLite conversion in the generated app's feature
+set — `Uuid`, `Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and
+`enum{…}` — are still **rejected at generate time** (with an actionable error)
+rather than emitting uncompilable code; `--searchable`, UUID primary keys, and
+`--sharded` likewise remain Postgres-only. First-class SQLite support for the
 rejected kinds is tracked in #1924.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
@@ -205,7 +217,9 @@ owner-scopes the index; pass `--no-policy` to opt out (issue #1125).
 
 **Scaffold typed path module (trunk-dev)**: scaffolds reference a generated
 `autumn_web::paths![index, show, new, create, edit, update, delete]` module
-(`+events` under `--live`, `+validate_{field}` under `--live-validation`) for
+(`+events` under `--live`, `+validate_{field}` under `--live-validation`,
+`+nested_index, nested_create` under `--belongs-to`, `+trash, restore, purge`
+under `--soft-delete`) for
 every href/action/redirect/SSE endpoint/`hx-post` target instead of literal URL
 strings (issue #1133).
 
@@ -215,12 +229,78 @@ non-owner-scoped `GET /<plural>` index wires allowlisted sort/filter through the
 `?filter[col]=`), rendering sortable `data_table` headers (blob/attachment/enum
 columns excluded). Owner-scoped and `--live` indexes opt out (issue #1126).
 
+**Scaffold bulk select + delete selected (trunk-dev)**: every standard HTML
+index list ships a no-JavaScript bulk-delete flow — a leading
+`bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
+htmx-swapped results container) wrapped in a `bulk_actions_form`, and a
+`#[secured] POST /<plural>/bulk_delete` handler mounted right after `destroy`.
+The handler drops malformed ids and redirects on an empty selection (a
+list-write endpoint never 400s), per-row authorizes with the same `"delete"`
+action `destroy` uses when policy wiring is on (an unauthorized row is dropped
+from the batch, not 403'd), and deletes through `repo.delete_many` so
+soft-delete, hooks and `dependent(...)` cascades all apply. Not emitted for
+`--live`, `--live-validation`, `--sharded`, or `--api` (issue #1312).
+
+**Scaffold CSV export (trunk-dev)**: every standard HTML index also ships a
+working **Export CSV** download — a `CsvSchema` impl for the model (in
+`src/routes/<plural>.rs`, covering `id`, every scaffolded column in
+declaration order, then `created_at`), a `#[get("/<plural>/export.csv")]`
+handler returning a `Download` (so `Content-Type: text/csv`,
+`Content-Disposition: attachment; filename="<plural>.csv"` and
+`Content-Length` come from the framework, not hand-built header strings), an
+**Export CSV** link on the index carrying the current query string, and a
+database-free generated test. The planner auto-enables autumn-web's `csv`
+feature, so the scaffold compiles with no manual edits. The export honours the
+same allowlisted `?sort=`/`?filter[col]=` params as the index via the same
+`ListQuery` + `repo.list` pair (`?page=`/`?size=` are ignored — an export
+spans every page; `?q=` is NOT honoured, since `ListQuery` carries no
+full-text term), reads in `MAX_PAGE_SIZE` batches capped at `MAX_EXPORT_ROWS`
+(10 000), and mirrors the index's security posture exactly: an owner-scoped
+scaffold's export is `#[secured]` and goes through `list_scoped`, never the
+unscoped `list`. It additionally carries `#[throttle(limit = 6, per = "1m",
+key = "ip")]` the index does not — same row set, ~100x the cost per request.
+`NULL` columns become empty cells, not the string `None`, and text columns
+pass through an emitted `csv_text_cell` guard against spreadsheet formula
+injection (numeric/date/bool/enum columns are not guarded — guarding them
+would corrupt a negative number). Not emitted for `--live`, `--sharded`,
+owner-scoped `--live-validation`, or `--api` (issue #1315).
+
+**Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
+also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page
+listing deleted rows through the repository's generated `page_only_deleted`
+(the paginated `only_deleted` scope; the handler writes no `deleted_at` filter
+of its own), a **Trash** link in the index furniture, a `Deleted` column with
+each row's `deleted_at` stamp, and per row a CSRF-protected **Restore**
+(`POST /<plural>/{id}/restore` → `restore(id)`) and **Purge**
+(`POST /<plural>/{id}/purge` → `purge(id)`) control — Purge behind
+`confirm_action`'s server-rendered dialog, because the default
+`script-src 'self'` CSP blocks an inline `onclick` confirm. Both write handlers
+load their target with `deleted_at IS NOT NULL` first (so a crafted POST cannot
+hard-delete a live row) and record-authorize it with the same `"delete"` action
+`destroy` uses. The generated test walks create → soft delete → Trash →
+restore → purge. Not emitted for `--live`, `--live-validation`, `--sharded`, an
+owner-scoped index, `--api`, or any scaffold without `--soft-delete`
+(issue #1332).
+
+**Scaffold i18n views (trunk-dev)**: `--i18n` makes a generated resource
+translatable the moment it exists — `t!(locale, "key")` lookups in place of
+every English literal in the views, the `Locale` extractor on each view
+handler, and an `i18n/en.ftl` back-filled with exactly the keys referenced (no
+more — an unreferenced key is what `autumn i18n check` reports as unused). The
+generated app passes `autumn i18n check --strict`. Reach for it whenever the
+user mentions localization, translation, multiple languages, or a non-English
+audience; otherwise leave it off, since the default scaffold stays
+zero-i18n-config (issue #1349).
+
 **Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
 `multipart/form-data` uploads without JS — the create/update handlers take a
 `Multipart` extractor and stream to the blob store via `save_to_blob_store`
 — the scaffold planner auto-enables autumn-web's `storage` and `multipart`
 features (and uuid's `v4`) in the project's Cargo.toml, so a freshly
-scaffolded resource compiles with no manual edits (issue #1236).
+scaffolded resource compiles with no manual edits. The show and edit views
+render the stored file as a signed, time-bounded download link
+(`attachment_url` / `attachment_link`), and the edit form labels the currently
+stored file above the file input (issue #1236).
 
 ### controller (trunk-dev)
 ```
@@ -412,6 +492,52 @@ concurrent-lock TOCTOU. It sits before the TOTP branch, so it covers both
 generic failure page as an expired/consumed/unknown token, so there is no
 oracle.
 
+### teams (trunk-dev)
+```
+Next steps:
+1. `autumn generate teams` takes no name/model argument — it always emits the
+   fixed Organization/Membership/Invitation set under src/teams/. Requires an
+   existing `users` table (e.g. from `autumn generate auth`); it does not
+   scaffold login/signup itself. Postgres only — rejects a SQLite-backed
+   project up front with an actionable error.
+2. Wire the three-line auth-integration seam by hand (see
+   docs/generate-teams.md):
+   - After your own signup handler creates the user, call
+     `teams::routes::organizations::provision_default_organization(user.id, &mut db)`
+     to make them the Owner of a personal organization (org+membership run in
+     one transaction; wrap your own user insert in `db.tx(...)` too and call
+     `provision_default_organization_on_conn` on the same `conn` instead if
+     you need full 3-way atomicity with the account row).
+   - After your own login handler resolves the session, call
+     `teams::role::establish_org_session(...)` to set the active
+     organization + role in the session.
+   - Before (or as part of) your own account-deletion handler, call
+     `teams::routes::organizations::remove_all_memberships(user.id, &mut db)`
+     — `Membership` has no FK to your `users` table, so nothing else notices
+     the account is gone; skipping this leaves a deleted user's team access
+     live on any device with a still-valid session cookie.
+3. Set `[tenancy]` in autumn.toml: `source = "session"`,
+   `session_key = "organization_id"`, and list `/invite` (NOT `/invitations`)
+   in `public_paths` — `/invite/{token}` is the invitee-facing accept flow;
+   `/invitations` is the Admin-only create/revoke/resend surface and must
+   stay tenant-gated.
+4. Run: autumn migrate   (applies the organizations/memberships/invitations
+   migration)
+5. Generated forms already carry CSRF tokens — every mutating form embeds a
+   hidden `_csrf` field sourced from an `Option<CsrfToken>` extractor, so no
+   manual wiring is needed here even with the framework's on-by-default CSRF
+   protection.
+6. If you generated auth with a custom resource name (e.g.
+   `autumn generate auth Account`, table `accounts` rather than the default
+   `users`), edit `src/teams/routes/invitations.rs`'s `caller_email_lookup`
+   module by hand to match — it hard-codes a `users` table name as a
+   placeholder, since this generator can't introspect which name a separate,
+   prior `auth` generation used.
+7. `examples/teams` is the fully-wired reference this generator adapts
+   from — it owns its own `users` table end to end, so all three integration
+   points from step 2 are inlined directly into its `routes/auth.rs`.
+```
+
 ## Flags
 
 - `--api`: Generate JSON-only scaffold (no HTML views)
@@ -424,7 +550,9 @@ oracle.
 - `--live-validation` **(trunk-dev)**: For `scaffold` — per-field inline validation endpoints with `hx-post` inputs (implies `--live`)
 - `--unique FIELD` / `--index FIELD` / `--default field=variant` **(trunk-dev)**: Constraint/index/default markers (see field table)
 - `--no-policy` **(trunk-dev)**: For `scaffold` — skip the default-generated record-level `Policy`/`Scope`. Ignored under `--api` (issue #1125)
+- `--belongs-to <Parent>` **(trunk-dev)**: For `scaffold` — bind this resource to a parent as its child (issue #1323). Needs a matching `references` column (`--belongs-to Post` + `post:references`) and a parent that is **already scaffolded**. Emits `GET`/`POST /<parents>/{<fk>}/<children>` (the create takes the FK from the path, never the body), a `pub children_section(…)` helper, an injected children list + inline "add" form on the **parent's** generated `show` view, a back-link on the child's show view, and a cross-parent-isolation test. Marker-delimited, so re-runs are idempotent and `autumn destroy` reverses it. If the child has an owner column, the nested list inherits the flat index's `#[secured]` + owner scoping. Refused with `--api`/`--live`/`--live-validation`/`--sharded`, an `Attachment` column, a nullable or self-referential parent reference, or a parent that isn't scaffolded / is `slug`-keyed / carries a `:states(…)` column / has a hand-rewritten `show`. Single-level only
 - `--searchable <field,field>` **(trunk-dev)**: For `scaffold` — make the named text fields Postgres full-text searchable. Emits `#[searchable]` attrs, a `search_vector` generated column + GIN index migration, and a search box wired to `GET /<plural>/search`. Rejected for non-text/unknown fields, uuid-PK models, and owner-scoped models; gated off under `--live`/`--live-validation` (issue #1319)
+- `--i18n` **(trunk-dev)**: For `scaffold` — emit translatable views. Every user-facing string in the generated HTML (page titles, `h1`s, buttons, links, index column headers, show-page property labels, form control labels, enum options, empty states, the delete-confirm prompt, the flash notices, the media type/size line beside a stored attachment, and the labels the shared pager/bulk-delete/confirm widgets supply by default) becomes a `t!(locale, "key")` lookup; each view handler takes the `Locale` extractor as its **first** parameter (`FromRequestParts`, so it must precede the single body extractor); and the default locale's `.ftl` is created — or merged into, never rewriting a value already translated — with exactly the keys the views reference, so the generated app passes `autumn i18n check --strict`. Keys go to the locale `autumn.toml` actually names as default (`fr.ftl` for a `default_locale = "fr"` project). Also enables autumn-web's `i18n` feature, adds `[i18n] default_locale = "en"` when there is no `[i18n]` section, wires `.i18n_auto()` into the `AppBuilder` chain, and adds `COPY i18n` to both Dockerfile stages (`.i18n_auto()` PANICS at startup without the bundle). Shared chrome (`common.create`/`save`/`back`/`edit`/`delete`/`show`/`pagination`/…) is written once per project; each resource adds only its own strings (`post.new`, `post.field.<column>`, `post.flash.*`, …). Row keys and counts interpolate as Fluent arguments; the model NAME never does — "New Post" is a per-resource key, since a noun in a sentence pattern cannot be made to agree in gender or case from the bundle. Composes with `--searchable`, `--soft-delete`, `--sharded`, and the CSV export; a no-op under `--api`. Refused with `--live`/`--live-validation` (rows render outside a request, so no `Locale` in scope), `--belongs-to` (the nested section splices into the parent's own `show` handler), and a resource named `Common` (its keys would collide with the chrome namespace). The nesting refusal follows the relationship rather than the flag: a `--force --i18n` re-scaffold that omits `--belongs-to` is refused too, since the nesting is recovered from the parent's routes file — `autumn destroy scaffold` the child first to scaffold it flat. Without the flag, scaffold output is byte-for-byte unchanged. One behaviour note: one key per field serves the index header, show row, and form label alike, so a *multi-word* column's show label normalizes from "Author name" to "Author Name" (issue #1349)
 
 ## Wizard name constraints
 

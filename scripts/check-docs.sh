@@ -41,16 +41,22 @@ echo ""
 # Build each publishable crate with its declared docs.rs feature set.
 # autumn-web declares [package.metadata.docs.rs].features which cargo doc
 # does not read directly — we pass them explicitly here.
-AUTUMN_WEB_DOCS_FEATURES="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv"
+AUTUMN_WEB_DOCS_FEATURES="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,pdf,edge"
 
 echo "==> autumn-web (explicit docs.rs features)"
 cargo doc -p autumn-web --no-deps \
   --features "$AUTUMN_WEB_DOCS_FEATURES" \
   --no-default-features 2>&1
 
+# autumn-edge's docs.rs metadata declares `all-features = true` (the `host`
+# feature carries the reference host's API surface), so mirror that here.
+echo ""
+echo "==> autumn-edge (all features)"
+cargo doc -p autumn-edge --no-deps --all-features 2>&1
+
 # All other publishable crates: use their default features (no
 # [package.metadata.docs.rs] section means docs.rs uses defaults).
-for crate in autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis; do
+for crate in autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis autumn-search; do
   echo ""
   echo "==> $crate (default features)"
   cargo doc -p "$crate" --no-deps 2>&1

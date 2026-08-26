@@ -4,7 +4,7 @@
 //! assert the produced filesystem matches the documented contract — covering
 //! the user-facing flow described in [Issue #493].
 //!
-//! [Issue #493]: https://github.com/madmax983/autumn/issues/493
+//! [Issue #493]: https://github.com/autumn-foundation/autumn/issues/493
 
 use std::fmt::Write as _;
 use std::fs;
@@ -816,6 +816,12 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
+        // Issue #1312: the bulk delete-selected route is mounted alongside the
+        // per-row destroy for every non-live, non-sharded HTML scaffold.
+        "routes::posts::bulk_delete",
+        // Issue #1315: the CSV export route is mounted for every scaffold whose
+        // index row set is a repository call the export can reuse verbatim.
+        "routes::posts::export_csv",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
     ] {
@@ -1257,8 +1263,20 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(routes.contains("<Bookmark as autumn_web::form::FormModel>::form_fields()"));
     assert!(routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"));
     assert!(!routes.contains("autumn_web::form::required_text_input(&changeset"));
-    // `alive` is defaulted → excluded from the form entirely.
-    assert!(!routes.contains("\"alive\""));
+    // `alive` is defaulted → excluded from the FORM entirely. Scoped to the
+    // generated form struct + its `form_fields` descriptors rather than the whole
+    // file: since issue #1315 the module also carries a `CsvSchema` impl, whose
+    // column list is the MODEL's columns (what `show` renders), not the form's —
+    // a defaulted column is still data an author downloading a spreadsheet wants.
+    // The ONE remaining `"alive"` string in the module is that CSV header; the
+    // form struct, its descriptors and every rendered control are free of it.
+    assert_eq!(
+        routes.matches("\"alive\"").count(),
+        1,
+        "`alive` is defaulted: its only quoted mention may be the CSV header:\n{routes}"
+    );
+    assert!(routes.contains(r#"&["id", "url", "title", "tag", "alive", "created_at"]"#));
+    assert!(routes.contains("self.alive.to_string(),"));
     assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
     assert!(!routes.contains("bookmarks::alive.eq("));
     assert!(!routes.contains("new.alive"));
@@ -1651,6 +1669,88 @@ fn generated_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #1323: a `--belongs-to` scaffold compiles against the real framework
+/// AND its generated nested write-path test passes.
+///
+/// This is the only machine proof that the nested surface type-checks: the
+/// nested handlers, the shared `children_section` helper, the `exclude_parent_fk`
+/// form flag, the `paths::nested_index`/`nested_create` helpers, AND — critically
+/// — the *injected* edit to the parent's already-generated `show` handler, which
+/// is a textual patch to a file this invocation does not own. A `cargo check`
+/// here is what catches that patch going stale if the flat `show` template ever
+/// changes shape.
+///
+/// The generated nested test needs no database (its rows are in-process), so it
+/// is run for real rather than just compiled.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nested_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nested-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ],
+    );
+
+    let child = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    assert!(
+        child.contains("#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+        "missing the nested read route:\n{child}"
+    );
+    assert!(
+        child.contains("#[post(\"/posts/{post_id}/comments\", name = \"nested_create\")]"),
+        "missing the nested create route:\n{child}"
+    );
+    let parent = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        parent.contains("crate::routes::comments::children_section("),
+        "the parent show must render its children:\n{parent}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the nested scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    // AC7: create child under parent -> appears in that parent's list -> does
+    // NOT appear under a different parent. DB-free, so run it here.
+    let output = Command::new("cargo")
+        .args(["test", "--test", "comment", "comments_nested_under_parent"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the generated nested write-path test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok"),
+        "expected the generated nested test to pass:\n{stdout}"
+    );
+}
+
 /// Issue #1125: a scaffold WITH an owner column generates a record-level
 /// `Policy`/`Scope`, authorizes the mutating HTML handlers, scopes the index,
 /// and emits a cross-user 403 smoke test. `cargo check --tests` proves the
@@ -1732,6 +1832,32 @@ fn generated_policy_scaffold_cargo_checks() {
         String::from_utf8_lossy(&cross_user.stdout).contains("test result: ok"),
         "expected the cross-user test to pass:\n{}",
         String::from_utf8_lossy(&cross_user.stdout)
+    );
+
+    // Issue #1315: the generated CSV download test needs no database either.
+    // Running it here is the only place the repo proves the emitted test
+    // actually passes against the real `export_csv` + `Download` pair, rather
+    // than merely type-checking.
+    let export_csv = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_export_csv_downloads_a_spreadsheet",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        export_csv.status.success(),
+        "generated CSV export test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout),
+        String::from_utf8_lossy(&export_csv.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&export_csv.stdout).contains("1 passed"),
+        "expected the CSV export test to run and pass:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout)
     );
 }
 
@@ -3030,6 +3156,103 @@ fn generate_scaffold_help_documents_unique_field() {
     assert!(stdout.contains("--unique"), "got:\n{stdout}");
 }
 
+/// Issue #1340: the `{encrypted}` modifier must be discoverable from the help
+/// of the two subcommands that actually accept it. Documenting it only on the
+/// parent `autumn generate --help` is not enough — clap builds each
+/// subcommand's long help from its own doc block, and `model`/`scaffold` are
+/// what a user checking "how do I declare this field?" actually runs.
+#[test]
+fn generate_model_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    // The one manual step the generator cannot do for the user.
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_scaffold_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+/// The advertised examples must survive a copy-paste into bash/zsh: an
+/// unquoted `{…}` is brace-expanded by the shell before `autumn` ever sees it,
+/// so every `String{encrypted…}` token shown in help must be single-quoted.
+///
+/// Checked positionally rather than per-line, so it holds whichever way clap
+/// wraps the block (`verbatim_doc_comment` or reflowed) and for examples given
+/// inline in a paragraph as well as in an `Examples:` list.
+#[test]
+fn generate_help_encrypted_examples_are_shell_quoted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    for args in [
+        vec!["generate", "--help"],
+        vec!["generate", "model", "--help"],
+        vec!["generate", "scaffold", "--help"],
+    ] {
+        let label = args.join(" ");
+        let output = Command::new(autumn_bin)
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut checked = 0usize;
+        for (idx, _) in stdout.match_indices("String{encrypted") {
+            // Walk back to the start of the `name:String{encrypted…}` token.
+            let token_start = stdout[..idx]
+                .rfind(|c: char| c.is_whitespace())
+                .map_or(0, |i| i + 1);
+            // Only the runnable examples need quoting — a bare mention of the
+            // syntax in prose is wrapped in markdown backticks instead.
+            let is_example = stdout[..token_start].ends_with("autumn generate ")
+                || stdout[..token_start]
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.contains("autumn generate "));
+            if !is_example {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                stdout[token_start..].starts_with('\''),
+                "`{label}` shows an unquoted example — bash/zsh would \
+                 brace-expand it before `autumn` sees it: {}",
+                &stdout[token_start
+                    ..stdout[token_start..]
+                        .find(char::is_whitespace)
+                        .map_or(stdout.len(), |i| token_start + i)]
+            );
+        }
+        // `generate --help` and both subcommands each advertise at least one.
+        assert!(checked > 0, "`{label}` shows no runnable encrypted example");
+    }
+}
+
 #[test]
 fn generate_scaffold_help_documents_unique_is_html_only() {
     // Regression guard (issue #1032 review follow-up): `unique`'s 422
@@ -3118,6 +3341,49 @@ fn generated_unique_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated unique scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check (issue #1260): scaffold a `slug` field and `cargo
+/// check` the result. The rekeyed `show`/`edit`/`update`/`delete` handlers
+/// (`Path<String>` instead of `Path<i64>`, `.filter(...)` instead of
+/// `.find(*id)`, the create-time collision-suffix loop) are hand-templated
+/// string codegen with no compiler feedback at generation time — this is the
+/// one test that actually compiles that generated code, catching any
+/// template/escaping/borrow mistake a string-content assertion alone would
+/// miss.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+// `"slug:slug{from:title}"` is a literal DSL token passed to the CLI, not a
+// format string — the `{…}` is the scaffold's own constraint-modifier syntax.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn generated_slug_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("slug-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            r"slug:slug{from:title}",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated slug scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
@@ -3403,6 +3669,312 @@ fn generated_channel_smoke_test_passes() {
     assert!(
         String::from_utf8_lossy(&test_run.stdout).contains("test result: ok"),
         "expected the smoke test to report success"
+    );
+}
+
+// ── autumn generate webhook integration tests (issue #1366) ───────────────────
+
+#[test]
+fn generate_webhook_creates_all_expected_files() {
+    let (_tmp, project) = fresh_project("webhook-app");
+    let (stdout, stderr) = run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    assert!(
+        stdout.contains("Created") && stdout.contains("payments.rs"),
+        "output should list the created handler: {stdout}"
+    );
+
+    assert!(project.join("src/webhooks/payments.rs").is_file());
+    assert!(project.join("src/webhooks/mod.rs").is_file());
+
+    let handler = fs::read_to_string(project.join("src/webhooks/payments.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe\")]"),
+        "handler must own the provider route path:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook: SignedWebhook"),
+        "handler must take the shipped extractor:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook.event_type()")
+            && handler.contains("\"payment_intent.succeeded\""),
+        "handler must dispatch on the event type:\n{handler}"
+    );
+
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("mod webhooks;"), "got:\n{main_rs}");
+    assert!(
+        main_rs.contains("webhooks::payments::payments_webhook"),
+        "the route must be registered in routes![...]:\n{main_rs}"
+    );
+
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert!(
+        autumn_toml.contains("[[security.webhooks.endpoints]]"),
+        "got:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("secret_env = \"STRIPE_WEBHOOK_SECRET\""),
+        "the endpoint must reference a secret env var, never an inline secret:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("replay_protection = true"),
+        "replay protection must be on by default:\n{autumn_toml}"
+    );
+    // No CSRF/CAPTCHA exemption copies: the framework derives those from the
+    // endpoint block on every boot, so a literal copy would only go stale.
+    assert!(
+        !autumn_toml.contains("exempt_paths"),
+        "path exemptions are derived from the endpoint block, not copied:\n{autumn_toml}"
+    );
+
+    // The printed next steps name the secret env var, the dashboard target, and
+    // how to fire a test delivery — on stdout, not as warnings.
+    assert!(
+        stdout.contains("Next steps:") && stdout.contains("STRIPE_WEBHOOK_SECRET"),
+        "the secret env var must be part of the printed next steps:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("autumn webhook sim stripe"),
+        "the next steps should show how to fire a signed test delivery:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Warning:"),
+        "a clean run must not print warnings:\n{stderr}"
+    );
+}
+
+#[test]
+fn generate_webhook_supports_every_provider_preset() {
+    let (_tmp, project) = fresh_project("webhook-presets");
+    for (provider, name, snake) in [
+        ("stripe", "Payments", "payments"),
+        ("github", "Repo", "repo"),
+        ("slack", "Events", "events"),
+        ("generic", "Partner", "partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+        let handler = fs::read_to_string(project.join(format!("src/webhooks/{snake}.rs"))).unwrap();
+        assert!(
+            handler.contains(&format!("#[post(\"/webhooks/{provider}\")]")),
+            "{provider}: wrong route path:\n{handler}"
+        );
+    }
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert_eq!(
+        autumn_toml
+            .matches("[[security.webhooks.endpoints]]")
+            .count(),
+        4,
+        "each preset must add its own endpoint:\n{autumn_toml}"
+    );
+}
+
+#[test]
+fn generate_webhook_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("webhook-dry-run");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &["generate", "webhook", "stripe", "Payments", "--dry-run"],
+    );
+
+    assert!(stdout.contains("Dry run"), "got:\n{stdout}");
+    assert!(stdout.contains("Would create"), "got:\n{stdout}");
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "--dry-run must not write any file"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "--dry-run must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_an_unknown_provider() {
+    let (_tmp, project) = fresh_project("webhook-bad-provider");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "twilio", "Sms"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("twilio") && stderr.contains("generic"),
+        "got:\n{stderr}"
+    );
+    assert!(!project.join("src/webhooks").exists());
+}
+
+#[test]
+fn generate_webhook_rejects_hostile_path_and_secret_env_overrides() {
+    let (_tmp, project) = fresh_project("webhook-hostile-input");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+
+    // A quote would break out of the generated `#[post("…")]` attribute.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--path",
+            "/a\")]pub fn evil(){}//",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+
+    // A newline in --secret-env used to smuggle a whole endpoint block, with a
+    // plaintext secret and replay protection off, into autumn.toml.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--secret-env",
+            "X\n\n[[security.webhooks.endpoints]]\nname = \"evil\"\npath = \"/evil\"\nprovider = \"generic\"\nsecret = \"attacker-known\"\nreplay_protection = false\n# ",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("secret environment variable"),
+        "got:\n{stderr}"
+    );
+
+    assert!(!project.join("src/webhooks").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "a rejected invocation must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_a_second_endpoint_on_the_same_path() {
+    let (_tmp, project) = fresh_project("webhook-dup-path");
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "stripe", "Billing"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("/webhooks/stripe") && stderr.contains("--path"),
+        "the duplicate-path error must suggest --path:\n{stderr}"
+    );
+
+    // …and the override succeeds.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Billing",
+            "--path",
+            "/webhooks/stripe-billing",
+        ],
+    );
+    let handler = fs::read_to_string(project.join("src/webhooks/billing.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe-billing\")]"),
+        "got:\n{handler}"
+    );
+}
+
+#[test]
+fn destroy_webhook_removes_the_generated_files_and_config() {
+    let (_tmp, project) = fresh_project("webhook-destroy");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    run_autumn(&project, &["destroy", "webhook", "stripe", "Payments"]);
+
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "the handler module must be gone"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "autumn.toml must be restored exactly"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before,
+        "src/main.rs must be restored exactly"
+    );
+}
+
+/// Slow end-to-end check: scaffold a fresh project, generate every provider
+/// preset, and `cargo check --tests` it — the acceptance-criterion proof that
+/// generated webhook code compiles with no hand-editing.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_cargo_checks() {
+    let (_tmp, project) = fresh_project("webhook-build");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated webhooks failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: actually RUN the generated webhook tests. This is the
+/// acceptance-criterion proof that a valid signature is accepted, a
+/// missing/invalid signature is rejected, and a replayed delivery is rejected —
+/// on first run, with no manual edits beyond the ones the issue allows.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_tests_pass() {
+    let (_tmp, project) = fresh_project("webhook-smoke");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let test_run = Command::new("cargo")
+        .args(["test", "webhooks::"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        test_run.status.success(),
+        "generated webhook tests failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&test_run.stderr),
+    );
+    assert!(
+        stdout.contains("16 passed"),
+        "expected all four presets' four cases to pass; got:\n{stdout}"
     );
 }
 
@@ -4356,9 +4928,17 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         routes.contains(".page(") || routes.contains(".list("),
         "scaffold index must call a paginated repository method (page()/list()): {routes}"
     );
+    // Scoped to the `index` handler body: since issue #1312 the module also
+    // emits a `bulk_delete` handler whose SELECT is bounded by the submitted id
+    // list (`WHERE id = ANY($1)`), which is not an unpaginated index load.
+    let index = routes
+        .split_once("pub async fn index(")
+        .expect("scaffold must emit an index handler")
+        .1;
+    let index = index.split("pub async fn ").next().unwrap_or(index);
     assert!(
-        !routes.contains(".load(&mut *db)"),
-        "scaffold index must not load every row without pagination: {routes}"
+        !index.contains(".load(&mut *db)"),
+        "scaffold index must not load every row without pagination: {index}"
     );
     // The repository trait must be imported so `repo.list()`/`repo.page()` (trait
     // methods) resolve at compile time — without it the generated code fails with E0599.
@@ -4586,6 +5166,214 @@ fn generate_mailer_preview_registry_wired_into_main() {
     assert!(
         main.contains("mailers::welcome::WelcomeMailer"),
         "preview registry must reference the generated mailer type"
+    );
+}
+
+// ── autumn generate teams (issue #1261) ────────────────────────────────────
+
+#[test]
+fn generate_teams_emits_organization_membership_invitation_models() {
+    let (_tmp, project) = fresh_project("teams-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "teams"]);
+    assert!(
+        stdout.contains("Created") || stdout.contains("teams"),
+        "output should mention created files: {stdout}"
+    );
+
+    // Models: Organization, Membership, Invitation.
+    assert!(project.join("src/teams/models.rs").is_file());
+    let models = fs::read_to_string(project.join("src/teams/models.rs")).unwrap();
+    assert!(models.contains("pub struct Organization"), "{models}");
+    assert!(models.contains("pub struct Membership"), "{models}");
+    assert!(models.contains("pub struct Invitation"), "{models}");
+
+    // Role enum + require_role guard.
+    assert!(project.join("src/teams/role.rs").is_file());
+    let role = fs::read_to_string(project.join("src/teams/role.rs")).unwrap();
+    assert!(role.contains("pub enum Role"), "{role}");
+    assert!(role.contains("Owner"), "{role}");
+    assert!(role.contains("Admin"), "{role}");
+    assert!(role.contains("Member"), "{role}");
+    assert!(role.contains("pub async fn require_role"), "{role}");
+    assert!(
+        role.contains("pub async fn establish_org_session"),
+        "{role}"
+    );
+
+    // Repositories, tenant_scoped.
+    assert!(project.join("src/teams/repositories.rs").is_file());
+    let repos = fs::read_to_string(project.join("src/teams/repositories.rs")).unwrap();
+    assert!(repos.contains("tenant_scoped"), "{repos}");
+
+    // InvitationMailer.
+    assert!(
+        project
+            .join("src/teams/mailers/invitation_mailer.rs")
+            .is_file()
+    );
+    let mailer =
+        fs::read_to_string(project.join("src/teams/mailers/invitation_mailer.rs")).unwrap();
+    assert!(mailer.contains("pub struct InvitationMailer"), "{mailer}");
+    assert!(mailer.contains("#[mailer]"), "{mailer}");
+
+    // Route handlers.
+    assert!(project.join("src/teams/routes/organizations.rs").is_file());
+    assert!(project.join("src/teams/routes/invitations.rs").is_file());
+    assert!(project.join("src/teams/routes/members.rs").is_file());
+
+    // Migration: organizations, memberships, invitations tables.
+    let migrations_root = project.join("migrations");
+    let teams_migration_dir = fs::read_dir(&migrations_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+        .expect("a *_create_teams migration must be generated")
+        .path();
+    let up = fs::read_to_string(teams_migration_dir.join("up.sql")).unwrap();
+    assert!(up.contains("CREATE TABLE organizations"), "{up}");
+    assert!(up.contains("CREATE TABLE memberships"), "{up}");
+    assert!(up.contains("CREATE TABLE invitations"), "{up}");
+
+    // main.rs wiring.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod teams;"), "{main}");
+    assert!(
+        main.contains("teams::routes::organizations::create_organization"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::invitations::accept_invitation"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::members::list_members"),
+        "{main}"
+    );
+
+    // Cargo.toml: mail feature enabled.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"mail\""),
+        "Cargo.toml must include the mail feature: {cargo}"
+    );
+}
+
+#[test]
+fn generate_teams_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("teams-dry-app");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, _) = run_autumn(&project, &["generate", "teams", "--dry-run"]);
+    assert!(
+        stdout.contains("Dry run"),
+        "dry run must print Dry run header: {stdout}"
+    );
+    assert!(
+        !project.join("src/teams").exists(),
+        "dry run must not create the src/teams directory"
+    );
+    let has_teams_migration = fs::read_dir(project.join("migrations")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+    });
+    assert!(
+        !has_teams_migration,
+        "dry run must not create a *_create_teams migration"
+    );
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !main.contains("mod teams;"),
+        "dry run must not touch main.rs: {main}"
+    );
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert_eq!(
+        cargo_after, cargo_before,
+        "dry run must not touch Cargo.toml"
+    );
+}
+
+#[test]
+fn generate_teams_invite_accept_routes_use_invite_prefix_not_invitations() {
+    let (_tmp, project) = fresh_project("teams-invite-prefix-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+
+    // Invitee-facing accept flow lives under its own `/invite` prefix so
+    // `[tenancy] public_paths = ["/invite"]` doesn't also exempt the
+    // Admin-only routes below from tenant resolution.
+    assert!(
+        invitations.contains(r#"#[get("/invite/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invite/{token}/accept")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[get("/invitations/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[post("/invitations/{token}/accept")]"#),
+        "{invitations}"
+    );
+
+    // Admin-only create/revoke/resend stay under `/invitations`.
+    assert!(
+        invitations.contains(r#"#[post("/invitations")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/revoke")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/resend")]"#),
+        "{invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_sends_invite_mail_synchronously_not_deliver_later() {
+    let (_tmp, project) = fresh_project("teams-sync-mail-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains(".send_invite("),
+        "invite mail must be sent synchronously: {invitations}"
+    );
+    assert!(
+        !invitations.contains(".deliver_later_invite("),
+        "invite mail must not be a fire-and-forget background send: {invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_guards_against_admin_self_promotion_to_owner() {
+    let (_tmp, project) = fresh_project("teams-owner-guard-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    // create_invitation: an Admin cannot mint a fresh Owner invite.
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains("role == Role::Owner && caller_role != Role::Owner"),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains("Only an owner can invite someone as owner"),
+        "{invitations}"
+    );
+
+    // change_role: an Admin cannot promote an existing member to Owner.
+    let members = fs::read_to_string(project.join("src/teams/routes/members.rs")).unwrap();
+    assert!(
+        members.contains("new_role == Role::Owner && caller_role != Role::Owner"),
+        "{members}"
+    );
+    assert!(
+        members.contains("Only an owner can grant the owner role"),
+        "{members}"
     );
 }
 

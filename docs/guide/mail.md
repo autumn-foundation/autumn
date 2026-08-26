@@ -4,7 +4,7 @@ Enable the optional mail subsystem when your app needs password resets, signup
 confirmations, or transactional notifications:
 
 ```toml
-autumn-web = { version = "0.5", features = ["mail"] }
+autumn-web = { version = "0.7", features = ["mail"] }
 ```
 
 ## Configuration
@@ -343,8 +343,17 @@ imply durable delivery on their own. The framework provides two paths:
 
 ### Production Guard
 
-In `prod`/`production`, Autumn refuses to start with an active mail transport
-and no durable backend unless you explicitly opt in:
+In `prod`/`production`, with an active mail transport and no durable backend
+registered, Autumn does **not** fail to start — apps that never call
+`deliver_later`/`deliver_later_eager` (e.g. only `mailer.send(...)`) are
+unaffected either way. Startup logs a warning, and the guard is enforced lazily
+at the call site instead: `try_deliver_later`/`try_deliver_later_eager` return
+`MailError::NoDurableQueueInProduction` on the first deferred send, until you
+either register a `MailDeliveryQueueHandle` or explicitly opt in. The plain
+`deliver_later`/`deliver_later_eager` convenience methods call these
+fallible `try_*` variants but only log the error — they still return `()`, so
+a caller using them cannot observe or match on the typed error and should not
+assume the mail was scheduled just because the call returned.
 
 ```toml
 [mail]
@@ -352,9 +361,10 @@ transport = "smtp"
 allow_in_process_deliver_later_in_production = true
 ```
 
-Without that flag, startup fails with a clear message asking you to either
-install a `MailDeliveryQueueHandle` or set the flag. The flag is intended as an
-acknowledged single-replica escape hatch, not a recommended production setup.
+The flag is intended as an acknowledged single-replica escape hatch, not a
+recommended production setup — with it set, `deliver_later` falls back to an
+in-process Tokio task instead of failing, but delivery is not durable across
+restarts or replicas.
 
 ### DB-Write + Mail Patterns (Outbox)
 
@@ -393,9 +403,13 @@ build a `Mailer::with_transport(...)`.
 - Add a plain-text fallback for every HTML email.
 - Assert file-transport `.eml` contents in integration tests.
 - Register a `MailDeliveryQueueHandle` (Harvest, DB outbox, Redis, etc.) for
-  durable `deliver_later` retries. Without one, `prod` startup fails unless
-  `mail.allow_in_process_deliver_later_in_production = true` is set, in which
-  case Autumn falls back to an in-process Tokio task and logs failures.
+  durable `deliver_later` retries. Without one, `try_deliver_later`/
+  `try_deliver_later_eager` return `MailError::NoDurableQueueInProduction` in
+  `prod` unless `mail.allow_in_process_deliver_later_in_production = true` is
+  set, in which case Autumn falls back to an in-process Tokio task. The plain
+  `deliver_later`/`deliver_later_eager` methods only log that error — they
+  don't propagate it to the caller. Apps that only use `mailer.send(...)` are
+  unaffected and need neither.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
 - Shipping newsletters, digests, or other bulk mail? See

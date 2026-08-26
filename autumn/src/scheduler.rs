@@ -4,6 +4,13 @@
 //! The Postgres backend uses advisory locks so each fleet-wide task tick is
 //! claimed by at most one replica under normal operation.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -17,6 +24,8 @@
         clippy::todo,
         clippy::unimplemented,
         clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -329,7 +338,9 @@ pub fn coordinator_from_config(
 #[must_use]
 pub fn fixed_delay_tick_key(task_name: &str, delay: Duration, unix_elapsed: Duration) -> String {
     let interval = delay.as_nanos().max(1);
-    let bucket = unix_elapsed.as_nanos() / interval;
+    // `interval` is `.max(1)`, so the division is always defined; going through
+    // `checked_div` states that rather than relying on the reader to spot it.
+    let bucket = unix_elapsed.as_nanos().checked_div(interval).unwrap_or(0);
     format!("{task_name}:{bucket}")
 }
 
@@ -359,15 +370,50 @@ pub fn advisory_lock_key(key_prefix: &str, task_name: &str, tick_key: &str) -> i
     i64::from_be_bytes(bytes)
 }
 
-/// Current Unix timestamp in seconds.
+/// Current Unix timestamp in seconds, read from the real system clock.
+///
+/// # Deprecated
+///
+/// This reads wall time off the injected-clock seam, so a tick key derived from
+/// it is not reproducible under a [`#[sim_test]`](crate::sim_test). Read the
+/// app's clock instead:
+///
+/// ```rust,ignore
+/// let secs = autumn_web::time::clock_unix_secs(state.clock());
+/// ```
+///
+/// The framework's own scheduler already does exactly that; this function has
+/// no remaining production caller inside autumn.
 #[must_use]
+#[deprecated(
+    since = "0.7.0",
+    note = "reads real wall time off the injected-clock seam; use \
+            autumn_web::time::clock_unix_secs(state.clock()) instead (see #1797)"
+)]
 pub fn now_unix_secs() -> u64 {
+    #[allow(deprecated, reason = "the deprecated shim delegates to its own pair")]
     now_unix_duration().as_secs()
 }
 
-/// Current elapsed time since the Unix epoch.
+/// Current elapsed time since the Unix epoch, read from the real system clock.
+///
+/// # Deprecated
+///
+/// See [`now_unix_secs`]. Use
+/// [`crate::time::clock_unix_duration(state.clock())`](crate::time::clock_unix_duration).
 #[must_use]
+#[deprecated(
+    since = "0.7.0",
+    note = "reads real wall time off the injected-clock seam; use \
+            autumn_web::time::clock_unix_duration(state.clock()) instead (see #1797)"
+)]
 pub fn now_unix_duration() -> Duration {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the body of the deprecated real-time shim itself; it exists only \
+                  so an existing downstream caller keeps compiling while the \
+                  deprecation steers it onto time::clock_unix_duration"
+    )]
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
