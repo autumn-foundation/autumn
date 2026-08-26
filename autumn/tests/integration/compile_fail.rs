@@ -2,6 +2,10 @@
 //! Tests for compile failures using trybuild.
 //!
 #[test]
+// A flat registry of trybuild fixtures: one `t.compile_fail(...)` per case, plus
+// the comment explaining why each case must not compile. It grows by a line per
+// guarantee and has no structure worth extracting.
+#[allow(clippy::too_many_lines)]
 fn compile_fail_tests() {
     let t = trybuild::TestCases::new();
 

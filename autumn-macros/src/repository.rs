@@ -18139,11 +18139,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         == revisions.last().map(|r| r.seq);
 
                     let live_state = if stable {
-                        match live.as_ref() {
-                            ::core::option::Option::Some(value) =>
-                                ::autumn_web::ledger::LedgerLiveState::Present(value),
-                            ::core::option::Option::None =>
+                        match (revisions.last(), live.as_ref()) {
+                            (_, ::core::option::Option::None) =>
                                 ::autumn_web::ledger::LedgerLiveState::Absent,
+                            (::core::option::Option::None, ::core::option::Option::Some(_)) =>
+                                ::autumn_web::ledger::LedgerLiveState::Diverged,
+                            (
+                                ::core::option::Option::Some(head),
+                                ::core::option::Option::Some(live_value),
+                            ) => {
+                                // Both sides go through the SAME projection. The
+                                // stored snapshot is already codec-shaped, so it
+                                // only needs the randomized columns dropped; the
+                                // live row is re-encoded through the codec first.
+                                let head_view = Self::__autumn_ledger_comparable(
+                                    head.snapshot.clone(),
+                                );
+                                if ::autumn_web::ledger::canonical_json(&head_view)
+                                    == ::autumn_web::ledger::canonical_json(live_value)
+                                {
+                                    ::autumn_web::ledger::LedgerLiveState::Matches
+                                } else {
+                                    ::autumn_web::ledger::LedgerLiveState::Diverged
+                                }
+                            }
                         }
                     } else {
                         ::autumn_web::ledger::LedgerLiveState::NotChecked
@@ -18154,15 +18173,43 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 }
 
-                /// The live row's public projection, or `None` when the record has
-                /// no row at all.
+                /// The projection both sides of the live-state cross-check are
+                /// compared under.
+                ///
+                /// The model's durable per-field codec — which carries
+                /// `#[private]` and `#[encrypted]` columns that the model's
+                /// public JSON omits — minus the columns encrypted in randomized
+                /// mode. Those carry a fresh nonce per write, so a stored
+                /// snapshot and a freshly encoded live row could never compare
+                /// equal on them; dropping them keeps the check free of false
+                /// positives. Deterministic columns have stable ciphertext and
+                /// stay in. Everything dropped here is still covered by the
+                /// revision hash — the chain sees it, only this cross-check
+                /// cannot.
+                #[doc(hidden)]
+                fn __autumn_ledger_comparable(
+                    mut value: ::autumn_web::reexports::serde_json::Value,
+                ) -> ::autumn_web::reexports::serde_json::Value {
+                    if let ::core::option::Option::Some(object) = value.as_object_mut() {
+                        let mut randomized: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+                        ::autumn_web::encryption::randomized_encrypted_columns_for_table(
+                            #table_name,
+                            &mut randomized,
+                        );
+                        for column in randomized {
+                            object.remove(column);
+                        }
+                    }
+                    value
+                }
+
+                /// The live row in the cross-check projection, or `None` when
+                /// the record has no row at all.
                 ///
                 /// Reads with soft-deleted rows included: a ledgered delete leaves
                 /// the row in place, so "absent" here means erased out of band.
-                /// The projection is the model's own `Serialize` view — the same
-                /// one `__autumn_ledger_view_of` builds from a revision — so a
-                /// column the model hides from serialization is covered by the
-                /// hash chain but not by this cross-check.
+                /// See [`__autumn_ledger_comparable`](Self::__autumn_ledger_comparable)
+                /// for what the projection covers.
                 #[doc(hidden)]
                 async fn __autumn_ledger_live_view(
                     &self,
@@ -18180,13 +18227,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?;
 
-                    ::core::result::Result::Ok(row.map(|model| {
-                        ::autumn_web::reexports::serde_json::to_value(&model).unwrap_or(
-                            ::autumn_web::reexports::serde_json::Value::Object(
-                                ::autumn_web::reexports::serde_json::Map::new(),
-                            ),
-                        )
-                    }))
+                    match row {
+                        ::core::option::Option::None =>
+                            ::core::result::Result::Ok(::core::option::Option::None),
+                        ::core::option::Option::Some(model) => {
+                            let encoded = model.__autumn_commit_hook_to_value()?;
+                            ::core::result::Result::Ok(::core::option::Option::Some(
+                                Self::__autumn_ledger_comparable(encoded),
+                            ))
+                        }
+                    }
                 }
 
                 /// The head of the record's chain, for pinning outside the

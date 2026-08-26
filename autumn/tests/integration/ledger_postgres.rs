@@ -18,6 +18,11 @@
 
 #![cfg(feature = "db")]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
+// The `f64` column makes the `#[model]` expansion (change tracking uses strict
+// equality) trip clippy's `float_cmp`; that generated comparison is the macro's
+// concern, not this test's, and an item-level allow can't reach the
+// macro-emitted impls. Same convention as `form_for_derive.rs`.
+#![allow(clippy::float_cmp)]
 
 use autumn_web::current::with_actor;
 use autumn_web::hooks::Patch;
@@ -41,7 +46,6 @@ diesel::table! {
 }
 
 #[autumn_web::model(table = "test_ledger_invoices")]
-#[derive(PartialEq)]
 pub struct LedgerInvoice {
     #[id]
     pub id: i64,
@@ -123,6 +127,21 @@ const fn build_repo(pool: Pool<AsyncPgConnection>) -> PgLedgerInvoiceRepository 
     }
 }
 
+/// Byte-for-byte model comparison.
+///
+/// The models carry an `f64` column, so `#[derive(PartialEq)]` on them would
+/// trip `clippy::float_cmp` from inside the `#[model]` expansion (where an
+/// `#[allow]` on the struct does not reach). Comparing serialized forms is both
+/// lint-clean and the stronger assertion: "byte-for-byte identical to what a
+/// plain query would have returned" is exactly what the issue asks for.
+fn assert_same_record<T: serde::Serialize>(left: &T, right: &T, context: &str) {
+    assert_eq!(
+        serde_json::to_string(left).expect("serialize left"),
+        serde_json::to_string(right).expect("serialize right"),
+        "{context}"
+    );
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "test asserts against real recorded_at values"
@@ -137,6 +156,10 @@ async fn tick() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+// One linear scenario — three writes, then chain shape, oracle reconstruction,
+// diff, verify and head all asserted against it. Splitting it would mean
+// re-running the container and the writes per assertion.
+#[allow(clippy::too_many_lines)]
 async fn ledger_records_chains_and_reconstructs_on_postgres() {
     let (pool, _container) = setup_pool().await;
     let repo = build_repo(pool.clone());
@@ -219,10 +242,10 @@ async fn ledger_records_chains_and_reconstructs_on_postgres() {
             .await
             .expect("as-of read")
             .expect("the record existed at this instant");
-        assert_eq!(&reconstructed, expected, "as-of state at {instant}");
-        assert_eq!(
-            serde_json::to_string(&reconstructed).expect("serialize reconstructed"),
-            serde_json::to_string(expected).expect("serialize oracle"),
+        assert_same_record(
+            &reconstructed,
+            expected,
+            &format!("as-of state at {instant}"),
         );
     }
     assert!(
@@ -299,7 +322,7 @@ async fn a_float_snapshot_round_trips_without_renormalization() {
         .await
         .expect("as-of")
         .expect("state");
-    assert_eq!(reconstructed, created);
+    assert_same_record(&reconstructed, &created, "as-of must reproduce the insert");
 
     // And a window with no writes reports no phantom change.
     let quiet = repo
@@ -343,7 +366,7 @@ async fn restore_records_a_revision_on_postgres() {
         .await
         .expect("as-of")
         .expect("state");
-    assert_eq!(reconstructed, live, "as-of(now) must equal the live row");
+    assert_same_record(&reconstructed, &live, "as-of(now) must equal the live row");
     assert!(
         repo.ledger_verify(created.id)
             .await

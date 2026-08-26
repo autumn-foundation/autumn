@@ -690,6 +690,25 @@ pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static
     }
 }
 
+/// Append this table's **randomized**-mode encrypted columns to `columns`,
+/// de-duplicating.
+///
+/// A column encrypted in randomized mode produces different ciphertext for the
+/// same plaintext on every write, so two independent encodings of the same row
+/// never compare equal. Deterministic columns are deliberately excluded: their
+/// ciphertext is stable, so they compare fine and stay covered.
+///
+/// Used by the ledger's live-row cross-check (#1699), which compares a stored
+/// revision's snapshot against a freshly encoded live row and must not read a
+/// fresh nonce as a divergence.
+pub fn randomized_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
+    for d in registered_encrypted_columns() {
+        if d.table == table && !d.deterministic && !columns.contains(&d.column) {
+            columns.push(d.column);
+        }
+    }
+}
+
 /// Rewrite a model's JSON column-values snapshot (as produced for record version
 /// history) so that columns opted into `versioned_ciphertext` carry ciphertext
 /// rather than plaintext.

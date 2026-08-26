@@ -417,24 +417,34 @@ pub struct LedgerHead {
     pub recorded_at: DateTime<Utc>,
 }
 
-/// What the live table holds for the record being verified.
+/// How the live table row compares to the chain's head revision.
 ///
 /// A hash chain proves the revisions that are *present* were not edited. It
 /// cannot prove that none is missing from the *end*: lopping the last two
 /// revisions off leaves a chain that verifies perfectly. Nor can it see a write
 /// that reached the table without appending a revision at all. Comparing the
 /// head revision against the row the table actually holds closes both gaps, so
-/// [`verify_chain_against`] takes the live state as an explicit input.
+/// [`verify_chain_against`] takes the outcome of that comparison as an input.
+///
+/// The comparison itself is the caller's, not this module's: deciding which
+/// columns are even comparable needs per-table knowledge this layer does not
+/// have. The generated `ledger_verify` encodes the head revision and the live
+/// row through the *same* projection — the model's durable per-field codec,
+/// which carries `#[private]` and `#[encrypted]` columns that the model's public
+/// JSON omits — minus the columns encrypted in randomized mode, whose ciphertext
+/// carries a fresh nonce per write and so could never compare equal. Everything
+/// dropped from that comparison is still covered by the revision hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LedgerLiveState<'a> {
-    /// The live row was not read, so no cross-check is performed. Chain-internal
-    /// breaks are still reported.
+pub enum LedgerLiveState {
+    /// The live row was not read, or moved under the reader, so no cross-check
+    /// is performed. Chain-internal breaks are still reported.
     NotChecked,
     /// The record has no row in the table.
     Absent,
-    /// The record's current row, in the same projection the head revision's
-    /// snapshot is compared under.
-    Present(&'a serde_json::Value),
+    /// The live row is the one the head revision describes.
+    Matches,
+    /// The live row is not the one the head revision describes.
+    Diverged,
 }
 
 /// Verify one record's revision chain and report the first broken link.
@@ -480,7 +490,7 @@ pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerif
 pub fn verify_chain_against(
     record_id: i64,
     revisions: &[LedgerRevision],
-    live: LedgerLiveState<'_>,
+    live: LedgerLiveState,
 ) -> LedgerVerification {
     let checked = revisions.len();
     let broken = first_break(revisions).or_else(|| live_state_break(revisions, live));
@@ -503,25 +513,12 @@ pub fn verify_chain_against(
 /// the *end* of the history is missing rather than its middle being edited.
 fn live_state_break(
     revisions: &[LedgerRevision],
-    live: LedgerLiveState<'_>,
+    live: LedgerLiveState,
 ) -> Option<LedgerBreakReport> {
-    let live_snapshot = match live {
-        LedgerLiveState::NotChecked => return None,
-        LedgerLiveState::Absent => None,
-        LedgerLiveState::Present(value) => Some(value),
-    };
-
-    match (revisions.last(), live_snapshot) {
-        (None, None) => None,
-        (None, Some(_)) => Some(LedgerBreakReport {
-            seq: 0,
-            revision_id: None,
-            kind: LedgerBreak::LiveStateMismatch,
-            detail: "the record exists but its ledger is empty; \
-                     every revision of its history was deleted"
-                .to_owned(),
-        }),
-        (Some(head), None) => Some(LedgerBreakReport {
+    match (live, revisions.last()) {
+        (LedgerLiveState::NotChecked | LedgerLiveState::Matches, _)
+        | (LedgerLiveState::Absent, None) => None,
+        (LedgerLiveState::Absent, Some(head)) => Some(LedgerBreakReport {
             seq: head.seq,
             revision_id: Some(head.id),
             kind: LedgerBreak::LiveStateMismatch,
@@ -531,23 +528,25 @@ fn live_state_break(
                 head.seq
             ),
         }),
-        (Some(head), Some(live_value)) => {
-            if canonical_json(&head.snapshot) == canonical_json(live_value) {
-                None
-            } else {
-                Some(LedgerBreakReport {
-                    seq: head.seq,
-                    revision_id: Some(head.id),
-                    kind: LedgerBreak::LiveStateMismatch,
-                    detail: format!(
-                        "revision {} is the newest in the ledger but does not describe \
-                         the row the table holds; either the tail of the history was \
-                         deleted or a write reached the table without appending a revision",
-                        head.seq
-                    ),
-                })
-            }
-        }
+        (LedgerLiveState::Diverged, None) => Some(LedgerBreakReport {
+            seq: 0,
+            revision_id: None,
+            kind: LedgerBreak::LiveStateMismatch,
+            detail: "the record exists but its ledger is empty; \
+                     every revision of its history was deleted"
+                .to_owned(),
+        }),
+        (LedgerLiveState::Diverged, Some(head)) => Some(LedgerBreakReport {
+            seq: head.seq,
+            revision_id: Some(head.id),
+            kind: LedgerBreak::LiveStateMismatch,
+            detail: format!(
+                "revision {} is the newest in the ledger but does not describe \
+                 the row the table holds; either the tail of the history was \
+                 deleted or a write reached the table without appending a revision",
+                head.seq
+            ),
+        }),
     }
 }
 
@@ -1539,22 +1538,8 @@ mod tests {
 
     #[test]
     fn verify_accepts_a_head_that_matches_the_live_row() {
-        let revisions = chain(3);
-        let live = revisions[2].snapshot.clone();
-        let report = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live));
+        let report = verify_chain_against(7, &chain(3), LedgerLiveState::Matches);
         assert!(report.is_intact(), "{report:?}");
-    }
-
-    #[test]
-    fn verify_ignores_key_order_when_comparing_against_the_live_row() {
-        let revisions = chain(1);
-        // Same content, different insertion order — the comparison canonicalizes.
-        let mut reordered = serde_json::Map::new();
-        reordered.insert("title".to_owned(), json!("v1"));
-        reordered.insert("deleted_at".to_owned(), json!(null));
-        reordered.insert("id".to_owned(), json!(7));
-        let live = serde_json::Value::Object(reordered);
-        assert!(verify_chain_against(7, &revisions, LedgerLiveState::Present(&live)).is_intact());
     }
 
     #[test]
@@ -1562,7 +1547,6 @@ mod tests {
         // Revisions 4 and 5 are lopped off. The surviving chain is internally
         // perfect — only the live row exposes the erasure.
         let full = chain(5);
-        let live = full[4].snapshot.clone();
         let truncated = &full[..3];
 
         assert!(
@@ -1570,7 +1554,7 @@ mod tests {
             "a truncated chain is internally consistent by construction"
         );
 
-        let broken = verify_chain_against(7, truncated, LedgerLiveState::Present(&live))
+        let broken = verify_chain_against(7, truncated, LedgerLiveState::Diverged)
             .broken
             .expect("the live row must expose the truncation");
         assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
@@ -1579,11 +1563,8 @@ mod tests {
 
     #[test]
     fn verify_detects_a_write_that_never_appended_a_revision() {
-        let revisions = chain(2);
         // The table moved on — a restore, a counter-cache bump, a raw UPDATE.
-        let live = json!({ "id": 7, "title": "v2", "deleted_at": "2026-08-26T00:00:00" });
-
-        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live))
+        let broken = verify_chain_against(7, &chain(2), LedgerLiveState::Diverged)
             .broken
             .expect("a ledger-bypassing write must be detected");
         assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
@@ -1597,8 +1578,7 @@ mod tests {
 
     #[test]
     fn verify_detects_a_wholly_erased_chain_behind_a_live_row() {
-        let live = json!({ "id": 7, "title": "v1", "deleted_at": null });
-        let broken = verify_chain_against(7, &[], LedgerLiveState::Present(&live))
+        let broken = verify_chain_against(7, &[], LedgerLiveState::Diverged)
             .broken
             .expect("a live record with no history must be detected");
         assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
@@ -1625,13 +1605,21 @@ mod tests {
         // Both faults present: the earlier, more specific one is reported.
         let mut revisions = chain(3);
         revisions[1].snapshot = json!({ "id": 7, "title": "tampered" });
-        let live = json!({ "id": 7, "title": "something else", "deleted_at": null });
 
-        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live))
+        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Diverged)
             .broken
             .expect("break detected");
         assert_eq!(broken.kind, LedgerBreak::HashMismatch);
         assert_eq!(broken.seq, 2);
+    }
+
+    #[test]
+    fn verify_skips_the_cross_check_when_the_head_moved_under_the_reader() {
+        // A concurrent write is not tampering: rather than report a divergence
+        // it cannot trust, `ledger_verify` passes `NotChecked`.
+        let report = verify_chain_against(7, &chain(2), LedgerLiveState::NotChecked);
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.head_hash.as_deref(), Some(chain(2)[1].hash.as_str()));
     }
 
     // ── sequence overflow ────────────────────────────────────────────

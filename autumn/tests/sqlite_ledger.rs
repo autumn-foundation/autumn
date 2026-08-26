@@ -26,6 +26,11 @@
 //! `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_ledger`.
 #![cfg(feature = "sqlite")]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
+// The `f64` column makes the `#[model]` expansion (change tracking uses strict
+// equality) trip clippy's `float_cmp`; that generated comparison is the macro's
+// concern, not this test's, and an item-level allow can't reach the
+// macro-emitted impls. Same convention as `form_for_derive.rs`.
+#![allow(clippy::float_cmp)]
 
 use autumn_web::config::DatabaseConfig;
 use autumn_web::current::with_actor;
@@ -66,6 +71,15 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        lg_secret_notes (id) {
+            id -> Int8,
+            body -> Text,
+            internal_note -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         lg_tenant_invoices (id) {
             id -> Int8,
             reference -> Text,
@@ -75,10 +89,9 @@ mod schema {
     }
 }
 
-use schema::{lg_effective_notes, lg_invoices, lg_tenant_invoices};
+use schema::{lg_effective_notes, lg_invoices, lg_secret_notes, lg_tenant_invoices};
 
 #[autumn_web::model(table = "lg_invoices")]
-#[derive(PartialEq)]
 pub struct LgInvoice {
     #[id]
     pub id: i64,
@@ -141,6 +154,27 @@ pub struct LgEffectiveNote {
 )]
 pub trait LgEffectiveNoteRepository {}
 
+/// A model with a column the public JSON omits.
+///
+/// `#[model]` stamps `#[serde(skip_serializing)]` on a `#[private]` field, so a
+/// serde-shaped live-state cross-check would be blind to it — the hole Codex
+/// flagged on #2318, and the mirror-image false positive of comparing a
+/// codec-shaped snapshot against a serde-shaped live row.
+#[autumn_web::model(table = "lg_secret_notes")]
+#[derive(PartialEq, Eq)]
+pub struct LgSecretNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    #[private]
+    pub internal_note: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(LgSecretNote, table = "lg_secret_notes", soft_delete, ledgered = true)]
+pub trait LgSecretNoteRepository {}
+
 /// The migration SQL Autumn actually ships, applied verbatim.
 ///
 /// Included rather than hand-copied so a syntax error or a schema change in
@@ -184,6 +218,12 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
                  tenant_id TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
+            "CREATE TABLE lg_secret_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
+                 internal_note TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
             "CREATE TABLE lg_effective_notes (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  body TEXT NOT NULL, \
@@ -200,6 +240,21 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
     }
 
     pool
+}
+
+/// Byte-for-byte model comparison.
+///
+/// The models carry an `f64` column, so `#[derive(PartialEq)]` on them would
+/// trip `clippy::float_cmp` from inside the `#[model]` expansion (where an
+/// `#[allow]` on the struct does not reach). Comparing serialized forms is both
+/// lint-clean and the stronger assertion: "byte-for-byte identical to what a
+/// plain query would have returned" is exactly what the issue asks for.
+fn assert_same_record<T: serde::Serialize>(left: &T, right: &T, context: &str) {
+    assert_eq!(
+        serde_json::to_string(left).expect("serialize left"),
+        serde_json::to_string(right).expect("serialize right"),
+        "{context}"
+    );
 }
 
 /// Wall-clock instant, matching the write path's own clock read.
@@ -222,6 +277,9 @@ async fn tick() {
 /// create → update → update, as-of reconstruction against a live oracle at every
 /// intermediate instant, then tamper and assert `verify` names the broken link.
 #[tokio::test]
+// The issue's golden scenario end to end; splitting it would mean re-running the
+// whole write sequence per assertion.
+#[allow(clippy::too_many_lines)]
 async fn golden_as_of_reconstruction_matches_the_oracle_and_tampering_is_detected() {
     let pool = boot_pool("lg_golden").await;
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
@@ -285,15 +343,10 @@ async fn golden_as_of_reconstruction_matches_the_oracle_and_tampering_is_detecte
             .await
             .expect("as-of read")
             .expect("the record existed at this instant");
-        assert_eq!(
-            &reconstructed, expected,
-            "as-of state at {instant} must equal what a live query returned then"
-        );
-        // "byte-for-byte" in the strongest available sense: the serialized forms
-        // match, not just the structural comparison.
-        assert_eq!(
-            serde_json::to_string(&reconstructed).expect("serialize reconstructed"),
-            serde_json::to_string(expected).expect("serialize oracle"),
+        assert_same_record(
+            &reconstructed,
+            expected,
+            &format!("as-of state at {instant} must equal what a live query returned then"),
         );
     }
 
@@ -733,7 +786,7 @@ async fn restore_records_a_revision_and_keeps_as_of_true() {
         .await
         .expect("live read")
         .expect("live row");
-    assert_eq!(reconstructed, live, "as-of(now) must equal the live row");
+    assert_same_record(&reconstructed, &live, "as-of(now) must equal the live row");
     assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
 }
 
@@ -926,6 +979,121 @@ async fn bulk_writes_chain_every_row_independently() {
         let report = repo.ledger_verify(*id).await.expect("verify");
         assert!(report.is_intact(), "record {id}: {report:?}");
     }
+}
+
+// ── hidden columns are covered by the live-state cross-check ─────────
+
+/// The exact case Codex flagged: the newest revision changes *only* a column the
+/// model hides from its public JSON, and an attacker deletes that revision. A
+/// serde-shaped cross-check would find the preceding revision and the live row
+/// identical and call the truncated chain intact.
+#[tokio::test]
+async fn a_truncated_tail_is_detected_when_only_a_hidden_column_changed() {
+    let pool = boot_pool("lg_hidden_tail").await;
+    let repo = PgLgSecretNoteRepository::with_pool_untracked(pool.clone());
+
+    let created = repo
+        .save(&NewLgSecretNote {
+            body: "public".to_string(),
+            internal_note: "before".to_string(),
+        })
+        .await
+        .expect("insert");
+    // The public projection of this update is identical to the insert's.
+    repo.update(
+        created.id,
+        &UpdateLgSecretNote {
+            internal_note: Patch::Set("after".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update a hidden column only");
+
+    // Sanity: the two snapshots differ only in the hidden column.
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(
+        revisions[0].snapshot["body"], revisions[1].snapshot["body"],
+        "the public column is unchanged across the two revisions"
+    );
+    assert_ne!(
+        revisions[0].snapshot["internal_note"], revisions[1].snapshot["internal_note"],
+        "the hidden column is what changed — and the snapshot carries it"
+    );
+
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact(),
+        "no false positive on an intact chain with a hidden column"
+    );
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_secret_notes' AND record_id = ? AND seq = 2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the revision that changed only the hidden column");
+    }
+
+    let broken = repo
+        .ledger_verify(created.id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a hidden-column-only truncation must still be detected");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+    assert_eq!(broken.seq, 1);
+}
+
+/// The mirror-image bug: comparing a codec-shaped snapshot against a
+/// serde-shaped live row would make every model with a hidden column report
+/// tampering on history nobody touched.
+#[tokio::test]
+async fn a_hidden_column_does_not_cause_a_false_positive() {
+    let pool = boot_pool("lg_hidden_intact").await;
+    let repo = PgLgSecretNoteRepository::with_pool_untracked(pool);
+
+    let created = repo
+        .save(&NewLgSecretNote {
+            body: "public".to_string(),
+            internal_note: "secret".to_string(),
+        })
+        .await
+        .expect("insert");
+    for note in ["secret-2", "secret-3"] {
+        repo.update(
+            created.id,
+            &UpdateLgSecretNote {
+                internal_note: Patch::Set(note.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    repo.restore(created.id).await.expect("restore");
+
+    for _ in 0..3 {
+        let report = repo.ledger_verify(created.id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 5);
+    }
+
+    // And as-of still reconstructs the hidden column exactly.
+    let reconstructed = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::default())
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(reconstructed.internal_note, "secret-3");
 }
 
 // ── valid time read from a model column ──────────────────────────────
