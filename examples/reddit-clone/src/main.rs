@@ -33,6 +33,9 @@
 //                          (see routes/webhooks.rs, [[security.webhooks.endpoints]] in autumn.toml)
 //   Outbound HTTP       -> autumn_web::http::Client extractor for traced, retried outbound calls
 //                          (link-preview deferred: tracked in #1238 + #1239 for 0.5.0)
+//   Route-level SEO     -> seo(...) on the route attributes + the SeoMeta extractor, a
+//                          database-backed SitemapSource, /robots.txt and /sitemap.xml
+//                          (see src/seo.rs, [seo] in autumn.toml, docs/guide/seo.md)
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -40,6 +43,9 @@
 // WebSocket:  ws://localhost:3000/ws/feed
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
+// SEO test:   curl http://localhost:3000/robots.txt
+//             curl http://localhost:3000/sitemap.xml
+//             curl -s http://localhost:3000/ | grep -E '<title>|og:|canonical'
 
 use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
 use autumn_web::config::AutumnConfig;
@@ -95,11 +101,22 @@ async fn main() {
     // assignments survive restarts and you can conclude experiments from the DB.
     let experiment_svc = experiments::setup();
 
+    // Route-level SEO (docs/guide/seo.md). Two steps:
+    //
+    //   1. Record `[seo] base_url` so the handlers can build canonical URLs
+    //      without cloning the whole config on each request.
+    //   2. Register the sitemap source. This ALSO mounts /robots.txt and
+    //      /sitemap.xml — `[seo] base_url` alone is enough to mount them, and
+    //      the source only adds the dynamic URLs.
+    reddit_clone::seo::init_base_url(&app_config);
+    let sitemap_source = reddit_clone::seo::RedditSitemapSource::from_config(&app_config);
+
     let app = autumn_web::app()
         .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .with_flag_store(flag_store)
         .with_error_reporter(StructuredReporter)
+        .seo_source(sitemap_source)
         .state_initializer(move |state| {
             state.insert_extension(experiment_svc);
             // Audit sink: an append-only security-event log, kept separate from

@@ -153,10 +153,10 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
 | **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
-| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
+| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing every community and post |
 
 ---
 
@@ -300,7 +300,7 @@ can pick the closest starting point without overlap.
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
-| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
+| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |

@@ -224,7 +224,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
 | [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
+| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, route-level SEO (`seo(...)`, `sitemap.xml`, `robots.txt`), and live-tunable config |
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
 | [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
 | [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
@@ -268,6 +268,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 - [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
 - [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
+- [SEO](docs/guide/seo.md) — `seo(...)` on any route macro plus the `SeoMeta` extractor, canonical URLs, `robots = "noindex"` and its sitemap exclusion, `SitemapSource`, and the auto-mounted `/sitemap.xml` + `/robots.txt`
 - [Threaded Comments on Anything](docs/guide/commentable.md) — `#[commentable]`, the polymorphic `(commentable_type, commentable_id)` association, `add_comment()` / `comment_thread()` / `delete_comment()`, the registry-driven comment router, and the no-JS `comment_thread` widget
 
 ## Stability

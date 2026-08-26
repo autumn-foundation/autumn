@@ -4,15 +4,37 @@
 //! static HTML — zero compute per request. It showcases all the Autumn
 //! features used in this Reddit clone example.
 
+use autumn_web::seo::SeoMeta;
 use autumn_web::{Markup, html, static_get};
 
-use super::layout::layout;
+use super::layout::layout_with_seo;
 
+/// The about page, pre-rendered at build time.
+///
+/// The `seo(...)` argument on the attribute holds every meta value this page
+/// needs, and the `SeoMeta` parameter receives them. The handler adds nothing:
+/// a page whose text never changes needs no per-request builder.
+///
+/// `#[static_get]` honours `seo(...)` in the same way as `#[get]`, so the
+/// pre-rendered HTML carries the tags too.
+///
+/// This route also puts `/about` in `/sitemap.xml`. The framework derives a
+/// sitemap entry for each `#[static_get]` path when `[seo] base_url` is set,
+/// so `RedditSitemapSource` does not list this page. See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
-#[static_get("/about")]
-pub async fn about() -> Markup {
-    layout(
-        "About",
+#[static_get(
+    "/about",
+    seo(
+        title = "About \u{2022} Autumn Reddit",
+        description = "Autumn Reddit is a demo link-sharing site. It shows every major feature of \
+                       the Autumn web framework for Rust in one application.",
+        og_type = "website",
+        twitter_card = "summary"
+    )
+)]
+pub async fn about(seo: SeoMeta) -> Markup {
+    layout_with_seo(
+        seo,
         None,
         None,
         html! {

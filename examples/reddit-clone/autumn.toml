@@ -22,6 +22,35 @@ path = "/health"
 [security.csrf]
 enabled = true
 
+# Route-level SEO (docs/guide/seo.md).
+#
+# `base_url` turns on /robots.txt and /sitemap.xml. The framework needs it
+# because both files hold absolute URLs. It also lets the handlers build a
+# canonical URL for each page (see src/seo.rs).
+#
+# Change this to the real host before you deploy. The value below is the demo
+# host, and a wrong `base_url` sends crawlers to URLs that do not exist.
+[seo]
+base_url = "https://autumn-reddit.example.com"
+
+[seo.robots]
+# The profile sets the default: `dev` and `test` disallow every crawler, `prod`
+# allows every crawler. Set `allow_all = false` here to keep a staging
+# deployment out of search results even when it runs the `prod` profile.
+#
+# These rules are a second line of defence for the pages that must stay out of
+# the index. `robots.txt` stops the crawl; the `seo(robots = "noindex")`
+# argument on a route stops the indexing. Use both: a page that another site
+# links to can still be indexed without ever being crawled.
+additional_rules = [
+  "Disallow: /submit",
+  "Disallow: /login",
+  "Disallow: /register",
+  "Disallow: /_partials/",
+  "Disallow: /actuator/",
+  "Disallow: /api/",
+]
+
 [security.webhooks.replay]
 allow_memory_in_production = true
 

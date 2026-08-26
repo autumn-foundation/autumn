@@ -14,17 +14,32 @@ use crate::schema::users;
 use autumn_web::slugify;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 
-use super::layout::{layout, time_ago};
+use super::layout::{layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
-#[get("/r")]
-pub async fn list(session: Session, repo: PgSubredditRepository) -> AutumnResult<Markup> {
+/// The community index.
+///
+/// Every meta value is fixed text, so the `seo(...)` argument carries all of
+/// them and the handler only adds the canonical URL. See `docs/guide/seo.md`.
+#[get(
+    "/r",
+    seo(
+        title = "Communities \u{2022} Autumn Reddit",
+        description = "Every community on Autumn Reddit. Each one collects posts on one topic.",
+        og_type = "website"
+    )
+)]
+pub async fn list(
+    seo: SeoMeta,
+    session: Session,
+    repo: PgSubredditRepository,
+) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let all = repo.find_all().await?;
 
-    Ok(layout(
-        "Communities",
+    Ok(layout_with_seo(
+        crate::seo::with_canonical(seo, "/r"),
         current_user.as_deref(),
         None,
         html! {
@@ -179,9 +194,17 @@ pub async fn create(
 
 // ── Show subreddit with posts ──────────────────────────────────
 
-#[get("/r/{slug}")]
+/// A community's page.
+///
+/// The name and the description come from the row, so the handler refines the
+/// attribute defaults after it reads the community.
+#[get("/r/{slug}", seo(og_type = "website"))]
+// Every argument is a distinct extractor: path, SEO defaults, session, CSRF
+// token, CSRF field name, repository, connection, flash.
+#[allow(clippy::too_many_arguments)]
 pub async fn show(
     Path(slug): Path<String>,
+    seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
     // Same as the post detail page: the widget's hidden input must be named
@@ -256,10 +279,19 @@ pub async fn show(
             .sign_in_prompt("Log in to join the discussion.");
     }
 
+    let seo = crate::seo::with_canonical(
+        seo.title(format!("r/{} \u{2022} Autumn Reddit", sub.name))
+            .description(
+                crate::seo::summarize(&sub.description, 155)
+                    .unwrap_or_else(|| format!("The r/{} community on Autumn Reddit.", sub.name)),
+            ),
+        &__autumn_path_show(&sub.slug),
+    );
+
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
-    Ok(layout(
-        &format!("r/{}", sub.name),
+    Ok(layout_with_seo(
+        seo,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
