@@ -27,6 +27,7 @@
 //! See `docs/guide/query-budgets.md` for the user-facing guide.
 //!
 //! [`query_budget`]: macro@crate::query_budget
+//! [`StaticQueryBudget`]: crate::query_budget::StaticQueryBudget
 
 /// The compile-time query budget proved for one handler.
 ///
