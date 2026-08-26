@@ -131,6 +131,7 @@ copy of the publish order.
 | `#[step_up]` | Step-up authentication guard |
 | `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**0.6.0**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**0.6.0**) — publish via the `Events` extractor, register with `.listeners(...)` |
+| `#[query_budget(N)]` | Compile-time per-route database query ceiling — the build fails when a reachable path can exceed `N` (trunk-dev, #1667). Escape hatches: `#[query_budget(unbounded, reason = "…")]`, and `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement |
 
 Route macros accept a `seo(...)` argument declaring per-page meta tag defaults
 (0.7.0, #1182):
@@ -929,7 +930,8 @@ double-submits and replays.
 - Route macros: `get`, `post`, `put`, `patch`, `delete`, `routes`, `main`,
   `static_get`, `static_routes`, `scheduled`, `tasks`, `job`, `jobs`, `task`,
   `one_off_tasks`, `secured`, `authorize`, `service`, `cached`, `api_doc`,
-  `oauth2_callback`, `paths`, `step_up`, `ws` (when `ws` feature enabled).
+  `oauth2_callback`, `paths`, `step_up`, `query_budget`, `ws` (when `ws`
+  feature enabled).
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.

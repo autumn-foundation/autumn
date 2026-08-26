@@ -42,6 +42,7 @@ mod param_helpers;
 mod parse;
 mod paths_macro;
 mod public;
+mod query_budget;
 mod repository;
 mod route;
 mod routes_macro;
@@ -1106,6 +1107,59 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
     throttle::throttle_macro(attr.into(), item.into()).into()
+}
+
+/// Bound the number of database queries a handler can issue — at compile time.
+///
+/// `#[query_budget(N)]` fails the build when any statically reachable path
+/// through the handler can issue more than `N` queries. The canonical case is
+/// the N+1: a repository or `Db` call inside a loop over a runtime-sized
+/// collection. Because the gate runs during `cargo build`, it fires on every
+/// branch — including the ones no test exercises.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::{get, query_budget};
+///
+/// #[get("/posts")]
+/// #[query_budget(2)]
+/// async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+///     let posts = repo.find_all().await?;                              // 1
+///     let posts = repo.preload(posts, Post::preload().author()).await?; // 2
+///     Ok(render(&posts))
+/// }
+/// ```
+///
+/// Written with a per-row `repo.find_author(...)` inside a `for` loop instead,
+/// the same handler fails to compile with a diagnostic pointing at the loop.
+///
+/// # How the count is computed
+///
+/// * Straight-line statements **sum**; `if` / `match` arms take the
+///   **maximum** (the worst reachable path).
+/// * A loop whose body issues a query is **unbounded**, unless the iterable
+///   has a literal compile-time bound (`for _ in 0..3`), in which case the
+///   body cost is multiplied.
+/// * A method chain rooted at a `Db` / repository handle is **one** query,
+///   however many builder methods (`on_primary()`, `scoped()`, …) it carries.
+/// * `.preload(rows, Post::preload().author().tags())` costs **one query per
+///   association** — the batched `WHERE ... IN (...)` loads.
+/// * Anything opaque — a helper function handed the handle, a macro body that
+///   names it, a closure that may run per element — is **reported**, never
+///   assumed query-free.
+///
+/// # Escape hatches
+///
+/// * `#[query_budget(unbounded, reason = "…")]` — opt the whole handler out.
+/// * `#[query_cost(N)]` on a statement — declare an opaque call's cost.
+/// * `#[query_exempt(reason = "…")]` on a statement — drop it from the ledger.
+///
+/// Both statement annotations are consumed by this macro and never reach
+/// rustc. See `docs/guide/query-budgets.md` for the full guide.
+#[proc_macro_attribute]
+pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
+    query_budget::query_budget_macro(attr.into(), item.into()).into()
 }
 
 /// Gate a route handler on a named feature flag.

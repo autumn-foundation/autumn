@@ -463,6 +463,11 @@ Reads executed inside an explicit transaction (`db.tx(...)` or `repo.with_lock(.
 
 ## Performance & Scaling Guidelines
 
+A route's query count can also be pinned at compile time: annotate the handler
+with [`#[query_budget(N)]`](query-budgets.md) and the build fails if any
+reachable path — including a repository call inside a loop — can exceed `N`.
+
+
 Bulk operations are built for maximum performance, with the following built-in safeguards:
 
 ### The Postgres Parameter Ceiling

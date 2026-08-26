@@ -134,6 +134,9 @@ fn bookmark_columns() -> Vec<Column<'static, Bookmark>> {
 }
 
 #[get("/bookmarks")]
+// One finder, and a page of rows rendered from it. The build fails if a future
+// edit adds a per-row lookup inside the table's column closures (#1667).
+#[query_budget(1)]
 pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let rows = repo.find_all().await?;
     let search_config = autumn_web::widgets::ActiveSearchConfig::new(
@@ -290,6 +293,10 @@ const ACTIVITY_WINDOW_DAYS: i64 = 30;
 ///
 /// See `docs/guide/aggregates.md` for the walkthrough behind this route.
 #[get("/bookmarks/stats")]
+// Two grouped aggregates, each a single `GROUP BY` in the database. The
+// builder methods that shape them (`order_by_aggregate_desc`, `limit`,
+// `bucket`, `filter_range`) issue nothing, so the ceiling is 2 (#1667).
+#[query_budget(2)]
 pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     // Top tags by bookmark count, largest first: `COUNT(*) GROUP BY tag`
     // ordered on the aggregate and capped — the whole top-N runs in the DB.
