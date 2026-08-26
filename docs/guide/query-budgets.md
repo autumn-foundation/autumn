@@ -30,7 +30,7 @@ Autumn already ships two N+1 tools, and both are reactive:
 | Tool | When it fires | Coverage |
 |---|---|---|
 | [Dev inspector](dev-inspector.md) N+1 badge | while you browse | only paths you happen to click |
-| `TestResponse::assert_max_queries` ([testing](testing.md)) | while a test runs | only paths a test exercises |
+| `TestResponse::assert_max_queries` (issue #1262) | while a test runs | only paths a test exercises |
 | **`#[query_budget(N)]`** | **`cargo build`** | **every reachable path, tested or not** |
 
 They are complements, not replacements. The compile-time gate proves an upper
@@ -267,4 +267,4 @@ rather than assumed.
 
 - [Repositories](repositories.md) — `#[repository]` and the derived finders
 - [Dev Request Inspector](dev-inspector.md) — the runtime N+1 badge
-- [Testing](testing.md) — `assert_max_queries` / `assert_no_n_plus_one`
+- [Testing](testing.md) — driving handlers with `TestApp`; `TestResponse::assert_max_queries` / `assert_no_n_plus_one` are the runtime counterpart to this gate

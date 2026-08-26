@@ -77,6 +77,34 @@ client.get("/posts").send().await
 `Server-Timing` query counter); `assert_max_queries(n)` chains and returns
 `&Self` (issue #1262).
 
+### Prove a route's query budget at compile time (trunk-dev)
+
+`assert_max_queries` catches an N+1 only on the path a test exercises.
+`#[query_budget(N)]` fails the **build** when any statically reachable path
+can exceed `N` — every branch, tested or not:
+
+```rust
+#[get("/posts")]
+#[query_budget(2)]
+pub async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+    let posts = repo.find_all().await?;                                // 1
+    let posts = repo.preload(posts, Post::preload().author()).await?;  // 2
+    Ok(render(&posts))
+}
+```
+
+Written with a per-row `repo.find_author(...)` inside a `for` loop instead, the
+build fails with a diagnostic naming the loop and the call. Straight-line
+statements sum; `if`/`match` arms take the worst arm; a handle-rooted chain is
+one query; `preload` costs one query per association. Anything the analysis
+cannot read — a helper handed the `Db` handle, a macro body naming it, a
+closure that may run per element — is reported, not assumed query-free.
+
+Escape hatches: `#[query_budget(unbounded, reason = "…")]` on the handler,
+`#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement. Use the
+two together: the compile-time gate for the upper bound, `assert_max_queries`
+for the SQL actually issued (issue #1667). See `docs/guide/query-budgets.md`.
+
 ### Fake-data factories and bulk seeding (trunk-dev)
 
 Don't hand-build model fixtures. `#[model]` generates a `{Model}Factory`; fill

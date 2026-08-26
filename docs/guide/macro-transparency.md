@@ -24,7 +24,7 @@ in `autumn-macros/src/*.rs` and by trybuild/integration tests.
   - [Repositories](#repositories) — `#[repository(Model)]` and its advanced surface
   - [Services](#services) — `#[service]`
   - [Background Work: Scheduled Tasks, Jobs, Events, Listeners, One-off Tasks](#background-work-scheduled-tasks-jobs-events-listeners-one-off-tasks) — `#[scheduled]` + `tasks![]`, `#[job]` + `jobs![]`, `#[event]`, `#[listener]` + `listeners![]`, `#[task]` + `one_off_tasks![]`, `#[cached]`
-  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`
+  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`, `#[query_budget]`
   - [Mail](#mail) — `#[mailer]`, `#[mailer_preview]` + `mail_previews![]`, `#[inbound_mail]`
   - [i18n, Stories & Path Helpers](#i18n-stories--path-helpers) — `t!`, `story!`, `paths![]`
 - [The Companion Function Pattern](#the-companion-function-pattern)
@@ -1383,6 +1383,50 @@ path-override limiters (added via `AppBuilder::layer`) do **not** share the
 envelope bucket and **still** charge it, exactly as a direct call (use
 `RateLimitExempt` to bypass *every* limiter). It's mentioned here only because it
 lives next to the throttle machinery. See [Rate Limiting](./rate-limiting.md).
+
+### `#[query_budget(N)]`
+
+A **build-time** gate, not a runtime guard: it walks the handler's AST, bounds
+how many database queries any statically reachable path can issue, and fails
+the compile when that bound exceeds `N`.
+
+**You write:**
+
+```rust
+#[get("/posts")]
+#[query_budget(2)]
+async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+    let posts = repo.find_all().await?;                                // 1
+    let posts = repo.preload(posts, Post::preload().author()).await?;  // 2
+    Ok(render(&posts))
+}
+```
+
+**Effect:** the handler is emitted **unchanged** — no injected extractors, no
+prologue, no rewritten return type, nothing at runtime. The only added item is
+a hidden constant recording the contract and the proof:
+
+```rust
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+const __AUTUMN_QUERY_BUDGET_index: ::autumn_web::query_budget::StaticQueryBudget =
+    ::autumn_web::query_budget::StaticQueryBudget::new("index", Some(2u32), Some(2u32));
+```
+
+(That constant is withheld for a method taking `self`, where a trait impl would
+reject an associated const the trait never declared.)
+
+Two statement-level annotations, `#[query_cost(N)]` and
+`#[query_exempt(reason = "…")]`, are this macro's own vocabulary: it reads them
+and **strips them from the emitted function**, so they never reach rustc — and
+so they are meaningless outside a `#[query_budget]`-annotated function.
+
+**Attribute ordering:** either order works, since the handler is emitted
+verbatim. Keep the method attribute outermost anyway, matching `#[throttle]` /
+`#[secured]`, so the route macro still sees the real return type for the
+OpenAPI response schema.
+
+See [Compile-Time Query Budgets](./query-budgets.md).
 
 ---
 
