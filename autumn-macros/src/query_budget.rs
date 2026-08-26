@@ -29,7 +29,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
+use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -129,6 +129,11 @@ const INERT_MACROS: &[&str] = &[
     "event",
     "span",
     "log",
+    // Template macros. Sync by construction, so they cannot drive a future;
+    // one that *does* contain an `await` is caught by the check above before
+    // this list is consulted.
+    "html",
+    "maud",
 ];
 
 /// Methods that run their closure **exactly once**, so a query inside is a
@@ -384,9 +389,24 @@ impl Analyzer {
             Stmt::Item(_) => return Cost::ZERO,
         };
 
+        // An annotation replaces the statement's *cost*, never its effect on
+        // handle tracking. `#[query_exempt(...)] let shard = repo.for_shard(id);`
+        // still binds `shard` to a handle; forgetting that made a later
+        // `shard.find_all()` — including one inside a loop — invisible (#1667
+        // review).
         match self.annotation(attrs) {
-            Some(Annotation::Cost(n)) => return Cost::Exact(n),
-            Some(Annotation::Exempt) => return Cost::ZERO,
+            Some(Annotation::Cost(n)) => {
+                if let Stmt::Local(local) = stmt {
+                    self.bind_handles(local);
+                }
+                return Cost::Exact(n);
+            }
+            Some(Annotation::Exempt) => {
+                if let Stmt::Local(local) = stmt {
+                    self.bind_handles(local);
+                }
+                return Cost::ZERO;
+            }
             None => {}
         }
 
@@ -405,25 +425,34 @@ impl Analyzer {
             if let Some((_, diverge)) = &init.diverge {
                 cost = cost.then(self.expr(diverge));
             }
-            // A binding initialised from a handle (or from a handle-rooted
-            // chain) is itself a handle from here on, so passing it into an
-            // opaque call is still caught.
-            // A binding initialised from a handle — or from a chain rooted at
-            // one, so a builder chain split across `let`s keeps its identity —
-            // is itself a handle from here on.
-            if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
-                collect_pat_idents(&local.pat, &mut self.handles);
-            } else if let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) {
-                // `let (conn, key) = (db, id);` — pair the pattern against the
-                // initialiser element-wise so the handle keeps its tracking.
-                for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
-                    if self.expr_is_handle(element) || self.chain_root_is_handle(element) {
-                        collect_pat_idents(element_pat, &mut self.handles);
-                    }
+        }
+        self.bind_handles(local);
+        cost
+    }
+
+    /// Propagate handle identity from a `let`'s initialiser to its bindings.
+    ///
+    /// Split out of [`Self::local`] because it must run for an *annotated*
+    /// local too: the annotation declares what the statement costs, not
+    /// whether its bindings are handles.
+    fn bind_handles(&mut self, local: &Local) {
+        let Some(init) = &local.init else {
+            return;
+        };
+        // A binding initialised from a handle — or from a chain rooted at one,
+        // so a builder chain split across `let`s keeps its identity — is
+        // itself a handle from here on.
+        if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
+            collect_pat_idents(&local.pat, &mut self.handles);
+        } else if let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) {
+            // `let (conn, key) = (db, id);` — pair the pattern against the
+            // initialiser element-wise so the handle keeps its tracking.
+            for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
+                if self.expr_is_handle(element) || self.chain_root_is_handle(element) {
+                    collect_pat_idents(element_pat, &mut self.handles);
                 }
             }
         }
-        cost
     }
 
     /// Read a `#[query_cost(N)]` / `#[query_exempt(...)]` statement annotation.
@@ -780,12 +809,17 @@ impl Analyzer {
     /// element differently from a transaction callback that runs exactly once.
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
         let name = method.method.to_string();
-        let runs_once = TRANSACTION_METHODS.contains(&name.as_str())
-            || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
+        // Both kinds run their closure at most once, so the body is a fixed
+        // cost either way — but only a transaction hands its closure a
+        // *connection*. Promoting an `Option`/`Result` combinator's parameter
+        // to a handle made `result.unwrap_or_else(|error| error.to_string())`
+        // count `error.to_string()` as a query (#1667 review, round two).
+        let is_transaction = TRANSACTION_METHODS.contains(&name.as_str());
+        let runs_once = is_transaction || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
         let mut cost = Cost::ZERO;
         for arg in &method.args {
             if runs_once {
-                cost = cost.then(self.callback_arg(arg));
+                cost = cost.then(self.callback_arg(arg, is_transaction));
                 continue;
             }
             cost = cost.then(self.expr(arg));
@@ -794,14 +828,20 @@ impl Analyzer {
     }
 
     /// An argument to something that invokes it exactly once: the closure body
-    /// is counted as a fixed cost rather than a per-element one, and its
-    /// parameter is the transaction's own connection — a handle.
-    fn callback_arg(&mut self, arg: &Expr) -> Cost {
+    /// is counted as a fixed cost rather than a per-element one.
+    ///
+    /// `binds_handle` says whether the closure's parameter is a database
+    /// connection. It is for a transaction callback (`db.tx(|conn| …)`); it is
+    /// **not** for an `Option`/`Result` combinator, whose parameter is the
+    /// contained value.
+    fn callback_arg(&mut self, arg: &Expr, binds_handle: bool) -> Cost {
         let Expr::Closure(closure) = arg else {
             return self.expr(arg);
         };
-        for input in &closure.inputs {
-            collect_pat_idents(input, &mut self.handles);
+        if binds_handle {
+            for input in &closure.inputs {
+                collect_pat_idents(input, &mut self.handles);
+            }
         }
         self.expr(&closure.body)
     }
@@ -841,7 +881,8 @@ impl Analyzer {
         let mut cost = self.expr(&call.func);
         for arg in &call.args {
             if runs_once {
-                cost = cost.then(self.callback_arg(arg));
+                // `scoped_transaction` / `savepoint` — always a connection.
+                cost = cost.then(self.callback_arg(arg, true));
                 continue;
             }
             cost = cost.then(self.expr(arg));
@@ -893,30 +934,31 @@ impl Analyzer {
             .segments
             .last()
             .map_or_else(|| "macro".to_string(), |s| s.ident.to_string());
-        // A logging or formatting macro cannot query, however it names the
-        // handle (`tracing::debug!(db = ?db, …)`).
+        // An `await` anywhere in the body is a future being driven right here,
+        // whatever macro wraps it — checked *before* the allowlist so that
+        // `html! { div { (fetch_title(&mut db).await?) } }` is still reported.
+        if tokens_contain_await(&mac.tokens) {
+            return Self::opaque_macro(mac, &name);
+        }
+        // A logging, formatting or template macro cannot itself issue a query,
+        // however it names the handle (`tracing::debug!(db = ?db, …)`,
+        // `html! { (render_row(p, &repo)) }`): it does not await, and a sync
+        // helper it hands the handle to cannot run an async query.
         if INERT_MACROS.contains(&name.as_str()) {
             return Cost::ZERO;
         }
-        // Every query in autumn is `await`ed — but the `await` is not always
-        // spelled at the call site. `tokio::join!(repo.find_one(), …)` drives
-        // both futures with no `await` token in its tokens at all, so an
-        // await-only test reports nothing and the queries vanish (#1667 review).
-        //
-        // Two signals, either of which makes the body suspicious:
-        //   - it awaits, or
-        //   - it calls a method *on* a handle (`repo.find_one()`), which is
-        //     how a query is built whether or not this body awaits it.
-        //
-        // A template that merely passes `&repo` to a render helper
-        // (`html! { (render_row(p, &repo)) }`) does neither: the handle is an
-        // argument, never a receiver. Rejecting that would make `html!`
-        // unusable, and a sync helper cannot issue an async query anyway.
-        if !tokens_contain_await(&mac.tokens)
-            && !tokens_call_on_any_handle(&mac.tokens, &self.handles)
-        {
-            return Cost::ZERO;
-        }
+        // Anything else that names a handle is reported. This is an
+        // allowlist, deliberately: a receiver-shaped test ("does the body call
+        // `repo.method()`?") looked like it separated `tokio::join!` from
+        // `html!`, but it does not — `join!(Post::published(&mut db), …)`
+        // passes the handle as an *argument*, exactly as a template passes it
+        // to a render helper, and slipped through (#1667 review, round two).
+        // Only a name we recognise as inert may be assumed query-free.
+        Self::opaque_macro(mac, &name)
+    }
+
+    /// Report a macro body the analysis cannot read but which names a handle.
+    fn opaque_macro(mac: &syn::Macro, name: &str) -> Cost {
         Cost::unbounded(
             mac.span(),
             format!(
@@ -1130,32 +1172,6 @@ fn is_associated_fn_path(call: &ExprCall) -> bool {
             .iter()
             .nth(segments.len() - 2)
             .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
-}
-
-/// Does this token stream call a method **on** one of the handles — the
-/// `repo . find_one (` shape? A macro body that does this is building a query
-/// whether or not it also spells `await`; `tokio::join!` drives the future for
-/// it. Passing a handle as an argument (`render_row(p, &repo)`) is not this.
-fn tokens_call_on_any_handle(tokens: &TokenStream, handles: &HashSet<String>) -> bool {
-    let flat: Vec<TokenTree> = tokens.clone().into_iter().collect();
-    for window in flat.windows(4) {
-        if let [
-            TokenTree::Ident(recv),
-            TokenTree::Punct(dot),
-            TokenTree::Ident(_),
-            TokenTree::Group(args),
-        ] = window
-            && dot.as_char() == '.'
-            && args.delimiter() == Delimiter::Parenthesis
-            && handles.contains(&recv.to_string())
-        {
-            return true;
-        }
-    }
-    flat.iter().any(|tt| match tt {
-        TokenTree::Group(group) => tokens_call_on_any_handle(&group.stream(), handles),
-        _ => false,
-    })
 }
 
 /// Does this token stream contain an `await` — the marker that something in it
@@ -2491,6 +2507,84 @@ mod tests {
             marker_const_of(&gated_expansion).contains("cfg"),
             "plain cfg was dropped from the marker const: {gated_expansion}"
         );
+    }
+
+    #[test]
+    fn an_annotated_local_still_binds_its_handle() {
+        // The annotation declares what the *statement* costs. It must not also
+        // erase the fact that `shard` is a handle, or every query through the
+        // alias becomes invisible — including one in a loop (#1667 review).
+        let handler = r#"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                #[query_exempt(reason = "selects a shard, issues nothing")]
+                let shard = repo.for_shard(1);
+                let rows = shard.find_all().await?;
+                Ok(rows.len())
+            }
+            "#;
+        // The exempt statement costs nothing, but the query through the alias
+        // is still counted — so a budget of 0 is rejected and 1 is clean.
+        assert_error_contains("0", handler, &["1"]);
+        assert_clean("1", handler);
+
+        // And the alias is still a handle inside a loop, so the N+1 is caught.
+        let n_plus_one = r#"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                #[query_exempt(reason = "selects a shard, issues nothing")]
+                let shard = repo.for_shard(1);
+                let posts = shard.find_all().await?;
+                let mut n = 0;
+                for post in &posts {
+                    n += shard.find_by_id(post.author_id).await?;
+                }
+                Ok(n)
+            }
+            "#;
+        assert_error_contains("5", n_plus_one, &["loop"]);
+    }
+
+    #[test]
+    fn a_future_driving_macro_is_reported_even_when_the_handle_is_an_argument() {
+        // The receiver-shaped test this replaced saw no `db.method()` here and
+        // scored it zero, although `join!` polls two model-finder futures
+        // (#1667 review, round two).
+        let handler = r"
+            async fn dashboard(mut db: Db) -> AutumnResult<usize> {
+                let (posts, todos) = tokio::join!(Post::published(&mut db), Todo::page(&page, &mut db));
+                Ok(posts?.len() + todos?.len())
+            }
+            ";
+        assert_error_contains("0", handler, &["join"]);
+        assert_error_contains("9", handler, &["join"]);
+    }
+
+    #[test]
+    fn an_option_combinator_closure_parameter_is_not_a_handle() {
+        // `unwrap_or_else` runs its closure at most once, but its parameter is
+        // the contained error — not a connection. Treating it as a handle made
+        // `error.to_string()` count as a query (#1667 review, round two).
+        let handler = r"
+            async fn index(flag: bool) -> AutumnResult<String> {
+                let result: Result<String, String> = Err(String::new());
+                Ok(result.unwrap_or_else(|error| error.to_string()))
+            }
+            ";
+        assert_clean("0", handler);
+    }
+
+    #[test]
+    fn a_transaction_callback_parameter_is_still_a_handle() {
+        // The counterpart to the test above: `tx` really does hand its closure
+        // a connection, so a query through it is still counted.
+        let handler = r"
+            async fn index(mut db: Db) -> AutumnResult<usize> {
+                let n = db.tx(|conn| async move { conn.find_all().await }).await?;
+                Ok(n)
+            }
+            ";
+        // 1 for the `tx` call itself, 1 for the query through `conn`.
+        assert_error_contains("1", handler, &["2"]);
+        assert_clean("2", handler);
     }
 
     #[test]
