@@ -29,7 +29,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -898,10 +898,23 @@ impl Analyzer {
         if INERT_MACROS.contains(&name.as_str()) {
             return Cost::ZERO;
         }
-        // Every query in autumn is `await`ed. A template that merely passes
-        // `&repo` to a render helper names the handle without querying, and
-        // rejecting that would make `html!` unusable.
-        if !tokens_contain_await(&mac.tokens) {
+        // Every query in autumn is `await`ed — but the `await` is not always
+        // spelled at the call site. `tokio::join!(repo.find_one(), …)` drives
+        // both futures with no `await` token in its tokens at all, so an
+        // await-only test reports nothing and the queries vanish (#1667 review).
+        //
+        // Two signals, either of which makes the body suspicious:
+        //   - it awaits, or
+        //   - it calls a method *on* a handle (`repo.find_one()`), which is
+        //     how a query is built whether or not this body awaits it.
+        //
+        // A template that merely passes `&repo` to a render helper
+        // (`html! { (render_row(p, &repo)) }`) does neither: the handle is an
+        // argument, never a receiver. Rejecting that would make `html!`
+        // unusable, and a sync helper cannot issue an async query anyway.
+        if !tokens_contain_await(&mac.tokens)
+            && !tokens_call_on_any_handle(&mac.tokens, &self.handles)
+        {
             return Cost::ZERO;
         }
         Cost::unbounded(
@@ -1117,6 +1130,32 @@ fn is_associated_fn_path(call: &ExprCall) -> bool {
             .iter()
             .nth(segments.len() - 2)
             .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
+}
+
+/// Does this token stream call a method **on** one of the handles — the
+/// `repo . find_one (` shape? A macro body that does this is building a query
+/// whether or not it also spells `await`; `tokio::join!` drives the future for
+/// it. Passing a handle as an argument (`render_row(p, &repo)`) is not this.
+fn tokens_call_on_any_handle(tokens: &TokenStream, handles: &HashSet<String>) -> bool {
+    let flat: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    for window in flat.windows(4) {
+        if let [
+            TokenTree::Ident(recv),
+            TokenTree::Punct(dot),
+            TokenTree::Ident(_),
+            TokenTree::Group(args),
+        ] = window
+            && dot.as_char() == '.'
+            && args.delimiter() == Delimiter::Parenthesis
+            && handles.contains(&recv.to_string())
+        {
+            return true;
+        }
+    }
+    flat.iter().any(|tt| match tt {
+        TokenTree::Group(group) => tokens_call_on_any_handle(&group.stream(), handles),
+        _ => false,
+    })
 }
 
 /// Does this token stream contain an `await` — the marker that something in it
@@ -1512,10 +1551,18 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let errors = errors.iter().map(syn::Error::to_compile_error);
 
+    // Only plain `cfg` is replayed. A `cfg_attr` applies *some other*
+    // attribute conditionally, and that attribute is written for a function:
+    // copying `#[cfg_attr(feature = "tracing", tracing::instrument)]` verbatim
+    // puts `tracing::instrument` on a `const` and fails to compile once the
+    // feature is on (#1667 review). Dropping it is safe — the marker is a
+    // standalone const that names nothing from the function, so emitting it in
+    // a configuration where the function is absent costs a dead const, which
+    // `dead_code` below already allows.
     let cfgs: Vec<&Attribute> = input_fn
         .attrs
         .iter()
-        .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+        .filter(|a| a.path().is_ident("cfg"))
         .collect();
 
     let marker_const = if takes_self {
@@ -1584,6 +1631,38 @@ mod tests {
         let mut messages = Vec::new();
         collect_compile_errors(&out, &mut messages);
         (!messages.is_empty()).then(|| messages.join("\n---\n"))
+    }
+
+    /// The generated marker const, sliced out of a full expansion. The
+    /// handler's own attributes stay on the handler, so a test that asks what
+    /// the *const* carries must not look at the whole stream.
+    fn marker_const_of(expansion: &str) -> &str {
+        let doc_hidden = expansion
+            .find("# [doc (hidden)]")
+            .expect("expansion contains a marker const");
+        // The const's own attributes (`#[cfg(...)]`) precede `#[doc(hidden)]`,
+        // so start just past the handler body's closing brace.
+        let start = expansion[..doc_hidden]
+            .rfind('}')
+            .map_or(doc_hidden, |brace| brace + 1);
+        &expansion[start..]
+    }
+
+    /// Expand and return the rendered token stream, asserting it carries no
+    /// compile error. Used by tests that assert on what expansion *emits*
+    /// rather than on whether it rejects.
+    fn expand_ok(attr: &str, item: &str) -> String {
+        let attr_ts: TokenStream = attr.parse().expect("attr parses");
+        let item_ts: TokenStream = item.parse().expect("item parses");
+        let out = query_budget_macro(attr_ts, item_ts);
+        let mut messages = Vec::new();
+        collect_compile_errors(&out, &mut messages);
+        assert!(
+            messages.is_empty(),
+            "expected a clean expansion, got: {}",
+            messages.join("\n---\n")
+        );
+        out.to_string()
     }
 
     fn collect_compile_errors(tokens: &TokenStream, out: &mut Vec<String>) {
@@ -2343,6 +2422,75 @@ mod tests {
             ";
         assert_clean("2", handler);
         assert_error_contains("1", handler, &["2"]);
+    }
+
+    #[test]
+    fn a_macro_that_drives_futures_without_an_await_token_is_reported() {
+        // `tokio::join!` polls both futures, but its tokens carry no `await`.
+        // An await-only test scores this zero and the two queries vanish —
+        // a false negative, which the soundness contract forbids (#1667 review).
+        let handler = r"
+            async fn dashboard(repo: PgPostRepository) -> AutumnResult<usize> {
+                let (a, b) = tokio::join!(repo.find_one(), repo.find_two());
+                Ok(a? + b?)
+            }
+            ";
+        assert_error_contains("0", handler, &["join"]);
+        // And it stays reported however generous the budget: the body is
+        // opaque, so no finite ceiling can be proven from it.
+        assert_error_contains("5", handler, &["join"]);
+    }
+
+    #[test]
+    fn a_template_that_passes_a_handle_to_a_helper_still_compiles() {
+        // The counterpart to the test above: `&repo` is an *argument* here,
+        // never a receiver, and a sync helper cannot issue an async query.
+        // Reporting this would make `html!` unusable.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+                let posts = repo.find_all().await?;
+                Ok(html! { @for p in &posts { (render_row(p, &repo)) } })
+            }
+            ";
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn a_cfg_attr_on_the_handler_is_not_replayed_onto_the_marker_const() {
+        // `#[cfg_attr(feature = "x", tracing::instrument)]` names an attribute
+        // written for a *function*. Copying it verbatim onto the generated
+        // `const` fails to compile once the feature is on (#1667 review), so
+        // only plain `cfg` is replayed.
+        let handler = r#"
+            #[cfg_attr(feature = "tracing", tracing::instrument)]
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let posts = repo.find_all().await?;
+                Ok(posts.len())
+            }
+            "#;
+        // Assert on the marker const alone — the function itself keeps its
+        // `cfg_attr`, which is correct and would otherwise mask the check.
+        let expansion = expand_ok("1", handler);
+        let marker = marker_const_of(&expansion);
+        assert!(
+            !marker.contains("instrument"),
+            "marker const replayed a cfg_attr payload: {marker}"
+        );
+
+        // A plain `cfg`, by contrast, still gates the const so it cannot
+        // outlive the function it describes.
+        let gated = r#"
+            #[cfg(feature = "db")]
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let posts = repo.find_all().await?;
+                Ok(posts.len())
+            }
+            "#;
+        let gated_expansion = expand_ok("1", gated);
+        assert!(
+            marker_const_of(&gated_expansion).contains("cfg"),
+            "plain cfg was dropped from the marker const: {gated_expansion}"
+        );
     }
 
     #[test]
