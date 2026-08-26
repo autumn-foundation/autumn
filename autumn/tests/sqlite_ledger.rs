@@ -71,6 +71,22 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        lg_cascade_parents (id) {
+            id -> Int8,
+            name -> Text,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        lg_cascade_children (id) {
+            id -> Int8,
+            parent_id -> Int8,
+            label -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         lg_secret_notes (id) {
             id -> Int8,
             body -> Text,
@@ -89,7 +105,10 @@ mod schema {
     }
 }
 
-use schema::{lg_effective_notes, lg_invoices, lg_secret_notes, lg_tenant_invoices};
+use schema::{
+    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_secret_notes,
+    lg_tenant_invoices,
+};
 
 #[autumn_web::model(table = "lg_invoices")]
 pub struct LgInvoice {
@@ -154,6 +173,46 @@ pub struct LgEffectiveNote {
 )]
 pub trait LgEffectiveNoteRepository {}
 
+// ── A hard-deleting parent cascading into a ledgered child ───────────
+//
+// The parent's macro cannot see that the child is ledgered — separate
+// `#[repository]` invocations — so the combination cannot be refused at compile
+// time. Erasing the child would destroy the record its ledger reconstructs;
+// soft-deleting it would leave a live foreign key pointing at a parent row about
+// to disappear, which the database rejects. It is refused with a typed error.
+
+#[autumn_web::model(table = "lg_cascade_children")]
+pub struct LgCascadeChild {
+    #[id]
+    pub id: i64,
+    pub parent_id: i64,
+    pub label: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    LgCascadeChild,
+    table = "lg_cascade_children",
+    soft_delete,
+    ledgered = true
+)]
+pub trait LgCascadeChildRepository {}
+
+#[autumn_web::model(table = "lg_cascade_parents")]
+pub struct LgCascadeParent {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    LgCascadeParent,
+    table = "lg_cascade_parents",
+    dependent(PgLgCascadeChildRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait LgCascadeParentRepository {}
+
 /// A model with a column the public JSON omits.
 ///
 /// `#[model]` stamps `#[serde(skip_serializing)]` on a `#[private]` field, so a
@@ -216,6 +275,16 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  reference TEXT NOT NULL, \
                  tenant_id TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_cascade_parents (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 name TEXT NOT NULL\
+             )",
+            "CREATE TABLE lg_cascade_children (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 parent_id BIGINT NOT NULL REFERENCES lg_cascade_parents(id), \
+                 label TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_secret_notes (\
@@ -979,6 +1048,62 @@ async fn bulk_writes_chain_every_row_independently() {
         let report = repo.ledger_verify(*id).await.expect("verify");
         assert!(report.is_intact(), "record {id}: {report:?}");
     }
+}
+
+// ── a hard-deleting parent cannot erase a ledgered child ─────────────
+
+/// Neither outcome is available, so the cascade is refused with a typed error
+/// rather than erasing the ledger or dying on a foreign-key violation.
+#[tokio::test]
+async fn a_hard_parent_delete_is_refused_rather_than_erasing_a_ledgered_child() {
+    let pool = boot_pool("lg_cascade").await;
+    let parents = PgLgCascadeParentRepository::with_pool_untracked(pool.clone());
+    let children = PgLgCascadeChildRepository::with_pool_untracked(pool);
+
+    let parent = parents
+        .save(&NewLgCascadeParent {
+            name: "p".to_string(),
+        })
+        .await
+        .expect("insert parent");
+    let child = children
+        .save(&NewLgCascadeChild {
+            parent_id: parent.id,
+            label: "c".to_string(),
+        })
+        .await
+        .expect("insert ledgered child");
+
+    let err = parents
+        .delete_by_id(parent.id)
+        .await
+        .expect_err("a hard parent delete must not erase a ledgered child");
+    let typed = err
+        .downcast_chain_ref::<autumn_web::ledger::LedgerError>()
+        .expect("the refusal is a typed LedgerError, not a foreign-key violation");
+    assert!(
+        matches!(
+            typed,
+            autumn_web::ledger::LedgerError::HardDeleteCascade { record_id, .. }
+                if *record_id == child.id
+        ),
+        "{typed:?}"
+    );
+    // The message has to name the fix, since the app author cannot see the
+    // conflict from either repository's declaration alone.
+    let rendered = typed.to_string();
+    assert!(rendered.contains("soft_delete"), "{rendered}");
+
+    // Nothing was erased, and the child's chain is untouched.
+    let live = children
+        .find_by_id(child.id)
+        .await
+        .expect("read child")
+        .expect("the child survives a refused cascade");
+    assert!(live.deleted_at.is_none());
+    let report = children.ledger_verify(child.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 1);
 }
 
 // ── hidden columns are covered by the live-state cross-check ─────────

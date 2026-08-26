@@ -2500,17 +2500,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
         // semantic orphan. Non-soft-delete children are always hard-deleted.
         let destroy_mutation = if config.soft_delete && config.ledgered {
-            // #1699: a ledgered child is never hard-deleted, even by a cascade
-            // from a hard-deleting parent. The rule the branch below encodes —
-            // "a soft-deleted child left pointing at a hard-deleted parent is a
-            // semantic orphan" — is real, but for a ledgered entity the cure is
-            // worse: erasing the row erases the record the ledger reconstructs,
-            // which is exactly what `ledgered` refusing `purge` and requiring
-            // `soft_delete` exists to prevent. The child is soft-deleted either
-            // way and the revision that records it stays truthful; an orphaned
-            // FK is a schema concern the app can see, an erased ledger is not.
+            // #1699: a ledgered child is never hard-deleted, even by a cascade —
+            // erasing the row erases the record the ledger reconstructs, which is
+            // exactly what `ledgered` refusing `purge` and requiring `soft_delete`
+            // exists to prevent.
+            //
+            // When the parent is soft-deleted the child follows suit and records a
+            // revision, as it would for any other delete. When the parent is being
+            // *hard*-deleted there is no good outcome left: erasing the child is
+            // refused above, and soft-deleting it leaves a live foreign key pointing
+            // at a row that is about to disappear — which the database rejects,
+            // rolling the whole cascade back with an opaque constraint error. The
+            // parent's macro cannot see that this child is ledgered (separate
+            // `#[repository]` invocations), so the combination is refused here, at
+            // runtime, with a typed error that names the fix. That is the escape
+            // hatch the issue allows where compile-time enforcement cannot reach.
             quote! {
                 #destroy_count_bind = {
+                    if !__parent_soft {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::conflict(
+                                ::autumn_web::ledger::LedgerError::HardDeleteCascade {
+                                    table: #table_name.to_string(),
+                                    record_id: __cid,
+                                },
+                            ),
+                        );
+                    }
                     #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     ::autumn_web::reexports::diesel::update(

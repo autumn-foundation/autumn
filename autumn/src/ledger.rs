@@ -889,6 +889,28 @@ pub enum LedgerError {
         /// Underlying reason.
         detail: String,
     },
+    /// A hard-deleting parent's `dependent(..., on_delete = destroy)` cascade
+    /// reached a ledgered child.
+    ///
+    /// Neither outcome is available: erasing the child destroys the record its
+    /// ledger reconstructs, and soft-deleting it leaves a live foreign key
+    /// pointing at a parent row that is about to be deleted, which the database
+    /// rejects and rolls back. The parent's macro cannot see that the child is
+    /// ledgered — they are separate `#[repository]` invocations — so this is
+    /// refused at runtime with a typed error rather than at compile time.
+    #[error(
+        "cannot cascade a hard delete into ledgered {table}#{record_id}: erasing it \
+         would destroy the record its ledger reconstructs, and keeping it would leave \
+         a foreign key pointing at a deleted parent. Make the parent repository \
+         `soft_delete` (a soft parent delete soft-deletes this child and records a \
+         revision), or change the association to `on_delete = nullify`"
+    )]
+    HardDeleteCascade {
+        /// Table of the ledgered child.
+        table: String,
+        /// Primary key of the child the cascade reached.
+        record_id: i64,
+    },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
     ChainBroken {

@@ -78,8 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape hatch, which writes no history at all) is not generated,
   `#[version_history(sensitive = [...])]` is rejected because a redacted column
   could not be reconstructed, and a `dependent(..., on_delete = destroy)` cascade
-  from a hard-deleting parent soft-deletes a ledgered child rather than erasing
-  it. `restore` — the inverse of a ledgered delete — records its own revision, so
+  never erases a ledgered child — from a soft-deleting parent the child follows
+  suit and records a revision, and from a hard-deleting parent the cascade is
+  refused with a typed `LedgerError::HardDeleteCascade` naming the fix (the
+  parent's macro cannot see that the child is ledgered, so this is the one guard
+  that cannot be a compile error). `restore` — the inverse of a ledgered delete — records its own revision, so
   the ledger never silently disagrees with the table. `tenant_scoped` ledgered
   reads fail closed across tenants, and `across_tenants()` and cross-shard ledger
   reads are rejected rather than interleaving chains that share a record id. See
