@@ -565,7 +565,17 @@ impl Analyzer {
             Expr::Call(call) => self.call(call),
             Expr::Macro(m) => self.mac(&m.mac),
             Expr::Closure(closure) => {
+                // A parameter shadows whatever the name meant outside:
+                // `rows.iter().map(|repo| repo.len())` binds an element, not
+                // the repository. Analysing the body against the outer
+                // identity scored `len()` as a query and then blamed the
+                // closure for it (#1667 review, round four).
+                let outer = self.handles.clone();
+                for input in &closure.inputs {
+                    self.rebind(input, false);
+                }
                 let body = self.expr(&closure.body);
+                self.handles = outer;
                 if body.is_zero() {
                     Cost::ZERO
                 } else if matches!(body, Cost::Unbounded(_)) {
@@ -896,12 +906,16 @@ impl Analyzer {
         let Expr::Closure(closure) = arg else {
             return self.expr(arg);
         };
-        if binds_handle {
-            for input in &closure.inputs {
-                collect_pat_idents(input, &mut self.handles);
-            }
+        // Same scoping as the general closure arm: a parameter shadows the
+        // outer meaning of its name. A transaction's parameter *is* a
+        // connection, so it binds; any other parameter clears.
+        let outer = self.handles.clone();
+        for input in &closure.inputs {
+            self.rebind(input, binds_handle);
         }
-        self.expr(&closure.body)
+        let cost = self.expr(&closure.body);
+        self.handles = outer;
+        cost
     }
 
     /// `.preload(rows, Post::preload().author().tags())` issues one batched
@@ -1055,6 +1069,28 @@ impl Analyzer {
                 }
                 HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
             }
+            // A handle selected through a conditional is still a handle:
+            // `let active = if primary { repo } else { replica };`. Every arm
+            // is a candidate and *any* of them being a handle is enough — the
+            // conservative direction, since guessing "not a handle" here loses
+            // every query made through the binding (#1667 review, round four).
+            Expr::If(i) => {
+                self.block_tail_is_handle(&i.then_branch)
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_is_handle(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_handle(&arm.body)),
+            Expr::Block(b) => self.block_tail_is_handle(&b.block),
+            Expr::Unsafe(u) => self.block_tail_is_handle(&u.block),
+            _ => false,
+        }
+    }
+
+    /// Does a block *evaluate to* a handle — i.e. does its tail expression?
+    fn block_tail_is_handle(&self, block: &Block) -> bool {
+        match block.stmts.last() {
+            Some(Stmt::Expr(expr, None)) => self.expr_is_handle(expr),
             _ => false,
         }
     }
@@ -2728,6 +2764,85 @@ mod tests {
             ";
         assert_clean("1", handler);
         assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn a_conditionally_selected_handle_is_still_a_handle() {
+        // Every arm yields a repository, so the loop below is an N+1. Scoring
+        // the initialiser "not a handle" loses every query through the binding
+        // (#1667 review, round four).
+        let handler = r"
+            async fn index(repo: PgPostRepository, replica: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> {
+                let active = if primary { repo } else { replica };
+                let mut n = 0;
+                for id in &ids {
+                    n += active.find_by_id(*id).await?;
+                }
+                Ok(n)
+            }
+            ";
+        assert_error_contains("9", handler, &["loop"]);
+
+        // `match` selects a handle the same way.
+        let via_match = r"
+            async fn index(repo: PgPostRepository, replica: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> {
+                let active = match mode { Mode::Primary => repo, Mode::Replica => replica };
+                let mut n = 0;
+                for id in &ids {
+                    n += active.find_by_id(*id).await?;
+                }
+                Ok(n)
+            }
+            ";
+        assert_error_contains("9", via_match, &["loop"]);
+    }
+
+    #[test]
+    fn rebinding_a_handle_through_a_conditional_keeps_it_tracked() {
+        // The regression guard for the shadowing fix: clearing on a
+        // non-handle initialiser must not swallow `let repo = if … { repo }`,
+        // where the name genuinely still holds a handle.
+        let handler = r"
+            async fn index(repo: PgPostRepository, replica: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> {
+                let repo = if primary { repo } else { replica };
+                let mut n = 0;
+                for id in &ids {
+                    n += repo.find_by_id(*id).await?;
+                }
+                Ok(n)
+            }
+            ";
+        assert_error_contains("9", handler, &["loop"]);
+    }
+
+    #[test]
+    fn a_closure_parameter_shadows_an_outer_handle_name() {
+        // `|repo|` binds a row, not the repository. Analysing the body against
+        // the outer identity counted `len()` as a query and then reported it as
+        // unbounded for sitting in a closure (#1667 review, round four).
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let rows = repo.find_all().await?;
+                Ok(rows.iter().map(|repo| repo.len()).sum())
+            }
+            ";
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn a_closure_parameter_shadow_does_not_leak_past_the_closure() {
+        // The counterpart: clearing the name inside the closure must not stop
+        // the real handle being counted afterwards.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let rows = repo.find_all().await?;
+                let n: usize = rows.iter().map(|repo| repo.len()).sum();
+                let more = repo.find_all().await?;
+                Ok(n + more.len())
+            }
+            ";
+        assert_clean("2", handler);
+        assert_error_contains("1", handler, &["2"]);
     }
 
     #[test]
