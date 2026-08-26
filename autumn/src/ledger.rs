@@ -1060,7 +1060,7 @@ mod tests {
 
     // ── revision_hash ────────────────────────────────────────────────
 
-    fn base_input<'a>(snapshot: &'a serde_json::Value) -> RevisionHashInput<'a> {
+    fn base_input(snapshot: &serde_json::Value) -> RevisionHashInput<'_> {
         RevisionHashInput {
             prev_hash: None,
             table_name: "widgets",
