@@ -1403,6 +1403,73 @@ fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
     );
 }
 
+/// Start a Postgres testcontainer and return it (alive for as long as the
+/// binding lives) alongside its connection URL.
+async fn start_postgres() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+) {
+    use testcontainers::runners::AsyncRunner as _;
+
+    let postgres = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer");
+    let host = postgres.get_host().await.expect("postgres host");
+    let pg_port = postgres
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
+    let url = format!("postgres://postgres:postgres@{host}:{pg_port}/postgres");
+    (postgres, url)
+}
+
+/// Migrate, `cargo build`, and boot a freshly generated project against
+/// `database_url`, returning the running server (kept alive by the returned
+/// guard) and its base URL.
+///
+/// Shared by the live-HTTP gates so they cannot drift on how the app under test
+/// is brought up; a build failure surfaces the full compiler output, since these
+/// gates are the only place the generated app is ever compiled AND run.
+async fn migrate_build_and_boot(
+    project: &Path,
+    database_url: &str,
+    client: &reqwest::Client,
+) -> (ServerGuard, String) {
+    run_autumn_with_env(
+        project,
+        &["migrate"],
+        &[("AUTUMN_DATABASE__URL", database_url)],
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let port = free_port();
+    let child = Command::new("cargo")
+        .args(["run", "--quiet"])
+        .current_dir(project)
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_DATABASE__URL", database_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn generated server");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let server = wait_for_server_ready_async(child, client, &base).await;
+    (server, base)
+}
+
 /// Slow live-HTTP check: scaffold a fresh project, run migrations against a
 /// real Postgres testcontainer, boot the generated server, and assert the
 /// generated HTML and JSON routes actually respond.
@@ -1412,9 +1479,6 @@ fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
 #[tokio::test]
 #[ignore = "slow: starts Postgres, runs diesel migrations, builds and boots a generated app"]
 async fn generated_scaffold_serves_posts_index_and_json_api() {
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::postgres::Postgres;
-
     let (_tmp, project) = fresh_project("scaffold-live");
     patch_generated_cargo_toml(&project);
 
@@ -1430,49 +1494,9 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         ],
     );
 
-    let postgres = Postgres::default()
-        .start()
-        .await
-        .expect("failed to start Postgres testcontainer");
-    let host = postgres.get_host().await.expect("postgres host");
-    let pg_port = postgres
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("postgres port");
-    let database_url = format!("postgres://postgres:postgres@{host}:{pg_port}/postgres");
-
-    run_autumn_with_env(
-        &project,
-        &["migrate"],
-        &[("AUTUMN_DATABASE__URL", database_url.as_str())],
-    );
-
-    let build = Command::new("cargo")
-        .args(["build"])
-        .current_dir(&project)
-        .output()
-        .expect("failed to run cargo build");
-    assert!(
-        build.status.success(),
-        "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr),
-    );
-
-    let port = free_port();
-    let child = Command::new("cargo")
-        .args(["run", "--quiet"])
-        .current_dir(&project)
-        .env("AUTUMN_SERVER__PORT", port.to_string())
-        .env("AUTUMN_DATABASE__URL", &database_url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn generated server");
-
+    let (_postgres, database_url) = start_postgres().await;
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{port}");
-    let _server = wait_for_server_ready_async(child, &client, &base).await;
+    let (_server, base) = migrate_build_and_boot(&project, &database_url, &client).await;
 
     let response = client
         .get(format!("{base}/posts"))
@@ -1502,6 +1526,471 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
     assert_eq!(
         envelope["total_elements"], 0,
         "empty JSON index total_elements"
+    );
+}
+
+/// Give a freshly generated app a test-only session sign-in route.
+///
+/// A scaffold's `new`/`edit` forms and every mutating route are `#[secured]`,
+/// so an anonymous client is answered 401 and never reaches the validation path
+/// under test. `#[secured]` is satisfied by the configured auth session key
+/// (`auth.session_key`, default `user_id`) being present in the session, so
+/// this splices exactly one `#[public]` route into the generated `src/main.rs`
+/// that sets it — the smallest stand-in for `autumn generate auth`'s real
+/// sign-in flow, which is a separate generator with its own coverage.
+fn add_session_signin_stub(project: &Path) {
+    const HANDLER: &str = "\n// Test-only sign-in stub (see `add_session_signin_stub`).\n\
+                           #[get(\"/__signin\")]\n\
+                           #[public]\n\
+                           async fn signin_stub(session: autumn_web::session::Session) -> &'static str {\n    \
+                           session.insert(\"user_id\", \"1\").await;\n    \
+                           \"signed in\"\n\
+                           }\n\n\
+                           #[autumn_web::main]\n";
+
+    let main_rs = project.join("src/main.rs");
+    let source = fs::read_to_string(&main_rs).expect("read generated src/main.rs");
+
+    assert_eq!(
+        source.matches("\n#[autumn_web::main]\n").count(),
+        1,
+        "expected exactly one `#[autumn_web::main]` in the generated src/main.rs"
+    );
+    let patched = source.replacen("\n#[autumn_web::main]\n", HANDLER, 1);
+
+    assert_eq!(
+        patched.matches("routes![index,").count(),
+        1,
+        "expected the generated `routes![index, …]` list in src/main.rs"
+    );
+    let patched = patched.replacen("routes![index,", "routes![signin_stub, index,", 1);
+
+    fs::write(&main_rs, patched).expect("write patched src/main.rs");
+}
+
+/// Slice the rendered `<input …>` tag whose `name="…"` attribute matches
+/// `name`, so a field-scoped attribute assertion can never accidentally match a
+/// sibling control. `name="…"` appears only on the control itself — the
+/// `<label>` uses `for=`, and the inline-error `<div>` uses `id="…-error"` — so
+/// the match is unambiguous.
+fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!("name=\"{name}\"");
+    let at = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no control named `{name}` in the rendered form:\n{html}"));
+    let start = html[..at]
+        .rfind('<')
+        .unwrap_or_else(|| panic!("control `{name}` has no opening tag:\n{html}"));
+    let end = html[start..]
+        .find('>')
+        .map_or(html.len(), |rel| start + rel + 1);
+    &html[start..end]
+}
+
+/// Every `<input type="hidden" name=… value=…>` inside the `<form>` whose
+/// `action` matches, as name/value pairs ready to re-submit.
+///
+/// Collected wholesale rather than named one at a time so the POST legs below
+/// carry whatever the framework's own form rendering decided to inject — today
+/// the one-time `_submit_token`, and the `_csrf` field whenever the CSRF layer
+/// is active — instead of hard-coding a list that silently rots. Scoped to the
+/// resource's own form so the layout's consent-banner form can't leak in.
+fn hidden_form_fields(html: &str, action: &str) -> Vec<(String, String)> {
+    let marker = format!("action=\"{action}\"");
+    let at = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no <form {marker}> in:\n{html}"));
+    let start = html[..at].rfind('<').expect("form opening tag");
+    let end = html[start..]
+        .find("</form>")
+        .map_or(html.len(), |rel| start + rel);
+    let form = &html[start..end];
+
+    // Matched as "an `<input>` tag that carries `type=\"hidden\"`" rather than
+    // the literal prefix `<input type="hidden"`: attribute ORDER is a maud
+    // rendering detail, and a helper that ever emitted `name` first would
+    // otherwise drop its field here silently — the POST would then fail CSRF /
+    // submit-token checks and surface as a baffling 403 instead of the 422 the
+    // leg is actually asserting.
+    let mut fields = Vec::new();
+    let mut rest = form;
+    while let Some(at) = rest.find("<input") {
+        let tag_end = rest[at..].find('>').map_or(rest.len(), |rel| at + rel + 1);
+        let tag = &rest[at..tag_end];
+        if tag.contains("type=\"hidden\"")
+            && let (Some(name), Some(value)) = (attr_value(tag, "name"), attr_value(tag, "value"))
+        {
+            fields.push((name, value));
+        }
+        rest = &rest[tag_end..];
+    }
+    assert!(
+        !fields.is_empty(),
+        "the create form must carry at least the one-time submit token:\n{form}"
+    );
+    fields
+}
+
+/// The value of `attr` on a single rendered tag, un-escaping the entities maud
+/// emits inside an attribute value.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let at = tag.find(&needle)? + needle.len();
+    let end = at + tag[at..].find('"')?;
+    Some(
+        tag[at..end]
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Fetch `GET {base}/posts/new` and return the rendered create form plus the
+/// hidden fields a subsequent `POST /posts` must echo back.
+///
+/// Re-fetched before every POST leg: the submit token is one-time, so a stale
+/// pair would be rejected before the validation path under test is reached.
+async fn fetch_new_post_form(
+    client: &reqwest::Client,
+    base: &str,
+) -> (String, Vec<(String, String)>) {
+    let response = client
+        .get(format!("{base}/posts/new"))
+        .send()
+        .await
+        .expect("GET /posts/new failed");
+    assert_eq!(response.status(), 200, "GET /posts/new status");
+    let html = response.text().await.expect("GET /posts/new body");
+    let hidden = hidden_form_fields(&html, "/posts");
+    (html, hidden)
+}
+
+/// `POST /posts` carrying the form's own hidden fields plus the submitted
+/// columns, returning `(status, body)`.
+async fn submit_post(
+    client: &reqwest::Client,
+    base: &str,
+    hidden: &[(String, String)],
+    columns: &[(&str, &str)],
+) -> (u16, String) {
+    let mut form: Vec<(String, String)> = hidden.to_vec();
+    form.extend(
+        columns
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
+    let response = client
+        .post(format!("{base}/posts"))
+        .form(&form)
+        .send()
+        .await
+        .expect("POST /posts failed");
+    let status = response.status().as_u16();
+    let body = response.text().await.expect("POST /posts body");
+    (status, body)
+}
+
+/// `GET /api/posts` -> the `total_elements` count of the generated JSON index.
+async fn stored_post_count(client: &reqwest::Client, base: &str) -> u64 {
+    let response = client
+        .get(format!("{base}/api/posts"))
+        .send()
+        .await
+        .expect("GET /api/posts failed");
+    assert_eq!(response.status(), 200, "GET /api/posts status");
+    let body = response.text().await.expect("GET /api/posts body");
+    let envelope: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("GET /api/posts must return a JSON Page envelope");
+    envelope["total_elements"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("Page envelope must carry total_elements:\n{body}"))
+}
+
+/// Assert the rendered `Post` form carries the HTML5 constraints its DSL
+/// modifiers declared (issue #1388 AC3/AC4/AC6), and that the pre-existing
+/// `required` (derived from non-nullability) survives alongside them rather
+/// than being displaced by them.
+///
+/// Shared by the initial `GET /posts/new` render and the 422 re-render, so a
+/// field that sheds its client-side guards on the way back from a rejection is
+/// caught as readily as one that never had them.
+fn assert_constrained_controls_render_html5(html: &str) {
+    // The BOOLEAN `required` attribute, not the `aria-required="true"` that sits
+    // beside it: `contains("required")` would be satisfied by the ARIA hint
+    // alone, so a regression that dropped the browser-enforced attribute while
+    // keeping the screen-reader one would sail through. `required` is rendered
+    // last on the tag (`autumn_web::a11y::TextField`), so the closing angle
+    // bracket pins it.
+    const REQUIRED: &str = " required>";
+
+    let title = input_tag(html, "title");
+    for attr in ["minlength=\"3\"", "maxlength=\"120\"", REQUIRED] {
+        assert!(
+            title.contains(attr),
+            "`title` input must carry `{attr}` (issue #1388 AC4): {title}"
+        );
+    }
+    let contact = input_tag(html, "contact");
+    for attr in ["type=\"email\"", REQUIRED] {
+        assert!(
+            contact.contains(attr),
+            "`contact` input must carry `{attr}` (issue #1388 AC4): {contact}"
+        );
+    }
+    let homepage = input_tag(html, "homepage");
+    for attr in ["type=\"url\"", REQUIRED] {
+        assert!(
+            homepage.contains(attr),
+            "`homepage` input must carry `{attr}` (issue #1388 AC3): {homepage}"
+        );
+    }
+    let age = input_tag(html, "age");
+    for attr in ["type=\"number\"", "min=\"0\"", "max=\"130\"", REQUIRED] {
+        assert!(
+            age.contains(attr),
+            "`age` input must carry `{attr}` (issue #1388 AC6): {age}"
+        );
+    }
+}
+
+/// Assert the 422 re-render carries an inline, `role="alert"` error block for
+/// `field` specifically.
+///
+/// Scoped to the field's own `id="{field}-error"` container rather than checking
+/// `role="alert"` anywhere on the page: a sibling field's error block (or a
+/// flash region) would otherwise satisfy a document-wide search, so the
+/// assertion would keep passing after the alert role was dropped from the very
+/// element a screen reader needs it on.
+fn assert_inline_field_error(html: &str, field: &str) {
+    let marker = format!("id=\"{field}-error\"");
+    let at = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("the 422 must re-render an inline error for `{field}`:\n{html}"));
+    let start = html[..at].rfind('<').expect("error element opening tag");
+    let end = html[start..]
+        .find('>')
+        .map_or(html.len(), |rel| start + rel + 1);
+    let tag = &html[start..end];
+    assert!(
+        tag.contains("role=\"alert\""),
+        "`{field}`'s inline error must be announced with role=\"alert\": {tag}"
+    );
+}
+
+/// A booted, signed-in generated app under test, with everything that must
+/// outlive the assertions held alive.
+///
+/// Field order IS the teardown order (struct fields drop in declaration order):
+/// the server dies before the Postgres container it talks to, which dies before
+/// the tempdir holding the project it was built from.
+struct LiveApp {
+    _server: ServerGuard,
+    _postgres: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    _tmp: tempfile::TempDir,
+    client: reqwest::Client,
+    base: String,
+}
+
+/// Scaffold a `Post` whose columns carry the full issue #1388 constraint mix,
+/// boot it against a real Postgres, and sign in — the shared setup for the
+/// runtime round-trip below.
+async fn boot_constrained_post_app() -> LiveApp {
+    let (tmp, project) = fresh_project("scaffold-constraints-live");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String{min=3,max=120}",
+            "contact:String{email}",
+            "homepage:String{url}",
+            "age:i32{min=0,max=130}",
+        ],
+    );
+    add_session_signin_stub(&project);
+
+    let (postgres, database_url) = start_postgres().await;
+
+    // A cookie jar carries the session the `#[secured]` form routes need (and
+    // the CSRF cookie whenever that layer is active); redirects are NOT
+    // followed, so the create handler's 303-vs-422 answer is observable
+    // directly rather than through whatever it redirects to. The per-request
+    // timeout keeps a wedged handler failing the test instead of hanging the CI
+    // job until the runner's own deadline.
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client");
+    let (server, base) = migrate_build_and_boot(&project, &database_url, &client).await;
+
+    // The sign-in stub must be load-bearing: assert the form route really is
+    // `#[secured]` FIRST. Without this, a regression that made the scaffold's
+    // whole write surface public would leave every assertion below green, and
+    // the stub would quietly become dead weight.
+    let anonymous = client
+        .get(format!("{base}/posts/new"))
+        .send()
+        .await
+        .expect("anonymous GET /posts/new failed");
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "the scaffold's create form must be `#[secured]`"
+    );
+
+    let signin = client
+        .get(format!("{base}/__signin"))
+        .send()
+        .await
+        .expect("GET /__signin failed");
+    assert_eq!(signin.status(), 200, "test sign-in stub must succeed");
+
+    LiveApp {
+        _server: server,
+        _postgres: postgres,
+        _tmp: tmp,
+        client,
+        base,
+    }
+}
+
+/// Issue #1388 AC4/AC6, proven at RUNTIME rather than by string-matching the
+/// generated source: scaffold a resource whose fields carry `{…}` constraint
+/// modifiers, migrate it against a real Postgres, boot the generated server,
+/// and drive the actual HTTP surface.
+///
+/// Every other test for the `{…}` block asserts on generated *text* — that the
+/// model carries `#[validate(length(min = 3, max = 120))]`, that the routes
+/// module builds an `a11y::TextField` with `.minlength(3u32)`. None of them
+/// proves the fan-out actually *works*: that the emitted `#[validate]` rules
+/// reach the `Validated`/changeset path and answer **422** (never a 500, never
+/// a silent store), that the emitted builder calls render the promised HTML5
+/// attributes into the browser's markup, or that a valid submission still gets
+/// through. This is the acceptance criterion's "scaffold-to-runtime round-trip
+/// test", end to end:
+///
+/// * `GET /posts/new` renders `title` with `minlength="3" maxlength="120"
+///   required`, `contact` as `type="email"`, and `age` as `type="number"
+///   min="0" max="130"` — AC3, AC4's client half, AC6's typed-input half;
+/// * an empty `title` and a malformed `contact` are rejected **server-side**
+///   with a 422 whose body re-renders the form with inline `role="alert"`
+///   errors and the submitted input preserved — AC2, AC4's server half, and
+///   composition with the #1124 error re-render;
+/// * an out-of-range `age` surfaces its `range` rejection inline the same way
+///   — AC6's server half;
+/// * neither rejected submission stores a row — the Success Metric's "zero
+///   successful inserts of an empty title or a malformed email";
+/// * a valid submission still redirects (303) and persists, so the constraints
+///   reject bad input without blocking good input.
+///
+/// `age:i32{min=0,max=130}` is scaffolded alongside the acceptance criterion's
+/// own `title`/`contact` pair (rather than in a second test) deliberately: it
+/// is the issue's own AC1/AC6 numeric example, and booting a freshly compiled
+/// app is the expensive part — one boot covers both halves. The extra column
+/// changes nothing about the `title`/`contact` assertions.
+///
+/// Ignored by default; requires Docker and `diesel` CLI on PATH. Run with:
+/// `cargo test -p autumn-cli --test generate generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact`
+#[tokio::test]
+#[ignore = "slow: starts Postgres, runs diesel migrations, builds and boots a constrained scaffold"]
+async fn generated_constrained_scaffold_enforces_validation_end_to_end() {
+    let app = boot_constrained_post_app().await;
+    let (client, base) = (&app.client, app.base.as_str());
+
+    // ── AC3/AC4 (client half) + AC6: the rendered form carries the HTML5
+    // attributes the DSL declared, and the pre-existing `required` (from
+    // non-null) survives alongside them. ────────────────────────────────────
+    let (form_html, hidden) = fetch_new_post_form(client, base).await;
+    assert_constrained_controls_render_html5(&form_html);
+
+    // ── AC2/AC4 (server half): an empty title and a malformed email are
+    // rejected with a 422 that re-renders inline errors and preserves input —
+    // not a 500, not a redirect, not a silent store. ────────────────────────
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", ""),
+            ("contact", "not-an-email"),
+            ("homepage", "not-a-url"),
+            ("age", "42"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "an empty title + malformed email must be a 422, never a 500 or a redirect:\n{body}"
+    );
+    for field in ["title", "contact", "homepage"] {
+        assert_inline_field_error(&body, field);
+    }
+    assert!(
+        input_tag(&body, "contact").contains("value=\"not-an-email\""),
+        "the 422 must preserve the submitted input (issue #1124):\n{body}"
+    );
+    // The constraints still render on the re-rendered form, so a corrected
+    // resubmit keeps its client-side guards.
+    assert_constrained_controls_render_html5(&body);
+
+    // ── AC6 (server half): a numeric `range` rejection surfaces inline the
+    // same way. ─────────────────────────────────────────────────────────────
+    let (_, hidden) = fetch_new_post_form(client, base).await;
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", "A valid title"),
+            ("contact", "author@example.com"),
+            ("homepage", "https://example.com"),
+            ("age", "999"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "an out-of-range `age` must be a 422 (issue #1388 AC6):\n{body}"
+    );
+    assert_inline_field_error(&body, "age");
+
+    // ── Success Metric: neither rejected submission stored a row. ───────────
+    assert_eq!(
+        stored_post_count(client, base).await,
+        0,
+        "a rejected submission must never be stored"
+    );
+
+    // ── And the constraints reject bad input without blocking good input: a
+    // valid submission still redirects (303) and persists. ──────────────────
+    let (_, hidden) = fetch_new_post_form(client, base).await;
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", "A valid title"),
+            ("contact", "author@example.com"),
+            ("homepage", "https://example.com"),
+            ("age", "42"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 303,
+        "a valid submission must redirect, not re-render:\n{body}"
+    );
+    assert_eq!(
+        stored_post_count(client, base).await,
+        1,
+        "the valid submission must persist"
     );
 }
 

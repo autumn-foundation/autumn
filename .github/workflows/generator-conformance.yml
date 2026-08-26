@@ -27,6 +27,7 @@ on:
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
+      - "autumn-cli/tests/integration/scaffold_validation.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -45,6 +46,7 @@ on:
       - "autumn-cli/tests/e2e.rs"
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
+      - "autumn-cli/tests/integration/scaffold_validation.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -88,6 +90,7 @@ jobs:
   #   generated_channel_smoke_test_passes         (generate.rs)
   #   generated_webhook_cargo_checks              (generate.rs, #1366)
   #   generated_webhook_tests_pass                (generate.rs, #1366)
+  #   constrained_scaffold_cargo_checks           (cli_tests, #1388)
   #
   # Each test scaffolds a project, patches Cargo.toml to point at the local
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
@@ -97,6 +100,9 @@ jobs:
     name: Compile-and-serve gates (${{ matrix.toolchain }})
     needs: meta
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    # Fail fast instead of burning GitHub's 360-minute default if a
+    # generated app wedges on boot (these jobs compile AND run one).
+    timeout-minutes: 90
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]
@@ -330,6 +336,21 @@ jobs:
             integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
             -- --ignored --exact
 
+      # ── DSL `{…}` validation constraints (#1388) ────────────────────────
+      #
+      # The only machine proof that a scaffold carrying the FULL constraint
+      # mix compiles: `{min,max}` length bounds, `{email}`, `{url}`, a numeric
+      # `{min,max}` range, and a NULLABLE `Option<String>{max=…}`. The
+      # Postgres e2e gate below drives `{…}` at runtime but cannot cover the
+      # nullable column or `{url}`'s emitted `#[validate(url)]` compiling
+      # against the `validator` derive. Same `cli_tests` caveat as the blocks
+      # above — named explicitly here or it never runs anywhere.
+      - name: constrained_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_validation::constrained_scaffold_cargo_checks \
+            -- --ignored --exact
+
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"
@@ -353,6 +374,9 @@ jobs:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     needs: meta
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    # Fail fast instead of burning GitHub's 360-minute default if a
+    # generated app wedges on boot (these jobs compile AND run one).
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -426,6 +450,7 @@ jobs:
   #
   # Runs:
   #   generated_scaffold_serves_posts_index_and_json_api  (generate.rs)
+  #   generated_constrained_scaffold_enforces_validation_end_to_end (generate.rs, #1388)
   #
   # Scaffolds a Post resource, runs Diesel migrations against a Postgres
   # testcontainer, builds the generated app, boots it, and asserts the HTML
@@ -437,6 +462,9 @@ jobs:
     name: Scaffold Postgres e2e gate (${{ matrix.toolchain }})
     needs: meta
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    # Fail fast instead of burning GitHub's 360-minute default if a
+    # generated app wedges on boot (these jobs compile AND run one).
+    timeout-minutes: 90
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]
@@ -463,6 +491,22 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+
+      # ── DSL `{…}` validation constraints (#1388) ────────────────────────
+      #
+      # The ONLY runtime proof of that feature's headline acceptance
+      # criterion (AC4). Every other test for the `{…}` block string-matches
+      # generated source — that the model carries `#[validate(length(…))]`,
+      # that the routes module builds an `a11y::TextField` with
+      # `.minlength(3u32)`. This one boots the compiled app and drives the
+      # real HTTP surface: the rendered form carries the HTML5 attributes,
+      # an empty title / malformed email / out-of-range number are answered
+      # **422** with inline per-field errors and stored nowhere, and a valid
+      # submission still redirects and persists.
+      - name: generated_constrained_scaffold_enforces_validation_end_to_end
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact
 
       # ── `json`/`jsonb` scaffold field type (#1341) ──────────────────────
       #

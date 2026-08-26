@@ -111,7 +111,12 @@ libc = "0.2"
 nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
+# `form` (urlencoded bodies) is needed by the generated-app e2e gates that drive
+# the real, browser-facing form flow. `cookies` is already unified in from the
+# normal dependency above and is restated here only so the dev-only cookie jar
+# those gates build (a jar-less client can't hold the session a `#[secured]`
+# route requires) does not depend on that unification staying true.
+reqwest = { version = "0.13", features = ["blocking", "cookies", "form", "rustls"], default-features = false }
 proptest = "1.4"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 # `blocking` enables the synchronous `SyncRunner` used by the deploy_e2e harness
