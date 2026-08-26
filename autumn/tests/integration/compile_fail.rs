@@ -48,6 +48,16 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/lifecycle_unknown_initial.rs");
     t.compile_fail("tests/compile-fail/lifecycle_terminal_source.rs");
 
+    // Ledgered entities (issue #1699). A ledgered entity's history is the
+    // record: every way of erasing or redacting it is refused at the repository
+    // seam rather than silently weakening the as-of / tamper-evidence guarantee.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_requires_soft_delete.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_purge_rejected.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_sensitive_columns.rs");
+
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
@@ -220,6 +230,12 @@ fn compile_pass_tests() {
     // Compile-time query budgets (#1667): every in-budget handler shape, plus
     // the three escape hatches, plus the `StaticQueryBudget` proof the
     // expansion leaves behind.
+    // A ledgered repository (issue #1699) type-checks end to end: the ledger
+    // write emitted into every version-history site, the generated
+    // `LedgeredRecord` impl (default and `valid_time = "..."` variants), and the
+    // as-of / diff / verify / head query surface.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_ledgered.rs");
     t.pass("tests/compile-pass/query_budget_valid.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/query_budget_route.rs");

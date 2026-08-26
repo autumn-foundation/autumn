@@ -1,0 +1,11 @@
+error: ledgered = true requires soft_delete: a hard DELETE erases the row the ledger reconstructs, so an as-of query would return state whose record no longer exists and `verify` could not tell erasure from tampering. Add `soft_delete` to #[repository(...)] — a ledgered delete records a revision and is undone with restore()
+  --> tests/compile-fail/repository_ledgered_requires_soft_delete.rs:28:1
+   |
+28 | / #[autumn_web::repository(
+29 | |     LedgeredHardDeleteNote,
+30 | |     table = "ledgered_hard_delete_notes",
+31 | |     ledgered = true
+32 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)

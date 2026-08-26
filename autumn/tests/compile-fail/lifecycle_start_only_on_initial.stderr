@@ -16,9 +16,7 @@ error[E0599]: no associated function or constant named `start` found for struct 
    = help: items from traits can only be used if the trait is implemented and in scope
    = note: the following traits define an item `start`, perhaps you need to implement one of them:
            candidate #1: `cluster::transport::PeerTransport`
-           candidate #2: `opentelemetry::trace::tracer::Tracer`
-           candidate #3: `regex_syntax::ast::visitor::Visitor`
-           candidate #4: `regex_syntax::hir::visitor::Visitor`
-           candidate #5: `rustls::crypto::SupportedKxGroup`
-           candidate #6: `rustls::crypto::hash::Hash`
-           candidate #7: `testcontainers::runners::async_runner::AsyncRunner`
+           candidate #2: `regex_syntax::ast::visitor::Visitor`
+           candidate #3: `regex_syntax::hir::visitor::Visitor`
+           candidate #4: `rustls::crypto::SupportedKxGroup`
+           candidate #5: `rustls::crypto::hash::Hash`
