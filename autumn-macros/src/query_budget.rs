@@ -372,10 +372,16 @@ impl Analyzer {
     // ── Blocks and statements ────────────────────────────────────────
 
     fn block(&mut self, block: &Block) -> Cost {
+        // Handle identity is lexically scoped. A binding introduced (or
+        // *shadowed away*) inside a block must not outlive it — without the
+        // restore, `{ let repo = something_else; }` would strip `repo` for the
+        // rest of the function and silently stop counting its queries.
+        let outer = self.handles.clone();
         let mut cost = Cost::ZERO;
         for stmt in &block.stmts {
             cost = cost.then(self.stmt(stmt));
         }
+        self.handles = outer;
         cost
     }
 
@@ -437,20 +443,48 @@ impl Analyzer {
     /// whether its bindings are handles.
     fn bind_handles(&mut self, local: &Local) {
         let Some(init) = &local.init else {
+            // `let repo;` with no initialiser still shadows: the name holds
+            // nothing yet, so it is not a handle.
+            self.rebind(&local.pat, false);
             return;
         };
         // A binding initialised from a handle — or from a chain rooted at one,
         // so a builder chain split across `let`s keeps its identity — is
         // itself a handle from here on.
         if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
-            collect_pat_idents(&local.pat, &mut self.handles);
-        } else if let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) {
+            self.rebind(&local.pat, true);
+        } else if matches!(&local.pat, Pat::Tuple(_)) && matches!(&*init.expr, Expr::Tuple(_)) {
+            let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) else {
+                unreachable!("guarded by the matches! above")
+            };
             // `let (conn, key) = (db, id);` — pair the pattern against the
             // initialiser element-wise so the handle keeps its tracking.
             for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
-                if self.expr_is_handle(element) || self.chain_root_is_handle(element) {
-                    collect_pat_idents(element_pat, &mut self.handles);
-                }
+                let is_handle = self.expr_is_handle(element) || self.chain_root_is_handle(element);
+                self.rebind(element_pat, is_handle);
+            }
+        } else {
+            // Shadowing. `let repo = repo.find_all().await?;` rebinds the name
+            // to a `Vec`, and the old identity must go with it — otherwise
+            // `repo.len()` is scored as another query and handing the rows to a
+            // renderer is reported as a handle escaping (#1667 review, round
+            // three). `block` restores the outer set, so this cannot leak past
+            // the enclosing scope.
+            self.rebind(&local.pat, false);
+        }
+    }
+
+    /// Bind every name in `pat` to a handle, or clear whatever identity those
+    /// names carried. Insertion alone is not enough: a `HashSet` of names has
+    /// no notion of shadowing, so a rebinding must actively remove.
+    fn rebind(&mut self, pat: &Pat, is_handle: bool) {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        if is_handle {
+            self.handles.extend(names);
+        } else {
+            for name in names {
+                self.handles.remove(&name);
             }
         }
     }
@@ -608,7 +642,25 @@ impl Analyzer {
 
             Expr::Array(a) => self.each(a.elems.iter()),
             Expr::Tuple(t) => self.each(t.elems.iter()),
-            Expr::Assign(a) => self.expr(&a.left).then(self.expr(&a.right)),
+            Expr::Assign(a) => {
+                let cost = self.expr(&a.left).then(self.expr(&a.right));
+                // `active = repo;` makes `active` a handle just as a `let`
+                // would; without this the queries through it vanish (#1667
+                // review, round three). A non-handle RHS clears it, for the
+                // same reason shadowing does.
+                if let Expr::Path(path) = &*a.left
+                    && let Some(ident) = path.path.get_ident()
+                {
+                    let is_handle =
+                        self.expr_is_handle(&a.right) || self.chain_root_is_handle(&a.right);
+                    if is_handle {
+                        self.handles.insert(ident.to_string());
+                    } else {
+                        self.handles.remove(&ident.to_string());
+                    }
+                }
+                cost
+            }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Break(b) => b.expr.as_deref().map_or(Cost::ZERO, |e| self.expr(e)),
             Expr::Cast(c) => self.expr(&c.expr),
@@ -787,7 +839,13 @@ impl Analyzer {
         for method in &methods {
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
             let takes_handle = method.args.iter().any(|a| self.expr_carries_handle(a));
-            if is_executor && (awaited || takes_handle) {
+            // Provenance, not just the name: this chain is *not* rooted at a
+            // handle, so `store.load(id).await` and `client.execute(req).await`
+            // land here with executor-shaped names and no database in sight.
+            // Counting those spent a route's budget on ordinary async APIs
+            // (#1667 review, round three). A real diesel executor is handed the
+            // connection — `query.load(&mut conn).await` — so require that.
+            if is_executor && takes_handle {
                 let name = method.method.to_string();
                 cost = cost.then(self.count(&name));
             } else if takes_handle && !is_executor {
@@ -2585,6 +2643,91 @@ mod tests {
         // 1 for the `tx` call itself, 1 for the query through `conn`.
         assert_error_contains("1", handler, &["2"]);
         assert_clean("2", handler);
+    }
+
+    #[test]
+    fn an_assignment_propagates_handle_identity() {
+        // `active = repo` aliases the handle exactly as a `let` would. Without
+        // tracking it the loop below issues one query per id and scores zero
+        // (#1667 review, round three).
+        let handler = r"
+            async fn index(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> {
+                let mut active;
+                active = repo;
+                let mut n = 0;
+                for id in &ids {
+                    n += active.find_by_id(*id).await?;
+                }
+                Ok(n)
+            }
+            ";
+        assert_error_contains("9", handler, &["loop"]);
+    }
+
+    #[test]
+    fn shadowing_a_handle_clears_its_identity() {
+        // `let repo = repo.find_all().await?;` rebinds the name to a `Vec`.
+        // Keeping the old identity scored `repo.len()` as another query and
+        // reported handing the rows to a renderer as a handle escape.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let repo = repo.find_all().await?;
+                Ok(repo.len())
+            }
+            ";
+        assert_clean("1", handler);
+        // The one query is still counted — the shadow clears identity, it does
+        // not erase what already ran.
+        assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn a_shadow_inside_a_block_does_not_leak_out_of_it() {
+        // The guard on the fix above: clearing a name must be lexically scoped,
+        // or an inner shadow would stop the *outer* handle being counted —
+        // trading a false positive for a false negative.
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                {
+                    let repo = 1;
+                    let _ = repo;
+                }
+                let rows = repo.find_all().await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn an_executor_name_without_a_handle_is_not_a_query() {
+        // `load` / `execute` are diesel executor names, but on a chain with no
+        // database in sight they are just ordinary async APIs. Counting them by
+        // name alone spent the budget on unrelated calls (#1667 review, round
+        // three).
+        let handler = r"
+            async fn index(store: ObjectStore, client: HttpClient) -> AutumnResult<usize> {
+                let blob = store.load(1).await?;
+                let resp = client.execute(blob).await?;
+                Ok(resp.len())
+            }
+            ";
+        assert_clean("0", handler);
+    }
+
+    #[test]
+    fn a_diesel_executor_handed_the_connection_is_still_a_query() {
+        // The counterpart: provenance is the connection in the call, and when
+        // it is there the round trip is still counted.
+        let handler = r"
+            async fn index(mut db: Db) -> AutumnResult<usize> {
+                let rows = posts::table.filter(posts::published.eq(true)).load(&mut db).await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
     }
 
     #[test]
