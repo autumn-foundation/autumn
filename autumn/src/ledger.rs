@@ -189,9 +189,9 @@ pub struct RevisionHashInput<'a> {
 /// scalars use `serde_json`'s own compact encoding.
 #[must_use]
 pub fn canonical_json(value: &serde_json::Value) -> String {
-    // RED: not implemented yet.
-    let _ = value;
-    String::new()
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
 }
 
 fn write_canonical(value: &serde_json::Value, out: &mut String) {
@@ -249,11 +249,6 @@ pub fn truncate_to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
 /// distinct field tuples can produce the same byte stream.
 #[must_use]
 pub fn revision_hash(input: &RevisionHashInput<'_>) -> String {
-    // RED: not implemented yet.
-    if true {
-        let _ = input;
-        return String::new();
-    }
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -396,15 +391,6 @@ pub struct LedgerHead {
 /// a record that was never written, which is not evidence of tampering.
 #[must_use]
 pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerification {
-    // RED: not implemented yet.
-    if true {
-        return LedgerVerification {
-            record_id,
-            revisions_checked: revisions.len(),
-            head_hash: None,
-            broken: None,
-        };
-    }
     let checked = revisions.len();
     let broken = first_break(revisions);
     let head_hash = if broken.is_none() {
@@ -476,7 +462,10 @@ fn sequence_break(
 }
 
 /// Check one revision's own hash and its link to `prev`.
-fn link_break(revision: &LedgerRevision, prev: Option<&LedgerRevision>) -> Option<LedgerBreakReport> {
+fn link_break(
+    revision: &LedgerRevision,
+    prev: Option<&LedgerRevision>,
+) -> Option<LedgerBreakReport> {
     if revision.compute_hash() != revision.hash {
         return Some(LedgerBreakReport {
             seq: revision.seq,
@@ -588,11 +577,6 @@ impl LedgerAsOf {
 /// `deleted_at` exactly as a live query would.
 #[must_use]
 pub fn snapshot_as_of(revisions: &[LedgerRevision], as_of: LedgerAsOf) -> Option<&LedgerRevision> {
-    // RED: not implemented yet.
-    if true {
-        let _ = as_of;
-        return None;
-    }
     revisions
         .iter()
         .filter(|r| as_of.transaction.is_none_or(|t| r.recorded_at <= t))
@@ -641,11 +625,6 @@ impl LedgerDiff {
 /// record that did not yet exist reports every column as added.
 #[must_use]
 pub fn diff_snapshots(before: &serde_json::Value, after: &serde_json::Value) -> Vec<ColumnChange> {
-    // RED: not implemented yet.
-    if true {
-        let _ = (before, after);
-        return Vec::new();
-    }
     let empty = serde_json::Map::new();
     let before_obj = before.as_object().unwrap_or(&empty);
     let after_obj = after.as_object().unwrap_or(&empty);
@@ -814,7 +793,9 @@ mod tests {
     use serde_json::json;
 
     fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_800_000_000 + secs, 0).single().expect("valid instant")
+        Utc.timestamp_opt(1_800_000_000 + secs, 0)
+            .single()
+            .expect("valid instant")
     }
 
     /// Build a well-formed chain of `n` revisions whose snapshots carry an
@@ -952,7 +933,10 @@ mod tests {
         map.insert("id".to_owned(), json!(7));
         let b = serde_json::Value::Object(map);
 
-        assert_eq!(revision_hash(&base_input(&a)), revision_hash(&base_input(&b)));
+        assert_eq!(
+            revision_hash(&base_input(&a)),
+            revision_hash(&base_input(&b))
+        );
     }
 
     #[test]
@@ -962,17 +946,50 @@ mod tests {
         let baseline = revision_hash(&base_input(&snapshot));
 
         let mutations: Vec<RevisionHashInput<'_>> = vec![
-            RevisionHashInput { prev_hash: Some("aa"), ..base_input(&snapshot) },
-            RevisionHashInput { table_name: "gadgets", ..base_input(&snapshot) },
-            RevisionHashInput { tenant_id: Some("t1"), ..base_input(&snapshot) },
-            RevisionHashInput { record_id: 8, ..base_input(&snapshot) },
-            RevisionHashInput { seq: 2, ..base_input(&snapshot) },
-            RevisionHashInput { op: VersionOp::Update, ..base_input(&snapshot) },
-            RevisionHashInput { actor: "mallory", ..base_input(&snapshot) },
-            RevisionHashInput { request_id: Some("r1"), ..base_input(&snapshot) },
-            RevisionHashInput { snapshot: &other_snapshot, ..base_input(&snapshot) },
-            RevisionHashInput { valid_from: at(1), ..base_input(&snapshot) },
-            RevisionHashInput { recorded_at: at(1), ..base_input(&snapshot) },
+            RevisionHashInput {
+                prev_hash: Some("aa"),
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                table_name: "gadgets",
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                tenant_id: Some("t1"),
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                record_id: 8,
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                seq: 2,
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                op: VersionOp::Update,
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                actor: "mallory",
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                request_id: Some("r1"),
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                snapshot: &other_snapshot,
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                valid_from: at(1),
+                ..base_input(&snapshot)
+            },
+            RevisionHashInput {
+                recorded_at: at(1),
+                ..base_input(&snapshot)
+            },
         ];
 
         for (idx, mutated) in mutations.iter().enumerate() {
@@ -989,8 +1006,16 @@ mod tests {
         // Without length prefixes, moving a suffix of `actor` onto the front of
         // `request_id` would produce the same byte stream.
         let snapshot = json!({});
-        let a = RevisionHashInput { actor: "ab", request_id: Some("c"), ..base_input(&snapshot) };
-        let b = RevisionHashInput { actor: "a", request_id: Some("bc"), ..base_input(&snapshot) };
+        let a = RevisionHashInput {
+            actor: "ab",
+            request_id: Some("c"),
+            ..base_input(&snapshot)
+        };
+        let b = RevisionHashInput {
+            actor: "a",
+            request_id: Some("bc"),
+            ..base_input(&snapshot)
+        };
         assert_ne!(revision_hash(&a), revision_hash(&b));
     }
 
@@ -999,8 +1024,14 @@ mod tests {
         let snapshot = json!({});
         let micros = Utc.timestamp_nanos(1_800_000_000_000_123_000);
         let nanos = Utc.timestamp_nanos(1_800_000_000_000_123_456);
-        let a = RevisionHashInput { recorded_at: micros, ..base_input(&snapshot) };
-        let b = RevisionHashInput { recorded_at: nanos, ..base_input(&snapshot) };
+        let a = RevisionHashInput {
+            recorded_at: micros,
+            ..base_input(&snapshot)
+        };
+        let b = RevisionHashInput {
+            recorded_at: nanos,
+            ..base_input(&snapshot)
+        };
         assert_eq!(revision_hash(&a), revision_hash(&b));
     }
 
@@ -1020,7 +1051,10 @@ mod tests {
         let report = verify_chain(7, &revisions);
         assert!(report.is_intact(), "{report:?}");
         assert_eq!(report.revisions_checked, 3);
-        assert_eq!(report.head_hash.as_deref(), Some(revisions[2].hash.as_str()));
+        assert_eq!(
+            report.head_hash.as_deref(),
+            Some(revisions[2].hash.as_str())
+        );
     }
 
     #[test]
@@ -1070,7 +1104,9 @@ mod tests {
         let mut revisions = chain(4);
         revisions.remove(1); // drop seq 2
 
-        let broken = verify_chain(7, &revisions).broken.expect("deletion detected");
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("deletion detected");
         assert_eq!(broken.kind, LedgerBreak::MissingRevision);
         assert_eq!(broken.seq, 2);
         assert_eq!(broken.revision_id, None);
@@ -1081,7 +1117,9 @@ mod tests {
         let mut revisions = chain(3);
         revisions.remove(0); // drop seq 1
 
-        let broken = verify_chain(7, &revisions).broken.expect("head deletion detected");
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("head deletion detected");
         assert_eq!(broken.kind, LedgerBreak::MissingRevision);
         assert_eq!(broken.seq, 1);
     }
@@ -1097,7 +1135,9 @@ mod tests {
         };
         revisions.insert(2, forged); // now seq 1, 2, 2, 3
 
-        let broken = verify_chain(7, &revisions).broken.expect("insertion detected");
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("insertion detected");
         assert_eq!(broken.kind, LedgerBreak::DuplicateSeq);
         assert_eq!(broken.seq, 2);
         assert_eq!(broken.revision_id, Some(99));
@@ -1125,7 +1165,9 @@ mod tests {
         revisions[1].prev_hash = Some(revisions[0].hash.clone());
         revisions[1].hash = revisions[1].compute_hash();
 
-        let broken = verify_chain(7, &revisions).broken.expect("dangling start detected");
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("dangling start detected");
         assert_eq!(broken.kind, LedgerBreak::BrokenChainStart);
         assert_eq!(broken.seq, 1);
     }
@@ -1190,10 +1232,22 @@ mod tests {
         let true_then = snapshot_as_of(&revisions, LedgerAsOf::valid(at(6))).expect("rev");
         assert_eq!(true_then.seq, 2);
 
-        // Bitemporal: what the database believed at t=30 about t=6.
-        let believed = snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(30), at(6)))
-            .expect("rev");
-        assert_eq!(believed.seq, 1);
+        // Bitemporal: what the database believed at t=30 about t=6. The only
+        // revision it held then became valid at t=10, so as far as it knew, the
+        // record did not yet exist at t=6.
+        assert!(snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(30), at(6))).is_none());
+
+        // Once the back-dated correction is on record, the same valid-time
+        // question gets the corrected answer.
+        let corrected =
+            snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(50), at(6))).expect("rev");
+        assert_eq!(corrected.seq, 2);
+
+        // The correction governs only the window before the next revision's
+        // valid_from: at valid time 20, the insert's own statement is in force.
+        let later =
+            snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(50), at(20))).expect("rev");
+        assert_eq!(later.seq, 1);
     }
 
     #[test]
@@ -1327,7 +1381,10 @@ mod tests {
     #[test]
     fn valid_time_value_shapes() {
         let instant = at(3);
-        assert_eq!(LedgerValidTimeValue::ledger_valid_from(&instant), Some(instant));
+        assert_eq!(
+            LedgerValidTimeValue::ledger_valid_from(&instant),
+            Some(instant)
+        );
         assert_eq!(
             LedgerValidTimeValue::ledger_valid_from(&Some(instant)),
             Some(instant)
@@ -1337,7 +1394,10 @@ mod tests {
             None
         );
         let naive = instant.naive_utc();
-        assert_eq!(LedgerValidTimeValue::ledger_valid_from(&naive), Some(instant));
+        assert_eq!(
+            LedgerValidTimeValue::ledger_valid_from(&naive),
+            Some(instant)
+        );
         assert_eq!(
             LedgerValidTimeValue::ledger_valid_from(&None::<chrono::NaiveDateTime>),
             None
