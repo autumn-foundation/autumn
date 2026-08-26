@@ -3160,6 +3160,19 @@ enum GenerateCommands {
         /// `--live-validation`, or `--belongs-to`.
         #[arg(long)]
         i18n: bool,
+        /// Emit a CSV import surface (issue #1393): a `GET /<plural>/import`
+        /// upload form and a `POST /<plural>/import` handler that parses the
+        /// uploaded multipart CSV, previews it with `import_csv` in
+        /// `ImportMode::DryRun` — reporting total rows, rows that would
+        /// insert, and a per-row error list with line numbers — and only
+        /// writes when the submit explicitly confirms a commit, through the
+        /// repository's transactional `save_many_skip_invalid`. Decodes rows
+        /// against the same `CsvSchema` impl the CSV export emits, so it is
+        /// honoured wherever that export is (not `--api`, `--live`,
+        /// `--sharded`, or an owner-scoped `--live-validation` scaffold — the
+        /// generator warns and emits nothing there).
+        #[arg(long)]
+        import: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -4793,6 +4806,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             counter_cache,
             searchable,
             i18n,
+            import,
             dry_run,
             force,
         } => {
@@ -4854,6 +4868,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 counter_cache,
                 &searchable,
                 i18n,
+                import,
             ) {
                 Ok(result) => result,
                 Err(e) => {

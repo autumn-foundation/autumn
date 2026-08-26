@@ -162,7 +162,17 @@ fn no_prose_survives_in_a_maximally_flagged_scaffold() {
         let project = tmp.path().join(name);
         let mut args = vec!["generate", "scaffold", "Post"];
         args.extend_from_slice(columns);
-        args.extend_from_slice(&["--i18n", "--soft-delete", "--searchable", "title,body"]);
+        args.extend_from_slice(&[
+            "--i18n",
+            "--soft-delete",
+            "--searchable",
+            "title,body",
+            // Issue #1393: the CSV import surface renders a whole page of its
+            // own (upload form, preview totals, per-row error table), so it has
+            // to be inside this sweep or its prose would be exactly the kind of
+            // flag-gated English the sweep exists to catch.
+            "--import",
+        ]);
         run_autumn_ok(&project, &args);
         maud_body_prose(&fs::read_to_string(project.join("src/routes/posts.rs")).unwrap())
     };

@@ -296,14 +296,39 @@ where
         }
     };
 
+    // Calibrate the reported line numbers against the header, whose true span
+    // we know: it is line 1, so a reader that has just consumed it sits at line
+    // 2. The underlying `csv` parser's own counter does NOT agree with that on
+    // every dialect — on a CRLF file (what Excel and most Windows tools write)
+    // it runs exactly one behind the LF reading of the same rows, so a row a
+    // spreadsheet shows on line 7 would be reported as line 6, and a
+    // byte-identical LF copy of the same file would report 7. A row number that
+    // depends on the line endings is worse than useless in an error report
+    // someone is meant to act on, so measure the parser's convention once here
+    // and shift every position below by the same amount. On a dialect the
+    // parser does not count lines for at all (bare-CR, the classic-Mac
+    // dialect), the shift still puts the first data row at 2 — the rows after
+    // it share that number rather than climbing, which is the parser's limit,
+    // not this offset's.
+    //
+    // A header carrying an embedded newline inside a quoted field would
+    // mis-calibrate this by however many lines it spans; that is vanishingly
+    // rare, and the alternative (trusting a counter that disagrees with itself
+    // across dialects) is wrong on the common case instead of the exotic one.
+    let line_offset: i64 = 2 - i64::try_from(rdr.position().line()).unwrap_or(2);
+    let absolute_line = move |raw: u64| -> u64 {
+        let raw = i64::try_from(raw).unwrap_or(i64::MAX);
+        u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
+    };
+
     for result in rdr.records() {
         let (line, record) = match result {
             Ok(r) => {
-                let pos = r.position().map_or(0, csv::Position::line);
+                let pos = absolute_line(r.position().map_or(0, csv::Position::line));
                 (pos, r)
             }
             Err(e) => {
-                let pos = e.position().map_or(0, csv::Position::line);
+                let pos = absolute_line(e.position().map_or(0, csv::Position::line));
                 report
                     .errors
                     .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
@@ -527,6 +552,61 @@ mod tests {
         assert_eq!(report.inserted, 2);
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].message, "title must not be 'Bad row'");
+        // "Bad row" is the THIRD line of the file (the header is line 1), and
+        // that is the number an operator has to be able to find in their
+        // spreadsheet.
+        assert_eq!(report.errors[0].line, 3);
+    }
+
+    /// The same file with CRLF terminators — what Excel and most Windows tools
+    /// write — must report the SAME line numbers. The underlying parser's own
+    /// counter runs one behind on that dialect, so this is what pins the
+    /// calibration in `import_csv`; without it a byte-identical CRLF copy of the
+    /// file above blames line 2 for the row on line 3.
+    #[test]
+    fn import_csv_line_numbers_are_the_same_for_crlf_and_lf() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            let report = import_csv(csv, &ImportOptions::default(), |line, row, _mode| {
+                seen.push(line);
+                if row.get("title").map(String::as_str) == Some("Bad row") {
+                    ImportRowResult::RowError("bad".into())
+                } else {
+                    ImportRowResult::Inserted
+                }
+            });
+            assert_eq!(report.errors.len(), 1, "one bad row per fixture");
+            assert_eq!(
+                report.errors[0].line, 3,
+                "the bad row is on line 3 of both fixtures"
+            );
+            seen
+        };
+        let lf = lines(b"title\nGood row\nBad row\nAnother good\n");
+        let crlf = lines(b"title\r\nGood row\r\nBad row\r\nAnother good\r\n");
+        assert_eq!(lf, vec![2, 3, 4]);
+        assert_eq!(crlf, lf, "line endings must not change the row numbers");
+    }
+
+    /// A quoted field carrying an embedded newline moves the rows after it down
+    /// the file, and the reported numbers have to move with them — the operator
+    /// counts lines in a text editor, not records.
+    #[test]
+    fn import_csv_line_numbers_follow_multi_line_quoted_fields() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            import_csv(csv, &ImportOptions::default(), |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            });
+            seen
+        };
+        // Row 1 spans lines 2-3; row 2 therefore starts on line 4.
+        assert_eq!(lines(b"title,note\n\"a\nb\",fine\nsecond,x\n"), vec![2, 4]);
+        assert_eq!(
+            lines(b"title,note\r\n\"a\r\nb\",fine\r\nsecond,x\r\n"),
+            vec![2, 4]
+        );
     }
 
     #[test]

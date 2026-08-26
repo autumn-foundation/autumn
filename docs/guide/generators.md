@@ -1445,6 +1445,77 @@ pre-#1315 shape.
 > in the generated `to_csv_record` — the emitted impl carries a note at the
 > same spot.
 
+### Import CSV with a dry-run preview (`--import`)
+
+`--import` adds the other direction of the same data door: an upload form, a
+**dry-run preview** with per-row errors, and a confirmed commit — zero lines of
+user code, no hand-written multipart handler, no import loop (issue #1393).
+
+```bash
+autumn generate scaffold Post title:String body:Text published:bool --import
+```
+
+- `GET /<plural>/import` renders the upload form: a file input, the
+  confirmation checkbox, and the **expected header row**, printed straight from
+  the same `CsvSchema::csv_columns()` the export writes. An **Import CSV** link
+  appears on the index next to **Export CSV**.
+- `POST /<plural>/import` parses the uploaded multipart CSV and, unless the
+  submit carries the `commit` confirmation, runs
+  `autumn_web::data::csv::import_csv` in **`ImportMode::DryRun`**: the response
+  reports rows read, rows that *would* insert, and a table of row errors with
+  the **line number** and message from `ImportReport`. Nothing is written.
+- Ticking **"Import for real"** and uploading again runs the same parse in write
+  mode and commits through the repository's `save_many_skip_invalid` — a batched
+  insert inside a transaction that falls back to row-by-row on a database
+  constraint failure, so one duplicate key does not take the batch down with it.
+  Every skipped row comes back against its own CSV line, and the result page
+  shows inserted-vs-failed. No row is dropped silently.
+- `autumn-web`'s `multipart` feature is added to `Cargo.toml` (`csv` is already
+  on, because the import rides on the export's gate), and removed again by
+  `autumn destroy scaffold` unless other code still uses it.
+- The generated `tests/<name>.rs` gains a database-free test that uploads a
+  2-row CSV (1 valid, 1 invalid), asserts the dry run reports 1 insertable row
+  and 1 row error **on the right line** and writes nothing, then commits and
+  asserts exactly the valid row persists.
+
+**One column map, both directions.** The import decodes each row against the
+*same* generated `CsvSchema` impl the export writes from — there is no second
+list to keep in step. That also means a file this app exported can be edited and
+uploaded straight back: `id` and `created_at` are columns the form does not own,
+so they are ignored on the way in rather than rejected.
+
+Contract of the generated handler:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| No `commit` confirmation | `ImportMode::DryRun`. Every row is parsed and validated, the report says what *would* happen, and the handler's only write call is not reached. This is the default: an unchecked checkbox submits nothing at all. |
+| How a row becomes a record | The row (`column -> value`) is re-encoded as a urlencoded body and handed to the module's own `decode_form`, so it is decoded, blank-normalized and validated by **exactly** the code path a browser form submission takes — the same `#[validate(...)]` rules, the same `into_new`. |
+| A row that fails to parse | A row error naming the parse failure, against that row's line. The rest of the file still imports. |
+| A row that fails validation | A **field** error naming the column (alphabetically first, so the message is stable) and its messages. |
+| A row the database rejects (e.g. a unique violation) | Reported against its own CSV line. `save_many_skip_invalid` isolates the failing chunk row-by-row rather than aborting the batch. |
+| Atomicity | Owned by `save_many_skip_invalid`, which this handler calls exactly once: successful rows commit, failed rows are skipped and reported. For all-or-nothing, swap in `save_many`, which aborts the batch on the first failure. |
+| Model hooks | Run per inserted row, exactly as for `create` — including `after_create_commit` and counter caches. An import of N rows is N records' worth of side effects. |
+| Upload size | Capped at the emitted `MAX_IMPORT_BYTES` (2 MiB) *and* `security.upload.max_file_size_bytes`, whichever is smaller — `with_max_bytes` takes the min. Over the cap is a **413**, never a truncated import. That constant, not a row count, is what bounds the handler's memory. |
+| File-type check | The filename must end in `.csv` (case-insensitively) **and** the declared content type must be one of a small allow-list (`text/csv`, `application/csv`, `text/plain`, `application/vnd.ms-excel`, `application/octet-stream`, or absent — browsers are inconsistent here). This is a *shape* check: CSV has no magic bytes, so what actually protects the handler is that the body is only ever parsed as CSV and every row is validated before it can be written. |
+| Magic-byte sniffing (#1354) | Composes, but is not required. Setting `security.upload.allowed_mime_types` makes the `Multipart` extractor sniff each file part before the handler runs — note that sniffing cannot recognise plain text, so such an allow-list must also admit the declared fallback or CSV uploads are refused before they arrive. |
+| CSRF and double submit | The POST is `#[secured]` and the form renders the shipped CSRF and one-time submit-token hidden inputs as its **first** fields, so both land inside `security.csrf.token_scan_bytes` on a multipart body. Keep them first if you rearrange the form. |
+| Rate limiting | No `#[throttle]` (unlike the export): the route is authenticated and its work is bounded by `MAX_IMPORT_BYTES`, and the handler already sits near axum's 16-extractor ceiling that `#[throttle]`'s injected extractors would push it past on an owner-scoped or `--i18n` scaffold. Add one by hand — and give up an extractor — if you need it. |
+| Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and calls `authorize_create::<Model>` once, exactly like `create`: an import has no loaded row to authorize per record, any more than a create does. A per-row rule therefore does not apply here either; add the check inside the row closure if your policy needs one. |
+| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. |
+| `Attachment` column | Not importable — a storage key in a cell is not a file. The column is left NULL; upload the file through the record's own edit form afterwards. |
+| `datetime` column | Round-trips: the export writes chrono's `Display` form (a space between date and time) and an `--import` scaffold's `parse_local_datetime` accepts that shape alongside the browser's `datetime-local` `T` form. Without the flag the helper is unchanged. |
+| A value that looks like a formula | Round-trips too. The export prefixes an apostrophe to a text cell beginning `=`, `+`, `-`, `@`, TAB or CR; the import strips it back off — but only in exactly that shape, so `'tis` is left alone. A value someone really typed as `'=x` is indistinguishable from a guarded `=x` in the file and resolves to the latter; drop the `csv_unguard_cell` call if you would rather store the apostrophe. |
+| `slug` column | Imported verbatim from the file. The blank-slug derivation `create` performs needs a database probe, which the parse closure (a synchronous callback) cannot do — so a blank slug reaches the insert as-is and its `UNIQUE` index reports the collision per row. A file exported from this app already carries its slugs. |
+| Route vs `/<plural>/{id}` | The static `import` segment outranks the `{id}` parameter, the same way `/<plural>/new` already does; with a `slug` route key the derived-slug guard also treats `"import"` as taken so no record is shadowed. |
+| Very large files | Out of scope for this slice — it is the synchronous request-time flow. Raise `MAX_IMPORT_BYTES` only so far; past that, move the parse into a background job. |
+
+`--import` is honoured wherever the CSV export is (it shares that gate, because
+it shares that `CsvSchema` impl): the plain `repo.list` index — including
+`--live-validation` — and the owner-scoped `repo.list_scoped` one. Passing it to
+an `--api`, `--live`, `--sharded` or owner-scoped `--live-validation` scaffold
+generates nothing and prints a warning naming the reason;
+`autumn_web::data::csv::import_csv` is still there for a hand-written route.
+
 ### Trash, Restore and Purge (`--soft-delete`)
 
 `--soft-delete` already turned the delete button into a `deleted_at`

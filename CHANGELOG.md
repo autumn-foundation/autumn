@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CSV import row numbers are now the same for CRLF and LF files:**
+  `autumn_web::data::csv::import_csv` reports a 1-based line number for every
+  `CsvRowError`, but the underlying CSV parser's own counter runs exactly one
+  behind on a CRLF file — the dialect Excel and most Windows tools write — so a
+  row a spreadsheet shows on line 7 was blamed on line 6, while a byte-identical
+  LF copy of the same file correctly said 7. An error report whose row numbers
+  depend on the file's line endings is worse than no row number at all, so
+  `import_csv` now calibrates against the header (whose true span is known: it
+  is line 1) and shifts every reported position by the same amount. Multi-line
+  quoted fields still push the rows after them down, in both dialects.
+
 - **TLS-enabled migrations no longer panic when applied from an app's own
   async `on_startup` hook:** the sync migration/wait-check path bridges to
   Postgres through diesel-async's `AsyncConnectionWrapper` whenever the
@@ -32,6 +43,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `multi_thread` tokio runtime, called directly from an async body.
 
 ### Added
+
+- **`autumn generate scaffold --import` — a CSV import route with a dry-run
+  preview and per-row errors (#1393):** the symmetric counterpart to the
+  scaffolded CSV export (#1315). One flag emits `GET /<plural>/import` (an
+  upload form that prints the expected header row straight from the model's
+  generated `CsvSchema`) and `POST /<plural>/import`, which parses the uploaded
+  multipart CSV and — unless the submit explicitly confirms a commit — runs
+  `import_csv` in `ImportMode::DryRun` and renders the `ImportReport`: rows
+  read, rows that *would* insert, and a table of row errors with line numbers
+  and messages. Ticking "Import for real" runs the same parse in write mode and
+  commits through the repository's `save_many_skip_invalid`, so a row the
+  database rejects is isolated and reported against its own CSV line instead of
+  aborting the batch — inserted-versus-failed always adds up, with no silent
+  drops. Each row is decoded, blank-normalized and validated through the module's
+  own `decode_form` + `Changeset`, i.e. exactly the code path a browser form
+  submission takes, and against the **same** `CsvSchema` impl the export writes
+  from — one column map for both directions, so a file this app exported can be
+  edited and uploaded straight back. The POST is `#[secured]`, renders the
+  shipped CSRF and one-time submit-token inputs first (so both land inside the
+  multipart token-scan window), caps the upload at an emitted
+  `MAX_IMPORT_BYTES` on top of `security.upload.max_file_size_bytes`, and checks
+  the file's extension and declared content type; magic-byte sniffing (#1354)
+  composes when configured but is not required. The generated `tests/<name>.rs`
+  gains a database-free test that uploads a 2-row CSV (1 valid, 1 invalid),
+  proves the dry run reports 1 insertable row plus 1 row error on the right line
+  and writes nothing, then commits and proves exactly the valid row persists.
+  A file this app exported re-imports unchanged: the import undoes the export's
+  spreadsheet-formula apostrophe guard, and an `--import` scaffold's
+  `parse_local_datetime` also accepts the timestamp format the export writes.
+  Additive: without the flag the scaffold's output is byte-identical, and
+  `--import` on a variant that emits no `CsvSchema` (`--api`, `--live`,
+  `--sharded`, an owner-scoped `--live-validation`) generates nothing and warns
+  with the reason.
 
 - **`#[query_budget(N)]` — a compile-time, per-route database query budget
   (#1667):** declare a handler's query ceiling and the build fails when any

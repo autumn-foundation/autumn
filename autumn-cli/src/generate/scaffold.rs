@@ -89,6 +89,22 @@ pub struct ScaffoldOptions {
     /// unchanged: [`super::scaffold_i18n::ViewLabels`] is an identity function
     /// over the literal expressions the plain path emits.
     pub i18n: bool,
+    /// Emit the CSV import surface (issue #1393) — `--import`. Adds a
+    /// `GET /{plural}/import` upload form and a `POST /{plural}/import`
+    /// handler that parses the uploaded multipart CSV, previews it with
+    /// `autumn_web::data::csv::import_csv` in `ImportMode::DryRun` unless the
+    /// submit explicitly confirms a commit, and renders the per-row
+    /// `ImportReport`. The confirmed commit writes through the repository's
+    /// `save_many_skip_invalid`.
+    ///
+    /// The import decodes rows against the SAME `CsvSchema` impl the export
+    /// (issue #1315) emits — one column map for both directions — so it is
+    /// honoured exactly where that export is emitted, and warns (naming the
+    /// reason) where it is not.
+    ///
+    /// `false` (the default) keeps the scaffold's output byte-for-byte
+    /// unchanged.
+    pub import: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,6 +683,7 @@ fn plan_scaffold_with_options_impl(
         belongs_to: options.belongs_to.clone(),
         counter_cache: options.counter_cache,
         i18n: options.i18n,
+        import: options.import,
     };
     let mut plan = if for_revert {
         super::model::plan_model_with_options_for_revert(
@@ -1260,6 +1277,7 @@ fn plan_scaffold_with_options_impl(
             owner_column.as_ref().map(|o| o.name.as_str()),
             &options_with_key.model.searchable,
             nesting.as_ref(),
+            options_with_key.import,
             &labels,
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
@@ -1775,6 +1793,38 @@ fn plan_scaffold_with_options_impl(
     let plain_export =
         !owner_authorizes && !options_with_key.live && !options_with_key.model.sharded;
     let export_enabled = !options_with_key.api && (owner_scoped_standard_export || plain_export);
+    // Issue #1393: the CSV import surface (`GET`/`POST /{plural}/import`). Must
+    // agree exactly with the `import_enabled` gate in `render_routes_file`, or
+    // main.rs would mount routes the module never emitted. Gated on
+    // `export_enabled` rather than on a matrix of its own: the import decodes
+    // each row against the `CsvSchema` impl the export emits, so where there is
+    // no export there is no column map to import against.
+    let import_enabled = options_with_key.import && export_enabled;
+    // A `--import` that lands on a gated-off variant would otherwise be silent:
+    // no upload form, no route, no explanation. Say so at generation time with
+    // the reason and the way out, exactly as `--soft-delete` does for a missing
+    // Trash view. Only reached when the flag was actually passed, so an ordinary
+    // scaffold prints nothing.
+    if options_with_key.import && !import_enabled {
+        let reason = if options_with_key.api {
+            "an --api scaffold renders no HTML views, so there is no upload form to render"
+        } else if options_with_key.live || options_with_key.live_validation {
+            "the CSV schema the import decodes against is only emitted for a list \
+             view the export can reuse verbatim, and a --live index runs `repo.page` \
+             behind an SSE island"
+        } else if options_with_key.model.sharded {
+            "a sharded repository pins every write to the shard it is handed, so a \
+             bulk import would land wherever the request happened to route"
+        } else {
+            "the index is owner-scoped through a manual query rather than a scoped \
+             repository method, so no CsvSchema impl is emitted to import against"
+        };
+        plan.warn(format!(
+            "--import: no CSV import route generated for {plural} — {reason}. \
+             `autumn_web::data::csv::import_csv` is still available for a hand-written \
+             import route; see docs/guide/generators.md."
+        ));
+    }
     // Issue #1332: the trash view + restore/purge controls. Must agree exactly
     // with the `trash_enabled` gate in `render_routes_file` (plus `--api`, which
     // emits no HTML routes module at all), or main.rs would mount routes the
@@ -1889,6 +1939,14 @@ fn plan_scaffold_with_options_impl(
     if export_enabled {
         smoke_test.push_str(&render_csv_export_smoke_test(&plural, &fields));
     }
+    // Issue #1393 (AC6): the import test — a 2-row upload (1 valid, 1 invalid)
+    // previewed, then committed. Appended here for the same reason as the export
+    // test above: it is built from the resource's ROUTES rather than from the
+    // column list `render_smoke_test` is shaped around, and it is emitted under
+    // exactly the gate that decides whether those routes exist at all.
+    if import_enabled {
+        smoke_test.push_str(&render_csv_import_smoke_test(&plural));
+    }
     // Issue #1332 (AC7): the trash lifecycle test — create, soft delete, recover,
     // purge. Appended here, alongside the CSV test, for the same reason: it is
     // built from the resource's ROUTES rather than from the column list
@@ -1981,6 +2039,12 @@ fn plan_scaffold_with_options_impl(
         search_enabled && !options_with_key.api,
         bulk_delete_enabled,
         export_enabled,
+        // Same double-gate reasoning as `trash_enabled || for_revert` below: a
+        // DESTROY run may not repeat `--import`, but main.rs still mounts the two
+        // handlers this resource emitted, and a revert that removed the routes
+        // module while leaving those entries behind would leave the project
+        // uncompilable. Removing an entry that is not there is a no-op.
+        import_enabled || for_revert,
         // Same shape as the `nested` predicate below, for the same reason: on the
         // DESTROY path `--soft-delete` may not have been repeated on the command
         // line, so `trash_enabled` is false — but `main.rs` still mounts the three
@@ -2281,6 +2345,45 @@ fn plan_scaffold_with_options_impl(
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "csv".to_owned(),
+            owner_dir: None,
+        });
+    }
+
+    // Issue #1393: the emitted import handler takes an
+    // `autumn_web::extract::Multipart` body, which is gated behind autumn-web's
+    // `multipart` feature (off by default so `axum/multipart` and the `infer`
+    // sniffer stay out of apps that never take an upload). The `csv` feature the
+    // handler also needs is already enabled by the export block above — the
+    // import is gated on that export existing — so only `multipart` is added
+    // here. Without it the generated app would not compile.
+    if import_enabled {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "multipart");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // `owner_dir: None` for the same reason the `csv` feature above uses it:
+        // "some routes file still exists" is the wrong question, since only an
+        // IMPORT-enabled resource (or an attachment scaffold, which enables the
+        // same feature) needs `multipart`. The
+        // `autumn_web::extract::Multipart` marker registered in
+        // `emit::autumn_web_feature_markers` is the precise test — it matches
+        // another scaffold's import or attachment handler AND any hand-written
+        // multipart code, and matches neither when the resource being destroyed
+        // was the only user.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "multipart".to_owned(),
             owner_dir: None,
         });
     }
@@ -3026,10 +3129,25 @@ const PARSE_LOCAL_DATETIME_FN: &str = r#"
 /// unconditionally, so any precision lost here would corrupt the stored value.
 fn parse_local_datetime(value: &str) -> AutumnResult<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))__IMPORT_DATETIME_FORMAT__
         .map_err(|err| AutumnError::bad_request_msg(format!("invalid datetime: {err}")))
 }
 "#;
+
+/// The extra datetime format a `--import` scaffold accepts (issue #1393).
+///
+/// The CSV export writes a timestamp with chrono's `Display`, which separates
+/// date and time with a SPACE; the browser's `datetime-local` control sends a
+/// `T`. Without this arm a file this app exported would fail to re-import on
+/// exactly the column it had just written — the round trip the import promises.
+/// Spliced into `PARSE_LOCAL_DATETIME_FN` only under `--import`, so a scaffold
+/// without the flag emits the pre-#1393 helper byte-for-byte.
+const IMPORT_DATETIME_FORMAT_ARM: &str = r#"
+        // The CSV export's format (chrono's `Display`: a space, not a `T`), so
+        // an exported file re-imports on this column. Harmless for the browser
+        // path, which never sends this shape.
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))"#;
 
 /// The generated pieces backing the changeset round-trip (issue #1124): the
 /// public, validating `{Pascal}Form` struct, its fallible conversion into
@@ -3069,6 +3187,10 @@ fn render_model_form(
     validations: &BTreeMap<String, Vec<String>>,
     // The parent foreign-key column under `--belongs-to` (issue #1323).
     parent_fk: Option<&str>,
+    // Issue #1393: whether the CSV import surface is emitted. The only thing it
+    // changes here is that `parse_local_datetime` also accepts the format the
+    // CSV export writes, so an exported file re-imports on its datetime columns.
+    import: bool,
 ) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
@@ -3363,7 +3485,14 @@ fn render_model_form(
     );
 
     let datetime_helper = if needs_datetime {
-        PARSE_LOCAL_DATETIME_FN.to_owned()
+        PARSE_LOCAL_DATETIME_FN.replace(
+            "__IMPORT_DATETIME_FORMAT__",
+            if import {
+                IMPORT_DATETIME_FORMAT_ARM
+            } else {
+                ""
+            },
+        )
     } else {
         String::new()
     };
@@ -3415,6 +3544,11 @@ fn render_routes_file(
     // `show` view renders. `None` keeps every emission below byte-identical to
     // the pre-#1323 flat scaffold.
     nesting: Option<&super::nested::Nesting>,
+    // Issue #1393: `--import`. The CSV import surface decodes rows against the
+    // export's `CsvSchema` impl, so it is honoured only where that export is
+    // emitted — `import_enabled` below is this flag AND `export_enabled`. The
+    // caller warns when the flag was passed and could not be honoured.
+    import: bool,
     // Issue #1349: the seam every user-facing view string passes through.
     // Disabled (`--i18n` off) it returns each caller's literal expression
     // verbatim, so this whole template renders byte-for-byte as before.
@@ -3791,6 +3925,14 @@ fn render_routes_file(
     // emits no HTML routes module at all), or `main.rs` would mount a route this
     // module never emitted.
     let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
+    // Issue #1393: the CSV import surface. Gated on the export's own gate, not
+    // on a fresh matrix of its own: the import decodes each row against the
+    // `CsvSchema` impl `export_enabled` emits, so an import without an export
+    // would reference an impl that is not there. Must agree exactly with the
+    // `import_enabled` gate in `plan_scaffold_with_options_impl` (which also
+    // excludes `--api`, whose scaffold emits no HTML routes module at all), or
+    // main.rs would mount routes this module never emitted.
+    let import_enabled = import && export_enabled;
     // Issue #1349: the export link's text, registered only where the export is
     // actually emitted so a non-exporting scaffold defines no unused key.
     // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
@@ -4108,6 +4250,7 @@ fn render_routes_file(
         fields,
         validations,
         nesting.map(|n| n.fk.as_str()),
+        import_enabled,
     );
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
@@ -5022,6 +5165,12 @@ mod attachment_read_back_tests {{
         }
         if trash_enabled {
             guard.push_str(" && candidate != \"trash\"");
+        }
+        // Issue #1393 adds `GET /{plural}/import` to the static siblings, so a
+        // record whose title derives the slug "import" must be treated as taken
+        // too — otherwise it would be permanently shadowed by the upload form.
+        if import_enabled {
+            guard.push_str(" && candidate != \"import\"");
         }
         guard
     };
@@ -6161,6 +6310,46 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
+    // Issue #1393: the CSV import surface — upload form, dry-run preview, commit.
+    // Emitted straight after the export it mirrors, so the two directions of the
+    // same data door read together, and gated on the same predicate: both go
+    // through the one `CsvSchema` impl above.
+    let csv_import_fn = if import_enabled {
+        // The import writes rows, so it authorizes exactly as `create` does:
+        // context-only `authorize_create`, once for the submit. It carries no
+        // `state:` wrapper of its own, so it takes the full extractor pair.
+        let (authz_params, authz_call) = if authorize {
+            (
+                format!("{authz_params_full},"),
+                format!(
+                    "autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n    "
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        // The same predicate `render_csv_schema_impl` uses to decide whether to
+        // emit `csv_text_cell` at all: an at-rest encrypted column is excluded
+        // from the export entirely, so it cannot contribute a guarded cell.
+        let guards_text_cells = all_fields
+            .iter()
+            .any(|f| !f.is_encrypted() && csv_kind_is_text(f.kind));
+        render_csv_import_section(
+            pascal_name,
+            plural,
+            snake_name,
+            layout_fn,
+            &cp(&format!("/{plural}/import")),
+            flash_arg,
+            &authz_params,
+            &authz_call,
+            guards_text_cells,
+            labels,
+        )
+    } else {
+        String::new()
+    };
+
     // Issue #1332: the trash view + its Restore/Purge handlers. Emitted straight
     // after the index (and its bulk/export companions) because the Trash link is
     // index furniture and the page it opens is the same list, filtered to the
@@ -6746,6 +6935,22 @@ pub async fn move_down(
     // a selection action). The explicit `" "` separator is the same one the
     // export link and the show view use: Maud drops template whitespace between
     // nodes, so without it the anchors render as one glued run.
+    // Issue #1393: the index's "Import CSV" link. Page furniture like "Trash",
+    // NOT like "Export CSV": it opens an upload form rather than describing the
+    // row set on screen, so a search that swaps the results container cannot
+    // leave it pointing at rows the user has since filtered away — which is why
+    // it stays in the furniture slot even on a searchable scaffold. Outside the
+    // #1312 bulk-actions `<form>` for the same reason the export is: an import
+    // is not a selection action, and a nested `<form>` is invalid HTML.
+    let import_link_furniture = if import_enabled {
+        format!(
+            "\n        \" \"\n        \
+             (autumn_web::a11y::Link::new(paths::import_form(), {}))",
+            labels.lit("common.import.csv", "Import CSV")
+        )
+    } else {
+        String::new()
+    };
     let trash_link_furniture = if trash_enabled {
         format!(
             "\n        \" \"\n        \
@@ -6862,7 +7067,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
         h1 {{ {index_heading} }}
-        a href=(paths::new()) {{ {new_link_markup} }}{export_link_furniture}
+        a href=(paths::new()) {{ {new_link_markup} }}{export_link_furniture}{import_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -7013,7 +7218,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {export_href_let}{index_label_loads}{index_columns_labeled}{resource_bind}    Ok({layout_fn}({index_title}, {cp_index}{flash_arg}, html! {{
         h1 {{ {index_heading} }}
-        (autumn_web::a11y::Link::new(paths::new(), {new_link_text})){export_link_furniture}{trash_link_furniture}
+        (autumn_web::a11y::Link::new(paths::new(), {new_link_text})){export_link_furniture}{import_link_furniture}{trash_link_furniture}
         {index_list_block}
     }}))
 }}"#
@@ -7242,6 +7447,16 @@ pub async fn index(
         // stays byte-identical.
         if export_enabled {
             names.push("export_csv".to_owned());
+        }
+        // Issue #1393: `paths::import_form()` backs the index's "Import CSV" link
+        // and `paths::import()` the upload form's action. Two helpers for one
+        // URL — the GET and the POST live at the same path, exactly as `index`
+        // and `create` do — so a reader can tell which verb a call site means.
+        // Gated with the handlers, so a scaffold without `--import` keeps its
+        // `paths!` block byte-identical.
+        if import_enabled {
+            names.push("import_form".to_owned());
+            names.push("import".to_owned());
         }
         // Issue #1332: `paths::trash()` backs the index's "Trash" link and both
         // recovery redirects; `paths::restore(id)`/`paths::purge(id)` back the
@@ -7925,7 +8140,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
-{index_handler}{bulk_delete_fn}{export_csv_fn}{trash_section}{reorder_section}{show_section}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{csv_import_fn}{trash_section}{reorder_section}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -10020,6 +10235,590 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     )
 }
 
+/// The inverse of the export's `csv_text_cell` formula guard, spliced into
+/// [`CSV_IMPORT_TEMPLATE`] at `__UNGUARD_FN__` only when some exported column is
+/// text-backed — an unused `fn` would be a `dead_code` warning in the user's
+/// app, and the scaffold's contract is that generated code compiles clean.
+const CSV_UNGUARD_CELL_FN: &str = r"/// Undo the export's `csv_text_cell` formula guard.
+///
+/// `to_csv_record` prefixes an apostrophe to a text value beginning `=`, `+`,
+/// `-`, `@`, TAB or CR so a spreadsheet displays it instead of executing it.
+/// Left in place on the way back in, re-importing a file this app exported
+/// would store that apostrophe as data — and the value would grow one character
+/// per export/import round trip.
+///
+/// The inverse is deliberately narrow: it strips the apostrophe ONLY when it is
+/// immediately followed by one of the characters the guard fires on, which is
+/// exactly the shape the guard produces. An ordinary value that merely starts
+/// with an apostrophe (`'tis`) is untouched.
+///
+/// The ambiguity that remains is inherent to the guard, not to this inverse: a
+/// value someone really typed as `'=x` and one the export guarded from `=x` are
+/// the same bytes in the file, and this resolves them to `=x`. Delete the call
+/// in the import handler if you would rather keep the apostrophe and store it.
+fn csv_unguard_cell(value: &str) -> &str {
+    let mut rest = value.chars();
+    if rest.next() == Some('\'')
+        && matches!(rest.next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        &value[1..]
+    } else {
+        value
+    }
+}
+
+";
+
+/// The CSV import surface (issue #1393): the upload form, its two helper
+/// functions, the shared report view, and the `GET`/`POST /{plural}/import`
+/// pair.
+///
+/// Emitted only where the export (#1315) is — the import decodes rows against
+/// the same `CsvSchema` impl the export writes them from, so it cannot exist
+/// where that impl does not. Everything below is spliced into the routes module
+/// straight after the export handler, so a reader meets the two directions of
+/// the same data door together.
+///
+/// Every user-facing string arrives already rendered by
+/// [`scaffold_i18n::ViewLabels`], so this template is literal-free under
+/// `--i18n` and byte-identical without it. [`CSV_UNGUARD_CELL_FN`] fills
+/// `__UNGUARD_FN__` when the export actually guards a cell.
+const CSV_IMPORT_TEMPLATE: &str = r#"
+
+// ── CSV import: upload → dry-run preview → commit (issue #1393) ─────────────
+
+/// The most bytes one uploaded CSV may carry.
+///
+/// `security.upload.max_file_size_bytes` (16 MiB by default) is the framework
+/// ceiling; this is the tighter route-local one, applied through
+/// `with_max_bytes`, which takes `min(global, this)` — so raising it above the
+/// global is a no-op, and lowering the global still wins.
+///
+/// This, not a row count, is what bounds the handler's memory: the file is read
+/// into memory whole, and on a commit every valid row is held as a
+/// `New__PASCAL__` until the write. An oversized upload is REFUSED (413), never
+/// truncated — a half-imported spreadsheet is worse than a rejected one. For
+/// files big enough that a request-time round trip is the wrong shape, move the
+/// parse into a background job instead of raising this.
+const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Media types accepted for the uploaded CSV part.
+///
+/// Browsers are inconsistent about what they declare for a `.csv` chosen from a
+/// file dialog: a file Excel owns commonly arrives as
+/// `application/vnd.ms-excel`, and some platforms fall back to
+/// `application/octet-stream`. The declared type is therefore a filter, not the
+/// gate — see `is_csv_upload`.
+const CSV_CONTENT_TYPES: &[&str] = &[
+    "text/csv",
+    "application/csv",
+    "text/comma-separated-values",
+    "text/plain",
+    "application/vnd.ms-excel",
+    "application/octet-stream",
+];
+
+/// Whether an uploaded multipart part is plausibly a CSV file.
+///
+/// Two checks, both of which must pass: the filename ends in `.csv`
+/// (case-insensitively), and the declared content type — client-supplied, and
+/// therefore spoofable — is one of `CSV_CONTENT_TYPES` (a part that declares
+/// nothing at all passes this half, which is why the extension is required).
+///
+/// This is a SHAPE check, not a safety check. CSV is plain text and has no
+/// magic bytes, so nothing here can prove the body really is CSV. What actually
+/// protects the handler is what happens next: the bytes are only ever parsed as
+/// CSV, and every row is validated through the same `#[validate(...)]` rules a
+/// form submission goes through before it can be written. For content-based
+/// enforcement as well, set `security.upload.allowed_mime_types` — the
+/// `Multipart` extractor then sniffs each file part's leading bytes before this
+/// handler is reached. Mind the interaction: sniffing cannot recognise CSV, so
+/// such an allow-list has to admit the declared fallback too, or CSV uploads
+/// are refused before they arrive.
+fn is_csv_upload(file_name: Option<&str>, content_type: Option<&str>) -> bool {
+    let named_csv = file_name.is_some_and(|name| {
+        std::path::Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+    });
+    let declared_ok = match content_type {
+        None => true,
+        Some(declared) => {
+            // Compare on the media type's essence, so `text/csv; charset=utf-8`
+            // matches `text/csv`.
+            let essence = declared.split(';').next().unwrap_or("").trim();
+            essence.is_empty()
+                || CSV_CONTENT_TYPES
+                    .iter()
+                    .any(|allowed| essence.eq_ignore_ascii_case(allowed))
+        }
+    };
+    named_csv && declared_ok
+}
+
+__UNGUARD_FN__/// The CSV upload control: the expected column list, the file input, and the
+/// commit confirmation.
+///
+/// Shared by `GET /__PLURAL__/import`, the 422 re-render when an upload is
+/// refused, and the page rendered after a preview or a commit — so "read the
+/// preview, tick the box, upload again" is always the same control.
+///
+/// The CSRF and one-time submit-token inputs are rendered FIRST on purpose.
+/// Both layers scan only the first `security.csrf.token_scan_bytes` of a
+/// multipart body, so a token rendered after the file part would sit past the
+/// scan window on any real upload and the submit would be rejected. Keep them
+/// first if you rearrange this form.
+///
+/// `commit` pre-checks the confirmation box. The preview passes `true` (the
+/// next submit is the one that writes) and the committed result passes `false`
+/// (so the next upload previews again rather than silently importing twice).
+fn import_form_body(
+    __LOCALE_REF_PARAM__csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+    submit_token: Option<&SubmitToken>,
+    submit_field: Option<&SubmitFormField>,
+    commit: bool,
+    error: Option<&str>,
+) -> Markup {
+    html! {
+        @if let Some(error) = error {
+            p role="alert" { (error) }
+        }
+        p {
+            __L_COLUMNS__
+            ": "
+            (<__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns().join(", "))
+        }
+        form method="post" action=(paths::import()) enctype="multipart/form-data" {
+            (csrf_input(csrf, csrf_field))
+            (submit_token_input(submit_token, submit_field))
+            label for="__PLURAL__-import-file" { __L_FILE__ }
+            input id="__PLURAL__-import-file" type="file" name="file" accept=".csv,text/csv" required;
+            label for="__PLURAL__-import-commit" {
+                input id="__PLURAL__-import-commit" type="checkbox" name="commit" value="1" checked[commit];
+                " "
+                __L_COMMIT__
+            }
+            (autumn_web::a11y::Button::new(__L_UPLOAD__).submit())
+        }
+    }
+}
+
+/// Render an [`ImportReport`](autumn_web::data::csv::ImportReport): the totals,
+/// then one table row per rejected CSV row.
+///
+/// The same view serves the dry run and the commit — only the wording of the
+/// two counts changes — so an operator compares like with like: whatever the
+/// preview said would insert is what the commit reports inserting, unless the
+/// database rejected a row in between (which shows up here as an extra row
+/// error against its own line).
+///
+/// `inserted + errors.len()` always equals `total_rows()`: no row is counted
+/// twice and none is dropped silently.
+fn import_report_view(__LOCALE_REF_PARAM__report: &autumn_web::data::csv::ImportReport, committed: bool) -> Markup {
+    html! {
+        h2 {
+            @if committed { __L_COMPLETE__ } @else { __L_PREVIEW__ }
+        }
+        ul {
+            li { __L_ROWS_READ__ ": " (report.total_rows()) }
+            li {
+                @if committed { __L_ROWS_INSERTED__ } @else { __L_ROWS_INSERTABLE__ }
+                ": "
+                (report.inserted)
+            }
+            li { __L_ROWS_FAILED__ ": " (report.errors.len()) }
+        }
+        @if report.errors.is_empty() {
+            p { __L_NO_ERRORS__ }
+        } @else {
+            table {
+                thead {
+                    tr {
+                        th scope="col" { __L_LINE__ }
+                        th scope="col" { __L_COLUMN__ }
+                        th scope="col" { __L_PROBLEM__ }
+                    }
+                }
+                tbody {
+                    @for error in &report.errors {
+                        tr {
+                            // The 1-based line number in the uploaded file, so
+                            // the operator can jump straight to the row in their
+                            // spreadsheet.
+                            td { (error.line) }
+                            td { (error.column.as_deref().unwrap_or("-")) }
+                            td { (error.message) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `GET /__PLURAL__/import` — the CSV upload form.
+///
+/// The counterpart to `GET /__PLURAL__/export.csv`, and deliberately the same
+/// file format: both directions go through the ONE `CsvSchema` impl above, so
+/// a file this app exported can be edited and uploaded back without reshaping
+/// it. Columns the form does not own — `id` and `created_at`, which the
+/// database assigns — are ignored on the way in rather than rejected.
+#[secured]
+#[get("/__PLURAL__/import")]
+pub async fn import_form(
+    __LOCALE_PARAM__flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
+) -> AutumnResult<Markup> {
+    Ok(__LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
+        h1 { __L_HEADING__ }
+        (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, None))
+        (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
+    }))
+}
+
+/// `POST /__PLURAL__/import` — parse the uploaded CSV, then preview or commit it.
+///
+/// A DRY RUN IS THE DEFAULT. Unless the submitted form carries the `commit`
+/// confirmation, the engine runs in `ImportMode::DryRun`: every row is parsed
+/// and validated, the report says exactly what WOULD happen, and this handler's
+/// single write call — the `repo.save_many_skip_invalid` below — is not
+/// reached. That is the whole point of the route: see which rows are bad before
+/// anything is written.
+///
+/// HOW A ROW BECOMES A RECORD. `import_csv` hands the closure the CSV line
+/// number and the row as `column -> value`. The closure re-encodes it as a
+/// urlencoded body and calls this module's own `decode_form`, so an imported
+/// row is decoded, blank-normalized and validated by EXACTLY the code path a
+/// browser submission takes — the same `#[validate(...)]` rules, the same
+/// `into_new` conversion. A row that fails to decode becomes a row error naming
+/// the parse failure; a row that fails validation becomes a field error naming
+/// the column. Neither aborts the file.
+///
+/// WHY THE WRITE IS NOT INSIDE THE CLOSURE. `import_csv`'s handler is a
+/// synchronous `FnMut`, so it cannot await a database call. The closure
+/// therefore collects the validated rows (with their line numbers) and the
+/// write happens after the parse pass, through the repository's
+/// `save_many_skip_invalid`: a batched insert inside a transaction that falls
+/// back to row-by-row for a chunk the database rejects, so one duplicate key
+/// isolates itself instead of taking the whole batch down. Each returned
+/// failure carries the index of the row that caused it, which maps back to the
+/// CSV line recorded during the parse — that is how a unique violation is
+/// reported against line 7 rather than as an opaque 500.
+///
+/// ATOMICITY, precisely: `save_many_skip_invalid` owns the transaction, and
+/// this handler makes exactly one call to it. Rows that fail are skipped and
+/// reported; rows that succeed are committed. If you need all-or-nothing, call
+/// `save_many` instead (it aborts the batch on the first failure) and report the
+/// error against the whole file.
+///
+/// MODEL HOOKS AND SIDE EFFECTS run per inserted row, exactly as they do for
+/// `create` — including `after_create_commit` and any counter caches. An import
+/// of N rows is N records' worth of side effects, not one.
+///
+/// SIZE: the file is capped at `MAX_IMPORT_BYTES` (and at the framework's
+/// `security.upload.max_file_size_bytes`, whichever is smaller); an oversized
+/// upload is refused with 413 rather than truncated.
+///
+/// COST, and why this route carries no `#[throttle]` where the CSV export does:
+/// it is `#[secured]`, so it is not an anonymous endpoint, and the work it can
+/// be asked to do is bounded by `MAX_IMPORT_BYTES` rather than by the size of
+/// the table. It also sits near axum's handler-arity ceiling (16 extractors)
+/// once the CSRF pair, the submit token, the flash, the repository and the
+/// multipart body are counted, and `#[throttle]` injects several extractors of
+/// its own — on an owner-scoped or `--i18n` scaffold the combination does not
+/// fit, and a "sometimes throttled" route would be worse than an honest one. To
+/// rate-limit it anyway, add `#[throttle]` and give up an extractor here (the
+/// submit token is the cheapest to lose — at the cost of double-submit
+/// protection, which for an import means a second commit of the same file).
+#[secured]
+#[post("/__PLURAL__/import")]
+pub async fn import(
+    __LOCALE_PARAM__flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,__AUTHZ_PARAMS__
+    repo: Pg__PASCAL__Repository,
+    mut multipart: autumn_web::extract::Multipart,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    use autumn_web::reexports::axum::response::IntoResponse as _;
+    __AUTHZ_CALL__let mut uploaded: Option<Vec<u8>> = None;
+    let mut commit = false;
+    let mut wrong_type = false;
+    while let Some(field) = multipart.next_field().await? {
+        // Copy the part's metadata before the consuming reads below move it.
+        let field_name = field.name().map(str::to_owned);
+        match field_name.as_deref() {
+            Some("file") => {
+                let file_name = field.file_name().map(str::to_owned);
+                let content_type = field.content_type().map(str::to_owned);
+                if is_csv_upload(file_name.as_deref(), content_type.as_deref()) {
+                    uploaded = Some(field.with_max_bytes(MAX_IMPORT_BYTES).bytes_limited().await?);
+                } else {
+                    // Refuse WITHOUT reading the body: a rejected upload should
+                    // cost no more than the part header. Dropping the field here
+                    // lets the parser skip straight to the next part.
+                    wrong_type = true;
+                }
+            }
+            Some("commit") => {
+                // The confirmation checkbox. An unchecked box submits NOTHING —
+                // absence is what keeps the default a dry run — and any value
+                // other than the ones below is treated as "not confirmed".
+                let value = String::from_utf8(field.bytes_limited().await?).unwrap_or_default();
+                commit = matches!(value.trim(), "1" | "on" | "true" | "yes");
+            }
+            _ => {}
+        }
+    }
+    // A refused or missing upload re-renders the form at 422 with the reason
+    // inline and the confirmation box left as the operator set it, rather than
+    // 400ing an ordinary form submission.
+    let refusal: Option<String> = if wrong_type {
+        Some(__L_NOT_CSV__)
+    } else if uploaded.as_ref().is_none_or(Vec::is_empty) {
+        Some(__L_NO_FILE__)
+    } else {
+        None
+    };
+    if let Some(message) = refusal {
+        let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
+            h1 { __L_HEADING__ }
+            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), commit, Some(&message)))
+            (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
+        });
+        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
+    }
+    let uploaded = uploaded.unwrap_or_default();
+    let options = autumn_web::data::csv::ImportOptions {
+        mode: if commit {
+            autumn_web::data::csv::ImportMode::Insert
+        } else {
+            autumn_web::data::csv::ImportMode::DryRun
+        },
+        ..autumn_web::data::csv::ImportOptions::default()
+    };
+    // The validated rows and the CSV line each came from, kept in step so a
+    // write failure is reported against the line the operator sees in their
+    // spreadsheet. Filled only on the commit path: a dry run validates each row
+    // and drops it.
+    let mut pending_lines: Vec<u64> = Vec::new();
+    let mut pending_rows: Vec<New__PASCAL__> = Vec::new();
+    let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(row.iter().map(|(key, value)| (key.as_str(), __UNGUARD_CALL__)))
+            .finish();
+        let form = match decode_form(Bytes::from(encoded)) {
+            Ok(form) => form,
+            Err(err) => return autumn_web::data::csv::ImportRowResult::RowError(err.to_string()),
+        };
+        let changeset = form.into_changeset();
+        if !changeset.is_valid() {
+            // Report the alphabetically first failing column, so the message is
+            // stable run to run (`errors()` is a `HashMap`; its order is not).
+            let mut failed: Vec<(&String, &Vec<String>)> = changeset.errors().iter().collect();
+            failed.sort_by(|left, right| left.0.cmp(right.0));
+            // `into_iter().next()`, not `first()`: this module imports
+            // `diesel::prelude::*`, whose `RunQueryDsl::first` is also in scope
+            // and wins the method lookup on a `Vec`.
+            if let Some((column, messages)) = failed.into_iter().next() {
+                return autumn_web::data::csv::ImportRowResult::FieldError {
+                    column: column.clone(),
+                    message: messages.join(", "),
+                };
+            }
+        }
+        let new = match into_new(changeset.data()) {
+            Ok(new) => new,
+            Err(err) => return autumn_web::data::csv::ImportRowResult::RowError(err.to_string()),
+        };
+        if commit {
+            pending_lines.push(line);
+            pending_rows.push(new);
+        }
+        autumn_web::data::csv::ImportRowResult::Inserted
+    });
+    if commit {
+        let (saved, failures) = repo.save_many_skip_invalid(&pending_rows).await?;
+        // Take the inserted count from what the DATABASE returned rather than
+        // from what the parse pass counted: a row that validated and then lost a
+        // unique race is a failure, and `inserted + errors = rows read` has to
+        // keep holding or the report is lying about what happened.
+        report.inserted = saved.len() as u64;
+        for (index, failure) in failures {
+            let line = pending_lines.get(index).copied().unwrap_or_default();
+            report.errors.push(autumn_web::data::csv::CsvRowError::row(line, failure.to_string()));
+        }
+    }
+    let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
+        h1 { __L_HEADING__ }
+        (import_report_view(__LOCALE_ARG__&report, commit))
+        (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), !commit, None))
+        (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
+    });
+    Ok(page.into_response())
+}
+"#;
+
+/// Fill [`CSV_IMPORT_TEMPLATE`] in for one resource.
+///
+/// `authz_params` is the `State` + `Session` pair the record policy needs,
+/// already comma-terminated (empty without policy wiring), and `authz_call` the
+/// `authorize_create` line that goes with it. The import authorizes exactly as
+/// `create` does — context-only, once for the submit — because like `create` it
+/// has no loaded row to authorize against. A per-row rule therefore does NOT
+/// apply here any more than it applies to a hand-typed create; if your policy
+/// needs one, add the check inside the row closure below.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one slot-filling call per emitted string — splitting it would put \
+              the template's placeholders and their values in different functions"
+)]
+fn render_csv_import_section(
+    pascal_name: &str,
+    plural: &str,
+    snake_name: &str,
+    layout_fn: &str,
+    cp_import: &str,
+    flash_arg: &str,
+    authz_params: &str,
+    authz_call: &str,
+    // Whether the emitted `CsvSchema` routes any column through the export's
+    // `csv_text_cell` formula guard. When it does, the import has to undo that
+    // guard or a file this app exported would gain an apostrophe per round trip;
+    // when it does not, emitting the inverse would be an unused `fn` — a
+    // `dead_code` warning in the user's app.
+    guards_text_cells: bool,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    // Issue #1349: the two view helpers take the locale by reference (they only
+    // forward it into `t!`), the handlers take the extractor by value — the same
+    // split the attachment read-back helpers use. All three are empty without
+    // the flag, keeping every signature byte-identical.
+    let (locale_param, locale_ref_param, locale_arg) = if labels.enabled() {
+        (
+            "locale: Locale,\n    ",
+            "locale: &autumn_web::i18n::Locale,\n    ",
+            "&locale, ",
+        )
+    } else {
+        ("", "", "")
+    };
+    // "Import {Pascal}s" is a per-resource key for the same reason "New
+    // {Pascal}" is (see `new_link_markup`): a translator cannot agree an article
+    // or adjective with a noun passed in as an argument.
+    let import_key = format!("{snake_name}.import");
+    let import_english = format!("Import {pascal_name}s");
+    // The error messages are `String` in BOTH modes — `t!` yields an owned
+    // String and the plain path an owned literal — so the `Option<String>` the
+    // handler binds has one type either way.
+    let not_csv_english = "That file is not a .csv - choose a CSV file and try again.";
+    let no_file_english = "Choose a CSV file to import.";
+    let (unguard_fn, unguard_call) = if guards_text_cells {
+        (CSV_UNGUARD_CELL_FN, "csv_unguard_cell(value)")
+    } else {
+        ("", "value.as_str()")
+    };
+    CSV_IMPORT_TEMPLATE
+        .replace("__UNGUARD_FN__", unguard_fn)
+        .replace("__UNGUARD_CALL__", unguard_call)
+        .replace("__LOCALE_REF_PARAM__", locale_ref_param)
+        .replace("__LOCALE_PARAM__", locale_param)
+        .replace("__LOCALE_ARG__", locale_arg)
+        .replace("__AUTHZ_PARAMS__", authz_params)
+        .replace("__AUTHZ_CALL__", authz_call)
+        .replace("__LAYOUT__", layout_fn)
+        .replace("__CP_IMPORT__", cp_import)
+        .replace("__FLASH_ARG__", flash_arg)
+        .replace("__L_TITLE__", &labels.lit_ref(&import_key, &import_english))
+        .replace(
+            "__L_HEADING__",
+            &labels.markup(&import_key, &import_english),
+        )
+        .replace("__L_BACK__", &labels.lit("common.back", "Back to list"))
+        .replace(
+            "__L_COLUMNS__",
+            &labels.markup("common.import.columns", "Expected columns"),
+        )
+        .replace(
+            "__L_FILE__",
+            &labels.markup("common.import.file", "CSV file"),
+        )
+        .replace(
+            "__L_COMMIT__",
+            &labels.markup(
+                "common.import.commit",
+                "Import for real (leave unchecked to preview)",
+            ),
+        )
+        .replace(
+            "__L_UPLOAD__",
+            &labels.lit("common.import.upload", "Upload"),
+        )
+        .replace(
+            "__L_PREVIEW__",
+            &labels.markup("common.import.preview", "Import preview"),
+        )
+        .replace(
+            "__L_COMPLETE__",
+            &labels.markup("common.import.complete", "Import complete"),
+        )
+        .replace(
+            "__L_ROWS_READ__",
+            &labels.markup("common.import.rows.read", "Rows read"),
+        )
+        .replace(
+            "__L_ROWS_INSERTABLE__",
+            &labels.markup("common.import.rows.insertable", "Rows that would insert"),
+        )
+        .replace(
+            "__L_ROWS_INSERTED__",
+            &labels.markup("common.import.rows.inserted", "Rows inserted"),
+        )
+        .replace(
+            "__L_ROWS_FAILED__",
+            &labels.markup("common.import.rows.failed", "Rows with errors"),
+        )
+        .replace(
+            "__L_NO_ERRORS__",
+            &labels.markup("common.import.rows.clean", "No row errors."),
+        )
+        .replace("__L_LINE__", &labels.markup("common.import.line", "Line"))
+        .replace(
+            "__L_COLUMN__",
+            &labels.markup("common.import.column", "Column"),
+        )
+        .replace(
+            "__L_PROBLEM__",
+            &labels.markup("common.import.problem", "Problem"),
+        )
+        .replace(
+            "__L_NOT_CSV__",
+            &labels.expr(
+                "common.import.error.not.csv",
+                not_csv_english,
+                &format!("\"{not_csv_english}\".to_owned()"),
+                &[],
+            ),
+        )
+        .replace(
+            "__L_NO_FILE__",
+            &labels.expr(
+                "common.import.error.no.file",
+                no_file_english,
+                &format!("\"{no_file_english}\".to_owned()"),
+                &[],
+            ),
+        )
+        .replace("__PASCAL__", pascal_name)
+        .replace("__PLURAL__", plural)
+}
+
 /// Whether a column of this kind is server-sortable via the generated
 /// `list()` method (#1126).
 ///
@@ -11479,6 +12278,216 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
          );\n\
          }}\n"
     )
+}
+
+/// Render the CSV import test (issue #1393, AC6) appended to
+/// `tests/<snake>.rs`.
+///
+/// Emitted under exactly the gate that decides whether the import routes exist
+/// at all, alongside the export's download test.
+///
+/// Like every #1127-style generated test this drives a STAND-IN resource rather
+/// than the app's own handler — a `tests/*.rs` integration binary cannot import
+/// a binary crate's modules (see `docs/guide/tutorial/11-testing.md`) — but it
+/// drives the REAL shipped primitives the generated handler is built on: the
+/// `Multipart` extractor, `import_csv`, `ImportMode::DryRun`, and the
+/// `ImportReport` the preview is rendered from. It needs no database (a
+/// process-local store stands in for the persistence layer), so it is a visible
+/// green rather than an `#[ignore]`d test, and its assertions have real failure
+/// power: a handler that wrote on a dry run, lost the bad row's line number, or
+/// silently dropped the valid one turns it red.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the body is one emitted test template — splitting it would break \
+              the generated file into fragments no reader wants to reassemble"
+)]
+fn render_csv_import_smoke_test(plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+// ── CSV import: dry-run preview, then commit (issue #1393) ─────────────────
+//
+// The two halves of the import contract, driven through the same primitives
+// `POST /__PLURAL__/import` uses:
+//
+//   * a submit that does NOT confirm runs `ImportMode::DryRun`, reports one
+//     insertable row and one row error carrying the bad row's LINE NUMBER, and
+//     writes nothing;
+//   * a submit that confirms writes exactly the valid row.
+//
+// The uploaded file is two data rows, one valid and one not, so "1 good, 1 bad"
+// is proven rather than assumed. The resource here is a stand-in (a `tests/`
+// binary cannot import this project's own modules — see
+// `docs/guide/tutorial/11-testing.md`) with one deliberately simple validation
+// rule; the real handler runs the model's own `#[validate(...)]` rules through
+// the same `Changeset` a form submission goes through.
+//
+// No database required, so this runs on a plain `cargo test`.
+//
+// CSRF: `TestApp::new()` disables CSRF (like Spring Security's test support),
+// so this multipart POST carries no `_csrf` token. The real, generated upload
+// form renders the CSRF and submit-token hidden inputs as its FIRST fields for
+// the browser; the in-process harness does not require them, and this note
+// records that the absent token is intentional.
+#[tokio::test]
+async fn __PLURAL___csv_import_previews_then_commits() {
+    use autumn_web::data::csv::{ImportMode, ImportOptions, ImportRowResult, import_csv};
+    use autumn_web::test::{TestApp, TestClient};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Stands in for the persistence layer: the titles that were really written.
+    fn store() -> &'static Mutex<Vec<String>> {
+        static STORE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// A `multipart/form-data` body (boundary `BOUND`) with the CSV file part
+    /// and, optionally, the `commit` confirmation. `None` models an UNCHECKED
+    /// checkbox, which submits no part at all — that absence is what keeps a
+    /// dry run the default.
+    fn probe_body(csv: &str, commit: Option<&str>) -> String {
+        let mut out = String::new();
+        out.push_str("--BOUND\r\n");
+        out.push_str("Content-Disposition: form-data; name=\"file\"; filename=\"rows.csv\"\r\n");
+        out.push_str("Content-Type: text/csv\r\n\r\n");
+        out.push_str(csv);
+        out.push_str("\r\n");
+        if let Some(commit) = commit {
+            out.push_str("--BOUND\r\n");
+            out.push_str("Content-Disposition: form-data; name=\"commit\"\r\n\r\n");
+            out.push_str(commit);
+            out.push_str("\r\n");
+        }
+        out.push_str("--BOUND--\r\n");
+        out
+    }
+
+    #[post("/__PLURAL__/import-probe")]
+    async fn import_probe(
+        mut multipart: autumn_web::extract::Multipart,
+    ) -> AutumnResult<String> {
+        let mut uploaded: Vec<u8> = Vec::new();
+        let mut commit = false;
+        while let Some(field) = multipart.next_field().await? {
+            // `name()` borrows the field, which the consuming read below moves.
+            let field_name = field.name().map(str::to_owned);
+            match field_name.as_deref() {
+                Some("file") => uploaded = field.bytes_limited().await?,
+                Some("commit") => {
+                    let value =
+                        String::from_utf8(field.bytes_limited().await?).unwrap_or_default();
+                    commit = matches!(value.trim(), "1" | "on" | "true" | "yes");
+                }
+                _ => {}
+            }
+        }
+        let options = ImportOptions {
+            mode: if commit {
+                ImportMode::Insert
+            } else {
+                ImportMode::DryRun
+            },
+            ..ImportOptions::default()
+        };
+        // Collected during the parse pass and written afterwards, because
+        // `import_csv`'s handler is a synchronous closure that cannot await a
+        // write — the same reason the generated handler defers to
+        // `save_many_skip_invalid` after the pass rather than writing per row.
+        let mut pending: Vec<String> = Vec::new();
+        let report = import_csv(&uploaded[..], &options, |_line, row, _mode| {
+            let title = row
+                .get("title")
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if title.is_empty() {
+                return ImportRowResult::FieldError {
+                    column: "title".to_owned(),
+                    message: "must not be blank".to_owned(),
+                };
+            }
+            if commit {
+                pending.push(title);
+            }
+            ImportRowResult::Inserted
+        });
+        if commit {
+            store().lock().expect("import store").extend(pending);
+        }
+        Ok(format!(
+            "read {} / would insert {} / errors {} / first error line {}",
+            report.total_rows(),
+            report.inserted,
+            report.errors.len(),
+            // `iter().next()`, not `first()`: this test imports
+            // `diesel::prelude::*`, whose `RunQueryDsl::first` also applies here.
+            report.errors.iter().next().map_or(0, |error| error.line),
+        ))
+    }
+
+    /// What actually got written, so the assertions below are about persisted
+    /// rows rather than about the handler's own report of itself.
+    #[get("/__PLURAL__/import-probe/written")]
+    async fn written() -> String {
+        store().lock().expect("import store").join(",")
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![import_probe, written])
+        .build();
+
+    // Line 1 is the header, line 2 is valid, line 3 has a blank `title`.
+    let csv = "title,note\r\nKeep me,fine\r\n,blank title\r\n";
+
+    // ── the dry run ────────────────────────────────────────────────────────
+    let preview = client
+        .post("/__PLURAL__/import-probe")
+        .header("content-type", "multipart/form-data; boundary=BOUND")
+        .body(probe_body(csv, None))
+        .send()
+        .await;
+    preview
+        .assert_ok()
+        .assert_body_contains("read 2")
+        .assert_body_contains("would insert 1")
+        .assert_body_contains("errors 1")
+        // The line number is what makes the report actionable: the operator has
+        // to be able to find the bad row in the file they uploaded.
+        .assert_body_contains("first error line 3");
+
+    let after_preview = client
+        .get("/__PLURAL__/import-probe/written")
+        .send()
+        .await
+        .text();
+    assert!(
+        after_preview.is_empty(),
+        "a dry run must not write: store held {after_preview:?}"
+    );
+
+    // ── the confirmed commit ───────────────────────────────────────────────
+    client
+        .post("/__PLURAL__/import-probe")
+        .header("content-type", "multipart/form-data; boundary=BOUND")
+        .body(probe_body(csv, Some("1")))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("would insert 1")
+        .assert_body_contains("errors 1");
+
+    let after_commit = client
+        .get("/__PLURAL__/import-probe/written")
+        .send()
+        .await
+        .text();
+    assert_eq!(
+        after_commit, "Keep me",
+        "exactly the valid row must persist, and the invalid one must not"
+    );
+}
+"#;
+    TEMPLATE.replace("__PLURAL__", plural)
 }
 
 /// Render the write-path portion of `tests/<snake>.rs` (issue #1127): one
@@ -13153,6 +14162,9 @@ fn main_route_entries(
     search: bool,
     bulk_delete: bool,
     export_csv: bool,
+    // Issue #1393: `true` under `--import`, mounting the CSV upload form and the
+    // handler that previews or commits it.
+    import_csv: bool,
     // Issue #1332: `true` under `--soft-delete` on the standard HTML path,
     // mounting the trash view and its restore/purge controls.
     trash: bool,
@@ -13200,6 +14212,13 @@ fn main_route_entries(
         // as `bulk_delete` above.
         if export_csv {
             entries.push(format!("routes::{plural}::export_csv"));
+        }
+        // Issue #1393: mount the import pair next to the export it mirrors.
+        // Gated with the handler emission in `render_routes_file` for the same
+        // reason as `bulk_delete`/`export_csv` above.
+        if import_csv {
+            entries.push(format!("routes::{plural}::import_form"));
+            entries.push(format!("routes::{plural}::import"));
         }
         // Issue #1332: mount the trash view next to the index it recovers from,
         // then its two per-row controls. Gated with the handler emission in
