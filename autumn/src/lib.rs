@@ -435,6 +435,12 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+/// Web Push: VAPID key handling, RFC 8291 payload encryption, subscription
+/// storage, and a built-in subscribe/unsubscribe router (#1392).
+///
+/// See [`push::WebPush`] for the send API and [`push::router`] for the
+/// built-in endpoints.
+pub mod push;
 /// Compile-time per-route database query budgets (#1667).
 ///
 /// See [`query_budget::StaticQueryBudget`] and the

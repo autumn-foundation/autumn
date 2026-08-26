@@ -350,6 +350,13 @@ infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 aes-gcm = "0.10"
+# NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
+# (RFC 8292) and the ECDH half of RFC 8291 payload encryption. Adds NO new
+# crate to the graph — `jsonwebtoken` (a non-optional dependency above) already
+# resolves p256 0.13 for its `rust_crypto` ES256 backend; this only adds the
+# direct edge plus the `ecdh` feature, which is a feature flag on the
+# already-compiled `elliptic-curve`, not a new dependency.
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
 getrandom = "0.2"
 hex = "0.4"
 include_dir = { version = "0.7", optional = true }
