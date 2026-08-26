@@ -249,6 +249,7 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.listeners(listeners![...])` | Register `#[listener]` event listeners (0.6.0) |
 | `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (0.6.0; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
 | `.with_shard_router(router)` | Install a shard router for `[[database.shards]]` (0.6.0) |
+| `.seo_source(source)` | Register a `SitemapSource` for dynamic `/sitemap.xml` entries (0.7.0) |
 | `.run()` | Launch the server |
 
 ## Route macros
@@ -322,6 +323,40 @@ accepts the same argument, so pre-rendered pages carry the tags. The extractor
 never fails — on a route without `seo(...)` it yields an empty builder. Note the
 attribute supplies *values*, not markup: the handler still emits them, normally
 via `seo.render()` inside the layout's `<head>`.
+
+**`sitemap.xml` and `robots.txt` (0.7.0):** set `[seo] base_url =
+"https://example.com"` in `autumn.toml` and the framework mounts `GET
+/robots.txt` and `GET /sitemap.xml`. `robots.txt` defaults by profile
+(`dev`/`test` → `Disallow: /`, `prod` → `Allow: /`); override with `[seo.robots]
+allow_all`, add lines with `additional_rules`, and pin the `Sitemap:` URL with
+`sitemap_url` (otherwise derived from `base_url`). The sitemap gets one entry
+per concrete `#[static_get]` path for free; every other URL comes from a
+`SitemapSource` registered with `.seo_source(...)`:
+
+```rust
+use autumn_web::seo::{SitemapEntry, SitemapSource};
+
+impl SitemapSource for PostSitemap {
+    fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send + '_>> {
+        Box::pin(async {
+            vec![SitemapEntry::new("https://example.com/posts/hello")
+                .lastmod("2026-05-01")
+                .changefreq(autumn_web::seo::SitemapChangefreq::Weekly)]
+        })
+    }
+}
+```
+
+Traps: `entries()` is awaited **once**, while the router builds, and the body is
+cached — the sitemap is a start-up snapshot, so an app needing live entries must
+register its own `/sitemap.xml` route (the framework detects the collision, warns,
+and mounts neither of its own SEO routes). A source cannot use the `Db` extractor
+(no `AppState` yet) — build a pool with `autumn_web::db::create_pool(&config.database)`.
+`seo(robots = "noindex")` drops a route from the sitemap only for `#[static_get]`
+paths the framework derived itself; `SitemapSource` entries are never filtered, so
+omit the URL from the source instead. `sitemap_xml` truncates past 50,000 URLs.
+`autumn build` writes both files into `dist/`. Guide: `docs/guide/seo.md`; runnable
+example: `examples/reddit-clone` (`src/seo.rs`, `autumn.toml`).
 
 **Locale-prefixed routing (issue #1251, 0.7.0):** set
 `[i18n] locale_prefix_enabled = true` in `autumn.toml` (default `false`) and
@@ -2466,6 +2501,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/daemon.md`
 - `docs/guide/resilience.md`
 - `docs/guide/generators.md`
+- `docs/guide/seo.md`
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
 - `docs/guide/maintenance-mode.md`
