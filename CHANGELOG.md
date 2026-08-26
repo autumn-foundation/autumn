@@ -56,7 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiling: `#[query_budget(unbounded, reason = "…")]` on the handler, and
   `#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement. Each
   annotated function also emits a hidden `StaticQueryBudget` constant recording
-  what was declared and what was proved. See
+  what was declared and what was proved. The analysis is written against
+  autumn's real query surface: `Db::tx` / `tx_with` callbacks are counted once
+  and their `conn` is tracked, `#[model]` static finders (`Post::published(&mut
+  db)`) count as one query, repository builder chains cost the same whether or
+  not they are split across `let` bindings, and `find_in_batches` / `find_each`
+  are unbounded because a keyset walk issues one query per batch. Handles are
+  followed through fields and conventional accessors (`self.repo`, `state.db`,
+  `app.pool()`) so a service method's queries are visible too. Adopted in
+  `examples/bookmarks`. See
   [the query budgets guide](docs/guide/query-budgets.md).
 
 - **`AppBuilder::plugin_migrations(name, migrations)`:** a named registration

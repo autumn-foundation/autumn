@@ -23,7 +23,7 @@ mod schema {
 }
 
 use autumn_web::prelude::*;
-use autumn_web::query_budget;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 use autumn_web::reexports::diesel::prelude::*;
 use autumn_web::reexports::diesel_async::RunQueryDsl;
 use schema::{qb_authors, qb_posts};
@@ -85,8 +85,58 @@ async fn raw(mut db: Db) -> AutumnResult<String> {
     Ok(posts.len().to_string())
 }
 
+/// Stacked with the auth and rate guards, which rewrite the body into an
+/// `async` block. The analysis walks through that, so the count is the same as
+/// it would be without them — pinned here because nothing else would notice if
+/// a guard's rewrite started hiding queries.
+#[get("/qb-posts/secure")]
+#[secured]
+#[query_budget(1)]
+async fn secure(repo: PgQbPostRepository) -> AutumnResult<String> {
+    Ok(repo.count().await?.to_string())
+}
+
+#[get("/qb-posts/limited")]
+#[throttle(limit = 5, per = "1m", key = "ip")]
+#[query_budget(1)]
+async fn limited(repo: PgQbPostRepository) -> AutumnResult<String> {
+    Ok(repo.count().await?.to_string())
+}
+
+/// autumn's real transaction API: the callback runs once, and the `conn` it
+/// hands over is tracked, so the two writes inside are counted — not reported
+/// as a per-element closure.
+#[post("/qb-posts")]
+#[query_budget(3)]
+async fn create(mut db: Db) -> AutumnResult<String> {
+    let title: String = db
+        .tx(move |conn| {
+            async move {
+                let created: QbPost = diesel::insert_into(qb_posts::table)
+                    .values((
+                        qb_posts::title.eq("hello"),
+                        qb_posts::author_id.eq(1_i64),
+                    ))
+                    .returning(QbPost::as_returning())
+                    .get_result(conn)
+                    .await?;
+                diesel::update(qb_authors::table.find(created.author_id))
+                    .set(qb_authors::name.eq("seen"))
+                    .execute(conn)
+                    .await?;
+                Ok::<_, autumn_web::AutumnError>(created.title)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    Ok(title)
+}
+
 fn main() {
     assert_eq!(__AUTUMN_QUERY_BUDGET_index.proven_max, Some(2));
+    assert_eq!(__AUTUMN_QUERY_BUDGET_secure.proven_max, Some(1));
+    assert_eq!(__AUTUMN_QUERY_BUDGET_limited.proven_max, Some(1));
+    assert_eq!(__AUTUMN_QUERY_BUDGET_create.proven_max, Some(3));
     assert_eq!(__AUTUMN_QUERY_BUDGET_count.proven_max, Some(1));
     assert_eq!(__AUTUMN_QUERY_BUDGET_raw.proven_max, Some(1));
 }

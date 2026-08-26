@@ -1,6 +1,6 @@
 error: `#[query_budget(5)]` cannot be proven: the `render!` macro body names the database handle, and a macro body is opaque token soup to the analysis.
 
-       Move the query out of the macro and into a statement the analysis can read, declare the statement with `#[query_cost(N)]`, or exempt it with `#[query_exempt(reason = ...)]`.
+       Move the query out of the macro and into a statement the analysis can read, declare the statement with `#[query_cost(N)]`, or exempt it with `#[query_exempt(reason = ...)]`. See docs/guide/query-budgets.md.
   --> tests/compile-fail/query_budget_macro_body.rs:27:8
    |
 27 |     Ok(render! { title: fetch_title(&mut db).await? })

@@ -65,17 +65,19 @@ pub async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
 `cargo build` fails:
 
 ```text
-error: `#[query_budget(2)]` cannot be proven: a database query (`find_author`)
-       runs inside a loop, so this handler's query count grows with the size of
-       the collection — the classic N+1
+error: `#[query_budget(2)]` cannot be proven: a database query
+       (`find_author`) runs inside a loop, so this handler's query count
+       grows with the size of the collection — the classic N+1.
 
-       Fix it by batching the lookup with `preload(...)`, by declaring the call
-       site with `#[query_cost(N)]` / `#[query_exempt(reason = ...)]`, or by
-       opting the handler out with `#[query_budget(unbounded, reason = ...)]`
+       Batch the per-row lookup into one query with `preload(...)`, put
+       `#[query_cost(N)]` on the loop statement when the iteration count
+       is bounded by something the analysis cannot see, or opt the handler
+       out with `#[query_budget(unbounded, reason = ...)]`. See
+       docs/guide/query-budgets.md.
   --> src/routes/posts.rs:9:5
    |
  9 |     for post in &posts {
-   |     ^^^^^^^^^^^^^^^^^^
+   |     ^^^
 ```
 
 Note what did *not* have to happen: no test ran, no request was made, and the
@@ -118,10 +120,13 @@ Both halves are compiled in CI as trybuild fixtures — see
 | A loop whose body issues a query | **unbounded** (rejected under a finite budget) |
 | A loop with a literal bound (`for _ in 0..3`) | body cost **× 3** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
-| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, …) it carries |
-| `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads |
+| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
+| `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
-| `db.transaction(\|conn\| …)` | **1**, plus the callback body counted **once** |
+| A `#[model]` static finder (`Post::published(&mut db)`) | **1** |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still counted |
+| `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
+| An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** — it is not an iterator adapter |
 
 A repository future is counted where it is **built**, not where it is awaited,
 so collecting futures in a `.map(…)` and driving them with `join_all` later is
@@ -135,8 +140,11 @@ negative ships an N+1 to production.
 
 - **A helper function handed the handle** — `load_links(&mut db, id)`. Its body
   is another function; the macro sees only the call.
-- **A macro body that names the handle** — `html! { … (fetch(&mut db)) … }`. A
-  macro body is token soup to `syn`.
+- **A macro body that `await`s while naming the handle** — `html! { …
+  (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
+  that merely *passes* the handle to a render helper is fine: only an `await`
+  inside the body makes it suspicious, and logging/formatting macros
+  (`tracing::debug!`, `format!`, …) are never suspicious.
 - **A closure that may run per element** — anything that isn't a transaction
   callback.
 - **A `preload` spec that isn't a literal builder chain** — a spec built
@@ -165,6 +173,29 @@ The `reason` is optional to the compiler and expected by review: it is the
 sentence the next reader needs.
 
 ### `#[query_cost(N)]` — declare one statement's cost
+
+Both annotations are read at **statement** level. You cannot annotate a
+sub-expression or a call buried inside a closure — hoist it to its own
+statement first. A compound statement *is* one statement, so
+`#[query_cost(10)]` on a `for` loop declares the whole loop's cost, which is
+the supported way to bound a loop whose iteration count the analysis cannot
+see:
+
+```rust
+#[query_budget(10)]
+pub async fn refresh(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<()> {
+    #[query_cost(10)]   // the page size is capped upstream at 10
+    for id in ids {
+        repo.reindex(id).await?;
+    }
+    Ok(())
+}
+```
+
+Because the annotated statement's interior is not analysed, an annotation on a
+loop or block hides everything inside it. Keep the scope as small as the fix
+allows.
+
 
 Use it when a helper's query count is known but not visible:
 
@@ -203,7 +234,10 @@ rustc — they are only meaningful inside an annotated function.
 ## Attribute order
 
 `#[query_budget]` reads the handler and emits it unchanged, so it composes with
-the route macro in either order:
+the route macro in either order. The same holds for `#[secured]`, `#[step_up]`,
+`#[authorize]`, and `#[throttle]`, which wrap the body in an `async` block the
+analysis walks through — pinned by the trybuild fixtures in
+`autumn/tests/compile-pass/`:
 
 ```rust
 #[get("/posts")]          // route macro outermost — preferred
@@ -214,6 +248,14 @@ pub async fn index(repo: PgPostRepository) -> AutumnResult<Markup> { /* … */ }
 Keeping the method attribute outermost matches the convention the other
 handler attributes (`#[secured]`, `#[throttle]`) document, and keeps the
 handler's real return type visible for OpenAPI response schemas.
+
+Some attributes rewrite the handler body before `#[query_budget]` reads it:
+`#[secured]`, `#[step_up]`, `#[authorize]`, and `#[throttle]` wrap it in an
+`async` block, and `#[cached]` wraps it in an immediately-invoked closure. The
+analysis walks through both shapes, so it never blames you for a closure you did
+not write. (`#[cached]` requires `Hash` arguments and a `Clone + Deserialize`
+return, so it cannot take a `Db` or repository extractor in the first place —
+a cached function has no queries to budget.)
 
 It also works on plain helper functions, not just routes — useful for pinning a
 shared query helper's cost where it is defined.
@@ -251,8 +293,8 @@ Within an annotated function, every construct that can issue a query is either
 counted or reported — never silently skipped. Counting rests on two framework
 contracts, both of which the macro states in its diagnostics:
 
-1. One repository-chain call issues one query, and one `preload` association
-   issues one batched query.
+1. One repository-chain call, one `#[model]` static finder, or one `preload`
+   association issues one query.
 2. A call site the analysis cannot read declares its own cost with
    `#[query_cost(N)]`, or is excluded with `#[query_exempt(reason = "…")]`.
 
@@ -260,6 +302,31 @@ A hand-written `#[repository]` method that issues more than one query must
 therefore declare it at the call site. Both annotations are opt-ins a reviewer
 can see in the diff — which is the point: the unprovable parts are visible
 rather than assumed.
+
+### Where the boundary sits
+
+The analysis tracks a handle from where the signature names it (the `Db` /
+repository extractor), through fields and conventionally-named accessors
+(`self.repo`, `state.db`, `app.pool()`), and into transaction callbacks. Two
+things sit outside it, by construction:
+
+- **A handle obtained some other way** — for example a repository pulled off an
+  application-state extractor by an application-specific method
+  (`state.posts()`). Take the `Db` or repository extractor in the signature and
+  the gate sees everything.
+- **Queries issued through ambient state rather than a handle** — `Job::enqueue`
+  writing a job row, audit sinks, session and flash writes. These reach the
+  database without any handle in the handler's signature, so no static
+  attribution is possible; they are the same class as the background-job work
+  listed under Scope above.
+
+### `proven_max` is not `query_count()`
+
+The compile-time bound and the runtime counter measure deliberately different
+things: `TestResponse::query_count` excludes transaction control statements
+(`BEGIN`/`COMMIT`/`SAVEPOINT`/…), while the static model charges 1 for the
+`db.tx(…)` call itself. A handler with one query inside one transaction has
+`proven_max == 2` and `query_count() == 1`. Tune each against its own tool.
 
 ---
 

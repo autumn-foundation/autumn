@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
-use quote::{format_ident, quote};
+use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
@@ -71,21 +71,89 @@ const HANDLE_BUILDERS: &[&str] = &[
     "as_ref",
     "reborrow",
     "clone",
+    // Query-DSL refinements on a repository's aggregate/finder builders. They
+    // are pure builder calls, so splitting a chain across `let` bindings must
+    // not change the count.
+    "filter",
+    "order",
+    "order_by",
+    "order_by_aggregate_asc",
+    "order_by_aggregate_desc",
+    "group_by",
+    "having",
+    "limit",
+    "offset",
+    "select",
+    "page",
+    "per_page",
+];
+
+/// Closure-taking methods that invoke their closure **at most once** —
+/// `Option`/`Result` combinators, not iterator adapters. A query inside one is
+/// a fixed cost, not a per-element one.
+const AT_MOST_ONCE_CLOSURE_METHODS: &[&str] = &[
+    "unwrap_or_else",
+    "ok_or_else",
+    "get_or_insert_with",
+    "unwrap_or_default",
+];
+
+/// Macros that are structurally incapable of issuing a query, however they
+/// mention the handle (`tracing::debug!(db = ?db, …)`, `format!("{db:?}")`).
+const INERT_MACROS: &[&str] = &[
+    "format",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "panic",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "dbg",
+    "vec",
+    "matches",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+    "span",
+    "log",
 ];
 
 /// Methods that run their closure **exactly once**, so a query inside is a
-/// fixed cost rather than a per-element one.
-const TRANSACTION_METHODS: &[&str] = &[
-    "transaction",
-    "transaction_with_retry",
-    "transaction_with_isolation",
-    "immediate_transaction",
-    "read_only_transaction",
-    "with_transaction",
-];
+/// fixed cost rather than a per-element one. `Db::tx` / `Db::tx_with` are
+/// autumn's transaction API (`autumn/src/db.rs`); `transaction` is
+/// diesel-async's own.
+const TRANSACTION_METHODS: &[&str] = &["tx", "tx_with", "transaction"];
+
+/// Free functions whose closure likewise runs exactly once, and which take the
+/// connection as their first argument (`autumn/src/db.rs`).
+const TRANSACTION_FREE_FNS: &[&str] = &["scoped_transaction", "savepoint"];
+
+/// Repository methods that walk a whole table through a keyset cursor. Their
+/// query count is the table's size divided by the batch size — unbounded at
+/// compile time, however small the budget looks.
+const UNBOUNDED_METHODS: &[&str] = &["find_in_batches", "find_each"];
 
 /// Free functions that may receive the handle without querying through it.
 const SAFE_FREE_FNS: &[&str] = &["drop"];
+
+/// Field and accessor names that conventionally *hold* a database handle
+/// rather than query through one: `self.repo`, `state.db`, `app.pool()`. A
+/// handle reached this way is tracked like one named in the signature, so a
+/// query issued through it is still counted.
+const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
 /// Exact type names that name a database handle.
 const HANDLE_TYPES: &[&str] = &[
@@ -102,15 +170,22 @@ const HANDLE_TYPES: &[&str] = &[
 ];
 
 /// Offered when the fix is to stop issuing a query per row.
-const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, declare \
-                          the call site with `#[query_cost(N)]`, exempt it with \
-                          `#[query_exempt(reason = ...)]`, or opt the handler out with \
-                          `#[query_budget(unbounded, reason = ...)]`.";
+const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
+                          handler out with `#[query_budget(unbounded, reason = ...)]`. See \
+                          docs/guide/query-budgets.md.";
+
+/// Offered for a loop, where the working annotation goes on the loop statement
+/// itself rather than on the call inside it.
+const LOOP_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, put \
+                         `#[query_cost(N)]` on the loop statement when the iteration count is \
+                         bounded by something the analysis cannot see, or opt the handler out \
+                         with `#[query_budget(unbounded, reason = ...)]`. See \
+                         docs/guide/query-budgets.md.";
 
 /// Offered when the fix is to state a cost the analysis cannot see.
 const DECLARE_HINT: &str = "Declare the statement's cost with `#[query_cost(N)]`, or exempt it \
                             with `#[query_exempt(reason = ...)]` once you have checked it issues \
-                            nothing.";
+                            nothing. See docs/guide/query-budgets.md.";
 
 /// Statement annotation declaring a call site's query cost.
 const ATTR_QUERY_COST: &str = "query_cost";
@@ -143,7 +218,14 @@ impl Parse for BudgetAttr {
 
         let budget = if input.peek(syn::LitInt) {
             let lit: syn::LitInt = input.parse()?;
-            Budget::Bounded(lit.base10_parse::<u32>()?)
+            let count = lit.base10_parse::<u32>().map_err(|_| {
+                syn::Error::new(
+                    lit.span(),
+                    "`#[query_budget(...)]` expects a whole, non-negative query count that fits \
+                     in a `u32`, e.g. `#[query_budget(3)]`",
+                )
+            })?;
+            Budget::Bounded(count)
         } else if input.peek(syn::Ident) {
             let ident: syn::Ident = input.parse()?;
             if ident == "unbounded" {
@@ -326,8 +408,19 @@ impl Analyzer {
             // A binding initialised from a handle (or from a handle-rooted
             // chain) is itself a handle from here on, so passing it into an
             // opaque call is still caught.
-            if self.expr_is_handle(&init.expr) {
+            // A binding initialised from a handle — or from a chain rooted at
+            // one, so a builder chain split across `let`s keeps its identity —
+            // is itself a handle from here on.
+            if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
                 collect_pat_idents(&local.pat, &mut self.handles);
+            } else if let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) {
+                // `let (conn, key) = (db, id);` — pair the pattern against the
+                // initialiser element-wise so the handle keeps its tracking.
+                for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
+                    if self.expr_is_handle(element) || self.chain_root_is_handle(element) {
+                        collect_pat_idents(element_pat, &mut self.handles);
+                    }
+                }
             }
         }
         cost
@@ -335,6 +428,17 @@ impl Analyzer {
 
     /// Read a `#[query_cost(N)]` / `#[query_exempt(...)]` statement annotation.
     fn annotation(&mut self, attrs: &[Attribute]) -> Option<Annotation> {
+        let annotated: Vec<&Attribute> = attrs
+            .iter()
+            .filter(|a| a.path().is_ident(ATTR_QUERY_COST) || a.path().is_ident(ATTR_QUERY_EXEMPT))
+            .collect();
+        if annotated.len() > 1 {
+            self.errors.push(syn::Error::new_spanned(
+                annotated[1],
+                "a statement carries more than one query annotation; keep exactly one of \
+                 `#[query_cost(N)]` or `#[query_exempt(reason = ...)]`",
+            ));
+        }
         for attr in attrs {
             if attr.path().is_ident(ATTR_QUERY_COST) {
                 let Ok(lit) = attr.parse_args::<syn::LitInt>() else {
@@ -353,6 +457,12 @@ impl Analyzer {
                 });
             }
             if attr.path().is_ident(ATTR_QUERY_EXEMPT) {
+                // The hatch's whole value is that a reviewer can see why. A
+                // reason-less or typo'd exemption is a silent hole, so it is an
+                // error rather than an accepted default.
+                if let Err(err) = parse_reason(attr) {
+                    self.errors.push(err);
+                }
                 return Some(Annotation::Exempt);
             }
         }
@@ -376,12 +486,29 @@ impl Analyzer {
             Expr::Group(e) => self.expr_in(&e.expr, awaited),
 
             Expr::MethodCall(mc) => self.method_chain(mc, awaited),
+            // `(|| async move { … })()` — the shape `#[cached]` wraps a handler
+            // body in when it expands first. The closure runs exactly once, so
+            // look straight through it rather than reporting a closure the user
+            // never wrote.
+            Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
+                let closure = immediately_invoked_closure(&call.func)
+                    .expect("guarded by the match arm above");
+                let mut cost = Cost::ZERO;
+                for arg in &call.args {
+                    cost = cost.then(self.expr(arg));
+                }
+                cost.then(self.expr(&closure.body))
+            }
             Expr::Call(call) => self.call(call),
             Expr::Macro(m) => self.mac(&m.mac),
             Expr::Closure(closure) => {
                 let body = self.expr(&closure.body);
                 if body.is_zero() {
                     Cost::ZERO
+                } else if matches!(body, Cost::Unbounded(_)) {
+                    // The body already explains itself (a nested loop, an
+                    // opaque helper). Don't overwrite a better diagnostic.
+                    body
                 } else {
                     Cost::unbounded(
                         closure.span(),
@@ -402,10 +529,13 @@ impl Analyzer {
                 iter.then(self.bound_loop(body, const_bound(&f.expr), f.span(), before))
             }
             Expr::While(w) => {
-                let cond = self.expr(&w.cond);
+                // The condition is re-evaluated on every iteration, so a query
+                // in it (`while let Some(job) = repo.next_pending().await?`) is
+                // loop-resident, not a one-off prologue.
                 let before = self.ledger.len();
+                let cond = self.expr(&w.cond);
                 let body = self.block(&w.body);
-                cond.then(self.bound_loop(body, None, w.span(), before))
+                self.bound_loop(cond.then(body), None, w.span(), before)
             }
             Expr::Loop(l) => {
                 let before = self.ledger.len();
@@ -424,17 +554,22 @@ impl Analyzer {
             }
             Expr::Match(m) => {
                 let mut cost = self.expr(&m.expr);
-                let mut worst = Cost::ZERO;
+                // Exactly one *body* runs, so bodies take the worst arm. Guards
+                // are different: a failing guard falls through to the next
+                // matching arm, so every guard on the path can run. They sum.
+                let mut worst_body = Cost::ZERO;
                 for arm in &m.arms {
-                    let mut arm_cost = arm
-                        .guard
-                        .as_ref()
-                        .map_or(Cost::ZERO, |(_, guard)| self.expr(guard));
-                    arm_cost = arm_cost.then(self.expr(&arm.body));
-                    worst = worst.or_worst(arm_cost);
+                    if let Some((_, guard)) = &arm.guard {
+                        cost = cost.then(self.expr(guard));
+                    }
+                    let body = match self.annotation(&arm.attrs) {
+                        Some(Annotation::Cost(n)) => Cost::Exact(n),
+                        Some(Annotation::Exempt) => Cost::ZERO,
+                        None => self.expr(&arm.body),
+                    };
+                    worst_body = worst_body.or_worst(body);
                 }
-                cost = cost.then(worst);
-                cost
+                cost.then(worst_body)
             }
 
             Expr::Block(syn::ExprBlock { block, .. })
@@ -470,9 +605,26 @@ impl Analyzer {
             Expr::Unary(u) => self.expr(&u.expr),
             Expr::Yield(y) => y.expr.as_deref().map_or(Cost::ZERO, |e| self.expr(e)),
 
-            // `Lit`, `Path`, `Const`, `Infer`, `Continue`, `Verbatim`, and any
-            // future variant carry no reachable call.
-            _ => Cost::ZERO,
+            // Forms that hold no reachable call at all.
+            Expr::Lit(_) | Expr::Path(_) | Expr::Infer(_) | Expr::Continue(_) => Cost::ZERO,
+            Expr::Const(c) => self.block(&c.block),
+
+            // `Expr::Verbatim` — syntax this `syn` could not parse — and any
+            // variant a future `syn` adds. Assuming those are query-free would
+            // make the no-false-negative claim depend on the toolchain, so an
+            // unreadable form that names the handle is reported instead.
+            other => {
+                if tokens_mention_any(&other.to_token_stream(), &self.handles) {
+                    Cost::unbounded(
+                        other.span(),
+                        "an expression form the analysis does not recognise names the database \
+                         handle",
+                        DECLARE_HINT,
+                    )
+                } else {
+                    Cost::ZERO
+                }
+            }
         }
     }
 
@@ -506,18 +658,17 @@ impl Analyzer {
             }
             return body.repeated(times);
         }
-        let culprit = self
-            .ledger
-            .get(ledger_before)
-            .cloned()
-            .unwrap_or_else(|| "a database query".to_string());
+        let culprit = self.ledger.get(ledger_before).map_or_else(
+            || "a declared query cost".to_string(),
+            |entry| format!("a database query ({entry})"),
+        );
         Cost::unbounded(
             span,
             format!(
-                "a database query ({culprit}) runs inside a loop, so this handler's query count \
-                 grows with the size of the collection — the classic N+1"
+                "{culprit} runs inside a loop, so this handler's query count grows with the size \
+                 of the collection — the classic N+1"
             ),
-            BATCH_HINT,
+            LOOP_HINT,
         )
     }
 
@@ -538,7 +689,18 @@ impl Analyzer {
         methods.reverse();
 
         let mut cost = self.expr(root);
-        let root_is_handle = self.expr_is_handle(root);
+
+        // Where the handle enters the chain: the root itself, or the first
+        // conventional accessor (`app.db()…`, `ctx.repo()…`). Methods before
+        // it are ordinary; methods after it act on a handle.
+        let handle_from = if self.expr_is_handle(root) {
+            Some(0)
+        } else {
+            methods
+                .iter()
+                .position(|m| HANDLE_ACCESSORS.contains(&m.method.to_string().as_str()))
+                .map(|i| i + 1)
+        };
 
         // Arguments run regardless of what the chain does with them.
         for method in &methods {
@@ -548,18 +710,45 @@ impl Analyzer {
             return cost;
         }
 
-        if root_is_handle {
-            if let Some(preload) = methods.iter().find(|m| m.method == "preload") {
-                return cost.then(self.preload_cost(preload));
+        if let Some(from) = handle_from {
+            let on_handle = &methods[from.min(methods.len())..];
+            if let Some(walker) = on_handle
+                .iter()
+                .find(|m| UNBOUNDED_METHODS.contains(&m.method.to_string().as_str()))
+            {
+                return Cost::unbounded(
+                    walker.span(),
+                    format!(
+                        "`{}` walks the whole table through a keyset cursor, so it issues one \
+                         query per batch — a count that depends on the table's size, not on the \
+                         code",
+                        walker.method
+                    ),
+                    DECLARE_HINT,
+                );
+            }
+            if let Some(preload) = on_handle.iter().find(|m| m.method == "preload") {
+                cost = cost.then(self.preload_cost(preload));
+                // A finder ahead of the preload is its own query:
+                // `repo.recent_page(1).preload(rows, spec)` is 1 + N, not N.
+                if on_handle
+                    .iter()
+                    .any(|m| m.method != "preload" && !is_handle_builder(&m.method.to_string()))
+                {
+                    cost = cost.then(self.count("finder ahead of `preload`"));
+                }
+                return cost;
             }
             // The chain is counted where it is *built*, not where it is
             // awaited: `let fut = repo.find_all();` still costs a query, and
             // collecting such futures to `join_all` later is still an N+1.
-            let last = methods
-                .last()
-                .map_or_else(|| "query".to_string(), |m| m.method.to_string());
-            if HANDLE_BUILDERS.contains(&last.as_str()) {
-                // `repo.on_primary()` refines the next query; it is not one.
+            let Some(last) = on_handle.last().map(|m| m.method.to_string()) else {
+                return cost;
+            };
+            // A builder name refines the *next* query rather than issuing one —
+            // unless the chain is awaited here, in which case the terminal call
+            // really did run (a user finder may share a builder's name).
+            if is_handle_builder(&last) && !awaited {
                 return cost;
             }
             return cost.then(self.count(&last));
@@ -568,7 +757,7 @@ impl Analyzer {
         // Not rooted at a handle: a diesel executor call is the round trip.
         for method in &methods {
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
-            let takes_handle = method.args.iter().any(|a| self.expr_is_handle(a));
+            let takes_handle = method.args.iter().any(|a| self.expr_carries_handle(a));
             if is_executor && (awaited || takes_handle) {
                 let name = method.method.to_string();
                 cost = cost.then(self.count(&name));
@@ -590,21 +779,31 @@ impl Analyzer {
     /// Analyse one method call's arguments, treating a closure that may run per
     /// element differently from a transaction callback that runs exactly once.
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
-        let runs_once = TRANSACTION_METHODS.contains(&method.method.to_string().as_str());
+        let name = method.method.to_string();
+        let runs_once = TRANSACTION_METHODS.contains(&name.as_str())
+            || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
         let mut cost = Cost::ZERO;
         for arg in &method.args {
-            if runs_once && let Expr::Closure(closure) = arg {
-                // The callback runs exactly once, and its parameter is the
-                // transaction's own connection — a handle.
-                for input in &closure.inputs {
-                    collect_pat_idents(input, &mut self.handles);
-                }
-                cost = cost.then(self.expr(&closure.body));
+            if runs_once {
+                cost = cost.then(self.callback_arg(arg));
                 continue;
             }
             cost = cost.then(self.expr(arg));
         }
         cost
+    }
+
+    /// An argument to something that invokes it exactly once: the closure body
+    /// is counted as a fixed cost rather than a per-element one, and its
+    /// parameter is the transaction's own connection — a handle.
+    fn callback_arg(&mut self, arg: &Expr) -> Cost {
+        let Expr::Closure(closure) = arg else {
+            return self.expr(arg);
+        };
+        for input in &closure.inputs {
+            collect_pat_idents(input, &mut self.handles);
+        }
+        self.expr(&closure.body)
     }
 
     /// `.preload(rows, Post::preload().author().tags())` issues one batched
@@ -635,10 +834,21 @@ impl Analyzer {
 
     fn call(&mut self, call: &ExprCall) -> Cost {
         let name = call_path_name(call);
+        let runs_once = name
+            .as_deref()
+            .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n));
 
         let mut cost = self.expr(&call.func);
         for arg in &call.args {
+            if runs_once {
+                cost = cost.then(self.callback_arg(arg));
+                continue;
+            }
             cost = cost.then(self.expr(arg));
+        }
+        if runs_once {
+            // The connection is the callback's, not an escape into opaque code.
+            return cost;
         }
         // An unreadable argument already explains itself; don't relabel it.
         if matches!(cost, Cost::Unbounded(_)) {
@@ -651,7 +861,14 @@ impl Analyzer {
             return cost;
         }
 
-        if call.args.iter().any(|a| self.expr_is_handle(a)) {
+        if call.args.iter().any(|a| self.expr_carries_handle(a)) {
+            // `Post::published(&mut db)` / `Todo::page(&page, &mut db)` — a
+            // model-level finder. Same framework contract as a repository
+            // method: one call, one query, declare it if it is more.
+            if is_associated_fn_path(call) {
+                let label = name.unwrap_or_else(|| "finder".to_string());
+                return cost.then(self.count(&label));
+            }
             let label = name.unwrap_or_else(|| "this call".to_string());
             return Cost::unbounded(
                 call.span(),
@@ -676,6 +893,17 @@ impl Analyzer {
             .segments
             .last()
             .map_or_else(|| "macro".to_string(), |s| s.ident.to_string());
+        // A logging or formatting macro cannot query, however it names the
+        // handle (`tracing::debug!(db = ?db, …)`).
+        if INERT_MACROS.contains(&name.as_str()) {
+            return Cost::ZERO;
+        }
+        // Every query in autumn is `await`ed. A template that merely passes
+        // `&repo` to a render helper names the handle without querying, and
+        // rejecting that would make `html!` unusable.
+        if !tokens_contain_await(&mac.tokens) {
+            return Cost::ZERO;
+        }
         Cost::unbounded(
             mac.span(),
             format!(
@@ -684,7 +912,7 @@ impl Analyzer {
             ),
             "Move the query out of the macro and into a statement the analysis can read, declare \
              the statement with `#[query_cost(N)]`, or exempt it with \
-             `#[query_exempt(reason = ...)]`.",
+             `#[query_exempt(reason = ...)]`. See docs/guide/query-budgets.md.",
         )
     }
 
@@ -703,10 +931,48 @@ impl Analyzer {
             Expr::Paren(p) => self.expr_is_handle(&p.expr),
             Expr::Group(g) => self.expr_is_handle(&g.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_handle(&u.expr),
+            // A field of a handle is a handle (`db.inner`), and so is a field
+            // that conventionally holds one (`self.repo`, `state.db`) — a
+            // service method's queries would otherwise be invisible.
+            Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
             Expr::MethodCall(mc) => {
-                HANDLE_BUILDERS.contains(&mc.method.to_string().as_str())
-                    && self.expr_is_handle(&mc.receiver)
+                let method = mc.method.to_string();
+                if HANDLE_ACCESSORS.contains(&method.as_str()) {
+                    return true;
+                }
+                HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
             }
+            _ => false,
+        }
+    }
+
+    /// Is this a method chain whose root is a handle (`repo.aggregate().order()`)?
+    fn chain_root_is_handle(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MethodCall(mc) => {
+                self.expr_is_handle(&mc.receiver) || self.chain_root_is_handle(&mc.receiver)
+            }
+            Expr::Paren(p) => self.chain_root_is_handle(&p.expr),
+            Expr::Group(g) => self.chain_root_is_handle(&g.expr),
+            _ => false,
+        }
+    }
+
+    /// Does this expression *carry* a handle into a callee — directly, or
+    /// wrapped one level deep in a context struct, tuple, or slice?
+    fn expr_carries_handle(&self, expr: &Expr) -> bool {
+        if self.expr_is_handle(expr) {
+            return true;
+        }
+        match expr {
+            Expr::Struct(s) => s.fields.iter().any(|f| self.expr_carries_handle(&f.expr)),
+            Expr::Tuple(t) => t.elems.iter().any(|e| self.expr_carries_handle(e)),
+            Expr::Array(a) => a.elems.iter().any(|e| self.expr_carries_handle(e)),
+            Expr::Call(c) => c.args.iter().any(|a| self.expr_carries_handle(a)),
+            Expr::Reference(r) => self.expr_carries_handle(&r.expr),
+            Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
+            Expr::Paren(p) => self.expr_carries_handle(&p.expr),
+            Expr::Group(g) => self.expr_carries_handle(&g.expr),
             _ => false,
         }
     }
@@ -828,6 +1094,92 @@ fn count_associations(spec: &Expr) -> u32 {
     }
 }
 
+/// The closure of an immediately-invoked `(|| …)()` / `(|| async move …)()`.
+fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {
+    match func {
+        Expr::Closure(closure) => Some(closure),
+        Expr::Paren(p) => immediately_invoked_closure(&p.expr),
+        Expr::Group(g) => immediately_invoked_closure(&g.expr),
+        _ => None,
+    }
+}
+
+/// Is this call `Type::assoc_fn(…)` — a model-level finder rather than a free
+/// function? The framework's `#[model]` finders take the handle as an argument,
+/// so they are counted like a repository method instead of being reported.
+fn is_associated_fn_path(call: &ExprCall) -> bool {
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let segments = &path.path.segments;
+    segments.len() >= 2
+        && segments
+            .iter()
+            .nth(segments.len() - 2)
+            .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
+}
+
+/// Does this token stream contain an `await` — the marker that something in it
+/// actually runs a future, and so could be a query?
+fn tokens_contain_await(tokens: &TokenStream) -> bool {
+    tokens.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(ident) => ident == "await",
+        TokenTree::Group(group) => tokens_contain_await(&group.stream()),
+        _ => false,
+    })
+}
+
+/// Do these tokens open a function definition? Used to decide whether a parse
+/// failure is "you put this on a non-function" or "your function body has a
+/// syntax error rustc will explain better than we can".
+fn tokens_look_like_fn(tokens: &TokenStream) -> bool {
+    tokens.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(ident) => ident == "fn",
+        _ => false,
+    })
+}
+
+/// Require `#[query_exempt(reason = "…")]` to actually carry a reason.
+fn parse_reason(attr: &Attribute) -> syn::Result<String> {
+    let reason: syn::MetaNameValue = attr.parse_args().map_err(|_| {
+        syn::Error::new_spanned(
+            attr,
+            "`#[query_exempt(...)]` needs the reason it is safe, e.g. \
+             `#[query_exempt(reason = \"reads the warm cache only\")]`",
+        )
+    })?;
+    if !reason.path.is_ident("reason") {
+        return Err(syn::Error::new_spanned(
+            &reason.path,
+            "the only `#[query_exempt(...)]` key is `reason`",
+        ));
+    }
+    match &reason.value {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(text),
+            ..
+        }) if !text.value().trim().is_empty() => Ok(text.value()),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "`#[query_exempt(reason = ...)]` takes a non-empty string explaining why the call \
+             site issues no query",
+        )),
+    }
+}
+
+/// Is this a chain method that refines a later query rather than issuing one?
+fn is_handle_builder(method: &str) -> bool {
+    HANDLE_BUILDERS.contains(&method)
+}
+
+/// Does this struct field name conventionally hold a database handle?
+fn member_is_handle_accessor(member: &syn::Member) -> bool {
+    match member {
+        syn::Member::Named(ident) => HANDLE_ACCESSORS.contains(&ident.to_string().as_str()),
+        syn::Member::Unnamed(_) => false,
+    }
+}
+
 fn call_path_name(call: &ExprCall) -> Option<String> {
     match &*call.func {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
@@ -882,18 +1234,37 @@ fn type_is_handle(ty: &Type) -> bool {
             if HANDLE_TYPES.contains(&name.as_str())
                 || name.ends_with("Db")
                 || name.ends_with("Repository")
-                || name.ends_with("Repo")
             {
                 return true;
             }
+            // Look inside an extractor wrapper (`Extension<Db>`, `State<Db>`)
+            // for an *exact* handle type only. Recursing with the suffix
+            // heuristic would make `Form<NewRepo>` a database handle.
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 return args.args.iter().any(|arg| match arg {
-                    syn::GenericArgument::Type(inner) => type_is_handle(inner),
+                    syn::GenericArgument::Type(inner) => type_is_exact_handle(inner),
                     _ => false,
                 });
             }
             false
         }
+        _ => false,
+    }
+}
+
+/// A type named exactly like a framework handle, ignoring the name-suffix
+/// heuristic. Used when peering inside extractor generics, where a suffix match
+/// would sweep in unrelated application types.
+fn type_is_exact_handle(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_exact_handle(&r.elem),
+        Type::Paren(p) => type_is_exact_handle(&p.elem),
+        Type::Group(g) => type_is_exact_handle(&g.elem),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| HANDLE_TYPES.contains(&s.ident.to_string().as_str())),
         _ => false,
     }
 }
@@ -916,6 +1287,26 @@ fn signature_handles(input_fn: &ItemFn) -> HashSet<String> {
 struct StripAnnotations;
 
 impl VisitMut for StripAnnotations {
+    fn visit_item_fn_mut(&mut self, item_fn: &mut ItemFn) {
+        // Includes the annotated handler itself: a stray `#[query_cost]` on the
+        // function has already been diagnosed, and leaving it behind would add
+        // rustc's "cannot find attribute" on top.
+        retain_foreign(&mut item_fn.attrs);
+        syn::visit_mut::visit_item_fn_mut(self, item_fn);
+    }
+
+    fn visit_arm_mut(&mut self, arm: &mut syn::Arm) {
+        retain_foreign(&mut arm.attrs);
+        syn::visit_mut::visit_arm_mut(self, arm);
+    }
+
+    fn visit_item_mut(&mut self, item: &mut syn::Item) {
+        if let Some(attrs) = item_attrs_mut(item) {
+            retain_foreign(attrs);
+        }
+        syn::visit_mut::visit_item_mut(self, item);
+    }
+
     fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
         match stmt {
             Stmt::Local(local) => retain_foreign(&mut local.attrs),
@@ -931,6 +1322,24 @@ impl VisitMut for StripAnnotations {
         }
         syn::visit_mut::visit_expr_mut(self, expr);
     }
+}
+
+/// The outer attributes of the item kinds that can appear inside a function
+/// body. Anything else cannot carry one of our annotations meaningfully.
+const fn item_attrs_mut(item: &mut syn::Item) -> Option<&mut Vec<Attribute>> {
+    Some(match item {
+        syn::Item::Fn(i) => &mut i.attrs,
+        syn::Item::Const(i) => &mut i.attrs,
+        syn::Item::Static(i) => &mut i.attrs,
+        syn::Item::Struct(i) => &mut i.attrs,
+        syn::Item::Enum(i) => &mut i.attrs,
+        syn::Item::Impl(i) => &mut i.attrs,
+        syn::Item::Mod(i) => &mut i.attrs,
+        syn::Item::Trait(i) => &mut i.attrs,
+        syn::Item::Type(i) => &mut i.attrs,
+        syn::Item::Use(i) => &mut i.attrs,
+        _ => return None,
+    })
 }
 
 fn retain_foreign(attrs: &mut Vec<Attribute>) {
@@ -986,27 +1395,66 @@ const fn expr_attrs_mut(expr: &mut Expr) -> Option<&mut Vec<Attribute>> {
 
 // ── Macro entry point ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let budget = match syn::parse2::<BudgetAttr>(attr) {
-        Ok(parsed) => parsed.budget,
-        Err(err) => {
-            let err = err.to_compile_error();
-            return quote! { #item #err };
-        }
-    };
-
     // Keep the original tokens so a parse failure still emits the item — one
     // purpose-written diagnostic beats a cascade of "cannot find" errors.
     let original = item.clone();
-    let Ok(mut input_fn) = syn::parse2::<ItemFn>(item) else {
-        let err = syn::Error::new(
-            Span::call_site(),
-            "`#[query_budget(...)]` can only be applied to a function — put it on the route \
-             handler whose queries you want bounded",
+    let parsed_fn = syn::parse2::<ItemFn>(item);
+
+    let budget = match syn::parse2::<BudgetAttr>(attr) {
+        Ok(parsed) => parsed.budget,
+        Err(err) => {
+            // Emit the function with our own statement annotations stripped, so
+            // a typo in the budget yields one diagnostic instead of that plus
+            // an "unknown attribute" per annotation in the body.
+            let err = err.to_compile_error();
+            return parsed_fn.map_or_else(
+                |_| quote! { #original #err },
+                |mut input_fn| {
+                    StripAnnotations.visit_item_fn_mut(&mut input_fn);
+                    quote! { #input_fn #err }
+                },
+            );
+        }
+    };
+
+    let mut input_fn = match parsed_fn {
+        Ok(parsed) => parsed,
+        Err(parse_error) => {
+            // A malformed function body is rustc's error to report, not ours;
+            // claiming "this is not a function" about a function is worse than
+            // useless.
+            let err = if tokens_look_like_fn(&original) {
+                parse_error.to_compile_error()
+            } else {
+                syn::Error::new(
+                    Span::call_site(),
+                    "`#[query_budget(...)]` can only be applied to a function — put it on the \
+                     route handler whose queries you want bounded",
+                )
+                .to_compile_error()
+            };
+            return quote! { #original #err };
+        }
+    };
+
+    // Our statement annotations mean nothing on the function itself.
+    if let Some(stray) = input_fn
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident(ATTR_QUERY_COST) || a.path().is_ident(ATTR_QUERY_EXEMPT))
+    {
+        let err = syn::Error::new_spanned(
+            stray,
+            "`#[query_cost(...)]` / `#[query_exempt(...)]` annotate a statement inside the \
+             handler, not the handler itself; the handler's ceiling is the `#[query_budget(N)]` \
+             argument",
         )
         .to_compile_error();
-        return quote! { #original #err };
-    };
+        StripAnnotations.visit_item_fn_mut(&mut input_fn);
+        return quote! { #input_fn #err };
+    }
 
     let mut analyzer = Analyzer::new(signature_handles(&input_fn));
     let cost = analyzer.block(&input_fn.block);
@@ -1042,6 +1490,10 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let marker = format_ident!("__AUTUMN_QUERY_BUDGET_{}", fn_name);
     let vis = input_fn.vis.clone();
     let handler_name = fn_name.to_string();
+    let handler_name = handler_name
+        .strip_prefix("r#")
+        .unwrap_or(&handler_name)
+        .to_string();
     // A method taking `self` may sit in a trait impl, where an associated const
     // the trait never declared is not a legal item. The analysis still runs;
     // only the marker is withheld.
@@ -1060,10 +1512,17 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let errors = errors.iter().map(syn::Error::to_compile_error);
 
+    let cfgs: Vec<&Attribute> = input_fn
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+        .collect();
+
     let marker_const = if takes_self {
         TokenStream::new()
     } else {
         quote! {
+            #(#cfgs)*
             #[doc(hidden)]
             #[allow(non_upper_case_globals, dead_code)]
             #vis const #marker: ::autumn_web::query_budget::StaticQueryBudget =
@@ -1101,6 +1560,8 @@ fn over_budget_message(limit: u32, actual: u32, ledger: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use quote::ToTokens as _;
+
     use super::*;
 
     /// Expand `#[query_budget(attr)]` over `item` and return the generated code
@@ -1111,14 +1572,52 @@ mod tests {
         query_budget_macro(attr, item).to_string()
     }
 
-    /// The `compile_error!` message the expansion emitted, if any.
+    /// The `compile_error!` messages the expansion emitted, concatenated.
+    ///
+    /// Walks the token stream rather than the stringified output: the
+    /// diagnostics themselves contain quoted attribute examples, so substring
+    /// scanning for the closing quote is not reliable.
     fn error_of(attr: &str, item: &str) -> Option<String> {
+        let attr: TokenStream = attr.parse().expect("attr parses");
+        let item: TokenStream = item.parse().expect("item parses");
+        let out = query_budget_macro(attr, item);
+        let mut messages = Vec::new();
+        collect_compile_errors(&out, &mut messages);
+        (!messages.is_empty()).then(|| messages.join("\n---\n"))
+    }
+
+    fn collect_compile_errors(tokens: &TokenStream, out: &mut Vec<String>) {
+        let mut saw_marker = false;
+        for tt in tokens.clone() {
+            match tt {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    saw_marker = ident == "compile_error";
+                }
+                proc_macro2::TokenTree::Group(group) => {
+                    if saw_marker {
+                        if let Some(proc_macro2::TokenTree::Literal(lit)) =
+                            group.stream().into_iter().next()
+                            && let Ok(text) = syn::parse2::<syn::LitStr>(lit.to_token_stream())
+                        {
+                            out.push(text.value());
+                        }
+                        saw_marker = false;
+                    } else {
+                        collect_compile_errors(&group.stream(), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The emitted item alone — the expansion with any trailing
+    /// `compile_error!` diagnostics cut off, since those quote our own
+    /// attribute names and would defeat a "did it leak?" substring check.
+    fn emitted_item(attr: &str, item: &str) -> String {
         let out = expand(attr, item);
-        let idx = out.find("compile_error !")?;
-        let rest = &out[idx..];
-        let start = rest.find('"')? + 1;
-        let end = rest[start..].find("\" }")? + start;
-        Some(rest[start..end].to_string())
+        out.find(":: core :: compile_error")
+            .map_or_else(|| out.clone(), |idx| out[..idx].to_string())
     }
 
     fn assert_clean(attr: &str, item: &str) {
@@ -1543,7 +2042,7 @@ mod tests {
 
     #[test]
     fn inner_annotations_are_stripped_from_the_emitted_function() {
-        let out = expand(
+        let out = emitted_item(
             "2",
             r"
             async fn show(mut db: Db) -> AutumnResult<Markup> {
@@ -1640,6 +2139,477 @@ mod tests {
     }
 
     // ── Attribute parsing ────────────────────────────────────────────
+
+    // ── Regressions from the #1667 review sweep ──────────────────────
+
+    #[test]
+    fn a_query_in_a_while_condition_is_loop_resident() {
+        // The condition re-runs every iteration, so a drain loop whose only
+        // query is in the condition is still an N+1.
+        assert_error_contains(
+            "1",
+            r"
+            async fn drain(repo: PgJobRepository) -> AutumnResult<()> {
+                while let Some(job) = repo.next_pending().await? {
+                    handle(job);
+                }
+                Ok(())
+            }
+            ",
+            &["loop"],
+        );
+    }
+
+    #[test]
+    fn match_guards_sum_because_a_failing_guard_falls_through() {
+        assert_error_contains(
+            "1",
+            r"
+            async fn show(repo: PgPostRepository, k: Kind) -> AutumnResult<usize> {
+                match k {
+                    _ if repo.count_a().await? > 0 => Ok(1),
+                    _ if repo.count_b().await? > 0 => Ok(2),
+                    _ => Ok(0),
+                }
+            }
+            ",
+            &["2"],
+        );
+    }
+
+    #[test]
+    fn a_handle_held_in_a_field_is_still_tracked() {
+        // `self.repo` / `ctx.repo` — a service method's queries would otherwise
+        // be invisible to the analysis.
+        assert_error_contains(
+            "1",
+            r"
+            async fn load(&self, ids: Vec<i64>) -> AutumnResult<()> {
+                for id in ids {
+                    let _ = self.repo.find_by_id(id).await?;
+                }
+                Ok(())
+            }
+            ",
+            &["loop"],
+        );
+    }
+
+    #[test]
+    fn a_handle_reached_through_a_conventional_accessor_is_tracked() {
+        assert_error_contains(
+            "1",
+            r"
+            async fn index(app: AppState, ids: Vec<i64>) -> AutumnResult<()> {
+                for id in ids {
+                    let _ = app.db().find_by_id(id).await?;
+                }
+                Ok(())
+            }
+            ",
+            &["loop"],
+        );
+    }
+
+    #[test]
+    fn a_tuple_binding_keeps_the_handle_tracked() {
+        assert_error_contains(
+            "0",
+            r"
+            async fn show(handle: Db, id: i64) -> AutumnResult<usize> {
+                let (conn, key) = (handle, id);
+                Ok(conn.posts().find_all().await?.len())
+            }
+            ",
+            &["query_budget(0)"],
+        );
+    }
+
+    #[test]
+    fn a_handle_wrapped_in_a_context_struct_is_still_reported() {
+        assert_error_contains(
+            "0",
+            r"
+            async fn show(mut db: Db) -> AutumnResult<usize> {
+                Ok(load_all(Ctx { db: &mut db }).await?)
+            }
+            ",
+            &["load_all"],
+        );
+    }
+
+    #[test]
+    fn a_terminal_builder_name_that_is_awaited_is_a_query() {
+        // A user finder may share a builder's name; awaiting it means it ran.
+        assert_error_contains(
+            "0",
+            r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                Ok(repo.published().scoped().await?.len())
+            }
+            ",
+            &["query_budget(0)"],
+        );
+    }
+
+    #[test]
+    fn a_finder_ahead_of_preload_is_its_own_query() {
+        let handler = r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                let posts = repo
+                    .recent_page(1)
+                    .preload(rows, Post::preload().author())
+                    .await?;
+                Ok(posts.len())
+            }
+            ";
+        assert_clean("2", handler);
+        assert_error_contains("1", handler, &["2"]);
+    }
+
+    #[test]
+    fn batch_walkers_are_unbounded_not_one_query() {
+        // `find_in_batches` walks the whole table through a keyset cursor.
+        assert_error_contains(
+            "50",
+            r"
+            async fn export(repo: PgPostRepository) -> AutumnResult<()> {
+                let mut batches = repo.find_in_batches(1000);
+                while let Some(chunk) = batches.next_batch().await? {
+                    write_chunk(chunk);
+                }
+                Ok(())
+            }
+            ",
+            &["find_in_batches"],
+        );
+    }
+
+    // ── The real framework surface, as the examples actually write it ──
+
+    #[test]
+    fn autumn_transaction_api_counts_its_body_once() {
+        // `Db::tx` is autumn's transaction API — `db.transaction(...)` does not
+        // exist. Getting this wrong made every transactional handler unbuildable.
+        assert_clean(
+            "3",
+            r"
+            async fn create(mut db: Db) -> AutumnResult<()> {
+                let id = db.tx(move |conn| {
+                    async move {
+                        let created = diesel::insert_into(collections::table)
+                            .values(&new)
+                            .get_result(conn)
+                            .await?;
+                        let _ = diesel::insert_into(links::table).values(&l).execute(conn).await?;
+                        Ok(created.id)
+                    }
+                    .scope_boxed()
+                })
+                .await?;
+                Ok(())
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_helper_handed_the_transaction_connection_is_reported() {
+        // The closure parameter is a handle, so an opaque call inside the
+        // transaction body cannot slip through uncounted.
+        assert_error_contains(
+            "5",
+            r"
+            async fn create(mut db: Db) -> AutumnResult<()> {
+                db.tx(move |conn| async move { write_audit(conn).await?; Ok(()) }.scope_boxed())
+                    .await?;
+                Ok(())
+            }
+            ",
+            &["write_audit"],
+        );
+    }
+
+    #[test]
+    fn model_static_finders_count_as_one_query() {
+        // `Post::published(&mut db)` is the `#[model]` finder idiom the blog and
+        // todo-app examples are written in — a framework finder, not opaque code.
+        let handler = r"
+            async fn index(mut db: Db, page: PageRequest) -> AutumnResult<usize> {
+                let posts = Post::published(&mut db).await?;
+                let page = Todo::page(&page, &mut db).await?;
+                Ok(posts.len() + page.len())
+            }
+            ";
+        assert_clean("2", handler);
+        assert_error_contains("1", handler, &["2"]);
+    }
+
+    #[test]
+    fn a_split_builder_chain_counts_the_same_as_a_joined_one() {
+        // Extracting a sub-expression to a `let` changes no SQL, so it must not
+        // change the count.
+        let joined = r"
+            async fn stats(repo: PgBookmarkRepository) -> AutumnResult<usize> {
+                let rows = repo.count_grouped_by_tag().order_by_aggregate_desc().limit(5).load().await?;
+                Ok(rows.len())
+            }
+            ";
+        let split = r"
+            async fn stats(repo: PgBookmarkRepository) -> AutumnResult<usize> {
+                let q = repo.count_grouped_by_tag().order_by_aggregate_desc();
+                let rows = q.limit(5).load().await?;
+                Ok(rows.len())
+            }
+            ";
+        assert_clean("1", joined);
+        assert_clean("1", split);
+    }
+
+    #[test]
+    fn an_immediately_invoked_closure_is_seen_through() {
+        // `#[cached]` expanding first wraps the body in `(|| async move {…})()`.
+        // Rejecting that would blame a closure the user never wrote.
+        assert_clean(
+            "1",
+            r"
+            async fn index(repo: PgPostRepository) -> AutumnResult<usize> {
+                (|| async move { Ok(repo.find_all().await?.len()) })().await
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_template_that_merely_names_the_handle_is_free() {
+        // Passing `&repo` to a render helper from inside `html!` is ordinary
+        // style; only an awaited macro body can be hiding a query.
+        assert_clean(
+            "1",
+            r#"
+            async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+                let posts = repo.find_all().await?;
+                tracing::debug!(count = posts.len(), handle = ?repo, "loaded");
+                Ok(html! { @for p in &posts { (render_row(p, &repo)) } })
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn an_at_most_once_combinator_closure_is_not_per_element() {
+        assert_clean(
+            "1",
+            r"
+            async fn show(repo: PgPostRepository, cached: Option<Vec<Post>>) -> AutumnResult<usize> {
+                let rows = cached.unwrap_or_else(|| repo.find_all_blocking());
+                Ok(rows.len())
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn an_extractor_generic_is_not_a_handle_by_name_suffix() {
+        // `Form<NewRepo>` is a form, not a database handle.
+        assert_clean(
+            "0",
+            r"
+            async fn create(form: Form<NewRepo>) -> AutumnResult<Markup> {
+                Ok(render(&form))
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_query_cost_on_the_loop_statement_bounds_it() {
+        // The documented way to bound a loop the analysis cannot size.
+        assert_clean(
+            "10",
+            r"
+            async fn refresh(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<()> {
+                #[query_cost(10)]
+                for id in ids {
+                    let _ = repo.find_by_id(id).await?;
+                }
+                Ok(())
+            }
+            ",
+        );
+    }
+
+    #[test]
+    fn a_loop_diagnostic_never_names_the_culprit_twice() {
+        let err = error_of(
+            "1",
+            r"
+            async fn index(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<()> {
+                for id in ids { let _ = repo.find_by_id(id).await?; }
+                Ok(())
+            }
+            ",
+        )
+        .expect("over-budget loop is rejected");
+        assert!(
+            !err.contains("a database query (a database query)"),
+            "culprit is named twice: {err}"
+        );
+        assert!(err.contains("find_by_id"), "culprit is not named: {err}");
+    }
+
+    #[test]
+    fn diagnostics_point_at_the_guide() {
+        let err = error_of(
+            "0",
+            r"
+            async fn index(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<()> {
+                for id in ids { let _ = repo.find_by_id(id).await?; }
+                Ok(())
+            }
+            ",
+        )
+        .expect("over-budget loop is rejected");
+        assert!(
+            err.contains("docs/guide/query-budgets.md"),
+            "diagnostic does not link the guide: {err}"
+        );
+    }
+
+    // ── Annotation hygiene ───────────────────────────────────────────
+
+    #[test]
+    fn match_arm_annotations_are_read_and_stripped() {
+        let handler = r"
+            async fn show(repo: PgPostRepository, k: Kind) -> AutumnResult<usize> {
+                match k {
+                    #[query_cost(3)]
+                    Kind::A => repo.find_all().await?.len(),
+                    Kind::B => repo.count().await? as usize,
+                }
+            }
+            ";
+        assert_error_contains("1", handler, &["3"]);
+        let out = emitted_item("3", handler);
+        assert!(
+            !out.contains("query_cost"),
+            "match-arm annotation leaked to rustc: {out}"
+        );
+    }
+
+    #[test]
+    fn query_exempt_without_a_reason_is_an_error() {
+        assert_error_contains(
+            "1",
+            r"
+            async fn show(mut db: Db) -> AutumnResult<usize> {
+                #[query_exempt]
+                let extra = helper(&mut db).await?;
+                Ok(extra)
+            }
+            ",
+            &["reason"],
+        );
+    }
+
+    #[test]
+    fn contradictory_annotations_on_one_statement_are_an_error() {
+        assert_error_contains(
+            "5",
+            r#"
+            async fn show(mut db: Db) -> AutumnResult<usize> {
+                #[query_cost(1)]
+                #[query_exempt(reason = "also this")]
+                let extra = helper(&mut db).await?;
+                Ok(extra)
+            }
+            "#,
+            &["more than one query annotation"],
+        );
+    }
+
+    #[test]
+    fn a_stray_annotation_on_the_handler_gets_our_own_diagnostic() {
+        let item = r"
+            #[query_cost(1)]
+            async fn show(mut db: Db) -> AutumnResult<usize> { Ok(0) }
+            ";
+        assert_error_contains("1", item, &["not the handler itself"]);
+        let out = emitted_item("1", item);
+        assert!(
+            !out.contains("query_cost"),
+            "stray annotation leaked to rustc: {out}"
+        );
+    }
+
+    #[test]
+    fn a_bad_budget_argument_still_strips_body_annotations() {
+        // Otherwise one typo yields our diagnostic plus an "unknown attribute"
+        // error per annotation in the body.
+        let out = emitted_item(
+            "bogus",
+            r#"
+            async fn show(mut db: Db) -> AutumnResult<usize> {
+                #[query_exempt(reason = "checked")]
+                let x = helper(&mut db);
+                Ok(0)
+            }
+            "#,
+        );
+        assert!(
+            !out.contains("query_exempt"),
+            "annotations survived a bad budget argument: {out}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_budget_names_the_attribute() {
+        assert_error_contains("99999999999999999999", "async fn f() {}", &["query_budget"]);
+        assert_error_contains("-1", "async fn f() {}", &["query_budget"]);
+    }
+
+    #[test]
+    fn a_cfg_gated_handler_carries_its_cfg_onto_the_marker() {
+        let out = expand(
+            "0",
+            r#"
+            #[cfg(feature = "reports")]
+            async fn report() -> usize { 0 }
+            "#,
+        );
+        let marker = out
+            .find("__AUTUMN_QUERY_BUDGET_report")
+            .expect("marker emitted");
+        assert!(
+            out[..marker].contains("cfg (feature = \"reports\")"),
+            "marker is not cfg-gated with its handler: {out}"
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_handler_records_its_plain_name() {
+        let out = expand("0", "async fn r#type() -> usize { 0 }");
+        assert!(
+            out.contains(r#""type""#),
+            "raw-identifier prefix leaked into the record: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_expression_naming_the_handle_is_reported() {
+        // The catch-all must not be fail-open: soundness cannot depend on which
+        // `syn` version parsed the body.
+        assert_error_contains(
+            "5",
+            r"
+            async fn show(mut db: Db) -> AutumnResult<usize> {
+                let x = const { helper(&mut db) };
+                Ok(0)
+            }
+            ",
+            &["helper"],
+        );
+    }
 
     // ── Seeded N+1 corpus (the issue's success metric) ───────────────
 
@@ -1801,6 +2771,61 @@ mod tests {
             }",
         ),
         (
+            "query in a while-loop condition",
+            r"async fn h(repo: PgJobRepository) -> R {
+                while let Some(job) = repo.next_pending().await? { handle(job); }
+                Ok(())
+            }",
+        ),
+        (
+            "query behind a repository field on self",
+            r"async fn h(&self, ids: Vec<i64>) -> R {
+                for id in ids { let _ = self.repo.find_by_id(id).await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "query behind a conventional accessor",
+            r"async fn h(app: AppState, ids: Vec<i64>) -> R {
+                for id in ids { let _ = app.db().find_by_id(id).await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "keyset batch walker",
+            r"async fn h(repo: PgPostRepository) -> R {
+                let mut b = repo.find_in_batches(1000);
+                while let Some(c) = b.next_batch().await? { write(c); }
+                Ok(())
+            }",
+        ),
+        (
+            "handle laundered through a tuple binding",
+            r"async fn h(handle: Db, ids: Vec<i64>) -> R {
+                let (conn, _) = (handle, 1);
+                for id in ids { let _ = posts::table.find(id).first(&mut *conn).await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "handle wrapped in a context struct",
+            r"async fn h(mut db: Db) -> R { Ok(load_all(Ctx { db: &mut db }).await?) }",
+        ),
+        (
+            "helper handed the transaction connection",
+            r"async fn h(mut db: Db) -> R {
+                db.tx(move |conn| async move { write_audit(conn).await?; Ok(()) }.scope_boxed()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "model static finder in a loop",
+            r"async fn h(mut db: Db, ids: Vec<i64>) -> R {
+                for id in ids { let _ = Post::find(id, &mut db).await?; }
+                Ok(())
+            }",
+        ),
+        (
             "preload spec passed as an opaque variable",
             r"async fn h(repo: PgPostRepository, spec: Spec) -> R {
                 let posts = repo.find_all().await?;
@@ -1913,6 +2938,91 @@ mod tests {
         ),
     ];
 
+    /// Handler shapes taken from the shipped example apps. These are the code
+    /// the framework's own docs teach, so a rejection here is the failure mode
+    /// that makes teams blanket-`unbounded` an app.
+    const EXAMPLE_APP_CORPUS: &[(&str, &str, &str)] = &[
+        (
+            "wiki: transactional create (db.tx + scope_boxed)",
+            "3",
+            r"async fn create(mut db: Db, form: Form<NewCollection>) -> R {
+                let id = db.tx(move |conn| {
+                    async move {
+                        let created = diesel::insert_into(collections::table)
+                            .values(&form.0)
+                            .returning(Collection::as_returning())
+                            .get_result(conn)
+                            .await?;
+                        diesel::insert_into(links::table).values(&rows).execute(conn).await?;
+                        Ok(created.id)
+                    }
+                    .scope_boxed()
+                })
+                .await?;
+                Ok(id)
+            }",
+        ),
+        (
+            "blog: model static finders",
+            "1",
+            r"async fn index(mut db: Db) -> R { Ok(Post::published(&mut db).await?.len()) }",
+        ),
+        (
+            "todo-app: paginated model finder",
+            "1",
+            r"async fn list(page: PageRequest, mut db: Db) -> R {
+                Ok(Todo::page(&page, &mut db).await?.len())
+            }",
+        ),
+        (
+            "bookmarks: grouped aggregate builder chain",
+            "1",
+            r"async fn stats(repo: PgBookmarkRepository) -> R {
+                Ok(repo.count_grouped_by_tag().order_by_aggregate_desc().limit(5).load().await?.len())
+            }",
+        ),
+        (
+            "reddit: repository preload with two associations",
+            "3",
+            r"async fn front(repo: PgPostRepository) -> R {
+                let hot = repo.hot_posts(20).await?;
+                let hot = repo.on_primary().preload(hot, Post::preload().author().subreddit()).await?;
+                Ok(hot.len())
+            }",
+        ),
+        (
+            "reddit: template naming the repository handle",
+            "1",
+            r#"async fn front(repo: PgPostRepository) -> R {
+                let posts = repo.find_all().await?;
+                tracing::debug!(?repo, "rendered");
+                Ok(html! { @for p in &posts { (render_row(p, &repo)) } })
+            }"#,
+        ),
+        (
+            "any app: drop the handle mid-handler, then render",
+            "1",
+            r"async fn show(mut db: Db) -> R {
+                let posts = posts::table.load(&mut *db).await?;
+                drop(db);
+                Ok(html! { div { (posts.len()) } })
+            }",
+        ),
+    ];
+
+    #[test]
+    fn example_app_handler_shapes_are_not_false_positives() {
+        let flagged: Vec<(&str, String)> = EXAMPLE_APP_CORPUS
+            .iter()
+            .filter_map(|(name, budget, handler)| error_of(budget, handler).map(|err| (*name, err)))
+            .collect();
+
+        assert!(
+            flagged.is_empty(),
+            "handler shapes the example apps actually use were rejected: {flagged:#?}"
+        );
+    }
+
     #[test]
     fn seeded_n_plus_one_corpus_is_caught_at_build_time() {
         // Deliberately generous: the budget is high enough that only an
@@ -1929,6 +3039,29 @@ mod tests {
             "{} of {} seeded N+1 handlers compiled clean (false negatives): {missed:?}",
             missed.len(),
             SEEDED_N_PLUS_ONE.len()
+        );
+    }
+
+    #[test]
+    fn every_seeded_diagnostic_names_the_offending_call_site() {
+        // AC2 asks for more than a rejection: the developer must be told which
+        // call is the problem.
+        let anonymous: Vec<&str> = SEEDED_N_PLUS_ONE
+            .iter()
+            .filter(|(_, handler)| {
+                let Some(err) = error_of("50", handler) else {
+                    return true;
+                };
+                // Every diagnostic quotes the offending call, association, or
+                // expression form in backticks alongside the fix.
+                !err.contains('`') || !err.contains("docs/guide/query-budgets.md")
+            })
+            .map(|(name, _)| *name)
+            .collect();
+
+        assert!(
+            anonymous.is_empty(),
+            "diagnostics that name no call site or omit the guide link: {anonymous:?}"
         );
     }
 

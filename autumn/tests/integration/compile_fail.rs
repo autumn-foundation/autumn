@@ -185,6 +185,9 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/query_budget_loop_closure.rs");
     t.compile_fail("tests/compile-fail/query_budget_macro_body.rs");
     t.compile_fail("tests/compile-fail/query_budget_bad_attr.rs");
+    // The same N+1, against the real generated repository surface.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
 }
 
 #[test]
@@ -380,4 +383,58 @@ fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
 #[rustversion::since(1.95)]
 fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
     t.compile_fail("tests/compile-fail/repository_hooks_not_default_1_95.rs");
+}
+
+/// The `#[query_budget]` guide is the reference a developer reaches for when a
+/// build fails, so the diagnostic it prints has to be the diagnostic the macro
+/// actually emits (#1667). Pins the guide against the trybuild golden, and
+/// against the compile-fail fixtures it names.
+#[test]
+fn query_budget_guide_matches_the_real_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let guide = std::fs::read_to_string(root.join("docs/guide/query-budgets.md"))
+        .expect("docs/guide/query-budgets.md exists");
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/compile-fail/query_budget_n_plus_one.stderr"),
+    )
+    .expect("N+1 golden exists");
+
+    // The guide reproduces the error verbatim; compare on collapsed whitespace
+    // so the two wrappings (markdown block vs. rustc gutter) don't matter.
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide_flat = collapse(&guide);
+    let golden_flat = collapse(&golden);
+
+    let message_start = golden_flat
+        .find("`#[query_budget(2)]` cannot be proven")
+        .expect("golden carries the budget diagnostic");
+    let message_end = golden_flat
+        .find("--> tests/compile-fail")
+        .expect("golden carries a span line");
+    let message = &golden_flat[message_start..message_end].trim_end();
+
+    assert!(
+        guide_flat.contains(message),
+        "docs/guide/query-budgets.md has drifted from the real diagnostic.\n\n\
+         expected the guide to contain:\n{message}\n\n\
+         Regenerate with TRYBUILD=overwrite and copy the message into the guide."
+    );
+
+    // Every fixture the guide points at must exist.
+    for fixture in [
+        "autumn/tests/compile-fail/query_budget_n_plus_one.rs",
+        "autumn/tests/compile-pass/query_budget_valid.rs",
+    ] {
+        assert!(
+            guide.contains(fixture),
+            "guide no longer references {fixture}"
+        );
+        assert!(
+            root.join(fixture).exists(),
+            "guide references a fixture that does not exist: {fixture}"
+        );
+    }
 }
