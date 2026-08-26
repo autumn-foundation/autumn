@@ -1458,8 +1458,11 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
 // #1996: the write path forks into pg / sqlite `backend_select!` arms (drop the
 // `$7::jsonb` cast, bind `recorded_at` explicitly on SQLite), which pushes this
-// token builder just past the line lint.
-#[allow(clippy::too_many_lines)]
+// token builder just past the line lint. #1699 adds the `ledgered` flag, which
+// selects whether a ledger revision is appended alongside the history row —
+// one more parameter than the arg lint allows, and splitting the tuple would
+// only rename the same eight values.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn vh_insert_ts(
     table_name_str: &str,
     op: &str,
@@ -1630,9 +1633,9 @@ fn vh_insert_ts(
 /// forked chain.
 ///
 /// Backend-forked exactly as the version-history writer is (#1996): the Postgres
-/// arm casts the snapshot to `jsonb` and binds `Timestamptz`; the SQLite arm
-/// stores JSON as `TEXT` and binds `TimestamptzSqlite` (there is no
-/// `FromSql<Timestamptz, Sqlite>`).
+/// arm binds `Timestamptz`; the `SQLite` arm binds `TimestamptzSqlite` (there is
+/// no `FromSql<Timestamptz, Sqlite>`).
+#[allow(clippy::too_many_lines)]
 fn ledger_append_ts(
     table_name_ts: &str,
     op: &str,
@@ -1748,14 +1751,18 @@ fn ledger_append_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            // The snapshot is the model's own column values — the same view
-            // version history diffs against, so at-rest-encrypted columns are
-            // snapshotted as ciphertext rather than plaintext (#805).
+            // The snapshot goes through the model's durable per-field codec, not
+            // `serde_json::to_value`. `#[model]` stamps `#[serde(skip_serializing)]`
+            // on `#[private]` and non-`admin_visible` `#[encrypted]` fields while
+            // leaving `Deserialize` requiring them, so a serde snapshot would omit
+            // exactly the columns as-of reconstruction then demands back — every
+            // `ledger_as_of` on such a model would fail. The same codec also
+            // rewrites `#[encrypted]` columns as recoverable ciphertext, so the
+            // ledger table never holds plaintext the model chose to protect, and
+            // `__autumn_commit_hook_from_value` decrypts on the way out.
             #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
-            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value = {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                (#record_expr).version_column_values()
-            };
+            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                (#record_expr).__autumn_commit_hook_to_value()?;
             #soft_delete_stamp
             // Transaction time. Truncated to microseconds — the precision both
             // storage tiers keep — so the value that is hashed is the value that
@@ -1805,11 +1812,18 @@ fn ledger_append_ts(
 
             ::autumn_web::backend_select! {
                 pg => {
+                    // `$8` is bound as TEXT, not cast to `jsonb`: `jsonb` parses
+                    // each number into `numeric` and re-renders it on output, so a
+                    // float `serde_json` writes as `1e16` comes back as
+                    // `10000000000000000` and re-canonicalizes to different bytes
+                    // than the ones that were hashed — `ledger_verify` would report
+                    // `HashMismatch` on an untampered chain. A tamper-evident
+                    // store has to hand back exactly the bytes it was given.
                     ::autumn_web::reexports::diesel::sql_query(
                         "INSERT INTO _autumn_ledger_revisions \
                          (table_name, tenant_id, record_id, seq, op, actor, request_id, \
                           snapshot, valid_from, recorded_at, prev_hash, hash) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12)"
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
                     )
                     #insert_binds
                     .bind::<::autumn_web::reexports::diesel::sql_types::Timestamptz, _>(__lg_valid_from)
@@ -2485,7 +2499,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // soft-delete child must be hard-deleted too: a soft-deleted child left
         // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
         // semantic orphan. Non-soft-delete children are always hard-deleted.
-        let destroy_mutation = if config.soft_delete {
+        let destroy_mutation = if config.soft_delete && config.ledgered {
+            // #1699: a ledgered child is never hard-deleted, even by a cascade
+            // from a hard-deleting parent. The rule the branch below encodes —
+            // "a soft-deleted child left pointing at a hard-deleted parent is a
+            // semantic orphan" — is real, but for a ledgered entity the cure is
+            // worse: erasing the row erases the record the ledger reconstructs,
+            // which is exactly what `ledgered` refusing `purge` and requiring
+            // `soft_delete` exists to prevent. The child is soft-deleted either
+            // way and the revision that records it stays truthful; an orphaned
+            // FK is a schema concern the app can see, an erased ledger is not.
+            quote! {
+                #destroy_count_bind = {
+                    #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
+            }
+        } else if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
                     #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
@@ -15707,6 +15744,103 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
             };
 
+            // #1699: `restore` is the one remaining write on a ledgered
+            // repository's mandatory surface that would otherwise change
+            // `deleted_at` without appending a revision — leaving `ledger_as_of`
+            // reporting a deleted row that the table shows as live, permanently,
+            // with `ledger_verify` none the wiser. The ledgered arm runs the same
+            // load-lock-write-record shape `delete_by_id` uses, recording the
+            // undelete as an update revision.
+            let restore_impl_method = if config.ledgered {
+                let vh_restore = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { __restored },
+                    Some(&quote! { record }),
+                    &quote! { conn },
+                    model_name,
+                    config.ledgered,
+                );
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        #cross_shard_write_guard
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                            #cc_before_restore
+                            let load_query = #table_ident::table.find(id);
+                            let record = if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
+                            } else {
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
+                            }
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+                            let update_query = #table_ident::table.find(id);
+                            let __restored = if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::update(update_query.filter(#table_ident::tenant_id.eq(t)))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::update(update_query)
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                            }
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+                            #vh_restore
+                            Ok(())
+                        }.scope_boxed())
+                        .await
+                    }
+                }
+            } else {
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        // §1d: restore is a write; reject cross-shard across_tenants
+                        // (per-shard ids are ambiguous, like delete/purge).
+                        #cross_shard_write_guard
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_restore_tenant_guard
+                        let query = #table_ident::table.find(id);
+                        let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                .execute(&mut conn)
+                                .await
+                        } else {
+                            ::autumn_web::reexports::diesel::update(query)
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                .execute(&mut conn)
+                                .await
+                        }
+                        .map_err(::autumn_web::AutumnError::from)?;
+                        if __count == 0 {
+                            return Err(::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ));
+                        }
+                        Ok(())
+                    }
+                }
+            };
+
             // #1699: see `purge_trait_method` — a ledgered repository has no
             // hard-delete method to implement.
             let purge_impl_method = if config.ledgered {
@@ -15744,35 +15878,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             quote! {
-                async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    // §1d: restore is a write; reject cross-shard across_tenants
-                    // (per-shard ids are ambiguous, like delete/purge).
-                    #cross_shard_write_guard
-                    #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    #cc_restore_tenant_guard
-                    let query = #table_ident::table.find(id);
-                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                            .execute(&mut conn)
-                            .await
-                    } else {
-                        ::autumn_web::reexports::diesel::update(query)
-                            .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                            .execute(&mut conn)
-                            .await
-                    }
-                    .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
-                }
+                #restore_impl_method
 
                 #purge_impl_method
 
@@ -15866,6 +15972,74 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         } else {
+            // #1699: see the tenant-scoped arm — `restore` must record the
+            // undelete, or the ledger permanently disagrees with the table.
+            let restore_impl_method = if config.ledgered {
+                let vh_restore = vh_insert_ts(
+                    table_name,
+                    "update",
+                    false,
+                    &quote! { __restored },
+                    Some(&quote! { record }),
+                    &quote! { conn },
+                    model_name,
+                    config.ledgered,
+                );
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
+                            #cc_before_restore
+                            let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+                            let __restored = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                .get_result::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+                            #vh_restore
+                            Ok(())
+                        }.scope_boxed())
+                        .await
+                    }
+                }
+            } else {
+                quote! {
+                    async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        #cc_restore_plain_guard
+                        let query = #table_ident::table.find(id);
+                        let __count = ::autumn_web::reexports::diesel::update(query)
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                            .execute(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        if __count == 0 {
+                            return Err(::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ));
+                        }
+                        Ok(())
+                    }
+                }
+            };
+
             // #1699: see `purge_trait_method`.
             let purge_impl_method = if config.ledgered {
                 quote! {}
@@ -15892,24 +16066,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             quote! {
-                async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
-                    #cc_restore_plain_guard
-                    let query = #table_ident::table.find(id);
-                    let __count = ::autumn_web::reexports::diesel::update(query)
-                        .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
-                        .execute(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    if __count == 0 {
-                        return Err(::autumn_web::AutumnError::not_found_msg(
-                            format!("{} with id {} not found", stringify!(#model_name), id)
-                        ));
-                    }
-                    Ok(())
-                }
+                #restore_impl_method
 
                 #purge_impl_method
 
@@ -17551,9 +17708,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __ledger_tenant_id: ::core::option::Option<&str> = ::core::option::Option::None;
         }
     };
+    // A chain is per (tenant, record): two tenants' rows can share a `record_id`,
+    // and an unscoped read would interleave their revisions into one sequence —
+    // 1,1,2,2,… — which `verify_chain` correctly reports as `DuplicateSeq` on
+    // history nobody touched. Refuse the read rather than manufacture tamper
+    // evidence. Same reasoning as the shard guard below, one level up.
+    let ledger_cross_tenant_guard = if config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-tenant ledger reads are not supported: a revision chain \
+                         is per (tenant, record), and two tenants' rows may share a \
+                         record id, so an unscoped read would interleave their chains. \
+                         Read the ledger inside a tenant scope instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
     let ledger_cross_shard_guard = if config.sharded && config.tenant_scoped {
         quote! {
-            if self.across_tenants && self.__autumn_shards.is_some() {
+            if self.__autumn_shards.is_some() && self.across_tenants {
                 return ::core::result::Result::Err(
                     ::autumn_web::AutumnError::bad_request_msg(
                         "cross-shard ledger reads are not supported: \
@@ -17609,6 +17787,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // The live-row read is tenant-filtered only on a tenant-scoped repository:
+    // a plain model has no `tenant_id` column to name.
+    let ledger_live_row_query = if config.tenant_scoped {
+        quote! {
+            {
+                let query = #table_ident::table.find(record_id);
+                if let ::core::option::Option::Some(t) = __ledger_tenant_id {
+                    query
+                        .filter(#table_ident::tenant_id.eq(t))
+                        .first::<#model_name>(&mut conn)
+                        .await
+                } else {
+                    query.first::<#model_name>(&mut conn).await
+                }
+            }
+        }
+    } else {
+        quote! {
+            {
+                let _ = __ledger_tenant_id;
+                #table_ident::table
+                    .find(record_id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+            }
+        }
+    };
+
     let ledger_query_impl = if config.ledgered {
         quote! {
             impl #pg_name {
@@ -17632,6 +17838,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
                     #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
                     #ledger_tenant_setup
 
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -17677,7 +17884,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let raw_rows: ::std::vec::Vec<__AutumnLedgerRow> =
                                     ::autumn_web::reexports::diesel::sql_query(
                                         "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
-                                         request_id, snapshot::text AS snapshot, valid_from, \
+                                         request_id, snapshot, valid_from, \
                                          recorded_at, prev_hash, hash \
                                          FROM _autumn_ledger_revisions \
                                          WHERE table_name = $1 AND record_id = $2 \
@@ -17791,20 +17998,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     else {
                         return ::core::result::Result::Ok(::core::option::Option::None);
                     };
-                    let model: #model_name = ::autumn_web::reexports::serde_json::from_value(
-                        revision.snapshot.clone(),
-                    )
-                    .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                        ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                            table: #table_name.to_string(),
-                            record_id,
-                            detail: format!(
-                                "revision {} does not deserialize into {}: {err}",
-                                revision.seq,
-                                stringify!(#model_name),
-                            ),
-                        },
-                    ))?;
+                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, revision)?;
                     ::core::result::Result::Ok(::core::option::Option::Some(model))
                 }
 
@@ -17847,8 +18041,69 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     to: ::autumn_web::ledger::LedgerAsOf,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerDiff> {
                     let revisions = self.ledger_revisions(record_id).await?;
+                    let from_rev = ::autumn_web::ledger::snapshot_as_of(&revisions, from);
+                    let to_rev = ::autumn_web::ledger::snapshot_as_of(&revisions, to);
+                    // Diffing stored snapshots directly would compare the
+                    // ciphertext of `#[encrypted]` columns, which carries a fresh
+                    // nonce per write and so always differs even when the
+                    // plaintext did not. Reconstruct each side and diff the
+                    // model's own view instead.
+                    let empty = ::autumn_web::reexports::serde_json::Value::Object(
+                        ::autumn_web::reexports::serde_json::Map::new(),
+                    );
+                    let before = match from_rev {
+                        ::core::option::Option::None => empty.clone(),
+                        ::core::option::Option::Some(revision) =>
+                            Self::__autumn_ledger_view_of(record_id, revision)?,
+                    };
+                    let after = match to_rev {
+                        ::core::option::Option::None => empty,
+                        ::core::option::Option::Some(revision) =>
+                            Self::__autumn_ledger_view_of(record_id, revision)?,
+                    };
+                    ::core::result::Result::Ok(::autumn_web::ledger::LedgerDiff {
+                        record_id,
+                        from_seq: from_rev.map(|r| r.seq),
+                        to_seq: to_rev.map(|r| r.seq),
+                        changes: ::autumn_web::ledger::diff_snapshots(&before, &after),
+                    })
+                }
+
+                /// Reconstruct the model a revision describes.
+                #[doc(hidden)]
+                fn __autumn_ledger_model_from_snapshot(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<#model_name> {
+                    #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
+                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name.to_string(),
+                                record_id,
+                                detail: format!(
+                                    "revision {} does not reconstruct into {}: {err}",
+                                    revision.seq,
+                                    stringify!(#model_name),
+                                ),
+                            },
+                        ))
+                }
+
+                /// A revision's model, in the same public projection
+                /// `__autumn_ledger_live_view` produces for the live row — so a
+                /// diff and the live-state cross-check compare like with like.
+                #[doc(hidden)]
+                fn __autumn_ledger_view_of(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::serde_json::Value> {
+                    let model = Self::__autumn_ledger_model_from_snapshot(record_id, revision)?;
                     ::core::result::Result::Ok(
-                        ::autumn_web::ledger::diff_as_of(record_id, &revisions, from, to),
+                        ::autumn_web::reexports::serde_json::to_value(&model).unwrap_or(
+                            ::autumn_web::reexports::serde_json::Value::Object(
+                                ::autumn_web::reexports::serde_json::Map::new(),
+                            ),
+                        ),
                     )
                 }
 
@@ -17867,10 +18122,71 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     record_id: i64,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerVerification> {
+                    // The chain alone cannot see a truncated tail — lopping the
+                    // last revisions off leaves something internally perfect — nor
+                    // a write that reached the table without appending a revision.
+                    // Cross-checking the head against the live row closes both.
+                    //
+                    // Both reads are taken twice: a write landing between them
+                    // would look exactly like a divergence, and this routine
+                    // exists to produce trustworthy accusations. If the chain head
+                    // moved under us, the live comparison is skipped rather than
+                    // reported — a concurrent write is not tampering.
                     let revisions = self.ledger_revisions(record_id).await?;
+                    let live = self.__autumn_ledger_live_view(record_id).await?;
+                    let settled_head = self.ledger_head(record_id).await?;
+                    let stable = settled_head.as_ref().map(|h| h.seq)
+                        == revisions.last().map(|r| r.seq);
+
+                    let live_state = if stable {
+                        match live.as_ref() {
+                            ::core::option::Option::Some(value) =>
+                                ::autumn_web::ledger::LedgerLiveState::Present(value),
+                            ::core::option::Option::None =>
+                                ::autumn_web::ledger::LedgerLiveState::Absent,
+                        }
+                    } else {
+                        ::autumn_web::ledger::LedgerLiveState::NotChecked
+                    };
+
                     ::core::result::Result::Ok(
-                        ::autumn_web::ledger::verify_chain(record_id, &revisions),
+                        ::autumn_web::ledger::verify_chain_against(record_id, &revisions, live_state),
                     )
+                }
+
+                /// The live row's public projection, or `None` when the record has
+                /// no row at all.
+                ///
+                /// Reads with soft-deleted rows included: a ledgered delete leaves
+                /// the row in place, so "absent" here means erased out of band.
+                /// The projection is the model's own `Serialize` view — the same
+                /// one `__autumn_ledger_view_of` builds from a revision — so a
+                /// column the model hides from serialization is covered by the
+                /// hash chain but not by this cross-check.
+                #[doc(hidden)]
+                async fn __autumn_ledger_live_view(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::reexports::serde_json::Value>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let row: ::core::option::Option<#model_name> = #ledger_live_row_query
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?;
+
+                    ::core::result::Result::Ok(row.map(|model| {
+                        ::autumn_web::reexports::serde_json::to_value(&model).unwrap_or(
+                            ::autumn_web::reexports::serde_json::Value::Object(
+                                ::autumn_web::reexports::serde_json::Map::new(),
+                            ),
+                        )
+                    }))
                 }
 
                 /// The head of the record's chain, for pinning outside the
@@ -17888,15 +18204,75 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     record_id: i64,
                 ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHead>> {
-                    let revisions = self.ledger_revisions(record_id).await?;
-                    ::core::result::Result::Ok(revisions.last().map(|revision| {
-                        ::autumn_web::ledger::LedgerHead {
-                            record_id,
-                            seq: revision.seq,
-                            hash: revision.hash.clone(),
-                            recorded_at: revision.recorded_at,
-                        }
-                    }))
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    // A single indexed row. Pinning a head is the thing an
+                    // operator polls on a schedule, so it must not cost a scan and
+                    // a JSON parse of every revision the record ever had.
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let head = ::autumn_web::backend_select! {
+                        pg => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerHead {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                hash: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions                                  WHERE table_name = $1 AND record_id = $2                                  AND ($3::text IS NULL OR tenant_id = $3)                                  ORDER BY seq DESC LIMIT 1"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerHead>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerHead {
+                                record_id,
+                                seq: row.seq,
+                                hash: row.hash,
+                                recorded_at: row.recorded_at,
+                            })
+                        }},
+                        sqlite => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerHead {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                hash: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions                                  WHERE table_name = $1 AND record_id = $2                                  AND ($3 IS NULL OR tenant_id = $3)                                  ORDER BY seq DESC LIMIT 1"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerHead>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerHead {
+                                record_id,
+                                seq: row.seq,
+                                hash: row.hash,
+                                recorded_at: row.recorded_at,
+                            })
+                        }},
+                    };
+                    ::core::result::Result::Ok(head)
                 }
             }
         }
@@ -24937,13 +25313,62 @@ mod tests {
             generated.contains("_autumn_ledger_revisions"),
             "a ledgered repository must append revisions: {generated}"
         );
-        // One INSERT per version-history write site, on both backend arms.
-        let inserts = generated
+        // Parity, not a floor: the ledger append is emitted from the same token
+        // builder as the version-history INSERT, so every history write site must
+        // carry exactly one ledger write. A `>= 2` check would pass with 27 of 28
+        // write paths silently unledgered.
+        let ledger_inserts = generated
             .matches("INSERT INTO _autumn_ledger_revisions")
             .count();
+        let history_inserts = generated
+            .matches("INSERT INTO _autumn_version_history")
+            .count();
+        assert_eq!(
+            ledger_inserts, history_inserts,
+            "every version-history write site must also append a ledger revision \
+             ({ledger_inserts} ledger vs {history_inserts} history)"
+        );
+        assert!(history_inserts > 0, "sanity: history writes are emitted");
+        // Each append reads the record's chain head first.
+        assert_eq!(
+            generated
+                .matches("SELECT seq, hash FROM _autumn_ledger_revisions")
+                .count(),
+            ledger_inserts,
+            "each append must read the chain head it links onto"
+        );
+    }
+
+    #[test]
+    fn repository_macro_ledgered_restore_records_the_undelete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // `restore` is the inverse of a ledgered delete, so it must append a
+        // revision — otherwise as-of reports a deleted row that the table shows
+        // as live, permanently, with `ledger_verify` none the wiser.
+        let restore_body = generated_fn(&generated, "async fn restore");
         assert!(
-            inserts >= 2,
-            "expected a ledger INSERT on every emitted write path, found {inserts}"
+            restore_body.contains("INSERT INTO _autumn_ledger_revisions"),
+            "a ledgered restore must append a revision: {restore_body}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_unledgered_restore_is_unchanged() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let restore_body = generated_fn(&generated, "async fn restore");
+        assert!(
+            !restore_body.contains("_autumn_ledger_revisions"),
+            "an unledgered restore must be byte-for-byte as before: {restore_body}"
         );
     }
 
@@ -25016,10 +25441,21 @@ mod tests {
         .to_string();
 
         // The soft-delete write path must reach the ledger too: a delete is a
-        // revision, not an absence of one.
+        // revision, not an absence of one. Match the `op:` field of the hash
+        // input specifically — the bare `VersionOp :: Delete` token is also
+        // emitted by the version-history row mapper, which every `versioned`
+        // repository generates, so asserting on it would pass with the entire
+        // ledger delete path removed.
         assert!(
-            generated.contains("VersionOp :: Delete"),
-            "a ledgered soft-delete must append a delete revision: {generated}"
+            generated.contains("op : :: autumn_web :: version_history :: VersionOp :: Delete"),
+            "a ledgered soft-delete must hash a delete revision: {generated}"
+        );
+        // And the snapshot it hashes must be the post-delete state: version
+        // history's delete entry records the pre-delete load, which would make
+        // as-of after a delete report `deleted_at: null`.
+        assert!(
+            generated.contains("\"deleted_at\" . to_string ()"),
+            "a ledgered delete revision must snapshot the stored deleted_at: {generated}"
         );
     }
 

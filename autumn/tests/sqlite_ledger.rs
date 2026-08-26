@@ -37,8 +37,8 @@ use autumn_web::tenancy::with_tenant;
 use autumn_web::version_history::VersionOp;
 
 use chrono::{DateTime, Duration, Utc};
-use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 
 type SqlitePool = Pool<RuntimeConnection>;
 
@@ -48,6 +48,19 @@ mod schema {
             id -> Int8,
             reference -> Text,
             amount_cents -> Int8,
+            // A float and a nested-JSON column: the two shapes where a
+            // snapshot round-trip is most likely to lose fidelity.
+            amount_rate -> Double,
+            metadata -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        lg_effective_notes (id) {
+            id -> Int8,
+            body -> Text,
+            effective_at -> Timestamp,
             deleted_at -> Nullable<Timestamp>,
         }
     }
@@ -62,15 +75,24 @@ mod schema {
     }
 }
 
-use schema::{lg_invoices, lg_tenant_invoices};
+use schema::{lg_effective_notes, lg_invoices, lg_tenant_invoices};
 
 #[autumn_web::model(table = "lg_invoices")]
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 pub struct LgInvoice {
     #[id]
     pub id: i64,
     pub reference: String,
     pub amount_cents: i64,
+    /// A float, deliberately. Postgres `jsonb` renders numbers through
+    /// `numeric`, so a value serde writes as `1e16` would come back as
+    /// `10000000000000000` and re-canonicalize to different bytes than the ones
+    /// that were hashed — which is why the snapshot column is `TEXT` on both
+    /// tiers. This column keeps that decision under test.
+    pub amount_rate: f64,
+    /// Nested JSON, stored as text, to prove key order inside a column value
+    /// survives the canonicalization the hash depends on.
+    pub metadata: String,
     #[default]
     pub deleted_at: Option<chrono::NaiveDateTime>,
 }
@@ -99,44 +121,41 @@ pub struct LgTenantInvoice {
 )]
 pub trait LgTenantInvoiceRepository {}
 
-/// The `SQLite` `_autumn_ledger_revisions` DDL — the exact fork shipped in
-/// `autumn/version_history_migrations_sqlite/…/up.sql`. Applied by hand here so
-/// the test proves the `SQLite` CREATE (expression unique index included) is
-/// valid and that the writer/reader work against it without booting the full
-/// migration harness.
-const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _autumn_ledger_revisions (\
-        id          INTEGER PRIMARY KEY, \
-        table_name  TEXT    NOT NULL, \
-        tenant_id   TEXT, \
-        record_id   BIGINT  NOT NULL, \
-        seq         BIGINT  NOT NULL, \
-        op          TEXT    NOT NULL CHECK (op IN ('insert', 'update', 'delete')), \
-        actor       TEXT    NOT NULL DEFAULT 'system', \
-        request_id  TEXT, \
-        snapshot    TEXT    NOT NULL DEFAULT '{}', \
-        valid_from  TEXT    NOT NULL, \
-        recorded_at TEXT    NOT NULL, \
-        prev_hash   TEXT, \
-        hash        TEXT    NOT NULL\
-    )";
+/// A model whose valid time comes from its own column, so the two axes diverge.
+#[autumn_web::model(table = "lg_effective_notes")]
+#[derive(PartialEq, Eq)]
+pub struct LgEffectiveNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    pub effective_at: chrono::NaiveDateTime,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
 
-const LEDGER_CHAIN_INDEX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS \
-    idx_autumn_ledger_revisions_chain ON _autumn_ledger_revisions \
-    (table_name, COALESCE(tenant_id, ''), record_id, seq)";
+#[autumn_web::repository(
+    LgEffectiveNote,
+    table = "lg_effective_notes",
+    soft_delete,
+    ledgered(valid_time = "effective_at")
+)]
+pub trait LgEffectiveNoteRepository {}
 
-/// The `SQLite` `_autumn_version_history` DDL. A `ledgered` repository implies
-/// `versioned`, so both tables must exist for a write to succeed.
-const VERSION_HISTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS _autumn_version_history (\
-        id          INTEGER PRIMARY KEY, \
-        table_name  TEXT    NOT NULL, \
-        tenant_id   TEXT, \
-        record_id   BIGINT  NOT NULL, \
-        op          TEXT    NOT NULL CHECK (op IN ('insert', 'update', 'delete')), \
-        actor       TEXT    NOT NULL DEFAULT 'system', \
-        request_id  TEXT, \
-        changes     TEXT    NOT NULL DEFAULT '[]', \
-        recorded_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP\
-    )";
+/// The migration SQL Autumn actually ships, applied verbatim.
+///
+/// Included rather than hand-copied so a syntax error or a schema change in
+/// `version_history_migrations_sqlite/` fails this suite instead of sailing past
+/// it — the previous hand-copied constants had already drifted from the shipped
+/// file by two indexes.
+const LEDGER_UP: &str = include_str!(
+    "../version_history_migrations_sqlite/20260826000000_create_ledger_revisions/up.sql"
+);
+
+/// A `ledgered` repository implies `versioned`, so both tables must exist for a
+/// write to succeed.
+const VERSION_HISTORY_UP: &str = include_str!(
+    "../version_history_migrations_sqlite/20260526000000_create_version_history/up.sql"
+);
 
 async fn boot_pool(db_name: &str) -> SqlitePool {
     let config = DatabaseConfig {
@@ -155,6 +174,8 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  reference TEXT NOT NULL, \
                  amount_cents BIGINT NOT NULL, \
+                 amount_rate DOUBLE PRECISION NOT NULL, \
+                 metadata TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_tenant_invoices (\
@@ -163,12 +184,16 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
                  tenant_id TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
-            VERSION_HISTORY_DDL,
-            LEDGER_DDL,
-            LEDGER_CHAIN_INDEX,
+            "CREATE TABLE lg_effective_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
+                 effective_at TIMESTAMP NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            VERSION_HISTORY_UP,
+            LEDGER_UP,
         ] {
-            diesel::sql_query(ddl)
-                .execute(&mut *conn)
+            conn.batch_execute(ddl)
                 .await
                 .unwrap_or_else(|err| panic!("apply DDL: {err}\n{ddl}"));
         }
@@ -209,6 +234,8 @@ async fn golden_as_of_reconstruction_matches_the_oracle_and_tampering_is_detecte
         repo.save(&NewLgInvoice {
             reference: "INV-1".to_string(),
             amount_cents: 1000,
+            amount_rate: 1e16,
+            metadata: r#"{"b":1,"a":{"y":2,"x":3}}"#.to_string(),
         })
         .await
         .expect("insert")
@@ -336,6 +363,8 @@ async fn every_write_appends_a_revision_with_both_time_axes() {
             .save(&NewLgInvoice {
                 reference: "INV-2".to_string(),
                 amount_cents: 500,
+                amount_rate: 1e16,
+                metadata: r#"{"b":1,"a":{"y":2,"x":3}}"#.to_string(),
             })
             .await
             .expect("insert");
@@ -425,6 +454,8 @@ async fn diff_reports_the_field_level_delta_between_two_instants() {
         .save(&NewLgInvoice {
             reference: "INV-3".to_string(),
             amount_cents: 100,
+            amount_rate: 1e16,
+            metadata: r#"{"b":1,"a":{"y":2,"x":3}}"#.to_string(),
         })
         .await
         .expect("insert");
@@ -556,6 +587,8 @@ async fn verify_has_no_false_positives_on_an_untouched_chain() {
             .save(&NewLgInvoice {
                 reference: format!("INV-{n}"),
                 amount_cents: i64::from(n),
+                amount_rate: 1e16,
+                metadata: r#"{"b":1,"a":{"y":2,"x":3}}"#.to_string(),
             })
             .await
             .expect("insert");
@@ -657,11 +690,352 @@ async fn ledger_reads_fail_closed_across_tenants() {
     );
 }
 
+// ── restore, bulk paths, and the live-state cross-check ──────────────
+
+/// `restore` is the sanctioned inverse of a ledgered delete, so it must record
+/// the undelete. Without a revision, `ledger_as_of(now)` would report a deleted
+/// row forever while the table shows it live — and `ledger_verify` would call
+/// that chain intact.
+#[tokio::test]
+async fn restore_records_a_revision_and_keeps_as_of_true() {
+    let pool = boot_pool("lg_restore").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+
+    let id = write_three_revisions(&repo).await;
+    repo.delete_by_id(id).await.expect("soft delete");
+    repo.restore(id).await.expect("restore");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.op).collect::<Vec<_>>(),
+        vec![
+            VersionOp::Insert,
+            VersionOp::Update,
+            VersionOp::Update,
+            VersionOp::Delete,
+            VersionOp::Update,
+        ],
+        "restore appends an update revision"
+    );
+
+    let reconstructed = repo
+        .ledger_as_of_at(id, LedgerAsOf::default())
+        .await
+        .expect("as-of")
+        .expect("state exists");
+    assert!(
+        reconstructed.deleted_at.is_none(),
+        "the restore revision must snapshot the undeleted row"
+    );
+
+    let live = repo
+        .find_by_id(id)
+        .await
+        .expect("live read")
+        .expect("live row");
+    assert_eq!(reconstructed, live, "as-of(now) must equal the live row");
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// A truncated tail leaves a chain that is internally perfect. Only the live row
+/// exposes it — which is what makes the cross-check worth its extra read.
+#[tokio::test]
+async fn verify_detects_a_truncated_tail_against_the_live_row() {
+    let pool = boot_pool("lg_truncate").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+    }
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    let broken = report.broken.expect("a truncated tail must be detected");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+    assert_eq!(broken.seq, 2, "reported at the surviving head");
+}
+
+/// The whole chain erased behind a row that still exists.
+#[tokio::test]
+async fn verify_detects_a_wholly_erased_chain() {
+    let pool = boot_pool("lg_erased").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("erase the chain");
+    }
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a live record with no history must be detected");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+    assert_eq!(broken.seq, 0);
+}
+
+/// A correctly-hashed appended forgery is undetectable from inside the chain —
+/// the hashing rule is public. A pinned head is the defence, so prove the pin
+/// actually disagrees.
+#[tokio::test]
+async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
+    let pool = boot_pool("lg_pinned_head").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let pinned = repo
+        .ledger_head(id)
+        .await
+        .expect("head")
+        .expect("a written record has a head");
+
+    // Mallory appends a well-formed revision, computing the hash the same way
+    // the framework does, and rewrites the live row to match so even the
+    // live-state cross-check is satisfied.
+    let head_revision = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head revision");
+    let mut snapshot = head_revision.snapshot.clone();
+    snapshot["amount_cents"] = serde_json::json!(999_999);
+    let recorded_at = autumn_web::ledger::truncate_to_micros(now());
+    let forged_hash = autumn_web::ledger::revision_hash(&autumn_web::ledger::RevisionHashInput {
+        prev_hash: Some(head_revision.hash.as_str()),
+        table_name: "lg_invoices",
+        tenant_id: None,
+        record_id: id,
+        seq: head_revision.seq + 1,
+        op: VersionOp::Update,
+        actor: "mallory",
+        request_id: None,
+        snapshot: &snapshot,
+        valid_from: recorded_at,
+        recorded_at,
+    });
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_revisions \
+             (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+              valid_from, recorded_at, prev_hash, hash) \
+             VALUES ('lg_invoices', NULL, ?, ?, 'update', 'mallory', NULL, ?, ?, ?, ?, ?)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head_revision.seq + 1)
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&snapshot))
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(recorded_at)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(recorded_at)
+        .bind::<diesel::sql_types::Text, _>(head_revision.hash.clone())
+        .bind::<diesel::sql_types::Text, _>(forged_hash)
+        .execute(&mut *conn)
+        .await
+        .expect("append a well-formed forgery");
+        diesel::sql_query("UPDATE lg_invoices SET amount_cents = 999999 WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .expect("rewrite the live row to match");
+    }
+
+    // Verification alone cannot see it — this is the documented limit.
+    assert!(
+        repo.ledger_verify(id).await.expect("verify").is_intact(),
+        "a correctly-hashed, live-consistent append is invisible from inside the chain"
+    );
+
+    // The pin does.
+    let now_head = repo.ledger_head(id).await.expect("head").expect("head");
+    assert_ne!(
+        now_head.hash, pinned.hash,
+        "a head pinned outside the database must disagree after a forgery"
+    );
+    assert_eq!(now_head.seq, pinned.seq + 1);
+}
+
+/// Bulk writes are where a per-row chain read is most likely to go wrong.
+#[tokio::test]
+async fn bulk_writes_chain_every_row_independently() {
+    let pool = boot_pool("lg_bulk").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+
+    let created = repo
+        .save_many(&[
+            NewLgInvoice {
+                reference: "BULK-1".to_string(),
+                amount_cents: 1,
+                amount_rate: 1e16,
+                metadata: "{}".to_string(),
+            },
+            NewLgInvoice {
+                reference: "BULK-2".to_string(),
+                amount_cents: 2,
+                amount_rate: 2.5,
+                metadata: "{}".to_string(),
+            },
+        ])
+        .await
+        .expect("save_many");
+    assert_eq!(created.len(), 2);
+    let ids: Vec<i64> = created.iter().map(|r| r.id).collect();
+
+    for id in &ids {
+        let revisions = repo.ledger_revisions(*id).await.expect("revisions");
+        assert_eq!(
+            revisions.len(),
+            1,
+            "each bulk-inserted row opens its own chain"
+        );
+        assert_eq!(revisions[0].seq, 1);
+        assert_eq!(revisions[0].prev_hash, None);
+        assert!(repo.ledger_verify(*id).await.expect("verify").is_intact());
+    }
+
+    repo.delete_many(&ids).await.expect("delete_many");
+    for id in &ids {
+        let revisions = repo.ledger_revisions(*id).await.expect("revisions");
+        assert_eq!(
+            revisions.iter().map(|r| r.op).collect::<Vec<_>>(),
+            vec![VersionOp::Insert, VersionOp::Delete],
+            "a bulk soft-delete appends one revision per row"
+        );
+        assert_eq!(revisions[1].seq, 2);
+        assert_eq!(
+            revisions[1].prev_hash.as_deref(),
+            Some(revisions[0].hash.as_str())
+        );
+        let report = repo.ledger_verify(*id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+    }
+}
+
+// ── valid time read from a model column ──────────────────────────────
+
+#[tokio::test]
+async fn a_declared_valid_time_column_separates_the_two_axes() {
+    let pool = boot_pool("lg_valid_time").await;
+    let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool);
+
+    let effective = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    let created = repo
+        .save(&NewLgEffectiveNote {
+            body: "v1".to_string(),
+            effective_at: effective,
+        })
+        .await
+        .expect("insert");
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(
+        revisions[0].valid_from,
+        effective.and_utc(),
+        "valid time comes from the declared column, not the clock"
+    );
+    assert!(
+        revisions[0].recorded_at > revisions[0].valid_from,
+        "transaction time is now; valid time is back in January"
+    );
+
+    // A back-dated correction: recorded second, valid from *before* the insert.
+    let earlier = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    repo.update(
+        created.id,
+        &UpdateLgEffectiveNote {
+            body: Patch::Set("v2".to_string()),
+            effective_at: Patch::Set(earlier),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("correction");
+
+    // Transaction-time (and unbounded) reads follow the chain: the correction
+    // is the live state, even though its valid_from is earlier.
+    let live = repo
+        .find_by_id(created.id)
+        .await
+        .expect("live read")
+        .expect("live row");
+    let latest = repo
+        .ledger_as_of(created.id, now() + Duration::seconds(1))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(latest, live, "as-of(now) must equal the live row");
+    assert_eq!(latest.body, "v2");
+
+    // Valid-time reads walk the valid-time timeline instead.
+    let mid_2025 = chrono::NaiveDate::from_ymd_opt(2025, 8, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time")
+        .and_utc();
+    let then = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::valid(mid_2025))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(
+        then.body, "v2",
+        "the back-dated correction governs August 2025"
+    );
+
+    let mid_2026 = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time")
+        .and_utc();
+    let later = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::valid(mid_2026))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(
+        later.body, "v2",
+        "a correction supersedes what it corrects from its own effective_at onward"
+    );
+
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact()
+    );
+}
+
 async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
     let created = repo
         .save(&NewLgInvoice {
             reference: "INV-X".to_string(),
             amount_cents: 1,
+            amount_rate: 1e16,
+            metadata: r#"{"b":1,"a":{"y":2,"x":3}}"#.to_string(),
         })
         .await
         .expect("insert");

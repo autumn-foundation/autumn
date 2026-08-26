@@ -47,30 +47,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Reconstruction is byte-for-byte identical to what a plain query would have
   returned at that instant, pinned in CI against an oracle recorded live at each
-  intermediate instant. Revisions are bitemporal: `recorded_at` is transaction
-  time, `valid_from` is valid time (defaulting to transaction time, or read from
-  your own column via `ledgered(valid_time = "effective_at")`), so
-  `LedgerAsOf::bitemporal` answers the auditor's question — what the database
-  believed *then* about *then*.
+  intermediate instant, on both storage tiers. Snapshots go through the model's
+  durable per-field codec rather than serde, so `#[private]` and `#[encrypted]`
+  columns — which a model omits from its public JSON — are preserved (encrypted
+  ones as recoverable ciphertext, decrypted on the way back out), and the
+  snapshot column is `TEXT` rather than `JSONB` so the stored bytes are exactly
+  the bytes that were hashed.
+
+  Revisions are bitemporal: `recorded_at` is transaction time, `valid_from` is
+  valid time (defaulting to transaction time, or read from your own column via
+  `ledgered(valid_time = "effective_at")`), so `LedgerAsOf::bitemporal` answers
+  the auditor's question — what the database believed *then* about *then*.
 
   Each revision embeds its predecessor's hash, and `ledger_verify` reports the
   first broken link, distinguishing an edited row (`HashMismatch`) from one that
   was edited and re-hashed (`PrevHashMismatch` at the next link), a deleted
-  revision (`MissingRevision`) and an inserted one (`DuplicateSeq`). The chain is
-  tamper-*evident*, not tamper-proof — an adversary with table access and the
-  open-source hashing rule can rewrite a chain consistently — so `ledger_head`
-  exports the head hash for pinning outside the database, and the migration's
-  `(table, tenant, record, seq)` unique index makes a forked chain a write error
-  rather than silent corruption.
+  revision (`MissingRevision`) and an inserted one (`DuplicateSeq`). Because a
+  hash chain cannot prove that nothing is missing from its *end* — a truncated
+  chain is internally perfect — `ledger_verify` also cross-checks the head
+  against the live row, which additionally catches any write that reached the
+  table without appending a revision (`LiveStateMismatch`). What remains
+  undetectable is a *consistent* rewrite by someone with table access and the
+  open-source hashing rule, so `ledger_head` exports the head hash for pinning
+  outside the database; the migration's `(table, tenant, record, seq)` unique
+  index makes a forked chain a write error rather than silent corruption.
 
   Because a ledgered entity's history *is* the record, every way of erasing or
   redacting it is refused at the repository seam at compile time: `ledgered`
   without `soft_delete` does not compile, `purge` (soft-delete's raw-`DELETE`
-  escape hatch, which writes no history at all) is not generated, and
+  escape hatch, which writes no history at all) is not generated,
   `#[version_history(sensitive = [...])]` is rejected because a redacted column
-  could not be reconstructed. `tenant_scoped` ledgered reads fail closed across
-  tenants; cross-shard ledger reads are rejected rather than silently consulting
-  one shard. See `docs/guide/ledgered-entities.md`.
+  could not be reconstructed, and a `dependent(..., on_delete = destroy)` cascade
+  from a hard-deleting parent soft-deletes a ledgered child rather than erasing
+  it. `restore` — the inverse of a ledgered delete — records its own revision, so
+  the ledger never silently disagrees with the table. `tenant_scoped` ledgered
+  reads fail closed across tenants, and `across_tenants()` and cross-shard ledger
+  reads are rejected rather than interleaving chains that share a record id. See
+  `docs/guide/ledgered-entities.md`.
 
 - **`#[query_budget(N)]` — a compile-time, per-route database query budget
   (#1667):** declare a handler's query ceiling and the build fails when any

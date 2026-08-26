@@ -35,6 +35,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_chain
 
 CREATE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_record
     ON _autumn_ledger_revisions (table_name, record_id, seq ASC);
-
-CREATE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_recorded_at
-    ON _autumn_ledger_revisions (table_name, recorded_at ASC);

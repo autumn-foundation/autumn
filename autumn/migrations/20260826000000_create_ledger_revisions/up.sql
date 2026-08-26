@@ -13,11 +13,18 @@
 --   op          TEXT        -- 'insert' | 'update' | 'delete'
 --   actor       TEXT        -- authenticated user_id, or 'system'
 --   request_id  TEXT        -- trace / correlation ID (nullable)
---   snapshot    JSONB       -- FULL column values after the mutation
+--   snapshot    TEXT        -- FULL column values after the mutation, as the
+--                            -- exact canonical JSON bytes that were hashed
 --   valid_from  TIMESTAMPTZ -- valid time: when the fact became true
 --   recorded_at TIMESTAMPTZ -- transaction time: when the DB learned it
 --   prev_hash   TEXT        -- hash of revision seq-1 (NULL at seq = 1)
 --   hash        TEXT        -- SHA-256 over this revision's fields + prev_hash
+
+-- `snapshot` is TEXT rather than JSONB on purpose. JSONB parses each number
+-- into `numeric` and re-renders it on output, so a float serde_json writes as
+-- `1e16` comes back as `10000000000000000`. The revision hash covers the exact
+-- canonical bytes that were written, so a re-rendering store would make
+-- `ledger_verify` report tampering on an untouched chain.
 
 CREATE TABLE IF NOT EXISTS _autumn_ledger_revisions (
     id          BIGSERIAL   PRIMARY KEY,
@@ -28,7 +35,7 @@ CREATE TABLE IF NOT EXISTS _autumn_ledger_revisions (
     op          TEXT        NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
     actor       TEXT        NOT NULL DEFAULT 'system',
     request_id  TEXT,
-    snapshot    JSONB       NOT NULL DEFAULT '{}',
+    snapshot    TEXT        NOT NULL DEFAULT '{}',
     valid_from  TIMESTAMPTZ NOT NULL,
     recorded_at TIMESTAMPTZ NOT NULL,
     prev_hash   TEXT,
@@ -47,6 +54,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_chain
 CREATE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_record
     ON _autumn_ledger_revisions (table_name, record_id, seq ASC);
 
--- Transaction-time scans across one table (as-of over many records).
-CREATE INDEX IF NOT EXISTS idx_autumn_ledger_revisions_recorded_at
-    ON _autumn_ledger_revisions (table_name, recorded_at ASC);

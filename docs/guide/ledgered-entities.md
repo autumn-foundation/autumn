@@ -54,7 +54,8 @@ CREATE TABLE _autumn_ledger_revisions (
     op          TEXT        NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
     actor       TEXT        NOT NULL DEFAULT 'system',
     request_id  TEXT,
-    snapshot    JSONB       NOT NULL DEFAULT '{}',   -- FULL row state after the write
+    snapshot    TEXT        NOT NULL DEFAULT '{}',   -- FULL row state after the write,
+                                                     -- the exact canonical bytes hashed
     valid_from  TIMESTAMPTZ NOT NULL,   -- valid time
     recorded_at TIMESTAMPTZ NOT NULL,   -- transaction time
     prev_hash   TEXT,                   -- NULL at seq = 1
@@ -64,6 +65,12 @@ CREATE TABLE _autumn_ledger_revisions (
 CREATE UNIQUE INDEX idx_autumn_ledger_revisions_chain
     ON _autumn_ledger_revisions (table_name, COALESCE(tenant_id, ''), record_id, seq);
 ```
+
+`snapshot` is `TEXT`, not `JSONB`, on purpose. `JSONB` parses each number into
+`numeric` and re-renders it on output, so a float serde writes as `1e16` comes
+back as `10000000000000000`. The revision hash covers the exact bytes that were
+written, so a re-rendering store would make `ledger_verify` report tampering on
+an untouched chain.
 
 SQLite gets an equivalent fork (`INTEGER PRIMARY KEY`, JSON as `TEXT`) under the
 same migration version, exactly as version history does.
@@ -105,17 +112,28 @@ live-only callers check it exactly as they would against the table.
 ### Fidelity
 
 Reconstruction is **byte-for-byte identical** to what a plain query would have
-returned at that instant — the snapshot is the model's own serialized column
-values, not a replayed diff. Autumn's test suite pins this against an oracle
-recorded live at each intermediate instant.
+returned at that instant — the snapshot is a full row image, not a replayed
+diff. Autumn's test suite pins this against an oracle recorded live at each
+intermediate instant, on both storage tiers.
 
-Two documented boundaries:
+Snapshots go through the model's durable per-field codec rather than
+`serde_json::to_value`, so they carry every column — including `#[private]` and
+[`#[encrypted]`](attribute-encryption.md) fields, which serde omits from a
+model's public JSON. Encrypted columns are stored as recoverable ciphertext (the
+ledger table never holds plaintext the model chose to protect) and come back
+decrypted.
 
-- Columns opted into [at-rest encryption](attribute-encryption.md)
-  (`versioned_ciphertext`) are snapshotted as ciphertext, exactly as version
-  history stores them. As-of reconstruction of such a column yields ciphertext.
+Three consequences worth knowing:
+
 - Declaring `#[version_history(sensitive = [...])]` columns on a ledgered
   repository is a **compile error** — see below.
+- `ledger_diff` compares the *reconstructed models*, not the stored bytes: an
+  encrypted column carries a fresh nonce per write, so raw snapshots would report
+  it as changed on every revision. A column the model hides from serialization
+  therefore does not appear in a diff, though it is fully preserved in an as-of
+  reconstruction and fully covered by the hash.
+- The live-row cross-check in `ledger_verify` (below) compares the same public
+  projection, for the same reason.
 
 ## Bitemporality
 
@@ -150,9 +168,13 @@ repo.ledger_as_of_at(id, LedgerAsOf::valid(t)).await?;
 repo.ledger_as_of_at(id, LedgerAsOf::bitemporal(known_at, true_at)).await?;
 ```
 
-A revision's valid interval is `[valid_from, next_revision.valid_from)`, derived
-at read time rather than stored, so no revision is ever updated after it is
-written and the chain stays append-only.
+Both bounds **filter**; the answer is always the newest revision that survives.
+A revision is a full snapshot, so a later one replaces an earlier one outright
+rather than sitting beside it on a timeline — valid time says when a revision's
+statement *starts* being true. A future-dated revision is invisible until its
+instant arrives; a back-dated correction is visible from the instant it claims,
+and supersedes what it corrects from then on. Nothing is ever written back to an
+existing revision, so the chain stays append-only.
 
 ## Tamper evidence
 
@@ -166,16 +188,42 @@ Each revision embeds the hash of its predecessor, forming a per-record chain.
 | A revision was deleted | `MissingRevision` at the absent sequence number |
 | A revision was inserted | `DuplicateSeq`, or `HashMismatch` on an appended forgery |
 | The chain no longer starts at seq 1 | `BrokenChainStart` / `MissingRevision` |
+| A sequence number is at `i64::MAX` and cannot be followed | `UnusableSeq` |
+| The newest revision does not describe the live row | `LiveStateMismatch` |
 
 An intact report carries `head_hash`; a broken one carries none.
+
+### Why the live row is read too
+
+A hash chain proves the revisions that are *present* were not edited. It cannot
+prove that none is missing from the **end**: lopping the last two revisions off
+leaves something internally perfect. Nor can it see a write that reached the
+table without appending a revision at all.
+
+So `ledger_verify` also reads the live row and compares it against the head
+revision. That closes both gaps, and with them every remaining write path that
+can move a ledgered row without the repository's knowledge — a raw `UPDATE`, a
+[counter-cache](counter-cache.md) bump on a ledgered parent, a `dependent(...,
+on_delete = delete_all)` cascade declared on some *other* repository. None of
+those can be refused at compile time (they are declared elsewhere, or maintained
+by the framework), but none of them can hide either.
+
+The reads are taken twice: a write landing between them would look exactly like a
+divergence, and this routine exists to produce trustworthy accusations. If the
+chain head moves under it, the live comparison is skipped rather than reported —
+a concurrent write is not tampering.
 
 ### Threat model — read this
 
 The chain is **tamper-evident, not tamper-proof**. It detects any mutation,
 insertion, deletion or reordering that does not also re-derive every subsequent
-hash. An adversary with write access to the ledger table *and* knowledge of the
-hashing rule — which is open source — can rewrite a whole chain consistently.
-Nothing stored inside the same database can prevent that.
+hash, plus — via the live-row cross-check — a truncated tail and any write that
+bypassed the ledger.
+
+What it cannot see is a *consistent* rewrite. The hashing rule is open source, so
+an adversary with write access to the ledger table can re-derive a whole chain
+and adjust the row to match. Nothing stored inside the same database can prevent
+that.
 
 To close that gap, pin the head hash somewhere the database cannot reach:
 
@@ -199,7 +247,8 @@ it is refused at the repository seam — at compile time, not at runtime:
 | Configuration | Diagnostic |
 |---|---|
 | `ledgered = true` without `soft_delete` | Rejected: a hard `DELETE` erases the row the ledger reconstructs, so an as-of query would return state whose record no longer exists and `verify` could not tell erasure from tampering. |
-| Calling `purge(id)` | Not generated. `purge` is soft-delete's hard-delete escape hatch — a raw `DELETE FROM` that writes no history at all. `delete_by_id` (which records a delete revision) and `restore` are the whole delete surface. |
+| Calling `purge(id)` | Not generated. `purge` is soft-delete's hard-delete escape hatch — a raw `DELETE FROM` that writes no history at all. `delete_by_id` and `restore` — both of which record a revision — are the whole delete surface. |
+| A `dependent(..., on_delete = destroy)` cascade from a hard-deleting parent | A ledgered child is soft-deleted anyway. Erasing the row would erase the record the ledger reconstructs; an orphaned foreign key is a schema concern the app can see, an erased ledger is not. |
 | `#[version_history(sensitive = [...])]` | Rejected: a redacted column cannot be reconstructed, so byte-for-byte as-of fidelity would be unprovable. |
 | `no_versioned_record_impl` | Rejected: the ledger snapshots through the generated `VersionedRecord` impl, and a hand-written one is not guaranteed to serialize every column. |
 | `retention(...)` / `position(...)` | Already rejected for `versioned = true`: both mutate rows outside the history-writing paths. |
@@ -210,17 +259,36 @@ A `tenant_scoped` ledgered repository stamps `tenant_id` on every revision and
 scopes every ledger read to the active tenant — a read as tenant B never sees
 tenant A's revisions, and `ledger_as_of` fails closed to `None`.
 
-Cross-shard ledger reads are rejected: per-shard record ids are ambiguous, so a
-naive merge would be wrong. Query a specific shard instead.
+`across_tenants()` ledger reads are **rejected**, not widened. A chain is per
+`(tenant, record)`, and two tenants' rows may share a record id, so an unscoped
+read would interleave their chains into one sequence — 1, 1, 2, 2 — which
+`verify` would correctly call `DuplicateSeq` on history nobody touched. Read the
+ledger inside a tenant scope instead.
+
+Cross-shard ledger reads are rejected for the same class of reason: per-shard
+record ids are ambiguous, so a naive merge would be wrong. Query a specific shard
+instead.
 
 ## Cost
 
 Each write adds one indexed `SELECT … ORDER BY seq DESC LIMIT 1` and one
-`INSERT`, inside the transaction the write already opened. Bulk paths
-(`save_many`, `upsert_many`, `delete_many`) do this per row. Snapshots store the
-full row, so a ledgered table's history grows with row width, not just with the
-size of each change — the price of O(1) as-of reconstruction and provable
-fidelity. Retention and compaction of old revisions are not part of this slice.
+`INSERT`, inside the transaction the write already opened; a ledgered **delete**
+adds a third statement, reading back the `deleted_at` the update wrote so the
+revision snapshots the post-delete row exactly. Bulk paths (`save_many`,
+`upsert_many`, `delete_many`) pay this per row, inside the transaction that
+already holds their row locks — a `delete_many` over 1000 ids goes from a couple
+of statements to a few thousand. Chunk accordingly, or keep bulk writes off
+ledgered entities where throughput matters.
+
+`ledger_head` is a single indexed row, so pinning it on a schedule is cheap.
+`ledger_revisions`, `ledger_as_of`, `ledger_diff` and `ledger_verify` read a
+record's whole chain (there is no pagination in this slice), and `ledger_verify`
+additionally reads the live row and re-reads the head.
+
+Snapshots store the full row, so a ledgered table's history grows with row width,
+not just with the size of each change — the price of O(1) as-of reconstruction
+and provable fidelity. Retention and compaction of old revisions are not part of
+this slice.
 
 ## Limits of this slice
 
@@ -230,6 +298,13 @@ fidelity. Retention and compaction of old revisions are not part of this slice.
 - No retention, compaction, or archival of old revisions.
 - No distributed or multi-node ledger consensus.
 - Postgres and SQLite only.
+- No pagination on `ledger_revisions` — a record's whole chain is read at once.
+- Writes that reach a ledgered table from outside its own repository — a
+  [counter-cache](counter-cache.md) column maintained on a ledgered parent, a
+  `dependent(..., on_delete = delete_all | nullify)` cascade declared on another
+  repository, a hand-written `UPDATE` — do not append a revision. They cannot be
+  refused at compile time (they are declared elsewhere), but `ledger_verify`
+  reports each as a `LiveStateMismatch`.
 
 ## See also
 

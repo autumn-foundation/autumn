@@ -50,26 +50,42 @@
 //!
 //! # Threat model
 //!
-//! The chain is **tamper-evident**, not tamper-proof. [`verify_chain`] detects
+//! The chain is **tamper-evident**, not tamper-proof.
+//! [`verify_chain_against`] — which the generated `ledger_verify` calls — detects
 //! any mutation, insertion, deletion, or reordering of stored revisions that
-//! does not also re-derive every subsequent hash. An adversary with write access
-//! to the ledger table *and* the framework's hashing rule can rewrite a whole
-//! chain; nothing stored inside the same database can prevent that. Pin
-//! [`LedgerHead::hash`] somewhere the database cannot reach (an append-only
-//! object store, a notary, a second operator's inbox) to close that gap.
+//! does not also re-derive every subsequent hash, plus, by cross-checking the
+//! head against the live row, a truncated tail and any write that reached the
+//! table without appending a revision.
+//!
+//! What it cannot see is a *consistent* rewrite: the hashing rule is open
+//! source, so an adversary with write access to the ledger table can re-derive a
+//! whole chain (and adjust the row to match). Nothing stored inside the same
+//! database can prevent that. Pin [`LedgerHead::hash`] somewhere the database
+//! cannot reach — an append-only object store, a notary, a second operator's
+//! inbox — and a rewritten chain disagrees with the pin.
 //!
 //! # Fidelity boundary
 //!
-//! A snapshot is the model's own serialized column values, so
-//! [`snapshot_as_of`] reconstruction is byte-for-byte identical to what a live
-//! query would have returned at that instant. Two documented exceptions:
+//! A snapshot goes through the model's durable per-field codec, not
+//! `serde_json::to_value`, so it carries every column — `#[private]` and
+//! `#[encrypted]` fields included, which serde omits — and reconstruction is
+//! byte-for-byte identical to what a live query would have returned at that
+//! instant. Encrypted columns are stored as recoverable ciphertext, exactly as
+//! the durable commit-hook queue stores them, and come back decrypted.
+//!
+//! Three consequences worth knowing:
 //!
 //! * Declaring `#[version_history(sensitive = [...])]` columns on a ledgered
 //!   repository is a **compile error** — a redacted column could not be
 //!   reconstructed, so the fidelity guarantee would be unprovable.
-//! * Columns opted into at-rest encryption (`versioned_ciphertext`, #805) are
-//!   snapshotted as ciphertext, exactly as version history stores them. As-of
-//!   reconstruction of such a column yields the ciphertext, not the plaintext.
+//! * `ledger_diff` compares the *reconstructed models*, not the stored bytes:
+//!   an encrypted column carries a fresh nonce per write, so raw snapshots would
+//!   report it as changed on every revision. A column the model hides from
+//!   serialization therefore does not appear in a diff, though it is fully
+//!   preserved in an as-of reconstruction and fully covered by the hash.
+//! * The live-row cross-check in `ledger_verify` compares the same public
+//!   projection, for the same reason. A hidden column that drifted out of band
+//!   is caught by the chain, not by that cross-check.
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
@@ -251,26 +267,35 @@ pub fn truncate_to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
 pub fn revision_hash(input: &RevisionHashInput<'_>) -> String {
     use sha2::{Digest, Sha256};
 
-    let mut hasher = Sha256::new();
-    let mut field = |bytes: &[u8]| {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
         hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(bytes);
-    };
+    }
+    // Nullable fields carry a presence tag before their bytes. Without it a
+    // `NULL` and an empty string hash identically, so flipping a revision's
+    // `tenant_id` from NULL to `''` — which changes which tenant's chain the row
+    // belongs to — would leave every stored hash valid.
+    fn optional_field(hasher: &mut Sha256, value: Option<&str>) {
+        field(hasher, if value.is_some() { b"\x01" } else { b"\x00" });
+        field(hasher, value.unwrap_or("").as_bytes());
+    }
 
-    field(HASH_DOMAIN.as_bytes());
-    field(input.prev_hash.unwrap_or("").as_bytes());
-    field(input.table_name.as_bytes());
-    field(input.tenant_id.unwrap_or("").as_bytes());
-    field(input.record_id.to_string().as_bytes());
-    field(input.seq.to_string().as_bytes());
-    field(input.op.as_str().as_bytes());
-    field(input.actor.as_bytes());
-    field(input.request_id.unwrap_or("").as_bytes());
-    field(format_instant(input.valid_from).as_bytes());
-    field(format_instant(input.recorded_at).as_bytes());
-    field(canonical_json(input.snapshot).as_bytes());
+    let mut hasher = Sha256::new();
+    let hasher = &mut hasher;
+    field(hasher, HASH_DOMAIN.as_bytes());
+    optional_field(hasher, input.prev_hash);
+    field(hasher, input.table_name.as_bytes());
+    optional_field(hasher, input.tenant_id);
+    field(hasher, input.record_id.to_string().as_bytes());
+    field(hasher, input.seq.to_string().as_bytes());
+    field(hasher, input.op.as_str().as_bytes());
+    field(hasher, input.actor.as_bytes());
+    optional_field(hasher, input.request_id);
+    field(hasher, format_instant(input.valid_from).as_bytes());
+    field(hasher, format_instant(input.recorded_at).as_bytes());
+    field(hasher, canonical_json(input.snapshot).as_bytes());
 
-    hex::encode(hasher.finalize())
+    hex::encode(hasher.finalize_reset())
 }
 
 /// Render an instant in the fixed encoding the hash preimage uses.
@@ -296,6 +321,17 @@ pub enum LedgerBreak {
     DuplicateSeq,
     /// The chain does not start at `seq = 1` with a null `prev_hash`.
     BrokenChainStart,
+    /// A sequence number cannot be followed (`seq` is at `i64::MAX`), so the
+    /// chain cannot be continued or checked past this point.
+    UnusableSeq,
+    /// The newest revision does not describe the row the table actually holds.
+    ///
+    /// The hash chain proves that the revisions *present* were not edited; it
+    /// cannot prove that no revision is *missing from the end*, because a
+    /// truncated chain is internally consistent. Cross-checking the head against
+    /// the live row closes that gap, and with it every write that reached the
+    /// table without appending a revision.
+    LiveStateMismatch,
 }
 
 impl LedgerBreak {
@@ -308,6 +344,8 @@ impl LedgerBreak {
             Self::MissingRevision => "missing_revision",
             Self::DuplicateSeq => "duplicate_seq",
             Self::BrokenChainStart => "broken_chain_start",
+            Self::UnusableSeq => "unusable_seq",
+            Self::LiveStateMismatch => "live_state_mismatch",
         }
     }
 }
@@ -372,7 +410,40 @@ pub struct LedgerHead {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// What the live table holds for the record being verified.
+///
+/// A hash chain proves the revisions that are *present* were not edited. It
+/// cannot prove that none is missing from the *end*: lopping the last two
+/// revisions off leaves a chain that verifies perfectly. Nor can it see a write
+/// that reached the table without appending a revision at all. Comparing the
+/// head revision against the row the table actually holds closes both gaps, so
+/// [`verify_chain_against`] takes the live state as an explicit input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerLiveState<'a> {
+    /// The live row was not read, so no cross-check is performed. Chain-internal
+    /// breaks are still reported.
+    NotChecked,
+    /// The record has no row in the table.
+    Absent,
+    /// The record's current row, in the same projection the head revision's
+    /// snapshot is compared under.
+    Present(&'a serde_json::Value),
+}
+
 /// Verify one record's revision chain and report the first broken link.
+///
+/// Equivalent to [`verify_chain_against`] with [`LedgerLiveState::NotChecked`]:
+/// it proves the stored revisions were not edited, inserted into, or deleted
+/// from the middle, but cannot see a truncated tail or a write that never
+/// appended a revision. The generated `ledger_verify` reads the live row and
+/// calls [`verify_chain_against`] instead.
+#[must_use]
+pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerification {
+    verify_chain_against(record_id, revisions, LedgerLiveState::NotChecked)
+}
+
+/// Verify one record's revision chain against the row the table holds, and
+/// report the first broken link.
 ///
 /// `revisions` must be the record's revisions in ascending `seq` order, as the
 /// generated `ledger_verify` reads them. Detects, in `seq` order:
@@ -385,14 +456,27 @@ pub struct LedgerHead {
 /// * a row whose contents no longer hash to its stored hash
 ///   ([`LedgerBreak::HashMismatch`]);
 /// * a row whose `prev_hash` no longer matches its predecessor
-///   ([`LedgerBreak::PrevHashMismatch`]).
+///   ([`LedgerBreak::PrevHashMismatch`]);
+/// * a `seq` that cannot be followed ([`LedgerBreak::UnusableSeq`]);
 ///
-/// An empty slice verifies as intact with no head: a record with no revisions is
-/// a record that was never written, which is not evidence of tampering.
+/// and finally, when `live` is not [`LedgerLiveState::NotChecked`]:
+///
+/// * a head revision that does not describe the live row
+///   ([`LedgerBreak::LiveStateMismatch`]) — a truncated tail, a row erased out
+///   of band, or a write that reached the table without appending a revision.
+///
+/// With `live` [`NotChecked`](LedgerLiveState::NotChecked), an empty slice
+/// verifies as intact: a record with no revisions may simply never have been
+/// written. With a live row present it does not — a row that exists with no
+/// history is evidence its history was erased.
 #[must_use]
-pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerification {
+pub fn verify_chain_against(
+    record_id: i64,
+    revisions: &[LedgerRevision],
+    live: LedgerLiveState<'_>,
+) -> LedgerVerification {
     let checked = revisions.len();
-    let broken = first_break(revisions);
+    let broken = first_break(revisions).or_else(|| live_state_break(revisions, live));
     let head_hash = if broken.is_none() {
         revisions.last().map(|r| r.hash.clone())
     } else {
@@ -403,6 +487,60 @@ pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerif
         revisions_checked: checked,
         head_hash,
         broken,
+    }
+}
+
+/// Cross-check the head revision against the live row.
+///
+/// Runs only after the chain itself verifies, so a mismatch here always means
+/// the *end* of the history is missing rather than its middle being edited.
+fn live_state_break(
+    revisions: &[LedgerRevision],
+    live: LedgerLiveState<'_>,
+) -> Option<LedgerBreakReport> {
+    let live_snapshot = match live {
+        LedgerLiveState::NotChecked => return None,
+        LedgerLiveState::Absent => None,
+        LedgerLiveState::Present(value) => Some(value),
+    };
+
+    match (revisions.last(), live_snapshot) {
+        (None, None) => None,
+        (None, Some(_)) => Some(LedgerBreakReport {
+            seq: 0,
+            revision_id: None,
+            kind: LedgerBreak::LiveStateMismatch,
+            detail: "the record exists but its ledger is empty; \
+                     every revision of its history was deleted"
+                .to_owned(),
+        }),
+        (Some(head), None) => Some(LedgerBreakReport {
+            seq: head.seq,
+            revision_id: Some(head.id),
+            kind: LedgerBreak::LiveStateMismatch,
+            detail: format!(
+                "the ledger's newest revision is {}, but the record no longer \
+                 exists in the table; the row was erased outside the repository",
+                head.seq
+            ),
+        }),
+        (Some(head), Some(live_value)) => {
+            if canonical_json(&head.snapshot) == canonical_json(live_value) {
+                None
+            } else {
+                Some(LedgerBreakReport {
+                    seq: head.seq,
+                    revision_id: Some(head.id),
+                    kind: LedgerBreak::LiveStateMismatch,
+                    detail: format!(
+                        "revision {} is the newest in the ledger but does not describe \
+                         the row the table holds; either the tail of the history was \
+                         deleted or a write reached the table without appending a revision",
+                        head.seq
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -417,7 +555,19 @@ fn first_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
         if let Some(report) = link_break(revision, prev) {
             return Some(report);
         }
-        expected_seq = revision.seq.saturating_add(1);
+        let Some(next_seq) = revision.seq.checked_add(1) else {
+            // Saturating here would make two consecutive `i64::MAX` rows look
+            // contiguous, hiding an inserted revision behind an overflow.
+            return Some(LedgerBreakReport {
+                seq: revision.seq,
+                revision_id: Some(revision.id),
+                kind: LedgerBreak::UnusableSeq,
+                detail: "sequence number is at i64::MAX and cannot be followed; \
+                         the chain cannot be continued or checked past this revision"
+                    .to_owned(),
+            });
+        };
+        expected_seq = next_seq;
         prev = Some(revision);
     }
     None
@@ -516,8 +666,8 @@ fn link_break(
 ///
 /// Both axes are optional. `transaction` restricts to what the database knew at
 /// that instant; `valid` restricts to what was true in the business domain at
-/// that instant. `AsOf::default()` — both `None` — selects the latest revision,
-/// which is the live state.
+/// that instant. `LedgerAsOf::default()` — both `None` — selects the newest
+/// revision by sequence, which is the live state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LedgerAsOf {
     /// Transaction-time bound: ignore revisions recorded after this instant.
@@ -565,10 +715,30 @@ impl LedgerAsOf {
 ///    did not yet hold);
 /// 2. of what remains, discard revisions valid from after `as_of.valid` (facts
 ///    that were not yet true);
-/// 3. return the survivor with the greatest `valid_from`, breaking ties by the
-///    greatest `seq` — the latest correction wins.
+/// 3. return the newest survivor.
 ///
-/// Returns `None` when no revision qualifies, i.e. the record did not exist yet.
+/// Both bounds **filter**; the winner is always the greatest `seq` among what
+/// survives. A revision is a full snapshot of the row, so a later revision does
+/// not sit beside an earlier one on a timeline — it replaces it outright. Valid
+/// time says when a revision's statement *starts* being true, which is exactly
+/// an eligibility question:
+///
+/// * `LedgerAsOf::transaction(t)` — the newest revision the database held at
+///   `t`, i.e. what a plain query returned then.
+/// * `LedgerAsOf::valid(v)` — the newest revision whose statement had taken
+///   effect by `v`. A future-dated revision is invisible until its instant
+///   arrives; a back-dated correction is visible from the instant it claims,
+///   and supersedes what it corrects from then on.
+/// * `LedgerAsOf::bitemporal(t, v)` — the newest revision the database held at
+///   `t` whose statement had taken effect by `v`: what it believed *then* about
+///   *then*.
+///
+/// Ordering by `valid_from` instead would return superseded state whenever a
+/// correction moves an instant earlier — the corrected row would keep answering
+/// for every instant past the one it used to claim.
+///
+/// Returns `None` when no revision qualifies, i.e. the record did not exist yet
+/// (or, under a valid-time bound, was not yet in effect).
 ///
 /// The returned revision's [`snapshot`](LedgerRevision::snapshot) is the record's
 /// exact state at that instant, including a soft-deleted state: a ledgered
@@ -581,11 +751,7 @@ pub fn snapshot_as_of(revisions: &[LedgerRevision], as_of: LedgerAsOf) -> Option
         .iter()
         .filter(|r| as_of.transaction.is_none_or(|t| r.recorded_at <= t))
         .filter(|r| as_of.valid.is_none_or(|v| r.valid_from <= v))
-        .max_by(|a, b| {
-            a.valid_from
-                .cmp(&b.valid_from)
-                .then_with(|| a.seq.cmp(&b.seq))
-        })
+        .max_by_key(|r| r.seq)
 }
 
 // ── Diffing ──────────────────────────────────────────────────────────
@@ -1243,11 +1409,28 @@ mod tests {
             snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(50), at(6))).expect("rev");
         assert_eq!(corrected.seq, 2);
 
-        // The correction governs only the window before the next revision's
-        // valid_from: at valid time 20, the insert's own statement is in force.
+        // And it keeps answering for every later instant: a revision is a full
+        // snapshot, so the correction replaced the insert rather than carving a
+        // window out of it.
         let later =
             snapshot_as_of(&revisions, LedgerAsOf::bitemporal(at(50), at(20))).expect("rev");
-        assert_eq!(later.seq, 1);
+        assert_eq!(later.seq, 2);
+    }
+
+    #[test]
+    fn snapshot_as_of_hides_a_revision_that_is_not_yet_in_effect() {
+        // A future-dated statement: recorded now, true from t=500.
+        let mut revisions = chain(1);
+        revisions[0].valid_from = at(500);
+        revisions[0].hash = revisions[0].compute_hash();
+
+        assert!(snapshot_as_of(&revisions, LedgerAsOf::valid(at(100))).is_none());
+        assert_eq!(
+            snapshot_as_of(&revisions, LedgerAsOf::valid(at(500)))
+                .expect("in effect")
+                .seq,
+            1
+        );
     }
 
     #[test]
@@ -1343,6 +1526,227 @@ mod tests {
         assert!(diff.is_empty());
         assert_eq!(diff.from_seq, Some(2));
         assert_eq!(diff.to_seq, Some(2));
+    }
+
+    // ── live-state cross-check (tail truncation & ledger bypass) ─────
+
+    #[test]
+    fn verify_accepts_a_head_that_matches_the_live_row() {
+        let revisions = chain(3);
+        let live = revisions[2].snapshot.clone();
+        let report = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live));
+        assert!(report.is_intact(), "{report:?}");
+    }
+
+    #[test]
+    fn verify_ignores_key_order_when_comparing_against_the_live_row() {
+        let revisions = chain(1);
+        // Same content, different insertion order — the comparison canonicalizes.
+        let mut reordered = serde_json::Map::new();
+        reordered.insert("title".to_owned(), json!("v1"));
+        reordered.insert("deleted_at".to_owned(), json!(null));
+        reordered.insert("id".to_owned(), json!(7));
+        let live = serde_json::Value::Object(reordered);
+        assert!(verify_chain_against(7, &revisions, LedgerLiveState::Present(&live)).is_intact());
+    }
+
+    #[test]
+    fn verify_detects_a_truncated_tail_against_the_live_row() {
+        // Revisions 4 and 5 are lopped off. The surviving chain is internally
+        // perfect — only the live row exposes the erasure.
+        let full = chain(5);
+        let live = full[4].snapshot.clone();
+        let truncated = &full[..3];
+
+        assert!(
+            verify_chain(7, truncated).is_intact(),
+            "a truncated chain is internally consistent by construction"
+        );
+
+        let broken = verify_chain_against(7, truncated, LedgerLiveState::Present(&live))
+            .broken
+            .expect("the live row must expose the truncation");
+        assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+        assert_eq!(broken.seq, 3, "the break is reported at the surviving head");
+    }
+
+    #[test]
+    fn verify_detects_a_write_that_never_appended_a_revision() {
+        let revisions = chain(2);
+        // The table moved on — a restore, a counter-cache bump, a raw UPDATE.
+        let live = json!({ "id": 7, "title": "v2", "deleted_at": "2026-08-26T00:00:00" });
+
+        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live))
+            .broken
+            .expect("a ledger-bypassing write must be detected");
+        assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+        assert_eq!(broken.seq, 2);
+        assert!(
+            broken.detail.contains("without appending a revision"),
+            "{}",
+            broken.detail
+        );
+    }
+
+    #[test]
+    fn verify_detects_a_wholly_erased_chain_behind_a_live_row() {
+        let live = json!({ "id": 7, "title": "v1", "deleted_at": null });
+        let broken = verify_chain_against(7, &[], LedgerLiveState::Present(&live))
+            .broken
+            .expect("a live record with no history must be detected");
+        assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+        assert_eq!(broken.seq, 0);
+    }
+
+    #[test]
+    fn verify_detects_a_row_erased_out_of_band() {
+        let revisions = chain(2);
+        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Absent)
+            .broken
+            .expect("a chain whose record no longer exists must be detected");
+        assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+        assert_eq!(broken.seq, 2);
+    }
+
+    #[test]
+    fn verify_accepts_an_absent_record_with_no_revisions() {
+        assert!(verify_chain_against(7, &[], LedgerLiveState::Absent).is_intact());
+    }
+
+    #[test]
+    fn a_chain_internal_break_outranks_a_live_state_mismatch() {
+        // Both faults present: the earlier, more specific one is reported.
+        let mut revisions = chain(3);
+        revisions[1].snapshot = json!({ "id": 7, "title": "tampered" });
+        let live = json!({ "id": 7, "title": "something else", "deleted_at": null });
+
+        let broken = verify_chain_against(7, &revisions, LedgerLiveState::Present(&live))
+            .broken
+            .expect("break detected");
+        assert_eq!(broken.kind, LedgerBreak::HashMismatch);
+        assert_eq!(broken.seq, 2);
+    }
+
+    // ── sequence overflow ────────────────────────────────────────────
+
+    #[test]
+    fn verify_refuses_to_follow_a_saturated_sequence_number() {
+        // Two rows both at i64::MAX would look contiguous under saturating
+        // arithmetic, hiding the inserted one.
+        let mut revisions = chain(1);
+        revisions[0].seq = i64::MAX;
+        revisions[0].hash = revisions[0].compute_hash();
+
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("a chain that starts at i64::MAX cannot be checked");
+        // The chain must start at seq 1, so this is caught before the overflow.
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+
+        let mut revisions = chain(1);
+        revisions[0].seq = 1;
+        let mut tail = revisions[0].clone();
+        tail.id = 2;
+        tail.seq = i64::MAX;
+        tail.prev_hash = Some(revisions[0].hash.clone());
+        tail.hash = tail.compute_hash();
+        revisions.push(tail);
+        let broken = verify_chain(7, &revisions).broken.expect("gap detected");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(broken.seq, 2);
+    }
+
+    // ── preimage: optional fields carry a presence tag ────────────────
+
+    #[test]
+    fn revision_hash_distinguishes_absent_from_empty_optionals() {
+        let snapshot = json!({});
+        for (absent, empty) in [
+            (
+                RevisionHashInput {
+                    tenant_id: None,
+                    ..base_input(&snapshot)
+                },
+                RevisionHashInput {
+                    tenant_id: Some(""),
+                    ..base_input(&snapshot)
+                },
+            ),
+            (
+                RevisionHashInput {
+                    request_id: None,
+                    ..base_input(&snapshot)
+                },
+                RevisionHashInput {
+                    request_id: Some(""),
+                    ..base_input(&snapshot)
+                },
+            ),
+            (
+                RevisionHashInput {
+                    prev_hash: None,
+                    ..base_input(&snapshot)
+                },
+                RevisionHashInput {
+                    prev_hash: Some(""),
+                    ..base_input(&snapshot)
+                },
+            ),
+        ] {
+            assert_ne!(
+                revision_hash(&absent),
+                revision_hash(&empty),
+                "a NULL optional must not hash like an empty string"
+            );
+        }
+    }
+
+    // ── as-of: transaction-only queries follow the chain, not valid time ──
+
+    #[test]
+    fn as_of_transaction_only_returns_the_newest_revision_the_database_held() {
+        // A back-dated correction: recorded last (seq 2), but valid from before
+        // the insert it corrects. A plain query after both writes returns the
+        // correction, so an as-of query with no valid-time bound must too.
+        let mut revisions = chain(2);
+        revisions[1].valid_from = at(5);
+        revisions[1].hash = revisions[1].compute_hash();
+
+        let now = snapshot_as_of(&revisions, LedgerAsOf::transaction(at(100)))
+            .expect("a revision is in force");
+        assert_eq!(
+            now.seq, 2,
+            "a transaction-time query must return the latest state, not the \
+             one with the greatest valid_from"
+        );
+
+        let head = snapshot_as_of(&revisions, LedgerAsOf::default()).expect("head");
+        assert_eq!(head.seq, 2, "the unbounded query is the live state");
+    }
+
+    #[test]
+    fn a_valid_time_bound_filters_eligibility_rather_than_reordering_the_chain() {
+        let mut revisions = chain(2);
+        revisions[1].valid_from = at(5);
+        revisions[1].hash = revisions[1].compute_hash();
+
+        // seq 1 is valid from t=10, seq 2 (a back-dated correction) from t=5.
+        // The correction is the newest statement in effect at both instants; it
+        // superseded the insert rather than carving a window out of it.
+        assert_eq!(
+            snapshot_as_of(&revisions, LedgerAsOf::valid(at(6)))
+                .expect("rev")
+                .seq,
+            2
+        );
+        assert_eq!(
+            snapshot_as_of(&revisions, LedgerAsOf::valid(at(20)))
+                .expect("rev")
+                .seq,
+            2
+        );
+        // Before either statement took effect, there is nothing to return.
+        assert!(snapshot_as_of(&revisions, LedgerAsOf::valid(at(1))).is_none());
     }
 
     // ── misc surface ─────────────────────────────────────────────────
