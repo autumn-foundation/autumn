@@ -18194,25 +18194,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ///
                 /// The model's durable per-field codec — which carries
                 /// `#[private]` and `#[encrypted]` columns that the model's
-                /// public JSON omits — minus the columns encrypted in randomized
-                /// mode. Those carry a fresh nonce per write, so a stored
-                /// snapshot and a freshly encoded live row could never compare
-                /// equal on them; dropping them keeps the check free of false
-                /// positives. Deterministic columns have stable ciphertext and
-                /// stay in. Everything dropped here is still covered by the
-                /// revision hash — the chain sees it, only this cross-check
-                /// cannot.
+                /// public JSON omits — minus every encrypted column. No
+                /// ciphertext survives this comparison: randomized mode draws a
+                /// fresh nonce per write, and deterministic mode is stable only
+                /// while the key is, so a deterministic key rotation would
+                /// re-encrypt the live row under the new key while the stored
+                /// snapshot keeps the old one. Comparing either would report
+                /// tampering on an untouched ledger after a supported operation.
+                ///
+                /// Everything dropped here is still covered by the revision hash
+                /// — the chain sees it, only this cross-check cannot.
                 #[doc(hidden)]
                 fn __autumn_ledger_comparable(
                     mut value: ::autumn_web::reexports::serde_json::Value,
                 ) -> ::autumn_web::reexports::serde_json::Value {
                     if let ::core::option::Option::Some(object) = value.as_object_mut() {
-                        let mut randomized: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
-                        ::autumn_web::encryption::randomized_encrypted_columns_for_table(
+                        let mut encrypted: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
+                        ::autumn_web::encryption::all_encrypted_columns_for_table(
                             #table_name,
-                            &mut randomized,
+                            &mut encrypted,
                         );
-                        for column in randomized {
+                        for column in encrypted {
                             object.remove(column);
                         }
                     }

@@ -690,20 +690,30 @@ pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static
     }
 }
 
-/// Append this table's **randomized**-mode encrypted columns to `columns`,
-/// de-duplicating.
+/// Append **every** encrypted column of `table` to `columns`, de-duplicating,
+/// whatever its mode or `versioned_ciphertext` setting.
 ///
-/// A column encrypted in randomized mode produces different ciphertext for the
-/// same plaintext on every write, so two independent encodings of the same row
-/// never compare equal. Deterministic columns are deliberately excluded: their
-/// ciphertext is stable, so they compare fine and stay covered.
+/// Distinct from [`merge_encrypted_columns_for_table`], which answers a
+/// different question (which columns version history must redact, excluding the
+/// `versioned_ciphertext` opt-in).
 ///
 /// Used by the ledger's live-row cross-check (#1699), which compares a stored
-/// revision's snapshot against a freshly encoded live row and must not read a
-/// fresh nonce as a divergence.
-pub fn randomized_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
+/// revision's snapshot against a freshly encoded live row. No ciphertext is
+/// comparable across those two encodings:
+///
+/// * randomized mode draws a fresh nonce per write, so the same plaintext never
+///   encodes the same way twice;
+/// * deterministic mode is stable only while the *key* is — rotating the
+///   deterministic key re-encrypts the live row under the new key while the
+///   stored snapshot keeps the old one, so comparing them would report tampering
+///   after a supported rotation.
+///
+/// Excluding all of them keeps the cross-check free of false positives. The
+/// revision hash still covers every one of these columns; only this cross-check
+/// cannot see them.
+pub fn all_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static str>) {
     for d in registered_encrypted_columns() {
-        if d.table == table && !d.deterministic && !columns.contains(&d.column) {
+        if d.table == table && !columns.contains(&d.column) {
             columns.push(d.column);
         }
     }

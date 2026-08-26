@@ -132,8 +132,11 @@ Three consequences worth knowing:
   it as changed on every revision. A column the model hides from serialization
   therefore does not appear in a diff, though it is fully preserved in an as-of
   reconstruction and fully covered by the hash.
-- The live-row cross-check in `ledger_verify` (below) compares the same public
-  projection, for the same reason.
+- The live-row cross-check in `ledger_verify` (below) compares the durable codec
+  projection minus every encrypted column — no ciphertext survives a comparison
+  between a stored snapshot and a freshly encoded live row (a fresh nonce per
+  write in randomized mode; a re-encryption under the new key after a
+  deterministic key rotation). Those columns stay covered by the revision hash.
 
 ## Bitemporality
 
@@ -225,7 +228,15 @@ an adversary with write access to the ledger table can re-derive a whole chain
 and adjust the row to match. Nothing stored inside the same database can prevent
 that.
 
-To close that gap, pin the head hash somewhere the database cannot reach:
+There is also a narrower window worth knowing about. Deleting the newest
+revision and then letting a *normal* write land re-uses the deleted sequence
+number: the new revision chains cleanly onto its predecessor and matches the live
+row, so both the chain and the cross-check report intact and the deleted state
+leaves no trace. `ledger_verify` catches the truncation in the window *before*
+that next write — but only if it runs there.
+
+Both gaps close the same way: pin the head hash somewhere the database cannot
+reach. Treat that as required for an audit posture, not optional.
 
 ```rust
 if let Some(head) = repo.ledger_head(id).await? {

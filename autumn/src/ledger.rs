@@ -66,10 +66,17 @@
 //!
 //! What it cannot see is a *consistent* rewrite: the hashing rule is open
 //! source, so an adversary with write access to the ledger table can re-derive a
-//! whole chain (and adjust the row to match). Nothing stored inside the same
-//! database can prevent that. Pin [`LedgerHead::hash`] somewhere the database
-//! cannot reach — an append-only object store, a notary, a second operator's
-//! inbox — and a rewritten chain disagrees with the pin.
+//! whole chain (and adjust the row to match). A narrower case has the same
+//! shape: deleting the newest revision and then letting a normal write land
+//! re-uses the deleted sequence number, so the replacement chains cleanly and
+//! matches the live row. The cross-check catches that truncation in the window
+//! *before* the next write, but only if it runs there.
+//!
+//! Nothing stored inside the same database closes either gap. Pin
+//! [`LedgerHead::hash`] somewhere the database cannot reach — an append-only
+//! object store, a notary, a second operator's inbox — and a rewritten or
+//! re-numbered chain disagrees with the pin. For an audit posture that pin is
+//! required, not optional.
 //!
 //! # Fidelity boundary
 //!
@@ -431,9 +438,10 @@ pub struct LedgerHead {
 /// have. The generated `ledger_verify` encodes the head revision and the live
 /// row through the *same* projection — the model's durable per-field codec,
 /// which carries `#[private]` and `#[encrypted]` columns that the model's public
-/// JSON omits — minus the columns encrypted in randomized mode, whose ciphertext
-/// carries a fresh nonce per write and so could never compare equal. Everything
-/// dropped from that comparison is still covered by the revision hash.
+/// JSON omits — minus every encrypted column, whose ciphertext could never
+/// compare equal across two encodings (a fresh nonce per write in randomized
+/// mode; a re-encryption under the new key after a deterministic key rotation).
+/// Everything dropped from that comparison is still covered by the revision hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerLiveState {
     /// The live row was not read, or moved under the reader, so no cross-check
