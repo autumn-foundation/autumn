@@ -52,7 +52,7 @@ const LAST_RECORD_DELIMITER: u8 = 0x02;
 /// Everything Autumn sends is a single record, so this only needs to exceed
 /// the record's own length; 4096 is the value RFC 8291's example uses and the
 /// one every push service is required to accept.
-pub(crate) const RECORD_SIZE: u32 = 4096;
+pub const RECORD_SIZE: u32 = 4096;
 
 /// The largest plaintext that still fits an encrypted body of [`RECORD_SIZE`].
 ///
@@ -60,8 +60,7 @@ pub(crate) const RECORD_SIZE: u32 = 4096;
 /// required to accept 4096 octets, so exceeding this is refused up front with
 /// [`PushError::PayloadTooLarge`] rather than dispatched and rejected
 /// remotely.
-pub(crate) const MAX_PLAINTEXT_LEN: usize =
-    RECORD_SIZE as usize - HEADER_LEN - 1 - TAG_LEN;
+pub const MAX_PLAINTEXT_LEN: usize = RECORD_SIZE as usize - HEADER_LEN - 1 - TAG_LEN;
 
 /// Encrypt `plaintext` for a subscription, minting a fresh salt and ephemeral
 /// key pair.
@@ -71,7 +70,7 @@ pub(crate) const MAX_PLAINTEXT_LEN: usize =
 /// [`PushError::InvalidSubscriptionKey`] for a malformed `p256dh`/`auth`,
 /// [`PushError::PayloadTooLarge`] past [`MAX_PLAINTEXT_LEN`], and
 /// [`PushError::Encryption`] if AES-GCM itself fails.
-pub(crate) fn encrypt(
+pub fn encrypt(
     plaintext: &[u8],
     ua_public: &[u8],
     auth_secret: &[u8],
@@ -83,7 +82,7 @@ pub(crate) fn encrypt(
     rand::TryRngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut salt)
         .map_err(|e| PushError::Encryption(format!("could not draw a random salt: {e}")))?;
     let ephemeral = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
-    encrypt_with(plaintext, ua_public, auth_secret, salt, ephemeral)
+    encrypt_with(plaintext, ua_public, auth_secret, salt, &ephemeral)
 }
 
 /// [`encrypt`] with the salt and ephemeral key supplied by the caller.
@@ -95,12 +94,12 @@ pub(crate) fn encrypt(
 /// # Errors
 ///
 /// See [`encrypt`].
-pub(crate) fn encrypt_with(
+pub fn encrypt_with(
     plaintext: &[u8],
     ua_public: &[u8],
     auth_secret: &[u8],
     salt: [u8; 16],
-    ephemeral: p256::SecretKey,
+    ephemeral: &p256::SecretKey,
 ) -> Result<Vec<u8>, PushError> {
     if plaintext.len() > MAX_PLAINTEXT_LEN {
         return Err(PushError::PayloadTooLarge {
@@ -163,10 +162,7 @@ pub(crate) fn encrypt_with(
     body.extend_from_slice(&salt);
     body.extend_from_slice(&RECORD_SIZE.to_be_bytes());
     // The key id length is a single octet; a P-256 point is always 65 bytes.
-    body.push(
-        u8::try_from(P256_UNCOMPRESSED_LEN)
-            .expect("65 fits in a u8"),
-    );
+    body.push(u8::try_from(P256_UNCOMPRESSED_LEN).expect("65 fits in a u8"));
     body.extend_from_slice(as_public);
     body.extend_from_slice(&ciphertext);
     Ok(body)
@@ -179,11 +175,12 @@ pub(crate) fn encrypt_with(
 /// than adding the `hkdf` crate for ~15 lines. Every output Web Push needs is
 /// at most 32 bytes, i.e. a single expansion block, but the loop is written
 /// generally so the RFC 5869 test vectors (which go to 42 bytes) exercise it.
-pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
 
     // Extract: PRK = HMAC(salt, IKM). `new_from_slice` accepts any key length.
-    let mut extract = <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+    let mut extract =
+        <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
     extract.update(ikm);
     let prk = extract.finalize().into_bytes();
 
@@ -192,7 +189,8 @@ pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> V
     let mut previous: Vec<u8> = Vec::new();
     let mut counter: u8 = 1;
     while okm.len() < len {
-        let mut expand = <HmacSha256 as Mac>::new_from_slice(&prk).expect("HMAC accepts any key length");
+        let mut expand =
+            <HmacSha256 as Mac>::new_from_slice(&prk).expect("HMAC accepts any key length");
         expand.update(&previous);
         expand.update(info);
         expand.update(&[counter]);
@@ -256,7 +254,7 @@ mod tests {
             &b64(RFC_UA_PUBLIC),
             &b64(RFC_AUTH_SECRET),
             rfc_salt(),
-            rfc_ephemeral(),
+            &rfc_ephemeral(),
         )
         .expect("encrypting the RFC vector succeeds");
 
@@ -275,7 +273,7 @@ mod tests {
             &b64(RFC_UA_PUBLIC),
             &b64(RFC_AUTH_SECRET),
             rfc_salt(),
-            rfc_ephemeral(),
+            &rfc_ephemeral(),
         )
         .expect("encrypt");
 
@@ -363,8 +361,8 @@ mod tests {
 
     #[test]
     fn rejects_a_wrong_length_auth_secret() {
-        let err = encrypt(b"hi", &b64(RFC_UA_PUBLIC), &[0_u8; 8])
-            .expect_err("auth is exactly 16 bytes");
+        let err =
+            encrypt(b"hi", &b64(RFC_UA_PUBLIC), &[0_u8; 8]).expect_err("auth is exactly 16 bytes");
         assert!(
             matches!(err, PushError::InvalidSubscriptionKey(_)),
             "{err:?}"
@@ -377,10 +375,7 @@ mod tests {
         let too_big = vec![b'x'; MAX_PLAINTEXT_LEN + 1];
         let err = encrypt(&too_big, &b64(RFC_UA_PUBLIC), &b64(RFC_AUTH_SECRET))
             .expect_err("oversize payloads are refused, not silently truncated");
-        assert!(
-            matches!(err, PushError::PayloadTooLarge { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, PushError::PayloadTooLarge { .. }), "{err:?}");
     }
 
     #[test]

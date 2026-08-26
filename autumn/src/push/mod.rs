@@ -1,8 +1,19 @@
 //! Web Push (issue #1392).
 
 pub(crate) mod encryption;
+pub mod service;
+pub mod store;
+pub mod transport;
 pub mod vapid;
 
+pub use service::{PushDeliveryReport, PushMessage, WebPush};
+#[cfg(feature = "db")]
+pub use store::DbPushSubscriptionStore;
+pub use store::{
+    BrowserSubscription, MemoryPushSubscriptionStore, PUSH_SUBSCRIPTIONS_TABLE, PushPrincipal,
+    PushSubscriptionStore, StoredSubscription, SubscriptionKeys,
+};
+pub use transport::{PushRequest, PushTransport, RecordingPushTransport};
 pub use vapid::VapidKey;
 
 /// Errors produced by the Web Push subsystem.
@@ -31,4 +42,17 @@ pub enum PushError {
     /// Payload encryption failed.
     #[error("push payload encryption failed: {0}")]
     Encryption(String),
+    /// The subscription store failed.
+    #[error("push subscription store error: {0}")]
+    Store(String),
+    /// No VAPID key is configured, so nothing can be signed or sent.
+    #[error(
+        "Web Push is not configured: no VAPID key. Set `[push] private_key = \"…\"` in \
+         autumn.toml (mint one with `VapidKey::generate()`), or register a key with \
+         `AppBuilder::with_vapid_key(...)`"
+    )]
+    NotConfigured,
+    /// The transport could not reach the push service at all.
+    #[error("push transport failed: {0}")]
+    Transport(String),
 }

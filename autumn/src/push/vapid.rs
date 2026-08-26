@@ -177,10 +177,10 @@ pub(crate) fn audience_for(endpoint: &str) -> Result<String, PushError> {
     let scheme = parsed.scheme();
     // `Url::port` is `None` for the scheme's default port, which is exactly
     // the origin form the push services expect (no `:443` on https).
-    match parsed.port() {
-        Some(port) => Ok(format!("{scheme}://{host}:{port}")),
-        None => Ok(format!("{scheme}://{host}")),
-    }
+    Ok(parsed.port().map_or_else(
+        || format!("{scheme}://{host}"),
+        |port| format!("{scheme}://{host}:{port}"),
+    ))
 }
 
 /// Decode base64url with or without padding (browsers emit both).
@@ -201,7 +201,10 @@ fn escape_json(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                write!(out, "\\u{:04x}", c as u32).expect("writing to a String cannot fail");
+            }
             c => out.push(c),
         }
     }
@@ -219,7 +222,9 @@ mod tests {
         (
             URL_SAFE_NO_PAD.decode(parts[0]).expect("header base64url"),
             URL_SAFE_NO_PAD.decode(parts[1]).expect("claims base64url"),
-            URL_SAFE_NO_PAD.decode(parts[2]).expect("signature base64url"),
+            URL_SAFE_NO_PAD
+                .decode(parts[2])
+                .expect("signature base64url"),
         )
     }
 
@@ -258,11 +263,11 @@ mod tests {
         // `atob`-based snippets and `applicationServerKey` conversion break on
         // `=` padding.
         let encoded = key.public_key_base64url();
-        assert!(!encoded.contains('='), "public key must be unpadded: {encoded}");
-        assert_eq!(
-            URL_SAFE_NO_PAD.decode(&encoded).expect("decodes").len(),
-            65
+        assert!(
+            !encoded.contains('='),
+            "public key must be unpadded: {encoded}"
         );
+        assert_eq!(URL_SAFE_NO_PAD.decode(&encoded).expect("decodes").len(), 65);
     }
 
     #[test]
@@ -416,9 +421,12 @@ mod tests {
             .expect("header");
         let jwt = jwt_from_header(&header);
         let (signing_input, signature_b64) = jwt.rsplit_once('.').expect("compact JWS");
-        let signature =
-            Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature_b64).expect("sig base64url"))
-                .expect("64-byte r‖s parses as a P-256 signature");
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(signature_b64)
+                .expect("sig base64url"),
+        )
+        .expect("64-byte r‖s parses as a P-256 signature");
 
         // Verify with a key reconstructed from the PUBLIC bytes we hand the
         // browser — the same path the push service takes.

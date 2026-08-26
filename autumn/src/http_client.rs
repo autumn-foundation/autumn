@@ -1232,6 +1232,18 @@ impl RequestBuilder {
         self
     }
 
+    /// Set a raw byte body, without assuming any content type.
+    ///
+    /// Use this for binary payloads — [`text_body`](Self::text_body) takes a
+    /// `String` and so cannot carry bytes that are not valid UTF-8. Set the
+    /// content type yourself with [`header`](Self::header). The Web Push
+    /// transport uses this for RFC 8291-encrypted bodies.
+    #[must_use]
+    pub fn bytes_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
     /// Override the maximum retry count for this request.
     ///
     /// Also clears the idempotent-only flag so non-idempotent methods such as
