@@ -29,12 +29,23 @@ use crate::schema::{posts, subreddits};
 
 /// The maximum number of posts in `/sitemap.xml`.
 ///
-/// The sitemap protocol permits 50,000 URLs in one file. This example stops
-/// well below that limit. A larger site must serve a sitemap index instead.
-/// See `docs/guide/seo.md`.
+/// The sitemap protocol permits 50,000 URLs in one file, and this example
+/// stops well below that. The cap is deliberate, not an oversight: the query
+/// below runs at boot, before the application serves anything, so it must be
+/// bounded by a number the author chose rather than by however many rows the
+/// table holds.
+///
+/// The consequence is real and this example accepts it: past this many posts
+/// the sitemap is **partial**, and it drops the least recently updated posts
+/// first. `collect` logs a warning when it hits the cap, so the truncation is
+/// never silent. A site that outgrows one file needs a sitemap index served
+/// from its own `/sitemap.xml` route — see `docs/guide/seo.md`.
 const MAX_POST_ENTRIES: i64 = 5_000;
 
 /// The maximum number of communities in `/sitemap.xml`.
+///
+/// Same contract as [`MAX_POST_ENTRIES`]: a bounded boot query, a logged
+/// warning at the cap, and a partial sitemap past it.
 const MAX_SUBREDDIT_ENTRIES: i64 = 1_000;
 
 /// The site base URL, without a trailing slash.
@@ -125,6 +136,11 @@ pub fn summarize(text: &str, max_chars: usize) -> Option<String> {
 
 /// The application's sitemap source.
 ///
+/// It lists the front page, the community index, up to
+/// [`MAX_SUBREDDIT_ENTRIES`] communities, and up to [`MAX_POST_ENTRIES`]
+/// posts. Both caps log a warning when they bite; read their doc comments for
+/// why the example bounds a boot-time query.
+///
 /// The framework calls [`SitemapSource::entries`] one time, while it builds
 /// the router. It renders the result into a static `/sitemap.xml` body. The
 /// sitemap is therefore a snapshot of the database at start-up. That is the
@@ -204,6 +220,12 @@ impl RedditSitemapSource {
                 Vec::new()
             }
         };
+        if i64::try_from(subs.len()).is_ok_and(|n| n >= MAX_SUBREDDIT_ENTRIES) {
+            tracing::warn!(
+                limit = MAX_SUBREDDIT_ENTRIES,
+                "sitemap: community cap reached; the sitemap is partial and omits the rest"
+            );
+        }
         for slug in subs {
             entries.push(
                 SitemapEntry::new(format!("{base}/r/{slug}"))
@@ -213,7 +235,13 @@ impl RedditSitemapSource {
         }
 
         // `updated_at` becomes each post's `<lastmod>`, which tells a crawler
-        // whether it must fetch the page again.
+        // whether it must fetch the page again. `PostHooks::before_update`
+        // advances that column on every update path, so the date is a real
+        // modification date and not the row's creation date.
+        //
+        // The `ORDER BY updated_at DESC` pairs with the cap below: when the
+        // table outgrows `MAX_POST_ENTRIES`, the posts that survive into the
+        // sitemap are the ones that changed most recently.
         let rows: Vec<(String, String, chrono::NaiveDateTime)> = match posts::table
             .inner_join(subreddits::table)
             .order(posts::updated_at.desc())
@@ -228,6 +256,13 @@ impl RedditSitemapSource {
                 Vec::new()
             }
         };
+        if i64::try_from(rows.len()).is_ok_and(|n| n >= MAX_POST_ENTRIES) {
+            tracing::warn!(
+                limit = MAX_POST_ENTRIES,
+                "sitemap: post cap reached; the sitemap is partial and omits the least \
+                 recently updated posts"
+            );
+        }
         for (sub_slug, post_slug, updated_at) in rows {
             entries.push(
                 SitemapEntry::new(format!("{base}/r/{sub_slug}/posts/{post_slug}"))

@@ -156,7 +156,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
-| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing every community and post |
+| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts |
 
 ---
 

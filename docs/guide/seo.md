@@ -368,8 +368,12 @@ let pool = autumn_web::db::create_pool(&config.database)?;
 let source = PostSitemapSource { pool };
 ```
 
-`examples/reddit-clone/src/seo.rs` does this. It lists each community and each
-post, and it puts `posts.updated_at` in `lastmod`.
+`examples/reddit-clone/src/seo.rs` does this. It lists the communities and the
+posts, and it puts `posts.updated_at` in `lastmod`.
+
+Bound the query. It runs at boot, so a row count you did not choose must not
+decide how long it takes. Log a warning when the bound bites, so a partial
+sitemap is never a silent one.
 
 Handle a query failure inside the source. Log the failure and return the
 entries you have. A short sitemap is better than a failed boot.
