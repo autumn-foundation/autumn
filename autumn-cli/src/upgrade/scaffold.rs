@@ -79,6 +79,10 @@ pub fn digest(contents: &str) -> String {
 struct ManifestFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    /// The newest release that has written digests here. Distinct from
+    /// `version`, which is held back while conflicts stand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written_by: Option<String>,
     flavor: String,
     #[serde(default)]
     i18n: bool,
@@ -113,6 +117,17 @@ pub struct Manifest {
     /// standing has not finished, and recording the target anyway would tell
     /// the next run — and the developer reading the file — that it had.
     pub version: Option<String>,
+    /// The newest release that has written any digest in this manifest — a
+    /// high-water mark, never moving backwards.
+    ///
+    /// Deliberately separate from [`Self::version`], which answers a different
+    /// question and cannot answer this one. A conflict holds `version` back
+    /// while the digests still advance to the newer templates, so an older CLI
+    /// reading `version` alone sees nothing newer than itself, trusts those
+    /// digests against its own older templates, and downgrades every file they
+    /// describe. Which release *reconciled* the project and which release
+    /// *wrote* these digests are not the same fact.
+    pub written_by: Option<String>,
     /// The flags that release was invoked with, insofar as they change which
     /// framework-owned files exist and what they contain.
     pub options: GenerateOptions,
@@ -132,6 +147,7 @@ impl Manifest {
     ) -> Self {
         Self {
             version: Some(version.to_owned()),
+            written_by: Some(version.to_owned()),
             options,
             digests: files
                 .iter()
@@ -146,6 +162,7 @@ impl Manifest {
     pub fn render(&self) -> String {
         let file = ManifestFile {
             version: self.version.clone(),
+            written_by: self.written_by.clone(),
             flavor: if self.options.with_api {
                 FLAVOR_API
             } else {
@@ -185,6 +202,7 @@ impl Manifest {
         let file: ManifestFile = toml::from_str(text).ok()?;
         Some(Self {
             version: file.version,
+            written_by: file.written_by,
             options: GenerateOptions {
                 // Anything but the two flavours this CLI knows is treated as no
                 // manifest at all. Falling back to `fullstack` would keep
@@ -851,8 +869,16 @@ impl ScaffoldReport {
         } else {
             previous.and_then(|manifest| manifest.version.clone())
         };
+        // The renderer mark moves forward on every write, conflicts or not:
+        // these digests describe *this* release's templates, and an older CLI
+        // must be able to see that even when the baseline could not advance.
+        let written_by = Some(newest(
+            previous.and_then(|m| m.written_by.as_deref()),
+            &self.target,
+        ));
         Manifest {
             version,
+            written_by,
             options: self.options,
             digests,
             pinned: previous
@@ -902,9 +928,18 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
     // templates here are older than the files those digests describe, so every
     // untouched file would classify as a writable `update` and `--apply` would
     // downgrade it. Nothing is rendered and nothing is classified.
+    // The newest release either field names. `written_by` is the one that
+    // matters — a conflict holds `version` back while the digests advance, so
+    // `version` alone would let an older CLI trust newer digests — but taking
+    // the newer of the two costs nothing, covers a manifest written before the
+    // mark existed, and refuses an incoherent manifest whose `version` somehow
+    // exceeds it rather than reasoning about which field to believe.
     let scaffolded_by_newer = manifest
         .as_ref()
-        .and_then(|manifest| manifest.version.clone())
+        .and_then(|manifest| match (&manifest.written_by, &manifest.version) {
+            (Some(written_by), Some(version)) => Some(newest(Some(version), written_by)),
+            (recorded, None) | (None, recorded) => recorded.clone(),
+        })
         .filter(|recorded| is_newer_than_this_cli(recorded));
     let files = scaffolded_by_newer
         .is_none()
@@ -924,6 +959,20 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
         target,
         has_manifest: manifest.is_some(),
         outcome: super::Outcome::Preview,
+    }
+}
+
+/// The newer of two release strings, preferring `candidate` when neither
+/// parses as a version.
+fn newest(previous: Option<&str>, candidate: &str) -> String {
+    let parse = super::migrations::parse_version_req;
+    match (previous.and_then(parse), parse(candidate)) {
+        (Some(previous_version), Some(candidate_version))
+            if previous_version > candidate_version =>
+        {
+            previous.unwrap_or(candidate).to_owned()
+        }
+        _ => candidate.to_owned(),
     }
 }
 
@@ -978,6 +1027,7 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
 
     let mut manifest = manifest.unwrap_or_else(|| Manifest {
         version: None,
+        written_by: None,
         options,
         digests: BTreeMap::new(),
         pinned: BTreeSet::new(),
@@ -1501,6 +1551,7 @@ mod tests {
         digests.insert(".github/workflows/ci.yml".to_owned(), digest("b\n"));
         let manifest = Manifest {
             version: Some("0.7.0".to_owned()),
+            written_by: Some("0.7.0".to_owned()),
             options: GenerateOptions {
                 with_api: true,
                 with_i18n: true,
@@ -1527,6 +1578,7 @@ mod tests {
         digests.insert("static/css/input.css".to_owned(), digest("z"));
         let manifest = Manifest {
             version: Some("0.7.0".to_owned()),
+            written_by: Some("0.7.0".to_owned()),
             options: GenerateOptions::default(),
             digests: digests.clone(),
             pinned: BTreeSet::new(),
@@ -1560,6 +1612,7 @@ mod tests {
         digests.insert("clippy.toml".to_owned(), digest("a\n"));
         let manifest = Manifest {
             version: Some("0.7.0".to_owned()),
+            written_by: Some("0.7.0".to_owned()),
             options: GenerateOptions::default(),
             digests,
             pinned: BTreeSet::new(),
@@ -2806,6 +2859,80 @@ mod tests {
         assert_eq!(
             added, expected,
             "an added file must carry the mode an ordinary write would give it"
+        );
+    }
+
+    #[test]
+    fn a_partial_upgrade_by_a_newer_release_still_refuses_an_older_cli() {
+        // `version` is held back while conflicts stand (so a half-finished
+        // upgrade never reads as finished), but the digests advance to the
+        // newer templates regardless. One field cannot mean both "the release
+        // fully reconciled to" and "the newest renderer that wrote here" — and
+        // reading the first as the second lets an older CLI trust newer digests
+        // and downgrade the files they describe.
+        let tmp = scaffolded(GenerateOptions::default());
+        let newer = "# written by a newer release\n";
+        write(tmp.path(), "clippy.toml", newer);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.version = Some("0.5.0".to_owned()); // held back by a conflict
+        manifest.written_by = Some("99.0.0".to_owned()); // but 99.0.0 wrote these digests
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(newer));
+        manifest.save(tmp.path()).unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(report.scaffolded_by_newer.as_deref(), Some("99.0.0"));
+        assert!(report.entries.is_empty());
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("clippy.toml")).unwrap(),
+            newer,
+            "a newer release's file must never be downgraded"
+        );
+    }
+
+    #[test]
+    fn the_renderer_high_water_mark_advances_even_when_the_baseline_cannot() {
+        // A conflict holds `version` back; it must not hold back the record of
+        // which renderer produced the digests, or the next older CLI to run
+        // here has nothing to refuse on.
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "Dockerfile", "FROM scratch\n");
+        let stale = "# older\n";
+        write(tmp.path(), "clippy.toml", stale);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.version = Some("0.5.0".to_owned());
+        manifest.written_by = Some("0.5.0".to_owned());
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(stale));
+        manifest.save(tmp.path()).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+
+        let after = Manifest::load(tmp.path()).unwrap();
+        assert_eq!(
+            after.version.as_deref(),
+            Some("0.5.0"),
+            "the baseline still waits on the conflict"
+        );
+        assert_eq!(
+            after.written_by.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "but this renderer wrote these digests"
+        );
+    }
+
+    #[test]
+    fn a_new_project_records_which_renderer_wrote_it() {
+        let tmp = scaffolded(GenerateOptions::default());
+        assert_eq!(
+            Manifest::load(tmp.path()).unwrap().written_by.as_deref(),
+            Some("0.7.0")
         );
     }
 }

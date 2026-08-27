@@ -271,6 +271,7 @@ every framework-owned file as it writes it, in `.autumn/scaffold.toml`:
 
 ```toml
 version = "0.7.0"
+written_by = "0.7.0"
 flavor = "fullstack"
 i18n = false
 seed = false
@@ -293,6 +294,13 @@ digests are of Autumn's own template text, never of your content).
 once no conflicts are left — so a half-finished upgrade never reads as a
 finished one, and a project that has never been fully reconciled simply has no
 `version` line rather than a flattering guess.
+
+`written_by` answers a different question: which is the newest release that has
+written any digest here. It moves forward on every apply, conflicts or not.
+The two come apart exactly when an upgrade leaves a conflict standing — the
+digests advance to the new templates while `version` waits — and that gap is
+what an older CLI has to see. Without it, rolling back to the older CLI would
+find digests it trusts, matching files it cannot render, and downgrade them.
 
 Every write is staged in the same directory and renamed into place, so an
 interrupted `--apply` cannot leave you with a half-written `Dockerfile` or a
