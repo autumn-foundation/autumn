@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::check_role;
+use crate::impersonation::AdminImpersonation;
 use crate::registry::AdminRegistry;
 use crate::templates;
 use crate::traits::{
@@ -143,6 +144,7 @@ pub fn admin_router(
     config_svc: Option<Arc<RuntimeConfigService>>,
     step_up_mutations: bool,
     step_up_max_age_secs: u64,
+    impersonation_enabled: bool,
 ) -> axum::Router<AppState> {
     let has_config = config_svc.is_some();
 
@@ -167,6 +169,17 @@ pub fn admin_router(
                 auth_session_key.clone(),
             )))
             .layer(axum::Extension(svc));
+    }
+
+    // Begin-impersonation route (#1394). Registered before the `/{slug}`
+    // catch-all and *inside* the role + step-up guards; the framework's
+    // `ImpersonationGate` then gates it again (default-deny), so holding the
+    // admin role is never sufficient on its own.
+    if impersonation_enabled {
+        router = router.route(
+            "/impersonate",
+            routing::post(crate::impersonation::impersonate_begin),
+        );
     }
 
     router = router
@@ -208,17 +221,35 @@ pub fn admin_router(
         router
     };
 
-    match require_role {
+    let router = match require_role {
         Some(role) => router.layer(from_fn(move |req, next| {
             check_role(role.clone(), auth_session_key.clone(), req, next)
         })),
         None => router,
+    };
+
+    if !impersonation_enabled {
+        return router;
     }
+
+    // The revert route is merged *after* the role and step-up layers, so it is
+    // deliberately outside both. While impersonating, the session carries the
+    // target's role (usually none) — a gated revert would trap the operator in
+    // the target's identity with no way back. The route is self-gating: a
+    // session that is not impersonating gets a 400 and nothing changes.
+    router.merge(
+        axum::Router::new()
+            .route(
+                "/impersonate/stop",
+                routing::post(crate::impersonation::impersonate_stop),
+            )
+            .layer(axum::Extension(AdminPrefix(prefix.to_owned()))),
+    )
 }
 
 /// Typed Extension carrying the admin URL prefix so handlers can build links.
 #[derive(Clone)]
-struct AdminPrefix(String);
+pub struct AdminPrefix(pub String);
 
 /// Typed Extension signalling whether the runtime config service is mounted.
 #[derive(Clone)]
@@ -397,7 +428,9 @@ fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /admin` — Dashboard with model counts.
+#[allow(clippy::too_many_arguments)]
 async fn dashboard(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -433,12 +466,15 @@ async fn dashboard(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/jobs` -- built-in background jobs dashboard.
 #[allow(clippy::too_many_arguments)]
 async fn jobs_dashboard(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -465,6 +501,8 @@ async fn jobs_dashboard(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -550,6 +588,7 @@ fn scheduled_job_summaries(state: &AppState) -> Vec<JobScheduleSummary> {
 /// `GET /admin/{slug}` -- Model list view.
 #[allow(clippy::too_many_arguments)]
 async fn model_list(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -614,11 +653,15 @@ async fn model_list(
         show_config,
         model.supports_csv_export(),
         model.supports_csv_import(),
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/{slug}/new` — Create form.
+#[allow(clippy::too_many_arguments)]
 async fn model_new_form(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -648,6 +691,8 @@ async fn model_new_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -727,6 +772,7 @@ async fn model_create(
 /// `GET /admin/{slug}/{id}` — Detail view.
 #[allow(clippy::too_many_arguments)]
 async fn model_detail(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -779,6 +825,8 @@ async fn model_detail(
         &actuator_prefix,
         model.has_history(),
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     ))
     .into_response();
 
@@ -809,6 +857,7 @@ async fn model_detail(
 /// (`model.has_history()` returns `false`).
 #[allow(clippy::too_many_arguments)]
 async fn model_history(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -849,12 +898,15 @@ async fn model_history(
         &actuator_prefix,
         csrf.token_header(),
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `GET /admin/{slug}/{id}/edit` — Edit form.
 #[allow(clippy::too_many_arguments)]
 async fn model_edit_form(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -891,6 +943,8 @@ async fn model_edit_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1115,6 +1169,7 @@ async fn model_export_csv(
 /// `GET /admin/{slug}/import` — Render the CSV import form.
 #[allow(clippy::too_many_arguments)]
 async fn model_import_form(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -1147,12 +1202,15 @@ async fn model_import_form(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
 /// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn model_import_csv(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
@@ -1267,6 +1325,8 @@ async fn model_import_csv(
         &prefix,
         &actuator_prefix,
         show_config,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1274,6 +1334,7 @@ async fn model_import_csv(
 
 /// `GET /admin/config` — List all runtime config keys with their values.
 async fn config_list(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -1294,6 +1355,8 @@ async fn config_list(
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1342,6 +1405,7 @@ async fn config_unset(
 /// `GET /admin/config/{key}/history` — View change history for a config key.
 #[allow(clippy::too_many_arguments)]
 async fn config_key_history(
+    imp: AdminImpersonation,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
@@ -1363,6 +1427,8 @@ async fn config_key_history(
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
+        imp.banner(&prefix, csrf.token(), csrf.form_field())
+            .as_ref(),
     )))
 }
 
@@ -1568,6 +1634,7 @@ mod tests {
             None,
             false,
             autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            false,
         )
         .layer(axum::Extension(session))
         .with_state(state);

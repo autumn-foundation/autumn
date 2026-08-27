@@ -652,6 +652,112 @@ and include the table in your GDPR export.
 
 ---
 
+## Impersonation ("log in as this user")
+
+Support eventually needs to see what a customer sees. Doing it by hand —
+`session.insert("user_id", target)` — quietly breaks the audit trail: from that
+point on every version row and audit event claims the *customer* did it.
+`autumn_web::auth::impersonation` is the primitive that keeps the real operator
+on the record.
+
+Opt in first — it is **default-deny**, so an app without a registered gate
+refuses every attempt with `403`:
+
+```rust,ignore
+use autumn_web::auth::impersonation::ImpersonationGate;
+
+autumn_web::app()
+    .state_initializer(|state| {
+        state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+    })
+```
+
+Then begin and end it from your own routes:
+
+```rust,ignore
+use autumn_web::auth::impersonation;
+
+#[post("/support/impersonate/{user_id}")]
+#[secured("admin")]
+async fn start(
+    State(state): State<AppState>,
+    session: Session,
+    Path(user_id): Path<String>,
+) -> AutumnResult<Redirect> {
+    impersonation::begin_impersonation(&state, &session, user_id).await?;
+    Ok(Redirect::to("/"))
+}
+
+#[post("/support/stop-impersonating")]
+async fn stop(State(state): State<AppState>, session: Session) -> AutumnResult<Redirect> {
+    impersonation::end_impersonation(&state, &session).await?;
+    Ok(Redirect::to("/"))
+}
+```
+
+What the framework guarantees while impersonation is active:
+
+| Question | Answer |
+|---|---|
+| Who does `#[secured]` / `Auth<T>` / `PolicyContext` resolve? | the **impersonated** user |
+| Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** |
+| Who does `impersonation::impersonator_id(&session)` return? | the **real impersonator** |
+| Session id | rotated on begin *and* end |
+| Audit | one event on begin, one on end, each `{impersonator_id, target_id}` |
+
+And what it refuses:
+
+- **No nesting.** Starting a second hop while impersonating is a `409`, so it
+  cannot be chained to escalate.
+- **No self-impersonation**, and no blank target.
+- **No unaudited swap.** If the audit write fails, `begin_impersonation` returns
+  `500` and the session is untouched. Ending is the opposite trade-off: a sink
+  failure is logged, but the revert still happens.
+- **No client-chosen role.** The impersonated session's role comes from
+  `ImpersonationPolicy::target_role`, resolved server-side; it defaults to *no*
+  role rather than inheriting the admin's.
+- **No laundering past step-up.** The admin's own `last_strong_auth_at` claim is
+  preserved, not refreshed, so `#[step_up]` still evaluates the real operator's
+  freshness.
+
+Tenancy is yours to enforce: implement `ImpersonationPolicy` instead of using
+`allow_roles`, and consult `ctx` (which carries the session and the DB pool) to
+confirm the target is in the caller's tenant.
+
+```rust,ignore
+use autumn_web::auth::impersonation::{ImpersonationPolicy, ImpersonationTarget};
+use autumn_web::authorization::{BoxFuture, PolicyContext};
+
+struct SupportDesk;
+
+impl ImpersonationPolicy for SupportDesk {
+    fn can_impersonate<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("support") && same_tenant(ctx, target).await })
+    }
+
+    fn target_role<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { lookup_role(target.user_id()).await })
+    }
+}
+```
+
+Session-based auth only: an API-token principal has no session to swap, so the
+bearer-token path is untouched.
+
+`autumn-admin-plugin` ships the whole flow — routes, a persistent "Viewing as …
+— Stop impersonating" banner, and one-click revert — behind
+`AdminPlugin::with_impersonation(gate)`. See the [admin guide](./admin.md).
+
+---
+
 ## Testing authenticated routes
 
 The test client can mint an authenticated session directly, so a test of a

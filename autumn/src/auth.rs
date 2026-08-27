@@ -79,6 +79,12 @@ pub use password::{
     validate_password,
 };
 
+pub mod impersonation;
+pub use impersonation::{
+    ImpersonationGate, ImpersonationPolicy, ImpersonationState, ImpersonationTarget,
+    begin_impersonation, end_impersonation, impersonator_id, is_impersonating,
+};
+
 pub mod remember;
 pub use remember::{
     DEFAULT_ROTATION_GRACE_SECS, RememberConfig, RememberCredential, RememberDecision,
@@ -217,8 +223,13 @@ pub async fn __check_secured_with_key(
     // token principal, so we must not clobber it with the session user here.
     // (`log::context::set_user_id` for #1169 is independent and stays
     // unconditional.)
+    //
+    // While the session is impersonating (#1394) the responsible principal is
+    // the *real* impersonator, not the user the request resolves as, so the
+    // actor published here is the impersonator. The log context keeps carrying
+    // the effective user (that is the identity the request is acting under).
     if crate::current::Current::actor().is_none() {
-        crate::current::Current::set_actor(user_id.clone());
+        crate::current::Current::set_actor(impersonation::audit_actor_id(session, &user_id).await);
     }
     crate::log::context::set_user_id(user_id);
 
@@ -435,8 +446,16 @@ where
                 // resolver wins" rule: if an outer bearer layer or an explicit
                 // `with_actor(...)` scope already resolved a principal, that one
                 // stays. (`set_user_id` for #1169 is independent, stays unconditional.)
+                //
+                // Impersonation (#1394): the actor is the real impersonator
+                // whenever the session carries one, so writes made while
+                // impersonating stay attributed to the operator.
                 if crate::current::Current::actor().is_none() {
-                    crate::current::Current::set_actor(user_id.clone());
+                    let actor = match session.as_ref() {
+                        Some(session) => impersonation::audit_actor_id(session, &user_id).await,
+                        None => user_id.clone(),
+                    };
+                    crate::current::Current::set_actor(actor);
                 }
                 crate::log::context::set_user_id(user_id);
                 inner.call(req).await

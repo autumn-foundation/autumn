@@ -397,6 +397,128 @@ const ADMIN_CSS: &str = "
     }
     ";
 
+// ── Impersonation banner ────────────────────────────────────────────
+
+/// Styles for the impersonation banner ([`impersonation_banner`]).
+///
+/// The admin layout already includes these. An application that embeds the
+/// banner in its **own** layout — the surface an operator actually sees while
+/// impersonating a non-admin user — should drop this into its stylesheet or a
+/// `<style>` block. Deliberately class-based rather than inline `style`
+/// attributes, so it survives a nonce-based `style-src` CSP.
+pub const IMPERSONATION_BANNER_CSS: &str = "
+    .autumn-impersonation-banner {
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.6rem 1rem;
+        background: #b45309;
+        color: #fff;
+        font: 500 0.9rem/1.4 system-ui, -apple-system, sans-serif;
+        box-shadow: 0 1px 3px rgb(0 0 0 / 25%);
+    }
+    .autumn-impersonation-banner__text { margin: 0; }
+    .autumn-impersonation-banner__who { font-weight: 700; }
+    .autumn-impersonation-banner__form { margin: 0; }
+    .autumn-impersonation-banner__stop {
+        padding: 0.35rem 0.85rem;
+        border: 1px solid rgb(255 255 255 / 60%);
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+    }
+    .autumn-impersonation-banner__stop:hover { background: rgb(255 255 255 / 15%); }
+    .autumn-impersonation-banner__stop:focus-visible {
+        outline: 2px solid #fff;
+        outline-offset: 2px;
+    }
+";
+
+/// Everything the impersonation banner needs to render.
+///
+/// Built from an [`ImpersonationState`](autumn_web::auth::impersonation::ImpersonationState)
+/// plus the request's CSRF token; see
+/// [`impersonation_banner_for`](crate::impersonation_banner_for) for the
+/// one-call version that reads both from the request.
+#[derive(Debug, Clone)]
+pub struct ImpersonationBanner {
+    /// The user the session is currently acting as.
+    pub effective_user_id: String,
+    /// The real operator behind the session.
+    pub impersonator_id: String,
+    /// Prefix the admin plugin is mounted at; the revert form posts to
+    /// `{stop_path}/impersonate/stop`.
+    pub stop_path: String,
+    /// CSRF token for that form. Empty when no `CsrfLayer` is installed, in
+    /// which case the hidden field is omitted entirely.
+    pub csrf_token: String,
+    /// Configured CSRF form-field name (defaults to `_csrf` when empty).
+    pub csrf_form_field: String,
+}
+
+impl ImpersonationBanner {
+    /// The CSRF field name to render, defaulting to Autumn's `_csrf`.
+    fn csrf_field(&self) -> &str {
+        if self.csrf_form_field.is_empty() {
+            "_csrf"
+        } else {
+            &self.csrf_form_field
+        }
+    }
+}
+
+/// Render the persistent "Viewing as … — Stop impersonating" banner.
+///
+/// The revert is a single `POST` to the plugin's stop route, which is mounted
+/// **outside** the admin role gate — so an operator impersonating a user
+/// without the admin role can always get back to their own session.
+///
+/// Embed it at the top of `<body>` in your application's layout:
+///
+/// ```rust,ignore
+/// let banner = autumn_admin_plugin::impersonation_banner_for(
+///     &state, &session, "/admin", csrf.token(), csrf.form_field(),
+/// ).await;
+/// html! {
+///     body {
+///         @if let Some(banner) = banner { (banner) }
+///         main { (content) }
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn impersonation_banner(banner: &ImpersonationBanner) -> Markup {
+    let stop_action = format!(
+        "{}/impersonate/stop",
+        banner.stop_path.trim_end_matches('/')
+    );
+    html! {
+        div class="autumn-impersonation-banner" role="status" aria-live="polite" {
+            p class="autumn-impersonation-banner__text" {
+                "Viewing as "
+                span class="autumn-impersonation-banner__who" { (banner.effective_user_id) }
+                " — impersonated by "
+                span class="autumn-impersonation-banner__who" { (banner.impersonator_id) }
+            }
+            form class="autumn-impersonation-banner__form" method="post" action=(stop_action) {
+                @if !banner.csrf_token.is_empty() {
+                    input type="hidden" name=(banner.csrf_field()) value=(banner.csrf_token);
+                }
+                button type="submit" class="autumn-impersonation-banner__stop" {
+                    "Stop impersonating"
+                }
+            }
+        }
+    }
+}
+
 // ── Layout ──────────────────────────────────────────────────────────
 
 /// Render the full admin page layout with sidebar navigation.
@@ -411,6 +533,7 @@ pub fn admin_layout(
     csrf_token_header: &str,
     messages: &[FlashMessage],
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
     content: &Markup,
 ) -> Markup {
     // Each nav item's href is computed once here and reused both to
@@ -476,11 +599,17 @@ pub fn admin_layout(
                     (PreEscaped(TOKENS_CSS))
                     (PreEscaped(FLASH_CSS))
                     (PreEscaped(ADMIN_CSS))
+                    (PreEscaped(IMPERSONATION_BANNER_CSS))
                 }
             }
             body {
                 // Skip-to-content link — first focusable element for keyboard users.
                 a href="#admin-main" class="admin-skip-link" { "Skip to main content" }
+                // Persistent impersonation banner (#1394): rendered above the
+                // whole layout so it is on every admin page the operator loads.
+                @if let Some(banner) = impersonation {
+                    (impersonation_banner(banner))
+                }
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
@@ -517,6 +646,7 @@ pub fn jobs_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -594,6 +724,7 @@ pub fn jobs_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -840,6 +971,7 @@ pub fn dashboard_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem;" {
@@ -875,6 +1007,7 @@ pub fn dashboard_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -906,6 +1039,7 @@ pub fn model_list_page(
     show_config: bool,
     supports_csv_export: bool,
     supports_csv_import: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
@@ -1142,6 +1276,7 @@ pub fn model_list_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1161,6 +1296,7 @@ pub fn model_import_form_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1241,6 +1377,7 @@ pub fn model_import_form_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1259,6 +1396,7 @@ pub fn model_import_result_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let mode_label = match mode {
         CsvImportMode::DryRun => "Dry Run",
@@ -1355,6 +1493,7 @@ pub fn model_import_result_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1383,6 +1522,7 @@ pub fn model_detail_page(
     actuator_prefix: &str,
     has_history: bool,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1445,6 +1585,7 @@ pub fn model_detail_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1470,6 +1611,7 @@ pub fn model_form_page(
     prefix: &str,
     actuator_prefix: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let is_edit = id.is_some();
     let title = if is_edit {
@@ -1542,6 +1684,7 @@ pub fn model_form_page(
         csrf_token_header,
         messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -1559,6 +1702,7 @@ pub fn config_page(
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let content = html! {
         div class="breadcrumbs" {
@@ -1667,6 +1811,7 @@ pub fn config_page(
         csrf_token_header,
         messages,
         true,
+        impersonation,
         &content,
     )
 }
@@ -1682,6 +1827,7 @@ pub fn config_history_page(
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let title = format!("History: {key}");
     let content = html! {
@@ -1764,6 +1910,7 @@ pub fn config_history_page(
         csrf_token_header,
         messages,
         true,
+        impersonation,
         &content,
     )
 }
@@ -2208,6 +2355,7 @@ pub fn model_history_page(
     actuator_prefix: &str,
     csrf_token_header: &str,
     show_config: bool,
+    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
     let record_display = format!("{model_name} #{record_id_val}");
     let history_page_href = |page: u64| {
@@ -2334,6 +2482,7 @@ pub fn model_history_page(
         csrf_token_header,
         empty_messages,
         show_config,
+        impersonation,
         &content,
     )
 }
@@ -2698,6 +2847,7 @@ mod tests {
             "/ops",
             "X-CSRF-Token",
             false,
+            None,
         )
         .into_string();
 
@@ -2723,6 +2873,7 @@ mod tests {
             "/admin",
             "/ops",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2738,8 +2889,18 @@ mod tests {
     #[test]
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
-        let html = dashboard_page(&r, &[], &[], "tok", "X-CSRF-Token", "/admin", "/ops", false)
-            .into_string();
+        let html = dashboard_page(
+            &r,
+            &[],
+            &[],
+            "tok",
+            "X-CSRF-Token",
+            "/admin",
+            "/ops",
+            false,
+            None,
+        )
+        .into_string();
         assert!(
             html.contains(r#"href="/ops/ui""#),
             "sidebar link wrong: {html}"
@@ -2882,6 +3043,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(html.contains("Jobs"));
@@ -2936,6 +3098,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -2966,6 +3129,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3000,6 +3164,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3034,6 +3199,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3085,6 +3251,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(!html.contains("hx-confirm"), "{html}");
@@ -3127,6 +3294,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3166,6 +3334,7 @@ mod tests {
             "/actuator",
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3194,6 +3363,7 @@ mod tests {
             "/admin",
             "/actuator",
             false,
+            None,
         )
         .into_string();
         let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
@@ -3258,6 +3428,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3310,6 +3481,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3359,6 +3531,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Row with id renders working links and a checkbox.
@@ -3420,6 +3593,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Sort header link carries both filters.
@@ -3476,6 +3650,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3533,6 +3708,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3586,6 +3762,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Form posts to the bulk-action endpoint with the CSRF token.
@@ -3665,6 +3842,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3704,6 +3882,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -3746,6 +3925,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         // Sortable field gets a sort link.
@@ -3797,6 +3977,7 @@ mod tests {
             false, // show_config
             true,  // supports_csv_export
             false, // supports_csv_import
+            None,
         )
         .into_string();
         assert!(
@@ -3840,6 +4021,7 @@ mod tests {
             false, // show_config
             false, // supports_csv_export
             true,  // supports_csv_import
+            None,
         )
         .into_string();
         assert!(
@@ -3883,6 +4065,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .into_string();
         assert!(
@@ -4081,6 +4264,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4115,6 +4299,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("max_upload_mb"), "key name missing: {html}");
@@ -4154,6 +4339,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4184,6 +4370,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4214,6 +4401,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4244,6 +4432,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4264,6 +4453,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(
@@ -4294,6 +4484,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("rate_limit"), "key name missing: {html}");
@@ -4323,6 +4514,7 @@ mod tests {
             "X-CSRF-Token",
             "/admin",
             "/actuator",
+            None,
         )
         .into_string();
         assert!(html.contains("flag"), "key name missing: {html}");
@@ -4357,6 +4549,7 @@ mod tests {
             "X-CSRF-Token",
             &[],
             true,
+            None,
             &html! {},
         )
         .into_string()
@@ -4419,6 +4612,7 @@ mod tests {
             "X-CSRF-Token",
             &[],
             true,
+            None,
             &html! {},
         )
         .into_string()
@@ -4536,6 +4730,7 @@ mod tests {
             "X-CSRF-Token",
             &messages,
             true,
+            None,
             &html! {},
         )
         .into_string();
