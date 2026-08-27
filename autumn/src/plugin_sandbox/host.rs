@@ -6,7 +6,7 @@
 //! a function the host gave it. It has no syscalls, no ambient file
 //! descriptors and no way to name anything outside its own linear memory. So
 //! the entire authority a sandboxed plugin holds is the list of host functions
-//! [`define_wasi_shim`] registers — which is why they are all in one function,
+//! `define_wasi_shim` registers — which is why they are all in one function,
 //! in one place, readable top to bottom.
 //!
 //! Every one of them either serves the request dialogue or says no:
