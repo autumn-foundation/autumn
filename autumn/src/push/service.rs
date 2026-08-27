@@ -211,7 +211,7 @@ impl WebPush {
 
     /// The `applicationServerKey` a browser needs to subscribe.
     ///
-    /// Serve this to the client (the built-in [`router`](super::router) does,
+    /// Serve this to the client (the built-in [`router()`](super::router) does,
     /// at `/push/vapid-public-key`). It is public key material — safe to
     /// expose to any visitor.
     ///

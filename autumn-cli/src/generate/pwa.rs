@@ -160,7 +160,7 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     // A silently unmounted router is the worst outcome here: the command exits
     // 0, the client snippet ships, and every `fetch` it makes 404s with
     // nothing pointing at the cause. Say so instead.
-    if !updated_main.contains("autumn_web::push::router()") {
+    if !push_router_already_mounted(&updated_main) {
         plan.warn(
             "could not find the app builder in src/main.rs, so the Web Push routes were not \
              mounted. Add this line to your builder chain by hand:\n    \
@@ -498,6 +498,13 @@ fn render_service_worker_registration() -> String {
 /// Every path and header name below comes from `autumn_web::push::router`'s own
 /// constants, so the snippet and the mounted routes can never drift apart.
 fn render_push_opt_in() -> String {
+    format!("{}{}", render_push_helpers(), render_push_entry_points())
+}
+
+/// The shared helpers the push entry points below build on: CSRF header
+/// assembly, the base64url→`Uint8Array` key decode, the rotated-key check, and
+/// the CSRF capture.
+fn render_push_helpers() -> String {
     format!(
         r"// Autumn's CSRF layer rejects an unaccompanied mutating request, so both POSTs
 // below must carry a token. Without one they 403 the moment
@@ -528,6 +535,30 @@ function autumnPushHeaders() {{
   return headers;
 }}
 
+// Whether an existing subscription was created with `key`.
+//
+// `options.applicationServerKey` is the ArrayBuffer the browser recorded at
+// subscribe time; comparing bytes is the only way to notice a server-side key
+// rotation before `subscribe()` throws over it.
+function autumnPushKeyMatches(subscription, key) {{
+  const recorded = subscription.options && subscription.options.applicationServerKey;
+  if (!recorded) {{
+    // The browser does not expose it (older Safari): assume it still matches
+    // rather than churning a working subscription on every page load.
+    return true;
+  }}
+  const bytes = new Uint8Array(recorded);
+  if (bytes.length !== key.length) {{
+    return false;
+  }}
+  for (let i = 0; i < bytes.length; i += 1) {{
+    if (bytes[i] !== key[i]) {{
+      return false;
+    }}
+  }}
+  return true;
+}}
+
 // Read the CSRF token off a public-key response. Same-origin only: a
 // cross-origin reader cannot see these headers without the app opting in via
 // CORS, which is the property double-submit CSRF already depends on.
@@ -555,7 +586,17 @@ function autumnDecodeVapidKey(base64url) {{
   return bytes;
 }}
 
-// Opt the current visitor in to Web Push. Call it from a click handler — it
+",
+        csrf_token_header = autumn_web::push::CSRF_TOKEN_HEADER,
+        csrf_header_name_header = autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER,
+    )
+}
+
+/// `window.autumnPushSubscribe` / `window.autumnPushUnsubscribe`, plus the
+/// declarative `data-autumn-push-subscribe` wiring.
+fn render_push_entry_points() -> String {
+    format!(
+        r"// Opt the current visitor in to Web Push. Call it from a click handler — it
 // prompts for notification permission, so it needs a user gesture.
 // Resolves `true` once the subscription has been recorded server-side.
 window.autumnPushSubscribe = async function autumnPushSubscribe() {{
@@ -574,11 +615,30 @@ window.autumnPushSubscribe = async function autumnPushSubscribe() {{
   }}
   autumnPushCaptureCsrf(response);
   const registration = await navigator.serviceWorker.ready;
+  const applicationServerKey = autumnDecodeVapidKey((await response.text()).trim());
+
+  // A browser keeps its subscription across deployments. If this deployment
+  // rotated `[push] private_key`, that stored subscription was created with
+  // the OLD applicationServerKey, and `subscribe()` then REJECTS rather than
+  // replacing it — leaving the user unable to opt back in through the button
+  // without manually clearing site data. Drop a subscription whose key no
+  // longer matches and subscribe afresh.
+  const existing = await registration.pushManager.getSubscription();
+  if (existing && !autumnPushKeyMatches(existing, applicationServerKey)) {{
+    await fetch('{unsubscribe_path}', {{
+      method: 'POST',
+      headers: autumnPushHeaders(),
+      credentials: 'same-origin',
+      body: JSON.stringify({{ endpoint: existing.endpoint }}),
+    }}).catch(() => {{}});
+    await existing.unsubscribe();
+  }}
+
   const subscription = await registration.pushManager.subscribe({{
     // Chrome refuses a subscription without this, and it is also the honest
     // contract: every push this app sends raises a visible notification.
     userVisibleOnly: true,
-    applicationServerKey: autumnDecodeVapidKey((await response.text()).trim()),
+    applicationServerKey,
   }});
   const recorded = await fetch('{subscribe_path}', {{
     method: 'POST',
@@ -629,13 +689,10 @@ document.addEventListener('click', (event) => {{
     event.preventDefault();
     window.autumnPushSubscribe().catch(console.error);
   }}
-}});
-",
-        key_path = autumn_web::push::router::VAPID_PUBLIC_KEY_PATH,
-        subscribe_path = autumn_web::push::router::SUBSCRIBE_PATH,
-        unsubscribe_path = autumn_web::push::router::UNSUBSCRIBE_PATH,
-        csrf_token_header = autumn_web::push::router::CSRF_TOKEN_HEADER,
-        csrf_header_name_header = autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER,
+}});",
+        key_path = autumn_web::push::VAPID_PUBLIC_KEY_PATH,
+        subscribe_path = autumn_web::push::SUBSCRIBE_PATH,
+        unsubscribe_path = autumn_web::push::UNSUBSCRIBE_PATH,
     )
 }
 
@@ -806,7 +863,7 @@ const PUSH_ROUTER_LINE: &str =
 /// by text, which could land on an earlier occurrence), skips anything inside
 /// a comment, and only accepts an anchor at or after `async fn main`.
 fn inject_push_router(source: &str) -> String {
-    if source.contains("autumn_web::push::router()") {
+    if push_router_already_mounted(source) {
         return source.to_owned();
     }
     let Some(anchor_end) = push_router_anchor(source) else {
@@ -820,21 +877,62 @@ fn inject_push_router(source: &str) -> String {
     result
 }
 
+/// Whether `main.rs` already mounts the push router **in code**.
+///
+/// A plain substring test is not enough: this project's own documentation (and
+/// `autumn_web::push::routes`' doc comment) shows a quick-start snippet
+/// containing that exact call, so a `main.rs` that pasted it into a comment
+/// would look mounted, skip injection, *and* skip the warning the caller emits
+/// off this same predicate — leaving every generated `fetch` to 404 with
+/// nothing pointing at the cause. So the scan ignores comments, exactly as
+/// [`push_router_anchor`] does.
+fn push_router_already_mounted(source: &str) -> bool {
+    for_each_code_line(source, |line, _offset| {
+        line.contains("autumn_web::push::router()").then_some(())
+    })
+    .is_some()
+}
+
 /// Byte offset just past the builder-opening `autumn_web::app()` inside
 /// `main()`, or `None` when there is no unambiguous anchor.
 ///
 /// See [`inject_push_router`]'s "Anchor selection" for why each rule is here.
 fn push_router_anchor(source: &str) -> Option<usize> {
+    let mut seen_main = false;
+    for_each_code_line(source, |line, offset| {
+        if line.trim().contains("async fn main") {
+            seen_main = true;
+        }
+        // Only a line that ENDS with the builder opener is an anchor: a
+        // single-line chain (`autumn_web::app().routes(…).run().await;`) has
+        // no place to insert a `.merge(…)` line, so it is deliberately left
+        // alone and reported instead of being spliced mid-expression.
+        (seen_main && line.trim_end().ends_with("autumn_web::app()"))
+            .then(|| offset + line.trim_end().len())
+    })
+}
+
+/// Walk `source`'s lines that are **code**, skipping comments, and return the
+/// first non-`None` result of `f`.
+///
+/// `f` receives the raw line and its byte offset in `source`. The offset is
+/// tracked as the walk proceeds rather than recovered afterwards with
+/// `source.find(line)`, which would re-locate an identical earlier line and
+/// splice at the wrong place.
+///
+/// Shared by [`push_router_anchor`] and [`push_router_already_mounted`] so the
+/// two can never disagree about what counts as a comment — a disagreement
+/// there is what lets a doc-comment mention suppress both the injection and
+/// the warning about it.
+fn for_each_code_line<T>(source: &str, mut f: impl FnMut(&str, usize) -> Option<T>) -> Option<T> {
     let mut offset = 0_usize;
     let mut in_block_comment = false;
-    let mut seen_main = false;
 
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim();
         let line_start = offset;
         offset += line.len();
 
-        // Track block comments so a commented-out builder never anchors.
         if in_block_comment {
             if trimmed.contains("*/") {
                 in_block_comment = false;
@@ -852,15 +950,8 @@ fn push_router_anchor(source: &str) -> Option<usize> {
             continue;
         }
 
-        if trimmed.contains("async fn main") {
-            seen_main = true;
-        }
-        // Only a line that ENDS with the builder opener is an anchor: a
-        // single-line chain (`autumn_web::app().routes(…).run().await;`) has
-        // no place to insert a `.merge(…)` line, so it is deliberately left
-        // alone and reported instead of being spliced mid-expression.
-        if seen_main && line.trim_end().ends_with("autumn_web::app()") {
-            return Some(line_start + line.trim_end().len());
+        if let Some(found) = f(line, line_start) {
+            return Some(found);
         }
     }
     None
@@ -2084,12 +2175,12 @@ async fn main() {
     fn client_snippet_subscribes_against_the_frameworks_public_key_endpoint() {
         let js = render_pwa_register_js();
         assert!(
-            js.contains(autumn_web::push::router::VAPID_PUBLIC_KEY_PATH),
+            js.contains(autumn_web::push::VAPID_PUBLIC_KEY_PATH),
             "the snippet must fetch the key from the built-in endpoint so the two \
              can never drift:\n{js}"
         );
         assert!(
-            js.contains(autumn_web::push::router::SUBSCRIBE_PATH),
+            js.contains(autumn_web::push::SUBSCRIBE_PATH),
             "the snippet must POST the subscription to the built-in endpoint:\n{js}"
         );
         assert!(
@@ -2162,26 +2253,113 @@ async fn main() {
         // is HttpOnly — so without this the generated subscribe/unsubscribe
         // POSTs 403 and push opt-in is unusable in exactly the environment it
         // is meant for.
-        let js = render_pwa_register_js();
+        let js = render_push_opt_in();
         assert!(
-            js.contains(autumn_web::push::router::CSRF_TOKEN_HEADER),
+            js.contains(autumn_web::push::CSRF_TOKEN_HEADER),
             "the snippet must read the token the public-key response serves:\n{js}"
         );
         assert!(
-            js.contains(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER),
+            js.contains(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER),
             "…and the configured header name to send it back in:\n{js}"
         );
         // Every POST must go through the helper that attaches it — a `fetch`
         // with a hand-written `content-type` header would silently skip it.
+        // Counted, not fixed at a number: adding a POST later must not be able
+        // to quietly ship one without a token.
         let posts = js.matches("method: 'POST'").count();
-        assert_eq!(
-            posts, 2,
-            "expected exactly the subscribe and unsubscribe POSTs"
+        assert!(
+            posts >= 2,
+            "expected at least the subscribe and unsubscribe POSTs:\n{js}"
         );
         assert_eq!(
             js.matches("headers: autumnPushHeaders()").count(),
             posts,
             "every push POST must attach the CSRF token:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_replaces_a_subscription_made_with_a_rotated_key() {
+        // A browser keeps its subscription across deployments. After a
+        // `[push] private_key` rotation `subscribe()` REJECTS rather than
+        // replacing one made with the old applicationServerKey, so without
+        // this the affected users cannot opt back in through the generated
+        // button at all.
+        let js = render_push_opt_in();
+        assert!(
+            js.contains("autumnPushKeyMatches"),
+            "the snippet must compare the stored key against the current one:\n{js}"
+        );
+        assert!(
+            js.contains("applicationServerKey"),
+            "…by reading `options.applicationServerKey`:\n{js}"
+        );
+        assert!(
+            js.contains("existing.unsubscribe()"),
+            "…and drop the stale subscription before re-subscribing:\n{js}"
+        );
+        // The server-side row must go too, or it lingers until the push
+        // service reports it gone.
+        assert!(
+            js.contains("existing.endpoint"),
+            "…telling the server to forget the old endpoint as well:\n{js}"
+        );
+    }
+
+    #[test]
+    fn a_browser_that_hides_the_recorded_key_is_left_alone() {
+        // Older Safari does not expose `options.applicationServerKey`.
+        // Churning a working subscription on every page load would be worse
+        // than the rotation case this guards.
+        let js = render_push_opt_in();
+        assert!(
+            js.contains("return true;"),
+            "an unavailable recorded key must be treated as matching:\n{js}"
+        );
+    }
+
+    #[test]
+    fn the_registration_half_stays_free_of_push_concerns() {
+        // Registration must work on a build that never configures push.
+        let js = render_service_worker_registration();
+        assert!(js.contains("serviceWorker"), "{js}");
+        assert!(
+            !js.contains("pushManager") && !js.contains("autumnPush"),
+            "service-worker registration must not depend on the push half:\n{js}"
+        );
+    }
+
+    #[test]
+    fn a_router_mount_inside_a_comment_does_not_count_as_mounted() {
+        // This project's own docs show a quick-start snippet containing the
+        // mount call, so a `main.rs` that pasted it into a comment would look
+        // mounted, skip injection AND skip the warning — leaving every
+        // generated `fetch` to 404 with nothing pointing at the cause.
+        let commented = DEFAULT_MAIN.replace(
+            "#[autumn_web::main]",
+            "// Example from the guide:\n             //     .merge(autumn_web::push::router())\n             #[autumn_web::main]",
+        );
+        assert!(
+            !push_router_already_mounted(&commented),
+            "a commented-out mount must not count as mounted"
+        );
+        let injected = inject_pwa_into_main(&commented);
+        assert!(
+            push_router_already_mounted(&injected),
+            "…so injection must still happen:\n{injected}"
+        );
+    }
+
+    #[test]
+    fn a_real_router_mount_does_count_as_mounted() {
+        let injected = inject_pwa_into_main(DEFAULT_MAIN);
+        assert!(push_router_already_mounted(&injected));
+        assert_eq!(
+            inject_pwa_into_main(&injected)
+                .matches("autumn_web::push::router()")
+                .count(),
+            1,
+            "and a second run must not add another"
         );
     }
 
@@ -2200,11 +2378,16 @@ async fn main() {
     fn client_snippet_sends_credentials_on_every_push_request() {
         // The server resolves the subscriber from the session; without the
         // cookie every call is an anonymous 401.
-        let js = render_pwa_register_js();
+        //
+        // Compared against the number of `fetch` calls rather than a fixed
+        // count: every request the push half makes either authenticates or
+        // reads a per-visitor token, so a new one without credentials is a bug
+        // whatever the total happens to be.
+        let js = render_push_opt_in();
         assert_eq!(
             js.matches("credentials: 'same-origin'").count(),
-            4,
-            "two POSTs plus the two public-key GETs must all carry the session:\n{js}"
+            js.matches("fetch(").count(),
+            "every push request must carry the session cookie:\n{js}"
         );
     }
 

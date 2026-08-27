@@ -57,7 +57,7 @@
 //! Push is a *delivery leg*, not a replacement for the feed: the feed is the
 //! durable record the user can come back to, and the push is the nudge that
 //! brings them back. Write the notification first, then push best-effort —
-//! mirroring how [`Notifications::notify_with_push`] treats its `channels`
+//! mirroring how [`Notifications::notify_with_push`](crate::notifications::Notifications::notify_with_push) treats its `channels`
 //! broadcast:
 //!
 //! ```rust,ignore
@@ -120,14 +120,17 @@
 
 pub mod config;
 pub(crate) mod encryption;
-pub mod router;
+pub mod routes;
 pub mod service;
 pub mod store;
 pub mod transport;
 pub mod vapid;
 
 pub use config::PushConfig;
-pub use router::router;
+pub use routes::{
+    CSRF_TOKEN_HEADER, CSRF_TOKEN_HEADER_NAME_HEADER, SUBSCRIBE_PATH, UNSUBSCRIBE_PATH,
+    VAPID_PUBLIC_KEY_PATH, router,
+};
 pub use service::{PushDeliveryReport, PushMessage, WebPush};
 #[cfg(feature = "db")]
 pub use store::DbPushSubscriptionStore;
@@ -210,7 +213,7 @@ impl PushError {
     /// Consulted by [`AutumnError`](crate::error::AutumnError)'s blanket
     /// conversion, so `push.subscribe(…).await?` in an application's own
     /// handler answers a malformed *browser* payload with the same `400` the
-    /// built-in [`router`] does, instead of reporting a client mistake as a
+    /// built-in [`router()`] does, instead of reporting a client mistake as a
     /// server fault.
     #[must_use]
     pub const fn status(&self) -> http::StatusCode {

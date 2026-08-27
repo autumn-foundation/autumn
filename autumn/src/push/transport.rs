@@ -214,38 +214,57 @@ impl HttpPushTransport {
 impl PushTransport for HttpPushTransport {
     fn deliver<'a>(&'a self, request: &'a PushRequest) -> PushTransportFuture<'a> {
         Box::pin(async move {
-            let pin = resolve_and_validate_endpoint(&request.endpoint).await?;
+            // Every address the host resolves to, all of them already checked
+            // against the SSRF deny-list. Keeping the whole set matters: a
+            // dual-stack push service on a host with no working IPv6 route —
+            // or a CDN whose first answer is momentarily unreachable — would
+            // otherwise fail every push despite the endpoint being perfectly
+            // reachable on another address.
+            let addrs = resolve_and_validate_endpoint(&request.endpoint).await?;
 
-            let mut builder = self
-                .client
-                .post(&request.endpoint)
-                // See the type docs: pin the checked address and refuse to
-                // follow a redirect, so neither DNS rebinding nor a `307` can
-                // steer this POST at an internal host.
-                .pin_to(pin)
-                .no_redirect();
-            for (name, value) in &request.headers {
-                builder = builder.header(name, value);
+            let mut last_error = None;
+            for addr in addrs {
+                let mut builder = self
+                    .client
+                    .post(&request.endpoint)
+                    // See the type docs: pin the checked address and refuse to
+                    // follow a redirect, so neither DNS rebinding nor a `307`
+                    // can steer this POST at an internal host.
+                    .pin_to(addr)
+                    .no_redirect();
+                for (name, value) in &request.headers {
+                    builder = builder.header(name, value);
+                }
+                // A `410 Gone` is a normal, expected answer that must reach
+                // the pruning logic, so a status code is never an error here
+                // — and never a reason to try another address either. Only a
+                // genuine transport failure falls through to the next one.
+                match builder.bytes_body(request.body.clone()).send().await {
+                    Ok(response) => return Ok(response.status().as_u16()),
+                    Err(e) => last_error = Some(e.to_string()),
+                }
             }
-            // A `410 Gone` is a normal, expected answer that must reach the
-            // pruning logic, so status codes are never turned into errors
-            // here — only a genuine transport failure is.
-            match builder.bytes_body(request.body.clone()).send().await {
-                Ok(response) => Ok(response.status().as_u16()),
-                Err(e) => Err(PushError::Transport(e.to_string())),
-            }
+            Err(PushError::Transport(last_error.unwrap_or_else(|| {
+                "the push endpoint host resolved to no usable address".to_owned()
+            })))
         })
     }
 }
 
-/// Resolve `endpoint`'s host and return one address that is safe to connect to.
+/// Resolve `endpoint`'s host and return **every** address that is safe to
+/// connect to, in the resolver's order.
 ///
 /// Every resolved address must pass the outbound client's SSRF deny-list: a
 /// host that resolves to *any* blocked address is refused outright rather than
 /// filtered down to its public addresses, since a resolver returning both is
 /// exactly the shape a rebinding attack produces.
+///
+/// All of them are returned, not just the first, so the caller can fall back
+/// to the next when one is unreachable — see [`HttpPushTransport`].
 #[cfg(feature = "http-client")]
-async fn resolve_and_validate_endpoint(endpoint: &str) -> Result<std::net::SocketAddr, PushError> {
+async fn resolve_and_validate_endpoint(
+    endpoint: &str,
+) -> Result<Vec<std::net::SocketAddr>, PushError> {
     let parsed = url::Url::parse(endpoint)
         .map_err(|e| PushError::InvalidEndpoint(format!("{endpoint}: {e}")))?;
     let host = parsed
@@ -270,9 +289,12 @@ async fn resolve_and_validate_endpoint(endpoint: &str) -> Result<std::net::Socke
             blocked.ip()
         )));
     }
-    addrs.first().copied().ok_or_else(|| {
-        PushError::Transport("the push endpoint host resolved to no addresses".to_owned())
-    })
+    if addrs.is_empty() {
+        return Err(PushError::Transport(
+            "the push endpoint host resolved to no addresses".to_owned(),
+        ));
+    }
+    Ok(addrs)
 }
 
 /// A transport for a build with no HTTP client compiled in.

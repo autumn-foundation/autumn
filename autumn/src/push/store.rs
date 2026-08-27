@@ -311,6 +311,25 @@ fn validate_endpoint(endpoint: &str) -> Result<String, PushError> {
 /// caller can register unbounded rows, and since a send dispatches to each in
 /// turn, that turns one account into an unbounded amount of work per
 /// notification.
+///
+/// # How the bound is actually guaranteed
+///
+/// Enforced in two places, deliberately, because they guarantee different
+/// things:
+///
+/// - [`save`](PushSubscriptionStore::save) refuses a *new* endpoint past the
+///   cap. This is a check-then-insert, so a burst of concurrent subscribes for
+///   one principal can overshoot it by up to the number of requests in flight.
+///   Serializing every subscribe per principal (an advisory lock, or
+///   `SERIALIZABLE`) would close that window at a cost out of all proportion
+///   to what it buys, because —
+/// - [`list_for`](PushSubscriptionStore::list_for) returns **at most** this
+///   many rows. That is the bound that matters: it caps the work a single
+///   notification can cause no matter how many rows a race, a restored backup,
+///   or a hand-written `INSERT` managed to leave in the table.
+///
+/// So the row count is approximately capped and the *per-notification work* is
+/// strictly capped.
 pub const MAX_SUBSCRIPTIONS_PER_PRINCIPAL: usize = 20;
 
 /// Pluggable storage for push subscriptions.
@@ -384,6 +403,11 @@ pub trait PushSubscriptionStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), PushError>> + Send;
 
     /// Every subscription belonging to `principal_id` (empty when none do).
+    ///
+    /// Must return at most [`MAX_SUBSCRIPTIONS_PER_PRINCIPAL`] rows. This is
+    /// the hard bound on how much work one notification can cause — see that
+    /// constant — so a backend must apply it even when the table somehow holds
+    /// more.
     fn list_for(
         &self,
         principal_id: &str,
@@ -502,6 +526,9 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
         Ok(rows
             .iter()
             .filter(|row| row.principal_id == principal_id)
+            // The bound that actually caps per-notification work; see
+            // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
+            .take(MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
             .cloned()
             .collect())
     }
@@ -664,11 +691,13 @@ mod db_store {
             let p256dh = subscription.p256dh_base64url();
             let auth = subscription.auth_base64url();
 
-            // Cap the principal's device count. Checked before the insert
-            // rather than enforced in SQL because the ceiling is a per-owner
-            // count, not a constraint any single row can express; the upsert
-            // below is what stays atomic. A pre-existing endpoint is an
-            // update, so it is never blocked by the cap.
+            // Cap the principal's device count. A per-owner count is not a
+            // constraint any single row can express, so this is a
+            // check-then-insert and a concurrent burst can overshoot it — see
+            // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL` for why that is accepted
+            // rather than serialized away (`list_for`'s LIMIT is the bound
+            // that has to hold, and it does unconditionally). A pre-existing
+            // endpoint is an update, so it is never blocked by the cap.
             // Fully qualified: `FilterDsl` is imported above for the upsert's
             // `DO UPDATE … WHERE`, which would otherwise make this ambiguous.
             let counted = diesel::QueryDsl::filter(
@@ -737,6 +766,10 @@ mod db_store {
             let rows: Vec<SubscriptionRow> = dsl::push_subscriptions
                 .filter(dsl::principal_id.eq(principal_id))
                 .order(dsl::id.asc())
+                // The bound that actually caps per-notification work — applied
+                // in SQL so it holds however many rows the table contains. See
+                // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
+                .limit(i64::try_from(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL).unwrap_or(i64::MAX))
                 .select(SubscriptionRow::as_select())
                 .load(&mut conn)
                 .await
@@ -794,6 +827,21 @@ mod tests {
                 auth: AUTH.to_owned(),
             },
         }
+    }
+
+    /// Put more rows in the store than [`MAX_SUBSCRIPTIONS_PER_PRINCIPAL`]
+    /// allows, bypassing `save`'s cap the way a restored backup or a
+    /// hand-written `INSERT` would.
+    ///
+    /// Deliberately not `async`: holding the guard inside an async fn would
+    /// keep a `MutexGuard` alive across an await point.
+    fn stuff_past_the_cap(store: &MemoryPushSubscriptionStore) {
+        let extra: Vec<StoredSubscription> = (0..(MAX_SUBSCRIPTIONS_PER_PRINCIPAL * 3))
+            .map(|i| stored(1_i64, &format!("https://push.example.com/raw{i}")))
+            .collect();
+        let mut rows = store.rows.lock().expect("memory store lock");
+        rows.extend(extra);
+        drop(rows);
     }
 
     fn stored(principal: impl Into<PushPrincipal>, endpoint: &str) -> StoredSubscription {
@@ -1223,6 +1271,22 @@ mod tests {
         assert_eq!(
             store.list_for("1").await.expect("list").len(),
             MAX_SUBSCRIPTIONS_PER_PRINCIPAL
+        );
+    }
+
+    #[tokio::test]
+    async fn list_for_is_bounded_even_when_the_table_holds_more() {
+        // This is the bound that actually caps per-notification work. The
+        // insert-time cap is a check-then-insert and can be overshot by a
+        // concurrent burst (or by a restored backup, or a hand-written
+        // INSERT); this must hold regardless, so it is asserted against a
+        // store deliberately stuffed past the cap.
+        let store = MemoryPushSubscriptionStore::new();
+        stuff_past_the_cap(&store);
+        assert_eq!(
+            store.list_for("1").await.expect("list").len(),
+            MAX_SUBSCRIPTIONS_PER_PRINCIPAL,
+            "one notification must never fan out past the cap"
         );
     }
 

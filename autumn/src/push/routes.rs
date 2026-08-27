@@ -74,8 +74,12 @@ struct UnsubscribeBody {
     endpoint: String,
 }
 
-/// Response header carrying the caller's CSRF token on the public-key
-/// response. See [`vapid_public_key`].
+/// Response header carrying the caller's CSRF token on the
+/// `GET /push/vapid-public-key` response.
+///
+/// The subscribe snippet reads it and sends the token back in the header named
+/// by [`CSRF_TOKEN_HEADER_NAME_HEADER`]; see the [module docs](self) for why
+/// the token travels this way.
 pub const CSRF_TOKEN_HEADER: &str = "x-autumn-push-csrf-token";
 /// Response header naming the header the CSRF token must be sent back in.
 pub const CSRF_TOKEN_HEADER_NAME_HEADER: &str = "x-autumn-push-csrf-header";

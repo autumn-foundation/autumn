@@ -529,7 +529,7 @@ async fn the_public_key_response_carries_a_csrf_token_for_the_snippet() {
     response.assert_status(200);
 
     let token = response
-        .header(autumn_web::push::router::CSRF_TOKEN_HEADER)
+        .header(autumn_web::push::CSRF_TOKEN_HEADER)
         .expect("the response must carry a CSRF token when CSRF is enabled");
     assert!(!token.is_empty(), "an empty token is no token");
     // Compared case-insensitively: the framework normalizes the configured
@@ -538,7 +538,7 @@ async fn the_public_key_response_carries_a_csrf_token_for_the_snippet() {
     // name to use rather than guessing.
     assert_eq!(
         response
-            .header(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER)
+            .header(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER)
             .map(str::to_ascii_lowercase),
         Some("x-csrf-token".to_owned()),
         "the snippet needs the configured header name, not a guess"
@@ -562,11 +562,11 @@ async fn subscribe_succeeds_with_the_token_from_the_public_key_response() {
 
     let key_response = client.get("/push/vapid-public-key").send().await;
     let token = key_response
-        .header(autumn_web::push::router::CSRF_TOKEN_HEADER)
+        .header(autumn_web::push::CSRF_TOKEN_HEADER)
         .expect("token")
         .to_owned();
     let header_name = key_response
-        .header(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER)
+        .header(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER)
         .expect("header name")
         .to_owned();
 
