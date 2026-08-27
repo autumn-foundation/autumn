@@ -225,10 +225,11 @@ impl SandboxArtifact {
                 max: MAX_MANIFEST_BYTES,
             });
         }
-        let length = u32::try_from(manifest.len()).map_err(|_| ArtifactError::ManifestTooLarge {
-            found: manifest.len(),
-            max: MAX_MANIFEST_BYTES,
-        })?;
+        let length =
+            u32::try_from(manifest.len()).map_err(|_| ArtifactError::ManifestTooLarge {
+                found: manifest.len(),
+                max: MAX_MANIFEST_BYTES,
+            })?;
 
         let mut out = Vec::with_capacity(HEADER_BYTES + manifest.len() + self.module.len());
         out.extend_from_slice(Self::MAGIC);
@@ -278,13 +279,11 @@ impl SandboxArtifact {
             });
         }
         let body = bytes.get(HEADER_BYTES..).unwrap_or_default();
-        let manifest_bytes = body
-            .get(..manifest_len)
-            .ok_or(ArtifactError::Truncated {
-                what: "the manifest",
-                needed: manifest_len,
-                available: body.len(),
-            })?;
+        let manifest_bytes = body.get(..manifest_len).ok_or(ArtifactError::Truncated {
+            what: "the manifest",
+            needed: manifest_len,
+            available: body.len(),
+        })?;
         let manifest_src =
             std::str::from_utf8(manifest_bytes).map_err(|_| ArtifactError::ManifestNotUtf8)?;
         let manifest = SandboxManifest::parse(manifest_src)?;
@@ -295,7 +294,7 @@ impl SandboxArtifact {
         let actual = Self::digest(&module);
         if actual != manifest.sha256 {
             return Err(ArtifactError::DigestMismatch {
-                declared: manifest.sha256.clone(),
+                declared: manifest.sha256,
                 actual,
             });
         }
@@ -330,7 +329,7 @@ impl SandboxArtifact {
 fn read_u32(header: &[u8], at: usize) -> Result<u32, ArtifactError> {
     let slice = header
         .get(at..at.saturating_add(4))
-        .ok_or(ArtifactError::Truncated {
+        .ok_or_else(|| ArtifactError::Truncated {
             what: "a container header field",
             needed: at.saturating_add(4),
             available: header.len(),
@@ -437,7 +436,10 @@ path = "/hello/greet"
         bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
         let err = SandboxArtifact::read(&bytes).expect_err("future version must be caught");
         assert!(
-            matches!(err, ArtifactError::UnsupportedFormatVersion { found: 2, .. }),
+            matches!(
+                err,
+                ArtifactError::UnsupportedFormatVersion { found: 2, .. }
+            ),
             "{err}"
         );
     }
@@ -461,7 +463,10 @@ path = "/hello/greet"
         let err = SandboxArtifact::read(&bytes).expect_err("must be caught");
         // The ceiling check runs before the slice, so a 4 GiB claim is refused
         // without the reader ever sizing a buffer from it.
-        assert!(matches!(err, ArtifactError::ManifestTooLarge { .. }), "{err}");
+        assert!(
+            matches!(err, ArtifactError::ManifestTooLarge { .. }),
+            "{err}"
+        );
 
         // A length under the ceiling but past the end is a framing error.
         #[allow(clippy::cast_possible_truncation)]
@@ -482,7 +487,10 @@ path = "/hello/greet"
         bytes.extend_from_slice(manifest.as_bytes());
         bytes.extend_from_slice(EMPTY_MODULE);
         let err = SandboxArtifact::read(&bytes).expect_err("must be caught");
-        assert!(matches!(err, ArtifactError::ManifestTooLarge { .. }), "{err}");
+        assert!(
+            matches!(err, ArtifactError::ManifestTooLarge { .. }),
+            "{err}"
+        );
     }
 
     #[test]

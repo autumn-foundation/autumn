@@ -226,11 +226,7 @@ impl ResourceLimits {
             // limit" but "cannot run", and a manifest that says it by accident
             // should say so at load rather than at the first request.
             if value == 0 || value > max {
-                return Err(ManifestError::LimitOutOfRange {
-                    field,
-                    value,
-                    max,
-                });
+                return Err(ManifestError::LimitOutOfRange { field, value, max });
             }
         }
         // `max_request_body_bytes` is exempt from the zero check above only in
@@ -485,25 +481,31 @@ impl SandboxManifest {
     /// may not, and which bytes were reviewed.
     #[must_use]
     pub fn consent_summary(&self) -> String {
+        use std::fmt::Write as _;
+
         let mut out = String::new();
-        out.push_str(&format!(
-            "Sandboxed plugin: {name} {version}\n",
+        // `write!` to a `String` is infallible; the results are dropped rather
+        // than unwrapped so this stays panic-free by construction.
+        let _ = writeln!(
+            out,
+            "Sandboxed plugin: {name} {version}",
             name = self.name,
             version = self.version
-        ));
-        out.push_str(&format!("  module sha256: {}\n", self.sha256));
-        out.push_str(&format!("  mounts prefix: {}\n", self.prefix));
+        );
+        let _ = writeln!(out, "  module sha256: {}", self.sha256);
+        let _ = writeln!(out, "  mounts prefix: {}", self.prefix);
         out.push_str("  routes it serves (and only these):\n");
         for route in &self.routes {
-            out.push_str(&format!("    {} {}\n", route.method, route.path));
+            let _ = writeln!(out, "    {} {}", route.method, route.path);
         }
         out.push_str("  capabilities granted:\n");
         for capability in &self.capabilities {
-            out.push_str(&format!(
-                "    {name} — {describe}\n",
+            let _ = writeln!(
+                out,
+                "    {name} — {describe}",
                 name = capability.as_str(),
                 describe = capability.describe()
-            ));
+            );
         }
         out.push_str(
             "  denied, with no way to ask for it in this version:\n    \
@@ -511,15 +513,16 @@ impl SandboxManifest {
              database access, and any host authority not listed above\n",
         );
         out.push_str("  resource ceilings per request:\n");
-        out.push_str(&format!(
+        let _ = writeln!(
+            out,
             "    cpu {fuel} fuel units, memory {memory} bytes, request body {body} bytes,\n    \
-             response {response} bytes, at most {concurrency} concurrent requests\n",
+             response {response} bytes, at most {concurrency} concurrent requests",
             fuel = self.limits.fuel,
             memory = self.limits.memory_bytes,
             body = self.limits.max_request_body_bytes,
             response = self.limits.max_response_bytes,
             concurrency = self.limits.max_concurrency,
-        ));
+        );
         out
     }
 
@@ -766,14 +769,20 @@ max_concurrency = 8
     fn a_route_outside_the_declared_prefix_is_refused() {
         let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/admin/users""#);
         let err = SandboxManifest::parse(&src).expect_err("off-prefix route must fail");
-        assert!(matches!(err, ManifestError::RouteOutsidePrefix { .. }), "{err}");
+        assert!(
+            matches!(err, ManifestError::RouteOutsidePrefix { .. }),
+            "{err}"
+        );
     }
 
     #[test]
     fn a_route_that_only_shares_a_prefix_string_is_refused() {
         let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/helloworld""#);
         let err = SandboxManifest::parse(&src).expect_err("string-prefix route must fail");
-        assert!(matches!(err, ManifestError::RouteOutsidePrefix { .. }), "{err}");
+        assert!(
+            matches!(err, ManifestError::RouteOutsidePrefix { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -793,7 +802,14 @@ max_concurrency = 8
 
     #[test]
     fn a_prefix_with_a_wildcard_or_traversal_is_refused() {
-        for bad in ["/he*llo", "/{tenant}", "/hello/", "/hello//x", "/../hello", "hello"] {
+        for bad in [
+            "/he*llo",
+            "/{tenant}",
+            "/hello/",
+            "/hello//x",
+            "/../hello",
+            "hello",
+        ] {
             let src = valid_toml()
                 .replace(r#"prefix = "/hello""#, &format!(r#"prefix = "{bad}""#))
                 .replace(r#"path = "/hello/greet""#, &format!(r#"path = "{bad}""#));

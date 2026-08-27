@@ -14,13 +14,13 @@ pub mod wire;
 #[doc(hidden)]
 pub mod test_guests;
 
+pub use artifact::{ArtifactError, SandboxArtifact};
 pub use host::{
     CapabilityDenial, DeniedCapability, SandboxFailure, SandboxHost, SandboxLoadError,
     SandboxOutcome,
 };
-pub use plugin::{SandboxPluginError, SandboxedPlugin, SANDBOX_ATTRIBUTION_HEADER};
-pub use artifact::{ArtifactError, SandboxArtifact};
-pub use wire::{GuestFrame, HostFrame, SandboxRequest, SandboxResponse, WireError};
 pub use manifest::{
     ManifestError, ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
+pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use wire::{GuestFrame, HostFrame, SandboxRequest, SandboxResponse, WireError};

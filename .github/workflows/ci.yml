@@ -65,6 +65,18 @@ jobs:
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
         run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" --all-targets -- -D warnings
+      - name: Clippy (autumn-web, plugin-sandbox — panic gate)
+        # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
+        # above compiles `plugin_sandbox`'s request-path modules and their
+        # `#![cfg_attr(not(test), deny(clippy::…))]` panic gates never fire. This is
+        # the module set where an unannotated panic matters most: `host.rs` runs an
+        # interpreter over an artifact the operator explicitly did not audit, and
+        # the whole promise of the lane is that nothing a hostile guest does can
+        # abort the host process.
+        #
+        # Kept as its own lane rather than folded into the list above so a
+        # `wasmi`-linking build is not forced on every gated-feature Clippy run.
+        run: cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -200,6 +212,21 @@ jobs:
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+      - name: Run plugin-sandbox tests (untrusted-plugin containment)
+        # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
+        # compiles neither the sandbox's in-module suites nor
+        # `autumn/tests/integration/plugin_sandbox.rs`. That integration module IS
+        # the containment claim for #1609 — an adversarial corpus of file, network,
+        # environment, database, CPU-spin, memory-bomb, trap and abort attempts,
+        # each asserted to be refused at load or denied at runtime, with the host
+        # process and every other route still serving. A regression there is a
+        # sandbox escape, so it has to run in a lane that blocks merge.
+        #
+        # `test-support` supplies the shared WAT guest corpus; `wat` (a dev
+        # dependency) compiles it, so no `wasm32-wasip1` toolchain is needed.
+        run: |
+          cargo test -p autumn-web --features plugin-sandbox --lib plugin_sandbox
+          cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends

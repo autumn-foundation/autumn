@@ -143,8 +143,11 @@ RFC 5322 / MIME bytes into typed values), the shared saturating-arithmetic helpe
 those modules call (`time_math`), the per-request middleware stack, and the
 failure-capsule capture path (`autumn/src/capsule/capture.rs`, `wire.rs`,
 `record_db.rs`: they tee a live request's body and its database connection, so
-a panic there would take down the very request they exist to record). These are
-the 37 files listed in the `REQUEST_PATH_MODULES` array in
+a panic there would take down the very request they exist to record), and the
+sandboxed-plugin runtime (`autumn/src/plugin_sandbox/host.rs`, `wire.rs`,
+`plugin.rs`: they run an artifact the operator explicitly did not audit, and the
+lane's whole promise is that nothing a hostile guest does can abort the host
+process). These are the files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 

@@ -112,10 +112,7 @@ async fn an_artifact_modified_after_review_is_refused_at_install() {
     std::fs::write(&path, &bytes).expect("writes");
 
     let err = SandboxedPlugin::from_file(&path).expect_err("tampering must be refused");
-    assert!(
-        matches!(err, SandboxPluginError::Artifact(_)),
-        "{err}"
-    );
+    assert!(matches!(err, SandboxPluginError::Artifact(_)), "{err}");
     // The refusal has to say what happened, or an operator cannot act on it.
     assert!(err.to_string().contains("digest mismatch"), "{err}");
 }
@@ -209,7 +206,11 @@ const CORPUS: &[(&str, &str, Containment)] = &[
         guests::FORGE_COOKIE,
         Containment::DeniedAndServed(DeniedCapability::ResponseHeader),
     ),
-    ("call a database seam", guests::DATABASE, Containment::RefusedAtLoad),
+    (
+        "call a database seam",
+        guests::DATABASE,
+        Containment::RefusedAtLoad,
+    ),
     (
         "call an invented host escape",
         guests::HOST_COMMAND,
@@ -220,7 +221,11 @@ const CORPUS: &[(&str, &str, Containment)] = &[
         guests::UNDEFINED_WASI,
         Containment::RefusedAtLoad,
     ),
-    ("spin the CPU forever", guests::CPU_SPIN, Containment::StoppedWithFivehundred),
+    (
+        "spin the CPU forever",
+        guests::CPU_SPIN,
+        Containment::StoppedWithFivehundred,
+    ),
     (
         "allocate without bound",
         guests::MEMORY_BOMB,
@@ -291,10 +296,7 @@ async fn the_adversarial_corpus_is_contained_in_full() {
                 let err = loaded
                     .err()
                     .unwrap_or_else(|| panic!("{what}: must be refused at load"));
-                assert!(
-                    matches!(err, SandboxPluginError::Load(_)),
-                    "{what}: {err}"
-                );
+                assert!(matches!(err, SandboxPluginError::Load(_)), "{what}: {err}");
                 continue;
             }
             _ => {}
@@ -322,7 +324,10 @@ async fn the_adversarial_corpus_is_contained_in_full() {
                 );
             }
             Containment::StoppedWithFivehundred => {
-                assert!(status.is_server_error(), "{what}: expected 5xx, got {status}");
+                assert!(
+                    status.is_server_error(),
+                    "{what}: expected 5xx, got {status}"
+                );
             }
             Containment::RefusedAtLoad => unreachable!(),
         }
@@ -351,10 +356,13 @@ fn sandbox_request() -> autumn_web::plugin_sandbox::SandboxRequest {
 async fn a_runaway_plugin_does_not_stop_a_concurrent_request_to_another_route() {
     // The interpreter is synchronous; if it ran on the async runtime a single
     // spinning guest would stall every other in-flight request on that worker.
-    let plugin = Arc::new(plugin(guests::CPU_SPIN, ResourceLimits {
-        fuel: 200_000_000,
-        ..adversarial_limits()
-    }));
+    let plugin = Arc::new(plugin(
+        guests::CPU_SPIN,
+        ResourceLimits {
+            fuel: 200_000_000,
+            ..adversarial_limits()
+        },
+    ));
     let spinning = tokio::spawn({
         let plugin = Arc::clone(&plugin);
         async move { get(app(&plugin), "/hello/greet").await }

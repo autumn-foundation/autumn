@@ -50,6 +50,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capability-sandboxed plugins — install an unaudited plugin without
+  installing its authority (#1609):** every Autumn plugin until now has been
+  full-trust native code. `Plugin::build(self, app)` hands over the entire
+  `AppBuilder`, which is the right trade for a first-party crate and the wrong
+  one for something found on crates.io ten minutes ago — a compromised
+  `autumn-plugin-*` can read your credentials, exfiltrate your database, or take
+  the process down, and dependency auditing catches only the vulnerabilities
+  someone has already named. The new non-default `plugin-sandbox` feature adds
+  the other lane. A sandboxed plugin ships as a `.autumn-plugin` artifact — a
+  `wasm32-wasip1` module plus a manifest declaring its route prefix, the exact
+  `(method, path)` pairs it mounts, its capabilities, and its per-request CPU
+  and memory ceilings — and the runtime enforces every word of it.
+  Deny-by-default is structural rather than configured: the guest's whole
+  authority is the host-function table the shim registers, so filesystem,
+  network, environment and database access are not "off" but absent, each
+  attempt answered with `ENOTCAPABLE` and recorded as a logged denial, and an
+  import no host function defines is refused at load before the artifact runs
+  once. The manifest is the mount, not a description of it: the router is built
+  from its declared routes, so an undeclared path under the prefix is a 404 the
+  guest never sees. Fuel bounds CPU and a store limiter bounds memory, both
+  per request against a fresh instance, and the interpreter runs on a blocking
+  worker — so a spin, a memory bomb, a trap, a `proc_exit`, a malformed answer
+  or no answer at all is a 502/503/504 on the plugin's own prefix while every
+  other route keeps serving, and nothing a plugin does can abort the host
+  process. Credentials are stripped from the request before it crosses, and
+  `Set-Cookie`, framing headers and anything carrying `\r\n` are stripped or
+  refused on the way back, so a plugin cannot forge a session in your origin or
+  split your response. `autumn plugin package` binds a manifest to a module and
+  stamps the digest the author could not know; `autumn plugin inspect` is the
+  consent screen — the grant, the routes, the reviewed digest, every host
+  function imported, the classes of authority denied — and it loads the module
+  into the same sandbox the runtime uses and runs the existing route
+  conformance checks over the manifest, offline. The app still deploys as one
+  binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
+  subprocess and no native codegen backend. Purely additive — the native
+  `Plugin` trait and every existing plugin are untouched, and the feature is off
+  by default. First slice: request handling under the declared prefix is the
+  only capability that exists, so no manifest can ask for a database, a session
+  or an outbound call. See `docs/guide/sandboxed-plugins.md`.
+
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
   shipped until now — rolling, blue/green, canary — routes **real** traffic to

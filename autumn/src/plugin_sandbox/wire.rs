@@ -35,9 +35,25 @@
 //! Header names and values are validated before they reach a response: a value
 //! carrying `\r\n` would otherwise let a guest inject headers of its own into
 //! the host's response, which is a `Set-Cookie` by another route.
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 use std::fmt;
-
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
@@ -100,10 +116,16 @@ impl fmt::Display for WireError {
         match self {
             Self::Json(err) => write!(f, "malformed sandbox wire frame: {err}"),
             Self::InvalidStatus(status) => {
-                write!(f, "the plugin answered with status {status}, which is not a valid HTTP status")
+                write!(
+                    f,
+                    "the plugin answered with status {status}, which is not a valid HTTP status"
+                )
             }
             Self::InvalidHeader { name, reason } => {
-                write!(f, "the plugin answered with an invalid header {name:?}: {reason}")
+                write!(
+                    f,
+                    "the plugin answered with an invalid header {name:?}: {reason}"
+                )
             }
             Self::ResponseTooLarge { found, max } => write!(
                 f,
@@ -374,8 +396,11 @@ mod tests {
 
     #[test]
     fn a_request_frame_round_trips() {
-        let line = to_line(&HostFrame::request(&request(), &[SandboxCapability::HttpRequest]))
-            .expect("serializes");
+        let line = to_line(&HostFrame::request(
+            &request(),
+            &[SandboxCapability::HttpRequest],
+        ))
+        .expect("serializes");
         assert!(line.ends_with('\n'), "frames are newline terminated");
         let back: HostFrame = from_line(line.trim_end()).expect("parses");
         let HostFrame::Request {
@@ -486,7 +511,10 @@ mod tests {
                 headers: vec![],
                 body: vec![],
             };
-            assert!(response.validate().is_ok(), "status {status} must be allowed");
+            assert!(
+                response.validate().is_ok(),
+                "status {status} must be allowed"
+            );
         }
     }
 

@@ -43,6 +43,23 @@
 //! answers: all of them come back as [`SandboxFailure`] inside an
 //! [`SandboxOutcome`]. Nothing in this module can abort, exit or panic the host
 //! process.
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -214,7 +231,9 @@ impl SandboxFailure {
     #[must_use]
     pub const fn status(&self) -> http::StatusCode {
         match self {
-            Self::FuelExhausted { .. } | Self::OutputBudget { .. } => http::StatusCode::GATEWAY_TIMEOUT,
+            Self::FuelExhausted { .. } | Self::OutputBudget { .. } => {
+                http::StatusCode::GATEWAY_TIMEOUT
+            }
             _ => http::StatusCode::BAD_GATEWAY,
         }
     }
@@ -560,9 +579,7 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
 fn forbidden_imports(module: &Module) -> Vec<CapabilityDenial> {
     module
         .imports()
-        .filter(|import| {
-            import.module() != WASI || !is_shim_function(import.name())
-        })
+        .filter(|import| import.module() != WASI || !is_shim_function(import.name()))
         .map(|import| CapabilityDenial {
             capability: DeniedCapability::UnknownImport,
             operation: format!("{}::{}", import.module(), import.name()),
@@ -663,7 +680,7 @@ impl HostState {
     /// same artifact see the same bytes.
     const RANDOM_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
-    fn new(limits: ResourceLimits) -> Self {
+    const fn new(limits: ResourceLimits) -> Self {
         Self {
             stdin: VecDeque::new(),
             stdout_line: Vec::new(),
@@ -876,30 +893,130 @@ const SERVED_IMPORTS: &[&str] = &[
 const DENIED_IMPORTS: &[(&str, DeniedCapability, &str, &str)] = &[
     // There is no filesystem.
     ("fd_advise", DeniedCapability::Filesystem, FS_DETAIL, "illi"),
-    ("fd_allocate", DeniedCapability::Filesystem, FS_DETAIL, "ill"),
+    (
+        "fd_allocate",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "ill",
+    ),
     ("fd_datasync", DeniedCapability::Filesystem, FS_DETAIL, "i"),
-    ("fd_fdstat_set_flags", DeniedCapability::Filesystem, FS_DETAIL, "ii"),
-    ("fd_fdstat_set_rights", DeniedCapability::Filesystem, FS_DETAIL, "ill"),
-    ("fd_filestat_get", DeniedCapability::Filesystem, FS_DETAIL, "ii"),
-    ("fd_filestat_set_size", DeniedCapability::Filesystem, FS_DETAIL, "il"),
-    ("fd_filestat_set_times", DeniedCapability::Filesystem, FS_DETAIL, "illi"),
+    (
+        "fd_fdstat_set_flags",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "ii",
+    ),
+    (
+        "fd_fdstat_set_rights",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "ill",
+    ),
+    (
+        "fd_filestat_get",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "ii",
+    ),
+    (
+        "fd_filestat_set_size",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "il",
+    ),
+    (
+        "fd_filestat_set_times",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "illi",
+    ),
     ("fd_pread", DeniedCapability::Filesystem, FS_DETAIL, "iiili"),
-    ("fd_prestat_dir_name", DeniedCapability::Filesystem, FS_DETAIL, "iii"),
-    ("fd_prestat_get", DeniedCapability::Filesystem, FS_DETAIL, "ii"),
-    ("fd_pwrite", DeniedCapability::Filesystem, FS_DETAIL, "iiili"),
-    ("fd_readdir", DeniedCapability::Filesystem, FS_DETAIL, "iiili"),
+    (
+        "fd_prestat_dir_name",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iii",
+    ),
+    (
+        "fd_prestat_get",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "ii",
+    ),
+    (
+        "fd_pwrite",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiili",
+    ),
+    (
+        "fd_readdir",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiili",
+    ),
     ("fd_renumber", DeniedCapability::Filesystem, FS_DETAIL, "ii"),
     ("fd_sync", DeniedCapability::Filesystem, FS_DETAIL, "i"),
-    ("path_create_directory", DeniedCapability::Filesystem, FS_DETAIL, "iii"),
-    ("path_filestat_get", DeniedCapability::Filesystem, FS_DETAIL, "iiiii"),
-    ("path_filestat_set_times", DeniedCapability::Filesystem, FS_DETAIL, "iiiilli"),
-    ("path_link", DeniedCapability::Filesystem, FS_DETAIL, "iiiiiii"),
-    ("path_open", DeniedCapability::Filesystem, FS_DETAIL, "iiiiillii"),
-    ("path_readlink", DeniedCapability::Filesystem, FS_DETAIL, "iiiiii"),
-    ("path_remove_directory", DeniedCapability::Filesystem, FS_DETAIL, "iii"),
-    ("path_rename", DeniedCapability::Filesystem, FS_DETAIL, "iiiiii"),
-    ("path_symlink", DeniedCapability::Filesystem, FS_DETAIL, "iiiii"),
-    ("path_unlink_file", DeniedCapability::Filesystem, FS_DETAIL, "iii"),
+    (
+        "path_create_directory",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iii",
+    ),
+    (
+        "path_filestat_get",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiii",
+    ),
+    (
+        "path_filestat_set_times",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiilli",
+    ),
+    (
+        "path_link",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiiiii",
+    ),
+    (
+        "path_open",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiiillii",
+    ),
+    (
+        "path_readlink",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiiii",
+    ),
+    (
+        "path_remove_directory",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iii",
+    ),
+    (
+        "path_rename",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiiii",
+    ),
+    (
+        "path_symlink",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iiiii",
+    ),
+    (
+        "path_unlink_file",
+        DeniedCapability::Filesystem,
+        FS_DETAIL,
+        "iii",
+    ),
     // There is no network.
     ("sock_accept", DeniedCapability::Network, NET_DETAIL, "iii"),
     ("sock_recv", DeniedCapability::Network, NET_DETAIL, "iiiiii"),
@@ -951,11 +1068,7 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         .func_wrap(
             WASI,
             "fd_read",
-            |mut caller: Caller<'_, HostState>,
-             fd: i32,
-             iovs: i32,
-             iovs_len: i32,
-             nread: i32| {
+            |mut caller: Caller<'_, HostState>, fd: i32, iovs: i32, iovs_len: i32, nread: i32| {
                 if fd != 0 {
                     // The guest was given one descriptor. Anything else is a
                     // reach for a file it was never handed.
@@ -1314,7 +1427,8 @@ fn write_two_zeroes(caller: &mut Caller<'_, HostState>, first: i32, second: i32)
     let (Ok(first), Ok(second)) = (usize::try_from(first), usize::try_from(second)) else {
         return errno::INVAL;
     };
-    if write_u32(caller, memory, first, 0).is_none() || write_u32(caller, memory, second, 0).is_none()
+    if write_u32(caller, memory, first, 0).is_none()
+        || write_u32(caller, memory, second, 0).is_none()
     {
         return errno::INVAL;
     }
@@ -1448,7 +1562,10 @@ path = "/hello/greet"
     fn the_guest_sees_the_request_it_was_sent() {
         let host = host(guests::HELLO);
         assert_eq!(
-            host.run(&get("/hello/other")).result.expect("answers").status,
+            host.run(&get("/hello/other"))
+                .result
+                .expect("answers")
+                .status,
             404
         );
         assert_eq!(
@@ -1467,7 +1584,10 @@ path = "/hello/greet"
         let host = host(guests::HELLO);
         let first = host.run(&get("/hello/greet"));
         let second = host.run(&get("/hello/greet"));
-        assert_eq!(first.result.expect("answers"), second.result.expect("answers"));
+        assert_eq!(
+            first.result.expect("answers"),
+            second.result.expect("answers")
+        );
         assert_eq!(first.fuel_used, second.fuel_used);
     }
 
@@ -1634,7 +1754,10 @@ path = "/hello/greet"
         let first = host.run(&get("/hello/greet"));
         let second = host.run(&get("/hello/greet"));
         assert!(first.denials.is_empty(), "{:?}", first.denials);
-        assert_eq!(first.result.expect("answers"), second.result.expect("answers"));
+        assert_eq!(
+            first.result.expect("answers"),
+            second.result.expect("answers")
+        );
     }
 
     #[test]
@@ -1651,7 +1774,10 @@ path = "/hello/greet"
     #[test]
     fn a_host_escape_from_an_invented_namespace_is_refused_at_load() {
         let err = try_host(guests::HOST_COMMAND).expect_err("must be refused");
-        assert!(matches!(err, SandboxLoadError::ForbiddenImports(_)), "{err}");
+        assert!(
+            matches!(err, SandboxLoadError::ForbiddenImports(_)),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1726,7 +1852,10 @@ path = "/hello/greet"
     #[test]
     fn the_first_answer_is_the_answer() {
         let outcome = host(guests::DOUBLE_ANSWER).run(&get("/hello/greet"));
-        assert_eq!(outcome.result.expect("answers").body, b"hello from the sandbox");
+        assert_eq!(
+            outcome.result.expect("answers").body,
+            b"hello from the sandbox"
+        );
     }
 
     #[test]
@@ -1735,16 +1864,19 @@ path = "/hello/greet"
         // honest guest from linking at all. This builds a module importing
         // every refusal with the shape the table declares and proves it
         // instantiates and runs.
+        use std::fmt::Write as _;
+
         let mut wat = String::from("(module\n");
         for (name, _, _, signature) in DENIED_IMPORTS {
             let params: Vec<&str> = signature
                 .chars()
                 .map(|ch| if ch == 'l' { "i64" } else { "i32" })
                 .collect();
-            wat.push_str(&format!(
-                "  (import \"wasi_snapshot_preview1\" \"{name}\" (func (param {params}) (result i32)))\n",
+            let _ = writeln!(
+                wat,
+                "  (import \"wasi_snapshot_preview1\" \"{name}\" (func (param {params}) (result i32)))",
                 params = params.join(" ")
-            ));
+            );
         }
         wat.push_str("  (memory (export \"memory\") 1)\n  (func (export \"_start\") (nop))\n)");
         let outcome = host(&wat).run(&get("/hello/greet"));

@@ -41,6 +41,23 @@
 //! The last column is the point. Every failure mode is scoped to the plugin's
 //! own prefix, because the interpreter runs on a blocking worker with a bounded
 //! permit count and can only ever return a value.
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 use std::borrow::Cow;
 use std::fmt;
@@ -168,7 +185,6 @@ impl SandboxedPlugin {
     /// Generic over the router's state because the handlers use none: a
     /// sandboxed plugin has no access to application state, which is the whole
     /// point.
-    #[must_use]
     pub fn router<S>(&self) -> axum::Router<S>
     where
         S: Clone + Send + Sync + 'static,
@@ -323,21 +339,19 @@ async fn serve(
 
     // The ceiling is applied while reading, so an oversized body is refused
     // without ever being buffered in full.
-    let body = match axum::body::to_bytes(body, limits.max_request_body_bytes).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(_) => {
-            tracing::warn!(
-                plugin,
-                max_request_body_bytes = limits.max_request_body_bytes,
-                "request body over the sandboxed plugin's declared ceiling; refusing it"
-            );
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "the request body is over this sandboxed plugin's declared ceiling\n",
-            )
-                .into_response();
-        }
+    let Ok(body) = axum::body::to_bytes(body, limits.max_request_body_bytes).await else {
+        tracing::warn!(
+            plugin,
+            max_request_body_bytes = limits.max_request_body_bytes,
+            "request body over the sandboxed plugin's declared ceiling; refusing it"
+        );
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the request body is over this sandboxed plugin's declared ceiling\n",
+        )
+            .into_response();
     };
+    let body = body.to_vec();
 
     let sandbox_request = SandboxRequest {
         method: parts.method.as_str().to_owned(),
@@ -364,7 +378,11 @@ async fn serve(
                 error = %err,
                 "the sandbox worker did not complete; serving 502 on the plugin's prefix"
             );
-            return sandbox_error(&plugin, StatusCode::BAD_GATEWAY, "the plugin did not complete");
+            return sandbox_error(
+                &plugin,
+                StatusCode::BAD_GATEWAY,
+                "the plugin did not complete",
+            );
         }
     };
 
@@ -428,11 +446,10 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
         None => return sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid plugin name"),
     }
 
-    out.body(Body::from(response.body.clone()))
-        .map_or_else(
-            |_| sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid response"),
-            axum::response::IntoResponse::into_response,
-        )
+    out.body(Body::from(response.body.clone())).map_or_else(
+        |_| sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid response"),
+        axum::response::IntoResponse::into_response,
+    )
 }
 
 fn attribution(plugin: &str) -> Option<HeaderValue> {

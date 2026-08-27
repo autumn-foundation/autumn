@@ -359,10 +359,7 @@ path = "/hello/greet"
     }
 
     fn good_fixture() -> Fixture {
-        fixture(
-            &manifest_toml(),
-            wat::parse_str(MODULE).expect("valid WAT"),
-        )
+        fixture(&manifest_toml(), wat::parse_str(MODULE).expect("valid WAT"))
     }
 
     fn pack(fixture: &Fixture) -> SandboxArtifact {
@@ -520,6 +517,10 @@ path = "/hello/greet"
         let report = Report::of(&artifact);
         assert!(!report.loads);
         assert!(!report.passed());
-        assert!(report.to_text().contains("env::system"), "{}", report.to_text());
+        assert!(
+            report.to_text().contains("env::system"),
+            "{}",
+            report.to_text()
+        );
     }
 }

@@ -13,11 +13,10 @@
 //! integration suite can share the corpus with this crate's unit tests instead
 //! of keeping a second, drifting copy.
 
-
 /// A well-behaved plugin: it reads the request frame, dispatches on
 /// its content, and answers. Everything else in this corpus is a
 /// variation on it that misbehaves in exactly one way.
-pub const HELLO: &str = r##"(module
+pub const HELLO: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -103,10 +102,10 @@ pub const HELLO: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Never stops computing. Bounded only by the fuel ceiling.
-pub const CPU_SPIN: &str = r##"(module
+pub const CPU_SPIN: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -193,10 +192,10 @@ pub const CPU_SPIN: &str = r##"(module
     (loop $l (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l))
   )
 )
-"##;
+"#;
 
 /// Grows linear memory until the host refuses, then keeps asking.
-pub const MEMORY_BOMB: &str = r##"(module
+pub const MEMORY_BOMB: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2)
@@ -282,10 +281,10 @@ pub const MEMORY_BOMB: &str = r##"(module
     (loop $l (drop (memory.grow (i32.const 1))) (br $l))
   )
 )
-"##;
+"#;
 
 /// Traps immediately — what a Rust panic compiles to on wasm.
-pub const TRAP: &str = r##"(module
+pub const TRAP: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -371,10 +370,10 @@ pub const TRAP: &str = r##"(module
     (unreachable)
   )
 )
-"##;
+"#;
 
 /// Calls `proc_exit`, the closest a guest can get to killing the process.
-pub const EXIT: &str = r##"(module
+pub const EXIT: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
@@ -461,10 +460,10 @@ pub const EXIT: &str = r##"(module
     (call $proc_exit (i32.const 3))
   )
 )
-"##;
+"#;
 
 /// Returns without ever answering.
-pub const SILENT: &str = r##"(module
+pub const SILENT: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -550,11 +549,11 @@ pub const SILENT: &str = r##"(module
     (nop)
   )
 )
-"##;
+"#;
 
 /// Tries to open `/etc/passwd`, then answers, so the denial is
 /// observable without the guest dying of it.
-pub const READ_FILE: &str = r##"(module
+pub const READ_FILE: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_open" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
@@ -643,10 +642,10 @@ pub const READ_FILE: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Asks for the pre-opened directories a WASI host normally hands out.
-pub const DISCOVER_PREOPENS: &str = r##"(module
+pub const DISCOVER_PREOPENS: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_prestat_get" (func $fd_prestat_get (param i32 i32) (result i32)))
@@ -734,10 +733,10 @@ pub const DISCOVER_PREOPENS: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Reads from a descriptor it was never given.
-pub const READ_STRAY_FD: &str = r##"(module
+pub const READ_STRAY_FD: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -826,10 +825,10 @@ pub const READ_STRAY_FD: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Tries to send on a socket.
-pub const NETWORK: &str = r##"(module
+pub const NETWORK: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_send" (func $sock_send (param i32 i32 i32 i32 i32) (result i32)))
@@ -917,10 +916,10 @@ pub const NETWORK: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Reads the host process's environment.
-pub const ENVIRONMENT: &str = r##"(module
+pub const ENVIRONMENT: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "environ_sizes_get" (func $environ_sizes_get (param i32 i32) (result i32)))
@@ -1010,10 +1009,10 @@ pub const ENVIRONMENT: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Reads the host process's argv.
-pub const ARGUMENTS: &str = r##"(module
+pub const ARGUMENTS: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "args_sizes_get" (func $args_sizes_get (param i32 i32) (result i32)))
@@ -1101,10 +1100,10 @@ pub const ARGUMENTS: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Asks the host to block it on a poll subscription.
-pub const POLL: &str = r##"(module
+pub const POLL: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
@@ -1192,12 +1191,12 @@ pub const POLL: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Imports a database seam that does not exist. Refused at load: the
 /// linker's world is closed, so an import nothing defines is not a
 /// runtime error a guest can retry — the artifact never runs.
-pub const DATABASE: &str = r##"(module
+pub const DATABASE: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "autumn_db" "query" (func $db_query (param i32 i32) (result i32)))
@@ -1285,10 +1284,10 @@ pub const DATABASE: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Imports a host escape from a namespace of its own invention.
-pub const HOST_COMMAND: &str = r##"(module
+pub const HOST_COMMAND: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "env" "system" (func $system (param i32) (result i32)))
@@ -1376,10 +1375,10 @@ pub const HOST_COMMAND: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Imports a WASI function this shim does not implement at all.
-pub const UNDEFINED_WASI: &str = r##"(module
+pub const UNDEFINED_WASI: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_connect" (func $sock_connect (param i32 i32 i32) (result i32)))
@@ -1467,10 +1466,10 @@ pub const UNDEFINED_WASI: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
 
 /// Answers with something that is not a frame.
-pub const MALFORMED_FRAME: &str = r##"(module
+pub const MALFORMED_FRAME: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -1557,10 +1556,10 @@ pub const MALFORMED_FRAME: &str = r##"(module
     (call $emit (i32.const 2816))
   )
 )
-"##;
+"#;
 
 /// Answers with an op the wire does not define.
-pub const UNKNOWN_OP: &str = r##"(module
+pub const UNKNOWN_OP: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -1646,10 +1645,10 @@ pub const UNKNOWN_OP: &str = r##"(module
     (call $emit (i32.const 2176))
   )
 )
-"##;
+"#;
 
 /// Answers with a status HTTP has no room for.
-pub const IMPOSSIBLE_STATUS: &str = r##"(module
+pub const IMPOSSIBLE_STATUS: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -1735,11 +1734,11 @@ pub const IMPOSSIBLE_STATUS: &str = r##"(module
     (call $emit (i32.const 2304))
   )
 )
-"##;
+"#;
 
 /// Writes to stdout forever without ever ending a line, so nothing
 /// the host has bounded so far would bound it.
-pub const OUTPUT_FLOOD: &str = r##"(module
+pub const OUTPUT_FLOOD: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -1825,11 +1824,11 @@ pub const OUTPUT_FLOOD: &str = r##"(module
     (loop $l (call $emit (i32.const 2816)) (br $l))
   )
 )
-"##;
+"#;
 
 /// Answers with a `Set-Cookie`, which would be a forged session in
 /// the host application's own origin.
-pub const FORGE_COOKIE: &str = r##"(module
+pub const FORGE_COOKIE: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -1915,10 +1914,10 @@ pub const FORGE_COOKIE: &str = r##"(module
     (call $emit (i32.const 1152))
   )
 )
-"##;
+"#;
 
 /// Answers with a header value carrying CRLF.
-pub const SPLIT_RESPONSE: &str = r##"(module
+pub const SPLIT_RESPONSE: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -2004,10 +2003,10 @@ pub const SPLIT_RESPONSE: &str = r##"(module
     (call $emit (i32.const 1600))
   )
 )
-"##;
+"#;
 
 /// Answers twice. The first answer is the answer.
-pub const DOUBLE_ANSWER: &str = r##"(module
+pub const DOUBLE_ANSWER: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 2 4)
@@ -2094,19 +2093,19 @@ pub const DOUBLE_ANSWER: &str = r##"(module
     (call $emit (i32.const 3072))
   )
 )
-"##;
+"#;
 
 /// Exports no `_start`, so there is nothing to run.
-pub const NO_START: &str = r##"(module
+pub const NO_START: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "other") (nop))
 )
-"##;
+"#;
 
 /// Reads entropy and then answers normally. Entropy is not authority, so
 /// the host answers it — deterministically — rather than denying it.
-pub const ENTROPY: &str = r##"(module
+pub const ENTROPY: &str = r#"(module
   (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))
@@ -2194,4 +2193,4 @@ pub const ENTROPY: &str = r##"(module
     (call $answer)
   )
 )
-"##;
+"#;
