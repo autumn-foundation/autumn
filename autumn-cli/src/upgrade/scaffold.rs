@@ -977,13 +977,10 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
 /// The newer of two release strings, preferring `candidate` when neither
 /// parses as a version.
 fn newest(previous: Option<&str>, candidate: &str) -> String {
-    let parse = super::migrations::parse_version_req;
-    match (previous.and_then(parse), parse(candidate)) {
-        (Some(previous_version), Some(candidate_version))
-            if previous_version > candidate_version =>
-        {
-            previous.unwrap_or(candidate).to_owned()
-        }
+    match previous {
+        // The same precedence the refusal uses. A high-water mark compared any
+        // other way could move backwards across two prereleases of one triple.
+        Some(previous) if is_newer(previous, candidate) => previous.to_owned(),
         _ => candidate.to_owned(),
     }
 }
@@ -992,18 +989,77 @@ fn newest(previous: Option<&str>, candidate: &str) -> String {
 ///
 /// Only ever reached with a value [`Manifest::parse`] has already proven
 /// readable: an unreadable one makes the whole manifest no baseline, so this
-/// never has to decide what "unknown" means. It answers `false` for one anyway,
-/// because a comparison that cannot be made is not evidence of anything — but
-/// that answer must never again be the *only* thing standing between a corrupt
-/// version string and a trusted set of digests, which is exactly what it was.
+/// never has to decide what "unknown" means.
 fn is_newer_than_this_cli(recorded: &str) -> bool {
-    let (Some(recorded), Some(ours)) = (
-        super::migrations::parse_version_req(recorded),
-        super::migrations::parse_version_req(env!("CARGO_PKG_VERSION")),
-    ) else {
+    is_newer(recorded, env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether `recorded` has strictly higher SemVer precedence than `ours`.
+///
+/// Deliberately **not** [`Version`](super::migrations::Version)'s own [`Ord`],
+/// which distinguishes only prerelease-from-stable and treats every prerelease
+/// of one triple as interchangeable. That is right for what it exists for — an
+/// app on `0.8.0-rc.1` needs the same codemods as one on `0.8.0-rc.2`, so
+/// selection must not split them, and a test in that module pins it — and
+/// wrong here, where the question is which renderer wrote a file. Borrowing it
+/// made `0.8.0-rc.2` and `0.8.0-rc.1` compare equal, so an rc.1 CLI did not
+/// refuse an rc.2 project and downgraded every file it rendered.
+fn is_newer(recorded: &str, ours: &str) -> bool {
+    let parse = super::migrations::parse_version_req;
+    let (Some(recorded), Some(ours)) = (parse(recorded), parse(ours)) else {
         return false;
     };
-    recorded > ours
+    precedence(&recorded, &ours) == std::cmp::Ordering::Greater
+}
+
+/// Full SemVer precedence, prerelease identifiers included.
+fn precedence(
+    left: &super::migrations::Version,
+    right: &super::migrations::Version,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    (left.major, left.minor, left.patch)
+        .cmp(&(right.major, right.minor, right.patch))
+        .then_with(
+            || match (left.prerelease.as_deref(), right.prerelease.as_deref()) {
+                (None, None) => Ordering::Equal,
+                // A stable release outranks any prerelease of its own triple.
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => prerelease_precedence(left, right),
+            },
+        )
+}
+
+/// SemVer §11.4 precedence between two prerelease identifier sets.
+fn prerelease_precedence(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut left = left.split('.');
+    let mut right = right.split('.');
+    loop {
+        let ordering = match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            // "A larger set of pre-release fields has a higher precedence than
+            // a smaller set, if all of the preceding identifiers are equal."
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
+                // Numeric identifiers are compared numerically, so `rc.10`
+                // outranks `rc.9` — which a text comparison gets backwards.
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                // "Numeric identifiers always have lower precedence than
+                // non-numeric identifiers."
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => left.cmp(right),
+            },
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
 }
 
 /// Record `paths` as the developer's own, so reconciliation leaves them alone.
@@ -3008,5 +3064,38 @@ mod tests {
         let loaded = Manifest::load(tmp.path()).expect("still a baseline");
         assert!(loaded.version.is_none());
         assert!(!loaded.digests.is_empty());
+    }
+
+    fn newer(recorded: &str) -> bool {
+        is_newer(recorded, "0.8.0-rc.1")
+    }
+
+    #[test]
+    fn provenance_compares_prereleases_by_full_semver_precedence() {
+        // `Version`'s own ordering distinguishes only prerelease-vs-stable,
+        // deliberately: codemod selection treats every prerelease of a triple
+        // as interchangeable. Provenance cannot. Reusing that comparator makes
+        // `0.8.0-rc.2` and `0.8.0-rc.1` equal, so an rc.1 CLI does not refuse
+        // an rc.2 project and downgrades every file it renders.
+        assert!(newer("0.8.0-rc.2"), "rc.2 is newer than rc.1");
+        assert!(!newer("0.8.0-rc.1"), "the same release is not newer");
+        assert!(!newer("0.8.0-rc.0"), "rc.0 is older");
+
+        // A stable release outranks any prerelease of its own triple.
+        assert!(newer("0.8.0"));
+        assert!(!is_newer("0.8.0-rc.9", "0.8.0"));
+
+        // Numeric identifiers compare numerically, not as text.
+        assert!(is_newer("0.8.0-rc.10", "0.8.0-rc.9"));
+        assert!(!is_newer("0.8.0-rc.9", "0.8.0-rc.10"));
+
+        // Numeric identifiers rank below alphanumeric ones, and a longer set of
+        // fields outranks a shorter one that is otherwise equal (SemVer 11.4).
+        assert!(is_newer("0.8.0-alpha", "0.8.0-1"));
+        assert!(is_newer("0.8.0-rc.1", "0.8.0-rc"));
+
+        // The triple still dominates everything.
+        assert!(is_newer("0.9.0-rc.1", "0.8.0"));
+        assert!(!is_newer("0.8.0", "0.9.0-rc.1"));
     }
 }
