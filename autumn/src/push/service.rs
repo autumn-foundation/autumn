@@ -508,7 +508,12 @@ impl WebPush {
             tracing::error!(error = %e, "the `[push]` VAPID key failed to load; sends will fail");
             None
         });
-        let subject = config.push.subject_or_default();
+        // Validated at boot; if it somehow fails here the configuration was
+        // replaced at runtime, and the documented default is the safe reading.
+        let subject = config
+            .push
+            .validated_subject()
+            .unwrap_or_else(|_| super::config::DEFAULT_VAPID_SUBJECT.to_owned());
         let ttl_secs = config.push.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
 
         let transport = Self::default_transport(state);

@@ -452,37 +452,72 @@ fn render_maskable_icon_svg() -> String {
     .to_owned()
 }
 
+/// The `static/pwa-register.js` the generator emits.
+///
+/// Served as a same-origin script to avoid CSP `script-src 'self'` blocking
+/// inline scripts that the default `SecurityHeadersLayer` enforces.
+///
+/// Two halves, split across two functions so each stays readable: unconditional
+/// service-worker registration, and the Web Push opt-in (issue #1392).
 fn render_pwa_register_js() -> String {
-    // Served as a same-origin script to avoid CSP `script-src 'self'` blocking
-    // inline scripts that the default SecurityHeadersLayer enforces.
-    //
-    // Two halves: service-worker registration (unconditional), and Web Push
-    // opt-in (issue #1392), which is deliberately NOT run on load — a
-    // permission prompt fired without a user gesture is the fastest way to get
-    // permanently blocked, and both Chrome and Firefox penalise it. Instead the
-    // subscribe flow is exposed as `window.autumnPushSubscribe()` and wired to
-    // any element carrying `data-autumn-push-subscribe`, so an app gets an
-    // opt-in button with no JavaScript of its own:
-    //
-    //     <button data-autumn-push-subscribe>Enable notifications</button>
-    //
-    // The paths below come from `autumn_web::push::router`'s own constants, so
-    // the snippet and the mounted routes can never drift apart.
     format!(
-        r"if ('serviceWorker' in navigator) {{
-  navigator.serviceWorker
-    .register('/service-worker.js', {{ scope: '/' }})
-    .then(() => {{ document.documentElement.dataset.swRegistered = 'true'; }})
-    .catch(console.error);
-}}
+        "{}\n{}",
+        render_service_worker_registration(),
+        render_push_opt_in()
+    )
+}
 
-// Autumn's CSRF layer rejects an unaccompanied mutating request, so read the
-// token the layout publishes and send it on both POSTs below. Without this the
-// subscribe/unsubscribe calls 403 the moment `[security.csrf] enabled = true`
-// — and the tempting workaround (exempting `/push/`) would strip CSRF from a
-// route whose entire body is client-chosen.
+/// The service-worker registration half of `pwa-register.js`.
+///
+/// Sets `data-sw-registered="true"` on `<html>` once registration resolves;
+/// the generated system test polls for that attribute.
+fn render_service_worker_registration() -> String {
+    r"if ('serviceWorker' in navigator) {
+  navigator.serviceWorker
+    .register('/service-worker.js', { scope: '/' })
+    .then(() => { document.documentElement.dataset.swRegistered = 'true'; })
+    .catch(console.error);
+}
+"
+    .to_owned()
+}
+
+/// The Web Push opt-in half of `pwa-register.js` (issue #1392).
+///
+/// Deliberately NOT run on load: a permission prompt fired without a user
+/// gesture is the fastest way to get permanently blocked, and both Chrome and
+/// Firefox penalise it. The subscribe flow is exposed as
+/// `window.autumnPushSubscribe()` and wired to any element carrying
+/// `data-autumn-push-subscribe`, so an app gets an opt-in button with no
+/// JavaScript of its own:
+///
+/// ```html
+/// <button data-autumn-push-subscribe>Enable notifications</button>
+/// ```
+///
+/// Every path and header name below comes from `autumn_web::push::router`'s own
+/// constants, so the snippet and the mounted routes can never drift apart.
+fn render_push_opt_in() -> String {
+    format!(
+        r"// Autumn's CSRF layer rejects an unaccompanied mutating request, so both POSTs
+// below must carry a token. Without one they 403 the moment
+// `[security.csrf] enabled = true` — which the production smart defaults do —
+// and the tempting workaround (exempting `/push/`) would be far worse than the
+// bug it hides: a forced subscribe would register an ATTACKER's keys under the
+// victim's session, letting them decrypt every notification sent to that user.
+//
+// The CSRF cookie is HttpOnly, so this cannot read it. Two sources, in order:
+// the public-key response (which the subscribe flow fetches anyway, and which
+// carries the token for exactly this purpose), then `<meta name=csrf-token>`
+// for an app that already publishes it the way `autumn generate auth` does.
+let autumnPushCsrf = null;
+
 function autumnPushHeaders() {{
   const headers = {{ 'content-type': 'application/json' }};
+  if (autumnPushCsrf && autumnPushCsrf.token) {{
+    headers[autumnPushCsrf.header || 'X-CSRF-Token'] = autumnPushCsrf.token;
+    return headers;
+  }}
   // Unquoted attribute values (both are valid CSS identifiers) so this stays
   // inside a Rust raw string that cannot contain a double quote.
   const token = document.querySelector('meta[name=csrf-token]');
@@ -491,6 +526,19 @@ function autumnPushHeaders() {{
     headers[(header && header.content) || 'X-CSRF-Token'] = token.content;
   }}
   return headers;
+}}
+
+// Read the CSRF token off a public-key response. Same-origin only: a
+// cross-origin reader cannot see these headers without the app opting in via
+// CORS, which is the property double-submit CSRF already depends on.
+function autumnPushCaptureCsrf(response) {{
+  const token = response.headers.get('{csrf_token_header}');
+  if (token) {{
+    autumnPushCsrf = {{
+      token: token,
+      header: response.headers.get('{csrf_header_name_header}'),
+    }};
+  }}
 }}
 
 // `applicationServerKey` takes a BufferSource, not the base64url string the
@@ -518,12 +566,13 @@ window.autumnPushSubscribe = async function autumnPushSubscribe() {{
   if ((await Notification.requestPermission()) !== 'granted') {{
     return false;
   }}
-  const response = await fetch('{key_path}');
+  const response = await fetch('{key_path}', {{ credentials: 'same-origin' }});
   if (!response.ok) {{
     // 503 means the app has not configured `[push] private_key` yet.
     console.error('web push is not configured on this server');
     return false;
   }}
+  autumnPushCaptureCsrf(response);
   const registration = await navigator.serviceWorker.ready;
   const subscription = await registration.pushManager.subscribe({{
     // Chrome refuses a subscription without this, and it is also the honest
@@ -550,6 +599,13 @@ window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
   const subscription = await registration.pushManager.getSubscription();
   if (!subscription) {{
     return true;
+  }}
+  // Unsubscribe can be the first call of the page, before anything primed the
+  // token; one cheap GET is enough to obtain it.
+  if (!autumnPushCsrf) {{
+    autumnPushCaptureCsrf(
+      await fetch('{key_path}', {{ credentials: 'same-origin' }})
+    );
   }}
   await fetch('{unsubscribe_path}', {{
     method: 'POST',
@@ -578,6 +634,8 @@ document.addEventListener('click', (event) => {{
         key_path = autumn_web::push::router::VAPID_PUBLIC_KEY_PATH,
         subscribe_path = autumn_web::push::router::SUBSCRIBE_PATH,
         unsubscribe_path = autumn_web::push::router::UNSUBSCRIBE_PATH,
+        csrf_token_header = autumn_web::push::router::CSRF_TOKEN_HEADER,
+        csrf_header_name_header = autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER,
     )
 }
 
@@ -2095,6 +2153,58 @@ async fn main() {
             js.contains("data-autumn-push-subscribe"),
             "…and wire it to a declarative opt-in attribute so an app needs no JS \
              of its own:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_sends_a_csrf_token_with_both_push_posts() {
+        // Autumn's production smart defaults turn CSRF on, and the CSRF cookie
+        // is HttpOnly — so without this the generated subscribe/unsubscribe
+        // POSTs 403 and push opt-in is unusable in exactly the environment it
+        // is meant for.
+        let js = render_pwa_register_js();
+        assert!(
+            js.contains(autumn_web::push::router::CSRF_TOKEN_HEADER),
+            "the snippet must read the token the public-key response serves:\n{js}"
+        );
+        assert!(
+            js.contains(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER),
+            "…and the configured header name to send it back in:\n{js}"
+        );
+        // Every POST must go through the helper that attaches it — a `fetch`
+        // with a hand-written `content-type` header would silently skip it.
+        let posts = js.matches("method: 'POST'").count();
+        assert_eq!(
+            posts, 2,
+            "expected exactly the subscribe and unsubscribe POSTs"
+        );
+        assert_eq!(
+            js.matches("headers: autumnPushHeaders()").count(),
+            posts,
+            "every push POST must attach the CSRF token:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_still_falls_back_to_the_csrf_meta_tag() {
+        // An app that already publishes the token the way `autumn generate
+        // auth` does must keep working.
+        let js = render_pwa_register_js();
+        assert!(
+            js.contains("meta[name=csrf-token]"),
+            "the meta-tag fallback must remain:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_sends_credentials_on_every_push_request() {
+        // The server resolves the subscriber from the session; without the
+        // cookie every call is an anonymous 401.
+        let js = render_pwa_register_js();
+        assert_eq!(
+            js.matches("credentials: 'same-origin'").count(),
+            4,
+            "two POSTs plus the two public-key GETs must all carry the session:\n{js}"
         );
     }
 

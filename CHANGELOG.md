@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pointing at `169.254.169.254` nor a `307` can steer the POST at an internal
   host.
 
+  `[push]` honors the usual environment overrides
+  (`AUTUMN_PUSH__PRIVATE_KEY` and friends), and `subject` is validated at boot
+  against what RFC 8292 permits — a bare email address instead of a `mailto:`
+  URI otherwise boots cleanly and has every delivery refused remotely. Because
+  Autumn's CSRF layer rejects an unaccompanied POST and its cookie is
+  `HttpOnly`, the public-key response carries the caller's CSRF token for the
+  generated snippet, which is what keeps push opt-in working under the
+  production defaults without exempting the push routes from CSRF.
+
   Failure posture is deliberate: a `[push] private_key` that is present but
   unusable fails the **boot** rather than leaving push silently dead, and
   sending with no key configured is an error raised before any dispatch, never

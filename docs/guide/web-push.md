@@ -40,7 +40,14 @@ subject     = "mailto:ops@example.com"
 
 Supply `private_key` from an environment variable
 (`AUTUMN_PUSH__PRIVATE_KEY`) or the [encrypted credentials
-store](credentials.md) rather than committing it.
+store](credentials.md) rather than committing it. Every field has an
+environment override: `AUTUMN_PUSH__PUBLIC_KEY`, `AUTUMN_PUSH__SUBJECT`,
+`AUTUMN_PUSH__TTL_SECS`.
+
+`subject` must be a `mailto:` or `https:` URI — RFC 8292 requires it, and it is
+how a push service operator reaches you about your traffic. A bare email
+address is the common mistake and is refused at boot, because otherwise the app
+starts fine and every delivery is rejected remotely.
 
 ### 3. Generate the PWA
 
@@ -302,6 +309,31 @@ to, which makes an unvalidated subscribe route a server-side request forgery
 
 A hostname that *resolves* to a private address is caught at dispatch time by
 the outbound client's own SSRF address policy.
+
+## CSRF
+
+Autumn's CSRF layer rejects an unaccompanied `POST`, and its cookie is
+`HttpOnly` — so the subscribe snippet cannot read a token the usual way. The
+public-key response carries one for it:
+
+| Response header | Carries |
+|---|---|
+| `x-autumn-push-csrf-token` | the caller's CSRF token |
+| `x-autumn-push-csrf-header` | the header name to send it back in |
+
+The generated snippet fetches that endpoint before subscribing anyway, so this
+costs no extra request. Reading the headers requires a **same-origin** fetch —
+a cross-origin attacker cannot see response headers without the app opting in
+via CORS, which is the same property double-submit CSRF already relies on, and
+same-origin script could take a token from any rendered form regardless.
+
+If your app already publishes `<meta name="csrf-token">` (as
+`autumn generate auth` does), the snippet uses that as a fallback.
+
+**Do not exempt `/push/*` from CSRF.** It looks like the easy fix and it is the
+worst one available: a forced subscribe registers the *attacker's* keys under
+the victim's session, letting them decrypt every notification you send that
+user.
 
 ## Testing
 

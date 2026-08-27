@@ -4365,6 +4365,23 @@ impl AutumnConfig {
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
         self.apply_cluster_env_overrides_with_env(env);
+        self.apply_push_env_overrides_with_env(env);
+    }
+
+    /// Web Push (`[push]`) environment overrides.
+    ///
+    /// The private key is the reason this exists: it is a credential, so the
+    /// guide and `PushConfig`'s own docs tell operators to supply it through
+    /// `AUTUMN_PUSH__PRIVATE_KEY` rather than commit it. Overrides are applied
+    /// only through the explicit per-section methods above, so without this one
+    /// that documented deployment path silently leaves push unconfigured —
+    /// every send failing `NotConfigured` and the public-key endpoint serving
+    /// `503`, with the operator looking at a variable they did set.
+    fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_secret(env, "AUTUMN_PUSH__PRIVATE_KEY", &mut self.push.private_key);
+        parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
+        parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
+        parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);
     }
 
     fn apply_cluster_env_overrides_with_env(&mut self, env: &dyn Env) {

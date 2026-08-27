@@ -71,6 +71,20 @@ pub struct PushConfig {
     pub ttl_secs: Option<u32>,
 }
 
+/// Whether `subject` is a VAPID `sub` claim a push service will accept.
+///
+/// RFC 8292 §2.1 requires a `mailto:` or `https:` URI — it is how a push
+/// service operator reaches you about your traffic, so a bare email address or
+/// a name is not enough.
+fn is_valid_vapid_subject(subject: &str) -> bool {
+    let subject = subject.trim();
+    if let Some(rest) = subject.strip_prefix("mailto:") {
+        // `mailto:` with nothing after it names nobody.
+        return rest.contains('@') && !rest.starts_with('@') && !rest.ends_with('@');
+    }
+    url::Url::parse(subject).is_ok_and(|parsed| parsed.scheme() == "https" && parsed.has_host())
+}
+
 impl PushConfig {
     /// Load and validate the configured VAPID key.
     ///
@@ -129,7 +143,31 @@ impl PushConfig {
             }
         }
 
+        // A `sub` the push services will reject is just as fatal as a bad key,
+        // and just as invisible: the app boots, signs happily, and every
+        // delivery is refused remotely. Validate it here so it fails the boot
+        // alongside the key rather than in production.
+        self.validated_subject()?;
+
         Ok(Some(key))
+    }
+
+    /// The configured `sub` claim, checked against what RFC 8292 permits.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::InvalidConfig`] when `subject` is set to something that is
+    /// neither a `mailto:` nor an `https:` URI.
+    pub fn validated_subject(&self) -> Result<String, PushError> {
+        let subject = self.subject_or_default();
+        if !is_valid_vapid_subject(&subject) {
+            return Err(PushError::InvalidConfig(format!(
+                "`[push] subject` must be a `mailto:` or `https:` URI (RFC 8292 §2.1), got \
+                 `{subject}`. A push service may reject every message signed with anything \
+                 else, so this is refused at boot rather than in production."
+            )));
+        }
+        Ok(subject)
     }
 
     /// The configured `sub` claim, or [`DEFAULT_VAPID_SUBJECT`].
@@ -277,5 +315,82 @@ mod tests {
             config("subject = \"mailto:ops@example.com\"").subject_or_default(),
             "mailto:ops@example.com"
         );
+    }
+    // ── Subject validation (RFC 8292 §2.1) ──────────────────────────────────
+
+    #[test]
+    fn a_bare_email_address_is_not_a_valid_subject() {
+        // The commonest mistake, and the most invisible: the app boots, signs
+        // happily, and every push service refuses the delivery.
+        let err = config("subject = \"ops@example.com\"")
+            .validated_subject()
+            .expect_err("a bare address is not a `mailto:` URI");
+        assert!(matches!(err, PushError::InvalidConfig(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("mailto:"),
+            "the error must say what a valid subject looks like: {err}"
+        );
+    }
+
+    #[test]
+    fn mailto_and_https_subjects_are_accepted() {
+        for subject in [
+            "mailto:ops@example.com",
+            "https://example.com/contact",
+            "  mailto:ops@example.com  ",
+        ] {
+            config(&format!("subject = \"{}\"", subject.replace('"', "")))
+                .validated_subject()
+                .unwrap_or_else(|e| panic!("{subject} must be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn a_subject_with_a_wrong_scheme_is_rejected() {
+        // `http://` in particular: the point of the `sub` claim is that a push
+        // service operator can reach the sender, and RFC 8292 names only
+        // `mailto:` and `https:`.
+        for subject in ["http://example.com", "tel:+15550100", "example.com"] {
+            let err = config(&format!("subject = \"{subject}\""))
+                .validated_subject()
+                .expect_err("this subject must be refused");
+            assert!(
+                matches!(err, PushError::InvalidConfig(_)),
+                "{subject}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_mailto_is_rejected() {
+        for subject in ["mailto:", "mailto:@example.com", "mailto:ops@"] {
+            assert!(
+                config(&format!("subject = \"{subject}\""))
+                    .validated_subject()
+                    .is_err(),
+                "{subject} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_subject_passes_its_own_validation() {
+        PushConfig::default()
+            .validated_subject()
+            .expect("the shipped default must itself be a valid VAPID subject");
+    }
+
+    #[test]
+    fn an_invalid_subject_fails_the_boot_alongside_the_key() {
+        // `load_vapid_key` is what `AutumnConfig::validate_push` calls, so the
+        // subject has to be checked there or a bad one boots cleanly.
+        let key = VapidKey::generate();
+        let err = config(&format!(
+            "private_key = \"{}\"\nsubject = \"nonsense\"",
+            key.private_key_base64url()
+        ))
+        .load_vapid_key()
+        .expect_err("an invalid subject is a boot failure");
+        assert!(matches!(err, PushError::InvalidConfig(_)), "{err:?}");
     }
 }

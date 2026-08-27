@@ -446,3 +446,135 @@ async fn the_vapid_public_key_response_is_not_cacheable() {
         "a key rotation must not be masked by a cached response"
     );
 }
+
+/// `AUTUMN_PUSH__PRIVATE_KEY` is the deployment path the guide documents, so
+/// it has to actually reach the config.
+///
+/// Overrides are applied only through the explicit per-section methods
+/// `apply_env_overrides_with_env` calls; a new section that forgets to add one
+/// leaves every documented variable inert, and the operator is left looking at
+/// a variable they did set while every send reports "not configured".
+#[test]
+fn push_settings_can_be_supplied_through_the_environment() {
+    use autumn_web::config::AutumnConfig;
+    use secrecy::ExposeSecret as _;
+
+    let key = VapidKey::generate();
+    let vars = [
+        ("AUTUMN_PUSH__PRIVATE_KEY", key.private_key_base64url()),
+        ("AUTUMN_PUSH__PUBLIC_KEY", key.public_key_base64url()),
+        ("AUTUMN_PUSH__SUBJECT", "mailto:ops@example.com".to_owned()),
+        ("AUTUMN_PUSH__TTL_SECS", "600".to_owned()),
+    ];
+
+    temp_env::with_vars(
+        vars.iter()
+            .map(|(k, v)| (*k, Some(v.as_str())))
+            .collect::<Vec<_>>(),
+        || {
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides();
+
+            assert_eq!(
+                config
+                    .push
+                    .private_key
+                    .as_ref()
+                    .map(|k| k.expose_secret().to_owned()),
+                Some(key.private_key_base64url()),
+                "the documented private-key variable must reach the config"
+            );
+            assert_eq!(
+                config.push.public_key.as_deref(),
+                Some(key.public_key_base64url().as_str())
+            );
+            assert_eq!(
+                config.push.subject.as_deref(),
+                Some("mailto:ops@example.com")
+            );
+            assert_eq!(config.push.ttl_secs, Some(600));
+
+            // And the whole point: it produces a working, bootable key.
+            config.validate_push().expect("boots");
+            assert_eq!(
+                config
+                    .push
+                    .load_vapid_key()
+                    .expect("load")
+                    .expect("present")
+                    .public_key_base64url(),
+                key.public_key_base64url()
+            );
+        },
+    );
+}
+
+/// The public-key response carries the caller's CSRF token, because the
+/// subscribe snippet has no other way to get one: the CSRF cookie is
+/// `HttpOnly`, and the generated snippet runs on pages rendered by a
+/// `layout()` the PWA generator does not change the signature of.
+#[tokio::test]
+async fn the_public_key_response_carries_a_csrf_token_for_the_snippet() {
+    let vapid = VapidKey::generate();
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.push.private_key = Some(vapid.private_key_base64url().into());
+    config.security.csrf.enabled = true;
+
+    let client = TestApp::new()
+        .merge(autumn_web::push::router())
+        .config(config)
+        .build();
+
+    let response = client.get("/push/vapid-public-key").send().await;
+    response.assert_status(200);
+
+    let token = response
+        .header(autumn_web::push::router::CSRF_TOKEN_HEADER)
+        .expect("the response must carry a CSRF token when CSRF is enabled");
+    assert!(!token.is_empty(), "an empty token is no token");
+    // Compared case-insensitively: the framework normalizes the configured
+    // name to lowercase (`x-csrf-token`), and HTTP header names are
+    // case-insensitive anyway — what matters is that the snippet is told which
+    // name to use rather than guessing.
+    assert_eq!(
+        response
+            .header(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER)
+            .map(str::to_ascii_lowercase),
+        Some("x-csrf-token".to_owned()),
+        "the snippet needs the configured header name, not a guess"
+    );
+}
+
+/// Subscribing with that token succeeds where an unaccompanied POST is
+/// rejected — the end-to-end shape of the fix.
+#[tokio::test]
+async fn subscribe_succeeds_with_the_token_from_the_public_key_response() {
+    let vapid = VapidKey::generate();
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.push.private_key = Some(vapid.private_key_base64url().into());
+    config.security.csrf.enabled = true;
+
+    let client = TestApp::new()
+        .merge(autumn_web::push::router())
+        .config(config)
+        .build();
+    client.acting_as(7).await;
+
+    let key_response = client.get("/push/vapid-public-key").send().await;
+    let token = key_response
+        .header(autumn_web::push::router::CSRF_TOKEN_HEADER)
+        .expect("token")
+        .to_owned();
+    let header_name = key_response
+        .header(autumn_web::push::router::CSRF_TOKEN_HEADER_NAME_HEADER)
+        .expect("header name")
+        .to_owned();
+
+    client
+        .post("/push/subscribe")
+        .header(&header_name, &token)
+        .json(&subscription_json("https://push.example.com/csrf"))
+        .send()
+        .await
+        .assert_status(204);
+}

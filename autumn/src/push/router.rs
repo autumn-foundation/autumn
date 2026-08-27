@@ -74,20 +74,73 @@ struct UnsubscribeBody {
     endpoint: String,
 }
 
+/// Response header carrying the caller's CSRF token on the public-key
+/// response. See [`vapid_public_key`].
+pub const CSRF_TOKEN_HEADER: &str = "x-autumn-push-csrf-token";
+/// Response header naming the header the CSRF token must be sent back in.
+pub const CSRF_TOKEN_HEADER_NAME_HEADER: &str = "x-autumn-push-csrf-header";
+
 /// `GET /push/vapid-public-key`
-async fn vapid_public_key(push: WebPush) -> impl IntoResponse {
+///
+/// Also carries the caller's CSRF token, in [`CSRF_TOKEN_HEADER`].
+///
+/// # Why the token rides on this response
+///
+/// Both mutating push routes are `POST`s that Autumn's CSRF layer rejects
+/// without a token, and the CSRF cookie is `HttpOnly`, so the subscribe
+/// snippet cannot read it. The framework's usual answer — a handler takes
+/// `CsrfToken` and its template emits `<meta name="csrf-token">` — does not
+/// reach here: the generated snippet runs on the *app's own* pages, rendered
+/// by a `layout()` the PWA generator does not (and should not) change the
+/// signature of.
+///
+/// So the token travels on the one request the snippet already makes before
+/// subscribing. That is safe because reading it requires a **same-origin**
+/// fetch: a cross-origin attacker cannot read response headers without the
+/// app explicitly allowing it via CORS, which is exactly the property
+/// double-submit CSRF already relies on. Same-origin script could obtain a
+/// token from any rendered form anyway, so this exposes nothing new.
+///
+/// Exempting the push routes from CSRF instead would be the wrong trade: a
+/// forced subscribe registers the *attacker's* keys under the victim's
+/// session, letting them decrypt every notification the app sends that user.
+async fn vapid_public_key(
+    push: WebPush,
+    csrf: Option<crate::security::CsrfToken>,
+    csrf_header: Option<axum::Extension<crate::security::CsrfTokenHeader>>,
+) -> impl IntoResponse {
+    let csrf_headers = csrf.map(|token| {
+        let header_name =
+            csrf_header.map_or_else(|| "X-CSRF-Token".to_owned(), |axum::Extension(name)| name.0);
+        (token.token().to_owned(), header_name)
+    });
+
     match push.vapid_public_key() {
-        Ok(key) => (
-            StatusCode::OK,
-            [
-                ("content-type", "text/plain; charset=utf-8"),
-                // Per-deployment, not per-user, and stable — but never worth
-                // a shared cache holding it across a key rotation.
-                ("cache-control", "no-store"),
-            ],
-            key,
-        )
-            .into_response(),
+        Ok(key) => {
+            let mut response = (
+                StatusCode::OK,
+                [
+                    ("content-type", "text/plain; charset=utf-8"),
+                    // Per-deployment, not per-user, and stable — but never
+                    // worth a shared cache holding it across a key rotation.
+                    // The CSRF token below makes it per-visitor besides.
+                    ("cache-control", "no-store"),
+                ],
+                key,
+            )
+                .into_response();
+            if let Some((token, header_name)) = csrf_headers {
+                let headers = response.headers_mut();
+                if let (Ok(token), Ok(name)) = (
+                    axum::http::HeaderValue::from_str(&token),
+                    axum::http::HeaderValue::from_str(&header_name),
+                ) {
+                    headers.insert(CSRF_TOKEN_HEADER, token);
+                    headers.insert(CSRF_TOKEN_HEADER_NAME_HEADER, name);
+                }
+            }
+            response
+        }
         // 503, not 200-with-empty-body: the client must be able to tell "push
         // is not configured here" from "here is your key", and a
         // `NotConfigured` app is expected to start working once configured.
