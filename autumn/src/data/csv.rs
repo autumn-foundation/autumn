@@ -253,6 +253,96 @@ where
 
 // ── import_csv ────────────────────────────────────────────────────────────────
 
+/// Count the data rows in a CSV source without retaining any of them.
+///
+/// The header is not counted; a malformed row IS (it is a row the file has, and
+/// a caller bounding work has to see it). Nothing from the file is kept — each
+/// record is parsed and dropped — so the memory cost is one record at a time
+/// regardless of how long or how broken the input is.
+///
+/// This exists for callers that must bound how much work an untrusted upload can
+/// ask for BEFORE handing it to [`import_csv`]: `import_csv` records a malformed
+/// row as a [`CsvRowError`] and moves on *without* calling the row handler, so a
+/// counter inside that handler cannot see the very file that costs the most. A
+/// cheap counting pass first — over bytes the caller has already size-capped —
+/// closes that gap for every shape of input.
+///
+/// ```rust,no_run
+/// use autumn_web::data::csv::count_data_rows;
+///
+/// let file = b"title\nHello\nWorld\n";
+/// assert_eq!(count_data_rows(file.as_ref()), 2);
+/// ```
+pub fn count_data_rows<R>(reader: R) -> u64
+where
+    R: io::Read,
+{
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(reader);
+    // `byte_records` avoids the UTF-8 validation `records` performs: this pass
+    // only counts, and a row that is not valid UTF-8 is still a row.
+    rdr.byte_records().count() as u64
+}
+
+/// The column names in a CSV source's header row, in file order.
+///
+/// Returns an empty `Vec` for an empty source or one whose header cannot be
+/// parsed — "no columns" and "a header we could not read" are the same thing to
+/// a caller deciding whether a file is the right shape.
+///
+/// This exists so a caller can reject a file that is simply the WRONG FILE
+/// before importing any of it. [`import_csv`] decodes each row by column name
+/// and a decoder can legitimately default an absent field (an unchecked
+/// checkbox's `bool`, an optional column), so a spreadsheet whose header shares
+/// none of the expected names can otherwise parse cleanly into a run of blank
+/// records. Comparing the header against the columns you require turns that
+/// into one file-level refusal — which is also what it actually is, rather than
+/// the same error repeated per row.
+///
+/// ```rust,no_run
+/// use autumn_web::data::csv::read_header;
+///
+/// let file = b"title,published\nHello,true\n";
+/// assert_eq!(read_header(file.as_ref()), vec!["title", "published"]);
+/// ```
+pub fn read_header<R>(reader: R) -> Vec<String>
+where
+    R: io::Read,
+{
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(reader);
+    rdr.headers()
+        .map(|header| header.iter().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Strip the `(line: N, byte: N)` fragment the CSV parser embeds in its own
+/// error text.
+///
+/// The parser's line number is the UNCALIBRATED one (see the calibration in
+/// [`import_csv`]), so on a CRLF file it disagrees with the `line` field of the
+/// [`CsvRowError`] the message is attached to — and a report that shows a reader
+/// two different line numbers for the same row is worse than one that shows
+/// none. The `line` field is the answer; this removes the contradicting copy.
+///
+/// A message without the fragment is returned unchanged, so this degrades to a
+/// no-op if the parser's wording ever changes.
+fn without_parser_position(message: &str) -> String {
+    const OPEN: &str = " (line: ";
+    let Some(start) = message.find(OPEN) else {
+        return message.to_owned();
+    };
+    let Some(len) = message[start..].find(')') else {
+        return message.to_owned();
+    };
+    let mut out = String::with_capacity(message.len());
+    out.push_str(&message[..start]);
+    out.push_str(&message[start + len + 1..]);
+    out
+}
+
 /// Parse CSV from `reader`, validate rows, and drive import via `handler`.
 ///
 /// The `handler` closure receives the **1-based CSV line number** and a
@@ -296,17 +386,62 @@ where
         }
     };
 
+    // Calibrate the reported line numbers against the header, whose true span
+    // we know: it is line 1, so a reader that has just consumed it sits at line
+    // 2. The underlying `csv` parser's own counter does NOT agree with that on
+    // every dialect — on a CRLF file (what Excel and most Windows tools write)
+    // it runs exactly one behind the LF reading of the same rows, so a row a
+    // spreadsheet shows on line 7 would be reported as line 6, and a
+    // byte-identical LF copy of the same file would report 7. A row number that
+    // depends on the line endings is worse than useless in an error report
+    // someone is meant to act on, so measure the parser's convention once here
+    // and shift every position below by the same amount. On a dialect the
+    // parser does not count lines for at all (bare-CR, the classic-Mac
+    // dialect), the shift still puts the first data row at 2 — the rows after
+    // it share that number rather than climbing, which is the parser's limit,
+    // not this offset's.
+    //
+    // The shift is measured ONCE, so it assumes the file's terminators are
+    // internally consistent. The one input it cannot serve is a file that MIXES
+    // them — an editor that appended an LF row to a CRLF export, or two exports
+    // concatenated — where the rows after the switch drift by one. That is rare
+    // next to "the file came out of Excel", and the alternative (trusting a
+    // counter that disagrees with itself across dialects) is wrong on the common
+    // case instead of the exotic one.
+    // The header's TRUE span, so the shift is the dialect's alone. A header is
+    // normally one line, but a quoted header field may carry embedded newlines
+    // — and assuming one line there would push every data row's number back by
+    // however many lines the header really spans, turning numbers that were
+    // right before this calibration into ones that are wrong. Count the
+    // newlines the parser kept inside the header's own fields instead.
+    let header_lines: u64 = 1 + headers
+        .iter()
+        .map(|field| field.matches('\n').count() as u64)
+        .sum::<u64>();
+    // The first data row therefore starts at `header_lines + 1`; whatever the
+    // parser calls that row is the convention to correct for.
+    let line_offset: i64 = i64::try_from(header_lines.saturating_add(1)).unwrap_or(2)
+        - i64::try_from(rdr.position().line()).unwrap_or(2);
+    let absolute_line = move |raw: u64| -> u64 {
+        let raw = i64::try_from(raw).unwrap_or(i64::MAX);
+        u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
+    };
+
     for result in rdr.records() {
         let (line, record) = match result {
             Ok(r) => {
-                let pos = r.position().map_or(0, csv::Position::line);
+                let pos = absolute_line(r.position().map_or(0, csv::Position::line));
                 (pos, r)
             }
             Err(e) => {
-                let pos = e.position().map_or(0, csv::Position::line);
-                report
-                    .errors
-                    .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
+                let pos = absolute_line(e.position().map_or(0, csv::Position::line));
+                report.errors.push(CsvRowError::row(
+                    pos,
+                    format!(
+                        "CSV parse error: {}",
+                        without_parser_position(&e.to_string())
+                    ),
+                ));
                 continue;
             }
         };
@@ -527,6 +662,206 @@ mod tests {
         assert_eq!(report.inserted, 2);
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].message, "title must not be 'Bad row'");
+        // "Bad row" is the THIRD line of the file (the header is line 1), and
+        // that is the number an operator has to be able to find in their
+        // spreadsheet.
+        assert_eq!(report.errors[0].line, 3);
+    }
+
+    /// The same file with CRLF terminators — what Excel and most Windows tools
+    /// write — must report the SAME line numbers. The underlying parser's own
+    /// counter runs one behind on that dialect, so this is what pins the
+    /// calibration in `import_csv`; without it a byte-identical CRLF copy of the
+    /// file above blames line 2 for the row on line 3.
+    #[test]
+    fn import_csv_line_numbers_are_the_same_for_crlf_and_lf() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            let report = import_csv(csv, &ImportOptions::default(), |line, row, _mode| {
+                seen.push(line);
+                if row.get("title").map(String::as_str) == Some("Bad row") {
+                    ImportRowResult::RowError("bad".into())
+                } else {
+                    ImportRowResult::Inserted
+                }
+            });
+            assert_eq!(report.errors.len(), 1, "one bad row per fixture");
+            assert_eq!(
+                report.errors[0].line, 3,
+                "the bad row is on line 3 of both fixtures"
+            );
+            seen
+        };
+        let lf = lines(b"title\nGood row\nBad row\nAnother good\n");
+        let crlf = lines(b"title\r\nGood row\r\nBad row\r\nAnother good\r\n");
+        assert_eq!(lf, vec![2, 3, 4]);
+        assert_eq!(crlf, lf, "line endings must not change the row numbers");
+    }
+
+    /// The calibration has to reach the PARSE-ERROR branch too: a malformed row
+    /// is reported with the line it is on, and `docs/guide/generators.md`
+    /// promises the scaffolded importer surfaces it "against that row's line".
+    /// Pre-fix the CRLF fixture blamed line 2 for the row on line 3.
+    #[test]
+    fn import_csv_parse_error_line_numbers_match_across_dialects() {
+        let lines = |csv: &[u8]| -> u64 {
+            let report = import_csv(csv, &ImportOptions::default(), |_line, _row, _mode| {
+                ImportRowResult::Inserted
+            });
+            assert_eq!(report.errors.len(), 1, "one malformed row per fixture");
+            assert!(
+                report.errors[0].message.starts_with("CSV parse error"),
+                "expected a parse error, got {:?}",
+                report.errors[0].message
+            );
+            report.errors[0].line
+        };
+        // Row 2 carries a third field the two-column header cannot take.
+        assert_eq!(lines(b"title,note\na,b\nc,d,e\nf,g\n"), 3);
+        assert_eq!(lines(b"title,note\r\na,b\r\nc,d,e\r\nf,g\r\n"), 3);
+    }
+
+    /// The line number in the `line` FIELD and any line number inside the
+    /// `message` must never contradict each other. The parser's own Display
+    /// embeds its uncalibrated position, which on a CRLF file is one behind, so
+    /// the report would show a reader two different lines for one row.
+    #[test]
+    fn import_csv_parse_error_message_carries_no_second_line_number() {
+        for csv in [
+            &b"title,note\na,x\nBAD\nc,z\n"[..],
+            &b"title,note\r\na,x\r\nBAD\r\nc,z\r\n"[..],
+        ] {
+            let report = import_csv(csv, &ImportOptions::default(), |_line, _row, _mode| {
+                ImportRowResult::Inserted
+            });
+            assert_eq!(report.errors.len(), 1);
+            assert_eq!(report.errors[0].line, 3);
+            assert!(
+                !report.errors[0].message.contains("line:"),
+                "the parser's own line number must not travel in the message: {:?}",
+                report.errors[0].message
+            );
+            // The failure itself is still described.
+            assert!(
+                report.errors[0].message.contains("fields"),
+                "{:?}",
+                report.errors[0].message
+            );
+        }
+    }
+
+    /// A header that cannot be read at all aborts the import before any row
+    /// handler runs, and is reported against line 1 — the line the header is on.
+    #[test]
+    fn import_csv_header_error_is_reported_against_line_one_and_runs_no_rows() {
+        let report = import_csv(
+            &[0xff, 0xfe, b'a', b'\n'][..],
+            &ImportOptions::default(),
+            |_line, _row, _mode| unreachable!("no row handler may run for a bad header"),
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].line, 1);
+        assert!(
+            report.errors[0].message.starts_with("CSV header error"),
+            "{:?}",
+            report.errors[0].message
+        );
+        assert_eq!(report.total_rows(), 1);
+    }
+
+    /// The header a caller checks a file's shape against, before importing any
+    /// of it.
+    #[test]
+    fn read_header_returns_the_column_names_in_file_order() {
+        assert_eq!(
+            read_header(b"title,note\na,x\n".as_ref()),
+            vec!["title", "note"]
+        );
+        // CRLF, and a quoted header field carrying a comma and a newline.
+        assert_eq!(
+            read_header(b"title,note\r\na,x\r\n".as_ref()),
+            vec!["title", "note"]
+        );
+        assert_eq!(
+            read_header(b"\"a,b\",\"c\nd\"\nx,y\n".as_ref()),
+            vec!["a,b", "c\nd"]
+        );
+        // A header-only file still HAS a header; an empty one has none.
+        assert_eq!(read_header(b"title,note\n".as_ref()), vec!["title", "note"]);
+        assert!(read_header(b"".as_ref()).is_empty());
+    }
+
+    /// The counting pass a caller uses to bound work before importing has to
+    /// count the rows the import itself would never hand to a row handler — a
+    /// malformed row is exactly the one that costs the most to accumulate.
+    #[test]
+    fn count_data_rows_counts_every_data_row_including_malformed_ones() {
+        // Two well-formed rows, header excluded.
+        assert_eq!(count_data_rows(b"title,note\na,x\nb,y\n".as_ref()), 2);
+        // A row with the wrong field count is still a row.
+        assert_eq!(count_data_rows(b"title,note\na,x\nBAD\nb,y\n".as_ref()), 3);
+        // A quoted field spanning lines is ONE row, not two.
+        assert_eq!(
+            count_data_rows(b"title,note\n\"a\nz\",x\nb,y\n".as_ref()),
+            2
+        );
+        // CRLF counts the same as LF.
+        assert_eq!(count_data_rows(b"title,note\r\na,x\r\nb,y\r\n".as_ref()), 2);
+        // A header-only file, and an empty one.
+        assert_eq!(count_data_rows(b"title,note\n".as_ref()), 0);
+        assert_eq!(count_data_rows(b"".as_ref()), 0);
+    }
+
+    /// The count and what `import_csv` reports must agree, or a caller bounding
+    /// work by the first would be bounding the wrong number.
+    #[test]
+    fn count_data_rows_agrees_with_import_csv_total_rows() {
+        let csv = b"title,note\na,x\nBAD\nb,y\n";
+        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_l, _r, _m| {
+            ImportRowResult::Inserted
+        });
+        assert_eq!(count_data_rows(csv.as_ref()), report.total_rows());
+    }
+
+    /// A header that itself spans two lines (a quoted field with an embedded
+    /// newline in it) pushes every data row down by one — and the reported
+    /// numbers must move with it, in both dialects. This is what stops the
+    /// dialect calibration from assuming every header is one line: doing so
+    /// would take numbers that were RIGHT on an LF file and make them wrong.
+    #[test]
+    fn import_csv_line_numbers_survive_a_multi_line_header() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            import_csv(csv, &ImportOptions::default(), |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            });
+            seen
+        };
+        // The header occupies lines 1-2, so the data rows are on 3 and 4.
+        assert_eq!(lines(b"\"a\nz\",b\nr1,x\nr2,y\n"), vec![3, 4]);
+        assert_eq!(lines(b"\"a\r\nz\",b\r\nr1,x\r\nr2,y\r\n"), vec![3, 4]);
+    }
+
+    /// A quoted field carrying an embedded newline moves the rows after it down
+    /// the file, and the reported numbers have to move with them — the operator
+    /// counts lines in a text editor, not records.
+    #[test]
+    fn import_csv_line_numbers_follow_multi_line_quoted_fields() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            import_csv(csv, &ImportOptions::default(), |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            });
+            seen
+        };
+        // Row 1 spans lines 2-3; row 2 therefore starts on line 4.
+        assert_eq!(lines(b"title,note\n\"a\nb\",fine\nsecond,x\n"), vec![2, 4]);
+        assert_eq!(
+            lines(b"title,note\r\n\"a\r\nb\",fine\r\nsecond,x\r\n"),
+            vec![2, 4]
+        );
     }
 
     #[test]
@@ -614,6 +949,11 @@ mod tests {
         assert_eq!(report.errors.len(), 1, "exactly one error expected");
         assert!(!report.errors.is_empty());
         assert_eq!(report.errors[0].message, "value is BAD");
+        // The test's name promises an EXACT row; assert it, so this 27k-row
+        // fixture buys something the small ones above do not. The bad row is
+        // written at `i == target_line - 1`, which — with the header on line 1 —
+        // is file line 27143.
+        assert_eq!(report.errors[0].line, 27_143);
     }
 
     #[test]

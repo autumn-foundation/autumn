@@ -651,6 +651,18 @@ path = "tests/sqlite_votable.rs"
 name = "sqlite_version_history"
 path = "tests/sqlite_version_history.rs"
 
+# Bitemporal, tamper-evident record ledger end-to-end proof (issue #1699). The
+# issue's golden test — create/update/update, as-of reconstruction against a live
+# oracle at every intermediate instant, then tamper and assert `ledger_verify`
+# names the broken link — plus the mutation/insertion/deletion tampering classes,
+# the zero-false-positive check, and fail-closed tenant isolation. In-memory
+# SQLite, no Docker, so it runs on every CI push rather than only in the Docker
+# sweep. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_ledger`.
+[[test]]
+name = "sqlite_ledger"
+path = "tests/sqlite_ledger.rs"
+
 # SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
 # the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
 # + dead-letter + graceful drain) and the real enqueue surface against an in-memory

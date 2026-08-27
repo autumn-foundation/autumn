@@ -325,6 +325,15 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+/// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
+///
+/// See [`ledger`] module documentation for the full API (issue #1699).
+pub mod ledger;
+pub use ledger::{
+    LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
+    LedgerRevision, LedgerVerification, LedgeredRecord,
+};
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
@@ -479,6 +488,12 @@ pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
+/// Live-traffic shadow mirroring and response diffing.
+///
+/// Samples `GET`/`HEAD` traffic to a candidate build and compares the two
+/// responses before cutover (issue #1653) — see
+/// `docs/guide/staged-deploys.md`.
+pub mod shadow;
 /// URL-safe slug generation (`slugify`), shared by the scaffold generator's
 /// `slug:slug{from:...}` DSL token and any hand-written app.
 pub mod slug;

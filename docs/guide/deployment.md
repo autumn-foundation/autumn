@@ -2589,13 +2589,15 @@ controlled by `actuator.prometheus` (default **`true`**) and is **independent of
 `actuator.sensitive`**. That separation is the whole point: a production app can
 let Fly.io (or any scraper) collect metrics while keeping `actuator.sensitive =
 false`, so `/actuator/env`, `/actuator/configprops`, `/actuator/loggers`,
-`/actuator/tasks`, `/actuator/jobs`, and the actuator task UI stay off the
-public surface.
+`/actuator/tasks`, `/actuator/jobs`, `/actuator/shadow`, and the actuator task
+UI stay off the public surface. `/actuator/shadow` (see the [shadow deploys
+guide](staged-deploys.md#shadow-differential-deploys)) is the most sensitive of
+these: it publishes redacted excerpts of real production responses.
 
 ```toml
 # autumn.toml — metrics on, sensitive surfaces off (the safe production shape)
 [actuator]
-sensitive  = false   # env/configprops/loggers/tasks/jobs NOT mounted
+sensitive  = false   # env/configprops/loggers/tasks/jobs/shadow NOT mounted
 prometheus = true    # /actuator/prometheus still scrapeable
 ```
 

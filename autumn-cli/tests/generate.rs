@@ -2251,6 +2251,11 @@ fn generated_nested_scaffold_cargo_checks() {
 /// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
 #[test]
 #[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one compile gate covering the policy scaffold plus the two CSV \
+              surfaces that ride on it; each block is a separate assertion set"
+)]
 fn generated_policy_scaffold_cargo_checks() {
     let (_tmp, project) = fresh_project("policy-scaffold-build");
     patch_generated_cargo_toml(&project);
@@ -2264,6 +2269,13 @@ fn generated_policy_scaffold_cargo_checks() {
             "title:String",
             "body:Text",
             "author_id:i64",
+            // Issue #1393: the CSV import surface rides along on this scaffold
+            // rather than a fourth compile gate of its own. This is the
+            // owner-scoped shape, so it also puts the import's `authorize_create`
+            // call, its `Multipart` extractor, and the `save_many_skip_invalid`
+            // write through a real `cargo check --tests` — and the generated
+            // import test is run below.
+            "--import",
         ],
     );
 
@@ -2347,6 +2359,33 @@ fn generated_policy_scaffold_cargo_checks() {
         String::from_utf8_lossy(&export_csv.stdout).contains("1 passed"),
         "expected the CSV export test to run and pass:\n{}",
         String::from_utf8_lossy(&export_csv.stdout)
+    );
+
+    // Issue #1393: the same for the import. This is the only place the repo
+    // proves the emitted import test really passes against the real `Multipart`
+    // extractor + `import_csv` + `ImportReport` — that a dry run writes nothing
+    // and a confirmed commit writes exactly the valid row — rather than merely
+    // type-checking.
+    let import_csv = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_csv_import_previews_then_commits",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        import_csv.status.success(),
+        "generated CSV import test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&import_csv.stdout),
+        String::from_utf8_lossy(&import_csv.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&import_csv.stdout).contains("1 passed"),
+        "expected the CSV import test to run and pass:\n{}",
+        String::from_utf8_lossy(&import_csv.stdout)
     );
 }
 

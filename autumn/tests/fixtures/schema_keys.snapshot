@@ -377,6 +377,16 @@ session.redis.key_prefix
 session.redis.url
 session.same_site
 session.secure
+shadow
+shadow.enabled
+shadow.max_body_bytes
+shadow.max_in_flight
+shadow.max_records
+shadow.max_sample_bytes
+shadow.routes
+shadow.sample_rate
+shadow.target
+shadow.timeout_ms
 storage
 storage.allow_local_in_production
 storage.backend

@@ -806,11 +806,59 @@ raw Diesel:
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
 | `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
+| `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.7.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)` and `ledger_head(id)`. Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
 `docs/guide/repositories.md` and `docs/guide/pagination.md`.
+
+### Ledgered entities — time travel + tamper evidence (0.7.0, issue #1699)
+
+Reach for this when an entity's *past* is part of the product: regulated
+records, anything an auditor will ask about, anything you may need to undo.
+
+```rust
+#[repository(Invoice, soft_delete, ledgered = true)]
+pub trait InvoiceRepository {}
+
+let then  = repo.ledger_as_of(id, last_tuesday).await?;   // Option<Invoice>
+let delta = repo.ledger_diff(id, last_tuesday, now).await?;
+let proof = repo.ledger_verify(id).await?;                // LedgerVerification
+```
+
+The marker is the only per-model change — do **not** hand-write revision
+bookkeeping. `ledgered` implies `versioned`, so every write path version history
+already covers (hand-written handlers, generated `api = "…"` endpoints, `#[job]`
+/ `#[mailer]`, bulk saves, upserts, `find_or_create_by`, dependent cascades)
+appends a revision automatically.
+
+What to know when writing app code against it:
+
+- **`soft_delete` is mandatory** and `purge` does not exist. `delete_by_id`
+  records a delete revision; `restore` records the undelete. Both keep the
+  ledger and the table in agreement.
+- **As-of is byte-for-byte** what a plain query would have returned. It resolves
+  soft-deleted state too, so check `deleted_at` exactly as against the table.
+- **Two time axes.** `recorded_at` is transaction time; `valid_from` defaults to
+  it, or comes from your own column via `ledgered(valid_time = "effective_at")`
+  (`DateTime<Utc>` / `NaiveDateTime` / `Option` of either). Query both with
+  `LedgerAsOf::{transaction, valid, bitemporal}` via `ledger_as_of_at`. Both
+  bounds *filter*; the newest surviving revision wins.
+- **`ledger_verify` is the audit answer**, and it also cross-checks the head
+  revision against the live row — so it catches a truncated tail and any write
+  that reached the table without appending a revision (`LiveStateMismatch`).
+  Pin `ledger_head(id).hash` outside the database to catch a wholesale rewrite;
+  the hashing rule is open source, so in-database evidence cannot cover that.
+- **Reads are tenant- and shard-scoped.** `across_tenants()` and cross-shard
+  ledger reads are rejected (a chain is per `(tenant, record)`); read inside a
+  tenant scope.
+- **Cost is real**: one indexed `SELECT` + one `INSERT` per write inside the
+  same transaction (a delete pays a third statement), per row on bulk paths, and
+  a full row snapshot per revision. Don't ledger a high-churn table by reflex.
+
+`_autumn_ledger_revisions` arrives with `autumn migrate` (Postgres and SQLite).
+See `docs/guide/ledgered-entities.md`.
 
 ### JSON API endpoints — page envelope + write validation (0.6.0)
 
@@ -1970,6 +2018,81 @@ autumn canary promote   # clear the rollback flag after traffic is moved
 The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
 that cannot exec into the replica can write it directly. The flag is sticky
 across restarts — clear it with `autumn canary promote` once traffic has moved.
+
+## Shadow (differential) deploys
+
+Canary decides from **cohort metrics** over traffic the new build really serves.
+Shadow decides from a **per-request diff** and serves nobody: Autumn mirrors
+sampled `GET`/`HEAD` traffic to a candidate build you run alongside production
+and compares the two responses. Use it to catch the subtly-wrong-but-`200`
+regression — a dropped JSON field, a reordered list, an off-by-one total — that
+cohort metrics cannot see. It composes with canary; it does not replace it.
+
+Off by default. Requires the `http-client` feature (on by default).
+
+```toml
+# autumn.toml
+[shadow]
+enabled          = true
+target           = "http://127.0.0.1:9091"  # the candidate build (you run it)
+sample_rate      = 0.05    # of ELIGIBLE traffic. Default 1.0 — start low.
+routes           = ["/api/*"]  # empty (default) = every eligible route
+timeout_ms       = 2000    # bounds the shadow request AND the primary wait
+max_in_flight    = 8       # excess mirrors are dropped, never queued
+max_body_bytes   = 262144  # larger responses are not compared, either side
+max_records      = 50      # divergences kept for the actuator
+max_sample_bytes = 2048    # per recorded JSON sample, before truncation
+```
+
+Every key has an env override (`AUTUMN_SHADOW__ENABLED`,
+`AUTUMN_SHADOW__TARGET`, `AUTUMN_SHADOW__SAMPLE_RATE`, …).
+
+**What it guarantees.** The client never waits on the mirror (detached task; the
+primary body is teed, not buffered) and never receives a candidate byte. The
+candidate is dialed at `target` but sees the `Host` the live build accepted, and
+pages served from an SSG/ISG static cache are mirrored too. Only
+`GET`/`HEAD` are mirrored, and that is a constant, not a config key — replaying
+a `POST` needs effect virtualization, which does not exist yet. Requests the
+live build refuses (`429`/`503`) are not mirrored. Actuator and probe paths are
+never mirrored. Every mirrored request carries `X-Autumn-Shadow: 1`, so
+mirroring cannot recurse.
+
+**What it compares.** Status class (`200` vs `201` is not a divergence; `200` vs
+`500` is) and a normalized body: JSON object key order is normalized away,
+**array order is not**. Headers, latency, and fuzzy JSON tolerance are out of
+scope.
+
+**Reading the results** — `{actuator-prefix}/shadow`, sensitive-gated like
+`/actuator/tasks`:
+
+```bash
+curl -s localhost:3000/actuator/shadow | jq '.stats, .divergences[0]'
+```
+
+Plus two built-in metric families on `/actuator/prometheus`:
+
+```
+autumn_shadow_comparisons_total{version,route,outcome}  # match|diverged|error|
+                                                        # timeout|skipped|dropped|
+                                                        # refused|incomplete
+autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
+```
+
+**Tell the user before they enable it**: the candidate receives live cookies and
+`Authorization` headers (a candidate that cannot authenticate makes every diff
+noise), its own side effects are real so it must be contained by environment
+(scratch database / writes disabled), and recorded samples are redacted by a
+**key-name allowlist** (`[log] filter_parameters`) — not a PII classifier — so
+any other *keyed* field of a response body is stored verbatim on that actuator
+endpoint. (Bodies with unkeyed scalars record only a digest.)
+
+**One configuration step is easy to miss**: the candidate honours the forwarded
+client identity only if it trusts the mirroring host as a proxy. Add that host
+to the *candidate's* `[security.trusted_proxies] ranges`, or accept that routes
+reading `ClientAddr`/`ClientScheme` — and candidate-side per-IP rate limits —
+will see the mirror rather than the real client.
+
+See `docs/guide/staged-deploys.md`.
 
 ## CLI
 

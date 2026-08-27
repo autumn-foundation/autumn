@@ -218,6 +218,11 @@ mod rate_limit_redis_integration;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+// Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
+// The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
+// Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
+#[cfg(feature = "db")]
+mod ledger_postgres;
 #[cfg(feature = "db")]
 mod repository_audit_actor;
 #[cfg(feature = "db")]
@@ -259,6 +264,8 @@ mod search_index_definition;
 mod security;
 mod seo;
 mod server_timing;
+#[cfg(feature = "http-client")]
+mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
 #[cfg(feature = "db")]
