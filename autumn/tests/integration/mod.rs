@@ -204,6 +204,12 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+// The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
+// runtime) and `test-support` (the shared WAT escape corpus), neither of which
+// the Docker sweep's feature set enables — so the ignored timing benchmark in
+// here is never picked up by that bare `--ignored` run.
+#[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
+mod plugin_sandbox;
 mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]

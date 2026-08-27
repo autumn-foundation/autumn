@@ -35,6 +35,7 @@ mod overload_driver;
 mod paths;
 mod pg;
 mod plugin_check;
+mod plugin_sandbox;
 mod process;
 mod release;
 mod replay;
@@ -171,6 +172,61 @@ pub enum LifecycleSubcommands {
         /// Write the diagram(s) to this file instead of stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn plugin` — the capability-sandboxed plugin lane.
+#[derive(Subcommand)]
+pub enum PluginSubcommands {
+    /// Bind a manifest to a `wasm32-wasip1` module and write a
+    /// `.autumn-plugin` artifact.
+    ///
+    /// The module's SHA-256 is computed here and stamped into the manifest, so
+    /// an author never types the digest and can never ship one that describes
+    /// different bytes. The module is loaded into the same sandbox the runtime
+    /// uses before anything is written: an artifact that could not run is
+    /// refused at the author's desk rather than at the operator's boot.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin package --manifest plugin.toml \
+    ///       --module target/wasm32-wasip1/release/plugin.wasm \
+    ///       --out hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Package {
+        /// The authored manifest, as TOML.
+        #[arg(long, value_name = "FILE")]
+        manifest: String,
+        /// The `wasm32-wasip1` module the manifest describes.
+        #[arg(long, value_name = "FILE")]
+        module: String,
+        /// Where to write the artifact.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+
+    /// Review a `.autumn-plugin` artifact before installing it.
+    ///
+    /// Prints the capability grant, the routes it may serve, the module digest
+    /// that was reviewed, every host function it imports, and the classes of
+    /// authority the sandbox denies unconditionally. Then it loads the module
+    /// into this build's sandbox and runs the same route-conformance checks
+    /// `autumn plugin-check` runs against a native plugin — with no binary to
+    /// build and no process to start. Exits 1 if the artifact is not fit to
+    /// install.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin --format json
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// The artifact to review.
+        #[arg(value_name = "ARTIFACT")]
+        artifact: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
     },
 }
 
@@ -1053,12 +1109,26 @@ enum Commands {
         action: SearchSubcommands,
     },
 
+    /// Package, review and install capability-sandboxed plugins.
+    ///
+    /// A sandboxed plugin runs as a `wasm32-wasip1` module inside a
+    /// deny-by-default sandbox: it may serve HTTP under the one prefix its
+    /// manifest declares, and it has no filesystem, no network, no environment
+    /// and no database. See `docs/guide/sandboxed-plugins.md`.
+    #[command(subcommand, verbatim_doc_comment)]
+    Plugin(PluginSubcommands),
+
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
     /// and verifies that the named plugin satisfies five checks: installability,
     /// route attribution, route prefix, route collision, and sensitive-surface
     /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// A *sandboxed* plugin is checked with `autumn plugin inspect` instead,
+    /// which runs these same checks over its manifest with no binary to build.
+    /// A sandboxed plugin mounted into an app also passes this command's
+    /// route-attribution and route-prefix checks unchanged.
     ///
     /// # Examples
     ///
@@ -3836,6 +3906,24 @@ fn run_command(command: Commands) {
                     profile: profile.as_deref(),
                     purge,
                 });
+            }
+        },
+        Commands::Plugin(cmd) => match cmd {
+            PluginSubcommands::Package {
+                manifest,
+                module,
+                out,
+            } => plugin_sandbox::run_package(&plugin_sandbox::PackageOptions {
+                manifest: std::path::Path::new(&manifest),
+                module: std::path::Path::new(&module),
+                out: std::path::Path::new(&out),
+            }),
+            PluginSubcommands::Inspect { artifact, format } => {
+                let format = format.parse().unwrap_or_else(|e| {
+                    eprintln!("autumn plugin inspect: {e}");
+                    std::process::exit(1);
+                });
+                plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
             }
         },
         Commands::PluginCheck {
@@ -7050,6 +7138,72 @@ mod tests {
     #[test]
     fn parse_token_revoke_without_token_is_error() {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
+    }
+
+    // ── autumn plugin (sandboxed) tests ────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_package_requires_all_three_paths() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "package",
+            "--manifest",
+            "plugin.toml",
+            "--module",
+            "plugin.wasm",
+            "--out",
+            "hello.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin(PluginSubcommands::Package {
+                manifest,
+                module,
+                out,
+            }) => {
+                assert_eq!(manifest, "plugin.toml");
+                assert_eq!(module, "plugin.wasm");
+                assert_eq!(out, "hello.autumn-plugin");
+            }
+            _ => panic!("expected plugin package"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "plugin", "package", "--manifest", "plugin.toml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_plugin_inspect_defaults_to_text() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "inspect", "hello.autumn-plugin"])
+            .expect("parses");
+        match cli.command {
+            Commands::Plugin(PluginSubcommands::Inspect { artifact, format }) => {
+                assert_eq!(artifact, "hello.autumn-plugin");
+                assert_eq!(format, "text");
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_json() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "hello.autumn-plugin",
+            "--format",
+            "json",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin(PluginSubcommands::Inspect { format, .. }) => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected plugin inspect"),
+        }
     }
 
     // ── autumn plugin-check tests ──────────────────────────────────────────
