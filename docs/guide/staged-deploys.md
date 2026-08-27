@@ -531,10 +531,14 @@ container, another port, another machine) and point `target` at it.
   normally and every request through a planned maintenance window would look
   like a status-class divergence. The trade is that a genuine handler-produced
   `429`/`503` divergence is not reported either.
-- **A mirror cannot outlive its deadline.** `timeout_ms` bounds the shadow
-  request *and* the wait for the mirrored primary response, so a client that
-  stops reading — or a long-lived `text/event-stream` — cannot pin an
-  `max_in_flight` slot indefinitely. Those are counted as `incomplete`.
+- **A mirror's waiting is bounded.** One deadline, stamped at dispatch, covers
+  both the shadow request and the wait for the mirrored primary response, so a
+  client that stops reading — or a long-lived `text/event-stream` — cannot pin
+  an `max_in_flight` slot indefinitely. Those are counted as `incomplete`.
+  (Comparing the two responses once both are in hand is bounded CPU work on
+  bodies already capped by `max_body_bytes`, but it is not itself covered by
+  that deadline — see
+  [#2333](https://github.com/autumn-foundation/autumn/issues/2333).)
 - **Credentials never reach a proxy.** The mirroring client disables proxy
   autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
   a mirrored request (carrying the end user's cookie) to a third party.

@@ -419,10 +419,7 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     if rendered.len() <= sample_limit {
         return Some(scrubbed);
     }
-    Some(Value::String(truncate_to_serialized_budget(
-        &rendered,
-        sample_limit,
-    )))
+    truncate_to_serialized_budget(&rendered, sample_limit).map(Value::String)
 }
 
 /// Build the truncated excerpt so that the value's own **serialized** form fits
@@ -435,15 +432,16 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
 /// number the operator actually configured. So the cost is accumulated per
 /// character as it will be *written*, with the quotes and the marker reserved
 /// up front.
-fn truncate_to_serialized_budget(rendered: &str, sample_limit: usize) -> String {
+fn truncate_to_serialized_budget(rendered: &str, sample_limit: usize) -> Option<String> {
     /// The two `"` a JSON string is written between.
     const QUOTES: usize = 2;
 
     let reserved = QUOTES.saturating_add(TRUNCATION_MARKER.len());
-    // Not even the marker fits; the marker alone is the honest answer.
-    let Some(budget) = sample_limit.checked_sub(reserved) else {
-        return TRUNCATION_MARKER.to_owned();
-    };
+    // Not even the quoted marker fits. Returning it anyway would overshoot the
+    // budget by exactly the amount this function exists to prevent, so the
+    // honest answer is no sample at all — the record still carries the digest,
+    // the length, and how the body was normalized.
+    let budget = sample_limit.checked_sub(reserved)?;
 
     let mut truncated = String::new();
     let mut cost = 0usize;
@@ -455,7 +453,7 @@ fn truncate_to_serialized_budget(rendered: &str, sample_limit: usize) -> String 
         truncated.push(character);
     }
     truncated.push_str(TRUNCATION_MARKER);
-    truncated
+    Some(truncated)
 }
 
 /// How many bytes `character` occupies once written inside a JSON string.
@@ -986,19 +984,34 @@ mod tests {
     }
 
     #[test]
-    fn an_absurdly_small_budget_still_produces_something_valid() {
+    fn a_budget_too_small_for_the_marker_records_no_sample_at_all() {
+        // The quoted marker serializes to 5 bytes, so any budget below that
+        // cannot be honoured by emitting it — returning it anyway would
+        // overshoot by exactly what the budget exists to prevent. No sample is
+        // the honest answer; the digest and length still prove the divergence.
         let filter = ParameterFilter::default();
+        for limit in 0usize..=4 {
+            let Comparison::Diverged(d) =
+                compare(&json(200, r#"{"a":1}"#), &json(200, "{}"), &filter, limit)
+            else {
+                panic!("expected divergence at limit {limit}");
+            };
+            assert!(
+                d.primary_sample.is_none(),
+                "limit {limit}: recorded {:?}",
+                d.primary_sample
+            );
+            assert!(!d.primary_digest.is_empty());
+        }
+
+        // At 5 the quoted marker fits exactly, so a sample reappears.
         let Comparison::Diverged(d) =
-            compare(&json(200, r#"{"a":1}"#), &json(200, "{}"), &filter, 1)
+            compare(&json(200, r#"{"a":1}"#), &json(200, "{}"), &filter, 5)
         else {
             panic!("expected divergence");
         };
-        // Not required to fit a budget smaller than the marker itself, but it
-        // must still be a valid, obviously-truncated value rather than a panic.
-        let Some(Value::String(sample)) = d.primary_sample else {
-            panic!("expected a truncated string");
-        };
-        assert!(sample.ends_with(TRUNCATION_MARKER), "{sample}");
+        let serialized = serde_json::to_string(&d.primary_sample).expect("serializes");
+        assert!(serialized.len() <= 5, "{serialized}");
     }
 
     #[test]

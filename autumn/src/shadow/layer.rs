@@ -342,12 +342,19 @@ async fn run_mirror(
     // The permit is released when this task ends, whatever the outcome.
     let _permit = permit;
 
-    // ONE deadline for the whole mirror, stamped at dispatch and shared by both
-    // waits below. Two independent `timeout(settings.timeout, ..)` calls would
-    // let a shadow that answers just under the deadline be followed by a fresh
-    // full deadline on the primary wait — up to `2 * timeout_ms` holding a slot,
-    // which at capacity keeps every later mirror dropped for twice as long as
-    // the operator configured, against this module's stated guarantee.
+    // ONE deadline for the mirror's WAITING, stamped at dispatch and shared by
+    // both waits below. Two independent `timeout(settings.timeout, ..)` calls
+    // would let a shadow that answers just under the deadline be followed by a
+    // fresh full deadline on the primary wait — up to `2 * timeout_ms` holding
+    // a slot, which at capacity keeps every later mirror dropped for twice as
+    // long as the operator configured.
+    //
+    // KNOWN LIMITATION: it does NOT cover the comparison that follows. Decoding,
+    // canonicalising and digesting both bodies is bounded work (`max_body_bytes`
+    // caps each side) but runs with the permit still held, so a mirror can
+    // outlive `timeout_ms` by that much. Whether `max_in_flight` should bound
+    // outstanding *requests* or outstanding *mirrors* is the open question in
+    // issue #2333.
     let now = tokio::time::Instant::now();
     // `checked_add`, not `+`: this module's panic gate denies arithmetic that
     // can panic, and `Instant + Duration` does on overflow. An absurd
@@ -402,21 +409,15 @@ async fn run_mirror(
     // tee captures encoded bytes just as the candidate's response can arrive
     // encoded — decoding only one of them would report two identical builds as
     // divergent on every such route.
-    let (Ok(primary_body), Ok(shadow_body)) = (
-        crate::shadow::transport::decode_body(
-            primary.content_encoding.as_deref(),
-            primary.body.clone(),
-            ctx.settings.max_body_bytes,
-        ),
-        crate::shadow::transport::decode_body(
-            shadow.content_encoding.as_deref(),
-            shadow.body.clone(),
-            ctx.settings.max_body_bytes,
-        ),
-    ) else {
-        // Undecodable or over-budget once expanded: counted, never guessed at.
-        ctx.registry.record_skipped_oversize();
-        record_outcome(&ctx.registry, &context.route, "skipped");
+    // Decoded separately, and their failures told apart: a body that expands
+    // past the budget is a *size* skip, while a body whose declared encoding
+    // does not decode is an *error*. Folding both into `skipped_oversize` would
+    // show an operator a size-budget skip for what is actually a malformed
+    // encoding, and lose the reason entirely.
+    let Some(primary_body) = decode_side(&ctx, &context, "primary", &primary) else {
+        return;
+    };
+    let Some(shadow_body) = decode_side(&ctx, &context, "shadow", &shadow) else {
         return;
     };
     let primary = ResponseFacts::encoded(primary.status, primary.content_type, None, primary_body);
@@ -460,6 +461,41 @@ async fn run_mirror(
             "shadow build diverged from the live build; see the shadow actuator endpoint \
              for the redacted request target and response samples"
         );
+    }
+}
+
+/// Decode one side's body, counting the two failure modes distinctly.
+///
+/// `None` means the comparison cannot proceed and has already been counted.
+fn decode_side(
+    ctx: &MirrorContext,
+    context: &RequestContext,
+    side: &'static str,
+    facts: &ResponseFacts,
+) -> Option<Bytes> {
+    match crate::shadow::transport::decode_body(
+        facts.content_encoding.as_deref(),
+        facts.body.clone(),
+        ctx.settings.max_body_bytes,
+    ) {
+        Ok(body) => Some(body),
+        Err(ShadowError::Oversize) => {
+            ctx.registry.record_skipped_oversize();
+            record_outcome(&ctx.registry, &context.route, "skipped");
+            None
+        }
+        Err(error) => {
+            ctx.registry.record_shadow_error();
+            record_outcome(&ctx.registry, &context.route, error.as_str());
+            tracing::debug!(
+                target: "autumn::shadow",
+                route = %context.route,
+                side,
+                %error,
+                "could not decode a mirrored response body"
+            );
+            None
+        }
     }
 }
 
@@ -788,6 +824,8 @@ mod tests {
         ReplyGzipped {
             body: &'static str,
         },
+        /// Answer claiming an encoding the bytes do not actually carry.
+        ReplyMisencoded,
         Reply {
             status: u16,
             body: &'static str,
@@ -838,6 +876,12 @@ mod tests {
                         Some("application/json".to_owned()),
                         Some("gzip".to_owned()),
                         gzipped(body.as_bytes()),
+                    )),
+                    Behaviour::ReplyMisencoded => Ok(ResponseFacts::encoded(
+                        200,
+                        Some("application/json".to_owned()),
+                        Some("gzip".to_owned()),
+                        bytes::Bytes::from_static(b"this is not gzip"),
                     )),
                     Behaviour::Fail => Err(ShadowError::Transport("refused".to_owned())),
                     Behaviour::Oversize => Err(ShadowError::Oversize),
@@ -1324,6 +1368,37 @@ mod tests {
         })
         .await;
         assert_eq!(registry.stats().matched, 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_encoding_is_an_error_not_a_size_skip() {
+        // An operator seeing `skipped_oversize` would go looking for a body
+        // over `max_body_bytes`, when the real problem is a response whose
+        // declared encoding does not decode. Distinct counters, distinct
+        // outcome labels.
+        let transport = FakeTransport::new(Behaviour::ReplyMisencoded);
+        let registry = ShadowRegistry::new(10);
+        let service =
+            layer(transport.clone(), &registry, settings()).layer(primary(r#"{"ok":true}"#));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(read_body(response).await, r#"{"ok":true}"#);
+
+        settle("the decode failure to be counted", || {
+            registry.stats().shadow_errors == 1
+        })
+        .await;
+        let stats = registry.stats();
+        assert_eq!(stats.shadow_errors, 1);
+        assert_eq!(
+            stats.skipped_oversize, 0,
+            "a malformed encoding is not a size-budget skip"
+        );
+        assert_eq!(stats.compared, 0);
     }
 
     #[tokio::test]
