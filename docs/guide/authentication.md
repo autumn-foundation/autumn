@@ -761,13 +761,16 @@ And what it refuses:
   misconfiguration, and registering the gate logs it at startup. Check it
   yourself with `impersonation::is_reserved_session_key`.
 
-- **No inherited record.** The session records *which* user the impersonation
-  describes. If the effective user later changes — someone logs in on that
-  session after an operator walked away without reverting — the record is stale:
-  it is ignored for attribution and refused by the revert route, instead of
-  handing the new user the operator's identity and role. Call
-  `impersonation::clear(&session)` from your own login / magic-link / passkey
-  promotion so the record never outlives the session it belonged to.
+- **No inherited record.** The record is bound both to *which* user it describes
+  and to the session generation that created it. Either a different effective
+  user, or a session-id rotation — which every login must perform anyway, to
+  prevent fixation — retires it: it stops counting for attribution and the
+  revert route refuses it, instead of handing whoever comes next the operator's
+  identity and role. The generation binding is what covers the case an id check
+  alone misses: the impersonated customer signing in **as themselves** on the
+  same browser. Belt and braces: call `impersonation::clear(&session)` from your
+  own login / magic-link / passkey promotion too, so the record is gone outright
+  rather than merely inert.
 
 Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
 not look at the target at all, so it will happily impersonate any string

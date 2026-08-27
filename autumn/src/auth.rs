@@ -81,11 +81,11 @@ pub use password::{
 
 pub mod impersonation;
 pub use impersonation::{
-    BEGIN_AUDIT_ACTION, END_AUDIT_ACTION, IMPERSONATED_SESSION_KEY, IMPERSONATOR_ROLE_SESSION_KEY,
-    IMPERSONATOR_SESSION_KEY, IMPERSONATOR_STEP_UP_SESSION_KEY, Impersonation, ImpersonationGate,
-    ImpersonationPolicy, ImpersonationState, ImpersonationTarget, RESERVED_SESSION_KEYS,
-    audit_actor_id, begin_impersonation, end_impersonation, impersonation_state, impersonator_id,
-    is_impersonating, is_reserved_session_key,
+    BEGIN_AUDIT_ACTION, END_AUDIT_ACTION, IMPERSONATED_SESSION_KEY, IMPERSONATION_SESSION_ID_KEY,
+    IMPERSONATOR_ROLE_SESSION_KEY, IMPERSONATOR_SESSION_KEY, IMPERSONATOR_STEP_UP_SESSION_KEY,
+    Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationState, ImpersonationTarget,
+    RESERVED_SESSION_KEYS, audit_actor_id, begin_impersonation, end_impersonation,
+    impersonation_state, impersonator_id, is_impersonating, is_reserved_session_key,
 };
 
 pub mod remember;

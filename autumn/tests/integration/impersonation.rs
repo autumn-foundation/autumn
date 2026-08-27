@@ -880,6 +880,16 @@ async fn login_as_someone_else(session: Session) -> &'static str {
     "ok"
 }
 
+/// The impersonated customer logs in **as themselves** on the same browser,
+/// without clearing the record. Their id equals the recorded target, so an
+/// id-only staleness check would still consider the record live.
+#[autumn_web::post("/login-as-the-target")]
+async fn login_as_the_target(session: Session) -> &'static str {
+    session.rotate_id().await;
+    session.insert("user_id", "user-9").await;
+    "ok"
+}
+
 #[autumn_web::post("/scrubbed-login")]
 async fn scrubbed_login(session: Session) -> &'static str {
     session.rotate_id().await;
@@ -896,6 +906,7 @@ fn stale_record_app() -> TestClientAlias {
             stop,
             whoami,
             login_as_someone_else,
+            login_as_the_target,
             scrubbed_login
         ])
         .state_initializer(|state| {
@@ -941,6 +952,43 @@ async fn a_stale_record_does_not_hand_the_next_user_the_operators_identity() {
         .await
         .assert_status(400);
     assert_eq!(who(&client).await, "user=carol;impersonator=-;actor=carol");
+}
+
+#[tokio::test]
+async fn the_impersonated_user_cannot_inherit_the_record_by_logging_in_as_themselves() {
+    // The narrow case an id-only staleness check misses, and the *likely* one
+    // at a support desk: the operator impersonated this customer, walked away,
+    // and the customer signed in as themselves on the same browser. Their id
+    // matches the recorded target exactly, so the record is retired by its
+    // binding to the session generation instead — the login rotated the id.
+    let client = stale_record_app();
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    client.post("/login-as-the-target").send().await.assert_ok();
+
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=-;actor=user-9",
+        "user-9's own session must not be attributed to the operator"
+    );
+
+    // "Stop impersonating" must not be a credential-free path to the operator's
+    // account for the very user who was being impersonated.
+    client
+        .post("/stop-impersonating")
+        .send()
+        .await
+        .assert_status(400);
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=-;actor=user-9"
+    );
 }
 
 #[tokio::test]

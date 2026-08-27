@@ -81,11 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity bound to it, so begin stashes and drops it — otherwise a `#[step_up]`
   route could run a destructive action on the *target's* account on the strength
   of the operator's re-authentication — and end restores it. Impersonation also
-  does not survive a change of identity: the session records which user the
-  record describes, and a stale record (an operator walked away without
-  reverting and somebody else logged in) is ignored for attribution and refused
-  by the revert route rather than handing the newcomer the operator's identity
-  and role. `impersonation::clear` scrubs it from a login flow. An `auth.session_key`
+  does not survive a change of identity: the record is bound both to the user it
+  describes and to the session generation that created it, so either a different
+  effective user or a session-id rotation (which every login performs) retires
+  it — it stops counting for attribution and the revert route refuses it, rather
+  than handing whoever comes next the operator's identity and role. The
+  generation binding covers the case an id check alone misses: the impersonated
+  customer signing in as themselves on the same browser.
+  `impersonation::clear` scrubs it from a login flow outright. An `auth.session_key`
   configured as one of the reserved keys would make the swap clobber its own
   record, so both directions refuse it and registering the gate logs it at
   startup (`impersonation::is_reserved_session_key` /

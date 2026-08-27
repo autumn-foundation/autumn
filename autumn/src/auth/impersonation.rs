@@ -119,6 +119,18 @@ pub const IMPERSONATED_SESSION_KEY: &str = "impersonated_id";
 /// the framework, like [`IMPERSONATOR_SESSION_KEY`].
 pub const IMPERSONATOR_ROLE_SESSION_KEY: &str = "impersonator_role";
 
+/// Session key binding the record to the session generation that created it.
+///
+/// Holds the session id [`begin_impersonation`] minted when it rotated. Any
+/// later rotation — which every login is required to perform, to prevent
+/// fixation — leaves the record pointing at a generation that no longer exists,
+/// so it is treated as stale. Without this, a customer who logs in as
+/// *themselves* on a browser where they had just been impersonated would still
+/// match the recorded target, and the revert route would hand them the
+/// operator's identity. Reserved by the framework, like
+/// [`IMPERSONATOR_SESSION_KEY`].
+pub const IMPERSONATION_SESSION_ID_KEY: &str = "impersonation_session_id";
+
 /// Session key stashing the real admin's step-up claim.
 ///
 /// Holds [`step_up::STEP_UP_SESSION_KEY`](crate::step_up::STEP_UP_SESSION_KEY)
@@ -137,9 +149,10 @@ const ROLE_SESSION_KEY: &str = "role";
 /// this list: the swap would then clobber its own record.
 /// [`begin_impersonation`] refuses rather than corrupting the session, and
 /// `AppBuilder::impersonation_gate` logs the misconfiguration at startup.
-pub const RESERVED_SESSION_KEYS: [&str; 5] = [
+pub const RESERVED_SESSION_KEYS: [&str; 6] = [
     IMPERSONATOR_SESSION_KEY,
     IMPERSONATED_SESSION_KEY,
+    IMPERSONATION_SESSION_ID_KEY,
     IMPERSONATOR_ROLE_SESSION_KEY,
     IMPERSONATOR_STEP_UP_SESSION_KEY,
     ROLE_SESSION_KEY,
@@ -376,16 +389,23 @@ pub struct ImpersonationState {
     pub effective_user_id: String,
 }
 
-/// The raw impersonation record on the session, **unvalidated**.
+/// The impersonation record on the session, if it is still live.
 ///
-/// Returns `(impersonator_id, impersonated_id)` when both reserved keys are
-/// present. Callers must confirm `impersonated_id` still matches the session's
-/// effective user before honoring it — see [`audit_actor_id`], which is the
-/// validating form every framework seam uses.
-async fn raw_record(session: &Session) -> Option<(String, String)> {
+/// Returns `(impersonator_id, impersonated_id)` only when all three reserved
+/// keys are present **and** the record is bound to the current session
+/// generation. Callers must additionally confirm `impersonated_id` matches the
+/// session's effective user — see [`audit_actor_id`], the validating form every
+/// framework seam uses.
+///
+/// The generation check is what makes the record un-inheritable: a login (which
+/// must rotate the session id) leaves the record bound to a generation that no
+/// longer exists, so it stops being honored even if the person logging in is
+/// the very user who was being impersonated.
+async fn live_record(session: &Session) -> Option<(String, String)> {
     let impersonator = session.get(IMPERSONATOR_SESSION_KEY).await?;
     let impersonated = session.get(IMPERSONATED_SESSION_KEY).await?;
-    Some((impersonator, impersonated))
+    let bound_session_id = session.get(IMPERSONATION_SESSION_ID_KEY).await?;
+    (bound_session_id == session.id().await).then_some((impersonator, impersonated))
 }
 
 /// The real operator behind the current session, or `None` when the session is
@@ -423,7 +443,7 @@ pub async fn impersonation_state(
     session: &Session,
 ) -> Option<ImpersonationState> {
     let effective_user_id = session.get(state.auth_session_key()).await?;
-    let (impersonator_id, impersonated_id) = raw_record(session).await?;
+    let (impersonator_id, impersonated_id) = live_record(session).await?;
     (impersonated_id == effective_user_id).then_some(ImpersonationState {
         impersonator_id,
         effective_user_id,
@@ -453,6 +473,7 @@ pub async fn impersonation_state(
 pub async fn clear(session: &Session) {
     session.remove(IMPERSONATOR_SESSION_KEY).await;
     session.remove(IMPERSONATED_SESSION_KEY).await;
+    session.remove(IMPERSONATION_SESSION_ID_KEY).await;
     session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await;
     session.remove(IMPERSONATOR_STEP_UP_SESSION_KEY).await;
 }
@@ -471,7 +492,7 @@ pub async fn clear(session: &Session) {
 /// forgotten impersonation from misattributing the next person's writes to the
 /// operator.
 pub async fn audit_actor_id(session: &Session, effective_user_id: &str) -> String {
-    match raw_record(session).await {
+    match live_record(session).await {
         Some((impersonator, impersonated)) if impersonated == effective_user_id => impersonator,
         _ => effective_user_id.to_owned(),
     }
@@ -569,8 +590,14 @@ async fn swap_identity(
 
     session.insert(auth_key, target_id).await;
     set_or_remove(session, ROLE_SESSION_KEY, target_role).await;
-    // Privilege change ⇒ new session id (no fixation).
+    // Privilege change ⇒ new session id (no fixation). Bind the record to the
+    // generation this rotation mints, so the next rotation — a login, an
+    // account switch — retires the record instead of letting whoever comes next
+    // inherit it.
     session.rotate_id().await;
+    session
+        .insert(IMPERSONATION_SESSION_ID_KEY, session.id().await)
+        .await;
 }
 
 /// Move `from` to `to`, leaving neither key set when `from` was absent.
@@ -587,6 +614,68 @@ async fn set_or_remove(session: &Session, key: &str, value: Option<&str>) {
             session.remove(key).await;
         }
     }
+}
+
+/// Everything [`begin_impersonation`] must establish before it consults the
+/// [`ImpersonationGate`]: a usable auth session key, an authenticated operator,
+/// a non-empty target that is not the operator themselves, and no impersonation
+/// already in flight.
+///
+/// Returns the resolved `(auth_key, real_id)` on success.
+async fn check_begin_preconditions(
+    state: &AppState,
+    session: &Session,
+    target_id: &str,
+) -> crate::AutumnResult<(String, String)> {
+    let auth_key = state.auth_session_key().to_owned();
+    // A configured auth key that collides with one of this module's own keys
+    // makes the swap self-destructive: writing the target through `auth_key`
+    // would overwrite the record it just wrote, so attribution would follow the
+    // target and the revert could not restore the operator. Refuse the
+    // misconfiguration rather than corrupting the session — checked before the
+    // session is read at all, so the error names the real cause.
+    if is_reserved_session_key(&auth_key) {
+        return Err(reserved_auth_key_error(&auth_key));
+    }
+
+    let Some(real_id) = session.get(&auth_key).await else {
+        return Err(crate::AutumnError::unauthorized_msg(
+            "authentication required",
+        ));
+    };
+
+    if target_id.is_empty() {
+        return Err(crate::AutumnError::bad_request_msg(
+            "impersonation target is required",
+        ));
+    }
+
+    // No nesting: an already-impersonated session cannot start a second hop,
+    // so impersonation can never be chained into an escalation. Uses the
+    // validated form, so a *stale* record (one describing a user this session
+    // no longer resolves as) does not permanently wedge the session at 409.
+    if is_impersonating(state, session).await {
+        return Err(crate::AutumnError::conflict_msg(
+            "already impersonating; stop the current impersonation first",
+        ));
+    }
+
+    if target_id == real_id.trim() {
+        return Err(crate::AutumnError::bad_request_msg(
+            "cannot impersonate yourself",
+        ));
+    }
+
+    Ok((auth_key, real_id))
+}
+
+/// The error both directions return when `auth.session_key` collides with a key
+/// the impersonation record reserves.
+fn reserved_auth_key_error(auth_key: &str) -> crate::AutumnError {
+    crate::AutumnError::internal_server_error_msg(format!(
+        "impersonation refused: `auth.session_key` is set to \"{auth_key}\", which is \
+         reserved by the impersonation record; choose another key"
+    ))
 }
 
 /// Begin impersonating `target` from the current admin session.
@@ -635,48 +724,7 @@ pub async fn begin_impersonation(
     // policy denying `"root"` would authorize an id it never approved.
     let target = target.into().normalized();
     let target_id = target.user_id();
-
-    let auth_key = state.auth_session_key().to_owned();
-    // A configured auth key that collides with one of this module's own keys
-    // makes the swap self-destructive: writing the target through `auth_key`
-    // would overwrite the record it just wrote, so attribution would follow the
-    // target and the revert could not restore the operator. Refuse the
-    // misconfiguration rather than corrupting the session — checked before the
-    // session is read at all, so the error names the real cause.
-    if is_reserved_session_key(&auth_key) {
-        return Err(crate::AutumnError::internal_server_error_msg(format!(
-            "impersonation refused: `auth.session_key` is set to \"{auth_key}\", which is \
-             reserved by the impersonation record; choose another key"
-        )));
-    }
-
-    let Some(real_id) = session.get(&auth_key).await else {
-        return Err(crate::AutumnError::unauthorized_msg(
-            "authentication required",
-        ));
-    };
-
-    if target_id.is_empty() {
-        return Err(crate::AutumnError::bad_request_msg(
-            "impersonation target is required",
-        ));
-    }
-
-    // No nesting: an already-impersonated session cannot start a second hop,
-    // so impersonation can never be chained into an escalation. Uses the
-    // validated form, so a *stale* record (one describing a user this session
-    // no longer resolves as) does not permanently wedge the session at 409.
-    if is_impersonating(state, session).await {
-        return Err(crate::AutumnError::conflict_msg(
-            "already impersonating; stop the current impersonation first",
-        ));
-    }
-
-    if target_id == real_id.trim() {
-        return Err(crate::AutumnError::bad_request_msg(
-            "cannot impersonate yourself",
-        ));
-    }
+    let (auth_key, real_id) = check_begin_preconditions(state, session, target_id).await?;
 
     let ctx = PolicyContext::from_request(state, session).await;
     let gate = state.extension::<ImpersonationGate>();
@@ -803,10 +851,7 @@ pub async fn end_impersonation(
 ) -> crate::AutumnResult<ImpersonationState> {
     let auth_key = state.auth_session_key().to_owned();
     if is_reserved_session_key(&auth_key) {
-        return Err(crate::AutumnError::internal_server_error_msg(format!(
-            "impersonation refused: `auth.session_key` is set to \"{auth_key}\", which is \
-             reserved by the impersonation record; choose another key"
-        )));
+        return Err(reserved_auth_key_error(&auth_key));
     }
     let Some(active) = impersonation_state(state, session).await else {
         // Either there is no record, or there is a *stale* one describing a user
@@ -844,6 +889,7 @@ pub async fn end_impersonation(
     session.insert(&auth_key, real_id.clone()).await;
     session.remove(IMPERSONATOR_SESSION_KEY).await;
     session.remove(IMPERSONATED_SESSION_KEY).await;
+    session.remove(IMPERSONATION_SESSION_ID_KEY).await;
     stash(session, IMPERSONATOR_ROLE_SESSION_KEY, ROLE_SESSION_KEY).await;
     // Put the operator's own step-up claim back exactly as it was, and discard
     // anything the impersonated session accrued — that freshness belonged to
@@ -872,21 +918,29 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    const TEST_SID: &str = "sid-1";
+
     fn session_with(pairs: &[(&str, &str)]) -> Session {
         let data: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        Session::new_for_test("sid-1".to_owned(), data)
+        Session::new_for_test(TEST_SID.to_owned(), data)
+    }
+
+    /// A session carrying a record bound to the current generation.
+    fn impersonating_session(impersonator: &str, target: &str) -> Session {
+        session_with(&[
+            ("user_id", target),
+            (IMPERSONATOR_SESSION_KEY, impersonator),
+            (IMPERSONATED_SESSION_KEY, target),
+            (IMPERSONATION_SESSION_ID_KEY, TEST_SID),
+        ])
     }
 
     #[tokio::test]
     async fn audit_actor_prefers_the_impersonator_and_falls_back_to_the_user() {
-        let impersonating = session_with(&[
-            ("user_id", "target"),
-            (IMPERSONATOR_SESSION_KEY, "admin"),
-            (IMPERSONATED_SESSION_KEY, "target"),
-        ]);
+        let impersonating = impersonating_session("admin", "target");
         assert_eq!(audit_actor_id(&impersonating, "target").await, "admin");
 
         let plain = session_with(&[("user_id", "u1")]);
@@ -902,8 +956,22 @@ mod tests {
             ("user_id", "carol"),
             (IMPERSONATOR_SESSION_KEY, "admin"),
             (IMPERSONATED_SESSION_KEY, "target"),
+            (IMPERSONATION_SESSION_ID_KEY, TEST_SID),
         ]);
         assert_eq!(audit_actor_id(&stale, "carol").await, "carol");
+    }
+
+    #[tokio::test]
+    async fn a_record_bound_to_another_session_generation_is_ignored() {
+        // Same user id on both sides, but the session was rotated since — the
+        // shape a login leaves behind.
+        let rotated = session_with(&[
+            ("user_id", "target"),
+            (IMPERSONATOR_SESSION_KEY, "admin"),
+            (IMPERSONATED_SESSION_KEY, "target"),
+            (IMPERSONATION_SESSION_ID_KEY, "a-previous-generation"),
+        ]);
+        assert_eq!(audit_actor_id(&rotated, "target").await, "target");
     }
 
     #[tokio::test]
@@ -920,6 +988,7 @@ mod tests {
             ("user_id", "target"),
             (IMPERSONATOR_SESSION_KEY, "admin"),
             (IMPERSONATED_SESSION_KEY, "target"),
+            (IMPERSONATION_SESSION_ID_KEY, TEST_SID),
             (IMPERSONATOR_ROLE_SESSION_KEY, "admin"),
             (IMPERSONATOR_STEP_UP_SESSION_KEY, "123"),
         ]);
@@ -927,6 +996,7 @@ mod tests {
         for key in [
             IMPERSONATOR_SESSION_KEY,
             IMPERSONATED_SESSION_KEY,
+            IMPERSONATION_SESSION_ID_KEY,
             IMPERSONATOR_ROLE_SESSION_KEY,
             IMPERSONATOR_STEP_UP_SESSION_KEY,
         ] {

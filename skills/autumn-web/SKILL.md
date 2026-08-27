@@ -1007,8 +1007,11 @@ when the audit write fails **or when no audit sink is installed at all** — wir
 `AppBuilder::with_audit_sink(...)` before enabling it. The operator's step-up
 claim is stashed and dropped for the duration (so a `#[step_up]` action cannot
 be run on the target's account on the operator's re-auth) and restored on
-revert; call `impersonation::clear(&session)` from any login flow so a
-forgotten impersonation cannot be inherited by the next user of that session. No nesting (`409`), no self-impersonation, and
+revert; the record is bound to the user it names *and* to the session
+generation that created it, so a login (which rotates the session id) retires
+it — a forgotten impersonation cannot be inherited by the next user, not even by
+the impersonated customer signing in as themselves. Call
+`impersonation::clear(&session)` from any login flow to drop it outright. No nesting (`409`), no self-impersonation, and
 the admin's own step-up claim is preserved rather than refreshed.
 
 For the UI, `AdminPlugin::with_impersonation(gate)` mounts
