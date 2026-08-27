@@ -130,14 +130,17 @@ each has its own interceptor trait installed on the builder:
 
 They share one shape: you receive the operation plus a `next` future, and you
 decide whether, when, and how to call it — the same "around" contract as a
-tower layer, on a non-HTTP pipeline.
+tower layer, on a non-HTTP pipeline. Note that this is an *observe* hook, not a
+rewrite hook: the operation is borrowed and `next` already captured it, so an
+interceptor can wrap, time, refuse, or log a job — but it cannot edit the
+payload that gets enqueued.
 
 ```rust,ignore
 use autumn_web::interceptor::JobInterceptor;
 
-struct TenantStampingJobs;
+struct TracingJobs;
 
-impl JobInterceptor for TenantStampingJobs {
+impl JobInterceptor for TracingJobs {
     fn intercept_enqueue<'a>(
         &'a self,
         name: &'a str,
@@ -161,7 +164,7 @@ impl JobInterceptor for TenantStampingJobs {
 }
 
 autumn_web::app()
-    .with_job_interceptor(TenantStampingJobs)
+    .with_job_interceptor(TracingJobs)
     .run()
     .await;
 ```

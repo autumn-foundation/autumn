@@ -367,6 +367,33 @@ data_table(&page.content, &columns, &DataTableConfig {
 
 ---
 
+## Order by something unique, or pages will lie
+
+The single most common offset-pagination bug is an `ORDER BY` that is not a
+**total** order. SQL does not promise a stable order among rows with equal sort
+keys, and `LIMIT`/`OFFSET` re-runs the sort on every request — so two page
+requests can return the same row twice, or skip one entirely, with nothing in
+the table having changed.
+
+```rust,ignore
+// ❌ ties are ordered arbitrarily, and `hot_rank` defaults to 0.0 —
+//    on a young table almost every row is a tie
+.order(posts::hot_rank.desc())
+
+// ✅ a unique final column makes the order total, and therefore stable
+.order((posts::hot_rank.desc(), posts::id.desc()))
+```
+
+Append the primary key (or any unique column) as the last ordering term,
+always. It costs nothing, it is usually free on an existing index, and without
+it your pager is quietly wrong in a way no single-page test will catch.
+
+This applies to cursor pagination too, where it is even less optional — the
+cursor's whole job is to encode a position in a total order. The keyset filter
+shown earlier pairs `created_at` with `id` for exactly this reason.
+
+---
+
 ## Costs, and how to keep them down
 
 Pagination is where a fast page quietly becomes a slow one. Four things account
@@ -383,10 +410,11 @@ page of a big list is the slowest request on the site. Cursor pagination is
 O(1) in page depth; that is the reason to prefer it for large tables, not
 fashion.
 
-**Offset pages are not stable under concurrent inserts.** A row inserted at the
-head while a user reads page 1 pushes one row from page 1 onto page 2, so they
-see it twice — or, on a delete, never see it at all. For a feed, that is a bug
-report. Cursor pagination is keyset-based and does not have the problem.
+**Offset pages are not stable under concurrent inserts.** Even with a total
+order, a row inserted at the head while a user reads page 1 pushes one row from
+page 1 onto page 2, so they see it twice — or, on a delete, never see it at all.
+For a feed, that is a bug report. Cursor pagination is keyset-based and does not
+have the problem.
 
 **Two extractors, two connections.** A handler that holds `Db` *and* takes a
 repository extractor holds two pooled connections at once. Under the default

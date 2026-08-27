@@ -91,10 +91,17 @@ pub trait MailInterceptor: Send + Sync + 'static {
 
 /// Wraps job enqueue **and** job execution.
 ///
-/// The two halves run in different processes when the app is split into web
-/// and worker roles, so an implementation that must span both — propagating a
-/// trace context, stamping a tenant — has to write to the payload on enqueue
-/// and read it back on execute rather than relying on shared in-process state.
+/// An interceptor **observes** a job; it does not rewrite one. Both methods
+/// take the payload as `&serde_json::Value`, and `next` is a future that has
+/// already captured the operation, so there is no way to stamp a value into the
+/// payload on the way past.
+///
+/// To carry context from the enqueuing request to the worker, put it in the
+/// job's own args — that payload is what crosses the boundary — and use this
+/// trait to read it: typically to open a tracing span or set a task-local
+/// around `next.await` on the execute side. In-process state established during
+/// `intercept_enqueue` is not a channel to `intercept_execute`: when the app is
+/// split into web and worker roles the two halves run in different processes.
 pub trait JobInterceptor: Send + Sync + 'static {
     /// Run around one enqueue.
     ///

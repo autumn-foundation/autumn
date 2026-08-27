@@ -247,7 +247,17 @@ pub async fn show(
         crate::schema::posts::table
             .filter(crate::schema::posts::subreddit_id.eq(sub.id))
             .inner_join(users::table.on(crate::schema::posts::author_id.eq(users::id)))
-            .order(crate::schema::posts::hot_rank.desc())
+            // The `id` tie-breaker is what makes the ORDER BY a TOTAL order,
+            // and it is load-bearing the moment LIMIT/OFFSET splits this query.
+            // `hot_rank` defaults to 0.0, so a fresh community is mostly ties,
+            // and PostgreSQL does not promise a stable order among equal keys:
+            // without a unique final column, two page requests can return the
+            // same post twice or skip one entirely, with nothing having
+            // changed. See docs/guide/pagination.md.
+            .order((
+                crate::schema::posts::hot_rank.desc(),
+                crate::schema::posts::id.desc(),
+            ))
             .limit(page_req.limit())
             .offset(page_req.offset())
             .select((
@@ -421,7 +431,14 @@ pub async fn show(
             // the ends. `PagerOptions` has no `hx_target` here on purpose, so
             // every link is a plain <a href> and pagination keeps working with
             // JavaScript disabled. See docs/guide/pagination.md.
-            (pagination_nav(&page, &PagerOptions::new(&__autumn_path_show(&sub.slug))))
+            // `include_size` carries the effective page size onto every link.
+            // Without it a visitor who arrived on `?size=5` gets links that say
+            // only `?page=2`, silently reverting to the default size — so page 2
+            // would start at offset 20 and skip posts 6-20.
+            (pagination_nav(
+                &page,
+                &PagerOptions::new(&__autumn_path_show(&sub.slug)).include_size(),
+            ))
 
             // Community discussion -- the second `#[commentable]` model (#1367).
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mt-6" {
