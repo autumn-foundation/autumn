@@ -229,6 +229,22 @@ pub trait ClockSource: Send + Sync + 'static {
     }
 }
 
+/// A shared clock handle is itself a clock.
+///
+/// Lets an already-`Arc`ed source — the one a capsule replay builds, or one a
+/// test keeps a handle on to inspect afterwards — be handed to APIs that take
+/// `impl ClockSource` by value, without a hand-written forwarding newtype at
+/// every call site.
+impl ClockSource for std::sync::Arc<dyn ClockSource> {
+    fn now(&self) -> DateTime<Utc> {
+        (**self).now()
+    }
+
+    fn monotonic(&self) -> MonotonicInstant {
+        (**self).monotonic()
+    }
+}
+
 // ── Extractor ─────────────────────────────────────────────────────────────────
 
 /// Axum extractor that resolves the current framework time.

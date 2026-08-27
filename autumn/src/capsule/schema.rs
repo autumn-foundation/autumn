@@ -44,7 +44,18 @@ use serde::{Deserialize, Serialize};
 /// — a `mismatch` the guide tells operators to read as "the bug is gone".
 /// Tolerating the document silently is precisely what the version gate exists
 /// to prevent, so adding the field bumps the version.
-pub const CAPSULE_FORMAT_VERSION: u32 = 2;
+///
+/// | version | added |
+/// | --- | --- |
+/// | 1 | request, clock, database tape, outcome (#1598) |
+/// | 2 | [`Capsule::db_roles`] |
+/// | 3 | [`Capsule::effects`] (outbound HTTP, jobs, cache, mail, tenancy, randomness) and [`Capsule::job`] (#1634) |
+///
+/// Version 3 is the same kind of semantic bump version 2 was, one seam wider:
+/// a v2 reader would skip `effects` entirely, replay a handler whose outbound
+/// call, cache read or minted identifier is nowhere in the document, and
+/// report a verdict on a run that never met the recording's effects.
+pub const CAPSULE_FORMAT_VERSION: u32 = 3;
 
 /// Errors surfaced when reading a capsule back from disk.
 #[derive(Debug)]
@@ -67,11 +78,22 @@ impl std::fmt::Display for CapsuleError {
         match self {
             Self::Io(error) => write!(f, "failed to read capsule: {error}"),
             Self::Malformed(error) => write!(f, "capsule is not a valid capsule document: {error}"),
-            Self::VersionMismatch { found, expected } => write!(
-                f,
-                "capsule format version {found} is not supported by this build \
-                 (expected {expected}); re-record the capsule with a matching Autumn build"
-            ),
+            Self::VersionMismatch { found, expected } => {
+                let direction = if found < expected {
+                    "older than"
+                } else {
+                    "newer than"
+                };
+                write!(
+                    f,
+                    "capsule format version {found} is {direction} the version this build \
+                     understands ({expected}), so replaying it would judge the handler against \
+                     effects the document cannot describe. Re-record the capsule with this \
+                     build, or replay it with the Autumn version that wrote it — see the \
+                     \"Compatibility across Autumn versions\" section of the failure-capsule \
+                     guide."
+                )
+            }
         }
     }
 }
@@ -126,6 +148,23 @@ pub struct Capsule {
     /// unavailable").
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Framework effects the recorded run produced outside the request and the
+    /// database: outbound HTTP, job enqueues, cache reads and writes, mail
+    /// sends, the resolved tenant, and the random bytes it drew (#1634).
+    ///
+    /// Each seam is served from here on replay, in recorded order, with the
+    /// same no-live-effects posture the database tape has.
+    #[serde(default)]
+    pub effects: CapsuleEffects,
+    /// The job this capsule replays, when the failure happened inside a job
+    /// execution rather than while serving a request.
+    ///
+    /// `None` is the ordinary request capsule. When it is `Some`, `request`
+    /// holds a synthetic descriptor of the job (so every field that names "the
+    /// recorded entry point" still resolves) and replay dispatches the named
+    /// job with the recorded payload instead of driving the router.
+    #[serde(default)]
+    pub job: Option<CapsuleJob>,
 }
 
 impl Capsule {
@@ -355,6 +394,193 @@ pub enum BindValue {
     Masked,
 }
 
+// ── Effect tape (#1634) ─────────────────────────────────────────────────────
+
+/// Every framework effect one recorded run produced outside the request and
+/// the database.
+///
+/// Each list is in the order the run performed the effect. Ordering is
+/// per-seam rather than global on purpose: two outbound calls the handler
+/// `join!`s have no deterministic interleaving against each other, let alone
+/// against a cache read on a third task, so a single global order would be a
+/// fact the recording cannot actually establish — and replay would then report
+/// a divergence for an interleaving that was never guaranteed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleEffects {
+    /// Outbound HTTP request/response pairs made through
+    /// [`http_client`](crate::http_client), in call order. Outbound webhook
+    /// deliveries are covered here too: they send through the same client.
+    #[serde(default)]
+    pub http: Vec<HttpEffect>,
+    /// Background jobs the run enqueued, in enqueue order.
+    #[serde(default)]
+    pub jobs: Vec<JobEffect>,
+    /// Cache reads and writes, in call order.
+    #[serde(default)]
+    pub cache: Vec<CacheEffect>,
+    /// Mail the run handed to the mailer, in send order.
+    #[serde(default)]
+    pub mail: Vec<MailEffect>,
+    /// The tenant context the run resolved, when the app is multi-tenant.
+    #[serde(default)]
+    pub tenant: Option<TenantEffect>,
+    /// Random byte draws taken through [`Entropy`](crate::entropy::Entropy),
+    /// in draw order.
+    #[serde(default)]
+    pub random: Vec<RandomEffect>,
+}
+
+impl CapsuleEffects {
+    /// Whether the run recorded no effects at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.http.is_empty()
+            && self.jobs.is_empty()
+            && self.cache.is_empty()
+            && self.mail.is_empty()
+            && self.tenant.is_none()
+            && self.random.is_empty()
+    }
+}
+
+/// One outbound HTTP request and the response it received.
+///
+/// Headers and structured bodies are masked through the same
+/// `[log] filter_parameters` list the inbound request is: an outbound
+/// `Authorization` header carries a downstream credential exactly the way an
+/// inbound one carries the caller's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpEffect {
+    /// HTTP method the client sent.
+    pub method: String,
+    /// Absolute request URL, with its query string redacted.
+    pub url: String,
+    /// Request headers the caller set, already masked.
+    #[serde(default)]
+    pub request_headers: Vec<(String, String)>,
+    /// The (redacted) request body.
+    #[serde(default = "absent_body")]
+    pub request_body: CapsuleBody,
+    /// Status the peer answered with. `0` when the call never got a response
+    /// (see `error`).
+    pub status: u16,
+    /// Response headers, already masked.
+    #[serde(default)]
+    pub response_headers: Vec<(String, String)>,
+    /// The (redacted) response body.
+    #[serde(default = "absent_body")]
+    pub response_body: CapsuleBody,
+    /// Transport-level failure text, when the call produced no response at
+    /// all. Replay reproduces the failure rather than a status.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// A background job the recorded run enqueued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobEffect {
+    /// Registered job name.
+    pub name: String,
+    /// The (redacted) JSON payload.
+    pub payload: serde_json::Value,
+    /// Delay the enqueue asked for, in seconds, when it was a scheduled
+    /// enqueue.
+    #[serde(default)]
+    pub delay_secs: Option<i64>,
+}
+
+/// The job a job-scoped capsule replays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleJob {
+    /// Registered job name.
+    pub name: String,
+    /// The (redacted) JSON payload the failing execution ran with.
+    pub payload: serde_json::Value,
+}
+
+/// One cache interaction.
+///
+/// Values are base64-encoded JSON — the representation
+/// [`insert_cached`](crate::cache::insert_cached) already produces for
+/// cross-replica backends — so a recorded hit can be handed back to
+/// [`get_cached`](crate::cache::get_cached) on replay without the capsule
+/// having to carry Rust types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum CacheEffect {
+    /// A read. `value` is `None` for a miss, and for a hit whose value the
+    /// backend could not serialize (an in-process-only type) — the two are
+    /// distinguished on replay by whether the key appears at all.
+    Get {
+        /// Cache key read.
+        key: String,
+        /// base64 of the JSON bytes served, when the read hit and the value
+        /// was serializable.
+        #[serde(default)]
+        value: Option<String>,
+    },
+    /// A write.
+    Insert {
+        /// Cache key written.
+        key: String,
+        /// base64 of the JSON bytes written.
+        value: String,
+    },
+}
+
+impl CacheEffect {
+    /// The key this interaction touched.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Get { key, .. } | Self::Insert { key, .. } => key,
+        }
+    }
+}
+
+/// One message handed to the mailer.
+///
+/// Replay asserts the send happened and never delivers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailEffect {
+    /// `To` recipients. `Mail` carries no `Cc`/`Bcc`, so neither does this.
+    #[serde(default)]
+    pub to: Vec<String>,
+    /// `From`, when the message set one explicitly.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Subject line, masked like any other recorded text.
+    pub subject: String,
+    /// The (redacted) body.
+    #[serde(default = "absent_body")]
+    pub body: CapsuleBody,
+    /// The delivery error the recorded send produced, when it failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The tenant context the recorded run resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantEffect {
+    /// Resolved tenant id, or `None` when the run resolved no tenant.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// One draw from the framework's entropy source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RandomEffect {
+    /// The bytes the draw produced.
+    #[serde(with = "b64")]
+    pub bytes: Vec<u8>,
+}
+
+/// `serde(default)` for the body fields on effect records: an effect whose
+/// document omits a body carried none.
+const fn absent_body() -> CapsuleBody {
+    CapsuleBody::Absent
+}
+
 /// base64 (standard alphabet) serde adapter for byte fields.
 pub(crate) mod b64 {
     use base64::Engine as _;
@@ -383,7 +609,7 @@ pub(crate) mod b64 {
 pub mod test_support {
     use super::{
         AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb,
-        CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
+        CapsuleEffects, CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
     };
 
     /// An extended-protocol exchange with prebuilt backend frames.
@@ -463,6 +689,8 @@ pub mod test_support {
             db_roles: Vec::new(),
             truncated: false,
             notes: Vec::new(),
+            effects: CapsuleEffects::default(),
+            job: None,
         }
     }
 
@@ -512,6 +740,99 @@ mod tests {
             )],
         );
         capsule
+    }
+
+    /// #1634 Phase 0: the effect tape round-trips, and every kind survives.
+    #[test]
+    fn capsule_effects_round_trip() {
+        let mut capsule = sample();
+        capsule.effects.http.push(HttpEffect {
+            method: "POST".to_owned(),
+            url: "https://payments.example/charge".to_owned(),
+            request_headers: vec![("authorization".to_owned(), "[FILTERED]".to_owned())],
+            request_body: CapsuleBody::Text("{\"amount\":10}".to_owned()),
+            status: 502,
+            response_headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            response_body: CapsuleBody::Base64("AAEC".to_owned()),
+            error: None,
+        });
+        capsule.effects.jobs.push(JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({"order": 7}),
+            delay_secs: Some(30),
+        });
+        capsule.effects.cache.push(CacheEffect::Get {
+            key: "user:7".to_owned(),
+            value: Some("eyJhIjoxfQ==".to_owned()),
+        });
+        capsule.effects.cache.push(CacheEffect::Insert {
+            key: "user:7".to_owned(),
+            value: "eyJhIjoxfQ==".to_owned(),
+        });
+        capsule.effects.mail.push(MailEffect {
+            to: vec!["a@example.com".to_owned()],
+            from: Some("noreply@example.com".to_owned()),
+            subject: "Receipt".to_owned(),
+            body: CapsuleBody::Text("thanks".to_owned()),
+            error: None,
+        });
+        capsule.effects.tenant = Some(TenantEffect {
+            id: Some("acme".to_owned()),
+        });
+        capsule.effects.random.push(RandomEffect {
+            bytes: vec![0xAA, 0xBB, 0xCC],
+        });
+
+        let json = serde_json::to_string(&capsule).expect("capsule serializes");
+        let parsed = Capsule::from_json(&json).expect("capsule round-trips");
+        assert_eq!(parsed.effects, capsule.effects);
+        assert_eq!(
+            parsed.effects.random.first().map(|draw| draw.bytes.clone()),
+            Some(vec![0xAA, 0xBB, 0xCC]),
+            "random draws are byte-exact after the base64 hop"
+        );
+    }
+
+    /// A job-entry capsule names the job it replays instead of a route.
+    #[test]
+    fn capsule_job_entry_round_trips() {
+        let mut capsule = sample();
+        capsule.job = Some(CapsuleJob {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({"order": 7}),
+        });
+        let json = serde_json::to_string(&capsule).expect("capsule serializes");
+        let parsed = Capsule::from_json(&json).expect("capsule round-trips");
+        assert_eq!(
+            parsed.job.as_ref().map(|job| job.name.as_str()),
+            Some("send_receipt")
+        );
+    }
+
+    /// The effect tape is a semantic addition a v2 reader would skip while
+    /// happily reporting a reproduction, so it bumps the format version.
+    #[test]
+    fn effect_tape_bumped_the_format_version_past_two() {
+        assert!(
+            CAPSULE_FORMAT_VERSION >= 3,
+            "adding effect seams must bump the version gate so a pre-effects \
+             capsule is refused rather than replayed with every seam empty"
+        );
+    }
+
+    /// A capsule written before the effect tape existed must be refused, not
+    /// read with empty seams — the "spurious pass" the compatibility AC forbids.
+    #[test]
+    fn a_pre_effects_capsule_is_refused_by_the_version_gate() {
+        let mut capsule = sample();
+        capsule.format_version = 2;
+        let json = serde_json::to_string(&capsule).expect("capsule serializes");
+        let error = Capsule::from_json(&json).expect_err("a v2 capsule must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("older") || message.contains("re-record"),
+            "the refusal must be actionable: {message}"
+        );
     }
 
     #[test]

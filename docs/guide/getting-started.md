@@ -1174,7 +1174,9 @@ production.
 
 When a 5xx does reach a user, you can record it as a replayable
 [failure capsule](failure-capsules.md) — the request, the database traffic it
-produced, and the outcome, in one file that `autumn replay` re-runs offline.
+produced, and the outcome, in one file that `autumn replay` re-runs offline —
+then convert it with `autumn capsule test` into a committed regression test so
+the same bug can never come back unnoticed.
 
 ---
 

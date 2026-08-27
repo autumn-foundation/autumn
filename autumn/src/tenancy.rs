@@ -52,9 +52,47 @@ where
     CURRENT_TENANT.scope(Some(tenant_id), future).await
 }
 
-// Tenant extraction logic based on configuration
+/// Resolve the request's tenant, recording it into a failure capsule and
+/// serving it from one during replay (#1634).
+///
+/// Wrapping the resolver — rather than the middleware — puts the seam on the
+/// one path both the [`Tenant`] extractor and [`tenancy_middleware`] take, so
+/// a capsule cannot miss the tenant because the app resolves it in a handler
+/// instead of a layer.
+///
+/// Replay serves the *recorded* tenant without re-running resolution: the
+/// resolution reads live tenant configuration (a header allow-list, a session
+/// lookup, a subdomain map) that the machine doing the replaying generally
+/// does not have, and a replay that re-derived a different tenant would judge
+/// the handler on data the failing request never saw.
 #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn extract_tenant_from_parts(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+) -> Result<String, crate::AutumnError> {
+    if let Some(tenant_id) = crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+    {
+        return Ok(tenant_id);
+    }
+    // A capsule with no recorded tenant falls through to the real resolver.
+    // That is not a gap: the recorded request's headers are restored verbatim,
+    // so a run whose recorded failure *was* a tenant-resolution error
+    // reproduces that error instead of being handed a different 503 saying the
+    // capsule is too old.
+    let resolved = extract_tenant_from_parts_inner(parts, config).await;
+    if let Ok(tenant_id) = resolved.as_ref()
+        && let Some(scope) = crate::capsule::current_scope()
+    {
+        scope.record_tenant(crate::capsule::TenantEffect {
+            id: Some(tenant_id.clone()),
+        });
+    }
+    resolved
+}
+
+// Tenant extraction logic based on configuration
+#[allow(clippy::too_many_lines)]
+async fn extract_tenant_from_parts_inner(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {

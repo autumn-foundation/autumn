@@ -636,6 +636,59 @@ pub struct Mail {
     pub inline_css: Option<bool>,
 }
 
+// ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+
+/// Answer a mail send from the capsule's effect tape, when one is serving this
+/// task.
+///
+/// `Some(Ok(()))` means the send matched the recording and **nothing was
+/// delivered**; `Some(Err(..))` means it diverged (already logged by
+/// `next_mail`) and the send fails closed rather than reaching a transport.
+fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
+    let tape = crate::capsule::effects::current_tape()?;
+    if let Some(recorded) = tape.next_mail(&mail.to, &mail.subject) {
+        // A recorded delivery *failure* is reproduced as one. A handler whose
+        // bug is that it does not handle a suppressed recipient or an SMTP
+        // refusal has to meet that error again, not a synthesized success.
+        return Some(recorded.map_or(Ok(()), |error| {
+            Err(MailError::RuntimeUnavailable(format!(
+                "replayed from the capsule: {error}"
+            )))
+        }));
+    }
+    Some(Err(MailError::RuntimeUnavailable(format!(
+        "the replayed run sent mail ({:?} to {}) the capsule has no recording for; nothing \
+         was delivered",
+        mail.subject,
+        mail.to.join(", ")
+    ))))
+}
+
+/// Tee a mail send into the in-flight request's capsule.
+///
+/// The plain-text body is preferred over the HTML one: it is the same content,
+/// it is what redaction can scan, and an inlined HTML body is mostly markup
+/// that would dominate the capsule's size budget for no reproduction value.
+fn record_send(mail: &Mail, error: Option<&MailError>) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    let body = mail
+        .text
+        .as_ref()
+        .or(mail.html.as_ref())
+        .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+            crate::capsule::CapsuleBody::Text(body.clone())
+        });
+    scope.record_mail(crate::capsule::MailEffect {
+        to: mail.to.clone(),
+        from: mail.from.clone(),
+        subject: mail.subject.clone(),
+        body,
+        error: error.map(ToString::to_string),
+    });
+}
+
 /// Stable root path for the dev mail preview UI.
 pub const MAIL_PREVIEW_PATH: &str = "/_autumn/mail";
 
@@ -1713,7 +1766,29 @@ impl Mailer {
     /// suppressed, an error from the selected transport, or from the suppression
     /// store when a suppression check fails.
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
-        let mut mail = mail.with_defaults(&self.defaults);
+        let mail = mail.with_defaults(&self.defaults);
+
+        // Failure-capsule seam (#1634). A replay asserts the send against the
+        // recording and returns without touching a transport — the check sits
+        // ahead of suppression, CSS inlining and the list-mail branch because
+        // all three consult live state (a suppression store, an unsubscribe
+        // runtime) a replay does not have.
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        // Capture records the *finished* send, error included: a handler whose
+        // bug is "we do not handle `AllRecipientsSuppressed`" must meet that
+        // error again on replay, and recording up front would tell the capsule
+        // the message went out when it never did.
+        let recorded = mail.clone();
+        let result = self.send_inner(mail).await;
+        record_send(&recorded, result.as_ref().err());
+        result
+    }
+
+    /// [`send`](Self::send), minus the replay gate and the capture tee.
+    async fn send_inner(&self, mail: Mail) -> Result<(), MailError> {
+        let mut mail = mail;
 
         // Inline `<style>` CSS into element `style="…"` attributes before
         // transport, so every transport (SMTP, file, log, preview) delivers the
@@ -2043,6 +2118,19 @@ impl Mailer {
     }
 
     fn spawn_mail_delivery(&self, mail: Mail) -> Result<(), MailError> {
+        // Failure-capsule seam (#1634). Deferred delivery is the one mail path
+        // that leaves the request's task, and a task-local tape does not cross
+        // `tokio::spawn` — so a replayed handler that called `deliver_later`
+        // would send *for real* from the spawned task, where the seam in
+        // `send` can no longer see a tape. The check has to happen here, on the
+        // calling task, before anything is spawned.
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        // Recorded here for the same reason: the spawned task carries no
+        // capture scope either, so a `deliver_later` would otherwise be missing
+        // from the capsule and then report an unrecorded-effect divergence.
+        record_send(&mail, None);
         // Honor the disabled-transport contract: if the operator turned mail off
         // for this profile, deliver_later must drop the message just like
         // immediate `send` does — even when a queue is attached.

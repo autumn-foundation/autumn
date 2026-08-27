@@ -192,7 +192,7 @@ has one, which is how a capsule on disk is tied back to a log line.
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 3,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
   "autumn_version": "0.7.0",
@@ -214,6 +214,21 @@ has one, which is how a capsule on disk is tied back to a log line.
     { "protocol": "extended", "sql": "SELECT id, total FROM invoices WHERE id = $1",
       "binds": [{ "value": "NDI=" }], "response": "VAAA…", "row_count": 1, "error": null }
   ] } ] },
+  "effects": {
+    "http": [
+      { "method": "POST", "url": "https://tax.example/quote",
+        "request_headers": [["authorization", "[FILTERED]"]],
+        "request_body": { "text": "{\"total\":9900}" },
+        "status": 503, "response_headers": [], "response_body": { "text": "upstream busy" },
+        "error": null }
+    ],
+    "jobs": [{ "name": "send_receipt", "payload": { "order": 42 }, "delay_secs": null }],
+    "cache": [{ "op": "get", "key": "tax_rate:CA", "value": "eyJyYXRlIjowLjA5fQ==" }],
+    "mail": [],
+    "tenant": { "id": "acme" },
+    "random": [{ "bytes": "3q2+7wAAAAAAAAAAAAAAAA==" }]
+  },
+  "job": null,
   "truncated": false,
   "notes": []
 }
@@ -250,6 +265,68 @@ cold replay could never produce.
 order, so a handler that stamps `created_at` or expires a token sees the same
 times on replay. Readings taken outside a request — schedulers, jobs — pass
 straight through.
+
+**The effect seams.** Beyond the request, the clock and the database, a capsule
+records every framework effect the failing run produced. Each is captured at the
+one choke point every code path funnels through, so a capsule cannot miss an
+effect because your handler reached it a different way:
+
+| Seam | Captured at | Replayed as |
+| --- | --- | --- |
+| Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back; **no socket is opened**. Outbound webhook deliveries are covered here too — they send through the same client |
+| Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording and returns `Ok(())`; **nothing is written to a queue and no job runs** |
+| Cache | `cache::get_cached` / `insert_cached` | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write lands in the tape, so a read-back in the same run finds it |
+| Mail | `Mailer::send` | The send is asserted; **nothing is delivered** |
+| Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration |
+| Randomness | `state.entropy()` | Every draw replays byte-for-byte, so the session id, CSRF token, request id or job id the failing request minted reappears |
+
+**Randomness is recorded in the clear, by construction.** The bytes a request
+drew *are* the session id, the CSRF token, the reset token it minted — that is
+what makes replay reproduce them — so they cannot be masked and still replay,
+and no `filter_parameters` entry suppresses them. Treat a capsule from a route
+that mints credentials the way you would treat the credential itself: it is the
+single place in the document where redaction cannot help you. (The same is
+already true of database result rows, which the capsule records verbatim.) If
+that is unacceptable for a particular route, capture is per-application: leave
+`[failure_capture]` off, or prune the capsule directory aggressively.
+
+Two things are worth stating plainly about randomness. Autumn records the
+*drawn bytes*, not a seed: production runs on the OS CSPRNG, which has no seed
+to record, and a re-seeded stream would mint different UUIDs than the ones the
+capsule's own SQL binds were bound with. And a handler that calls
+`Uuid::new_v4()` directly rather than drawing through `Rng` / `state.entropy()`
+is outside the seam — its identifiers will differ on replay. The determinism
+gate (`autumn-determinism-gate`) is what keeps framework code on the seam; your
+own code should stay on it too.
+
+Effects are redacted through the **same** `[log] filter_parameters` list the
+inbound request is. That is deliberate and not merely tidy: an *outbound*
+`Authorization` header carries a downstream credential exactly the way an
+inbound one carries the caller's, and a job payload or a cache value is as
+likely to hold a token as a request body is. Anything masked on one seam is
+also masked wherever it is quoted back on another — an outbound body's secret
+is scrubbed out of an error message the handler later produced. The
+`redacted_keys` manifest names every masked location, effects included
+(`http[0].request_header:authorization`, `job[0].api_key`, …). On the outbound
+seam a short list of conventional credential headers — `Authorization`,
+`Cookie`, `Set-Cookie`, `X-API-Key`, `X-Auth-Token` and a few others — is
+masked *whatever* your filter says: the credential there is your
+application's, not your caller's, and you would never see the header in a log
+to think to name it.
+
+Ordering is **per seam**, not global. Two outbound calls a handler `join!`s
+have no deterministic interleaving against each other, let alone against a
+cache read on a third task, so a single global order would be a fact the
+recording cannot establish — and replay would then report divergences for
+interleavings that were never guaranteed.
+
+Each seam is capped at 2 000 entries per capsule; crossing the cap marks the
+capsule `truncated`, which replay refuses.
+
+**Job capsules.** A failure *inside* a job execution produces a capsule whose
+`job` field names the job and carries its (redacted) payload; `request` then
+holds a synthetic descriptor of that entry point rather than a real HTTP
+request.
 
 **Bounds and truncation.** Recorded traffic is charged against
 `max_capsule_bytes`. Exceeding it, or hitting anything the recorder refuses to
@@ -420,6 +497,171 @@ completion.
 
 ---
 
+## From capsule to regression test
+
+A replay answers "is this bug still there?" once. Converting the capsule
+answers "can it ever come back?": the capsule is copied into your test tree and
+an ordinary `#[tokio::test]` is generated beside it, so `cargo test` re-checks
+the failure from then on.
+
+```console
+$ autumn capsule test tmp/autumn-capsules/20260812T101413.882104-000000-01JB2K7Q.json
+wrote tests/capsules/c01jb2k7q8n4w.json
+wrote tests/integration/capsule_c01jb2k7q8n4w.rs
+wrote tests/integration/capsule_support.rs — add the app's routes to `router` before running the test
+registered the modules in tests/integration/mod.rs
+
+Run it with:  cargo test capsule_c01jb2k7q8n4w
+The whole corpus:  autumn capsule verify
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--name <NAME>` | Name the fixture and test yourself instead of slugging the capsule id |
+| `--tests-dir <DIR>` | The crate's tests directory (default `tests`) |
+| `--force` | Overwrite an existing fixture and test of the same name |
+
+A capsule recorded from a **job** failure is refused here: it has no request to
+drive through a router, so there is no router-driven test to generate. Replay it
+with `autumn replay`, which dispatches the job's handler.
+
+**Nothing is committed for you.** The files land in the working tree for review;
+whether they belong in the repository is your call.
+
+Three properties are worth knowing, because they are what make the generated
+test trustworthy:
+
+* **Zero live dependencies.** Everything the replayed handler touches comes from
+  the capsule — the clock, randomness, outbound HTTP, jobs, cache, mail and the
+  tenant — and the database comes from the same **in-process** stub server
+  `autumn replay` uses, rebuilt out of the recorded wire frames. No network, no
+  database, no queue, no Docker. It runs under plain `cargo test`.
+* **Redaction survives conversion.** The fixture is the capsule's own bytes,
+  copied verbatim: nothing is re-derived, re-read from a live system, or
+  re-serialized. Whatever redaction removed on the way to disk is exactly what
+  stays removed on the way into your repository. A capsule that was safe to hold
+  is safe to commit; one that was not, still is not — read it before you commit
+  it, the same way you would read a log excerpt.
+* **One replay engine.** The generated test drives the same
+  `capsule::execute` the CLI does, rather than re-deriving the comparison in
+  generated code, so a committed test and `autumn replay` can never disagree
+  about what a reproduction is.
+
+The one thing generation *cannot* infer is your route table, so it scaffolds a
+router hook once and then leaves it alone:
+
+```rust,ignore
+// tests/integration/capsule_support.rs
+use autumn_web::capsule::regression::RegressionContext;
+use autumn_web::test::TestApp;
+
+pub fn router(ctx: &RegressionContext<'_>) -> axum::Router {
+    TestApp::new()
+        .routes(autumn_web::routes![checkout, charge])
+        .with_clock(ctx.clock())
+        .with_entropy(ctx.entropy())
+        .build()
+        .into_router()
+}
+```
+
+For a capsule whose handler queried a database, add the stub pool from the same
+context — still offline:
+
+```rust,ignore
+let mut app = TestApp::new().routes(autumn_web::routes![checkout]);
+if let Ok(pool) = ctx.db_pool() {
+    app = app.with_db(pool);
+}
+app.with_clock(ctx.clock()).with_entropy(ctx.entropy()).build().into_router()
+```
+
+A generated test fails on a **mismatch** (the outcome changed — usually the bug
+is fixed and the test has done its job, so re-record or delete it) and on a
+**divergence** (the handler's database traffic or effects changed underneath the
+capsule). The panic message is the full report, so CI says *what* changed.
+
+### The whole corpus
+
+```console
+$ autumn capsule verify
+ok          tests/capsules/c01jb2k7q8n4w.json
+ok          tests/capsules/checkout_500.json
+
+2 capsule(s) in tests/capsules, 0 unusable by this build
+running the generated tests: cargo test capsule_
+...
+the corpus replays clean
+```
+
+Two halves, in order. First the corpus-level questions `cargo test` cannot
+answer: that the directory exists, that it is not empty — an empty corpus is
+reported as a **failure**, never as a vacuous pass — and that every committed
+capsule is still readable and replayable by *this* build. Then the generated
+tests themselves, via `cargo test capsule_`. Pass `--check-only` for the first
+half alone.
+
+Running them by delegation rather than re-implementing replay in the CLI is the
+point: the generated tests drive the same `capsule::execute` engine `autumn
+replay` does, so there is exactly one replay engine and no way for two of them
+to disagree.
+
+To sweep the corpus programmatically (a whole-corpus `#[test]` of your own, say),
+`RegressionCase::corpus(dir)` lists every committed capsule in chronological
+order.
+
+---
+
+## Compatibility across Autumn versions
+
+A capsule declares the format version that wrote it, and a build replays a
+capsule **only** at its own version. Anything else is refused, with a message
+that names the direction:
+
+```console
+$ autumn replay tmp/autumn-capsules/old.json
+REFUSED  tmp/autumn-capsules/old.json
+  capsule format version 2 is older than the version this build understands (3), so
+  replaying it would judge the handler against effects the document cannot describe.
+  Re-record the capsule with this build, or replay it with the Autumn version that
+  wrote it — see the "Compatibility across Autumn versions" section of the
+  failure-capsule guide.
+```
+
+Refusing is the point. A reader that tolerated an older document would rebuild
+an application shape production never ran — no effect tape at all, in the case
+of version 2 — and then report a verdict on it. A spurious `reproduced` (or a
+spurious "the bug is gone") is worse than no verdict, so the gate is absolute.
+
+What this means in practice:
+
+* **A capsule is a debugging artefact with the lifetime of a release.** Capsules
+  sitting in `[failure_capture] dir` when you upgrade Autumn are not portable
+  across the upgrade; replay them before you deploy the new version, or re-record
+  the failure afterwards.
+* **A committed corpus is re-recorded, not migrated.** After an Autumn upgrade
+  that bumps the format, `autumn capsule verify` reports every committed capsule
+  as `UNREADABLE` and exits non-zero — deliberately, so the corpus cannot quietly
+  stop testing anything. Re-record the failures that still matter and convert
+  them again.
+* **The version bumps only for changes a previous reader cannot tolerate.**
+  Adding a field `serde` would happily ignore still counts when it is
+  *semantic*: version 2 added the database-role list, and version 3 added the
+  effect tape and the job entry point.
+
+| Format version | Added |
+| --- | --- |
+| 1 | The request, the clock, the database tape and the outcome |
+| 2 | The configured database roles |
+| 3 | The effect tape (outbound HTTP, jobs, cache, mail, tenancy, randomness) and job-scoped capsules |
+
+Because the corpus replays a *committed* recording against *current* code, it
+doubles as an upgrade gate: run it against a new Autumn version before you
+deploy that version, and a behavioural change in the framework shows up as a
+divergence rather than as a production incident.
+
+---
+
 ## Linking capsules to your error reporter
 
 When capture is on, every `ErrorEvent` carries the capsule that was written for
@@ -523,7 +765,7 @@ dropped rather than written.
 
 ## Limitations
 
-This is the first slice. What it does not do, stated plainly:
+What capsules do not do, stated plainly:
 
 - **Authenticated and CSRF-protected routes do not replay faithfully.** The
   `authorization` and `cookie` headers are masked, so the replayed request meets
@@ -578,11 +820,12 @@ This is the first slice. What it does not do, stated plainly:
 - **A handler that extracts a subsystem the replay does not boot** — a
   `Mailer`, a `BlobStore` — fails during replay and is reported as a mismatch
   rather than taking the replay process down.
-- **Randomness is not recorded.** A handler that draws from `Rng` /
-  `state.entropy()` — a fresh UUID, a token — draws *different* bytes during
-  replay; if those bytes reach a SQL bind, the replay reports a bind divergence
-  naming the statement. Recording the entropy seam is a follow-on slice, like
-  outbound HTTP; the divergence is the honest signal until then.
+- **Randomness is recorded only through the framework's seam.** Draws through
+  `Rng` / `state.entropy()` replay byte-for-byte. A handler that calls
+  `uuid::Uuid::new_v4()` or the OS RNG *directly* bypasses the seam and draws
+  different bytes on replay; if those bytes reach a SQL bind, the replay reports
+  a bind divergence naming the statement. That divergence is the honest signal —
+  move the call onto the seam to fix it.
 - **Custom exception filters that rewrite failure identity can mis-verdict.**
   The capsule records the outcome where the framework observes failures —
   before the exception-filter chain runs — while replay observes the response
@@ -598,6 +841,41 @@ This is the first slice. What it does not do, stated plainly:
   SDK with its own HTTP stack, a remote config fetch) will still try to reach
   it; point such initializers at a local or stubbed endpoint when replaying, or
   they become a live dependency the verdict silently depends on.
+- **Channels/SSE, blob storage and feature flags have no seam yet.** A handler
+  that publishes to a channel, writes a blob or evaluates a remote flag during
+  replay is not served from the capsule; the effect either no-ops against the
+  in-process backend replay installs or reaches a live service, and a
+  flag-dependent branch may then differ from the recording. Those seams are a
+  later slice.
+- **A cache hit whose value was never serializable cannot be served.** The
+  capsule carries cache values as the JSON bytes `insert_cached` already
+  produces; an in-process-only value (stored through the untyped
+  `cache::insert`) is recorded as a keyed read with no value, and the replayed
+  read is a miss. It is on the tape, so it is not reported as an *unrecorded*
+  key — but the handler takes the miss branch.
+- **A run that resolved two different tenants is not replayable.** A capsule
+  holds one tenant context; a run that switched tenants mid-flight is noted and
+  marked truncated rather than replayed against whichever one happened to be
+  first.
+- **Effects on `tokio::spawn`ed tasks are outside the tape**, for exactly the
+  reason clock reads are: the task-local does not cross `spawn`. Under `autumn
+  replay` such a task's outbound call is refused by the process-wide block
+  rather than served from the capsule. A **generated regression test** has no
+  such block — it runs inside your ordinary `cargo test` process, where a
+  process-wide, permanent outbound block would break every other test — so an
+  outbound call from a spawned task there reaches the network. Mail handed to
+  `Mailer::deliver_later` is spawned for the same reason and behaves the same
+  way. Keep the effects a capsule needs on the awaited path.
+- **Only `get_cached` / `insert_cached` are on the cache seam.** The untyped
+  `cache::get` / `cache::insert`, and `Cache::invalidate` / `Cache::clear`, are
+  not: during a replay they reach whatever backend is installed (none, under
+  `autumn replay`, which clears the global cache). A handler that invalidates a
+  key during a replayed run is doing it for real.
+- **Only outbound HTTP made through the framework client is on the seam.** A
+  handler — or a framework subsystem such as CAPTCHA verification — that builds
+  its own `reqwest` client bypasses both the capsule and, in a generated test,
+  the block. `autumn replay` cannot see those calls either; it only blocks the
+  framework's own client.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.

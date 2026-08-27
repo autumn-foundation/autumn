@@ -74,6 +74,15 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// The capsule recorded a transport failure for this call, and replay
+    /// reproduced it (#1634).
+    ///
+    /// A recorded transport error cannot be rebuilt as a `reqwest::Error` — it
+    /// has no public constructor — but it must not be downgraded to a status
+    /// either: a handler whose bug is "we do not handle a connection reset"
+    /// has to meet the reset again. The recorded text is carried verbatim.
+    #[error("outbound HTTP request failed (replayed from the capsule): {0}")]
+    ReplayedRequestFailure(String),
     /// Outbound HTTP is blocked because this process is replaying a failure
     /// capsule (see the crate-internal `block_outbound_for_replay`).
     #[error(
@@ -587,6 +596,177 @@ pub(crate) fn block_outbound_for_replay() {
 #[must_use]
 pub(crate) fn outbound_blocked_for_replay() -> bool {
     OUTBOUND_BLOCKED.load(Ordering::SeqCst)
+}
+
+// ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+
+/// Serve one outbound call from a capsule's effect tape.
+///
+/// A recorded transport failure is reproduced as one, not as a status: a
+/// handler whose bug is "we do not handle a connection reset" must meet the
+/// reset again.
+fn replayed_response(
+    tape: &crate::capsule::effects::ReplayEffects,
+    method: &str,
+    url: &str,
+) -> Result<Response, ClientError> {
+    let Some(recorded) = tape.next_http(method, url) else {
+        // `next_http` already logged the divergence; the call fails closed.
+        return Err(ClientError::BlockedDuringReplay(
+            method.to_owned(),
+            url.to_owned(),
+        ));
+    };
+    if let Some(error) = recorded.error {
+        return Err(ClientError::ReplayedRequestFailure(error));
+    }
+    let mut headers = HeaderMap::new();
+    for (name, value) in &recorded.response_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    Ok(Response {
+        status: reqwest::StatusCode::from_u16(recorded.status)
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        headers,
+        body: Bytes::from(crate::capsule::effects::body_bytes(&recorded.response_body)),
+        url: url::Url::parse(url).ok(),
+    })
+}
+
+/// Tees one outbound exchange into the in-flight request's capsule.
+///
+/// Armed before the send so the request half is captured even when the call
+/// never produces a response, and disarmed to a no-op whenever no capture
+/// scope is active — which is every request in an application that has not
+/// turned `[failure_capture]` on, so the cost on the ordinary path is one
+/// task-local probe.
+struct OutboundRecorder {
+    scope: Option<Arc<crate::capsule::CaptureScope>>,
+    /// Cached from the scope's settings so `finish` need not re-read them.
+    max_body_bytes: usize,
+    method: String,
+    url: String,
+    request_headers: Vec<(String, String)>,
+    request_body: crate::capsule::CapsuleBody,
+}
+
+impl OutboundRecorder {
+    /// Snapshot the request half, if a capsule is being recorded.
+    ///
+    /// Records the headers the *caller* set. Headers the client adds later —
+    /// the injected W3C trace context, and any default the underlying
+    /// `reqwest::Client` was built with — are not on the tape, because replay
+    /// matches on method and URL and does not need them; the recorded request
+    /// half is a debugging aid, not the match key.
+    fn arm(builder: &RequestBuilder) -> Self {
+        let scope = crate::capsule::current_scope();
+        let Some(scope) = scope else {
+            return Self {
+                scope: None,
+                max_body_bytes: 0,
+                method: String::new(),
+                url: String::new(),
+                request_headers: Vec::new(),
+                request_body: crate::capsule::CapsuleBody::Absent,
+            };
+        };
+        let max_body_bytes = scope.settings().max_body_bytes;
+        let request_headers = builder
+            .extra_headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        Self {
+            scope: Some(scope),
+            max_body_bytes,
+            method: builder.method.to_string(),
+            url: builder.url.clone(),
+            request_headers,
+            request_body: builder
+                .body
+                .as_ref()
+                .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+                    encode_body(body, max_body_bytes)
+                }),
+        }
+    }
+
+    /// Record the finished exchange.
+    fn finish(self, result: &Result<Response, ClientError>) {
+        let Some(scope) = self.scope else {
+            return;
+        };
+        let (status, response_headers, response_body, error) = match result {
+            Ok(response) => (
+                response.status.as_u16(),
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            value.to_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect(),
+                encode_body(&response.body, self.max_body_bytes),
+                None,
+            ),
+            Err(error) => (
+                0,
+                Vec::new(),
+                crate::capsule::CapsuleBody::Absent,
+                Some(error.to_string()),
+            ),
+        };
+        scope.record_http(crate::capsule::HttpEffect {
+            method: self.method,
+            url: self.url,
+            request_headers: self.request_headers,
+            request_body: self.request_body,
+            status,
+            response_headers,
+            response_body,
+            error,
+        });
+    }
+}
+
+/// Record a body as capsule text when it is UTF-8, base64 otherwise.
+///
+/// Text is what makes a capsule diffable and what lets redaction parse a JSON
+/// payload by key; base64 is the honest fallback for a protobuf or an image.
+fn encode_body(bytes: &Bytes, max_body_bytes: usize) -> crate::capsule::CapsuleBody {
+    if bytes.is_empty() {
+        return crate::capsule::CapsuleBody::Absent;
+    }
+    // Checked *before* the copy, not after: a 50 MB download must not be
+    // duplicated into a `String` (or grown by a third into base64) only to be
+    // thrown away by the capsule's body cap a moment later.
+    if bytes.len() > max_body_bytes {
+        return crate::capsule::CapsuleBody::Skipped {
+            declared_len: Some(bytes.len()),
+        };
+    }
+    std::str::from_utf8(bytes).map_or_else(
+        |_| {
+            use base64::Engine as _;
+            crate::capsule::CapsuleBody::Base64(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )
+        },
+        |text| crate::capsule::CapsuleBody::Text(text.to_owned()),
+    )
 }
 
 /// Newtype stored in [`AppState`](crate::AppState) extensions so the
@@ -1371,13 +1551,21 @@ impl RequestBuilder {
             return Err(err);
         }
 
-        // A capsule records the request, the clock and the database — not the
-        // services the handler called. Letting a replay dial them would make it
-        // an unrepeatable experiment run against live third parties, so every
-        // outbound request fails closed with a message that says why. The block
-        // is checked here rather than on the client, because a handler can
-        // build one any way it likes (`Client::new()`, `from_state`, a stored
-        // one) and every path must be closed.
+        // Replay serves outbound calls from the capsule's effect tape (#1634)
+        // and never dials the peer. A call the tape cannot answer is a
+        // divergence, already logged by `next_http`, and fails closed here.
+        //
+        // The unconditional block below stays as the backstop for a replay
+        // process whose current task carries no tape — app boot, a state
+        // initializer, work the handler spawned — because a capsule records no
+        // response for any of those either. The check is here rather than on
+        // the client because a handler can build one any way it likes
+        // (`Client::new()`, `from_state`, a stored one) and every path must be
+        // closed.
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let method = self.method.to_string();
+            return replayed_response(&tape, &method, &self.url);
+        }
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(
                 self.method.to_string(),
@@ -1385,6 +1573,19 @@ impl RequestBuilder {
             ));
         }
 
+        // Capture: the exchange is recorded into the in-flight request's
+        // capsule scope, when there is one. Recording wraps every send path
+        // below (mock, custom, breaker-guarded) so a capsule cannot miss an
+        // exchange because the caller happened to use `no_redirect` or a
+        // pinned address.
+        let recorder = OutboundRecorder::arm(&self);
+        let result = self.send_recorded().await;
+        recorder.finish(&result);
+        result
+    }
+
+    /// [`send`](Self::send), minus the replay gate and the capture tee.
+    async fn send_recorded(self) -> Result<Response, ClientError> {
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
             return self.send_inner(false).await;

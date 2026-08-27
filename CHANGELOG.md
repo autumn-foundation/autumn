@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Replay capsules now record every framework effect a failing request
+  touched, and one command turns a capsule into a committed regression test:**
+  [#1634](https://github.com/autumn-foundation/autumn/issues/1634) extends the
+  deterministic replay capsules from
+  [#1598](https://github.com/autumn-foundation/autumn/issues/1598) past the
+  inbound request, the database and the clock. A capsule now also carries the
+  **outbound HTTP** exchanges the run made (so outbound webhook deliveries come
+  along, they send through the same client), the **jobs** it enqueued, its
+  **cache** reads and writes, the **mail** it sent, the **tenant** it resolved,
+  and every **random draw** it took — each captured at the one choke point every
+  code path funnels through, so a capsule cannot miss an effect because a
+  handler reached it a different way. Replay serves all of them from the
+  capsule with the same no-live-effects posture the database tape has: an
+  outbound call is answered from the recording rather than dialled, an enqueue
+  is asserted and never written to a queue, mail is asserted and never
+  delivered (a recorded *delivery failure* is reproduced as one, so a handler
+  whose bug is that it mishandles a suppressed recipient meets it again), and a
+  framework-minted identifier — a session id, a CSRF token, a
+  request id, a job id — reappears byte-for-byte, because Autumn records the
+  drawn bytes rather than a seed (production runs the OS CSPRNG, which has none,
+  and a re-seeded stream would mint different UUIDs than the ones the capsule's
+  own SQL binds were bound with). An effect the replayed code performs that the
+  recording never did — and a recorded effect it never performs — are both
+  divergences, exactly as they already were for SQL. A failure *inside* a job
+  execution produces a job-scoped capsule replayable the same way.
+  `autumn capsule test <capsule>` converts a triaged capsule into a
+  `#[tokio::test]` in the app's consolidated integration suite: the capsule's
+  bytes are copied **verbatim** into `tests/capsules/` — nothing re-derived, so
+  whatever redaction removed stays removed — a test is generated beside it, both
+  are registered in `tests/integration/mod.rs`, and a router hook is scaffolded
+  once and then left alone. The generated test drives the same
+  `capsule::execute` engine `autumn replay` does (so the two can never disagree
+  about what a reproduction is) and runs under plain `cargo test` with **zero
+  live dependencies** — no network, database, queue or Docker, including for
+  DB-touching capsules, whose pool comes from the in-process stub server
+  rebuilt out of the recorded wire frames. `autumn capsule verify` is the
+  whole-corpus mode; an empty corpus is a failure, never a vacuous pass. Effects
+  are redacted through the same `[log] filter_parameters` list the inbound
+  request is — an *outbound* `Authorization` header carries a downstream
+  credential exactly the way an inbound one carries the caller's — and the
+  `redacted_keys` manifest names every masked effect location. See
+  [Failure Capsules](docs/guide/failure-capsules.md).
+  **Breaking:** the capsule `format_version` bumps `2 → 3`, so a capsule
+  recorded by an older Autumn is **refused** rather than replayed with every new
+  seam empty, and `capsule::execute` takes a `ReplayFixtures` (the clock, the
+  entropy source and the effect tape from one capsule) in place of its
+  `Option<&ReplayClock>`. Capsules on disk are not migrated: replay them with
+  the version that wrote them, or re-record. See
+  [the migration guide](docs/migrations/next.md).
+
 ### Fixed
 
 - **CSV import row numbers are now the same for CRLF and LF files:**

@@ -366,9 +366,108 @@ pub struct ReplayOutcome {
     pub actual: CapsuleOutcome,
     /// Database divergences, in the order they happened.
     pub divergences: Vec<Divergence>,
+    /// Divergences on the non-database effect seams — outbound HTTP, job
+    /// enqueues, cache, mail (#1634) — in the order they happened.
+    #[serde(default)]
+    pub effect_divergences: Vec<crate::capsule::effects::EffectDivergence>,
     /// Non-fatal observations worth printing (clock over-reads, redaction
     /// limits, version drift).
     pub warnings: Vec<String>,
+}
+
+// ── Fixtures ────────────────────────────────────────────────────────────────
+
+/// Everything a capsule replays *through*: the clock, the entropy source and
+/// the effect tape, built once from one capsule.
+///
+/// Bundling them is not tidiness — a replay is only deterministic if all three
+/// come from the *same* capsule, and a single value makes that impossible to
+/// get wrong. It is also the handle a generated regression test plugs into
+/// [`TestApp`](crate::test::TestApp):
+///
+/// ```rust,ignore
+/// let fixtures = ReplayFixtures::from_capsule(&capsule);
+/// let router = TestApp::new()
+///     .routes(routes![charge])
+///     .with_clock(fixtures.clock())
+///     .with_entropy(fixtures.entropy())
+///     .build()
+///     .into_router();
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReplayFixtures {
+    clock: Arc<ReplayClock>,
+    entropy: Arc<crate::capsule::entropy::ReplayEntropy>,
+    effects: Arc<crate::capsule::effects::ReplayEffects>,
+}
+
+impl ReplayFixtures {
+    /// Build the fixtures a capsule's recording describes.
+    #[must_use]
+    pub fn from_capsule(capsule: &Capsule) -> Self {
+        // The fallback matters only for a capsule that recorded no readings at
+        // all: `captured_at` is then the closest thing to the failure's own
+        // wall time.
+        let fallback = capsule
+            .clock
+            .first()
+            .copied()
+            .unwrap_or(capsule.captured_at);
+        let clock = Arc::new(
+            ReplayClock::new(capsule.clock.clone(), fallback).with_monotonic(
+                capsule
+                    .clock_monotonic_us
+                    .iter()
+                    .map(|micros| std::time::Duration::from_micros(*micros))
+                    .collect(),
+            ),
+        );
+        let entropy = Arc::new(crate::capsule::entropy::ReplayEntropy::new(
+            capsule
+                .effects
+                .random
+                .iter()
+                .map(|draw| draw.bytes.clone())
+                .collect(),
+        ));
+        let effects = Arc::new(crate::capsule::effects::ReplayEffects::new(
+            capsule.effects.clone(),
+        ));
+        Self {
+            clock,
+            entropy,
+            effects,
+        }
+    }
+
+    /// The clock to install on the replayed application's state.
+    #[must_use]
+    pub fn clock(&self) -> Arc<dyn crate::time::ClockSource> {
+        Arc::clone(&self.clock) as Arc<dyn crate::time::ClockSource>
+    }
+
+    /// The entropy source to install on the replayed application's state.
+    #[must_use]
+    pub fn entropy(&self) -> Arc<dyn crate::entropy::Entropy> {
+        Arc::clone(&self.entropy) as Arc<dyn crate::entropy::Entropy>
+    }
+
+    /// The effect tape the replayed request's seams are served from.
+    #[must_use]
+    pub fn effects(&self) -> Arc<crate::capsule::effects::ReplayEffects> {
+        Arc::clone(&self.effects)
+    }
+
+    /// How many times the replayed run read the clock past the end of the
+    /// recording.
+    ///
+    /// Exposed so a test can distinguish an over-read from an *under*-read:
+    /// both produce a warning mentioning the clock, and asserting on the
+    /// warning text alone would pass for either.
+    #[must_use]
+    pub fn clock_over_reads(&self) -> usize {
+        self.clock.over_reads()
+    }
 }
 
 // ── Driver ──────────────────────────────────────────────────────────────────
@@ -382,8 +481,10 @@ pub struct ReplayOutcome {
 /// a statement the tape cannot answer is a divergence, and so is a recorded
 /// exchange the run never asked for, because reaching the recorded outcome
 /// without the recorded database traffic is not a reproduction.
-/// `clock` is the [`ReplayClock`] installed on the rebuilt state, when there is
-/// one; it is only read for the over-read warning.
+/// `fixtures` must be the ones the router was built with
+/// ([`ReplayFixtures::from_capsule`] on this same capsule): the clock and the
+/// entropy source are read here for their over-read warnings, and the effect
+/// tape is both installed for the run and drained for its divergences.
 ///
 /// The router is driven inside `catch_unwind`, so a handler that panics without
 /// a panic-catching middleware is *compared* against a recorded panic rather
@@ -392,13 +493,13 @@ pub async fn execute(
     router: axum::Router,
     capsule: &Capsule,
     divergences: Arc<DivergenceLog>,
-    clock: Option<&ReplayClock>,
+    fixtures: &ReplayFixtures,
 ) -> ReplayOutcome {
     let mut warnings = Vec::new();
     version_warnings(capsule, &mut warnings);
 
     let actual = match rebuild_request(&capsule.request, &mut warnings) {
-        Ok(request) => drive(router, request).await,
+        Ok(request) => drive(router, request, fixtures.effects()).await,
         Err(reason) => {
             warnings.push(format!(
                 "the recorded request could not be rebuilt: {reason}"
@@ -411,7 +512,8 @@ pub async fn execute(
         }
     };
 
-    if let Some(clock) = clock {
+    {
+        let clock = fixtures.clock.as_ref();
         let over_reads = clock.over_reads();
         if over_reads > 0 {
             warnings.push(format!(
@@ -432,11 +534,32 @@ pub async fn execute(
 
     redaction_warning(capsule, &actual, &mut warnings);
 
+    judge(capsule, actual, &divergences, fixtures, warnings)
+}
+
+/// Turn everything a finished replay observed into a verdict.
+///
+/// Shared by [`execute`] and [`execute_job`] so a request replay and a job
+/// replay can never grade themselves differently.
+fn judge(
+    capsule: &Capsule,
+    actual: CapsuleOutcome,
+    divergences: &DivergenceLog,
+    fixtures: &ReplayFixtures,
+    mut warnings: Vec<String>,
+) -> ReplayOutcome {
+    entropy_warnings(fixtures.entropy.as_ref(), &mut warnings);
+    scope_warning(capsule, fixtures, &mut warnings);
+
     // Statements the run issued that the tape could not answer, then recorded
     // statements the run never issued at all.
     let mut entries = divergences.entries();
     entries.extend(divergences.unconsumed());
-    let verdict = if entries.is_empty() {
+    // The same two halves for the effect seams: `finish` returns the
+    // divergences logged during the run *plus* every recorded effect the run
+    // never asked for.
+    let effect_entries = fixtures.effects.finish();
+    let verdict = if entries.is_empty() && effect_entries.is_empty() {
         if outcomes_match(&capsule.outcome, &actual) {
             Verdict::Reproduced
         } else {
@@ -451,19 +574,169 @@ pub async fn execute(
         expected: capsule.outcome.clone(),
         actual,
         divergences: entries,
+        effect_divergences: effect_entries,
         warnings,
     }
 }
 
+/// Warn when the replayed router never entered the scope that serves the
+/// recorded clock and randomness.
+///
+/// That scope is established by
+/// [`ReportingLayer`](crate::reporting::ReportingLayer). A router assembled
+/// without it — a hand-built `axum::Router`, or a regression test whose factory
+/// does not go through `TestApp` — runs on a clock and an entropy source that
+/// serve stable values without consuming anything, and could otherwise report
+/// `Reproduced` on a run that never met the recording's time or identifiers at
+/// all. Only worth saying when the capsule actually recorded some.
+fn scope_warning(capsule: &Capsule, fixtures: &ReplayFixtures, warnings: &mut Vec<String>) {
+    if fixtures.effects.scope_entered() {
+        return;
+    }
+    if capsule.clock.is_empty() && capsule.effects.random.is_empty() {
+        return;
+    }
+    warnings.push(
+        "the replayed router never entered the capsule's replay scope, so the recorded clock \
+         readings and random draws were not served — the router was built without Autumn's \
+         reporting layer (use `TestApp::build().into_router()`, or `autumn replay`, which \
+         rebuilds the real one)"
+            .to_owned(),
+    );
+}
+
+/// Warn when the replayed run drew a different number of random values than
+/// the recording did.
+///
+/// Symmetric with the clock warnings above, and for the same reason: an
+/// identifier minted from an exhausted tape is not the one the failure used,
+/// and a branch that no longer mints one never took the recorded path.
+fn entropy_warnings(entropy: &crate::capsule::entropy::ReplayEntropy, warnings: &mut Vec<String>) {
+    let over_draws = entropy.over_draws();
+    if over_draws > 0 {
+        warnings.push(format!(
+            "the replayed handler drew randomness {over_draws} more time(s) than the recording \
+             did; those draws were served as zero bytes, so identifiers minted after that point \
+             are not the ones the failing request used"
+        ));
+    }
+    let unconsumed = entropy.unconsumed();
+    if unconsumed > 0 {
+        warnings.push(format!(
+            "the replayed handler drew randomness {unconsumed} fewer time(s) than the recording \
+             did — a branch that minted an identifier in the failing run was not exercised, so \
+             treat a reproduced verdict with care"
+        ));
+    }
+}
+
+/// How a job-entry capsule's job is dispatched during replay.
+///
+/// A boxed closure rather than a `JobHandler` fn pointer, so the caller can
+/// capture the rebuilt `AppState` the handler needs without `execute_job`
+/// having to know how the application assembles one.
+pub type JobDispatch = Box<
+    dyn FnOnce(
+            serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>
+        + Send,
+>;
+
+/// Replay a **job-entry** capsule by dispatching the recorded job.
+///
+/// The request-capsule sibling of [`execute`]. A job failure is not reachable
+/// through the router — there is no request to drive — so the recorded payload
+/// is handed straight to the job's handler, with the same clock, entropy and
+/// effect tape a replayed request gets.
+///
+/// The replay-request scope is established here rather than by
+/// `ReportingLayer`, and that is still symmetric with capture: a job execution
+/// is recorded under a capture scope that wraps the *whole* run
+/// (`capture::capture_job`), with no Tower stack in between.
+///
+/// # Errors
+///
+/// Never returns an error: a panicking handler is caught and compared against
+/// a recorded panic, exactly as the request path does.
+pub async fn execute_job(
+    dispatch: JobDispatch,
+    capsule: &Capsule,
+    divergences: Arc<DivergenceLog>,
+    fixtures: &ReplayFixtures,
+) -> ReplayOutcome {
+    let mut warnings = Vec::new();
+    version_warnings(capsule, &mut warnings);
+
+    let Some(job) = capsule.job.as_ref() else {
+        warnings.push(
+            "this capsule records a request, not a job; replay it through the router".to_owned(),
+        );
+        return ReplayOutcome {
+            verdict: Verdict::Diverged,
+            expected: capsule.outcome.clone(),
+            actual: CapsuleOutcome::Status {
+                code: 0,
+                message: "not a job capsule".to_owned(),
+                problem_type: None,
+            },
+            divergences: Vec::new(),
+            effect_divergences: Vec::new(),
+            warnings,
+        };
+    };
+
+    let payload = job.payload.clone();
+    let run = crate::capsule::effects::with_effect_tape(
+        fixtures.effects(),
+        crate::capsule::clock::with_replay_request_scope(async move { dispatch(payload).await }),
+    );
+    let actual = match AssertUnwindSafe(run).catch_unwind().await {
+        Ok(Ok(())) => CapsuleOutcome::Status {
+            // A job that now succeeds is the "the bug is gone" shape; code 0
+            // never collides with the 500 a recorded failure carries.
+            code: 0,
+            message: "the job succeeded".to_owned(),
+            problem_type: None,
+        },
+        Ok(Err(error)) => CapsuleOutcome::Status {
+            code: 500,
+            message: error.to_string(),
+            problem_type: None,
+        },
+        Err(payload) => CapsuleOutcome::Panic {
+            status: 500,
+            // Byte-identical to what `job::format_job_panic` records, including
+            // its non-string fallback: `outcomes_match` compares payloads
+            // exactly, so a different spelling here would make every
+            // non-string job panic replay as a `Mismatch`.
+            payload: format_job_panic_payload(payload.as_ref()),
+            backtrace: None,
+        },
+    };
+
+    judge(capsule, actual, &divergences, fixtures, warnings)
+}
+
 /// Drive one rebuilt request through the router, capturing an escaping panic.
 ///
-/// The call runs inside [`crate::capsule::clock::with_replay_request_scope`],
-/// which is what entitles it — and only it — to consume the capsule's
-/// recorded clock readings. Reads from anywhere else during the replay
-/// (boot, or tasks the handler spawns) are served non-consuming, mirroring
-/// the capture side, where only scope-carrying reads were recorded.
-async fn drive(router: axum::Router, request: Request<Body>) -> CapsuleOutcome {
-    let call = crate::capsule::clock::with_replay_request_scope(router.oneshot(request));
+/// Installs the effect tape for the run. The scope that entitles the run to
+/// *consume* recorded clock readings and random draws is established one layer
+/// deeper, by [`ReportingLayer`](crate::reporting::ReportingLayer), so that it
+/// lines up exactly with the boundary capture recorded through — see
+/// [`crate::capsule::clock::with_replay_request_scope`]. Reads from anywhere
+/// else during the replay (boot, or tasks the handler spawns) are served
+/// non-consuming, mirroring the capture side, where only scope-carrying reads
+/// were recorded.
+async fn drive(
+    router: axum::Router,
+    request: Request<Body>,
+    effects: Arc<crate::capsule::effects::ReplayEffects>,
+) -> CapsuleOutcome {
+    // Only the effect tape is installed here. The *consuming* scope for the
+    // clock and the entropy source is established one layer deeper, by
+    // `ReportingLayer`, so that it lines up exactly with the boundary capture
+    // recorded through — see `clock::with_replay_request_scope`.
+    let call = crate::capsule::effects::with_effect_tape(effects, router.oneshot(request));
     match AssertUnwindSafe(call).catch_unwind().await {
         Ok(Ok(response)) => outcome_from_response(response).await,
         // `Router`'s error type is `Infallible`, but the service contract still
@@ -534,6 +807,19 @@ fn format_panic_payload(payload: &(dyn Any + Send)) -> String {
         .map(|text| (*text).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "handler panicked".to_owned())
+}
+
+/// The panic text a job execution records, reproduced exactly.
+///
+/// Mirrors `job::format_job_panic`; the two must not drift, which is what the
+/// `job_panic_text_matches_the_capture_side` test pins.
+fn format_job_panic_payload(payload: &(dyn Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+    format!("job handler panicked: {detail}")
 }
 
 /// Rebuild the recorded request.
@@ -909,6 +1195,7 @@ pub fn print_verdict(outcome: &ReplayOutcome, capsule_path: &Path) -> i32 {
         "expected": outcome.expected,
         "actual": outcome.actual,
         "divergences": outcome.divergences,
+        "effect_divergences": outcome.effect_divergences,
         "warnings": outcome.warnings,
     });
     println!("{document}");
@@ -939,6 +1226,22 @@ pub fn print_verdict(outcome: &ReplayOutcome, capsule_path: &Path) -> i32 {
                 divergence.kind.label(),
                 divergence.connection,
                 divergence.exchange_index,
+                printable(&divergence.detail)
+            );
+        }
+    }
+    if !outcome.effect_divergences.is_empty() {
+        // Without this the CLI would print `diverged` and then say nothing at
+        // all about *what* diverged, for every seam outside the database.
+        eprintln!(
+            "  effect divergences ({}):",
+            outcome.effect_divergences.len()
+        );
+        for divergence in &outcome.effect_divergences {
+            eprintln!(
+                "    [{} / {}] {}",
+                divergence.seam.label(),
+                divergence.kind.label(),
                 printable(&divergence.detail)
             );
         }
@@ -1014,7 +1317,122 @@ mod tests {
             db_roles: Vec::new(),
             truncated: false,
             notes: Vec::new(),
+            effects: crate::capsule::schema::CapsuleEffects::default(),
+            job: None,
         }
+    }
+
+    fn job_capsule(name: &str, payload: serde_json::Value, outcome: CapsuleOutcome) -> Capsule {
+        let mut capsule = fixture(outcome);
+        capsule.job = Some(crate::capsule::schema::CapsuleJob {
+            name: name.to_owned(),
+            payload,
+        });
+        capsule.request.method = "JOB".to_owned();
+        capsule.request.uri = format!("/jobs/{name}");
+        capsule
+    }
+
+    /// A job capsule replays by dispatching the job, not by driving a router —
+    /// the other half of "a failure inside a job execution produces a
+    /// job-scoped capsule replayable the same way".
+    #[tokio::test]
+    async fn a_job_capsule_reproduces_by_dispatching_the_recorded_job() {
+        let capsule = job_capsule(
+            "send_receipt",
+            serde_json::json!({"order": 7}),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "receipt 7 could not be sent".to_owned(),
+                problem_type: None,
+            },
+        );
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let dispatch: crate::capsule::JobDispatch = Box::new(|payload| {
+            Box::pin(async move {
+                let order = payload.get("order").and_then(serde_json::Value::as_i64);
+                Err(crate::AutumnError::internal_server_error_msg(format!(
+                    "receipt {} could not be sent",
+                    order.unwrap_or_default()
+                )))
+            })
+        });
+
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fixed_job_replays_as_a_mismatch_not_a_reproduction() {
+        let capsule = job_capsule(
+            "send_receipt",
+            serde_json::json!({"order": 7}),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "receipt 7 could not be sent".to_owned(),
+                problem_type: None,
+            },
+        );
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let dispatch: crate::capsule::JobDispatch = Box::new(|_| Box::pin(async { Ok(()) }));
+
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Mismatch, "{outcome:?}");
+    }
+
+    /// A panicking job is compared against a recorded panic by payload, and the
+    /// two sides must spell it identically or every job panic mismatches.
+    #[tokio::test]
+    async fn a_panicking_job_reproduces_a_recorded_panic() {
+        let capsule = job_capsule(
+            "send_receipt",
+            serde_json::json!({}),
+            CapsuleOutcome::Panic {
+                status: 500,
+                payload: "job handler panicked: receipts are down".to_owned(),
+                backtrace: None,
+            },
+        );
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let dispatch: crate::capsule::JobDispatch =
+            Box::new(|_| Box::pin(async { panic!("receipts are down") }));
+
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
+    }
+
+    /// The panic text the capture side writes and the text replay reconstructs
+    /// are compared verbatim by `outcomes_match`, so they must not drift.
+    #[test]
+    fn job_panic_text_matches_the_capture_side() {
+        let payload: Box<dyn Any + Send> = Box::new(42_u8);
+        assert_eq!(
+            format_job_panic_payload(payload.as_ref()),
+            "job handler panicked: non-string panic payload"
+        );
+        let payload: Box<dyn Any + Send> = Box::new("boom".to_owned());
+        assert_eq!(
+            format_job_panic_payload(payload.as_ref()),
+            "job handler panicked: boom"
+        );
     }
 
     #[test]
@@ -1382,7 +1800,13 @@ mod tests {
             problem_type: None,
         });
         capsule.db = None;
-        let outcome = execute(router, &capsule, Arc::new(DivergenceLog::new()), None).await;
+        let outcome = execute(
+            router,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &ReplayFixtures::from_capsule(&capsule),
+        )
+        .await;
         assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
         assert!(outcome.divergences.is_empty(), "{outcome:?}");
     }
@@ -1396,7 +1820,13 @@ mod tests {
         // without following the recorded effects.
         let _progress = log.register_tape(&tape(1, &["SELECT 1"]));
 
-        let outcome = execute(router, &capsule, Arc::clone(&log), None).await;
+        let outcome = execute(
+            router,
+            &capsule,
+            Arc::clone(&log),
+            &ReplayFixtures::from_capsule(&capsule),
+        )
+        .await;
         assert_eq!(outcome.verdict, Verdict::Diverged, "{outcome:?}");
         assert_eq!(
             outcome.divergences.first().map(|entry| entry.kind),
@@ -1413,7 +1843,13 @@ mod tests {
         let router = axum::Router::new().route("/boom", axum::routing::get(boom));
         let mut capsule = fixture(panic_outcome("kaboom in handler"));
         capsule.request.uri = "/boom".to_owned();
-        let outcome = execute(router, &capsule, Arc::new(DivergenceLog::new()), None).await;
+        let outcome = execute(
+            router,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &ReplayFixtures::from_capsule(&capsule),
+        )
+        .await;
         assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
     }
 }

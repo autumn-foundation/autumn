@@ -5,6 +5,7 @@ mod alert;
 mod assets;
 mod build;
 mod canary;
+mod capsule;
 mod check;
 mod cold_start_driver;
 mod config;
@@ -247,6 +248,48 @@ pub enum JobsSubcommands {
         /// Binary target to inspect (for packages with multiple bin targets).
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn capsule`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CapsuleCommands {
+    /// Convert one capsule into a committed regression test.
+    ///
+    /// Copies the capsule's bytes verbatim into `<tests-dir>/capsules/` — so
+    /// whatever redaction removed stays removed — writes a `#[tokio::test]`
+    /// beside it in `<tests-dir>/integration/`, registers both in that
+    /// directory's `mod.rs`, and scaffolds the shared router hook the first
+    /// time. The generated test runs under plain `cargo test` with no network,
+    /// database or queue.
+    Test {
+        /// Path to the capsule JSON file to convert.
+        #[arg(value_name = "CAPSULE")]
+        capsule: String,
+        /// Name for the generated test and fixture. Defaults to a slug of the
+        /// capsule's id.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The crate's tests directory.
+        #[arg(long, value_name = "DIR", default_value = "tests")]
+        tests_dir: String,
+        /// Overwrite an existing fixture and test of the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Replay the whole committed corpus.
+    ///
+    /// First checks every committed capsule is still readable and replayable by
+    /// this build — the question an Autumn upgrade raises — then runs the
+    /// generated tests with `cargo test capsule_`. An empty corpus is reported
+    /// as a failure, never as a pass.
+    Verify {
+        /// Directory holding the committed capsules.
+        #[arg(long, value_name = "DIR", default_value = "tests/capsules")]
+        dir: String,
+        /// Report on the corpus without running the generated tests.
+        #[arg(long)]
+        check_only: bool,
     },
 }
 
@@ -643,6 +686,28 @@ enum Commands {
         /// guard; has no effect otherwise.
         #[arg(long)]
         yes_i_mean_prod: bool,
+    },
+    /// Convert failure capsules into committed regression tests, and check a
+    /// committed corpus.
+    ///
+    /// `autumn replay` answers "is this bug still there?" once. This answers
+    /// "can it ever come back?": the capsule is copied into `tests/capsules/`
+    /// and a `#[tokio::test]` is generated beside it, so `cargo test` re-checks
+    /// the failure from then on — with no network, database or queue.
+    ///
+    /// Nothing is committed for you: the files land in the working tree for
+    /// review, and the generated router hook is scaffolded once and then left
+    /// alone.
+    ///
+    /// # Examples
+    ///
+    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json
+    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json --name checkout_500
+    ///   autumn capsule verify
+    #[command(verbatim_doc_comment)]
+    Capsule {
+        #[command(subcommand)]
+        command: CapsuleCommands,
     },
     /// Replay a recorded failure capsule against the application.
     ///
@@ -3540,6 +3605,25 @@ fn run_command(command: Commands) {
             model.as_deref(),
             yes_i_mean_prod,
         ),
+        Commands::Capsule { command } => match command {
+            CapsuleCommands::Test {
+                capsule: path,
+                name,
+                tests_dir,
+                force,
+            } => capsule::generate(&capsule::GenerateOptions {
+                capsule: &path,
+                name: name.as_deref(),
+                tests_dir: &tests_dir,
+                force,
+            }),
+            CapsuleCommands::Verify { dir, check_only } => {
+                capsule::verify(&capsule::VerifyOptions {
+                    dir: &dir,
+                    check_only,
+                });
+            }
+        },
         Commands::Replay {
             capsule,
             package,

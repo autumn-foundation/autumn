@@ -48,7 +48,10 @@ use chrono::{DateTime, Utc};
 use tower::{Layer, Service};
 
 use crate::capsule::redact::{CapturedBody, RawRequest};
-use crate::capsule::schema::{CapsuleDb, ConnectionTape};
+use crate::capsule::schema::{
+    CacheEffect, CapsuleBody, CapsuleDb, CapsuleEffects, CapsuleJob, ConnectionTape, HttpEffect,
+    JobEffect, MailEffect, RandomEffect, TenantEffect,
+};
 use crate::log::filter::ParameterFilter;
 
 tokio::task_local! {
@@ -67,7 +70,7 @@ pub fn current_scope() -> Option<Arc<CaptureScope>> {
 /// The task-local itself is crate-private (a request's scope is the framework's
 /// bookkeeping, not an extension point); this is the seam integration tests use
 /// to drive effect sources that read [`current_scope`].
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn with_capture_scope<F: Future>(scope: Arc<CaptureScope>, future: F) -> F::Output {
     CAPSULE_SCOPE.scope(scope, future).await
 }
@@ -201,6 +204,130 @@ impl DbBuffer {
     }
 }
 
+/// Most entries one capsule holds for a single effect seam.
+///
+/// The same reasoning as [`MAX_CLOCK_READINGS`]: a pathological loop calling a
+/// third party (or drawing UUIDs) must not grow the buffer without limit, and
+/// a capsule that long is not replayable anyway. Crossing the cap marks the
+/// capsule truncated, which is already a refusal.
+const MAX_EFFECTS_PER_SEAM: usize = 2_000;
+
+/// The framework effects one in-flight run has produced, in call order per
+/// seam (#1634).
+///
+/// Held behind the scope's mutex and only ever touched in short critical
+/// sections — never across an `.await` — because every seam that writes here
+/// is called from inside async framework code.
+#[derive(Debug, Default)]
+pub struct EffectBuffer {
+    effects: CapsuleEffects,
+    /// Bytes charged against `max_capsule_bytes` so far.
+    bytes: usize,
+    /// Set once any seam hit [`MAX_EFFECTS_PER_SEAM`] or the byte budget, so
+    /// the scope can mark the capsule truncated outside the lock.
+    overflowed: bool,
+}
+
+impl EffectBuffer {
+    /// The accumulated effects.
+    #[must_use]
+    pub const fn effects(&self) -> &CapsuleEffects {
+        &self.effects
+    }
+
+    /// Whether a seam ran past its cap.
+    #[must_use]
+    pub const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Bytes charged so far.
+    #[must_use]
+    pub const fn charged_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Push onto a seam, refusing (and flagging) once it is full.
+    ///
+    /// `weight` is the entry's approximate serialized size, charged against
+    /// the capsule's `max_capsule_bytes` budget. Two bounds rather than one
+    /// because they catch different pathologies: the count cap stops a loop
+    /// making ten thousand tiny calls, and the byte budget stops a single
+    /// handler streaming a hundred megabytes through the framework's HTTP
+    /// client into the capsule buffer.
+    fn push<T>(
+        &mut self,
+        seam: fn(&mut CapsuleEffects) -> &mut Vec<T>,
+        entry: T,
+        weight: usize,
+        budget: usize,
+    ) {
+        let list = seam(&mut self.effects);
+        if list.len() >= MAX_EFFECTS_PER_SEAM {
+            self.overflowed = true;
+            return;
+        }
+        // Charged only for an entry that is actually kept, so `charged_bytes`
+        // means what it says.
+        let charged = self.bytes.saturating_add(weight);
+        if charged > budget {
+            self.overflowed = true;
+            return;
+        }
+        self.bytes = charged;
+        let list = seam(&mut self.effects);
+        list.push(entry);
+    }
+}
+
+/// The approximate serialized size of a JSON payload, for the effect budget.
+///
+/// Serializing it just to measure would double the cost of every enqueue on a
+/// capture-enabled request; the string length of a compact rendering is close
+/// enough for a budget whose job is to stop unbounded growth.
+fn json_weight(payload: &serde_json::Value) -> usize {
+    /// A sink that counts bytes and keeps none of them.
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, payload);
+    counter.0
+}
+
+/// The approximate serialized size of a recorded body, for the effect budget.
+const fn body_weight(body: &CapsuleBody) -> usize {
+    match body {
+        CapsuleBody::Absent | CapsuleBody::Skipped { .. } => 0,
+        CapsuleBody::Text(text) => text.len(),
+        CapsuleBody::Base64(encoded) => encoded.len(),
+    }
+}
+
+/// Clamp a recorded effect body to `max_body_bytes`.
+///
+/// A body over the cap becomes a [`CapsuleBody::Skipped`] carrying its real
+/// length, rather than a silent truncation: half a JSON document replayed as
+/// though it were whole would drive the handler with input the failing run
+/// never had, which is the same falsification the *request* body cap already
+/// refuses to commit.
+fn clamp_body(body: CapsuleBody, max_body_bytes: usize) -> CapsuleBody {
+    let len = body_weight(&body);
+    if len <= max_body_bytes {
+        return body;
+    }
+    CapsuleBody::Skipped {
+        declared_len: Some(len),
+    }
+}
+
 /// Most clock readings one capsule will hold.
 const MAX_CLOCK_READINGS: usize = 10_000;
 
@@ -236,6 +363,14 @@ enum BodyTap {
 const BODY_OVERFLOW_NOTE: &str =
     "request body exceeded max_body_bytes while streaming; it was not captured";
 
+/// Note recorded when a run resolved two different tenants.
+///
+/// The capsule holds one tenant context, so a run that resolved two cannot be
+/// replayed faithfully: replay would install one of them and a handler that
+/// switched tenants mid-run would read the wrong one.
+const TENANT_CONFLICT_NOTE: &str = "the run resolved more than one tenant; a capsule records a single tenant context, so this \
+     one cannot reproduce the tenant the failing run saw";
+
 /// Note recorded when the handler stopped reading the body before its end.
 const BODY_PARTIAL_NOTE: &str =
     "request body was not read to its end before the failure; the captured body is incomplete";
@@ -252,9 +387,12 @@ pub struct CaptureScope {
     /// Monotonic readings, as offsets from the recording clock's origin.
     monotonic: Mutex<Vec<std::time::Duration>>,
     client_identity: OnceLock<CapturedClientIdentity>,
+    /// Set when this scope wraps a *job execution* rather than a request.
+    job: OnceLock<CapsuleJob>,
     /// The raw peer socket (`ConnectInfo`), before trusted-proxy resolution.
     peer_addr: OnceLock<std::net::SocketAddr>,
     db: Mutex<DbBuffer>,
+    effects: Mutex<EffectBuffer>,
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
     closed: AtomicBool,
@@ -273,8 +411,10 @@ impl CaptureScope {
             clock: Mutex::new(Vec::new()),
             monotonic: Mutex::new(Vec::new()),
             client_identity: OnceLock::new(),
+            job: OnceLock::new(),
             peer_addr: OnceLock::new(),
             db: Mutex::new(DbBuffer::default()),
+            effects: Mutex::new(EffectBuffer::default()),
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -497,6 +637,148 @@ impl CaptureScope {
         )
     }
 
+    /// Mark this scope as recording a *job execution* rather than a request.
+    ///
+    /// Only the first call takes: one entry point per capsule.
+    pub fn set_job_entry(&self, job: CapsuleJob) {
+        let _ = self.job.set(job);
+    }
+
+    /// The job this scope is recording, when it is a job-scoped capsule.
+    #[must_use]
+    pub fn job_entry(&self) -> Option<CapsuleJob> {
+        self.job.get().cloned()
+    }
+
+    // ── Effect seams (#1634) ────────────────────────────────────────────
+
+    /// Run `f` against the effect buffer, marking the capsule truncated if a
+    /// seam has overflowed.
+    ///
+    /// Every seam recorder goes through here so the overflow flag is checked
+    /// in exactly one place, and so the truncation store happens *after* the
+    /// lock is released rather than inside the critical section.
+    fn with_effects<R>(&self, f: impl FnOnce(&mut EffectBuffer) -> R) -> Option<R> {
+        let (result, overflowed) = {
+            let mut buffer = self.effects.lock().ok()?;
+            let result = f(&mut buffer);
+            (result, buffer.overflowed())
+        };
+        if overflowed {
+            self.mark_truncated();
+        }
+        Some(result)
+    }
+
+    /// Record one outbound HTTP request/response pair.
+    ///
+    /// Bodies over `max_body_bytes` are recorded as skipped rather than
+    /// copied: a capsule must not become the place a large download is
+    /// buffered.
+    pub fn record_http(&self, mut effect: HttpEffect) {
+        let cap = self.settings.max_body_bytes;
+        effect.request_body = clamp_body(effect.request_body, cap);
+        effect.response_body = clamp_body(effect.response_body, cap);
+        let weight = effect
+            .url
+            .len()
+            .saturating_add(body_weight(&effect.request_body))
+            .saturating_add(body_weight(&effect.response_body));
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.push(|effects| &mut effects.http, effect, weight, budget)
+        });
+    }
+
+    /// Record one job enqueue the run performed.
+    pub fn record_job_enqueue(&self, effect: JobEffect) {
+        let weight = effect
+            .name
+            .len()
+            .saturating_add(json_weight(&effect.payload));
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.push(|effects| &mut effects.jobs, effect, weight, budget)
+        });
+    }
+
+    /// Record one cache read or write.
+    pub fn record_cache(&self, effect: CacheEffect) {
+        let weight = effect.key().len().saturating_add(match &effect {
+            CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
+            CacheEffect::Insert { value, .. } => value.len(),
+        });
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.push(|effects| &mut effects.cache, effect, weight, budget);
+        });
+    }
+
+    /// Record one message handed to the mailer.
+    pub fn record_mail(&self, mut effect: MailEffect) {
+        effect.body = clamp_body(effect.body, self.settings.max_body_bytes);
+        let weight = effect
+            .subject
+            .len()
+            .saturating_add(body_weight(&effect.body));
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.push(|effects| &mut effects.mail, effect, weight, budget)
+        });
+    }
+
+    /// Record the tenant context the run resolved. Later resolutions of the
+    /// *same* tenant are idempotent; a different one is a second resolution
+    /// the capsule cannot represent, so the capsule is marked truncated rather
+    /// than silently recording only the first.
+    pub fn record_tenant(&self, effect: TenantEffect) {
+        let conflicting = self
+            .with_effects(|buffer| match &buffer.effects.tenant {
+                Some(existing) if *existing == effect => false,
+                Some(_) => true,
+                None => {
+                    buffer.effects.tenant = Some(effect);
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if conflicting {
+            self.note(TENANT_CONFLICT_NOTE);
+            self.mark_truncated();
+        }
+    }
+
+    /// Record one draw from the entropy source.
+    pub fn record_random(&self, bytes: Vec<u8>) {
+        let weight = bytes.len();
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.push(
+                |effects| &mut effects.random,
+                RandomEffect { bytes },
+                weight,
+                budget,
+            );
+        });
+    }
+
+    /// Snapshot the recorded effects for serialization.
+    ///
+    /// A poisoned buffer marks the capsule truncated for the same reason
+    /// [`db_snapshot`](Self::db_snapshot) does: "this run produced no effects"
+    /// and "the recorded effects are unreachable" must not look the same to
+    /// replay.
+    #[must_use]
+    pub fn effects_snapshot(&self) -> CapsuleEffects {
+        self.effects.lock().map_or_else(
+            |_| {
+                self.mark_truncated();
+                CapsuleEffects::default()
+            },
+            |buffer| buffer.effects().clone(),
+        )
+    }
+
     /// Note a degraded-capture condition for the capsule reader.
     pub fn note(&self, note: impl Into<String>) {
         let note = note.into();
@@ -563,6 +845,82 @@ impl CaptureHandle {
     pub const fn scope(&self) -> &Arc<CaptureScope> {
         &self.0
     }
+}
+
+// ── Job-scoped capsules (#1634) ─────────────────────────────────────────────
+
+/// Run a job execution under its own capture scope, writing a capsule when it
+/// fails.
+///
+/// A job is a second entry point into the application, and failures in one are
+/// exactly as hard to reproduce as failures in a request — often harder,
+/// because nobody watched it happen. So a job gets the same treatment: its own
+/// scope, so the clock, entropy, database and effect seams all record against
+/// it, and a capsule on failure that `autumn replay` and a generated
+/// regression test can drive.
+///
+/// The synthetic request record (`JOB /jobs/<name>`) is what lets every field
+/// that names "the recorded entry point" keep resolving; the `job` field is
+/// what tells replay to dispatch the job rather than the router.
+///
+/// `outcome` maps the job's result to a capsule outcome, returning `None` for
+/// a success — there is nothing to capture then, and the scope is dropped.
+#[cfg(feature = "reporting")]
+pub async fn capture_job<T>(
+    name: &str,
+    payload: &serde_json::Value,
+    settings: Arc<CaptureSettings>,
+    filter: Arc<ParameterFilter>,
+    run: impl Future<Output = T>,
+    outcome: impl FnOnce(&T) -> Option<crate::capsule::schema::CapsuleOutcome>,
+) -> T {
+    let id = job_scope_id();
+    let scope = Arc::new(CaptureScope::new(id, settings, filter));
+    scope.set_job_entry(CapsuleJob {
+        name: name.to_owned(),
+        payload: payload.clone(),
+    });
+    // A synthetic head, so the capsule's `request` describes the entry point
+    // the way a request capsule's does. `JOB` is deliberately not a real HTTP
+    // method: a reader (and `autumn replay`) must not mistake this for a
+    // request that can be driven through the router.
+    scope.set_request(RawRequest {
+        method: "JOB".to_owned(),
+        uri: format!("/jobs/{name}")
+            .parse()
+            .unwrap_or_else(|_| axum::http::Uri::from_static("/jobs")),
+        version: axum::http::Version::HTTP_11,
+        headers: axum::http::HeaderMap::new(),
+        route: Some("/jobs/{name}".to_owned()),
+    });
+    register(&scope);
+    let guard = RegistryGuard(Arc::clone(&scope));
+    let result = CAPSULE_SCOPE.scope(Arc::clone(&scope), run).await;
+    drop(guard);
+
+    if let Some(outcome) = outcome(&result) {
+        // Persisting is blocking (a directory scan and a file write), and this
+        // runs on a worker thread serving other jobs.
+        let scope = Arc::clone(&scope);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = crate::capsule::persist(&scope, outcome);
+        })
+        .await;
+    }
+    result
+}
+
+/// A capsule id for a job execution.
+///
+/// Jobs carry no request id, so one is minted here — through the same
+/// character set [`is_valid_scope_id`] accepts, because it is interpolated
+/// into the database attribution marker exactly as a request id is.
+#[cfg(feature = "reporting")]
+fn job_scope_id() -> String {
+    // Drawn through the framework's entropy seam rather than `Uuid::new_v4`,
+    // so a simulation with a seeded source gets reproducible capsule ids too.
+    use crate::entropy::Entropy as _;
+    format!("job-{}", crate::entropy::OsEntropy.uuid_v4().simple())
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────
