@@ -397,6 +397,31 @@ async fn run_mirror(
         return;
     };
 
+    // Decode BOTH sides, here in the detached task rather than on the response
+    // path. A handler can serve a precompressed representation, so the primary
+    // tee captures encoded bytes just as the candidate's response can arrive
+    // encoded — decoding only one of them would report two identical builds as
+    // divergent on every such route.
+    let (Ok(primary_body), Ok(shadow_body)) = (
+        crate::shadow::transport::decode_body(
+            primary.content_encoding.as_deref(),
+            primary.body.clone(),
+            ctx.settings.max_body_bytes,
+        ),
+        crate::shadow::transport::decode_body(
+            shadow.content_encoding.as_deref(),
+            shadow.body.clone(),
+            ctx.settings.max_body_bytes,
+        ),
+    ) else {
+        // Undecodable or over-budget once expanded: counted, never guessed at.
+        ctx.registry.record_skipped_oversize();
+        record_outcome(&ctx.registry, &context.route, "skipped");
+        return;
+    };
+    let primary = ResponseFacts::encoded(primary.status, primary.content_type, None, primary_body);
+    let shadow = ResponseFacts::encoded(shadow.status, shadow.content_type, None, shadow_body);
+
     let comparison = compare(
         &primary,
         &shadow,
@@ -558,9 +583,10 @@ where
         };
         if head {
             let (parts, body) = response.into_parts();
-            let _ = tx.send(Some(ResponseFacts::new(
+            let _ = tx.send(Some(ResponseFacts::encoded(
                 parts.status.as_u16(),
                 content_type_of(&parts.headers),
+                content_encoding_of(&parts.headers),
                 Bytes::new(),
             )));
             return Poll::Ready(Ok(Response::from_parts(parts, body)));
@@ -582,6 +608,15 @@ fn content_type_of(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// The `Content-Encoding` header value, when the response carries a readable
+/// one — a handler may serve a precompressed representation.
+fn content_encoding_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+}
+
 /// Wrap a response body so a copy of its bytes reaches `tx` once the client has
 /// been served the last frame.
 fn tee_response(
@@ -591,6 +626,7 @@ fn tee_response(
 ) -> Response<Body> {
     let status = response.status().as_u16();
     let content_type = content_type_of(response.headers());
+    let content_encoding = content_encoding_of(response.headers());
 
     let (parts, body) = response.into_parts();
 
@@ -598,7 +634,12 @@ fn tee_response(
     // polled at all, so there would be no poll on which to deliver the facts.
     // Deliver them now and leave the body untouched.
     if http_body::Body::is_end_stream(&body) {
-        let _ = tx.send(Some(ResponseFacts::new(status, content_type, Bytes::new())));
+        let _ = tx.send(Some(ResponseFacts::encoded(
+            status,
+            content_type,
+            content_encoding,
+            Bytes::new(),
+        )));
         return Response::from_parts(parts, body);
     }
 
@@ -606,6 +647,7 @@ fn tee_response(
         inner: body,
         status,
         content_type,
+        content_encoding,
         captured: BytesMut::new(),
         max_body_bytes,
         overflowed: false,
@@ -622,6 +664,7 @@ struct MirrorTeeBody {
     inner: Body,
     status: u16,
     content_type: Option<String>,
+    content_encoding: Option<String>,
     captured: BytesMut,
     max_body_bytes: usize,
     overflowed: bool,
@@ -660,9 +703,10 @@ impl MirrorTeeBody {
         let facts = if self.overflowed {
             None
         } else {
-            Some(ResponseFacts::new(
+            Some(ResponseFacts::encoded(
                 self.status,
                 self.content_type.clone(),
+                self.content_encoding.clone(),
                 std::mem::take(&mut self.captured).freeze(),
             ))
         };
@@ -728,10 +772,26 @@ mod tests {
     use std::time::Duration;
     use tower::{ServiceExt, service_fn};
 
+    /// gzip-encode `plain`, for the precompressed-representation tests.
+    fn gzipped(plain: &[u8]) -> bytes::Bytes {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain).expect("encode");
+        bytes::Bytes::from(encoder.finish().expect("finish"))
+    }
+
     /// What a [`FakeTransport`] should do with each mirrored request.
     #[derive(Clone)]
     enum Behaviour {
-        Reply { status: u16, body: &'static str },
+        /// Answer with a gzip `Content-Encoding`, as a handler serving a
+        /// precompressed representation would.
+        ReplyGzipped {
+            body: &'static str,
+        },
+        Reply {
+            status: u16,
+            body: &'static str,
+        },
         Fail,
         Oversize,
         Stall(Duration),
@@ -772,6 +832,12 @@ mod tests {
                         status,
                         Some("application/json".to_owned()),
                         bytes::Bytes::from_static(body.as_bytes()),
+                    )),
+                    Behaviour::ReplyGzipped { body } => Ok(ResponseFacts::encoded(
+                        200,
+                        Some("application/json".to_owned()),
+                        Some("gzip".to_owned()),
+                        gzipped(body.as_bytes()),
                     )),
                     Behaviour::Fail => Err(ShadowError::Transport("refused".to_owned())),
                     Behaviour::Oversize => Err(ShadowError::Oversize),
@@ -1180,6 +1246,84 @@ mod tests {
             recent[0].target
         );
         assert!(recent[0].target.contains("page=2"));
+    }
+
+    #[tokio::test]
+    async fn a_precompressed_body_is_decoded_on_both_sides_before_comparing() {
+        // A handler may serve a precompressed representation, so the primary
+        // tee captures ENCODED bytes — exactly as the candidate's response can
+        // arrive encoded. Decoding only one side would report two identical
+        // builds as divergent on every such route.
+        let transport = FakeTransport::new(Behaviour::ReplyGzipped {
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(service_fn(
+            |_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(Body::from(gzipped(br#"{"ok":true}"#)))
+                        .expect("valid response"),
+                )
+            },
+        ));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let _ = read_body(response).await;
+
+        settle("the comparison to be recorded", || {
+            registry.stats().compared == 1
+        })
+        .await;
+        assert_eq!(
+            registry.stats().matched,
+            1,
+            "identical precompressed bodies must not diverge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_precompressed_primary_matches_a_plain_candidate_with_the_same_content() {
+        // Only one side encoded: after decoding, the content is identical, so
+        // this is a match. An encoding difference is a header difference, and
+        // headers are outside the comparison contract.
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(service_fn(
+            |_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(Body::from(gzipped(br#"{"ok":true}"#)))
+                        .expect("valid response"),
+                )
+            },
+        ));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let _ = read_body(response).await;
+
+        settle("the comparison to be recorded", || {
+            registry.stats().compared == 1
+        })
+        .await;
+        assert_eq!(registry.stats().matched, 1);
     }
 
     #[tokio::test]

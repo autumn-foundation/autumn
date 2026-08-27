@@ -77,6 +77,13 @@ pub struct ResponseFacts {
     pub status: u16,
     /// `Content-Type` header value, when the build sent one.
     pub content_type: Option<String>,
+    /// `Content-Encoding` header value, when the build sent one.
+    ///
+    /// A handler may serve a precompressed representation, in which case the
+    /// bytes here are encoded — on **either** side. Both are decoded before
+    /// comparison; decoding only one would report identical builds as
+    /// divergent.
+    pub content_encoding: Option<String>,
     /// Response body bytes, already bounded by the mirror's capture budget.
     pub body: Bytes,
 }
@@ -88,6 +95,23 @@ impl ResponseFacts {
         Self {
             status,
             content_type,
+            content_encoding: None,
+            body,
+        }
+    }
+
+    /// Construct facts for a body that arrived under a `Content-Encoding`.
+    #[must_use]
+    pub const fn encoded(
+        status: u16,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        body: Bytes,
+    ) -> Self {
+        Self {
+            status,
+            content_type,
+            content_encoding,
             body,
         }
     }
@@ -395,18 +419,54 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     if rendered.len() <= sample_limit {
         return Some(scrubbed);
     }
-    // Cut on a character boundary at or below the budget, so the excerpt is
-    // still valid UTF-8 and never exceeds what the operator asked for.
-    let cut = rendered
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= sample_limit)
-        .last()
-        .unwrap_or(0);
-    let mut truncated = String::with_capacity(cut.saturating_add(TRUNCATION_MARKER.len()));
-    truncated.push_str(rendered.get(..cut).unwrap_or_default());
+    Some(Value::String(truncate_to_serialized_budget(
+        &rendered,
+        sample_limit,
+    )))
+}
+
+/// Build the truncated excerpt so that the value's own **serialized** form fits
+/// in `sample_limit` bytes.
+///
+/// Cutting the source string at the budget is not enough: the result is stored
+/// as a JSON string, so serializing it adds the surrounding quotes and escapes
+/// every `"`, `\` and control character already in the prefix. A prefix taken
+/// at exactly the budget can therefore serialize to well over it — which is the
+/// number the operator actually configured. So the cost is accumulated per
+/// character as it will be *written*, with the quotes and the marker reserved
+/// up front.
+fn truncate_to_serialized_budget(rendered: &str, sample_limit: usize) -> String {
+    /// The two `"` a JSON string is written between.
+    const QUOTES: usize = 2;
+
+    let reserved = QUOTES.saturating_add(TRUNCATION_MARKER.len());
+    // Not even the marker fits; the marker alone is the honest answer.
+    let Some(budget) = sample_limit.checked_sub(reserved) else {
+        return TRUNCATION_MARKER.to_owned();
+    };
+
+    let mut truncated = String::new();
+    let mut cost = 0usize;
+    for character in rendered.chars() {
+        cost = cost.saturating_add(serialized_len(character));
+        if cost > budget {
+            break;
+        }
+        truncated.push(character);
+    }
     truncated.push_str(TRUNCATION_MARKER);
-    Some(Value::String(truncated))
+    truncated
+}
+
+/// How many bytes `character` occupies once written inside a JSON string.
+const fn serialized_len(character: char) -> usize {
+    match character {
+        // Escaped as a two-character sequence.
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        // Every other control character becomes `\u00XX`.
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
 }
 
 /// Whether every scalar in `value` has an object key somewhere above it, and is
@@ -545,6 +605,7 @@ mod tests {
         ResponseFacts {
             status,
             content_type: Some("application/json".to_owned()),
+            content_encoding: None,
             body: Bytes::from(body.to_owned()),
         }
     }
@@ -644,6 +705,7 @@ mod tests {
         let html = |body: &str| ResponseFacts {
             status: 200,
             content_type: Some("text/html; charset=utf-8".to_owned()),
+            content_encoding: None,
             body: Bytes::from(body.to_owned()),
         };
         let Comparison::Diverged(d) = compare(
@@ -866,6 +928,7 @@ mod tests {
         let text = |body: &str| ResponseFacts {
             status: 200,
             content_type: Some("text/plain".to_owned()),
+            content_encoding: None,
             body: Bytes::from(body.to_owned()),
         };
         assert!(matches!(
@@ -897,6 +960,45 @@ mod tests {
             "sample body is {} bytes, budget was 64",
             body.len()
         );
+    }
+
+    #[test]
+    fn a_truncated_sample_fits_its_budget_once_serialized() {
+        // The excerpt is stored as a JSON string, so serializing re-adds the
+        // quotes and escapes every quote and backslash in the prefix. Cutting
+        // the source at the budget therefore overshoots the number the operator
+        // configured.
+        let filter = ParameterFilter::default();
+        let quoted = format!(r#"{{"blob":"{}"}}"#, "a\"b\\c".repeat(400));
+        for limit in [8usize, 16, 64, 512] {
+            let Comparison::Diverged(d) =
+                compare(&json(200, &quoted), &json(200, "{}"), &filter, limit)
+            else {
+                panic!("expected divergence at limit {limit}");
+            };
+            let serialized = serde_json::to_string(&d.primary_sample).expect("sample serializes");
+            assert!(
+                serialized.len() <= limit,
+                "limit {limit}: serialized sample is {} bytes: {serialized}",
+                serialized.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_absurdly_small_budget_still_produces_something_valid() {
+        let filter = ParameterFilter::default();
+        let Comparison::Diverged(d) =
+            compare(&json(200, r#"{"a":1}"#), &json(200, "{}"), &filter, 1)
+        else {
+            panic!("expected divergence");
+        };
+        // Not required to fit a budget smaller than the marker itself, but it
+        // must still be a valid, obviously-truncated value rather than a panic.
+        let Some(Value::String(sample)) = d.primary_sample else {
+            panic!("expected a truncated string");
+        };
+        assert!(sample.ends_with(TRUNCATION_MARKER), "{sample}");
     }
 
     #[test]
@@ -982,6 +1084,7 @@ mod tests {
         let head = || ResponseFacts {
             status: 204,
             content_type: None,
+            content_encoding: None,
             body: Bytes::new(),
         };
         assert!(matches!(

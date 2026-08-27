@@ -538,12 +538,15 @@ container, another port, another machine) and point `target` at it.
 - **Credentials never reach a proxy.** The mirroring client disables proxy
   autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
   a mirrored request (carrying the end user's cookie) to a third party.
-- **`Accept-Encoding` travels, and the candidate's answer is decoded.** A
-  handler can legitimately vary its body on that header, so stripping it would
-  have the two stacks answering different logical requests. The candidate's
-  response is `gzip`/`deflate`/`br`-decoded on arrival — under the same size
-  budget as the wire read, so a decompression bomb is refused rather than
-  buffered.
+- **`Accept-Encoding` travels, and both bodies are decoded.** A handler can
+  legitimately vary its body on that header, so stripping it would have the two
+  stacks answering different logical requests. A handler can also serve a
+  *precompressed* representation, in which case the live build's captured bytes
+  are encoded too — so `gzip`/`deflate`/`br` decoding is applied to **both**
+  sides before comparison, under the same size budget as the wire read. A
+  decompression bomb is refused rather than buffered, and an encoding difference
+  between the two builds is a header difference, which the contract does not
+  compare.
 - **Forwarding headers are not replayed.** `X-Forwarded-*`, `Forwarded`, and
   `X-Real-IP` are stripped: this layer runs before the primary's trusted-proxy
   policy, so forwarding them would hand the candidate a client-spoofed value

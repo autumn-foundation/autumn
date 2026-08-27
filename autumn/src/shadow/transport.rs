@@ -259,7 +259,7 @@ pub fn shadow_url(target_base: &str, request_target: &str) -> String {
 /// the compressed bytes would leave a decompression bomb able to grow this
 /// process. An unknown encoding is passed through untouched — better a
 /// byte-comparison the operator can see than a guess.
-fn decode_body(
+pub(crate) fn decode_body(
     content_encoding: Option<&str>,
     body: bytes::Bytes,
     max_body_bytes: usize,
@@ -402,16 +402,17 @@ impl ShadowTransport for HttpShadowTransport {
                 collected.extend_from_slice(&chunk);
             }
 
-            // The candidate saw the client's `Accept-Encoding`, so it may have
-            // answered encoded. Decode before comparing: the primary side was
-            // teed inside the compression layer and is plain.
-            let body = decode_body(
-                content_encoding.as_deref(),
+            // The encoding travels WITH the facts rather than being consumed
+            // here. Decoding only this side would report identical builds as
+            // divergent whenever a handler serves a precompressed
+            // representation, because the primary tee captures those encoded
+            // bytes too. Both sides are decoded together in the mirror task.
+            Ok(ResponseFacts::encoded(
+                status,
+                content_type,
+                content_encoding,
                 collected.freeze(),
-                max_body_bytes,
-            )?;
-
-            Ok(ResponseFacts::new(status, content_type, body))
+            ))
         })
     }
 }
