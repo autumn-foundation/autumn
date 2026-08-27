@@ -140,7 +140,7 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
 }
 
 /// Reject unsupported flag combinations before any files are written.
-fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+pub fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
     // The API flavor and the daemon flavors are different app shapes with
     // conflicting `autumn-web` feature sets: `--api` drops the view stack
     // (maud/htmx/tailwind) for a pure-JSON app, while `--daemon`/`--bundled-pg`

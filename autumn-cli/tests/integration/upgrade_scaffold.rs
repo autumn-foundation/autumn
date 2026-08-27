@@ -631,3 +631,36 @@ fn an_apply_that_cannot_record_its_baseline_exits_nonzero() {
     assert!(root.join("rustfmt.toml").is_file());
     assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine\n");
 }
+
+#[test]
+fn check_does_not_pass_a_project_scaffolded_by_a_newer_release() {
+    // Refusing to look is not an all-clear — the same rule as an unreadable
+    // package name. A gate that goes green because the CLI is too old to
+    // reconcile the project is worse than no gate.
+    let (_tmp, root) = new_project("fromfuture", &[]);
+    let manifest = fs::read_to_string(root.join(MANIFEST)).unwrap();
+    fs::write(
+        root.join(MANIFEST),
+        manifest
+            .lines()
+            .map(|line| {
+                if line.starts_with("version = ") {
+                    "version = \"99.0.0\"".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let output = run(&root, &["--check"]);
+    assert_eq!(output.status.code(), Some(2), "{}", report(&output));
+    let combined = format!(
+        "{}{}",
+        stdout_of(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("99.0.0"), "{combined}");
+}

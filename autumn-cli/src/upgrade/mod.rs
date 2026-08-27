@@ -1498,10 +1498,22 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
     } else {
         print!("{}", scaffold::render_summary(&report));
     }
-    // A refusal to answer is not an all-clear. Without a usable `[package]
-    // name` the scaffold cannot be rendered, so there is no verdict — and a
+    // A refusal to answer is not an all-clear, whatever the reason for it — a
     // gate that goes green because the tool could not look is worse than no
-    // gate at all.
+    // gate at all. This project's files were written by a release newer than
+    // this CLI, so reconciling them would mean downgrading them.
+    if let Some(newer) = &report.scaffolded_by_newer {
+        eprintln!(
+            "autumn upgrade: `{}` was scaffolded by autumn-cli {newer}, newer than this one \
+             ({}).\n\
+             Nothing was checked: reconciling would downgrade its files. Install {newer} or later.",
+            root.display(),
+            env!("CARGO_PKG_VERSION")
+        );
+        return 2;
+    }
+    // Without a usable `[package] name` the scaffold cannot be rendered, so
+    // there is no verdict either.
     if !report.named {
         eprintln!(
             "autumn upgrade: `{}` has no usable `[package] name` in Cargo.toml, and the\n\

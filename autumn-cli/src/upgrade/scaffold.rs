@@ -208,6 +208,15 @@ impl Manifest {
             digests: file.files,
             pinned: file.pinned,
         })
+        // A combination `autumn new` would have refused cannot have produced
+        // this project, so the manifest is corrupt however well-formed it
+        // parses. `--api` with `--daemon`, for instance, are different app
+        // shapes with conflicting feature sets: trusting it would render the
+        // API templates against a fullstack daemon's digests and make its
+        // `Dockerfile` and `build.rs` look like safe updates. Validated with
+        // `autumn new`'s own rule, so the two can never disagree about what is
+        // possible.
+        .filter(|manifest: &Self| crate::new::check_option_combination(manifest.options).is_ok())
     }
 
     /// Load the manifest under `root`, or `None` when there is not a readable
@@ -732,6 +741,14 @@ pub struct ScaffoldReport {
     /// not, the scaffold cannot be rendered for comparison and [`Self::entries`]
     /// is empty — which is a refusal to answer, not an "all clear".
     pub named: bool,
+    /// The recorded baseline, when it names a release newer than this CLI.
+    ///
+    /// Reconciling then means rendering *older* templates against digests a
+    /// newer release wrote — so every untouched file matches its digest,
+    /// classifies as a writable `update`, and `--apply` silently downgrades the
+    /// `Dockerfile`, the build script and the CI workflow. Downgrades are out
+    /// of scope, so the run refuses instead and [`Self::entries`] is empty.
+    pub scaffolded_by_newer: Option<String>,
     /// Whether this project is a crate inside an enclosing Cargo workspace, in
     /// which case the files that workspace owns at its root are out of scope.
     pub workspace_member: bool,
@@ -881,12 +898,24 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
-    let files = current_files(root, options);
+    // A baseline from a release newer than this CLI cannot be reconciled: the
+    // templates here are older than the files those digests describe, so every
+    // untouched file would classify as a writable `update` and `--apply` would
+    // downgrade it. Nothing is rendered and nothing is classified.
+    let scaffolded_by_newer = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.version.clone())
+        .filter(|recorded| is_newer_than_this_cli(recorded));
+    let files = scaffolded_by_newer
+        .is_none()
+        .then(|| current_files(root, options))
+        .flatten();
     ScaffoldReport {
         root: root.to_path_buf(),
         options,
         baseline: manifest.as_ref().and_then(|m| m.version.clone()),
-        named: files.is_some(),
+        named: scaffolded_by_newer.is_some() || files.is_some(),
+        scaffolded_by_newer,
         workspace_member: workspace_root_above(root).is_some(),
         entries: files
             .map(|files| classify(root, &files, manifest.as_ref(), migrated))
@@ -896,6 +925,22 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
         has_manifest: manifest.is_some(),
         outcome: super::Outcome::Preview,
     }
+}
+
+/// Whether `recorded` names a release newer than the one this CLI ships.
+///
+/// An unparsable version is *not* newer: it is simply unknown, and the
+/// conservative answer there is the one the rest of the module already gives an
+/// unreadable manifest — no baseline, everything a conflict — rather than a
+/// refusal that a typo could trigger.
+fn is_newer_than_this_cli(recorded: &str) -> bool {
+    let (Some(recorded), Some(ours)) = (
+        super::migrations::parse_version_req(recorded),
+        super::migrations::parse_version_req(env!("CARGO_PKG_VERSION")),
+    ) else {
+        return false;
+    };
+    recorded > ours
 }
 
 /// Record `paths` as the developer's own, so reconciliation leaves them alone.
@@ -1224,6 +1269,19 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
+    if let Some(newer) = &report.scaffolded_by_newer {
+        let _ = writeln!(out, "\nScaffold files");
+        let _ = writeln!(
+            out,
+            "  Skipped: this project was scaffolded by autumn-cli {newer}, which is newer\n  \
+             than this one ({}). Reconciling would render older templates over newer\n  \
+             files — a downgrade, which this command does not do. Install {newer} or\n  \
+             later and run it again.",
+            report.target
+        );
+        let _ = writeln!(out, "  Upgrade guide: {}", report.guide);
+        return out;
+    }
     if !report.named {
         let _ = writeln!(out, "\nScaffold files");
         let _ = writeln!(
@@ -1388,6 +1446,7 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
         "baseline": report.baseline,
         "target": report.target,
         "named": report.named,
+        "scaffolded_by_newer": report.scaffolded_by_newer,
         "has_manifest": report.has_manifest,
         "outcome": report.outcome.label(),
         "drift": report.drifted(),
@@ -2635,5 +2694,70 @@ mod tests {
         );
         assert_eq!(failure.written, report.applicable().len());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine\n");
+    }
+
+    #[test]
+    fn a_project_scaffolded_by_a_newer_release_is_refused_not_downgraded() {
+        // The recorded digests still match, so every untouched file looks like
+        // a writable `update` against this older CLI's templates — and applying
+        // them would DOWNGRADE the Dockerfile, build script and CI workflow.
+        // Downgrades are out of scope; silently performing one is worse still.
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.version = Some("99.0.0".to_owned());
+        manifest.save(tmp.path()).unwrap();
+        // An older template on disk, matching its recorded digest exactly as a
+        // newer CLI's output would.
+        let newer = "# written by a newer release\n";
+        write(tmp.path(), "clippy.toml", newer);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(newer));
+        manifest.save(tmp.path()).unwrap();
+
+        let report = plan_in(tmp.path());
+        assert!(report.entries.is_empty(), "nothing may be reconciled");
+        assert!(!report.drifted());
+        let text = render_text(&report);
+        assert!(text.contains("newer"), "{text}");
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("clippy.toml")).unwrap(),
+            newer,
+            "a newer release's file must never be downgraded"
+        );
+    }
+
+    #[test]
+    fn an_impossible_option_combination_is_no_baseline() {
+        // `--api` with `--daemon` is a combination `autumn new` refuses: they
+        // are different app shapes with conflicting feature sets. A manifest
+        // claiming both is corrupt, and trusting it renders the API templates
+        // against a fullstack daemon's digests — making its `Dockerfile` and
+        // `build.rs` look like safe updates.
+        let tmp = scaffolded(GenerateOptions::default());
+        let text = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+        fs::write(
+            tmp.path().join(MANIFEST_PATH),
+            text.replace("flavor = \"fullstack\"", "flavor = \"api\"")
+                .replace("daemon = false", "daemon = true"),
+        )
+        .unwrap();
+
+        assert!(
+            Manifest::load(tmp.path()).is_none(),
+            "an incoherent option set vouches for nothing"
+        );
+
+        let before = fs::read_to_string(tmp.path().join("Dockerfile")).unwrap();
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
+            before
+        );
     }
 }
