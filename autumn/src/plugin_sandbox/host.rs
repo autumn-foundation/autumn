@@ -579,24 +579,27 @@ fn finish(
                     "a sandboxed plugin may not set this response header",
                 );
             }
-            if let Some(essence) = response.refused_content_type() {
-                let detail = format!(
-                    "a sandboxed plugin may not serve `{essence}`: a document or a script from \
-                     the host's own origin would carry the host's authority"
-                );
-                state.deny(DeniedCapability::ResponseHeader, "content-type", &detail);
-                Err(SandboxFailure::ResponseRefused(
-                    super::wire::WireError::UnsupportedContentType(essence).to_string(),
-                ))
-            } else {
-                response
-                    .validate()
-                    .and_then(|()| response.check_size(limits.max_response_bytes))
-                    .map_or_else(
-                        |err| Err(SandboxFailure::ResponseRefused(err.to_string())),
-                        |()| Ok(response),
-                    )
-            }
+            response.refused_content_type().map_or_else(
+                || {
+                    response
+                        .validate()
+                        .and_then(|()| response.check_size(limits.max_response_bytes))
+                        .map_or_else(
+                            |err| Err(SandboxFailure::ResponseRefused(err.to_string())),
+                            |()| Ok(response.clone()),
+                        )
+                },
+                |essence| {
+                    let detail = format!(
+                        "a sandboxed plugin may not serve `{essence}`: a document or a script \
+                         from the host's own origin would carry the host's authority"
+                    );
+                    state.deny(DeniedCapability::ResponseHeader, "content-type", &detail);
+                    Err(SandboxFailure::ResponseRefused(
+                        super::wire::WireError::UnsupportedContentType(essence).to_string(),
+                    ))
+                },
+            )
         }
         Err(failure) => Err(failure),
     };
@@ -883,7 +886,7 @@ impl HostState {
     }
 
     /// Whether every further stderr byte would be discarded.
-    fn stderr_is_full(&self) -> bool {
+    const fn stderr_is_full(&self) -> bool {
         self.stderr.len() >= STDERR_BUDGET_BYTES
     }
 

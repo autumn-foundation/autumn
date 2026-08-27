@@ -193,7 +193,6 @@ impl SandboxedPlugin {
     /// Prefer installing it as a [`Plugin`], which also logs the capability
     /// grant and declares the routes for `autumn routes` and
     /// `autumn plugin-check`.
-    #[must_use]
     pub fn mounted_router<S>(&self) -> axum::Router<S>
     where
         S: Clone + Send + Sync + 'static,
