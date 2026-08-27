@@ -163,9 +163,17 @@ pub trait ShadowTransport: std::fmt::Debug + Send + Sync + 'static {
 /// from the target.
 ///
 /// `resolved` is what the trusted-proxy layer accepted, when it ran, and it is
-/// re-stamped over the stripped forwarding family: the candidate is told the
-/// *validated* host, client address, and scheme rather than the client's own
-/// claims. Behind a proxy the raw `Host` is the internal address while the
+/// re-stamped over the stripped forwarding family: the candidate is *told* the
+/// validated host, client address, and scheme rather than the client's own
+/// claims.
+///
+/// Told, not guaranteed to be believed: a candidate's own `ProxyResolver`
+/// honours `X-Forwarded-*` only when its immediate peer is trusted, so one that
+/// clones production's `[security.trusted_proxies]` — listing the load
+/// balancer, not this host — ignores them and resolves the mirroring process as
+/// the client. `Host` is unaffected, since it needs no proxy trust. The
+/// operator-facing consequence and its one-line fix are in
+/// `docs/guide/staged-deploys.md`. Behind a proxy the raw `Host` is the internal address while the
 /// public one arrives in `X-Forwarded-Host` — forwarding that header would let
 /// a client forge it, and dropping it silently would have the candidate resolve
 /// the wrong tenant or reject the request. Preferring the resolved value
@@ -307,6 +315,25 @@ pub(crate) fn decode_body(
     Ok(current)
 }
 
+/// Join every `Content-Encoding` field on a response into one coding list.
+///
+/// The header may legally appear as repeated fields (`Content-Encoding: gzip`
+/// then `Content-Encoding: br`) rather than one comma-joined value, and both
+/// forms mean the same chain. Reading only the first field would hand the
+/// decoder an incomplete chain — it would fail, and two identical builds would
+/// be recorded as decode errors instead of compared.
+#[must_use]
+pub(crate) fn joined_content_encoding(headers: &HeaderMap) -> Option<String> {
+    let codings: Vec<String> = headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    (!codings.is_empty()).then(|| codings.join(", "))
+}
+
 /// Whether this content coding can be unwound.
 fn is_known_coding(coding: &str) -> bool {
     matches!(coding, "gzip" | "x-gzip" | "deflate" | "br")
@@ -417,11 +444,7 @@ impl ShadowTransport for HttpShadowTransport {
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
-            let content_encoding = response
-                .headers()
-                .get(axum::http::header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.trim().to_ascii_lowercase());
+            let content_encoding = joined_content_encoding(response.headers());
             // Streamed, not `.bytes()`: collecting the whole body first would
             // buffer an arbitrarily large candidate response into this
             // process's memory before anyone could check its size. A candidate
@@ -567,6 +590,32 @@ mod tests {
 
         let decoded = decode_body(Some("gzip"), gzipped, 4096).expect("decode");
         assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn repeated_content_encoding_fields_join_into_one_chain() {
+        // `Content-Encoding: gzip` then `Content-Encoding: br` means the same
+        // chain as `gzip, br`. Reading only the first field hands the decoder an
+        // incomplete chain, which fails — recording two identical builds as
+        // decode errors instead of comparing them.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        headers.append(
+            axum::http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("br"),
+        );
+        assert_eq!(
+            joined_content_encoding(&headers).as_deref(),
+            Some("gzip, br")
+        );
+    }
+
+    #[test]
+    fn no_content_encoding_field_yields_none() {
+        assert_eq!(joined_content_encoding(&HeaderMap::new()), None);
     }
 
     #[test]

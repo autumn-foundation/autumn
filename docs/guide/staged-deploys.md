@@ -556,7 +556,8 @@ container, another port, another machine) and point `target` at it.
 - **Forwarding headers are not replayed.** `X-Forwarded-*`, `Forwarded`, and
   `X-Real-IP` are stripped: this layer runs before the primary's trusted-proxy
   policy, so forwarding them would hand the candidate a client-spoofed value
-  arriving from an address it *does* trust.
+  arriving from an address it *does* trust. What is sent instead is the
+  **validated** identity — see the configuration note below.
 - **`Host` is preserved.** The candidate is *dialed* at `target`, but it sees
   the authority the live build accepted. Those are separate things, and only the
   address comes from `target`: a candidate that clones your
@@ -569,6 +570,34 @@ container, another port, another machine) and point `target` at it.
   the static-first middleware answers matching `GET`/`HEAD` requests before the
   dynamic router runs; the mirror sits outside it, so a pre-rendered page the
   candidate generates differently is still compared.
+
+### One thing you must configure on the candidate
+
+Autumn sends the candidate the client identity its own trusted-proxy policy
+resolved — `X-Forwarded-For` and `X-Forwarded-Proto` synthesised from the
+validated values, never the client's raw claims. **The candidate only honours
+them if it trusts the mirroring process as a proxy.**
+
+`ProxyResolver` reads forwarding headers only when the *immediate peer* is
+trusted, so a candidate that clones production's `[security.trusted_proxies]` —
+which lists your load balancer, not the app host — will ignore them and resolve
+the mirror itself as the client. Handlers then see a loopback address over
+`http`, and per-IP rate limiting buckets every mirrored request together, which
+answers `429` and shows up as a divergence on every route.
+
+Add the mirroring replica's address to the **candidate's** trusted proxies:
+
+```toml
+# autumn.toml on the CANDIDATE build
+[security.trusted_proxies]
+# ...your production ranges, plus the host the mirror dials from:
+ranges = ["10.0.0.0/8", "127.0.0.1/32"]
+```
+
+If you would rather not widen that trust, leave it — the mirror still works,
+and the candidate simply resolves the mirroring process as the client. Routes
+that read `ClientAddr`/`ClientScheme`, and candidate-side per-IP rate limits,
+are the ones that will then disagree.
 
 ### What is compared
 

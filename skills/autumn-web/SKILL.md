@@ -1995,6 +1995,12 @@ noise), its own side effects are real so it must be contained by environment
 any other *keyed* field of a response body is stored verbatim on that actuator
 endpoint. (Bodies with unkeyed scalars record only a digest.)
 
+**One configuration step is easy to miss**: the candidate honours the forwarded
+client identity only if it trusts the mirroring host as a proxy. Add that host
+to the *candidate's* `[security.trusted_proxies] ranges`, or accept that routes
+reading `ClientAddr`/`ClientScheme` — and candidate-side per-IP rate limits —
+will see the mirror rather than the real client.
+
 See `docs/guide/staged-deploys.md`.
 
 ## CLI

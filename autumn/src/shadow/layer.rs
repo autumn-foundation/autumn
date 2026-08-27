@@ -661,13 +661,10 @@ fn content_type_of(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// The `Content-Encoding` header value, when the response carries a readable
-/// one — a handler may serve a precompressed representation.
+/// The response's full `Content-Encoding` coding list — a handler may serve a
+/// precompressed representation, and may emit the chain as repeated fields.
 fn content_encoding_of(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(axum::http::header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().to_ascii_lowercase())
+    crate::shadow::transport::joined_content_encoding(headers)
 }
 
 /// Wrap a response body so a copy of its bytes reaches `tx` once the client has
