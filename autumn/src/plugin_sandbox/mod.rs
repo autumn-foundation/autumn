@@ -97,3 +97,53 @@ pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
 pub fn __fuzz_parse_manifest(src: &str) -> bool {
     SandboxManifest::parse(src).is_ok()
 }
+
+/// The single-binary promise is a *manifest* property, not a source property.
+///
+/// "The app still deploys as one binary" holds because the sandbox is an
+/// in-process interpreter — no daemon, no subprocess, no native codegen backend
+/// and no sidecar artifact. One dependency edge would end that quietly, with a
+/// symptom (a build that needs a C toolchain, a runtime that needs a helper on
+/// PATH) three levels away from the line that caused it. These tests read this
+/// crate's own manifest and fail on that edit directly.
+#[cfg(test)]
+mod manifest_guard {
+    const MANIFEST: &str = include_str!("../../Cargo.toml");
+
+    /// The `plugin-sandbox = [...]` line, comments dropped.
+    fn feature_line() -> &'static str {
+        MANIFEST
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("plugin-sandbox ="))
+            .expect("the plugin-sandbox feature is declared")
+    }
+
+    #[test]
+    fn the_feature_adds_exactly_one_dependency() {
+        assert_eq!(
+            feature_line(),
+            r#"plugin-sandbox = ["dep:wasmi"]"#,
+            "enabling the sandbox must pull in the interpreter and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_interpreter_is_optional_so_a_default_build_never_links_it() {
+        let wasmi = MANIFEST
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("wasmi ="))
+            .expect("wasmi is a dependency");
+        assert!(wasmi.contains("optional = true"), "{wasmi}");
+        let default = MANIFEST
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("default = ["))
+            .expect("a default feature set");
+        assert!(
+            !default.contains("plugin-sandbox"),
+            "the sandbox must stay opt-in: {default}"
+        );
+    }
+}

@@ -2007,6 +2007,64 @@ path = "/hello/greet"
         assert_eq!(outcome.result.expect("still answers").status, 200);
     }
 
+    /// A subscriber that records the `capability` / `operation` fields of every
+    /// event, so "observable in logs" can be asserted rather than assumed.
+    #[derive(Default)]
+    struct DenialLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for DenialLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Fields<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push(format!("{}={value}", field.name()));
+                }
+            }
+            let mut fields = Vec::new();
+            event.record(&mut Fields(&mut fields));
+            if let Ok(mut recorded) = self.0.lock() {
+                recorded.push(format!(
+                    "{} [{}]",
+                    event.metadata().level(),
+                    fields.join(" ")
+                ));
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn a_denial_reaches_the_log_and_not_only_the_ledger() {
+        // The ledger is what tests read; the log is what an operator reads. If
+        // the two could drift, "each denial observable in logs" would be a
+        // claim about a field nobody sees.
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(DenialLog(std::sync::Arc::clone(&recorded)), || {
+            let _ = host(guests::READ_FILE).run(&get("/hello/greet"));
+        });
+        let lines = recorded.lock().expect("not poisoned").clone();
+        let denial = lines
+            .iter()
+            .find(|line| line.contains("operation=path_open"))
+            .unwrap_or_else(|| panic!("no denial line in {lines:#?}"));
+        assert!(denial.starts_with("WARN"), "{denial}");
+        assert!(denial.contains("capability=filesystem"), "{denial}");
+        assert!(denial.contains("plugin=autumn-plugin-hello"), "{denial}");
+        assert!(denial.contains("no filesystem"), "{denial}");
+    }
+
     #[test]
     fn there_are_no_preopened_directories_to_discover() {
         let outcome = host(guests::DISCOVER_PREOPENS).run(&get("/hello/greet"));
