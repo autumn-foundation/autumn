@@ -1,0 +1,38 @@
+{
+  "format_version": 2,
+  "id": "94a4cfd1-c7d0-4b3f-82f8-ffb6448220e1",
+  "captured_at": "2026-08-27T17:21:29.826775098Z",
+  "autumn_version": "0.7.0",
+  "app": {
+    "name": "autumn-app",
+    "profile": "capsules",
+    "debug_assertions": true
+  },
+  "request": {
+    "method": "GET",
+    "uri": "/dev/trigger-error",
+    "route": "/dev/trigger-error",
+    "http_version": "HTTP/1.1",
+    "headers": [],
+    "binary_headers": [],
+    "body": "absent",
+    "redacted_keys": [],
+    "peer_addr": null,
+    "client_addr": null,
+    "client_host": null,
+    "client_scheme": null
+  },
+  "outcome": {
+    "status": {
+      "code": 500,
+      "message": "invalid digit found in string",
+      "problem_type": null
+    }
+  },
+  "clock": [],
+  "clock_monotonic_us": [],
+  "db": null,
+  "db_roles": [],
+  "truncated": false,
+  "notes": []
+}

@@ -50,6 +50,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Examples for the four flagship 0.7.0 subsystems that shipped a guide and
+  nothing runnable (#2320, T2):** the 0.7.0 docs audit found guide coverage at
+  91.1% and example coverage at 59.4% — the debt had moved wholesale from docs
+  to examples, and the release's four headline subsystems were the worst of it.
+  Each now has a runnable example, and each example carries assertions rather
+  than prose alone:
+  - **Deterministic simulation testing** — `examples/reddit-clone/tests/sim_hot_rank.rs`
+    is a seeded `#[sim_test]` over the app's `score / (age_hours + 2)^1.5`
+    hot-rank decay curve. It walks 48 virtual hours in checkpoints through the
+    ordinary `Clock` extractor, so it exercises the injected-clock seam rather
+    than bypassing it, and finishes in milliseconds with no sleeping. `always!`
+    carries the hard invariants (a rank never climbs as a post ages; a positive
+    score never decays to zero) and `sometimes!` the reachability targets, with
+    two deliberately-separated score bands so `assert_all_sometimes_satisfied()`
+    holds at every seed and a green run is provably non-vacuous. It doubles as a
+    regression test for the sim seams: a clock that stops reaching handler
+    extractors makes every checkpoint equal and fires the monotonicity
+    invariant.
+  - **Failure capsules** — `examples/reddit-clone` gains an `autumn-capsules.toml`
+    profile that arms `[failure_capture]` (kept out of the dev profile because
+    turning capture on is a deliberate decision, not a convenience), a committed
+    capsule recorded from `/dev/trigger-error` under `capsules/`, and a README
+    walkthrough of `autumn replay` including the four verdicts and their exit
+    codes. `tests/failure_capsule.rs` proves the profile really arms capture
+    while `dev`/`redis` leave it off, that one failing request leaves exactly one
+    capsule and a 404 leaves none, and that the committed fixture parses through
+    the same `Capsule::from_json` the replay CLI uses. The profile also widens
+    `[log] filter_parameters` to cover this app's `Stripe-Signature` intake
+    header — redaction matches names by equality after normalization, never by
+    prefix, so a prefixed secret header is recorded verbatim unless it is named.
+  - **Self-clustering substrate** — `examples/bookmarks-distributed` already ran
+    two web replicas behind nginx; they now form a two-node cluster with no
+    coordination service, sharing a member view and a cluster-wide bookmark
+    counter. `[cluster]` lives in `autumn-docker.toml` and the per-instance
+    identity (node id, advertise address, seed peer) in `docker-compose.yml`,
+    which also gains an explicitly addressed bridge network — `[cluster]` parses
+    socket addresses and does not resolve hostnames, so the compose service
+    names the rest of the stack uses are unusable as an advertise address. A new
+    `/cluster` route reports the local view and the counter; unit tests assert
+    the committed section passes the same `ClusterConfig::validate` that runs at
+    boot, and that compose gives each replica a distinct dialable identity.
+  - **App metrics facade** — `examples/bookmarks` records one domain counter
+    (`bookmarks_created_total{outcome}`, counting rejected submissions as their
+    own series rather than dropping them) and one timer
+    (`bookmark_stats_query_seconds`, scoped to the two grouped aggregates behind
+    `/bookmarks/stats` by resolving the guard with `stop()` before rendering),
+    described once at startup so the timer's bucket bounds are set before
+    registration freezes them. `src/metrics.rs`'s tests assert both instruments
+    on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
+    database, and the Chromium smoke asserts the timer end-to-end against the
+    real binary.
+
 - **Capability-sandboxed plugins — install an unaudited plugin without
   installing its authority (#1609):** every Autumn plugin until now has been
   full-trust native code. `Plugin::build(self, app)` hands over the entire
