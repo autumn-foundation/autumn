@@ -97,9 +97,10 @@
 //!   report it as changed on every revision. A column the model hides from
 //!   serialization therefore does not appear in a diff, though it is fully
 //!   preserved in an as-of reconstruction and fully covered by the hash.
-//! * The live-row cross-check in `ledger_verify` compares the same public
-//!   projection, for the same reason. A hidden column that drifted out of band
-//!   is caught by the chain, not by that cross-check.
+//! * The live-row cross-check in `ledger_verify` compares the durable codec
+//!   projection of both sides, decrypted — so `#[private]` and `#[encrypted]`
+//!   columns are covered there too. Only a column whose key is gone entirely
+//!   drops out of that comparison.
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
@@ -438,10 +439,12 @@ pub struct LedgerHead {
 /// have. The generated `ledger_verify` encodes the head revision and the live
 /// row through the *same* projection — the model's durable per-field codec,
 /// which carries `#[private]` and `#[encrypted]` columns that the model's public
-/// JSON omits — minus every encrypted column, whose ciphertext could never
-/// compare equal across two encodings (a fresh nonce per write in randomized
-/// mode; a re-encryption under the new key after a deterministic key rotation).
-/// Everything dropped from that comparison is still covered by the revision hash.
+/// JSON omits — and decrypts both before comparing. Raw ciphertext is never
+/// comparable across two encodings (a fresh nonce per write in randomized mode;
+/// a re-encryption under the new key after a rotation), but the plaintext
+/// underneath is, so a revision whose only change was to an encrypted column
+/// stays visible. Only a column whose key is gone entirely drops out, from both
+/// sides, and the revision hash still covers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerLiveState {
     /// The live row was not read, or moved under the reader, so no cross-check

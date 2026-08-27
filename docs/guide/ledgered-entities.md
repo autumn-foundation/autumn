@@ -133,10 +133,13 @@ Three consequences worth knowing:
   therefore does not appear in a diff, though it is fully preserved in an as-of
   reconstruction and fully covered by the hash.
 - The live-row cross-check in `ledger_verify` (below) compares the durable codec
-  projection minus every encrypted column — no ciphertext survives a comparison
+  projection of both sides, **decrypted**. Raw ciphertext is never comparable
   between a stored snapshot and a freshly encoded live row (a fresh nonce per
-  write in randomized mode; a re-encryption under the new key after a
-  deterministic key rotation). Those columns stay covered by the revision hash.
+  write in randomized mode; a re-encryption under the new key after a rotation),
+  but the plaintext underneath is — so `#[private]` and `#[encrypted]` columns
+  are covered there too. Key rotation is handled by the envelope's `key_id`, so a
+  retired key still decrypts; only a column whose key is gone entirely drops out
+  of the comparison, and the revision hash still covers it.
 
 ## Bitemporality
 

@@ -18164,16 +18164,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ::core::option::Option::Some(head),
                                 ::core::option::Option::Some(live_value),
                             ) => {
-                                // Both sides go through the SAME projection. The
-                                // stored snapshot is already codec-shaped, so it
-                                // only needs the randomized columns dropped; the
-                                // live row is re-encoded through the codec first.
-                                let head_view = Self::__autumn_ledger_comparable(
-                                    head.snapshot.clone(),
-                                );
-                                if ::autumn_web::ledger::canonical_json(&head_view)
-                                    == ::autumn_web::ledger::canonical_json(live_value)
-                                {
+                                // Both sides are codec-shaped: the stored snapshot
+                                // already is, and the live row was re-encoded
+                                // through the same codec. Decrypted before
+                                // comparison — see the helper.
+                                if Self::__autumn_ledger_live_matches(&head.snapshot, live_value) {
                                     ::autumn_web::ledger::LedgerLiveState::Matches
                                 } else {
                                     ::autumn_web::ledger::LedgerLiveState::Diverged
@@ -18189,45 +18184,57 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 }
 
-                /// The projection both sides of the live-state cross-check are
-                /// compared under.
+                /// Whether the head revision describes the row the table holds.
                 ///
-                /// The model's durable per-field codec — which carries
-                /// `#[private]` and `#[encrypted]` columns that the model's
-                /// public JSON omits — minus every encrypted column. No
-                /// ciphertext survives this comparison: randomized mode draws a
-                /// fresh nonce per write, and deterministic mode is stable only
-                /// while the key is, so a deterministic key rotation would
-                /// re-encrypt the live row under the new key while the stored
-                /// snapshot keeps the old one. Comparing either would report
-                /// tampering on an untouched ledger after a supported operation.
+                /// Both sides are the model's durable per-field codec output —
+                /// which carries `#[private]` and `#[encrypted]` columns that the
+                /// model's public JSON omits — decrypted before comparison.
                 ///
-                /// Everything dropped here is still covered by the revision hash
-                /// — the chain sees it, only this cross-check cannot.
+                /// Decryption is what makes this comparison meaningful. Raw
+                /// ciphertext is never comparable between a stored snapshot and a
+                /// freshly encoded live row (randomized mode draws a fresh nonce
+                /// per write; deterministic mode is stable only while the key is),
+                /// but the plaintext underneath is — so a revision whose only
+                /// change was to an encrypted column is still visible here, and a
+                /// key rotation is not mistaken for tampering: each envelope
+                /// carries the `key_id` that encrypted it, so a retired key still
+                /// decrypts.
+                ///
+                /// A column whose key is gone entirely cannot be compared at all;
+                /// it is dropped from **both** sides rather than read as a
+                /// divergence. Only that residue is invisible to the cross-check,
+                /// and the revision hash still covers it.
                 #[doc(hidden)]
-                fn __autumn_ledger_comparable(
-                    mut value: ::autumn_web::reexports::serde_json::Value,
-                ) -> ::autumn_web::reexports::serde_json::Value {
-                    if let ::core::option::Option::Some(object) = value.as_object_mut() {
-                        let mut encrypted: ::std::vec::Vec<&'static str> = ::std::vec::Vec::new();
-                        ::autumn_web::encryption::all_encrypted_columns_for_table(
-                            #table_name,
-                            &mut encrypted,
-                        );
-                        for column in encrypted {
+                fn __autumn_ledger_live_matches(
+                    head: &::autumn_web::reexports::serde_json::Value,
+                    live: &::autumn_web::reexports::serde_json::Value,
+                ) -> bool {
+                    let mut head = head.clone();
+                    let mut live = live.clone();
+                    let mut unrecoverable =
+                        ::autumn_web::encryption::decrypt_snapshot_columns(#table_name, &mut head);
+                    unrecoverable.extend(
+                        ::autumn_web::encryption::decrypt_snapshot_columns(#table_name, &mut live),
+                    );
+                    for column in unrecoverable {
+                        if let ::core::option::Option::Some(object) = head.as_object_mut() {
+                            object.remove(column);
+                        }
+                        if let ::core::option::Option::Some(object) = live.as_object_mut() {
                             object.remove(column);
                         }
                     }
-                    value
+                    ::autumn_web::ledger::canonical_json(&head)
+                        == ::autumn_web::ledger::canonical_json(&live)
                 }
 
-                /// The live row in the cross-check projection, or `None` when
-                /// the record has no row at all.
+                /// The live row encoded through the model's durable codec, or
+                /// `None` when the record has no row at all.
                 ///
                 /// Reads with soft-deleted rows included: a ledgered delete leaves
                 /// the row in place, so "absent" here means erased out of band.
-                /// See [`__autumn_ledger_comparable`](Self::__autumn_ledger_comparable)
-                /// for what the projection covers.
+                /// See [`__autumn_ledger_live_matches`](Self::__autumn_ledger_live_matches)
+                /// for how it is compared against a stored snapshot.
                 #[doc(hidden)]
                 async fn __autumn_ledger_live_view(
                     &self,
@@ -18249,9 +18256,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::option::Option::None =>
                             ::core::result::Result::Ok(::core::option::Option::None),
                         ::core::option::Option::Some(model) => {
-                            let encoded = model.__autumn_commit_hook_to_value()?;
                             ::core::result::Result::Ok(::core::option::Option::Some(
-                                Self::__autumn_ledger_comparable(encoded),
+                                model.__autumn_commit_hook_to_value()?,
                             ))
                         }
                     }

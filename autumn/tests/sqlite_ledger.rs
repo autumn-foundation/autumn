@@ -71,6 +71,15 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        lg_vault_notes (id) {
+            id -> Int8,
+            body -> Text,
+            secret -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         lg_cascade_parents (id) {
             id -> Int8,
             name -> Text,
@@ -107,7 +116,7 @@ mod schema {
 
 use schema::{
     lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_secret_notes,
-    lg_tenant_invoices,
+    lg_tenant_invoices, lg_vault_notes,
 };
 
 #[autumn_web::model(table = "lg_invoices")]
@@ -213,6 +222,26 @@ pub struct LgCascadeParent {
 )]
 pub trait LgCascadeParentRepository {}
 
+/// A model with an at-rest-encrypted column, in the default (randomized) mode.
+///
+/// The ciphertext differs on every write, so the cross-check has to compare the
+/// plaintext underneath — otherwise a revision whose only change was to this
+/// column would be invisible to it, which is exactly what deleting that revision
+/// would exploit.
+#[autumn_web::model(table = "lg_vault_notes")]
+pub struct LgVaultNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    #[encrypted]
+    pub secret: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(LgVaultNote, table = "lg_vault_notes", soft_delete, ledgered = true)]
+pub trait LgVaultNoteRepository {}
+
 /// A model with a column the public JSON omits.
 ///
 /// `#[model]` stamps `#[serde(skip_serializing)]` on a `#[private]` field, so a
@@ -250,7 +279,30 @@ const VERSION_HISTORY_UP: &str = include_str!(
     "../version_history_migrations_sqlite/20260526000000_create_version_history/up.sql"
 );
 
+/// Install attribute-encryption keys once for this test binary.
+///
+/// `LgVaultNote` registers an `#[encrypted]` column, so the codec needs a key
+/// ring to encode and decode it. Fixture key material only.
+fn install_encryption_keys() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        const PRIMARY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const DETERMINISTIC: &str =
+            "3333333333333333333333333333333333333333333333333333333333333333";
+        let ring = autumn_web::encryption::KeyRing::from_master_hex(
+            PRIMARY,
+            &[],
+            Some(DETERMINISTIC),
+            b"ledger-suite-salt",
+        )
+        .expect("fixture key material derives");
+        autumn_web::encryption::install_key_ring(ring);
+    });
+}
+
 async fn boot_pool(db_name: &str) -> SqlitePool {
+    install_encryption_keys();
     let config = DatabaseConfig {
         url: Some(format!("sqlite://file:{db_name}?mode=memory&cache=shared")),
         primary_pool_size: Some(1),
@@ -275,6 +327,12 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  reference TEXT NOT NULL, \
                  tenant_id TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_vault_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
+                 secret TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_cascade_parents (\
@@ -1065,6 +1123,121 @@ async fn bulk_writes_chain_every_row_independently() {
         let report = repo.ledger_verify(*id).await.expect("verify");
         assert!(report.is_intact(), "record {id}: {report:?}");
     }
+}
+
+// ── encrypted columns stay visible to the cross-check ────────────────
+
+/// The encrypted-column twin of the `#[private]` case: the newest revision
+/// changes only an `#[encrypted]` column, then that revision is deleted. If the
+/// cross-check compared raw ciphertext it would have to omit the column (a fresh
+/// nonce per write makes it incomparable) and the truncation would read as
+/// intact. Comparing the plaintext underneath keeps it visible.
+#[tokio::test]
+async fn a_truncated_tail_is_detected_when_only_an_encrypted_column_changed() {
+    let pool = boot_pool("lg_vault_tail").await;
+    let repo = PgLgVaultNoteRepository::with_pool_untracked(pool.clone());
+
+    let created = repo
+        .save(&NewLgVaultNote {
+            body: "public".to_string(),
+            secret: "before".to_string(),
+        })
+        .await
+        .expect("insert");
+    repo.update(
+        created.id,
+        &UpdateLgVaultNote {
+            secret: Patch::Set("after".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update an encrypted column only");
+
+    // The stored snapshots hold ciphertext, and two encodings of the *same*
+    // plaintext would differ — which is why the comparison decrypts.
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 2);
+    let stored_secret = revisions[1].snapshot["secret"]
+        .as_str()
+        .expect("the snapshot carries the encrypted column");
+    assert_ne!(
+        stored_secret, "after",
+        "the ledger must not store the plaintext of an encrypted column"
+    );
+
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact(),
+        "no false positive on an intact chain with an encrypted column"
+    );
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_vault_notes' AND record_id = ? AND seq = 2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the revision that changed only the encrypted column");
+    }
+
+    let broken = repo
+        .ledger_verify(created.id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("an encrypted-column-only truncation must still be detected");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+    assert_eq!(broken.seq, 1);
+}
+
+/// And the reverse: an untouched chain over an encrypted column must never
+/// report tampering, however many times it is verified — the ciphertext differs
+/// on every encoding, so only a decrypting comparison can stay quiet.
+#[tokio::test]
+async fn an_encrypted_column_does_not_cause_a_false_positive() {
+    let pool = boot_pool("lg_vault_intact").await;
+    let repo = PgLgVaultNoteRepository::with_pool_untracked(pool);
+
+    let created = repo
+        .save(&NewLgVaultNote {
+            body: "public".to_string(),
+            secret: "s1".to_string(),
+        })
+        .await
+        .expect("insert");
+    for secret in ["s2", "s3"] {
+        repo.update(
+            created.id,
+            &UpdateLgVaultNote {
+                secret: Patch::Set(secret.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    repo.restore(created.id).await.expect("restore");
+
+    for _ in 0..3 {
+        let report = repo.ledger_verify(created.id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 5);
+    }
+
+    // As-of reconstruction returns the decrypted value, not ciphertext.
+    let reconstructed = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::default())
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(reconstructed.secret, "s3");
 }
 
 // ── a hard-deleting parent cannot erase a ledgered child ─────────────
