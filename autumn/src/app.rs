@@ -11025,6 +11025,7 @@ async fn watch_for_in_place_upgrade(
             registry: state.extension::<crate::upgrade::LiveStateRegistry>(),
             ready_timeout,
             clock: state.clock_arc(),
+            entropy: state.entropy_arc(),
         };
         match crate::upgrade::upgrade_in_place(plan).await {
             Ok(handover) => {

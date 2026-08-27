@@ -812,6 +812,8 @@ pub(crate) struct UpgradePlan<'a> {
     pub ready_timeout: std::time::Duration,
     /// Clock the wait is measured on.
     pub clock: Arc<dyn crate::time::ClockSource>,
+    /// Entropy the handoff directory's name is drawn from.
+    pub entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 /// Hand this process's listening socket and live state to a freshly-execed
@@ -831,7 +833,7 @@ pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, 
     // Everything one in-flight handoff owns, and the undo for every way it can
     // fail to complete.
     let mut handoff = Handoff {
-        dir: create_handoff_dir(next_generation)?,
+        dir: create_handoff_dir(next_generation, plan.entropy.as_ref())?,
         child: None,
         registry: plan.registry.clone(),
         completed: false,
@@ -996,18 +998,28 @@ fn handoff_base_dir() -> std::path::PathBuf {
 ///
 /// `0700` and created (never opened) by us, so nothing pre-planted by another
 /// local user can be read as state or mistaken for a readiness signal.
+///
+/// The name carries 64 bits from the framework's entropy seam, not just the
+/// pid and generation. Those are observable, and a name a local neighbour can
+/// predict is a name they can pre-create: sixteen `mkdir`s would otherwise
+/// deny this process every future upgrade, since a taken name is (correctly)
+/// stepped over rather than opened.
 #[cfg(unix)]
-fn create_handoff_dir(generation: u64) -> Result<std::path::PathBuf, std::io::Error> {
+fn create_handoff_dir(
+    generation: u64,
+    entropy: &dyn crate::entropy::Entropy,
+) -> Result<std::path::PathBuf, std::io::Error> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     let base = handoff_base_dir();
     std::fs::create_dir_all(&base)?;
     let pid = std::process::id();
-    for attempt in 0..16u32 {
-        let dir = base.join(format!("autumn-upgrade-{pid}-{generation}-{attempt}"));
+    for _ in 0..16u32 {
+        let nonce = entropy.next_u64();
+        let dir = base.join(format!("autumn-upgrade-{pid}-{generation}-{nonce:016x}"));
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(dir),
-            // Anything already at this path is not ours: try the next name
+            // Anything already at this path is not ours: draw another name
             // rather than opening — or clobbering — whatever is there.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -1453,8 +1465,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
 
+        let entropy = crate::entropy::SeededEntropy::new(1674);
         let dir = temp_env::with_var(DIR_ENV, Some(&base), || {
-            create_handoff_dir(1).expect("creates a private directory")
+            create_handoff_dir(1, &entropy).expect("creates a private directory")
         });
 
         let mode = {
@@ -1463,11 +1476,23 @@ mod tests {
         };
         assert_eq!(mode & 0o777, 0o700, "handoff directory must be owner-only");
 
-        // A name already taken (by anyone) is stepped over, never opened.
+        // The name is not predictable from the pid and generation alone: a
+        // local neighbour cannot pre-create it to deny every future upgrade.
         let second = temp_env::with_var(DIR_ENV, Some(&base), || {
-            create_handoff_dir(1).expect("creates another private directory")
+            create_handoff_dir(1, &entropy).expect("creates another private directory")
         });
-        assert_ne!(dir, second);
+        assert_ne!(
+            dir, second,
+            "two handoffs at the same pid and generation must not collide on a name"
+        );
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("directory name");
+        assert!(
+            !name.ends_with(&format!("-{}-1-0", std::process::id())),
+            "the name must not be a bare pid/generation counter: {name}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -261,7 +261,7 @@ default disposition of `SIGUSR2`, which terminates the process.
 | Environment variable | Meaning |
 |---|---|
 | `AUTUMN_UPGRADE_BINARY` | Path to exec on upgrade. Defaults to the path this process was started from, captured at boot (`/proc/self/exe` reports `(deleted)` once a deploy replaces the file, which is why it is read early). |
-| `AUTUMN_UPGRADE_DIR` | Where the per-upgrade handoff directory is created. Defaults to the system temp directory. Each one is created `0700`, its files `0600`, and the whole directory is removed once the handover finishes either way. |
+| `AUTUMN_UPGRADE_DIR` | Where the per-upgrade handoff directory is created. Defaults to `XDG_RUNTIME_DIR` when set (a per-user `0700` directory), otherwise the system temp directory. Each handoff directory is created `0700` with an unpredictable name, its files `0600`, and the whole directory is removed once the handover finishes either way. |
 
 The remaining `AUTUMN_UPGRADE_*` variables (`LISTEN_FD`, `STATE_FILE`,
 `READY_FILE`, `GENERATION`, `PREDECESSOR_PID`) are the protocol between the two
