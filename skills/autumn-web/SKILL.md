@@ -2117,7 +2117,12 @@ rest of the app.
   `strict-transport-security`, framing headers and the host's own
   `x-autumn-sandboxed` / `x-content-type-options` are stripped and logged.
 - A declared `GET` also serves `HEAD` (HTTP requires it, axum dispatches it);
-  the guest sees `method: "HEAD"` and `route_infos()` reports the extra row.
+  the guest sees `method: "HEAD"` and `route_infos()` reports the extra row —
+  unless the manifest declares HEAD itself, in which case that route mounts
+  alone (two overlapping method routes on one path is an axum panic at boot).
+- Load refuses a module whose WASI import *signatures* disagree with the shim,
+  whose `_start` is not `() -> ()`, or which carries >4096 / >16 MiB of data and
+  element segments (every request re-instantiates it).
 - Response **content types** are an allowlist too: `text/plain`, `text/csv`,
   `application/json`, `application/octet-stream`, and raster images. HTML,
   SVG, JavaScript and CSS are refused — a document or script from your own

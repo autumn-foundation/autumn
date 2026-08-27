@@ -216,9 +216,13 @@ impl ResourceLimits {
     /// | Term | What holds it |
     /// | --- | --- |
     /// | `memory_bytes` | the guest instance's linear memory |
-    /// | `max_request_body_bytes` | the body, buffered before the frame is built |
+    /// | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded (≈4/3) into the NDJSON line that becomes the guest's stdin — all live at once |
     /// | `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
     /// | `max_response_bytes` | the decoded response, once the frame parses |
+    ///
+    /// The request terms are deliberately counted at their *simultaneous* peak
+    /// rather than at what any one of them costs: a ceiling that assumed the
+    /// buffers took turns would be a number nobody could rely on.
     ///
     /// Multiplied by `max_concurrency`, this is what the plugin can cost the
     /// host at any instant — the number a reviewer should actually look at, so
@@ -226,7 +230,7 @@ impl ResourceLimits {
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
-            .saturating_add(self.max_request_body_bytes as u128)
+            .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(3))
             .saturating_add(4096)
     }
@@ -1167,6 +1171,23 @@ max_concurrency = 8
         assert!(
             matches!(err, ManifestError::LimitOutOfRange { field, .. } if field.contains("footprint")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn the_footprint_counts_every_buffer_a_request_holds_at_once() {
+        // The request body is buffered, cloned into the frame, and
+        // base64-expanded into the NDJSON line that becomes the guest's stdin —
+        // three live copies of an expanding thing, not one.
+        let limits = ResourceLimits {
+            memory_bytes: 1_000_000,
+            max_request_body_bytes: 100_000,
+            max_response_bytes: 10_000,
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            limits.request_footprint_bytes(),
+            1_000_000 + 4 * 100_000 + 3 * 10_000 + 4096
         );
     }
 

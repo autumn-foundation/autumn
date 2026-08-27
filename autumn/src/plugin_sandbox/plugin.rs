@@ -210,7 +210,15 @@ impl SandboxedPlugin {
         let mut router = axum::Router::new();
         for route in &manifest.routes {
             let nested = nested_path(&route.path, &manifest.prefix);
-            let Some(filter) = method_filter(&route.method) else {
+            // A declared HEAD on the same path mounts itself; adding the
+            // implied one here as well would be an overlapping method route,
+            // which axum refuses by panicking as the router is built.
+            let implies_head = route.method == "GET"
+                && !manifest
+                    .routes
+                    .iter()
+                    .any(|other| other.method == "HEAD" && other.path == route.path);
+            let Some(filter) = method_filter(&route.method, implies_head) else {
                 // `SandboxManifest` validation already refused every method
                 // outside the allowed set, so this is unreachable in practice.
                 // Skipping rather than panicking keeps a future manifest
@@ -287,15 +295,19 @@ fn nested_path(path: &str, prefix: &str) -> String {
 
 /// The filter a declared method mounts under.
 ///
-/// `GET` mounts as `GET | HEAD` on purpose. HTTP defines HEAD as GET without a
-/// body, and axum's method router already dispatches a HEAD with no HEAD route
-/// to the GET one — so the alternative to naming it here is not "HEAD is
-/// refused", it is "HEAD is served by an accident the manifest never mentions".
+/// `GET` mounts as `GET | HEAD` when the manifest does not declare a HEAD of
+/// its own. HTTP defines HEAD as GET without a body, and axum's method router
+/// already dispatches a HEAD with no HEAD route to the GET one — so the
+/// alternative to naming it here is not "HEAD is refused", it is "HEAD is
+/// served by an accident the manifest never mentions". When the manifest *does*
+/// declare HEAD, that route mounts itself and the implication must be dropped:
+/// two overlapping method routes on one path is a panic as the router builds.
 /// [`SandboxManifest::route_infos`](crate::plugin_sandbox::SandboxManifest::route_infos)
 /// reports the implied HEAD for the same reason.
-fn method_filter(method: &str) -> Option<MethodFilter> {
+fn method_filter(method: &str, implies_head: bool) -> Option<MethodFilter> {
     match method {
-        "GET" => Some(MethodFilter::GET.or(MethodFilter::HEAD)),
+        "GET" if implies_head => Some(MethodFilter::GET.or(MethodFilter::HEAD)),
+        "GET" => Some(MethodFilter::GET),
         "HEAD" => Some(MethodFilter::HEAD),
         "POST" => Some(MethodFilter::POST),
         "PUT" => Some(MethodFilter::PUT),
@@ -612,6 +624,26 @@ sha256 = "{digest}"
             response.headers().contains_key(SANDBOX_ATTRIBUTION_HEADER),
             "the sandbox handler must have produced this"
         );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_declaring_both_get_and_head_still_mounts() {
+        // Mounting GET as `GET | HEAD` and then mounting the declared HEAD on
+        // the same path is an overlapping method route, which axum refuses by
+        // panicking while the router is built — a valid manifest taking the
+        // application down at boot, which is the one thing this lane must never
+        // do.
+        let plugin = plugin_from(
+            guests::HELLO,
+            "[[routes]]\nmethod = \"GET\"\npath = \"/hello/greet\"\n\n\
+             [[routes]]\nmethod = \"HEAD\"\npath = \"/hello/greet\"\n",
+            ResourceLimits::default(),
+        );
+        let (status, body) = send(app(&plugin), "GET", "/hello/greet").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "hello from the sandbox");
+        let (status, _) = send(app(&plugin), "HEAD", "/hello/greet").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "the guest answered");
     }
 
     #[test]

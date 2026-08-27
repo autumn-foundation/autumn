@@ -204,6 +204,8 @@ Every one of these is a hard error, not a warning:
 | a zero or oversized limit | a zero ceiling means "cannot run", not "no limit" |
 | `memory_bytes × max_concurrency` over 1 GiB | that product, not its factors, is what the plugin can cost the host |
 | a route path the router would refuse — `:id`, `*rest`, `{id`, `{*rest}/more` | `axum::Router::route` *panics* on one, so a manifest that passed would take the app down at boot |
+| a module importing an allowlisted WASI name with the wrong signature, or exporting a `_start` that is not `() -> ()` | it would load and then fail on every request, as a gateway error nobody can explain from outside |
+| a module with more than 4096 data + element segments, or more than 16 MiB of them | every request re-instantiates the module, and that copying happens before the first guest instruction — so it is bounded at load rather than discovered per request |
 | two routes that are one route to the router (`/{a}` and `/{b}`) | same |
 | a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
@@ -311,12 +313,19 @@ would the GET and the host discards the body for you.
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 
 The number worth reviewing is `max_concurrency × the per-request footprint`,
-where the footprint is the guest's linear memory **plus** the host buffers a
-request pins outside it: the buffered request body, the pending stdout frame,
-and the decoded response. A manifest with a tiny `memory_bytes` and 64 MiB
-body/response ceilings would pass a memory-only check and still allocate
-hundreds of gigabytes, so the validator checks the whole footprint against a
-1 GiB ceiling.
+where the footprint is the guest's linear memory **plus** every host buffer a
+request pins outside it, counted at their simultaneous peak:
+
+| Term | What holds it |
+|---|---|
+| `memory_bytes` | the guest instance's linear memory |
+| `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded into the NDJSON line that becomes the guest's stdin — all live at once |
+| `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
+| `max_response_bytes` | the decoded response, once the frame parses |
+
+A manifest with a tiny `memory_bytes` and 64 MiB body/response ceilings would
+pass a memory-only check and still allocate hundreds of gigabytes, so the
+validator checks the whole footprint against a 1 GiB ceiling.
 
 Each request gets a **fresh instance**, so no state survives a request and one
 request's misbehaviour cannot reach the next.

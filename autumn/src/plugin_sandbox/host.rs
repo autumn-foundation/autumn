@@ -112,6 +112,24 @@ const STDERR_BUDGET_BYTES: usize = 64 * 1024;
 /// the per-call amplification factor, which the fuel charge below then prices.
 const MAX_IOVECS: i32 = 64;
 
+/// The largest total data + element section a module may carry (16 MiB).
+///
+/// Every request instantiates a **fresh** module — that is what makes "no state
+/// survives a request" true — and instantiation copies the module's data and
+/// element segments before the first guest instruction runs. wasmi does not
+/// meter that phase, so the only real bound on it is a bound on the segments
+/// themselves, checked once at load. A hello-world Rust guest carries tens of
+/// kilobytes here; a large one, a few megabytes.
+pub const MAX_INIT_SECTION_BYTES: usize = 16 * 1024 * 1024;
+
+/// The largest number of data + element segments a module may declare.
+///
+/// Bytes alone do not bound the work: a segment costs a bounds check and a
+/// copy set-up regardless of its length, so a module of a million empty
+/// segments is small on disk and expensive to instantiate. Both are capped
+/// because instantiation cost is a function of both.
+pub const MAX_INIT_SEGMENTS: usize = 4096;
+
 /// Bytes of host-side copying one unit of fuel buys.
 ///
 /// wasmi meters the guest's own instructions, and a host call costs a handful
@@ -305,7 +323,17 @@ pub enum SandboxLoadError {
     Wasm(String),
     /// The module imports something no host function defines.
     ForbiddenImports(Vec<CapabilityDenial>),
-    /// The module exports no `_start`.
+    /// The module's data or element segments would make every request's
+    /// instantiation expensive, in host work no fuel budget prices.
+    InstantiationTooExpensive {
+        /// What was counted.
+        what: &'static str,
+        /// How many the module carries.
+        found: usize,
+        /// The ceiling.
+        max: usize,
+    },
+    /// The module exports no `_start` of type `() -> ()`.
     MissingStart,
     /// The engine could not be configured.
     Engine(String),
@@ -326,9 +354,16 @@ impl fmt::Display for SandboxLoadError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::InstantiationTooExpensive { what, found, max } => write!(
+                f,
+                "the plugin declares {found} {what}, over the {max} ceiling: every request \
+                 re-instantiates the module, and that work happens before the first guest \
+                 instruction — so it is bounded here rather than priced per request"
+            ),
             Self::MissingStart => write!(
                 f,
-                "the plugin exports no `_start`; it must be built as a wasm32-wasip1 *command*"
+                "the plugin exports no `_start` of type `() -> ()`; it must be built as a \
+                 wasm32-wasip1 *command*"
             ),
             Self::Engine(detail) => write!(f, "the sandbox engine could not be built: {detail}"),
         }
@@ -366,10 +401,10 @@ pub struct SandboxOutcome {
 pub struct SandboxHost {
     engine: Engine,
     module: Module,
-    /// The compiled module's source length. An upper bound on the data and
-    /// element bytes instantiation copies, and therefore what that copying is
-    /// priced at — see [`SandboxHost::run`].
-    module_bytes: usize,
+    /// What one instantiation of this module costs, in fuel. Bounded at load by
+    /// [`MAX_INIT_SEGMENTS`] and [`MAX_INIT_SECTION_BYTES`]; charged per request
+    /// so the declared CPU ceiling prices it — see [`SandboxHost::run`].
+    instantiation_fuel: u64,
     manifest: SandboxManifest,
 }
 
@@ -415,17 +450,44 @@ impl SandboxHost {
         if !forbidden.is_empty() {
             return Err(SandboxLoadError::ForbiddenImports(forbidden));
         }
-        if !module
-            .exports()
-            .any(|export| export.name() == "_start" && export.ty().func().is_some())
-        {
+
+        let Some((segments, init_bytes)) = instantiation_cost(wasm) else {
+            return Err(SandboxLoadError::Wasm(
+                "the module's section stream could not be walked".to_owned(),
+            ));
+        };
+        if segments > MAX_INIT_SEGMENTS {
+            return Err(SandboxLoadError::InstantiationTooExpensive {
+                what: "data and element segments",
+                found: segments,
+                max: MAX_INIT_SEGMENTS,
+            });
+        }
+        if init_bytes > MAX_INIT_SECTION_BYTES {
+            return Err(SandboxLoadError::InstantiationTooExpensive {
+                what: "bytes of data and element sections",
+                found: init_bytes,
+                max: MAX_INIT_SECTION_BYTES,
+            });
+        }
+        // Not merely "some function called `_start`": the host looks it up as
+        // `() -> ()`, so a `_start` with parameters or results is a module that
+        // loads and then fails on every request.
+        let start_is_callable = module.exports().any(|export| {
+            export.name() == "_start"
+                && export
+                    .ty()
+                    .func()
+                    .is_some_and(|ty| ty.params().is_empty() && ty.results().is_empty())
+        });
+        if !start_is_callable {
             return Err(SandboxLoadError::MissingStart);
         }
 
         Ok(Self {
             engine,
             module,
-            module_bytes: wasm.len(),
+            instantiation_fuel: instantiation_fuel(segments, init_bytes),
             manifest,
         })
     }
@@ -453,6 +515,15 @@ impl SandboxHost {
             .imports()
             .map(|import| format!("{}::{}", import.module(), import.name()))
             .collect())
+    }
+
+    /// What one request pays, in fuel, just to instantiate this module.
+    ///
+    /// Bounded at load; charged per request. Surfaced so a packaging tool can
+    /// show an author what their module costs before it costs anyone else.
+    #[must_use]
+    pub const fn instantiation_fuel(&self) -> u64 {
+        self.instantiation_fuel
     }
 
     /// Every import the module declares, as `module::name`, for review.
@@ -493,8 +564,13 @@ impl SandboxHost {
                 };
             }
         };
+        // The frame's bytes are *moved* into the queue rather than copied into
+        // it: `VecDeque::from(Vec<u8>)` reuses the allocation, and the `String`
+        // is gone afterwards. For a plugin with a large body ceiling that is a
+        // whole base64-expanded copy of the request that no longer exists at the
+        // same time as the others.
         let mut state = HostState::new(self.manifest.name.clone(), limits, line.as_bytes());
-        state.stdin.extend(line.as_bytes());
+        state.stdin = VecDeque::from(line.into_bytes());
 
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limiter);
@@ -511,18 +587,13 @@ impl SandboxHost {
         }
 
         // wasmi does not meter instantiation: every request copies the module's
-        // data and element segments before `_start` runs, and a 64 MiB module of
-        // compact segments would pin a blocking worker per request without
-        // spending a unit of the declared CPU budget. Price it up front, against
-        // the module's own length — an upper bound on what those segments can
-        // hold — so a budget that cannot cover instantiation is refused before
-        // the work is done rather than after.
-        let instantiation = u64::try_from(self.module_bytes)
-            .unwrap_or(u64::MAX)
-            .checked_div(BYTES_PER_FUEL)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        match limits.fuel.checked_sub(instantiation) {
+        // data and element segments before `_start` runs. Two things bound it,
+        // and it needs both. The *ceiling* is at load — a module whose segments
+        // are structurally expensive is refused outright, because a per-request
+        // charge cannot stop work that has already been admitted. The *price* is
+        // here, so the work that is admitted still comes out of the budget the
+        // manifest declared rather than being free.
+        match limits.fuel.checked_sub(self.instantiation_fuel) {
             Some(left) => {
                 if let Err(err) = store.set_fuel(left) {
                     return SandboxOutcome {
@@ -679,17 +750,97 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
     SandboxFailure::Trap(err.to_string())
 }
 
-/// Imports the shim does not define, as denials.
+/// What one instantiation of this module will cost: how many data and element
+/// segments it carries, and how many bytes those sections hold.
+///
+/// Walks the module's top-level sections directly. wasmi's public API does not
+/// expose segments, and this is the number that has to be bounded at load: the
+/// alternative is discovering it per request, in host work no budget prices.
+///
+/// Returns `None` for bytes that are not a well-formed section stream. wasmi
+/// has already compiled the module by the time this runs, so that should not
+/// happen — and refusing is the right answer if it does.
+fn instantiation_cost(wasm: &[u8]) -> Option<(usize, usize)> {
+    /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
+    fn leb128(wasm: &[u8], at: usize) -> Option<(usize, usize)> {
+        let mut value: usize = 0;
+        let mut shift: u32 = 0;
+        let mut cursor = at;
+        loop {
+            let byte = *wasm.get(cursor)?;
+            cursor = cursor.checked_add(1)?;
+            value = value.checked_add(usize::from(byte & 0x7f).checked_shl(shift)?)?;
+            if byte & 0x80 == 0 {
+                return Some((value, cursor));
+            }
+            shift = shift.checked_add(7)?;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+
+    /// Section ids for the element and data sections.
+    const ELEMENT_SECTION: u8 = 9;
+    const DATA_SECTION: u8 = 11;
+
+    let mut cursor = 8usize; // magic + version
+    let mut segments = 0usize;
+    let mut bytes = 0usize;
+    while cursor < wasm.len() {
+        let id = *wasm.get(cursor)?;
+        let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
+        let end = after_size.checked_add(size)?;
+        if end > wasm.len() {
+            return None;
+        }
+        if id == ELEMENT_SECTION || id == DATA_SECTION {
+            let (count, _) = leb128(wasm, after_size)?;
+            segments = segments.saturating_add(count);
+            bytes = bytes.saturating_add(size);
+        }
+        cursor = end;
+    }
+    Some((segments, bytes))
+}
+
+/// Imports the shim will not satisfy — by name **or** by type — as denials.
+///
+/// Checking the type here rather than letting `Linker::instantiate` discover it
+/// is what keeps `autumn plugin package` honest: a module importing an
+/// allowlisted name with the wrong signature would otherwise pass packaging and
+/// inspection, then fail on every request as a gateway error nobody can explain
+/// from the outside.
 fn forbidden_imports(module: &Module) -> Vec<CapabilityDenial> {
     module
         .imports()
-        .filter(|import| import.module() != WASI || !is_shim_function(import.name()))
-        .map(|import| CapabilityDenial {
+        .filter_map(|import| {
+            let operation = format!("{}::{}", import.module(), import.name());
+            if import.module() != WASI {
+                return Some((operation, "the sandbox defines no such host module"));
+            }
+            let Some(declared) = import.ty().func() else {
+                return Some((
+                    operation,
+                    "the sandbox provides host functions only, not memories, tables or globals",
+                ));
+            };
+            let Some((params, results)) = shim_signature(import.name()) else {
+                return Some((operation, "the sandbox defines no such host function"));
+            };
+            match signature_type(params, results) {
+                Some(expected) if expected == *declared => None,
+                _ => Some((
+                    operation,
+                    "the sandbox defines this host function with a different signature, so it \
+                     could never link",
+                )),
+            }
+        })
+        .map(|(operation, why)| CapabilityDenial {
             capability: DeniedCapability::UnknownImport,
-            operation: format!("{}::{}", import.module(), import.name()),
-            detail: "the sandbox defines no such host function, so the plugin is refused before \
-                     it runs"
-                .to_owned(),
+            operation,
+            detail: format!("{why}, so the plugin is refused before it runs"),
         })
         .take(MAX_DENIALS)
         .collect()
@@ -1011,24 +1162,28 @@ fn iovec(
 
 /// The WASI functions the shim implements itself, rather than refusing.
 ///
-/// Each one either serves the request dialogue or answers with something inert
-/// and fixed. Nothing here reaches outside the guest.
-const SERVED_IMPORTS: &[&str] = &[
-    "args_get",
-    "args_sizes_get",
-    "clock_res_get",
-    "clock_time_get",
-    "environ_get",
-    "environ_sizes_get",
-    "fd_close",
-    "fd_fdstat_get",
-    "fd_read",
-    "fd_seek",
-    "fd_tell",
-    "fd_write",
-    "proc_exit",
-    "random_get",
-    "sched_yield",
+/// Name, parameter signature, and result signature — `i` for `i32`, `l` for
+/// `i64`, empty for none. The signatures are here so a module can be
+/// **type**-checked at load and not merely name-checked: an import whose type
+/// disagrees with the shim links nowhere, and finding that out per request (as
+/// a 502 the operator cannot explain) instead of at `autumn plugin package` is
+/// exactly the failure this lane exists to move earlier.
+const SERVED_IMPORTS: &[(&str, &str, &str)] = &[
+    ("args_get", "ii", "i"),
+    ("args_sizes_get", "ii", "i"),
+    ("clock_res_get", "ii", "i"),
+    ("clock_time_get", "ili", "i"),
+    ("environ_get", "ii", "i"),
+    ("environ_sizes_get", "ii", "i"),
+    ("fd_close", "i", "i"),
+    ("fd_fdstat_get", "ii", "i"),
+    ("fd_read", "iiii", "i"),
+    ("fd_seek", "ilii", "i"),
+    ("fd_tell", "ii", "i"),
+    ("fd_write", "iiii", "i"),
+    ("proc_exit", "i", ""),
+    ("random_get", "ii", "i"),
+    ("sched_yield", "", "i"),
 ];
 
 /// The WASI functions the shim answers with a refusal: name, the capability
@@ -1190,12 +1345,57 @@ const DENIED_IMPORTS: &[(&str, DeniedCapability, &str, &str)] = &[
 const FS_DETAIL: &str = "a sandboxed plugin has no filesystem";
 const NET_DETAIL: &str = "a sandboxed plugin has no outbound network";
 
-/// Whether the shim defines a WASI function of this name.
+/// The signature the shim defines for a WASI function of this name, if any.
 ///
 /// The load-time gate and the shim read the same two tables, so an import that
 /// links at runtime is exactly one the gate admits — they cannot drift apart.
+fn shim_signature(name: &str) -> Option<(&'static str, &'static str)> {
+    if let Some((_, params, results)) = SERVED_IMPORTS.iter().find(|(known, ..)| *known == name) {
+        return Some((params, results));
+    }
+    DENIED_IMPORTS
+        .iter()
+        .find(|(known, ..)| *known == name)
+        .map(|(_, _, _, params)| (*params, "i"))
+}
+
+/// Whether the shim defines a WASI function of this name.
+///
+/// Test-only: the load gate needs the *signature*, not just the name, so it
+/// calls [`shim_signature`] directly. This stays as the shape the
+/// `the_load_gate_admits_exactly_what_the_shim_defines` invariant is written
+/// against.
+#[cfg(test)]
 fn is_shim_function(name: &str) -> bool {
-    SERVED_IMPORTS.contains(&name) || DENIED_IMPORTS.iter().any(|(known, ..)| *known == name)
+    shim_signature(name).is_some()
+}
+
+/// Build a [`wasmi::FuncType`] from a signature descriptor pair.
+fn signature_type(params: &str, results: &str) -> Option<wasmi::FuncType> {
+    fn types(descriptor: &str) -> Option<Vec<wasmi::core::ValType>> {
+        descriptor
+            .chars()
+            .map(|ch| match ch {
+                'i' => Some(wasmi::core::ValType::I32),
+                'l' => Some(wasmi::core::ValType::I64),
+                _ => None,
+            })
+            .collect()
+    }
+    Some(wasmi::FuncType::new(types(params)?, types(results)?))
+}
+
+/// What one instantiation costs in fuel: the bytes copied, plus a unit per
+/// segment for the bounds check and copy set-up each one needs regardless of
+/// its length.
+fn instantiation_fuel(segments: usize, init_bytes: usize) -> u64 {
+    let bytes = u64::try_from(init_bytes).unwrap_or(u64::MAX);
+    let segments = u64::try_from(segments).unwrap_or(u64::MAX);
+    bytes
+        .checked_div(BYTES_PER_FUEL)
+        .unwrap_or(u64::MAX)
+        .saturating_add(segments)
+        .saturating_add(1)
 }
 
 /// Charge the guest's fuel budget for `bytes` of host-side work.
@@ -1876,11 +2076,11 @@ path = "/hello/greet"
     #[test]
     fn instantiating_the_module_is_priced_against_the_budget() {
         // wasmi meters guest instructions, not instantiation: every request
-        // copies the module's data and element segments before `_start` runs,
-        // and a 64 MiB module of compact segments would pin a blocking worker
-        // per request without spending a unit of the declared CPU budget.
-        let wasm = wat::parse_str(guests::HELLO).expect("valid WAT");
-        let charged = wasm.len() as u64 / 64;
+        // copies the module's data and element segments before `_start` runs.
+        // The ceiling on that is at load (below); this is the price, so the work
+        // that IS admitted still comes out of the declared budget.
+        let charged = host(guests::HELLO).instantiation_fuel();
+        assert!(charged > 1, "the fixture carries data segments");
 
         // A budget that cannot even cover instantiation is refused before the
         // module is instantiated at all.
@@ -1905,6 +2105,32 @@ path = "/hello/greet"
             "instantiation cost {} of a {charged}-unit module",
             outcome.fuel_used
         );
+    }
+
+    #[test]
+    fn a_module_that_is_expensive_to_instantiate_is_refused_at_load() {
+        // Segment *count* is the sharp edge: each one costs a bounds check and a
+        // copy set-up regardless of its length, so a module of many empty
+        // segments is small on disk and expensive on every single request. A
+        // per-request charge cannot bound work that has already been admitted,
+        // so the ceiling is at load.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for offset in 0..=MAX_INIT_SEGMENTS {
+            let _ = writeln!(wat, "  (data (i32.const {offset}) \"x\")");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+
+        let err = try_host(&wat).expect_err("must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive { max, .. } if max == MAX_INIT_SEGMENTS
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("re-instantiates"), "{err}");
     }
 
     #[test]
@@ -2380,8 +2606,53 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn an_import_with_the_wrong_signature_is_refused_at_load() {
+        // Name-checking alone lets a module through packaging and inspection
+        // and then fails it on every request, as a gateway error nobody can
+        // explain from outside.
+        let wat = r#"(module
+             (import "wasi_snapshot_preview1" "fd_write"
+               (func (param i32 i32) (result i32)))
+             (memory (export "memory") 1)
+             (func (export "_start") (nop)))"#;
+        let err = try_host(wat).expect_err("must be refused");
+        let SandboxLoadError::ForbiddenImports(denials) = err else {
+            panic!("expected a forbidden-import refusal, got {err}");
+        };
+        assert!(denials[0].operation.contains("fd_write"), "{denials:?}");
+        assert!(denials[0].detail.contains("signature"), "{denials:?}");
+    }
+
+    #[test]
+    fn a_non_function_import_is_refused_at_load() {
+        let wat = r#"(module
+             (import "wasi_snapshot_preview1" "fd_write" (memory 1))
+             (memory (export "memory") 1)
+             (func (export "_start") (nop)))"#;
+        assert!(matches!(
+            try_host(wat),
+            Err(SandboxLoadError::ForbiddenImports(_))
+        ));
+    }
+
+    #[test]
+    fn a_start_that_takes_arguments_is_not_a_start() {
+        // The host looks `_start` up as `() -> ()`, so anything else loads and
+        // then fails on every request.
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (func (export "_start") (param i32) (nop)))"#;
+        assert!(matches!(try_host(wat), Err(SandboxLoadError::MissingStart)));
+
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (func (export "_start") (result i32) (i32.const 0)))"#;
+        assert!(matches!(try_host(wat), Err(SandboxLoadError::MissingStart)));
+    }
+
+    #[test]
     fn the_load_gate_admits_exactly_what_the_shim_defines() {
-        for name in SERVED_IMPORTS {
+        for (name, ..) in SERVED_IMPORTS {
             assert!(is_shim_function(name), "{name} is served but not admitted");
         }
         for (name, ..) in DENIED_IMPORTS {
