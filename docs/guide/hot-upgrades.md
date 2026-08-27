@@ -211,7 +211,11 @@ dropping state — reviewing what each field is mapped *to* is still yours.
    finished. The predecessor is still accepting the whole time. Note the
    successor starts accepting the moment it adopts the socket — before its
    startup hooks finish, exactly as a cold start does — so both builds serve
-   for that window.
+   for that window. Its adopted state is **frozen for that window too**: the
+   upgrade can still be abandoned (a failing startup hook), and a write the
+   successor acknowledged would die with it while the predecessor resumed from
+   the snapshot. Only one of the two processes is ever writable, so a retry
+   always lands somewhere that keeps it.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so
@@ -240,6 +244,7 @@ up and the state stays whole.
 | the new build hangs during startup | abandoned after `ready_timeout_secs`, and the successor is killed |
 | the listener cannot be handed over (Unix socket, TLS) | refused with an error in the log |
 | this process supervises a managed Postgres cluster | refused with an error in the log |
+| the new build turns TLS on (the transport would change mid-socket) | it refuses to start; the old build keeps serving plaintext |
 | the new build was handed the socket but cannot adopt it (it switched to a Unix socket, say) | it refuses to start rather than serve a different address |
 | the new build dropped its `with_live_state(...)` call | it refuses to start rather than throw the carried state away |
 
@@ -311,9 +316,12 @@ the listening socket.
   it, but it is not encrypted and unlinking is not shredding. Don't designate
   secrets as live state; carry them through the same secret store a restart
   would.
-* **Bind address changes need a real restart.** An adopted socket is the
-  predecessor's: a new `server.host`/`server.port` in the new build is logged
-  as a mismatch and ignored, because the socket is already bound.
+* **Bind address and transport changes need a real restart.** An adopted
+  socket is the predecessor's: a new `server.host`/`server.port` in the new
+  build is logged as a mismatch and ignored, because the socket is already
+  bound. A new build that turns `[server.tls]` *on* refuses to start under an
+  upgrade rather than wrap a plaintext socket its predecessor's clients are
+  mid-conversation on.
 * **`state_migration!` proves variant *presence*, not payload completeness.**
   An enum arm may bind a variant's payload as `..`, which compiles and drops
   those fields — the macro cannot tell that apart from a deliberate mapping.

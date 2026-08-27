@@ -126,17 +126,23 @@ pub trait MigrateFrom<Old: LiveState>: LiveState + Sized {
     fn migrate_from(old: Old) -> Self;
 }
 
-/// Returned by [`LiveStateHandle::write`] once the state has been snapshotted
-/// for an in-place upgrade.
+/// Returned by [`LiveStateHandle::write`] while an in-place upgrade is in
+/// flight — from either side of it.
 ///
-/// After the snapshot the successor owns the future of this state, so a write
-/// here would be thrown away when this process exits. Rather than lose it
-/// silently, the write is refused: return a retryable `503` from the handler.
-/// The freeze starts before the successor exists, so an immediate retry may be
-/// refused again by this same process until the successor is serving.
+/// On the **predecessor**, from the snapshot onward: the successor owns the
+/// future of this state, so a write here would be thrown away when this
+/// process exits. On the **successor**, until it has finished starting up: it
+/// is already accepting on the shared socket, but the upgrade can still be
+/// abandoned (a failing startup hook), and a write acknowledged now would die
+/// with it while the predecessor resumes from the snapshot.
+///
+/// Either way the write is refused rather than lost: return a retryable `503`
+/// from the handler. Only one of the two processes is ever writable, so a
+/// retry lands somewhere that keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "live state is frozen: it has been snapshotted for an in-place upgrade and this process is draining"
+    "live state is frozen: an in-place upgrade is in flight, so this process is not the one \
+     that would keep the write"
 )]
 pub struct LiveStateFrozen;
 
@@ -160,9 +166,24 @@ impl<T> LiveStateHandle<T> {
     /// Wrap `value` in a fresh handle.
     #[must_use]
     pub fn new(value: T) -> Self {
+        Self::with_frozen(value, false)
+    }
+
+    /// Wrap `value` in a handle that refuses writes until it is unfrozen.
+    ///
+    /// How a successor installs state it adopted: it starts accepting the
+    /// moment it takes the socket, but the upgrade is not yet irreversible, so
+    /// until it signals readiness a write here could still be discarded by an
+    /// abandoned upgrade. Refusing is what makes that impossible.
+    #[must_use]
+    pub(crate) fn new_frozen(value: T) -> Self {
+        Self::with_frozen(value, true)
+    }
+
+    fn with_frozen(value: T, frozen: bool) -> Self {
         Self {
             inner: Arc::new(std::sync::RwLock::new(value)),
-            frozen: Arc::new(AtomicBool::new(false)),
+            frozen: Arc::new(AtomicBool::new(frozen)),
         }
     }
 
@@ -1430,6 +1451,27 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successor_cannot_acknowledge_a_write_its_upgrade_might_still_discard() {
+        // A successor accepts the moment it adopts the socket, but until it
+        // signals readiness the upgrade can still be abandoned — at which point
+        // the predecessor resumes from the snapshot it took before spawning.
+        // A write acknowledged in that window would die with this process, so
+        // it is refused, exactly as on the predecessor's side of the handover.
+        let handle = LiveStateHandle::new_frozen(StatsV1::default());
+
+        assert!(handle.is_frozen());
+        assert_eq!(handle.write(|s| s.hits += 1), Err(LiveStateFrozen));
+        // Reads work throughout: the adopted state is complete, it is only its
+        // *future* that is not settled yet.
+        assert_eq!(handle.read(|s| s.hits), 0);
+
+        // Readiness is what settles it.
+        LiveStateRegistry::new(&handle).unfreeze();
+        assert_eq!(handle.write(|s| s.hits += 1), Ok(()));
+        assert_eq!(handle.read(|s| s.hits), 1);
     }
 
     #[test]

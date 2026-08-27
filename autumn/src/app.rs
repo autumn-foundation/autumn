@@ -4106,6 +4106,24 @@ impl AppBuilder {
                 std::process::exit(1);
             }
         } else {
+            // A successor that terminates TLS cannot take over a plaintext
+            // listener: the socket it inherited is mid-conversation with HTTP
+            // clients, and wrapping it in rustls fails every one of them while
+            // both builds accept from the shared queue. Refuse the same way an
+            // existing TLS or Unix listener is refused — before binding
+            // anything, so the predecessor's wait ends on this process exiting.
+            #[cfg(feature = "tls")]
+            if config.server.tls.is_some() && crate::upgrade::handoff_requested() {
+                tracing::error!(
+                    "refusing to start: this build terminates TLS ([server.tls]) but was \
+                     handed the previous build's plaintext listening socket. An in-place \
+                     upgrade cannot change the transport — restart the process to apply it. \
+                     The previous build keeps serving"
+                );
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
             let configured_addr = format!("{}:{}", config.server.host, config.server.port);
             let listener = bind_or_adopt_tcp_listener(&configured_addr).await;
             // Report where this process is *actually* listening, not what was
@@ -4826,6 +4844,10 @@ impl AppBuilder {
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
+                // Strictly before the predecessor is released, and strictly
+                // after everything that could still abandon this upgrade: from
+                // here this build is the one keeping the state.
+                unfreeze_adopted_live_state(&state);
                 crate::upgrade::signal_upgrade_ready();
             }
             signal_serve_ready(
@@ -7537,9 +7559,34 @@ fn install_live_state<T>(
         }
     };
 
-    let handle = crate::upgrade::LiveStateHandle::new(value);
+    // A successor installs its state **frozen**. It starts accepting the moment
+    // it adopts the socket — before its startup hooks have run — and until it
+    // signals readiness the upgrade can still be abandoned, at which point the
+    // predecessor resumes from the snapshot it took. A write acknowledged in
+    // that window would die with this process: refuse it instead, so the
+    // client's retry lands on whichever process is actually keeping state.
+    // `unfreeze_adopted_live_state` lifts it at the readiness point.
+    let handle = if crate::upgrade::handoff_requested() {
+        crate::upgrade::LiveStateHandle::new_frozen(value)
+    } else {
+        crate::upgrade::LiveStateHandle::new(value)
+    };
     state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
     state.insert_extension(handle);
+}
+
+/// Make an adopted live-state block writable, once this build has finished
+/// starting up and is about to release its predecessor (#1674).
+///
+/// A no-op on a cold start (the block was never frozen) and for an app that
+/// designated none.
+fn unfreeze_adopted_live_state(state: &AppState) {
+    if !crate::upgrade::handoff_requested() {
+        return;
+    }
+    if let Some(registry) = state.extension::<crate::upgrade::LiveStateRegistry>() {
+        registry.unfreeze();
+    }
 }
 
 fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {

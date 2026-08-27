@@ -116,3 +116,45 @@ async fn an_app_that_designates_nothing_has_no_live_state() {
     response.assert_ok();
     assert_eq!(response.text(), "false");
 }
+
+/// A successor's adopted state becomes writable only once the handover is
+/// irreversible — never before.
+///
+/// The window this closes is narrow and needs two processes to reach, so it is
+/// pinned where a refactor would break it: `run()` must unfreeze *after* the
+/// checks that can still abandon the upgrade, and *before* the signal that
+/// releases the predecessor to drain. Ordered the other way, a write the
+/// successor acknowledged could be discarded by an upgrade that then failed —
+/// the exact loss the freeze exists to prevent.
+#[test]
+fn an_adopted_block_is_unfrozen_after_the_last_abort_point_and_before_the_predecessor_is_released()
+{
+    let source = include_str!("../../src/app.rs");
+    let ready_path = source
+        .split_once("state.probes().mark_startup_complete();")
+        .expect("run() marks startup complete")
+        .1
+        .split_once("signal_serve_ready(")
+        .expect("run() signals serve readiness")
+        .0;
+
+    let verify = ready_path
+        .find("verify_handover_complete()")
+        .expect("the handover is verified before the predecessor is released");
+    let unfreeze = ready_path
+        .find("unfreeze_adopted_live_state(&state)")
+        .expect("the adopted live state is unfrozen before the predecessor is released");
+    let release = ready_path
+        .find("signal_upgrade_ready()")
+        .expect("the predecessor is released");
+
+    assert!(
+        verify < unfreeze,
+        "the adopted state must stay frozen until the handover is known to be complete"
+    );
+    assert!(
+        unfreeze < release,
+        "the successor must be writable before it releases the predecessor, or the first \
+         write after the cutover lands on a process that refuses it"
+    );
+}
