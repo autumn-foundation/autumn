@@ -822,12 +822,42 @@ fn generator_conformance_ci_gate_is_configured() {
         );
     }
 
-    // The Postgres-dependent gate must also be present (AC-2).
-    assert!(
-        workflow.contains("generated_scaffold_serves_posts_index_and_json_api"),
-        "generator-conformance.yml must run the Postgres e2e gate \
-         `generated_scaffold_serves_posts_index_and_json_api`",
-    );
+    // The Postgres-dependent gate must also be present (AC-2), alongside the two
+    // issue #1388 gates: the live-HTTP one is the only RUNTIME proof of that
+    // feature's headline acceptance criterion, and `constrained_scaffold_cargo_checks`
+    // the only proof that the full constraint mix (including `{url}` and a
+    // nullable bound) COMPILES. Every other test for the scaffold DSL's `{…}`
+    // modifiers string-matches generated source, so if these are dropped from
+    // the workflow the feature stops being verified anywhere.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the bare
+    // name: every gate is also mentioned in the job's header comment, so a bare
+    // substring check would stay green after the `run:` step itself was deleted
+    // — exactly the regression this pin exists to catch.
+    //
+    // Backslashes are dropped and all whitespace collapsed first, because the
+    // longer invocations wrap across shell line continuations. Folding on the
+    // literal "\\\n" would be WRONG: on a Windows checkout the workflow arrives
+    // with CRLF endings, so the continuation is a backslash followed by "\\r\\n"
+    // and the fold silently no-ops — which is exactly how this assertion first
+    // failed on `Test (windows-latest)` while passing everywhere else.
+    let invocations = workflow
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for test_name in [
+        "generated_scaffold_serves_posts_index_and_json_api",
+        "generated_constrained_scaffold_enforces_validation_end_to_end",
+        "integration::scaffold_validation::constrained_scaffold_cargo_checks",
+    ] {
+        assert!(
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment); these gates are the only place issue #1388's scaffold \
+             DSL constraints are compiled and exercised at runtime",
+        );
+    }
 
     // The auth/TOTP generator gate must also be included so that changes to
     // autumn-cli/src/generate/auth.rs are caught alongside scaffold changes.

@@ -34,13 +34,33 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{layout, time_ago, vote_controls};
+use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
-#[get("/")]
+/// The front page.
+///
+/// Route-level SEO (#1182): the `seo(...)` argument declares the values that
+/// never change, and the `SeoMeta` parameter delivers them to the handler.
+/// The handler adds the one value the attribute cannot hold — the canonical
+/// URL, which needs `[seo] base_url` from `autumn.toml` at run time.
+///
+/// See `docs/guide/seo.md`.
+#[get(
+    "/",
+    seo(
+        title = "Autumn Reddit \u{2022} Front page",
+        description = "The hottest posts across every community on Autumn Reddit, a demo \
+                       link-sharing site built with the Autumn web framework for Rust.",
+        og_type = "website",
+        // `summary` and not `summary_large_image`: this app ships no share
+        // image. Set `og_image` first, then change the card type.
+        twitter_card = "summary"
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn front_page(
+    seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
@@ -139,8 +159,8 @@ pub async fn front_page(
     // Consume the flash only after all fallible work, so a mid-handler error
     // doesn't drop the one-shot message before it is shown.
     let flash_html = flash.render().await;
-    Ok(layout(
-        "Front Page",
+    Ok(layout_with_seo(
+        crate::seo::with_canonical(seo, "/"),
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
@@ -305,9 +325,38 @@ pub async fn front_page(
 
 // ── Submit form (global — pick subreddit) ──────────────────────
 
+/// The submit form.
+///
+/// `robots = "noindex, nofollow"` declares the intent, but note what actually
+/// reaches a crawler here: the page is behind `#[secured]`, so an anonymous
+/// request gets the login redirect, not this HTML. The directive is therefore
+/// belt-and-braces for signed-in states rather than the thing keeping the URL
+/// out of an index. `routes::auth::profile` is the route where the same
+/// directive genuinely does the work, on a page a crawler can fetch.
+///
+/// What the app must NOT do is also add `/submit` to `[seo.robots]
+/// additional_rules`. A `Disallow` line stops the fetch, so no crawler could
+/// ever read this tag — the two are alternatives for one URL, not layers.
+/// See the comment in `autumn.toml` and `docs/guide/seo.md`.
+///
+/// The directive has a second effect on `#[static_get]` routes: the framework
+/// drops such a route from `/sitemap.xml`, so the application never advertises
+/// a URL and asks crawlers to skip it at the same time. This route is a
+/// `#[get]` route, so no derived entry exists to drop.
 #[secured]
-#[get("/submit")]
-pub async fn submit_form(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
+#[get(
+    "/submit",
+    seo(
+        title = "Submit a post \u{2022} Autumn Reddit",
+        robots = "noindex, nofollow"
+    )
+)]
+pub async fn submit_form(
+    seo: SeoMeta,
+    session: Session,
+    csrf: CsrfToken,
+    mut db: Db,
+) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
     let subs: Vec<Subreddit> = subreddits::table
@@ -316,8 +365,8 @@ pub async fn submit_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
         .load(&mut *db)
         .await?;
 
-    Ok(layout(
-        "Submit Post",
+    Ok(layout_with_seo(
+        seo,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
@@ -629,8 +678,25 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 
 // ── View single post with comments ─────────────────────────────
 
+/// A post's detail page.
+///
+/// This is the SEO case the attribute alone cannot serve. `og_type` and the
+/// Twitter card type are the same for every post, so they sit on the
+/// attribute. The title, the description, and the canonical URL come from the
+/// row, so the handler refines the builder after it reads the post.
+///
+/// The canonical URL matters here more than on any other page. `/posts/{id}`
+/// redirects to this route, and htmx and share links add query strings, so one
+/// post has many addresses. The canonical tag names the one true address.
+///
+/// See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
-#[get("/r/{sub_slug}/posts/{post_slug}")]
+#[get(
+    "/r/{sub_slug}/posts/{post_slug}",
+    // `og_type = "article"` is the right Open Graph type for a post. The card
+    // stays `summary` until the app has a share image to point `og_image` at.
+    seo(og_type = "article", twitter_card = "summary")
+)]
 // Every argument is a distinct extractor -- path, session, CSRF token, CSRF
 // field name, connection, repository, flags, flash. An axum handler's arguments
 // ARE its request-state declaration; bundling them into a struct would only
@@ -638,6 +704,7 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 #[allow(clippy::too_many_arguments)]
 pub async fn show(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
     // The widget's hidden input has to carry the field name `CsrfLayer` will
@@ -742,10 +809,27 @@ pub async fn show(
         None => None,
     };
 
+    // Refine the attribute defaults with this post's own values. `og_type`
+    // and the Twitter card type stay as the attribute declared them.
+    // `og:title` and `og:description` fall back to `title` and `description`,
+    // so this app sets each value one time.
+    let seo = crate::seo::with_canonical(
+        seo.title(format!(
+            "{} \u{2022} r/{} \u{2022} Autumn Reddit",
+            post.title, sub.name
+        ))
+        .description(
+            crate::seo::summarize(&post.body, 155)
+                .or_else(|| post.url.clone())
+                .unwrap_or_else(|| format!("A post in r/{}.", sub.name)),
+        ),
+        &post_path,
+    );
+
     // Consume the flash only after all fallible work above.
     let flash_html = flash.render().await;
-    Ok(layout(
-        &post.title,
+    Ok(layout_with_seo(
+        seo,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {

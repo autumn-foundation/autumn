@@ -19,7 +19,7 @@ use crate::jobs::{UserOnboardingArgs, UserOnboardingJob};
 use crate::models::{NewUser, User};
 use crate::schema::users;
 
-use super::layout::layout;
+use super::layout::{layout, layout_with_seo};
 
 struct AccountMailer;
 
@@ -404,8 +404,28 @@ pub async fn logout(
 
 // ── Profile ────────────────────────────────────────────────────
 
-#[get("/u/{username}")]
+/// A user's public profile.
+///
+/// This is the route where `robots = "noindex"` actually does its job, and it
+/// is worth understanding why. The directive only works if a crawler FETCHES
+/// the page and reads the tag. Two things have to be true for that:
+///
+///   1. `robots.txt` must not block the URL. A `Disallow` line stops the
+///      fetch, so the crawler never sees the tag -- and the URL can still be
+///      indexed from an inbound link, with no content and no way to remove it.
+///      `autumn.toml` deliberately does not list `/u/`.
+///   2. The page must be reachable without a session. This route is public;
+///      `submit_form` is `#[secured]`, so an anonymous crawler gets the login
+///      redirect there rather than the tag.
+///
+/// Profiles are the natural thing to keep out of an index: thin, near-duplicate
+/// pages whose content lives on the posts they link to.
+///
+/// See `docs/guide/seo.md`, "Keep a page out of the index".
+#[allow(clippy::too_many_arguments)]
+#[get("/u/{username}", seo(og_type = "profile", robots = "noindex, follow"))]
 pub async fn profile(
+    seo: SeoMeta,
     State(state): State<AppState>,
     Path(name): Path<String>,
     session: Session,
@@ -449,8 +469,19 @@ pub async fn profile(
     };
     let is_self = current_user.as_deref() == Some(user.username.as_str());
 
-    Ok(layout(
-        &format!("u/{}", user.username),
+    // `follow` and not `nofollow`: keep this page out of the index, but let
+    // crawlers walk the links to the user's posts, which DO belong there.
+    let seo = crate::seo::with_canonical(
+        seo.title(format!("u/{} \u{2022} Autumn Reddit", user.username))
+            .description(format!(
+                "The profile of u/{} on Autumn Reddit.",
+                user.username
+            )),
+        &__autumn_path_profile(&user.username),
+    );
+
+    Ok(layout_with_seo(
+        seo,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {

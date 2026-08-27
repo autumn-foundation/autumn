@@ -30,6 +30,7 @@ showcasing the framework's major features in a single cohesive application.
 | Tailwind CSS styling | All templates |
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
 | Audit logging (`AuditLogger` + `TracingAuditSink`, actor auto-attribution via `Current::actor()`) | `main.rs`, `routes/posts.rs` (`delete_post`) |
+| **Route-level SEO** (`seo(...)` + `SeoMeta` extractor, canonical URLs, `robots = "noindex"`, DB-backed `SitemapSource`, auto-mounted `/robots.txt` + `/sitemap.xml`) | `seo.rs`, `autumn.toml`, `routes/posts.rs`, `routes/subreddits.rs`, `routes/about.rs`, `routes/layout.rs` |
 
 ## Prerequisites
 
@@ -138,6 +139,41 @@ websocat ws://localhost:3000/ws/feed
 websocat ws://localhost:3000/ws/r/rustlang
 ```
 
+## SEO
+
+`[seo] base_url` in `autumn.toml` mounts `/robots.txt` and `/sitemap.xml`. The
+sitemap source in `src/seo.rs` reads the database at start-up and lists the
+front page, the community index, the communities, and the posts (capped at
+1,000 and 5,000 entries respectively, with a logged warning when a cap bites).
+The caps bound the number of URLs, not the work the query does — see
+`src/seo.rs` for when to stop building the sitemap at boot.
+
+```bash
+# The crawl rules. The dev profile disallows every crawler; prod allows them.
+curl http://localhost:3000/robots.txt
+
+# One <url> per public page, with <lastmod> from posts.updated_at.
+curl http://localhost:3000/sitemap.xml
+
+# The per-page meta tags the route attributes declare.
+curl -s http://localhost:3000/ | grep -E '<title>|og:|canonical'
+curl -s http://localhost:3000/about | grep -E '<title>|og:'
+```
+
+Where each part lives:
+
+| Part | File |
+|------|------|
+| `[seo]` and `[seo.robots]` settings | `autumn.toml` |
+| `SitemapSource`, canonical helpers, `summarize` | `src/seo.rs` |
+| Attribute-only meta tags on a static page | `src/routes/about.rs` |
+| Attribute defaults refined from a database row | `src/routes/posts.rs` (`show`) |
+| `robots = "noindex, nofollow"` on a private page | `src/routes/posts.rs` (`submit_form`) |
+| `SeoMeta::render()` in the shared `<head>` | `src/routes/layout.rs` |
+
+Change `base_url` to the real host before you deploy. See
+[`docs/guide/seo.md`](../../docs/guide/seo.md) for the full guide.
+
 ## API Endpoints
 
 The `#[repository]` macro auto-generates read-only REST endpoints:
@@ -165,6 +201,7 @@ src/
   jobs.rs           # #[job] onboarding + post-publication side effects
   live_bus.rs       # Live-feed bus config and backend selection
   live_events.rs    # Durable app-db live-feed relay with Postgres/Redis wakeups
+  seo.rs            # SitemapSource (DB-backed), canonical-URL helpers, summarize()
   tasks.rs          # Scheduled hot-rank + live-feed retention tasks
   slugify.rs        # URL slug generation utility
   routes/
