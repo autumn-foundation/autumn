@@ -1813,8 +1813,22 @@ fn plan_scaffold_with_options_impl(
         .iter()
         .find(|f| f.is_encrypted())
         .map(|f| f.name.clone());
-    let import_enabled =
-        options_with_key.import && export_enabled && encrypted_form_column.is_none();
+    // An import that can set NO column is a surface with no purpose: every row it
+    // creates is a row of database defaults, and — because a form with no
+    // settable field decodes ANY row successfully — an unrelated upload would
+    // preview and commit as a run of blank records. That is the wrong-file
+    // failure the header check exists to stop, in the one shape where there is
+    // no header to check. Refuse the surface rather than emit one whose only
+    // possible output is junk. Reached for a model whose every column is an
+    // `Attachment`, a `Bytea`, or `--default`ed.
+    let settable_import_columns = form_fields
+        .iter()
+        .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
+        .count();
+    let import_enabled = options_with_key.import
+        && export_enabled
+        && encrypted_form_column.is_none()
+        && settable_import_columns > 0;
     // A `--import` that lands on a gated-off variant would otherwise be silent:
     // no upload form, no route, no explanation. Say so at generation time with
     // the reason and the way out, exactly as `--soft-delete` does for a missing
@@ -1826,34 +1840,41 @@ fn plan_scaffold_with_options_impl(
         // `CsvSchema`, so every reason is really "no schema was emitted here".
         // Each names what to drop, because "not supported" without a way out is
         // the warning an author has to come and read the source to act on.
-        let reason = if let Some(column) = encrypted_form_column.as_deref() {
-            &format!(
-                "`{column}` is an at-rest #[encrypted] column, which the CSV export \
+        let reason =
+            if export_enabled && encrypted_form_column.is_none() && settable_import_columns == 0 {
+                "no column on this model can be set from a CSV — every column is an \
+             Attachment, a Bytea, or `--default`ed — so an import could only ever \
+             create rows of database defaults, and a file with any header at all \
+             would decode into them. Add a column the form carries, or drop \
+             --import."
+            } else if let Some(column) = encrypted_form_column.as_deref() {
+                &format!(
+                    "`{column}` is an at-rest #[encrypted] column, which the CSV export \
                  omits (issue #1340 — the model holds plaintext) but the generated \
                  form requires, so every imported row would fail to decode. Drop \
                  #[encrypted] from `{column}`, or import that column through a \
                  hand-written route"
-            )
-        } else if options_with_key.api {
-            "an --api scaffold renders no HTML views, so there is no upload form to \
+                )
+            } else if options_with_key.api {
+                "an --api scaffold renders no HTML views, so there is no upload form to \
              render and no CsvSchema impl to decode rows against. Drop --api for an \
              HTML resource"
-        } else if options_with_key.model.sharded {
-            "a sharded repository pins every write to the shard it is handed, so a \
+            } else if options_with_key.model.sharded {
+                "a sharded repository pins every write to the shard it is handed, so a \
              bulk import would land wherever the request happened to route. Drop \
              --sharded"
-        } else if options_with_key.live {
-            "a --live index runs `repo.page` behind an SSE island rather than the \
+            } else if options_with_key.live {
+                "a --live index runs `repo.page` behind an SSE island rather than the \
              `ListQuery` list the CSV schema is emitted for. Drop --live"
-        } else if owner_authorizes && options_with_key.live_validation {
-            "an owner-scoped --live-validation index runs a hand-written \
+            } else if owner_authorizes && options_with_key.live_validation {
+                "an owner-scoped --live-validation index runs a hand-written \
              owner-filtered query rather than a scoped repository method, so no \
              CsvSchema impl is emitted to decode rows against. Drop \
              --live-validation, or drop the owner column"
-        } else {
-            "this resource's index is not a repository list the CSV schema is \
+            } else {
+                "this resource's index is not a repository list the CSV schema is \
              emitted for"
-        };
+            };
         plan.warn(format!(
             "--import: no CSV import route generated for {plural} — {reason}. \
              `autumn_web::data::csv::import_csv` is still available for a hand-written \
@@ -4013,7 +4034,16 @@ fn render_routes_file(
     // `--default`ed out of the form does not block anything. Must agree exactly
     // with the `import_enabled` gate in `plan_scaffold_with_options_impl`, which
     // is where the warning naming the column is printed.
-    let import_enabled = import && export_enabled && !fields.iter().any(Field::is_encrypted);
+    // Must agree exactly with `plan_scaffold_with_options_impl`'s gate: an
+    // encrypted column the form carries makes every row undecodable, and a model
+    // with no settable column at all would emit an import whose only possible
+    // output is rows of defaults. `fields` here IS the caller's `form_fields`.
+    let import_enabled = import
+        && export_enabled
+        && !fields.iter().any(Field::is_encrypted)
+        && fields
+            .iter()
+            .any(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea);
     // Issue #1349: the export link's text, registered only where the export is
     // actually emitted so a non-exporting scaffold defines no unused key.
     // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
@@ -10906,7 +10936,7 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
     let __DISCARDED_MUT__discarded_seen = false;
     let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {__DISCARDED_PROBE__
         let encoded = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(row.iter().map(|(key, value)| {
+            .extend_pairs(row.iter().filter_map(|(key, value)| {
                 // The column name with surrounding whitespace removed. Some
                 // exporters write `a, b, c`, and RFC 4180 treats that space as
                 // part of the name — so the raw key would be `" b"`, which
@@ -10923,7 +10953,18 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
                 // then breaks. A column whose name is genuinely padded cannot
                 // exist here — form fields are Rust identifiers.
                 let key = key.trim();
-                (key, __CELL_CALL__)
+                // A column this import cannot set must never reach the decoder.
+                // For most of them that is belt-and-braces — serde ignores a
+                // field the form does not have — but a `Bytea` column DOES have
+                // a form field (a lossy `String`, see `{Pascal}Form`), so its
+                // exported mojibake would decode and `into_new` would write
+                // those replacement bytes back over the real binary value.
+                // Excluding it from the column LISTS is not enough on its own;
+                // this is where the exclusion actually bites.
+                if CSV_IGNORED_COLUMNS.contains(&key) {
+                    return None;
+                }
+                Some((key, __CELL_CALL__))
             }))
             .finish();
         let form = match decode_form(Bytes::from(encoded)) {

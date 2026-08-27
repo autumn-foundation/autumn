@@ -766,21 +766,78 @@ fn a_bytea_column_is_not_importable() {
     );
 }
 
+/// Excluding a column from the LISTS is not enough — the decoder must never see
+/// it. `{Pascal}Form` still carries a `String` field for a `Bytea` column, so a
+/// pair that reaches `decode_form` is written back by `into_new` regardless of
+/// what the column lists say. This asserts the exclusion where it actually
+/// bites, which the list-level assertions cannot.
 #[test]
-fn the_header_check_is_omitted_when_no_column_could_be_missing() {
-    // Every column is `--default`ed, so the form can set none of them and there
-    // is nothing a file could lack — emitting the const and the check would be
-    // dead code in the generated app.
-    // EVERY column defaulted — one column, and it is the defaulted one — so
-    // `form_carried` is empty and there is nothing a file could lack.
+fn an_unsettable_column_never_reaches_the_form_decoder() {
     let (_tmp, project, _) = scaffold_project(
+        "import-bytea-decode",
+        &["title:String", "blob:Bytea"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    let import = handler_slice(&routes, "import");
+    assert!(
+        import.contains("if CSV_IGNORED_COLUMNS.contains(&key) {")
+            && import.contains("return None;"),
+        "an ignored column must be filtered out before decode_form sees it:\n{import}"
+    );
+    // The premise the filter exists for: the form DOES still carry the column,
+    // so without the filter its exported mojibake would decode and be written.
+    assert!(
+        routes.contains("pub blob: String,")
+            && routes.contains("blob: form.blob.clone().into_bytes()"),
+        "the form still carries a Bytea column, which is why filtering matters:\n{routes}"
+    );
+}
+
+/// A model with nothing the form can set must not get an importer at all: a form
+/// with no settable field decodes ANY row, so an unrelated upload would preview
+/// and commit as a run of blank records — the wrong-file failure in the one
+/// shape where there is no header to check.
+#[test]
+fn a_model_with_no_settable_column_refuses_the_import() {
+    let (_tmp, project, output) =
+        scaffold_project("import-nosettable", &["cover:Attachment"], &["--import"]);
+    // `multipart` is expected HERE: the Attachment column's own upload handlers
+    // need it regardless of the import.
+    assert_no_import_surface(&project, false);
+    assert!(
+        output.contains("no column on this model can be set from a CSV"),
+        "the warning must name the reason:\n{output}"
+    );
+    assert!(
+        output.contains("drop --import"),
+        "the warning must name a way out:\n{output}"
+    );
+}
+
+/// The second shape of "no settable column": every column `--default`ed, so
+/// `{Pascal}Form` is an empty struct. Same refusal as the `Attachment`-only
+/// model above, and for the same reason — an empty form decodes any row, so an
+/// importer here could only ever commit rows of defaults.
+///
+/// Carries the control the refusal needs: a model that DOES have a settable
+/// column still gets the full import surface, so this is not passing merely
+/// because the feature is absent everywhere.
+#[test]
+fn an_all_defaulted_model_refuses_the_import_too() {
+    let (_tmp, project, output) = scaffold_project(
         "import-noheaders",
         &["tag:String", "--default", "tag=general"],
         &["--import"],
     );
-    // Premise check: a model that still has a settable column DOES emit the
-    // const, so the assertion below is about the all-defaulted case rather than
-    // passing because the feature is missing everywhere.
+    assert_no_import_anywhere(&project);
+    assert!(
+        output.contains("no column on this model can be set from a CSV"),
+        "the warning must name the reason:\n{output}"
+    );
+
+    // CONTROL: one settable column is enough to get the surface, header check
+    // and all.
     let (_tmp2, settable, _) = scaffold_project(
         "import-noheaders-control",
         &["title:String", "tag:String", "--default", "tag=general"],
@@ -791,16 +848,9 @@ fn the_header_check_is_omitted_when_no_column_could_be_missing() {
         control.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["title"];"#),
         "a model with a settable column must still emit the check:\n{control}"
     );
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    // The const DEFINITION, not the word: the row decoder's comment names the
-    // const to explain why it trims keys the same way the check does.
     assert!(
-        !routes.contains("const CSV_REQUIRED_COLUMNS:"),
-        "no settable column means no header check to emit:\n{routes}"
-    );
-    assert!(
-        !routes.contains("read_header(&uploaded[..])"),
-        "...and no header to read for it:\n{routes}"
+        control.contains("read_header(&uploaded[..])"),
+        "...and the header read that goes with it:\n{control}"
     );
 }
 
@@ -1048,6 +1098,15 @@ fn a_variant_that_gates_the_import_off_also_unmounts_it() {
 /// all — routes module, `main.rs` mount and Cargo feature alike — and must say
 /// why rather than leaving the author to notice the missing link.
 fn assert_no_import_anywhere(project: &Path) {
+    assert_no_import_surface(project, true);
+}
+
+/// `assert_no_import_anywhere`, but `expect_no_multipart` false for a scaffold
+/// that needs `multipart` for a reason of its own — an `Attachment` column's
+/// upload handlers take a `Multipart` extractor whether or not an import
+/// exists, so asserting the feature's absence there would be asserting the
+/// wrong thing.
+fn assert_no_import_surface(project: &Path, expect_no_multipart: bool) {
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap_or_default();
     assert!(!routes.contains("/posts/import"), "{routes}");
     assert!(!routes.contains("import_csv"), "{routes}");
@@ -1058,11 +1117,13 @@ fn assert_no_import_anywhere(project: &Path) {
     );
     // The Cargo feature and the generated test are two more places the surface
     // could leak; greping only the routes module would miss both.
-    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-    assert!(
-        !cargo.contains("\"multipart\""),
-        "no import means no multipart feature:\n{cargo}"
-    );
+    if expect_no_multipart {
+        let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("\"multipart\""),
+            "no import means no multipart feature:\n{cargo}"
+        );
+    }
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap_or_default();
     assert!(!test.contains("csv_import"), "{test}");
 }
