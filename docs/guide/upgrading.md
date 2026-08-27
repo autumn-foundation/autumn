@@ -247,6 +247,14 @@ delete a line from `.autumn/scaffold.toml` and the file comes back under
 reconciliation. `--accept` refuses a path the current scaffold does not own —
 promising to skip a file this command never touches would mean nothing.
 
+**When you resolve a conflict by taking this release's version by hand, run
+`autumn upgrade --apply` once more afterwards.** The file is now identical to
+the scaffold, so nothing gets written — but the run records its digest, and
+that baseline is what lets the *next* release update the file for you instead
+of raising it as a conflict again. `--check` deliberately writes nothing, so it
+cannot do this for you: it will report the file as current while leaving it
+without a baseline.
+
 ### How it knows you edited a file
 
 "May I overwrite this?" is really "did you touch it?", and neither the file's
@@ -454,19 +462,25 @@ git diff
 #    it; where the file is deliberately yours, say so once and for all:
 #      autumn upgrade --accept Dockerfile
 
-# 6. Confirm the skeleton is current.
+# 6. Record what you resolved by hand. This writes no file content — the
+#    conflicts you settled are now identical to the scaffold, so there is
+#    nothing left to write — but it does add them to your baseline, which is
+#    what makes the NEXT release able to update them for you automatically.
+autumn upgrade --apply
+
+# 7. Confirm the skeleton is current.
 autumn upgrade --check
 
-# 7. Now bump the library and build.
+# 8. Now bump the library and build.
 #    (The codemods migrate FROM the version Cargo.toml records, so this is last.)
 cargo add autumn-web@0.7.0
 cargo check
 
-# 8. Read the release's migration guide for anything mechanical rewriting
+# 9. Read the release's migration guide for anything mechanical rewriting
 #    could not do — the link is at the bottom of every report.
 ```
 
-Only step 3 writes anything, and step 4 shows you all of it.
+Only steps 3 and 6 write anything, and step 4 shows you everything step 3 did.
 
 ## Flags
 
