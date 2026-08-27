@@ -994,7 +994,7 @@ fn is_newer_than_this_cli(recorded: &str) -> bool {
     is_newer(recorded, env!("CARGO_PKG_VERSION"))
 }
 
-/// Whether `recorded` has strictly higher SemVer precedence than `ours`.
+/// Whether `recorded` has strictly higher `SemVer` precedence than `ours`.
 ///
 /// Deliberately **not** [`Version`](super::migrations::Version)'s own [`Ord`],
 /// which distinguishes only prerelease-from-stable and treats every prerelease
@@ -1012,7 +1012,7 @@ fn is_newer(recorded: &str, ours: &str) -> bool {
     precedence(&recorded, &ours) == std::cmp::Ordering::Greater
 }
 
-/// Full SemVer precedence, prerelease identifiers included.
+/// Full `SemVer` precedence, prerelease identifiers included.
 fn precedence(
     left: &super::migrations::Version,
     right: &super::migrations::Version,
@@ -1032,7 +1032,7 @@ fn precedence(
         )
 }
 
-/// SemVer §11.4 precedence between two prerelease identifier sets.
+/// `SemVer` §11.4 precedence between two prerelease identifier sets.
 fn prerelease_precedence(left: &str, right: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
