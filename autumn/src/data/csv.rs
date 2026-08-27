@@ -253,6 +253,38 @@ where
 
 // ── import_csv ────────────────────────────────────────────────────────────────
 
+/// Count the data rows in a CSV source without retaining any of them.
+///
+/// The header is not counted; a malformed row IS (it is a row the file has, and
+/// a caller bounding work has to see it). Nothing from the file is kept — each
+/// record is parsed and dropped — so the memory cost is one record at a time
+/// regardless of how long or how broken the input is.
+///
+/// This exists for callers that must bound how much work an untrusted upload can
+/// ask for BEFORE handing it to [`import_csv`]: `import_csv` records a malformed
+/// row as a [`CsvRowError`] and moves on *without* calling the row handler, so a
+/// counter inside that handler cannot see the very file that costs the most. A
+/// cheap counting pass first — over bytes the caller has already size-capped —
+/// closes that gap for every shape of input.
+///
+/// ```rust,no_run
+/// use autumn_web::data::csv::count_data_rows;
+///
+/// let file = b"title\nHello\nWorld\n";
+/// assert_eq!(count_data_rows(file.as_ref()), 2);
+/// ```
+pub fn count_data_rows<R>(reader: R) -> u64
+where
+    R: io::Read,
+{
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(reader);
+    // `byte_records` avoids the UTF-8 validation `records` performs: this pass
+    // only counts, and a row that is not valid UTF-8 is still a row.
+    rdr.byte_records().count() as u64
+}
+
 /// Strip the `(line: N, byte: N)` fragment the CSV parser embeds in its own
 /// error text.
 ///
@@ -702,6 +734,38 @@ mod tests {
             report.errors[0].message
         );
         assert_eq!(report.total_rows(), 1);
+    }
+
+    /// The counting pass a caller uses to bound work before importing has to
+    /// count the rows the import itself would never hand to a row handler — a
+    /// malformed row is exactly the one that costs the most to accumulate.
+    #[test]
+    fn count_data_rows_counts_every_data_row_including_malformed_ones() {
+        // Two well-formed rows, header excluded.
+        assert_eq!(count_data_rows(b"title,note\na,x\nb,y\n".as_ref()), 2);
+        // A row with the wrong field count is still a row.
+        assert_eq!(count_data_rows(b"title,note\na,x\nBAD\nb,y\n".as_ref()), 3);
+        // A quoted field spanning lines is ONE row, not two.
+        assert_eq!(
+            count_data_rows(b"title,note\n\"a\nz\",x\nb,y\n".as_ref()),
+            2
+        );
+        // CRLF counts the same as LF.
+        assert_eq!(count_data_rows(b"title,note\r\na,x\r\nb,y\r\n".as_ref()), 2);
+        // A header-only file, and an empty one.
+        assert_eq!(count_data_rows(b"title,note\n".as_ref()), 0);
+        assert_eq!(count_data_rows(b"".as_ref()), 0);
+    }
+
+    /// The count and what `import_csv` reports must agree, or a caller bounding
+    /// work by the first would be bounding the wrong number.
+    #[test]
+    fn count_data_rows_agrees_with_import_csv_total_rows() {
+        let csv = b"title,note\na,x\nBAD\nb,y\n";
+        let report = import_csv(csv.as_ref(), &ImportOptions::default(), |_l, _r, _m| {
+            ImportRowResult::Inserted
+        });
+        assert_eq!(count_data_rows(csv.as_ref()), report.total_rows());
     }
 
     /// A header that itself spans two lines (a quoted field with an embedded

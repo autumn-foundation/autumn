@@ -10449,10 +10449,13 @@ const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
 /// on the DRY-RUN path, where the caller pays nothing. The cap is the same
 /// 10 000 the CSV export uses, for the same reason.
 ///
-/// Rows past the cap are COUNTED and SKIPPED, never silently dropped: they land
-/// in `ImportReport::skipped`, so `total_rows()` still says how big the file
-/// really was, and the report leads with a warning naming the count. Split the
-/// file and import the rest, or raise this — and `MAX_IMPORT_BYTES` with it.
+/// A file over the cap is REFUSED whole, before it is imported — never imported
+/// as a prefix. The count is taken in a first pass that parses records and
+/// discards them, because the cap has to bind before `import_csv` runs: a
+/// malformed row never reaches the row handler (`import_csv` records it and
+/// moves on), so an in-handler counter would miss exactly the file that costs
+/// the most. Split the file and upload the parts, or raise this — and
+/// `MAX_IMPORT_BYTES` with it.
 const MAX_IMPORT_ROWS: u64 = 10_000;
 
 /// The most row errors the report page will RENDER.
@@ -10603,7 +10606,10 @@ fn import_report_view(
         ul {
             li { __L_ROWS_READ__ ": " (report.total_rows()) }
             li {
-                @if committed { __L_ROWS_INSERTED__ } @else { __L_ROWS_INSERTABLE__ }
+                // "Inserted" only when a commit actually completed. After an
+                // aborted write the number is what reached the database stage,
+                // not what landed, so it keeps the dry run's wording.
+                @if committed && write_failure.is_none() { __L_ROWS_INSERTED__ } @else { __L_ROWS_INSERTABLE__ }
                 ": "
                 (report.inserted)
             }
@@ -10624,12 +10630,6 @@ fn import_report_view(
         @if write_failures > 0 {
             p role="alert" { __L_WRITE_CAVEAT__ }
         }__DISCARDED_MARKUP__
-        // Rows the cap left unprocessed. Loud, and above the error table: an
-        // import that quietly stopped two thirds of the way through a file is
-        // the one failure an operator must not have to infer from arithmetic.
-        @if report.skipped > 0 {
-            p role="alert" { __L_ROWS_SKIPPED__ ": " (report.skipped) }
-        }
         @if report.errors.is_empty() {
             p { __L_NO_ERRORS__ }
         } @else {
@@ -10818,6 +10818,23 @@ pub async fn import(
         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
     }
     let uploaded = uploaded.unwrap_or_default();
+    // The row cap has to bind BEFORE the file is imported, not inside the row
+    // handler: `import_csv` records a malformed row as a `CsvRowError` and moves
+    // on WITHOUT calling the handler, so a file of nothing but malformed rows
+    // would never reach an in-handler counter while still accumulating one error
+    // string per row. Counting records first — a second parse over bytes already
+    // capped at `MAX_IMPORT_BYTES`, discarding everything it reads — bounds that
+    // for every shape of file, and refusing outright beats importing a prefix:
+    // a partially imported spreadsheet is exactly the trap this route exists to
+    // avoid, and the operator can split the file and run it twice.
+    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > MAX_IMPORT_ROWS {
+        let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
+            h1 { __L_HEADING__ }
+            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&__L_TOO_MANY_ROWS__)))
+            (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
+        });
+        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
+    }
     let options = autumn_web::data::csv::ImportOptions {
         mode: if commit {
             autumn_web::data::csv::ImportMode::Insert
@@ -10832,19 +10849,9 @@ pub async fn import(
     // and drops it.
     let mut pending_lines: Vec<u64> = Vec::new();
     let mut pending_rows: Vec<New__PASCAL__> = Vec::new();
-    let mut rows_seen: u64 = 0;
     // Whether the file supplied a value for a column this import cannot set.
     let __DISCARDED_MUT__discarded_seen = false;
-    let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {
-        rows_seen += 1;__DISCARDED_PROBE__
-        if rows_seen > MAX_IMPORT_ROWS {
-            // Past the cap. Count the row and move on WITHOUT decoding,
-            // validating, or allocating an error for it — those are exactly the
-            // costs `MAX_IMPORT_ROWS` exists to bound. `Skipped` keeps
-            // `total_rows()` honest, so the report still reports the file's real
-            // size and the banner above the table names what was left out.
-            return autumn_web::data::csv::ImportRowResult::Skipped;
-        }
+    let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {__DISCARDED_PROBE__
         let encoded = url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(row.iter().map(|(key, value)| (key.as_str(), __CELL_CALL__)))
             .finish();
@@ -10894,33 +10901,41 @@ pub async fn import(
         // accumulated while every earlier chunk stays committed. A bare 500 there
         // would tell the operator nothing about what landed, and their only move
         // (re-upload) would duplicate it, because this import is insert-only.
-        let (saved, failures) = match repo.save_many_skip_invalid(&pending_rows).await {
-            Ok(result) => result,
+        match repo.save_many_skip_invalid(&pending_rows).await {
+            Ok((saved, failures)) => {
+                // Take the inserted count from what the DATABASE returned rather
+                // than from what the parse pass counted: a row that validated and
+                // then lost a unique race is a failure, and
+                // `inserted + errors = rows read` has to keep holding or the
+                // report is lying about what happened.
+                report.inserted = saved.len() as u64;
+                write_failures = failures.len();
+                for (index, failure) in failures {
+                    let line = pending_lines.get(index).copied().unwrap_or_default();
+                    report.errors.push(autumn_web::data::csv::CsvRowError::row(line, failure.to_string()));
+                }
+                // Back into file order. Validation errors were collected row by
+                // row, but the write failures above are appended after all of
+                // them, so unsorted the report would read 3, 7, 12, then 2, 5 —
+                // against a file the operator is reading top to bottom.
+                report.errors.sort_by_key(|error| error.line);
+            }
             Err(err) => {
                 autumn_web::reexports::tracing::error!(
                     error = %err,
                     rows = pending_rows.len(),
                     "__PLURAL__ CSV import failed partway through the write"
                 );
+                // `report.inserted` is DELIBERATELY left as the parse pass
+                // counted it. How many rows actually landed is unknowable here —
+                // the call aborted with earlier chunks already committed — and
+                // zeroing it would collapse `total_rows()`, the file's own size,
+                // to the error count: a report that says "0 rows read" about a
+                // file of ten thousand. The count stays "rows that reached the
+                // write", and the banner above it says it is not a commit count.
                 write_failure = Some(err.to_string());
-                (Vec::new(), Vec::new())
             }
-        };
-        // Take the inserted count from what the DATABASE returned rather than
-        // from what the parse pass counted: a row that validated and then lost a
-        // unique race is a failure, and `inserted + errors = rows read` has to
-        // keep holding or the report is lying about what happened.
-        report.inserted = saved.len() as u64;
-        write_failures = failures.len();
-        for (index, failure) in failures {
-            let line = pending_lines.get(index).copied().unwrap_or_default();
-            report.errors.push(autumn_web::data::csv::CsvRowError::row(line, failure.to_string()));
         }
-        // Back into file order. Validation errors were collected row by row, but
-        // the write failures above are appended after all of them, so unsorted
-        // the report would read 3, 7, 12, then 2, 5 — against a file the operator
-        // is reading top to bottom.
-        report.errors.sort_by_key(|error| error.line);
     }
     let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
         h1 { __L_HEADING__ }
@@ -11247,17 +11262,19 @@ fn render_csv_import_section(
             ),
         )
         .replace(
+            "__L_TOO_MANY_ROWS__",
+            &labels.expr(
+                "common.import.error.too.many.rows",
+                "That file has more rows than this route imports at once. Split it and upload the parts.",
+                "\"That file has more rows than this route imports at once. Split it and upload the parts.\".to_owned()",
+                &[],
+            ),
+        )
+        .replace(
             "__L_WRITE_CAVEAT__",
             &labels.markup(
                 "common.import.write.caveat",
                 "A row listed as failed below may still have been written: an after-create hook runs once the insert has committed, and a failure there is reported here. Check the list view before importing this file again.",
-            ),
-        )
-        .replace(
-            "__L_ROWS_SKIPPED__",
-            &labels.markup(
-                "common.import.rows.skipped",
-                "Rows not processed (the file is over this route's row cap)",
             ),
         )
         .replace(

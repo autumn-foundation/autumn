@@ -50,6 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn_web::data::csv::count_data_rows`:** counts the data rows in a CSV
+  source without retaining any of them — the header excluded, a malformed row
+  included. It exists for callers that must bound how much work an untrusted
+  upload can ask for *before* handing it to `import_csv`: a malformed row never
+  reaches `import_csv`'s row handler (it is recorded as a `CsvRowError` and the
+  parse moves on), so a counter inside that handler cannot see the very file
+  that costs the most to accumulate. The scaffolded CSV import below uses it to
+  enforce its row cap.
+
 - **`autumn generate scaffold --import` — a CSV import route with a dry-run
   preview and per-row errors (#1393):** the symmetric counterpart to the
   scaffolded CSV export (#1315). One flag emits `GET /<plural>/import` (an
@@ -72,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_IMPORT_BYTES` on top of `security.upload.max_file_size_bytes`, and checks
   the file's extension and declared content type. Work is bounded by rows as
   well as bytes (`MAX_IMPORT_ROWS`, mirroring the export's cap), rows past the
-  cap are counted and reported rather than dropped, and a write that fails
+  cap is refused whole rather than imported as a prefix, and a write that fails
   partway through says which rows may already be committed instead of 500ing.
   The generated `tests/<name>.rs` gains a database-free test that uploads a
   2-row CSV (1 valid, 1 invalid) through the real `Multipart` extractor and

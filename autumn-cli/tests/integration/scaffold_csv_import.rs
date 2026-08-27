@@ -506,6 +506,28 @@ fn a_failed_write_reports_what_may_already_be_committed() {
         view.contains("@if let Some(failure) = write_failure {"),
         "the report must lead with the write failure:\n{view}"
     );
+    // The rows-read count must survive an aborted write. Zeroing `inserted`
+    // there would collapse `total_rows()` — the file's own size — to the error
+    // count, so a 10 000-row upload would report "Rows read: 0".
+    let (_, after_err) = import
+        .split_once("write_failure = Some(err.to_string());")
+        .expect("the aborted-write branch");
+    assert!(
+        !after_err.contains("report.inserted = 0"),
+        "an aborted write must not zero the parse-pass count:\n{import}"
+    );
+    assert_eq!(
+        import
+            .matches("report.inserted = saved.len() as u64;")
+            .count(),
+        1,
+        "the inserted count is set only where the write actually returned:\n{import}"
+    );
+    // ...and the count's label stops claiming "inserted" once the write aborted.
+    assert!(
+        view.contains("@if committed && write_failure.is_none() {"),
+        "an aborted write must not label its count as inserted:\n{view}"
+    );
 }
 
 /// The row cap bounds what a 2 MiB upload can make the server DO with it — a
@@ -523,18 +545,26 @@ fn the_import_is_capped_by_rows_as_well_as_by_bytes() {
         "the rendered error list must be bounded:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
-    // Rows past the cap are COUNTED and SKIPPED, so `total_rows()` still reports
-    // the file's real size — never silently dropped.
+    // The cap must bind BEFORE `import_csv` runs. A malformed row never reaches
+    // the row handler — `import_csv` records it and moves on — so a counter
+    // inside the closure would miss a file of nothing but malformed rows, which
+    // is exactly the file that costs the most to accumulate.
+    let (before_import, _) = import
+        .split_once("autumn_web::data::csv::import_csv(")
+        .expect("the handler must drive the import engine");
     assert!(
-        import.contains("if rows_seen > MAX_IMPORT_ROWS {")
-            && import.contains("return autumn_web::data::csv::ImportRowResult::Skipped;"),
-        "rows past the cap must be counted as skipped:\n{import}"
+        before_import.contains("count_data_rows(&uploaded[..]) > MAX_IMPORT_ROWS {"),
+        "the row cap must be checked before the file is imported:\n{import}"
+    );
+    // ...and an over-cap file is REFUSED whole, never imported as a prefix.
+    let (_, after_check) = before_import
+        .split_once("count_data_rows(&uploaded[..]) > MAX_IMPORT_ROWS {")
+        .expect("the cap check");
+    assert!(
+        after_check.contains("UNPROCESSABLE_ENTITY"),
+        "an over-cap file must be refused, not partially imported:\n{import}"
     );
     let view = fn_slice(&routes, "import_report_view");
-    assert!(
-        view.contains("@if report.skipped > 0 {"),
-        "a truncated import must say so:\n{view}"
-    );
     assert!(
         view.contains("report.errors.iter().take(MAX_REPORT_ERRORS)"),
         "the error listing must be bounded:\n{view}"
