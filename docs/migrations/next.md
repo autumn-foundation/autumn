@@ -161,7 +161,30 @@ wildcard-less `match`es are affected:
 One behaviour change worth knowing even though it does not break compilation:
 during a replay an outbound HTTP call is now **served from the capsule**
 instead of failing closed. A call the capsule never recorded is still refused,
-and is reported as an effect divergence rather than silently dialling.
+and is reported as an effect divergence rather than silently dialling. The
+recording answers a call only when its method, URL, caller-set headers *and*
+body match — the same endpoint with a different payload is a divergence — and
+a mail send is compared against its recorded sender and body as well as its
+recipients and subject.
+
+Three situations now produce a refusal or an incomplete capsule where an
+earlier build would have graded the run. A **job capsule whose payload was
+masked** by `[log] filter_parameters` is refused: a handler is handed its
+payload verbatim, so it would parse the `[FILTERED]` placeholder rather than
+the value production ran on. A run that **enqueued inside its own
+transaction** (`enqueue_on_conn`) marks its capsule incomplete, because that
+enqueue is also a job-row INSERT on the database tape which replay can serve
+but never issue. And an **effect whose future was cancelled** before it
+finished — a losing `tokio::select!` branch, a timeout — does the same rather
+than persist an outcome the run never had. Each case previously produced a
+verdict; each now says why it cannot.
+
+A **panicking job** now leaves a capsule on whatever attempt it panicked on.
+All three backends dead-letter a panic immediately regardless of remaining
+attempts, so a job configured with `max_attempts = 25` that panics on its
+first attempt never reaches a "final" one — and under the previous gate never
+produced a capsule at all. Ordinary failures are unchanged: still captured on
+the final attempt only.
 
 Capsules already on disk are not migrated: replay them with the version that
 wrote them, or re-record the failure. A committed regression corpus is

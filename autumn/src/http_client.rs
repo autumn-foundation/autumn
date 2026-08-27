@@ -604,6 +604,27 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 // `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
 // the same on either build.
 
+/// The headers the *caller* set, in the order they were set.
+///
+/// One definition for both halves of the seam: the recorder stores this, and
+/// replay compares against it. Headers the client adds later — the injected
+/// W3C trace context, and any default the underlying `reqwest::Client` was
+/// built with — are deliberately outside it, so a client-side default can
+/// never be read as the handler changing its request.
+#[cfg(feature = "reporting")]
+fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
+    builder
+        .extra_headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
 /// Serve one outbound call from a capsule's effect tape.
 ///
 /// A recorded transport failure is reproduced as one, not as a status: a
@@ -612,14 +633,13 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 #[cfg(feature = "reporting")]
 fn replayed_response(
     tape: &crate::capsule::effects::ReplayEffects,
-    method: &str,
-    url: &str,
+    request: &crate::capsule::effects::OutboundRequest<'_>,
 ) -> Result<Response, ClientError> {
-    let Some(recorded) = tape.next_http(method, url) else {
+    let Some(recorded) = tape.next_http(request) else {
         // `next_http` already logged the divergence; the call fails closed.
         return Err(ClientError::BlockedDuringReplay(
-            method.to_owned(),
-            url.to_owned(),
+            request.method.to_owned(),
+            request.url.to_owned(),
         ));
     };
     if let Some(error) = recorded.error {
@@ -639,7 +659,7 @@ fn replayed_response(
             .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
         headers,
         body: Bytes::from(crate::capsule::effects::body_bytes(&recorded.response_body)),
-        url: url::Url::parse(url).ok(),
+        url: url::Url::parse(request.url).ok(),
     })
 }
 
@@ -689,16 +709,7 @@ impl OutboundRecorder {
         };
         let max_body_bytes = scope.settings().max_body_bytes;
         let slot = scope.reserve_http();
-        let request_headers = builder
-            .extra_headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_owned(),
-                    value.to_str().unwrap_or_default().to_owned(),
-                )
-            })
-            .collect();
+        let request_headers = caller_headers(builder);
         Self {
             scope: Some(scope),
             slot,
@@ -1597,7 +1608,26 @@ impl RequestBuilder {
         #[cfg(feature = "reporting")]
         if let Some(tape) = crate::capsule::effects::current_tape() {
             let method = self.method.to_string();
-            return replayed_response(&tape, &method, &self.url);
+            // Derived exactly as `OutboundRecorder::arm` derives the recorded
+            // half, so the comparison is like with like. No cap on the body:
+            // the capsule's own cap already applied at record time, and a
+            // recording that hit it is refused before it ever reaches replay.
+            let headers = caller_headers(&self);
+            let body = self
+                .body
+                .as_ref()
+                .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+                    encode_body(body, usize::MAX)
+                });
+            return replayed_response(
+                &tape,
+                &crate::capsule::effects::OutboundRequest {
+                    method: &method,
+                    url: &self.url,
+                    headers: &headers,
+                    body: &body,
+                },
+            );
         }
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(

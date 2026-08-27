@@ -429,6 +429,81 @@ async fn a_failure_inside_a_job_produces_a_job_scoped_capsule() {
     job::clear_global_job_client();
 }
 
+static PANIC_RUNS: AtomicUsize = AtomicUsize::new(0);
+static RETRY_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Three attempts configured — but all three backends dead-letter a panic
+/// immediately, so attempt 1 is also the last one this job ever gets.
+#[job(name = "capsule_panicking_job", max_attempts = 3, backoff_ms = 1)]
+async fn capsule_panicking_job(_state: AppState, args: ReceiptArgs) -> AutumnResult<()> {
+    PANIC_RUNS.fetch_add(1, Ordering::SeqCst);
+    panic!("receipt {} exploded", args.order);
+}
+
+/// An ordinary failure with attempts left: this one really will be retried, so
+/// it must *not* leave a capsule yet.
+#[job(name = "capsule_retrying_job", max_attempts = 3, backoff_ms = 1)]
+async fn capsule_retrying_job(_state: AppState, _args: ReceiptArgs) -> AutumnResult<()> {
+    RETRY_RUNS.fetch_add(1, Ordering::SeqCst);
+    Err(AutumnError::internal_server_error_msg("not yet"))
+}
+
+struct RetryingJobPlugin;
+
+impl Plugin for RetryingJobPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        app.jobs(jobs![capsule_panicking_job, capsule_retrying_job])
+    }
+}
+
+#[post("/panic-later")]
+async fn enqueue_panicking() -> Result<&'static str, AutumnError> {
+    CapsulePanickingJobJob::enqueue(ReceiptArgs { order: 12 }).await?;
+    Ok("queued")
+}
+
+/// A panicked job dead-letters on its first attempt whatever `max_attempts`
+/// says, so gating capture on "is this the final attempt?" would mean the one
+/// job failure most worth a capsule never produced one.
+#[tokio::test]
+async fn a_job_that_panics_before_its_final_attempt_still_leaves_a_capsule() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let client = TestApp::new()
+        .config(capture_config(dir.path()))
+        .plugin(RetryingJobPlugin)
+        .routes(routes![enqueue_panicking])
+        .build();
+    client.post("/panic-later").send().await.assert_ok();
+
+    let path = await_one_capsule(dir.path()).await;
+    let capsule = load_capsule(&path).expect("the capsule loads");
+    assert_eq!(
+        capsule
+            .job
+            .as_ref()
+            .expect("a panicked job records its entry point")
+            .name,
+        "capsule_panicking_job"
+    );
+    match &capsule.outcome {
+        CapsuleOutcome::Panic { payload, .. } => assert!(
+            payload.contains("receipt 12 exploded"),
+            "the panic payload must be recorded: {payload}"
+        ),
+        other => panic!("expected a panic outcome, got {other:?}"),
+    }
+    assert_eq!(
+        PANIC_RUNS.load(Ordering::SeqCst),
+        1,
+        "a panic is dead-lettered, not retried"
+    );
+
+    job::clear_global_job_client();
+}
+
 // ── Phase 2: cache ──────────────────────────────────────────────────────────
 
 #[tokio::test]

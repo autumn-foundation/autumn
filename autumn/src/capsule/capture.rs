@@ -226,6 +226,17 @@ pub struct EffectBuffer {
     /// Set once any seam hit [`MAX_EFFECTS_PER_SEAM`] or the byte budget, so
     /// the scope can mark the capsule truncated outside the lock.
     overflowed: bool,
+    /// Slots handed out by [`reserve`](Self::reserve) that no
+    /// [`fill`](Self::fill) has completed yet.
+    ///
+    /// An effect whose future is *cancelled* between the two — the losing
+    /// branch of a `tokio::select!`, a client that hung up — drops its
+    /// recorder without filling the slot, leaving the placeholder behind. The
+    /// placeholder's error text would then replay as a recorded backend
+    /// failure the run never had, which could flip which branch wins on
+    /// replay. Counting outstanding reservations lets the snapshot say "this
+    /// recording is incomplete" instead.
+    outstanding: usize,
 }
 
 impl EffectBuffer {
@@ -239,6 +250,12 @@ impl EffectBuffer {
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// Whether any reserved slot was never completed.
+    #[must_use]
+    pub const fn has_unfinished(&self) -> bool {
+        self.outstanding > 0
     }
 
     /// Bytes charged so far.
@@ -277,6 +294,7 @@ impl EffectBuffer {
         }
         let index = list.len();
         list.push(placeholder);
+        self.outstanding = self.outstanding.saturating_add(1);
         Some(index)
     }
 
@@ -290,6 +308,10 @@ impl EffectBuffer {
         weight: usize,
         budget: usize,
     ) {
+        // Answered either way: a slot the budget refuses is already covered by
+        // `overflowed`, and counting it as unfinished as well would report one
+        // incomplete recording as two separate faults.
+        self.outstanding = self.outstanding.saturating_sub(1);
         let charged = self.bytes.saturating_add(weight);
         if charged > budget {
             self.overflowed = true;
@@ -425,6 +447,18 @@ const BODY_OVERFLOW_NOTE: &str =
 /// an unrecorded *request* body already refuses to commit.
 const HTTP_BODY_SKIPPED_NOTE: &str = "an outbound HTTP body exceeded `[failure_capture] max_body_bytes` and was not captured; \
      replaying would drive the handler with an empty body";
+
+/// Note recorded when an effect was reserved but never completed.
+///
+/// A seam reserves its tape position when the effect *starts* and fills it in
+/// when the effect finishes. Between the two the future can be dropped — the
+/// losing branch of a `tokio::select!`, a timeout, a client that hung up — and
+/// then nothing ever fills the slot. Persisting the placeholder as if it were
+/// a recorded outcome would hand replay a backend failure the run never had,
+/// and for a `select!` that is enough to change which branch wins. So the
+/// capsule says it is incomplete instead.
+const UNFINISHED_EFFECT_NOTE: &str = "an effect was still in flight when the recording ended (a cancelled future — a losing \
+     `tokio::select!` branch, a timeout), so its outcome was never recorded";
 
 /// Note recorded when a run resolved two different tenants.
 ///
@@ -876,13 +910,18 @@ impl CaptureScope {
     /// replay.
     #[must_use]
     pub fn effects_snapshot(&self) -> CapsuleEffects {
-        self.effects.lock().map_or_else(
+        let (effects, unfinished) = self.effects.lock().map_or_else(
             |_| {
                 self.mark_truncated();
-                CapsuleEffects::default()
+                (CapsuleEffects::default(), false)
             },
-            |buffer| buffer.effects().clone(),
-        )
+            |buffer| (buffer.effects().clone(), buffer.has_unfinished()),
+        );
+        if unfinished {
+            self.note(UNFINISHED_EFFECT_NOTE);
+            self.mark_truncated();
+        }
+        effects
     }
 
     /// Note a degraded-capture condition for the capsule reader.
@@ -1717,6 +1756,78 @@ mod tests {
     /// A lock poisoned by a panic mid-record means the capsule is missing
     /// whatever was being written. Returning the degraded value alone would
     /// make that indistinguishable from "the request did none of this".
+    /// A seam reserves its tape position when the effect starts and fills it
+    /// when the effect finishes. A cancelled future — the losing branch of a
+    /// `tokio::select!`, a timeout — never fills it, and persisting the
+    /// placeholder as if it were an outcome would hand replay a backend
+    /// failure the run never had.
+    #[test]
+    fn an_effect_reserved_but_never_completed_marks_the_capsule_incomplete() {
+        let scope = CaptureScope::new(
+            "sel".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let cancelled = scope.reserve_http().expect("a slot is available");
+        let finished = scope.reserve_http().expect("and a second one");
+        scope.fill_http(
+            finished,
+            HttpEffect {
+                method: "GET".to_owned(),
+                url: "https://a.example/one".to_owned(),
+                request_headers: Vec::new(),
+                request_body: CapsuleBody::Absent,
+                status: 200,
+                response_headers: Vec::new(),
+                response_body: CapsuleBody::Absent,
+                error: None,
+            },
+        );
+        // `cancelled` is deliberately never filled — its future was dropped.
+        let _ = cancelled;
+
+        let effects = scope.effects_snapshot();
+        assert_eq!(effects.http.len(), 2, "both slots are still on the tape");
+        assert!(
+            scope.is_truncated(),
+            "a recording with an unfinished effect must not present as complete"
+        );
+        assert!(
+            scope
+                .notes()
+                .iter()
+                .any(|note| note == UNFINISHED_EFFECT_NOTE),
+            "and must say why: {:?}",
+            scope.notes()
+        );
+    }
+
+    /// Every slot completed: an ordinary recording is not truncated.
+    #[test]
+    fn effects_that_all_completed_leave_the_capsule_whole() {
+        let scope = CaptureScope::new(
+            "ok".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_http().expect("a slot is available");
+        scope.fill_http(
+            slot,
+            HttpEffect {
+                method: "GET".to_owned(),
+                url: "https://a.example/one".to_owned(),
+                request_headers: Vec::new(),
+                request_body: CapsuleBody::Absent,
+                status: 200,
+                response_headers: Vec::new(),
+                response_body: CapsuleBody::Absent,
+                error: None,
+            },
+        );
+        let _ = scope.effects_snapshot();
+        assert!(!scope.is_truncated(), "{:?}", scope.notes());
+    }
+
     /// A handler that reads exactly `Content-Length` bytes and stops has the
     /// whole body; it just never polled again for the end-of-stream that sets
     /// the flag. Calling that partial would refuse a faithful capsule.

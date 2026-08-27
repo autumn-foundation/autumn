@@ -349,7 +349,8 @@ impl ReplayEffects {
     /// when the tape cannot answer it — in which case a divergence has been
     /// logged and the caller must fail the call rather than dial the peer.
     #[must_use]
-    pub(crate) fn next_http(&self, method: &str, url: &str) -> Option<HttpEffect> {
+    pub(crate) fn next_http(&self, request: &OutboundRequest<'_>) -> Option<HttpEffect> {
+        let (method, url) = (request.method, request.url);
         let Ok(mut seam) = self.http.lock() else {
             return None;
         };
@@ -387,6 +388,30 @@ impl ReplayEffects {
                 detail: format!(
                     "the replayed handler called {actual}, but the capsule's next recorded \
                      outbound call was {expected}"
+                ),
+            });
+            return None;
+        }
+        // Same endpoint, different message. Serving the recorded response here
+        // would hide the change *and* leave the audit nothing to notice, so an
+        // unchanged final failure would read as a reproduction of a run that
+        // sent something else entirely.
+        if !headers_match_redacted(&next.request_headers, request.headers)
+            || !body_matches_redacted(&next.request_body, request.body)
+        {
+            let expected = describe_http(&next.method, &next.url);
+            let changed = describe_request_mismatch(next, request);
+            drop(seam);
+            let actual = describe_http(method, url);
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Http,
+                kind: EffectDivergenceKind::Mismatch,
+                index,
+                expected: Some(expected),
+                actual: actual.clone(),
+                detail: format!(
+                    "the replayed handler called {actual} as the capsule recorded, but changed \
+                     {changed}; the recorded response was not served"
                 ),
             });
             return None;
@@ -599,7 +624,8 @@ impl ReplayEffects {
     ///
     #[cfg(any(test, feature = "mail"))]
     #[must_use]
-    pub(crate) fn next_mail(&self, to: &[String], subject: &str) -> MailVerdict {
+    pub(crate) fn next_mail(&self, sent: &SentMail<'_>) -> MailVerdict {
+        let (to, subject) = (sent.to, sent.subject);
         let Ok(mut seam) = self.mail.lock() else {
             return MailVerdict::Diverged;
         };
@@ -639,6 +665,36 @@ impl ReplayEffects {
                 detail: format!(
                     "the replayed run sent {actual}, but the capsule's next recorded send was \
                      {expected}"
+                ),
+            });
+            return MailVerdict::Diverged;
+        }
+        // Same envelope, different letter. Consuming the send here would hand
+        // back the recorded success for a message whose contents — or whose
+        // sender — the code now gets wrong, and the run would grade clean.
+        let sender_match = match (next.from.as_deref(), sent.from) {
+            (None, None) => true,
+            (Some(recorded), Some(actual)) => matches_redacted(recorded, actual),
+            _ => false,
+        };
+        if !sender_match || !body_matches_redacted(&next.body, sent.body) {
+            let expected = describe_mail(&next.to, &next.subject);
+            let changed = if sender_match {
+                "its body"
+            } else {
+                "its sender"
+            };
+            drop(seam);
+            let actual = describe_mail(to, subject);
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Mail,
+                kind: EffectDivergenceKind::Mismatch,
+                index,
+                expected: Some(expected),
+                actual: actual.clone(),
+                detail: format!(
+                    "the replayed run sent {actual} to the recipients the capsule recorded, but \
+                     changed {changed}; nothing was delivered"
                 ),
             });
             return MailVerdict::Diverged;
@@ -888,6 +944,101 @@ fn matches_redacted(recorded: &str, actual: &str) -> bool {
     true
 }
 
+/// The request half of an outbound call, as replay sees it.
+///
+/// The same three fields `OutboundRecorder::arm` records, so the two halves of
+/// a comparison are derived the same way: matching on method and URL alone
+/// would serve a recorded response to a handler that now sends a *different*
+/// body to the same endpoint — charging a different amount — and then, with no
+/// effect left over for the final audit to notice, grade the unchanged failure
+/// `reproduced`.
+pub(crate) struct OutboundRequest<'a> {
+    /// The HTTP method, as the caller spelled it.
+    pub method: &'a str,
+    /// The full URL, query string included.
+    pub url: &'a str,
+    /// The headers the *caller* set, in the order they were set — the same
+    /// subset `arm` records, so client-injected headers cannot diverge a run.
+    pub headers: &'a [(String, String)],
+    /// The body the caller supplied.
+    pub body: &'a CapsuleBody,
+}
+
+/// One message a replayed run handed to the mailer.
+///
+/// Derived exactly as `mail_effect` derives the recorded side, so the two
+/// compare like with like: matching on recipients and subject alone would
+/// serve the recorded success to a run that now sends different contents, or
+/// sends them from the wrong address, and leave the audit nothing to notice.
+#[cfg(any(test, feature = "mail"))]
+pub(crate) struct SentMail<'a> {
+    /// The recipients, in the order the caller listed them.
+    pub to: &'a [String],
+    /// The envelope sender, when the message set one.
+    pub from: Option<&'a str>,
+    /// The subject line.
+    pub subject: &'a str,
+    /// The body, preferring plain text over HTML — the same preference the
+    /// recorder applies.
+    pub body: &'a CapsuleBody,
+}
+
+/// Whether a recorded body matches what the replayed run produced.
+///
+/// A `Skipped` recording is treated as matching: the bytes were deliberately
+/// never captured, so there is nothing to compare against, and a capsule
+/// carrying one is refused before it reaches replay anyway.
+fn body_matches_redacted(recorded: &CapsuleBody, actual: &CapsuleBody) -> bool {
+    if matches!(recorded, CapsuleBody::Skipped { .. }) {
+        return true;
+    }
+    match (recorded, actual) {
+        (CapsuleBody::Absent, CapsuleBody::Absent) => true,
+        // Absent and empty are different facts on the wire — a POST with no
+        // body is not a POST with a zero-length one — so they are not folded
+        // together here.
+        (CapsuleBody::Absent, _) | (_, CapsuleBody::Absent) => false,
+        _ => bytes_match_redacted(&body_bytes(recorded), &body_bytes(actual)),
+    }
+}
+
+/// Whether the caller-set headers a run sent match the ones recorded.
+///
+/// Order and count are compared exactly — a header the code stopped sending is
+/// a change — while a masked value matches whatever stood in its place, for the
+/// same reason [`matches_redacted`] exists.
+fn headers_match_redacted(recorded: &[(String, String)], actual: &[(String, String)]) -> bool {
+    recorded.len() == actual.len()
+        && recorded.iter().zip(actual.iter()).all(
+            |((recorded_name, recorded_value), (actual_name, actual_value))| {
+                recorded_name.eq_ignore_ascii_case(actual_name)
+                    && matches_redacted(recorded_value, actual_value)
+            },
+        )
+}
+
+/// Which halves of an outbound request half differed, named but never quoted.
+///
+/// A header *value* and a body are production data — the whole reason the
+/// capsule redacts — and a divergence report is printed to a terminal and into
+/// CI logs. So this says *what* changed, and for headers which names, and
+/// leaves the operator to read the capsule for the rest.
+fn describe_request_mismatch(recorded: &HttpEffect, actual: &OutboundRequest<'_>) -> String {
+    let mut parts = Vec::new();
+    if !headers_match_redacted(&recorded.request_headers, actual.headers) {
+        let names: Vec<&str> = recorded
+            .request_headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        parts.push(format!("its headers ({} recorded)", names.join(", ")));
+    }
+    if !body_matches_redacted(&recorded.request_body, actual.body) {
+        parts.push("its body".to_owned());
+    }
+    parts.join(" and ")
+}
+
 /// Whether recorded bytes match what the replayed run produced, tolerating
 /// redaction placeholders in a UTF-8 recording.
 ///
@@ -973,7 +1124,8 @@ pub fn tape_active() -> bool {
 #[cfg(test)]
 mod tests {
     use crate::capsule::effects::{
-        CachedValue, EffectDivergenceKind, EffectSeam, EnqueueVerdict, MailVerdict, ReplayEffects,
+        CachedValue, EffectDivergenceKind, EffectSeam, EnqueueVerdict, FILTERED, MailVerdict,
+        OutboundRequest, ReplayEffects, SentMail,
     };
     use crate::capsule::schema::{
         CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect, TenantEffect,
@@ -989,6 +1141,30 @@ mod tests {
             response_headers: Vec::new(),
             response_body: CapsuleBody::Text("{}".to_owned()),
             error: None,
+        }
+    }
+
+    /// A request half with nothing but a method and a URL — what most of these
+    /// fixtures record, so the request-half comparison is a no-op for them and
+    /// each test keeps testing the one thing it names.
+    fn call<'a>(method: &'a str, url: &'a str) -> OutboundRequest<'a> {
+        OutboundRequest {
+            method,
+            url,
+            headers: &[],
+            body: &CapsuleBody::Absent,
+        }
+    }
+
+    /// A message with the body and sender these fixtures record, so the
+    /// contents comparison is satisfied and each test keeps testing the one
+    /// thing it names.
+    fn sent<'a>(to: &'a [String], subject: &'a str, body: &'a CapsuleBody) -> SentMail<'a> {
+        SentMail {
+            to,
+            from: None,
+            subject,
+            body,
         }
     }
 
@@ -1013,8 +1189,11 @@ mod tests {
         });
 
         assert!(
-            tape.next_http("GET", "https://api.example/items?key=sk-live-42&page=2")
-                .is_some(),
+            tape.next_http(&call(
+                "GET",
+                "https://api.example/items?key=sk-live-42&page=2"
+            ))
+            .is_some(),
             "a masked query value must match whatever really stood there"
         );
         assert_eq!(
@@ -1040,7 +1219,7 @@ mod tests {
         });
         // Same masked prefix, different path: still a divergence.
         assert!(
-            tape.next_http("GET", "https://api.example/other?key=sk-live-42")
+            tape.next_http(&call("GET", "https://api.example/other?key=sk-live-42"))
                 .is_none()
         );
         assert_eq!(tape.divergences().len(), 1);
@@ -1080,11 +1259,11 @@ mod tests {
         });
 
         let first = tape
-            .next_http("GET", "https://a.example/one")
+            .next_http(&call("GET", "https://a.example/one"))
             .expect("the first recorded exchange serves the first call");
         assert_eq!(first.status, 200);
         let second = tape
-            .next_http("GET", "https://a.example/two")
+            .next_http(&call("GET", "https://a.example/two"))
             .expect("the second call takes the second exchange");
         assert_eq!(second.status, 503);
         assert!(tape.divergences().is_empty(), "a faithful run diverges not");
@@ -1094,7 +1273,7 @@ mod tests {
     fn an_outbound_call_the_capsule_never_recorded_is_a_divergence_not_a_live_call() {
         let tape = ReplayEffects::new(CapsuleEffects::default());
         assert!(
-            tape.next_http("POST", "https://payments.example/charge")
+            tape.next_http(&call("POST", "https://payments.example/charge"))
                 .is_none(),
             "an unrecorded call must never fall through to the network"
         );
@@ -1114,7 +1293,10 @@ mod tests {
             http: vec![http("GET", "https://a.example/one", 200)],
             ..CapsuleEffects::default()
         });
-        assert!(tape.next_http("GET", "https://b.example/other").is_none());
+        assert!(
+            tape.next_http(&call("GET", "https://b.example/other"))
+                .is_none()
+        );
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 1);
         assert_eq!(
@@ -1300,17 +1482,151 @@ mod tests {
             }],
             ..CapsuleEffects::default()
         });
+        let body = CapsuleBody::Text("thanks".to_owned());
         assert_eq!(
-            tape.next_mail(&["a@example.com".to_owned()], "Receipt"),
+            tape.next_mail(&sent(&["a@example.com".to_owned()], "Receipt", &body)),
             MailVerdict::Sent,
             "a recorded success is served as one, and nothing is delivered"
         );
         assert!(tape.divergences().is_empty());
         assert_eq!(
-            tape.next_mail(&["b@example.com".to_owned()], "Receipt"),
+            tape.next_mail(&sent(&["b@example.com".to_owned()], "Receipt", &body)),
             MailVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
+    }
+
+    #[test]
+    fn a_changed_outbound_body_diverges_rather_than_being_served_the_old_response() {
+        // Same endpoint, different message. Serving the recorded response here
+        // would hide the change and leave the final audit nothing to notice,
+        // so an unchanged failure would grade `reproduced`.
+        let mut recorded = http("POST", "https://payments.example/charge", 502);
+        recorded.request_body = CapsuleBody::Text("{\"amount\":10}".to_owned());
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![recorded],
+            ..CapsuleEffects::default()
+        });
+        let body = CapsuleBody::Text("{\"amount\":9999}".to_owned());
+        assert!(
+            tape.next_http(&OutboundRequest {
+                method: "POST",
+                url: "https://payments.example/charge",
+                headers: &[],
+                body: &body,
+            })
+            .is_none(),
+            "a different amount to the same endpoint is not the recorded call"
+        );
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1);
+        assert!(
+            divergences[0].detail.contains("its body"),
+            "the report must name what changed: {}",
+            divergences[0].detail
+        );
+        assert!(
+            !divergences[0].detail.contains("9999"),
+            "and must not quote the body itself: {}",
+            divergences[0].detail
+        );
+    }
+
+    #[test]
+    fn a_changed_outbound_header_diverges_but_a_masked_one_still_matches() {
+        let mut recorded = http("POST", "https://api.example/send", 200);
+        recorded.request_headers = vec![
+            ("authorization".to_owned(), FILTERED.to_owned()),
+            ("x-idempotency-key".to_owned(), "abc".to_owned()),
+        ];
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![recorded.clone(), recorded],
+            ..CapsuleEffects::default()
+        });
+        // The masked credential stands for whatever was really sent.
+        let faithful = [
+            ("authorization".to_owned(), "Bearer sk-live-42".to_owned()),
+            ("x-idempotency-key".to_owned(), "abc".to_owned()),
+        ];
+        assert!(
+            tape.next_http(&OutboundRequest {
+                method: "POST",
+                url: "https://api.example/send",
+                headers: &faithful,
+                body: &CapsuleBody::Absent,
+            })
+            .is_some(),
+            "a masked header value must match whatever really stood there"
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+        // An unmasked one that genuinely changed is a divergence.
+        let changed = [
+            ("authorization".to_owned(), "Bearer sk-live-42".to_owned()),
+            ("x-idempotency-key".to_owned(), "zzz".to_owned()),
+        ];
+        assert!(
+            tape.next_http(&OutboundRequest {
+                method: "POST",
+                url: "https://api.example/send",
+                headers: &changed,
+                body: &CapsuleBody::Absent,
+            })
+            .is_none()
+        );
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1);
+        assert!(
+            divergences[0].detail.contains("x-idempotency-key")
+                && !divergences[0].detail.contains("zzz"),
+            "the report names the header but never its value: {}",
+            divergences[0].detail
+        );
+    }
+
+    #[test]
+    fn a_changed_mail_body_or_sender_diverges_rather_than_replaying_clean() {
+        let recorded = MailEffect {
+            to: vec!["a@example.com".to_owned()],
+            from: Some("billing@shop.example".to_owned()),
+            subject: "Receipt".to_owned(),
+            body: CapsuleBody::Text("you paid $10".to_owned()),
+            error: None,
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![recorded.clone(), recorded],
+            ..CapsuleEffects::default()
+        });
+        let to = ["a@example.com".to_owned()];
+        let wrong_body = CapsuleBody::Text("you paid $10000".to_owned());
+        assert_eq!(
+            tape.next_mail(&SentMail {
+                to: &to,
+                from: Some("billing@shop.example"),
+                subject: "Receipt",
+                body: &wrong_body,
+            }),
+            MailVerdict::Diverged,
+            "same envelope, different letter — the recorded success must not be served"
+        );
+        let right_body = CapsuleBody::Text("you paid $10".to_owned());
+        assert_eq!(
+            tape.next_mail(&SentMail {
+                to: &to,
+                from: Some("noreply@shop.example"),
+                subject: "Receipt",
+                body: &right_body,
+            }),
+            MailVerdict::Diverged,
+            "and mail sent from the wrong address is a change too"
+        );
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 2);
+        assert!(
+            divergences[0].detail.contains("its body")
+                && divergences[1].detail.contains("its sender"),
+            "each report names what changed: {:?}",
+            divergences
+        );
     }
 
     #[test]

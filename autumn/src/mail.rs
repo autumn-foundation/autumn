@@ -655,7 +655,16 @@ fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     use crate::capsule::effects::MailVerdict;
 
     let tape = crate::capsule::effects::current_tape()?;
-    Some(match tape.next_mail(&mail.to, &mail.subject) {
+    // Derived by `capsule_body`, the same rule the recorder applies, so the
+    // comparison is like with like.
+    let body = capsule_body(mail);
+    let sent = crate::capsule::effects::SentMail {
+        to: &mail.to,
+        from: mail.from.as_deref(),
+        subject: &mail.subject,
+        body: &body,
+    };
+    Some(match tape.next_mail(&sent) {
         MailVerdict::Sent => Ok(()),
         // A recorded delivery *failure* is reproduced as one. A handler whose
         // bug is that it does not handle a suppressed recipient or an SMTP
@@ -717,20 +726,28 @@ const fn replayed_send(_mail: &Mail) -> Option<Result<(), MailError>> {
 /// that would dominate the capsule's size budget for no reproduction value.
 #[cfg(feature = "reporting")]
 fn mail_effect(mail: &Mail, error: Option<&MailError>) -> crate::capsule::MailEffect {
-    let body = mail
-        .text
-        .as_ref()
-        .or(mail.html.as_ref())
-        .map_or(crate::capsule::CapsuleBody::Absent, |body| {
-            crate::capsule::CapsuleBody::Text(body.clone())
-        });
     crate::capsule::MailEffect {
         to: mail.to.clone(),
         from: mail.from.clone(),
         subject: mail.subject.clone(),
-        body,
+        body: capsule_body(mail),
         error: error.map(ToString::to_string),
     }
+}
+
+/// The body a capsule records for one message.
+///
+/// One definition for both halves of the seam — the recorder stores this, and
+/// replay compares against it — so the two can never disagree about which of a
+/// multipart message's two bodies the capsule is talking about.
+#[cfg(feature = "reporting")]
+fn capsule_body(mail: &Mail) -> crate::capsule::CapsuleBody {
+    mail.text
+        .as_ref()
+        .or(mail.html.as_ref())
+        .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+            crate::capsule::CapsuleBody::Text(body.clone())
+        })
 }
 
 /// Tee a send that never reaches [`Mailer::send`] into the capsule.

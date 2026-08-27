@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Option<&ReplayClock>`. Capsules on disk are not migrated: replay them with
   the version that wrote them, or re-record. See
   [the migration guide](docs/migrations/next.md).
+  A capsule commits to a verdict only where it can be honest about one, so
+  four cases refuse or declare themselves incomplete rather than grade a run:
+  an outbound call or a mail send is served from the tape only when its
+  *contents* match too — same endpoint but a different amount, or the same
+  recipients but a different letter, is a divergence rather than a clean
+  reproduction; a job capsule whose payload `[log] filter_parameters` masked is
+  refused, because a handler is handed its payload verbatim and would parse the
+  `[FILTERED]` placeholder; an effect whose future was cancelled before it
+  finished (a losing `tokio::select!` branch) marks the capsule incomplete
+  instead of persisting a backend failure the run never had; and a run that
+  enqueued inside its own transaction (`enqueue_on_conn`) does the same, since
+  that enqueue is also a job-row INSERT on the database tape that replay can
+  serve but never issue. A **panicking** job now leaves a capsule whatever its
+  attempt number: all three backends dead-letter a panic immediately, so its
+  first attempt is also its last, and gating capture on the final attempt meant
+  the job failure most worth a capsule never produced one.
 
 ### Fixed
 

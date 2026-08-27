@@ -2141,11 +2141,6 @@ async fn run_job_handler(
     #[cfg(feature = "reporting")]
     if let Some(config) = state.extension::<crate::config::AutumnConfig>()
         && config.failure_capture.enabled
-        // Only the last attempt is captured. A job with `max_attempts = 25`
-        // that keeps failing would otherwise leave 25 near-identical capsules,
-        // each costing the worker an awaited directory-scan-and-write, and
-        // evict every other capsule in the directory on the way.
-        && final_attempt
     {
         let settings = std::sync::Arc::new(crate::capsule::settings_from_config(&config));
         // The same filter composition the capture layer uses, so one
@@ -2164,19 +2159,36 @@ async fn run_job_handler(
             settings,
             filter,
             run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt),
-            job_capsule_outcome,
+            |outcome| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
     }
     run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt).await
 }
 
-/// The capsule outcome a finished job execution records, or `None` when it
-/// succeeded and there is nothing to capture.
+/// The capsule outcome a finished job execution records, or `None` when there
+/// is nothing to capture — it succeeded, or it failed on an attempt that will
+/// be retried.
+///
+/// Every attempt is *captured*; only some are *persisted*. Capturing costs a
+/// task-local scope and a buffer the attempt drops on the way out, while
+/// persisting costs the worker an awaited directory-scan-and-write, so a job
+/// with `max_attempts = 25` that keeps failing must not leave 25 near-identical
+/// capsules and evict every other capsule in the directory on the way.
+///
+/// A **panic** is the exception, and it is why capture cannot be gated on
+/// `final_attempt` the way persistence is: all three backends dead-letter a
+/// panicked job immediately, whatever attempts remain, so its first attempt is
+/// also its last — and gating capture would mean the one job failure most
+/// worth a capsule never produced one.
 #[cfg(feature = "reporting")]
-fn job_capsule_outcome(outcome: &JobExecutionOutcome) -> Option<crate::capsule::CapsuleOutcome> {
+fn job_capsule_outcome(
+    outcome: &JobExecutionOutcome,
+    final_attempt: bool,
+) -> Option<crate::capsule::CapsuleOutcome> {
     match outcome {
         JobExecutionOutcome::Succeeded => None,
+        JobExecutionOutcome::Failed(_) if !final_attempt => None,
         JobExecutionOutcome::Failed(message) => Some(crate::capsule::CapsuleOutcome::Status {
             // A job has no HTTP status; 500 is the outcome shape a capsule
             // reader and the replay comparison already understand, and it is
@@ -2382,6 +2394,36 @@ fn replayed_enqueue(
         },
     )
 }
+
+/// Note that this run enqueued a job inside the caller's transaction, and mark
+/// the capsule incomplete.
+///
+/// A transactional enqueue is two recorded effects for one action: the
+/// [`JobEffect`](crate::capsule::JobEffect) this seam records, and the job-row
+/// INSERT the database tape records on the attributed connection. Replay
+/// serves the first and cannot issue the second — the free enqueue functions
+/// answer from the tape before any client is reached, and replay starts no job
+/// runtime to rebuild the statement (or the entropy draw that mints the job
+/// id) with. Leaving that mismatch in place would report an unchanged request
+/// as `diverged`, which is exactly the false signal the tape audit exists to
+/// avoid, so the capsule declares itself incomplete instead.
+#[cfg(all(feature = "reporting", feature = "db"))]
+fn note_transactional_enqueue() {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(TRANSACTIONAL_ENQUEUE_NOTE);
+        scope.mark_truncated();
+    }
+}
+
+/// No capsule support compiled in: nothing to note.
+#[cfg(all(not(feature = "reporting"), feature = "db"))]
+const fn note_transactional_enqueue() {}
+
+/// Why a capsule from a run that used `enqueue_on_conn` is not replayable.
+#[cfg(all(feature = "reporting", feature = "db"))]
+const TRANSACTIONAL_ENQUEUE_NOTE: &str = "the run enqueued a job inside its own transaction (`enqueue_on_conn`), which the capsule \
+     records both as an enqueue and as the job-row INSERT on the database tape; replay can \
+     serve the first but never issue the second, so the recording is not replayable";
 
 /// A relative delay in whole seconds, for the capsule's enqueue comparison.
 ///
@@ -3749,6 +3791,15 @@ impl JobClient {
         // then report an unrecorded-effect divergence on replay.
         if let Some(answer) = replayed_enqueue(name, &payload, None) {
             return answer;
+        }
+        // On the postgres backend this enqueue is *also* a row INSERT on the
+        // caller's connection, which the database tape records — and which
+        // replay can never re-issue, because it short-circuits above and boots
+        // no job runtime to build the statement with. The recorded exchange
+        // would then sit unclaimed and grade an unchanged request `diverged`.
+        // Say so on the capsule rather than issue that verdict.
+        if self.pg_pool.is_some() {
+            note_transactional_enqueue();
         }
         let slot = reserve_enqueue(&payload);
         let result = self

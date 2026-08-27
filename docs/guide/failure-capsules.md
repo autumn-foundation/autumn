@@ -274,10 +274,10 @@ effect because your handler reached it a different way:
 
 | Seam | Captured at | Replayed as |
 | --- | --- | --- |
-| Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back; **no socket is opened**. Outbound webhook deliveries are covered here too — they send through the same client |
+| Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. Outbound webhook deliveries are covered here too, they send through the same client |
 | Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording and returns `Ok(())`; **nothing is written to a queue and no job runs** |
 | Cache | `cache::get_cached` / `insert_cached` | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write lands in the tape, so a read-back in the same run finds it |
-| Mail | `Mailer::send` | The send is asserted; **nothing is delivered** |
+| Mail | `Mailer::send` | The send is asserted against the recorded recipients, subject, sender and body; **nothing is delivered** |
 | Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration |
 | Randomness | `state.entropy()` | Every draw replays byte-for-byte, so the session id, CSRF token, request id or job id the failing request minted reappears |
 
@@ -431,7 +431,7 @@ A verdict is machine-readable JSON on **stdout** and a human summary on
 | `reproduced` | Same outcome — status code, message and Problem Details type — and both the database traffic and the effect tape matched the recording. The bug is still there. | `0` |
 | `mismatch` | The tape lined up but the outcome differs, in the code, the message or the problem type. Usually what you want after a fix. | `1` |
 | `diverged` | The code asked the database — or an effect seam — something the recording never asked: an unrecorded query, an outbound call the capsule has no response for, an enqueue or mail send the recording never made, a recorded one the run never made. The comparison was not fair, so a divergence outranks a matching status. | `1` |
-| `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded or only partly read (over `max_body_bytes`, an unparseable structured body, or a handler that abandoned the read), an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
+| `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded or only partly read (over `max_body_bytes`, an unparseable structured body, or a handler that abandoned the read), a job capsule whose payload was masked by `[log] filter_parameters`, an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
 
 A `diverged` verdict is not a failure of the tool. It is the tool telling you
 that a status matching by luck, while the queries differ, is not a
@@ -867,6 +867,24 @@ What capsules do not do, stated plainly:
   outbound call from a spawned task there reaches the network. Mail handed to
   `Mailer::deliver_later` is spawned for the same reason and behaves the same
   way. Keep the effects a capsule needs on the awaited path.
+- **A transactional enqueue makes a capsule unreplayable.** `enqueue_on_conn`
+  (and its delayed and absolute variants) is two recorded effects for one
+  action on the `postgres` backend: the enqueue itself, and the job-row INSERT
+  on the caller's connection, which the database tape records. Replay serves
+  the first and can never issue the second — it answers the enqueue from the
+  tape before any job client is reached, and it starts no job runtime to
+  rebuild the statement with. Rather than report an unchanged request as
+  `diverged`, the capsule notes the enqueue and marks itself incomplete.
+- **A job capsule whose payload was redacted is refused.** A job handler is
+  handed its payload *verbatim*, so unlike an effect there is no wildcard
+  reading of `[FILTERED]` at that boundary: the handler would parse or branch
+  on the placeholder. Redaction is not reversible, so the capsule is refused
+  by name rather than replayed against input production never had.
+- **An effect still in flight when the recording ends is not an outcome.** A
+  seam takes its tape position when the effect *starts*; a future cancelled
+  before it finishes — the losing branch of a `tokio::select!`, a timeout —
+  never completes its slot. Rather than persist the placeholder as a recorded
+  backend failure, the capsule notes it and marks itself incomplete.
 - **Only `get_cached` / `insert_cached` are on the cache seam.** The untyped
   `cache::get` / `cache::insert`, and `Cache::invalidate` / `Cache::clear`, are
   not: during a replay they reach whatever backend is installed (none, under

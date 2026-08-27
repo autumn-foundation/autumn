@@ -1130,6 +1130,34 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
              say which case this was; raise `max_body_bytes` and re-record if it was the cap."
         ));
     }
+    if capsule.job.is_some() {
+        // The job payload is the *input* a job capsule replays on, and unlike
+        // an effect it is handed to the handler verbatim: there is no wildcard
+        // reading of `[FILTERED]` at the entry boundary, because the handler
+        // parses the document rather than being compared against it. So a
+        // masked field reaches the code as the literal placeholder — a
+        // `serde` field that no longer deserializes, a branch that takes the
+        // wrong arm — and the verdict describes a run that never happened.
+        // The original bytes are gone by construction, so this is a refusal.
+        let masked: Vec<&str> = capsule
+            .request
+            .redacted_keys
+            .iter()
+            .filter_map(|key| key.strip_prefix("job_entry."))
+            .collect();
+        if !masked.is_empty() {
+            return Some(format!(
+                "the job payload this capsule replays on had {} field(s) masked by \
+                 `[log] filter_parameters` ({}). A job handler is handed its payload verbatim, \
+                 so it would parse or branch on the `[FILTERED]` placeholder rather than the \
+                 value production ran on, and the verdict would describe a run that never \
+                 happened. Redaction is not reversible: unfilter the field for this job, or \
+                 debug it from the recorded outcome instead.",
+                masked.len(),
+                masked.join(", ")
+            ));
+        }
+    }
     None
 }
 
@@ -1631,6 +1659,36 @@ mod tests {
         capsule.request.body = CapsuleBody::Text("{}".to_owned());
         assert!(refusal_reason(&capsule).is_none());
         capsule.request.body = CapsuleBody::Absent;
+        assert!(refusal_reason(&capsule).is_none());
+    }
+
+    /// A job payload is *input*, handed to the handler verbatim. Unlike an
+    /// effect it is never compared, so `[FILTERED]` has no wildcard reading
+    /// here — the handler simply parses the placeholder.
+    #[test]
+    fn a_job_capsule_whose_payload_was_redacted_is_refused() {
+        let mut capsule = fixture(status(500));
+        capsule.job = Some(crate::capsule::schema::CapsuleJob {
+            name: "charge".to_owned(),
+            payload: serde_json::json!({"api_key": "[FILTERED]", "order": 7}),
+        });
+        // A job capsule whose payload survived redaction intact still replays.
+        assert!(refusal_reason(&capsule).is_none());
+
+        capsule.request.redacted_keys = vec!["job_entry.api_key".to_owned()];
+        let reason = refusal_reason(&capsule).expect("a masked job payload is refused");
+        assert!(
+            reason.contains("api_key"),
+            "the refusal must name the field that was masked: {reason}"
+        );
+        assert!(
+            reason.contains("filter_parameters"),
+            "and point at the knob that masked it: {reason}"
+        );
+
+        // The same key on a *request* capsule is not this refusal: a request
+        // body is compared, not parsed, so redaction is tolerated there.
+        capsule.job = None;
         assert!(refusal_reason(&capsule).is_none());
     }
 
