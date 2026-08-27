@@ -222,7 +222,8 @@ has one, which is how a capsule on disk is tied back to a log line.
         "status": 503, "response_headers": [], "response_body": { "text": "upstream busy" },
         "error": null }
     ],
-    "jobs": [{ "name": "send_receipt", "payload": { "order": 42 }, "delay_secs": null }],
+    "jobs": [{ "name": "send_receipt", "payload": { "order": 42 }, "delay_secs": null,
+               "error": null }],
     "cache": [{ "op": "get", "key": "tax_rate:CA", "value": "eyJyYXRlIjowLjA5fQ==" }],
     "mail": [],
     "tenant": { "id": "acme" },
@@ -427,9 +428,9 @@ A verdict is machine-readable JSON on **stdout** and a human summary on
 
 | Verdict | Meaning | Exit |
 | --- | --- | --- |
-| `reproduced` | Same outcome — status code, message and Problem Details type — and the database traffic matched the tape. The bug is still there. | `0` |
+| `reproduced` | Same outcome — status code, message and Problem Details type — and both the database traffic and the effect tape matched the recording. The bug is still there. | `0` |
 | `mismatch` | The tape lined up but the outcome differs, in the code, the message or the problem type. Usually what you want after a fix. | `1` |
-| `diverged` | The code asked the database something the recording never asked, so the run was not a fair comparison. A divergence outranks a matching status. | `1` |
+| `diverged` | The code asked the database — or an effect seam — something the recording never asked: an unrecorded query, an outbound call the capsule has no response for, an enqueue or mail send the recording never made, a recorded one the run never made. The comparison was not fair, so a divergence outranks a matching status. | `1` |
 | `refused` | Nothing was replayed — a truncated capsule, a capsule whose request body was never recorded or only partly read (over `max_body_bytes`, an unparseable structured body, or a handler that abandoned the read), an unknown `format_version`, an unreadable file, or a `PostgreSQL` tape handed to a `sqlite` build. | `2` |
 
 A `diverged` verdict is not a failure of the tool. It is the tool telling you
