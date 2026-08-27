@@ -1393,7 +1393,7 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
                 .unwrap_or_else(|_| "{}".to_owned())
         );
     } else {
-        print!("{}", scaffold::render_text(&report));
+        print!("{}", scaffold::render_summary(&report));
     }
     if report.drifted() { DRIFT_EXIT_CODE } else { 0 }
 }

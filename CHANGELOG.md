@@ -43,10 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconciler render from one shared function, so what the scaffold writes and
   what the upgrade considers current cannot drift apart.
 
+  Nothing that cannot be read is ever written: a framework-owned path that is a
+  symlink, a directory, or not UTF-8 is reported as a conflict and left exactly
+  as it is, rather than being mistaken for a missing file and truncated —
+  which matters most for the projects with no manifest, where nothing else
+  vouches for the file. Writes go through a temporary file in the same
+  directory and are renamed into place, keeping the original's permissions, so
+  an interrupted apply cannot leave a half-written `Dockerfile`. The project
+  name is read from `[package] name` and validated, never guessed from the
+  directory: it is interpolated into `autumn.toml`, the CI workflow and the
+  `Dockerfile`'s `CMD`, so a guessed name would render a different scaffold and
+  rewrite files that had not actually drifted.
+
   New: `autumn upgrade --check` reconciles the scaffold files, writes nothing,
   and exits `3` when anything has drifted, so CI can gate on scaffold freshness
   (`1` still means the apply step died partway, and a deliberately deleted file
-  does not hold the gate red forever). Every report ends with a link to that
+  does not hold the gate red forever). It prints verdicts without the per-file
+  diffs, so a CI log does not accumulate the working contents of `autumn.toml`. Every report ends with a link to that
   release's migration guide, so file reconciliation and API migration are one
   workflow. `--json` carries the whole thing under a `scaffold` key.
   [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end

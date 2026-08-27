@@ -173,6 +173,11 @@ In every diff, `-` is what your project has now and `+` is what this release's
 scaffold writes. For a `conflict` that is a description of the difference, not
 of an impending write — a conflict is never applied.
 
+The scaffold half always reconciles to **this CLI's own release**. `--to`
+selects which codemods run against your Rust code; it cannot conjure a
+historical scaffold, because the CLI ships exactly one set of templates — its
+own. Downgrades and arbitrary historical scaffold versions are out of scope.
+
 ### Which files it owns
 
 | Owned — reconciled | Not owned — never touched |
@@ -200,6 +205,15 @@ your release's [migration guide](../migrations/README.md) to work through.
 | `conflict` | The template changed and your copy may be yours now. | **no** |
 | `removed` | Autumn wrote this file once and you deleted it. | **no** |
 
+A `conflict` says which of four things it is:
+
+| Reason | When |
+|---|---|
+| `you changed this since it was scaffolded` | The file no longer matches the digest Autumn recorded for it. |
+| `no recorded baseline, so an edit cannot be ruled out` | Nothing was recorded for this file — see [Projects older than this feature](#projects-older-than-this-feature). |
+| `on disk but unreadable as text, so its contents are unknown` | It is not UTF-8, it is a directory, or the process cannot open it. What it holds is unknown, so it is untouchable. |
+| `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. |
+
 ### How it knows you edited a file
 
 "May I overwrite this?" is really "did you touch it?", and neither the file's
@@ -220,10 +234,18 @@ bundled_pg = false
 
 **Commit that file.** Its entire value is being the baseline a *later* checkout
 compares against. It holds a release, the flags the project was created with,
-and one digest per file — no paths outside the project, and nothing secret.
-`autumn upgrade --apply` refreshes it, and it moves its recorded `version`
-forward only once no conflicts are left, so a half-finished upgrade never reads
-as a finished one.
+and one digest per file — no paths outside the project, and nothing secret (the
+digests are of Autumn's own template text, never of your content).
+
+`version` means "the release these files were last *fully* reconciled to".
+`autumn upgrade --apply` refreshes the file, and moves `version` forward only
+once no conflicts are left — so a half-finished upgrade never reads as a
+finished one, and a project that has never been fully reconciled simply has no
+`version` line rather than a flattering guess.
+
+Writes go through a temporary file in the same directory and are renamed into
+place, keeping the original's permissions, so an interrupted `--apply` cannot
+leave you with a half-written `Dockerfile`.
 
 Line endings are normalised before hashing, so a `core.autocrlf` checkout on
 Windows is not mistaken for you having personally rewritten all twelve files.
@@ -242,10 +264,22 @@ upgrade is best effort:
 The report says so up front. Once you have run `--apply` once, the manifest
 exists and every later upgrade gets the sharper answer.
 
-Flavor is inferred the same way when there is no manifest: a project with no
-`static/` directory and no `tailwind.config.js` is treated as an `--api` app
-and is never offered Tailwind files; an `i18n/` directory means the project was
-made with `--with-i18n`.
+Flavor is inferred the same way when there is no manifest, and deliberately
+needs *positive* evidence of the fullstack CSS pipeline: a `tailwind.config.js`,
+a `static/css/` directory, or the vendored `static/js/htmx.min.js`. Any one is
+enough, so deleting a single file cannot reclassify your project — and a JSON
+API that happens to serve its `openapi.json` out of `static/` is not handed a
+Tailwind config it has no use for. An `i18n/` directory means the project was
+made with `--with-i18n`, and `autumn.toml`'s own daemon markers identify the
+daemon flavors.
+
+The project's name comes from `[package] name` in `Cargo.toml` and from nowhere
+else — never the directory name. `autumn.toml`, `.env.example`, the CI workflow
+and the `Dockerfile`'s `CMD` all interpolate it, so a guessed name would render
+a *different* scaffold and could rewrite `COPY --from=builder
+/app/target/release/<name>` into an image that cannot start. If your manifest
+gives no usable package name, the scaffold half says so and reconciles nothing
+rather than comparing against a fiction.
 
 ### Reverting
 
@@ -268,8 +302,9 @@ hatch.
 autumn upgrade --check
 ```
 
-`--check` reconciles the scaffold files, writes nothing, and exits **3** when
-anything has drifted — so a CI job can fail the build on a stale skeleton:
+`--check` reconciles the scaffold files, writes nothing, prints the verdicts
+without the per-file diffs (a build log is a poor place for the working
+contents of `autumn.toml`), and exits **3** when anything has drifted — so a CI job can fail the build on a stale skeleton:
 
 ```yaml
 - name: Scaffold is current
@@ -346,7 +381,7 @@ Only step 3 writes anything, and step 4 shows you all of it.
 | `--to VERSION` | Upgrade to this release instead of the CLI's own version. |
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |
-| `--check` | Reconcile the scaffold files only, write nothing, and exit `3` if any have drifted. For CI. Cannot be combined with `--apply`. |
+| `--check` | Reconcile the scaffold files only, write nothing, print verdicts without diffs, and exit `3` if any have drifted. For CI. Cannot be combined with `--apply`. |
 
 ## Exit codes
 

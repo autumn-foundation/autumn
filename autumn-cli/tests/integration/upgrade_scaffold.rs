@@ -320,3 +320,102 @@ fn an_api_project_is_never_offered_fullstack_files() {
     assert!(!root.join("tailwind.config.js").exists(), "{out}");
     assert!(!root.join("static/css/input.css").exists(), "{out}");
 }
+
+#[test]
+fn a_file_that_is_not_utf8_is_never_treated_as_missing_and_overwritten() {
+    // The population this protects is every project that exists today: without
+    // a provenance manifest there is no baseline, so a file misread as absent
+    // would be classified `add` and truncated. `read_to_string` fails on
+    // non-UTF-8 exactly as it does on a missing file, and those two must not
+    // reach the classifier as the same answer.
+    let (_tmp, root) = new_project("binary", &[]);
+    fs::remove_dir_all(root.join(".autumn")).unwrap();
+    let mine: &[u8] = &[0xff, 0xfe, b'A', 0x00, b'B', 0x00];
+    fs::write(root.join(".env.example"), mine).unwrap();
+
+    let output = run(&root, &["--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let out = stdout_of(&output);
+    assert!(out.contains(".env.example"), "{out}");
+    assert!(out.contains("conflict"), "{out}");
+    assert_eq!(
+        fs::read(root.join(".env.example")).unwrap(),
+        mine,
+        "an unreadable file must survive --apply byte for byte"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_scaffold_file_is_never_written_through() {
+    // A monorepo hoists shared config and symlinks it back into each crate.
+    // Writing through the link edits a file outside the project, which
+    // `git diff` inside the project would not even show.
+    let (tmp, root) = new_project("linked", &[]);
+    let shared = tmp.path().join("shared-rustfmt.toml");
+    fs::write(&shared, "edition = \"2015\"\n").unwrap();
+    fs::remove_file(root.join("rustfmt.toml")).unwrap();
+    std::os::unix::fs::symlink(&shared, root.join("rustfmt.toml")).unwrap();
+
+    let output = run(&root, &["--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let out = stdout_of(&output);
+    assert!(out.contains("rustfmt.toml"), "{out}");
+    assert!(out.contains("symlink"), "{out}");
+    assert_eq!(
+        fs::read_to_string(&shared).unwrap(),
+        "edition = \"2015\"\n",
+        "the link target lives outside the project and must never be written"
+    );
+    assert!(
+        root.join("rustfmt.toml")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link itself must be left in place"
+    );
+}
+
+#[test]
+fn a_to_version_does_not_pretend_to_reconcile_a_historical_scaffold() {
+    // This CLI ships one set of scaffold templates: its own. `--to` selects
+    // which codemods run; downgrades and historical scaffolds are out of scope,
+    // and a report claiming otherwise would be false.
+    let (_tmp, root) = new_project("pinned", &[]);
+    let output = run(&root, &["--to", "0.6.0"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let out = stdout_of(&output);
+    let scaffold_line = out
+        .lines()
+        .find(|line| line.starts_with("Scaffold files"))
+        .unwrap_or_else(|| panic!("no scaffold header in:\n{out}"));
+    assert!(
+        scaffold_line.contains(env!("CARGO_PKG_VERSION")),
+        "{scaffold_line}"
+    );
+    assert!(!scaffold_line.contains("0.6.0"), "{scaffold_line}");
+}
+
+#[test]
+fn check_mode_does_not_print_file_contents_into_the_build_log() {
+    // `--check` is documented as a CI gate, and `autumn.toml` / `.env.example`
+    // are where people put connection strings. The gate needs the verdict and
+    // the file names, not the working contents.
+    let (_tmp, root) = new_project("quiet", &[]);
+    fs::write(
+        root.join(".env.example"),
+        "DATABASE_URL=postgres://user:hunter2@db.internal/prod\n",
+    )
+    .unwrap();
+
+    let output = run(&root, &["--check"]);
+    assert_eq!(output.status.code(), Some(3), "{}", report(&output));
+    let out = stdout_of(&output);
+    assert!(out.contains(".env.example"), "{out}");
+    assert!(out.contains("conflict"), "{out}");
+    assert!(!out.contains("hunter2"), "{out}");
+    // ...while the full report, which a human asked for, still shows the diff.
+    let full = stdout_of(&run(&root, &[]));
+    assert!(full.contains("hunter2"), "{full}");
+}

@@ -2850,7 +2850,7 @@ mod tests {
 
         assert!(root.join(MANIFEST_PATH).is_file(), "no scaffold manifest");
         let manifest = Manifest::load(&root).expect("manifest parses");
-        assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(manifest.options, GenerateOptions::default());
         // Every framework-owned file it just wrote has a baseline digest.
         for path in framework_owned_files(
