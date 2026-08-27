@@ -388,6 +388,15 @@ family colliding with a name already emitted is skipped with a warning.
 
 ---
 
+## A worked example
+
+`examples/bookmarks` records one counter and one timer through this facade:
+`bookmarks_created_total{outcome}` in the create handler and
+`bookmark_stats_query_seconds` around the two grouped aggregates behind
+`/bookmarks/stats`. `src/metrics.rs` holds the names, the `describe()` call
+`main` makes at startup, and the assertions against both actuator endpoints;
+`src/routes/bookmarks.rs` holds the one-line call sites.
+
 ## Testing
 
 The registry is process-global and tests run concurrently, so give each test its

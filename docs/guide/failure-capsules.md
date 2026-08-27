@@ -604,6 +604,18 @@ This is the first slice. What it does not do, stated plainly:
 
 ---
 
+## A worked example
+
+`examples/reddit-clone` carries the whole loop: an `autumn-capsules.toml`
+profile that arms capture (deliberately its own profile, not a dev default), a
+capsule recorded from `/dev/trigger-error` committed under `capsules/`, a README
+walkthrough of `autumn replay`, and `tests/failure_capsule.rs` asserting that
+the profile arms capture while the others do not, that one failing request
+leaves exactly one capsule and a `4xx` leaves none, and that the committed
+capsule parses through the same `Capsule::from_json` the replay CLI uses. Its
+`capsules/README.md` explains why that one capsule is safe to commit and yours
+is not.
+
 ## See also
 
 - [Error Reporting](./error-reporting.md) — the pipeline that decides a request

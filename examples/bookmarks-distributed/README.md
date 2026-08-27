@@ -21,6 +21,7 @@ runtime seams pulled into the open instead of hidden behind happy-path defaults.
 | **Compose deployment** | `docker-compose.yml` + `docker/` | Primary + streaming replica + one-shot migrator + 2 web replicas + nginx |
 | **Shared signing secret** | `docker-compose.yml` + `autumn-docker.toml` | All replicas share `AUTUMN_SECURITY__SIGNING_SECRET` so sessions and CSRF tokens survive load-balanced requests |
 | **Redis session backend** | `autumn-docker.toml` | Sessions stored in Redis so any replica can read a session established by another |
+| **Self-clustering substrate** | `autumn-docker.toml` `[cluster]` + `docker-compose.yml` + `routes/cluster.rs` | The two web replicas form a two-node cluster with **no** coordination service — no Redis, no Postgres, no etcd — sharing a member view and a cluster-wide bookmark counter over an authenticated (HMAC-SHA256) link |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
 
 ## Prerequisites
@@ -40,7 +41,11 @@ From the **workspace root** (`autumn/`):
 #    replica will be rejected by the others.
 export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 
-# 2. Build and start the full stack
+# 2. Generate the shared cluster secret. Same rule: identical on every node,
+#    at least 16 bytes. See docs/guide/clustering.md.
+export AUTUMN_CLUSTER__SECRET="$(openssl rand -hex 32)"
+
+# 3. Build and start the full stack
 docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --build
 ```
 
@@ -49,7 +54,7 @@ into every web replica via the `x-bookmarks-base` anchor. Compose will refuse
 to start if the variable is unset — that mirrors the hard startup failure you
 would see in a production Autumn app.
 
-`autumn-docker.toml` wires three additional things:
+`autumn-docker.toml` wires four additional things:
 - `[database] primary_url` / `replica_url` -- the same first-class topology
   contract used by Autumn itself. The old `[distributed.database]` shape is
   still accepted by the example loader only as a migration bridge.
@@ -58,6 +63,8 @@ would see in a production Autumn app.
   `bookmarks-2`.
 - `[security.signing_secret]` — the runtime secret comes from the env var
   above; the comment reminds you not to hardcode a value in the TOML file.
+- `[cluster] enabled = true` — the two web replicas gossip directly to each
+  other. See "The two-node cluster" below.
 
 That stack brings up:
 
@@ -158,6 +165,71 @@ curl -X PUT http://localhost:3000/api/bookmarks/1 \
   -d '{"title":"Rust Lang","tag":"rust","alive":true}'
 ```
 
+## The two-node cluster
+
+The compose stack already ran two web replicas behind nginx. `[cluster]` makes
+them a *cluster*: each node knows which nodes it believes are running, and they
+share one distributed primitive — a grow-only cluster-wide counter — with **no
+external coordination service**. Not Redis (which this stack does run, for
+sessions and cache), not Postgres, not etcd. The substrate is compiled into
+`autumn-web` and switched on by config. See
+[`docs/guide/clustering.md`](../../docs/guide/clustering.md).
+
+What makes it work, and where each piece lives:
+
+| Piece | Where | Why |
+|---|---|---|
+| `enabled`, `cluster_name`, `bind_addr`, intervals | `autumn-docker.toml` `[cluster]` | Identical on both nodes, so it belongs in the profile |
+| `AUTUMN_CLUSTER__SECRET` | `docker-compose.yml`, from your shell | A `SecretString` shared by every node; never committed |
+| `AUTUMN_CLUSTER__NODE_ID`, `ADVERTISE_ADDR`, `SEED_PEERS` | `docker-compose.yml`, per replica | Per-instance identity — the only values that differ |
+| Fixed IPs on the `bookmarks` network | `docker-compose.yml` `networks:` | `[cluster]` parses socket addresses and does **not** resolve hostnames, so the service names the rest of the stack uses are not usable as an advertise address |
+| `/cluster` route, counter increment | `src/routes/cluster.rs`, `src/routes/bookmarks.rs` | The application-visible surface |
+
+`bind_addr` is `0.0.0.0:7946` — a wildcard bind, which *requires* an explicit
+`advertise_addr`, because `0.0.0.0` is not an address a peer can dial. Both
+nodes must be dialable at the address they advertise: replies never travel back
+over an accepted inbound socket, so a node its peer cannot reach converges on a
+one-member view forever. `seed_peers` decides who makes first contact, not who
+has to be reachable — which is why only `bookmarks-2` carries one.
+
+### Watch it converge
+
+```bash
+# Both nodes report the same two members, within a couple of push intervals.
+docker compose -f examples/bookmarks-distributed/docker-compose.yml \
+  exec bookmarks-1 sh -c 'wget -qO- localhost:3000/actuator/health' \
+  | jq '.components["cluster:membership"].details | {node_id, member_count}'
+
+# Through nginx: repeated calls land on alternating replicas, so `node`
+# flips between web-1 and web-2 while the counter agrees on both.
+for i in 1 2 3 4; do curl -s localhost:3000/cluster | jq -c '{node, bookmarks_created}'; done
+```
+
+Create a bookmark on whichever replica nginx picks, then poll `/cluster` again:
+the total shows up on the *other* node within a push interval (500 ms here),
+with nothing coordinating the two processes.
+
+Stop one replica and the survivor converges to a one-member view — which is
+**healthy**. The `cluster:membership` indicator registers in the `HealthOnly`
+group, so it never gates `/ready` and an orchestrator cannot be tricked into
+restarting the survivor because its peer went away.
+
+The same facts are on `/actuator/metrics` as `autumn_cluster_members`,
+`autumn_cluster_pushes_sent_total`, `autumn_cluster_merges_applied_total` and
+`autumn_cluster_frames_rejected_total` — a steady
+`frames_rejected_total{reason="mac"}` means somebody is talking to your cluster
+port with the wrong secret.
+
+### What the counter is not
+
+It is eventually consistent, it lives in process memory (a restarted node
+starts its own entry at zero), and its traffic is authenticated but **not**
+encrypted. `get()` may jump upward as a peer's state merges in and never moves
+downward, so treat it as a lower bound on the true total — never as a limit to
+enforce. It cannot fence anything: work that must run on exactly one replica
+belongs to [distributed locks](../../docs/guide/distributed-locks.md) or the
+multi-replica scheduler, which is what `tasks.rs` already uses.
+
 ## Verifying cross-replica session consistency
 
 Once the stack is up, you can confirm that a session established on one replica
@@ -206,6 +278,12 @@ page), regardless of which replica handles it.
 - The distributed state lives beside Autumn's normal app state instead of inside
   it. That is an escape hatch, but it also shows where a future framework helper
   might reduce ceremony without hiding the runtime truth.
+- The cluster substrate needs *per-instance* identity that a shared profile
+  file cannot express — a node id and a dialable advertise address — and it
+  does not resolve hostnames, so the compose service names the rest of the
+  stack relies on are unusable there. That is what forced an explicitly
+  addressed compose network onto an example that had been happy with the
+  default one.
 - Signing secrets must be provisioned before `docker compose up`. The compose
   file uses `${AUTUMN_SECURITY__SIGNING_SECRET:?...}` syntax so that Compose
   itself fails loudly if the variable is missing — rather than silently starting
