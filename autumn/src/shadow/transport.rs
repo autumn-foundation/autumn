@@ -266,6 +266,16 @@ pub(crate) fn decode_body(
 ) -> Result<bytes::Bytes, ShadowError> {
     use std::io::Read as _;
 
+    // Nothing to decode. A `HEAD` response carries no body while keeping its
+    // representation headers, so it arrives here as zero bytes still declaring
+    // `Content-Encoding: gzip` — and a decoder handed zero bytes fails with an
+    // unexpected EOF. Reporting that as a transport error would have two
+    // identical builds increment `shadow_errors` and never be compared at all,
+    // on every precompressed route that answers `HEAD`.
+    if body.is_empty() {
+        return Ok(body);
+    }
+
     let Some(encoding) = content_encoding else {
         return Ok(body);
     };
@@ -523,6 +533,25 @@ mod tests {
 
         let decoded = decode_body(Some("gzip"), gzipped, 4096).expect("decode");
         assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn an_empty_body_needs_no_decoding_whatever_it_declares() {
+        // A `HEAD` keeps its representation headers and sends no body, so this
+        // is the shape that reaches the decoder for a precompressed route.
+        for encoding in [
+            Some("gzip"),
+            Some("br"),
+            Some("deflate"),
+            Some("identity"),
+            None,
+        ] {
+            assert_eq!(
+                decode_body(encoding, bytes::Bytes::new(), 4096),
+                Ok(bytes::Bytes::new()),
+                "{encoding:?}"
+            );
+        }
     }
 
     #[test]

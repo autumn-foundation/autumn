@@ -1371,6 +1371,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_head_on_a_precompressed_route_still_compares() {
+        // A `HEAD` sends no body while keeping its representation headers, so
+        // both sides arrive as zero bytes still declaring `Content-Encoding:
+        // gzip`. Handing that to a decoder fails with an unexpected EOF — which
+        // would have two identical builds counted as `shadow_errors` and never
+        // compared, on every precompressed route answering `HEAD`.
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: "",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(service_fn(
+            |_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(Body::from(gzipped(br#"{"ok":true}"#)))
+                        .expect("valid response"),
+                )
+            },
+        ));
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        settle("the HEAD comparison to be recorded", || {
+            registry.stats().compared == 1
+        })
+        .await;
+        let stats = registry.stats();
+        assert_eq!(stats.matched, 1, "a HEAD compares on status class alone");
+        assert_eq!(
+            stats.shadow_errors, 0,
+            "an empty body is not a decode failure"
+        );
+    }
+
+    #[tokio::test]
     async fn a_malformed_encoding_is_an_error_not_a_size_skip() {
         // An operator seeing `skipped_oversize` would go looking for a body
         // over `max_body_bytes`, when the real problem is a response whose
