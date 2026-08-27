@@ -1522,7 +1522,7 @@ fn render_mobile_main_rs(package_name: &str) -> String {
 const SYNC_LIB_DOC: &str = "\
 //!
 //! OFFLINE SYNC (--offline-sync): app data lives in a local SyncStore-backed
-//! SQLite database inside the app sandbox, and a background SyncEngine
+//! `SQLite` database inside the app sandbox, and a background SyncEngine
 //! reconciles it with the remote deployment's /sync endpoints whenever the
 //! network allows — the device itself needs NO direct database connection.
 //! See docs/guide/tauri-mobile-offline-sync.md.

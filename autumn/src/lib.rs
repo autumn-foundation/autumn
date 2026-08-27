@@ -317,7 +317,7 @@ pub mod retention;
 #[cfg(feature = "db")]
 pub mod read_your_writes;
 
-/// Offline-first local SQLite store and background sync engine for
+/// Offline-first local `SQLite` store and background sync engine for
 /// occasionally-connected apps (e.g. Tauri mobile).
 ///
 /// See the [`sync`] module documentation for the architecture (change
