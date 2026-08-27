@@ -1131,23 +1131,75 @@ fn assert_no_import_surface(project: &Path, expect_no_multipart: bool) {
 /// The strongest form of "additive": for a variant that cannot have the import,
 /// passing `--import` must change NOTHING. A grep only sees the strings it was
 /// told to look for; this compares the whole generated tree.
-/// Replace a migration directory's 14-digit generation timestamp with a fixed
-/// placeholder, so two scaffolds generated a second apart compare equal.
+/// A path relative to the project root, with a migration directory's 14-digit
+/// generation timestamp replaced by a fixed placeholder and `/` as the
+/// separator on every platform.
 ///
-/// Deliberately narrow: it rewrites only a `migrations/<14 digits>_` prefix, so
-/// a digit run anywhere else in a path — or in a file's contents — is untouched.
-fn normalize_migration_timestamp(rel: &str) -> String {
-    let Some(rest) = rel.strip_prefix("migrations/") else {
-        return rel.to_owned();
-    };
-    let Some((stamp, tail)) = rest.split_once('_') else {
-        return rel.to_owned();
-    };
-    if stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()) {
-        format!("migrations/<timestamp>_{tail}")
-    } else {
-        rel.to_owned()
+/// Two things it must survive, both learned the hard way:
+///
+/// * the two scaffolds this compares are separate process runs, so they straddle
+///   a second boundary often enough to matter — hence the placeholder;
+/// * this runs on Windows too, where `Path::display()` writes `\` — hence
+///   walking COMPONENTS rather than stripping a `"migrations/"` string prefix,
+///   which silently never matched there and turned the flake into a hard
+///   failure on the slowest runner.
+///
+/// Deliberately narrow: it rewrites only a 14-digit component directly under
+/// `migrations/`, so a digit run anywhere else in a path — or in a file's
+/// contents — is untouched.
+fn normalized_relative_path(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).expect("under root");
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.first().map(String::as_str) == Some("migrations")
+        && let Some(dir) = parts.get_mut(1)
+        && let Some((stamp, tail)) = dir.clone().split_once('_')
+        && stamp.len() == 14
+        && stamp.bytes().all(|b| b.is_ascii_digit())
+    {
+        *dir = format!("<timestamp>_{tail}");
     }
+    parts.join("/")
+}
+
+/// The normalization above is what a Windows CI run caught: it used to strip a
+/// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
+/// the timestamp survived and a second-boundary straddle became a hard failure
+/// on the slowest runner. `PathBuf` joining is separator-correct per platform,
+/// so building the fixture that way exercises the real shape on each one.
+#[test]
+fn normalized_relative_path_is_separator_agnostic() {
+    let root = PathBuf::from("root");
+    let migration = root
+        .join("migrations")
+        .join("20260827030722_create_posts")
+        .join("up.sql");
+    assert_eq!(
+        normalized_relative_path(&migration, &root),
+        "migrations/<timestamp>_create_posts/up.sql"
+    );
+
+    // Only a 14-digit component directly under `migrations/` is rewritten.
+    let other = root.join("src").join("routes").join("posts.rs");
+    assert_eq!(
+        normalized_relative_path(&other, &root),
+        "src/routes/posts.rs"
+    );
+
+    let not_a_stamp = root.join("migrations").join("readme_notes").join("up.sql");
+    assert_eq!(
+        normalized_relative_path(&not_a_stamp, &root),
+        "migrations/readme_notes/up.sql"
+    );
+
+    // A digit run of the right length somewhere else stays put.
+    let elsewhere = root.join("data").join("20260827030722_export.csv");
+    assert_eq!(
+        normalized_relative_path(&elsewhere, &root),
+        "data/20260827030722_export.csv"
+    );
 }
 
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
@@ -1175,13 +1227,7 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     // that has nothing to do with the flag under test. Normalize
                     // the timestamp away; the rest of the path (and every file
                     // body) is still compared exactly.
-                    let rel = normalize_migration_timestamp(
-                        &path
-                            .strip_prefix(root)
-                            .expect("under root")
-                            .display()
-                            .to_string(),
-                    );
+                    let rel = normalized_relative_path(&path, root);
                     // Freshly generated secrets differ by construction; every
                     // other file is the generator's own output.
                     if rel.contains("master.key") || rel.contains("credentials.enc") {
