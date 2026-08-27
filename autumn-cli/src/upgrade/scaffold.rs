@@ -1057,11 +1057,15 @@ fn write_one(entry: &Entry) -> Result<(), String> {
 }
 
 /// Whether a publish may take a destination that already exists.
+///
+/// A statement about what the caller has *established*, not about what is on
+/// disk right now — the gap between those two is the race this exists to catch.
+/// Permissions are decided separately, from the destination itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Publish {
     /// The path was empty when the plan was made and must still be empty.
     Create,
-    /// The path holds the contents the plan was computed from.
+    /// The caller may take whatever is there.
     Replace,
 }
 
@@ -1129,14 +1133,17 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
         .tempfile_in(directory)
         .map_err(|error| error.to_string())?;
 
-    // Replacing a file keeps the mode it already had; a genuinely new one takes
-    // the mode the directory implies.
-    let permissions = match mode {
-        Publish::Replace => std::fs::metadata(absolute)
-            .ok()
-            .map(|metadata| metadata.permissions()),
-        Publish::Create => permissions_for_new_file(directory),
-    };
+    // A file that is really there keeps the mode it already has; anything else
+    // is genuinely new and takes the mode the directory implies. Keyed on what
+    // is on disk rather than on `mode`, which says whether replacing is
+    // *allowed*, not whether there is anything to replace: a `Publish::Replace`
+    // of an absent path — the manifest on every `autumn new` — would otherwise
+    // keep `tempfile`'s 0600, and a manifest another uid cannot read is
+    // discarded as unreadable, throwing away every baseline in it.
+    let permissions = std::fs::metadata(absolute)
+        .ok()
+        .map(|metadata| metadata.permissions())
+        .or_else(|| permissions_for_new_file(directory));
     if let Some(permissions) = permissions {
         let _ = temp.as_file().set_permissions(permissions);
     }
@@ -2553,6 +2560,33 @@ mod tests {
         assert_eq!(
             status_of(&entries, "clippy.toml"),
             &Status::Conflict(ConflictReason::NoBaseline)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_newly_created_manifest_is_as_readable_as_the_files_it_describes() {
+        // The manifest is created, not replaced, on every `autumn new` and on a
+        // legacy project's first `--accept`. Publishing it as a replacement
+        // finds no destination permissions to copy, so `tempfile`'s 0600 would
+        // stick — and a manifest another uid cannot read is discarded as
+        // unreadable, which throws away every baseline it holds and turns the
+        // next upgrade into a wall of conflicts.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest = fs::metadata(tmp.path().join(MANIFEST_PATH))
+            .unwrap()
+            .permissions()
+            .mode();
+        let ordinary = fs::metadata(tmp.path().join("clippy.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            manifest & 0o777,
+            ordinary & 0o777,
+            "the manifest must be as readable as the files it describes"
         );
     }
 }
