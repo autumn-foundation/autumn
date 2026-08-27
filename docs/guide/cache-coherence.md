@@ -110,7 +110,8 @@ identity and the runtime key space are the same string, by construction.
 `#[cached]` emits an identity constant beside the function it wraps.
 `invalidates(crate::views::recent_posts)` rewrites the last path segment to that
 constant, so the edge only compiles when it names a real `#[cached]` function
-that is actually in scope:
+that is actually in scope. The constant inherits the function's visibility, so a
+cached read named from another module has to be at least `pub(crate)`:
 
 ```
 error[E0425]: cannot find value `__AUTUMN_CACHE_READ_ID__not_a_cached_function` in this scope
@@ -265,6 +266,30 @@ constant on, `invalidates(...)` cannot name it; today such a read is covered by
 Invalidate it at runtime with
 `autumn_web::cache::coherence::invalidate_namespace(id)`, which takes the same
 id string.
+
+## Interaction with `#[query_budget]`
+
+A cached read that takes a repository handle is, to
+[`#[query_budget]`](query-budgets.md), a free function handed the handle — and
+that analysis conservatively calls such a function `unbounded`, because what it
+does with the handle is another function's business. So a handler that calls one
+loses its budget:
+
+```rust
+#[query_budget(2)]
+#[get("/dashboard")]
+async fn dashboard(repo: PgProjectRepository) -> AutumnResult<Response> {
+    let total = cached_project_count(tenant_id, &repo).await?;   // ← unbounded
+    …
+}
+```
+
+That is correct as far as the budget analysis can see: on a cache miss the call
+really does issue a query. Use the escape hatch the budget already provides —
+`#[query_cost(1)]` on the statement — which is both honest (a miss costs one
+round trip, a hit costs none) and keeps the budget on the rest of the handler,
+rather than reaching for `#[query_budget(unbounded, …)]` and losing the gate
+entirely.
 
 ## Asserting coherence from your own tests
 

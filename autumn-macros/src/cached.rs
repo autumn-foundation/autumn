@@ -265,6 +265,18 @@ fn read_id_const_ident(fn_name: &syn::Ident) -> syn::Ident {
     format_ident!("__AUTUMN_CACHE_READ_ID__{}", fn_name)
 }
 
+/// The read's identity, as an expression.
+///
+/// Spliced verbatim everywhere the identity is needed — the cache key, the
+/// namespace registration, the descriptor, the invalidator, and the constant
+/// `invalidates(...)` resolves to — rather than having those sites reference
+/// the constant by path. In an `impl` block the constant is an ASSOCIATED
+/// const, which a bare path cannot reach; and `module_path!()` names the
+/// enclosing module either way, so every splice is the same string.
+fn read_id_expr(fn_name_str: &str) -> TokenStream {
+    quote! { concat!(module_path!(), "::", #fn_name_str) }
+}
+
 /// Name of the generated per-read invalidator.
 fn invalidator_ident(fn_name: &syn::Ident) -> syn::Ident {
     format_ident!("__autumn_cache_invalidate__{}", fn_name)
@@ -297,6 +309,7 @@ fn generate_coherence_items(
 ) -> CoherenceItems {
     let vis = &input_fn.vis;
     let id_const = read_id_const_ident(fn_name);
+    let id_expr = read_id_expr(fn_name_str);
     let invalidator = invalidator_ident(fn_name);
 
     // Declared beats derived: an explicit `reads(...)` is the strongest claim
@@ -331,7 +344,7 @@ fn generate_coherence_items(
     let registration = quote! {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::cache::coherence::CachedReadDescriptor {
-                id: #id_const,
+                id: #id_expr,
                 kind: ::autumn_web::cache::coherence::ReadKind::Cached,
                 reads: &[#(#read_exprs),*],
                 provenance:
@@ -351,7 +364,7 @@ fn generate_coherence_items(
         /// names a real cached read.
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
-        #vis const #id_const: &'static str = concat!(module_path!(), "::", #fn_name_str);
+        #vis const #id_const: &'static ::core::primitive::str = #id_expr;
 
         /// Drop every entry of the adjacent `#[cached]` function.
         ///
@@ -359,8 +372,8 @@ fn generate_coherence_items(
         /// [`autumn_web::cache::coherence::invalidate_namespace`].
         #[doc(hidden)]
         #[allow(non_snake_case, dead_code)]
-        #vis fn #invalidator() -> bool {
-            ::autumn_web::cache::coherence::invalidate_namespace(#id_const)
+        #vis fn #invalidator() -> ::core::primitive::bool {
+            ::autumn_web::cache::coherence::invalidate_namespace(#id_expr)
         }
     };
 
@@ -478,7 +491,7 @@ fn generate_cache_body(
         quote! { (|| #fn_block)() }
     };
 
-    let id_const = read_id_const_ident(fn_name);
+    let id_expr = read_id_expr(&fn_name.to_string());
     let cache_init = quote! {
         // `Arc` rather than a bare `MokaCache` (#1716): the store stays a
         // per-function static, but a clone is handed to the coherence registry
@@ -495,7 +508,7 @@ fn generate_cache_body(
                 ::autumn_web::cache::MokaCache::new(#max_expr, __autumn_ttl)
             );
             ::autumn_web::cache::coherence::register_namespace_store(
-                #id_const,
+                #id_expr,
                 ::std::clone::Clone::clone(&__autumn_store) as ::std::sync::Arc<dyn ::autumn_web::cache::Cache>,
             );
             __autumn_store
@@ -507,7 +520,7 @@ fn generate_cache_body(
             __autumn_global
                 .as_deref()
                 .unwrap_or(&**__autumn_moka as &dyn ::autumn_web::cache::Cache);
-        let __autumn_key = ::autumn_web::cache::make_cache_key(#id_const, #key_args);
+        let __autumn_key = ::autumn_web::cache::make_cache_key(#id_expr, #key_args);
     };
 
     if attrs.result {
@@ -992,33 +1005,44 @@ mod tests {
     }
 
     #[test]
-    fn cached_read_id_constant_matches_the_cache_key_namespace() {
+    fn every_use_of_the_identity_is_the_same_expression() {
         let out =
             cached_macro(TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }).to_string();
-        // The identity is defined ONCE and referenced everywhere: the runtime
-        // cache-key prefix, the registered descriptor and the invalidator all
-        // name the same constant, so the manifest's identity and the key space
-        // cannot drift apart.
+        // The identity is spliced, not referenced through the constant: in an
+        // `impl` block that constant is an ASSOCIATED const and a bare path to
+        // it does not resolve. Splicing keeps the runtime key prefix, the
+        // registered descriptor, the invalidator's namespace and the constant
+        // `invalidates(...)` resolves to provably the same string.
+        let id = "concat ! (module_path ! () , \"::\" , \"recent\")";
         assert_eq!(
-            out.matches("module_path ! ()").count(),
-            1,
-            "the namespace must be defined exactly once: {out}"
+            out.matches(id).count(),
+            5,
+            "key, namespace registration, descriptor, id constant, invalidator: {out}"
         );
         assert!(
-            out.contains("const __AUTUMN_CACHE_READ_ID__recent : & 'static str = concat ! (module_path ! () , \"::\" , \"recent\")"),
+            out.contains(&format!("make_cache_key ({id}")),
+            "the cache key must be prefixed with the identity: {out}"
+        );
+        assert!(out.contains(&format!("id : {id}")), "{out}");
+        assert!(
+            out.contains(&format!("invalidate_namespace ({id})")),
             "{out}"
         );
         assert!(
-            out.contains("make_cache_key (__AUTUMN_CACHE_READ_ID__recent"),
-            "the cache key must be prefixed with the registered id: {out}"
+            out.contains(&format!(
+                "const __AUTUMN_CACHE_READ_ID__recent : & 'static :: core :: primitive :: str = {id}"
+            )),
+            "{out}"
         );
-        assert!(
-            out.contains("id : __AUTUMN_CACHE_READ_ID__recent"),
-            "the descriptor must carry the same id: {out}"
-        );
-        assert!(
-            out.contains("invalidate_namespace (__AUTUMN_CACHE_READ_ID__recent)"),
-            "the invalidator must clear the same namespace: {out}"
-        );
+    }
+
+    #[test]
+    fn the_expansion_survives_a_shadowed_str_or_bool() {
+        // The generated const and invalidator name primitives, so a user type
+        // called `str` or `bool` in scope must not capture them.
+        let out =
+            cached_macro(TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }).to_string();
+        assert!(out.contains(":: core :: primitive :: str"), "{out}");
+        assert!(out.contains(":: core :: primitive :: bool"), "{out}");
     }
 }
