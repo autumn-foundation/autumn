@@ -285,9 +285,17 @@ fn nested_path(path: &str, prefix: &str) -> String {
     }
 }
 
+/// The filter a declared method mounts under.
+///
+/// `GET` mounts as `GET | HEAD` on purpose. HTTP defines HEAD as GET without a
+/// body, and axum's method router already dispatches a HEAD with no HEAD route
+/// to the GET one — so the alternative to naming it here is not "HEAD is
+/// refused", it is "HEAD is served by an accident the manifest never mentions".
+/// [`SandboxManifest::route_infos`](crate::plugin_sandbox::SandboxManifest::route_infos)
+/// reports the implied HEAD for the same reason.
 fn method_filter(method: &str) -> Option<MethodFilter> {
     match method {
-        "GET" => Some(MethodFilter::GET),
+        "GET" => Some(MethodFilter::GET.or(MethodFilter::HEAD)),
         "HEAD" => Some(MethodFilter::HEAD),
         "POST" => Some(MethodFilter::POST),
         "PUT" => Some(MethodFilter::PUT),
@@ -585,6 +593,40 @@ sha256 = "{digest}"
     }
 
     #[tokio::test]
+    async fn a_head_on_a_declared_get_reaches_the_guest_rather_than_axum_s_405() {
+        // axum's method router dispatches a HEAD with no HEAD route to the GET
+        // one (`call!(req, HEAD, get)`), which is what HTTP requires — so the
+        // guest really does see `method: "HEAD"`, and the manifest says so.
+        let plugin = hello_plugin();
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/hello/greet")
+            .body(Body::empty())
+            .expect("request");
+        let response = app(&plugin).oneshot(request).await.expect("infallible");
+        // This fixture answers 405 for anything but GET — which is the point:
+        // the *guest* decided, so the request crossed the boundary. axum's own
+        // 405 would carry no attribution.
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            response.headers().contains_key(SANDBOX_ATTRIBUTION_HEADER),
+            "the sandbox handler must have produced this"
+        );
+    }
+
+    #[test]
+    fn the_route_manifest_names_the_head_a_get_route_also_serves() {
+        let builder = crate::app::app().plugin(hello_plugin());
+        let routes = builder.plugin_route_infos().expect("route manifest");
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.method == "HEAD" && route.path == "/hello/greet"),
+            "{routes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn responses_are_attributable_to_the_plugin_that_produced_them() {
         let plugin = hello_plugin();
         let request = Request::builder()
@@ -700,9 +742,11 @@ sha256 = "{digest}"
                     == crate::route_listing::RouteSource::Plugin("autumn-plugin-hello".to_owned())
             })
             .collect();
-        assert_eq!(sandboxed.len(), 1);
-        assert_eq!(sandboxed[0].path, "/hello/greet");
+        // GET and the HEAD it also serves.
+        assert_eq!(sandboxed.len(), 2, "{sandboxed:?}");
+        assert!(sandboxed.iter().all(|route| route.path == "/hello/greet"));
         assert_eq!(sandboxed[0].method, "GET");
+        assert_eq!(sandboxed[1].method, "HEAD");
     }
 
     #[test]

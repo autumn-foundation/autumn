@@ -292,18 +292,31 @@ declared pair. A request to an undeclared path under the prefix is a 404 the
 guest never sees; a request outside the prefix never reaches the plugin's
 router at all.
 
+One implication is worth knowing before you write a guest: **a declared `GET`
+also serves `HEAD`**. HTTP defines HEAD as GET without a body, and axum's method
+router dispatches a HEAD with no HEAD route to the GET one — so the alternative
+to naming it is not "HEAD is refused", it is "HEAD is served by an accident the
+manifest never mentions". `autumn plugin inspect` and `autumn routes` both list
+the implied HEAD, and your guest will see `"method":"HEAD"`; answer it as you
+would the GET and the host discards the body for you.
+
 ### Resource bounds
 
 | Ceiling | What it bounds | What happens at the edge |
 |---|---|---|
-| `fuel` | instructions executed for one request, **and** host-side bytes copied on the guest's behalf, at 64 bytes per unit | 504 on the plugin's prefix |
+| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — including the module's own data and element segments, which every request re-instantiates — at 64 bytes per unit | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 
-`max_concurrency × memory_bytes` is the most memory this plugin can cost the
-host at any instant. That product is the number worth reviewing.
+The number worth reviewing is `max_concurrency × the per-request footprint`,
+where the footprint is the guest's linear memory **plus** the host buffers a
+request pins outside it: the buffered request body, the pending stdout frame,
+and the decoded response. A manifest with a tiny `memory_bytes` and 64 MiB
+body/response ceilings would pass a memory-only check and still allocate
+hundreds of gigabytes, so the validator checks the whole footprint against a
+1 GiB ceiling.
 
 Each request gets a **fresh instance**, so no state survives a request and one
 request's misbehaviour cannot reach the next.
@@ -317,28 +330,34 @@ plugin does can abort, exit, or panic the host process.
 
 ### What never crosses
 
-Stripped from the **request** before it reaches the guest: `cookie`,
-`authorization`, `proxy-authorization`, `www-authenticate`,
-`proxy-authenticate`, and the headers that are bearer tokens in practice even
-though the RFCs do not call them credentials — `x-csrf-token`, `x-xsrf-token`,
-`x-api-key`, `x-auth-token`, `api-key`. The CSRF one is load-bearing: Autumn's
-own htmx integration attaches it to every same-origin request, so without it a
-plugin route reached from one of your pages would be handed the caller's token.
-The sandbox grants no session or auth capability, so a credential reaching a
-plugin could only ever be a liability — and a plugin that echoed request headers
-would leak one.
+Only an **allowlist** of request headers reaches the guest: `accept`,
+`accept-charset`, `accept-encoding`, `accept-language`, `cache-control`,
+`content-length`, `content-type`, `if-match`, `if-modified-since`,
+`if-none-match`, `if-range`, `if-unmodified-since`, `range`, `user-agent`.
+Everything else is dropped.
+
+A denylist of credential headers is a losing game. The RFCs name `Cookie` and
+`Authorization`, but every authenticating proxy invents its own —
+`Cf-Access-Jwt-Assertion`, `X-Forwarded-User`, `X-Amzn-Oidc-Data`,
+`X-Ms-Client-Principal`, `X-Goog-Iap-Jwt-Assertion` — and Autumn's own htmx
+integration attaches `X-CSRF-Token` to every same-origin request. Each of those
+is a bearer credential the sandbox promised would not cross, and there is no
+version of that list that is finished. What a plugin actually needs is content
+negotiation and conditional-request metadata, which is short and does not grow.
 
 On the way back, an **allowlist** — because a deny-list is a blocklist against
 a header registry that keeps growing. A plugin may set `content-type`,
 `content-language`, `content-disposition`, `cache-control`, `etag`, `expires`,
-`last-modified`, `location`, `retry-after`, `vary`, `age`, `accept-ranges`,
-`content-range`, and any `x-`-prefixed header of its own. Everything else is
-stripped and each strip is logged as a denial — `set-cookie` (a plugin that
-could set a cookie could forge a session in your origin),
-`strict-transport-security` and `clear-site-data` (origin-wide and persistent),
-the framing headers your HTTP stack owns, and the host's own
-`x-autumn-sandboxed` / `x-content-type-options`, which a plugin must not be able
-to forge. A header name or value carrying `\r\n` is refused outright — that
+`last-modified`, `location`, `retry-after`, `vary`, `age`, `accept-ranges` and
+`content-range` — and nothing else. There is deliberately **no** `x-` escape
+hatch: `X-Accel-Redirect` (nginx) and `X-Sendfile` (Apache) make your *reverse
+proxy* serve an internal URI or a local file, so a hatch there would hand a
+filesystem-free plugin the filesystem one hop upstream. Everything outside the
+list is stripped and logged as a denial — `set-cookie` (a plugin that could set
+a cookie could forge a session in your origin), `strict-transport-security` and
+`clear-site-data` (origin-wide and persistent), the framing headers your HTTP
+stack owns, and the host's own `x-autumn-sandboxed` / `x-content-type-options`,
+which a plugin must not be able to forge. A header name or value carrying `\r\n` is refused outright — that
 would be response splitting.
 
 The **content type** is part of the same boundary, and it is the one most worth

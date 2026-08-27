@@ -36,6 +36,7 @@ pub const HELLO: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -134,6 +135,7 @@ pub const CPU_SPIN: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -233,6 +235,7 @@ pub const MEMORY_BOMB: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -331,6 +334,7 @@ pub const TRAP: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -430,6 +434,7 @@ pub const EXIT: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -528,6 +533,7 @@ pub const SILENT: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -628,6 +634,7 @@ pub const READ_FILE: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -729,6 +736,7 @@ pub const DISCOVER_PREOPENS: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -828,6 +836,7 @@ pub const READ_STRAY_FD: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -930,6 +939,7 @@ pub const NETWORK: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1031,6 +1041,7 @@ pub const ENVIRONMENT: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1132,6 +1143,7 @@ pub const ARGUMENTS: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1232,6 +1244,7 @@ pub const POLL: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1334,6 +1347,7 @@ pub const DATABASE: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1434,6 +1448,7 @@ pub const HOST_COMMAND: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1534,6 +1549,7 @@ pub const UNDEFINED_WASI: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1633,6 +1649,7 @@ pub const MALFORMED_FRAME: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1731,6 +1748,7 @@ pub const UNKNOWN_OP: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1829,6 +1847,7 @@ pub const IMPOSSIBLE_STATUS: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -1928,6 +1947,7 @@ pub const OUTPUT_FLOOD: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2027,6 +2047,7 @@ pub const STDERR_FLOOD: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2126,6 +2147,7 @@ pub const STDOUT_BULK: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2229,6 +2251,7 @@ pub const FORGE_COOKIE: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2327,6 +2350,7 @@ pub const SPLIT_RESPONSE: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2427,6 +2451,7 @@ pub const FORGE_ATTRIBUTION: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2504,6 +2529,107 @@ pub const FORGE_ATTRIBUTION: &str = r#"(module
 )
 "#;
 
+/// Answers with `X-Accel-Redirect` and `X-Sendfile`, asking the reverse proxy
+/// in front of the host to serve a local file on its behalf — a filesystem the
+/// sandbox withheld, one hop upstream.
+pub const PROXY_REDIRECT: &str = r#"(module
+  (import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+  (data (i32.const 128) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\0a\00")
+  (data (i32.const 512) "{\"op\":\"response\",\"status\":404,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"bm8gc3VjaCBzYW5kYm94ZWQgcm91dGU=\"}\0a\00")
+  (data (i32.const 768) "{\"op\":\"response\",\"status\":405,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"bWV0aG9kIG5vdCBhbGxvd2Vk\"}\0a\00")
+  (data (i32.const 1024) "\"method\":\"GET\"\00")
+  (data (i32.const 1088) "/greet\00")
+  (data (i32.const 1120) "/etc/passwd\00")
+  (data (i32.const 1152) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"set-cookie\",\"session=forged\"]],\"body_b64\":\"Y29va2llIGF0dGVtcHQ=\"}\0a\00")
+  (data (i32.const 1600) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-evil\",\"a\\r\\nset-cookie: forged=1\"]],\"body_b64\":\"c3BsaXR0aW5nIGF0dGVtcHQ=\"}\0a\00")
+  (data (i32.const 2048) "{\"op\":\"response\",\"status\":200,\0a\00")
+  (data (i32.const 2176) "{\"op\":\"exec\",\"cmd\":\"/bin/sh\"}\0a\00")
+  (data (i32.const 2304) "{\"op\":\"response\",\"status\":999,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aW1wb3NzaWJsZSBzdGF0dXM=\"}\0a\00")
+  (data (i32.const 2816) "X\00")
+  (data (i32.const 3072) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"c2Vjb25kIGFuc3dlcg==\"}\0a\00")
+  (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
+  (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
+  (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
+
+  ;; Length of the NUL-terminated string at $p.
+  (func $strlen (param $p i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $p) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $n))
+
+  ;; Write the NUL-terminated string at $p to stdout: one wire frame.
+  (func $emit (param $p i32)
+    (i32.store (i32.const 0) (local.get $p))
+    (i32.store (i32.const 4) (call $strlen (local.get $p)))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  ;; Write $len bytes of scratch memory to $fd.
+  (func $spew (param $fd i32) (param $len i32)
+    (i32.store (i32.const 0) (i32.const 8192))
+    (i32.store (i32.const 4) (local.get $len))
+    (drop (call $fd_write (local.get $fd) (i32.const 0) (i32.const 1) (i32.const 16))))
+
+  ;; Read one newline-terminated frame from stdin into the input buffer at
+  ;; 8192; returns its length, newline excluded.
+  (func $read_line (result i32)
+    (local $n i32)
+    (block $done
+      (loop $l
+        (i32.store (i32.const 0) (i32.add (i32.const 65536) (local.get $n)))
+        (i32.store (i32.const 4) (i32.const 1))
+        (i32.store (i32.const 16) (i32.const 0))
+        (br_if $done (i32.ne (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (i32.const 0)))
+        (br_if $done (i32.eqz (i32.load (i32.const 16))))
+        (br_if $done (i32.eq (i32.load8_u (i32.add (i32.const 65536) (local.get $n))) (i32.const 10)))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br_if $done (i32.ge_u (local.get $n) (i32.const 40000)))
+        (br $l)))
+    (local.get $n))
+
+  ;; Naive substring search of the NUL-terminated needle at $needle inside the
+  ;; first $len bytes of the input buffer.
+  (func $contains (param $len i32) (param $needle i32) (result i32)
+    (local $i i32) (local $j i32) (local $nl i32)
+    (local.set $nl (call $strlen (local.get $needle)))
+    (if (i32.gt_u (local.get $nl) (local.get $len)) (then (return (i32.const 0))))
+    (block $no
+      (loop $outer
+        (br_if $no (i32.gt_u (i32.add (local.get $i) (local.get $nl)) (local.get $len)))
+        (local.set $j (i32.const 0))
+        (block $mismatch
+          (loop $inner
+            (br_if $mismatch (i32.ne
+              (i32.load8_u (i32.add (i32.const 65536) (i32.add (local.get $i) (local.get $j))))
+              (i32.load8_u (i32.add (local.get $needle) (local.get $j)))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $inner (i32.lt_u (local.get $j) (local.get $nl))))
+          (return (i32.const 1)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $outer)))
+    (i32.const 0))
+
+  ;; Answer the request the way an honest hello-world plugin would.
+  (func $answer
+    (local $len i32)
+    (local.set $len (call $read_line))
+    (if (i32.eqz (call $contains (local.get $len) (i32.const 1024)))
+      (then (call $emit (i32.const 768)) (return)))
+    (if (call $contains (local.get $len) (i32.const 1088))
+      (then (call $emit (i32.const 128)) (return)))
+    (call $emit (i32.const 512)))
+  (func (export "_start")
+    (call $emit (i32.const 6000))
+  )
+)
+"#;
+
 /// Writes a complete, valid frame and forgets the trailing newline — the most
 /// likely author mistake there is.
 pub const PARTIAL_FRAME: &str = r#"(module
@@ -2526,6 +2652,7 @@ pub const PARTIAL_FRAME: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2624,6 +2751,7 @@ pub const DOUBLE_ANSWER: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2724,6 +2852,7 @@ pub const ANSWER_THEN_SPIN: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)
@@ -2834,6 +2963,7 @@ pub const ENTROPY: &str = r#"(module
   (data (i32.const 3584) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-autumn-sandboxed\",\"not-this-plugin\"],[\"x-content-type-options\",\"off\"]],\"body_b64\":\"YXR0cmlidXRpb24gYXR0ZW1wdA==\"}\0a\00")
   (data (i32.const 4200) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"aGVsbG8gZnJvbSB0aGUgc2FuZGJveA==\"}\00")
   (data (i32.const 5000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"]],\"body_b64\":\"ZW50cm9weSBlY2hvZWQgaW4gdGhlIHN0YXR1cw==\"}\0a\00")
+  (data (i32.const 6000) "{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain; charset=utf-8\"],[\"x-accel-redirect\",\"/internal/etc/passwd\"],[\"x-sendfile\",\"/etc/passwd\"]],\"body_b64\":\"cHJveHkgcmVkaXJlY3QgYXR0ZW1wdA==\"}\0a\00")
 
   ;; Length of the NUL-terminated string at $p.
   (func $strlen (param $p i32) (result i32)

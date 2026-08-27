@@ -2076,7 +2076,7 @@ path = "/hello/{name}"
 
 [limits]
 fuel = 200_000_000        # CPU: instructions AND host-side bytes copied (64B/unit)
-memory_bytes = 33_554_432 # per-request instance; × max_concurrency ≤ 1 GiB
+memory_bytes = 33_554_432 # per-request instance; footprint × concurrency ≤ 1 GiB
 max_request_body_bytes = 1_048_576
 max_response_bytes = 4_194_304
 max_concurrency = 8       # requests shed with 503, never queued
@@ -2108,11 +2108,16 @@ answer is a 502/503/504 **on the plugin's own prefix** — nothing reaches the
 rest of the app.
 
 **Boundary gotchas worth knowing before authoring one.**
-- Credentials are stripped from the request, including `x-csrf-token`.
-- Response headers are an **allowlist** (`content-type`, `cache-control`,
-  `etag`, `location`, `vary`, `x-*`, …). `set-cookie`,
+- Request headers are an **allowlist** (`accept*`, `content-type`,
+  `content-length`, `cache-control`, `if-*`, `range`, `user-agent`). Everything
+  else is dropped — a denylist could never name every proxy's identity header.
+- Response headers are a **closed allowlist** (`content-type`, `cache-control`,
+  `etag`, `location`, `vary`, …) with **no** `x-` hatch: `X-Accel-Redirect` /
+  `X-Sendfile` would borrow the reverse proxy's filesystem. `set-cookie`,
   `strict-transport-security`, framing headers and the host's own
   `x-autumn-sandboxed` / `x-content-type-options` are stripped and logged.
+- A declared `GET` also serves `HEAD` (HTTP requires it, axum dispatches it);
+  the guest sees `method: "HEAD"` and `route_infos()` reports the extra row.
 - Response **content types** are an allowlist too: `text/plain`, `text/csv`,
   `application/json`, `application/octet-stream`, and raster images. HTML,
   SVG, JavaScript and CSS are refused — a document or script from your own

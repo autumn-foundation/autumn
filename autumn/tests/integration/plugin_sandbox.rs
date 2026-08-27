@@ -253,7 +253,7 @@ const CORPUS: &[(&str, &str, Containment)] = &[
     (
         "split the response with CRLF",
         guests::SPLIT_RESPONSE,
-        Containment::StoppedWithFivehundred,
+        Containment::DeniedAndServed(DeniedCapability::ResponseHeader),
     ),
     (
         "answer with an impossible status",
@@ -273,6 +273,11 @@ const CORPUS: &[(&str, &str, Containment)] = &[
     (
         "forge the host's own attribution and sniffing headers",
         guests::FORGE_ATTRIBUTION,
+        Containment::DeniedAndServed(DeniedCapability::ResponseHeader),
+    ),
+    (
+        "reach a reverse proxy through an x- response header",
+        guests::PROXY_REDIRECT,
         Containment::DeniedAndServed(DeniedCapability::ResponseHeader),
     ),
     (

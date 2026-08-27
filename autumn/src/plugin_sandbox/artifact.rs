@@ -49,6 +49,15 @@ pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// The largest wasm module a container may carry (64 MiB).
 pub const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest `.autumn-plugin` file this build will read at all.
+///
+/// The ceilings inside [`SandboxArtifact::read`] apply to bytes the process has
+/// already allocated, so a reader that slurps the file first has made the
+/// decision before it can refuse: a crafted multi-gigabyte artifact would
+/// exhaust the process that was trying to inspect it. This bound is applied to
+/// the *file*, before a byte of it is read.
+pub const MAX_ARTIFACT_BYTES: usize = HEADER_BYTES + MAX_MANIFEST_BYTES + MAX_MODULE_BYTES;
+
 /// The four bytes every WebAssembly module starts with.
 const WASM_MAGIC: &[u8] = b"\0asm";
 
@@ -78,6 +87,13 @@ pub enum ArtifactError {
     ManifestTooLarge {
         /// The declared length.
         found: usize,
+        /// The ceiling.
+        max: usize,
+    },
+    /// The file exceeds [`MAX_ARTIFACT_BYTES`], refused before it was read.
+    ArtifactTooLarge {
+        /// The file's length in bytes.
+        found: u64,
         /// The ceiling.
         max: usize,
     },
@@ -141,6 +157,11 @@ impl fmt::Display for ArtifactError {
             Self::ManifestTooLarge { found, max } => write!(
                 f,
                 "sandboxed plugin manifest is {found} bytes, over the {max}-byte ceiling"
+            ),
+            Self::ArtifactTooLarge { found, max } => write!(
+                f,
+                "sandboxed plugin artifact is {found} bytes, over the {max}-byte ceiling; \
+                 refusing to read it"
             ),
             Self::ModuleTooLarge { found, max } => write!(
                 f,
@@ -343,11 +364,39 @@ impl SandboxArtifact {
     /// Returns [`ArtifactError::Io`] if the file cannot be read, or any
     /// [`read`](Self::read) error for its contents.
     pub fn read_file(path: &Path) -> Result<Self, ArtifactError> {
-        let bytes = std::fs::read(path).map_err(|err| ArtifactError::Io {
+        use std::io::Read as _;
+
+        let io = |err: &std::io::Error| ArtifactError::Io {
             path: path.to_path_buf(),
             kind: err.kind(),
             detail: err.to_string(),
-        })?;
+        };
+        let mut file = std::fs::File::open(path).map_err(|err| io(&err))?;
+        let length = file.metadata().map_err(|err| io(&err))?.len();
+        if length > MAX_ARTIFACT_BYTES as u64 {
+            return Err(ArtifactError::ArtifactTooLarge {
+                found: length,
+                max: MAX_ARTIFACT_BYTES,
+            });
+        }
+
+        // Read through a bounded reader as well as checking the metadata: the
+        // length can be a lie (a growing file, a pipe, a racing writer), and the
+        // ceiling has to hold against the bytes, not against what the
+        // filesystem said about them.
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(length).unwrap_or(0).min(MAX_ARTIFACT_BYTES));
+        let read = file
+            .by_ref()
+            .take(MAX_ARTIFACT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| io(&err))?;
+        if read > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactError::ArtifactTooLarge {
+                found: read as u64,
+                max: MAX_ARTIFACT_BYTES,
+            });
+        }
         Self::read(&bytes)
     }
 
@@ -568,6 +617,27 @@ path = "/hello/greet"
         bytes.extend_from_slice(EMPTY_MODULE);
         let err = SandboxArtifact::read(&bytes).expect_err("must be caught");
         assert!(matches!(err, ArtifactError::Manifest(_)), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_file_is_refused_before_it_is_read_into_memory() {
+        // `std::fs::read` sizes its buffer from the file, so the container
+        // ceilings inside `read()` are applied to bytes the process already
+        // allocated. A crafted multi-gigabyte artifact would exhaust the
+        // inspecting process instead of being refused by it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.autumn-plugin");
+        let file = std::fs::File::create(&path).expect("creates");
+        // Sparse: the bytes are never written, only the length is claimed.
+        file.set_len(MAX_ARTIFACT_BYTES as u64 + 1)
+            .expect("sets len");
+        drop(file);
+
+        let err = SandboxArtifact::read_file(&path).expect_err("must be refused");
+        assert!(
+            matches!(err, ArtifactError::ArtifactTooLarge { .. }),
+            "{err}"
+        );
     }
 
     #[test]

@@ -366,6 +366,10 @@ pub struct SandboxOutcome {
 pub struct SandboxHost {
     engine: Engine,
     module: Module,
+    /// The compiled module's source length. An upper bound on the data and
+    /// element bytes instantiation copies, and therefore what that copying is
+    /// priced at — see [`SandboxHost::run`].
+    module_bytes: usize,
     manifest: SandboxManifest,
 }
 
@@ -421,6 +425,7 @@ impl SandboxHost {
         Ok(Self {
             engine,
             module,
+            module_bytes: wasm.len(),
             manifest,
         })
     }
@@ -494,9 +499,7 @@ impl SandboxHost {
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limiter);
         // Set before instantiation, so the budget is in place the moment the
-        // first guest instruction runs. wasmi does not meter instantiation
-        // itself, which is why the module's data and element segments are
-        // bounded at load instead — by `MAX_MODULE_BYTES` on the container.
+        // first guest instruction runs.
         if let Err(err) = store.set_fuel(limits.fuel) {
             return SandboxOutcome {
                 result: Err(SandboxFailure::Instantiation(err.to_string())),
@@ -505,6 +508,41 @@ impl SandboxHost {
                 peak_memory_bytes: 0,
                 stderr: String::new(),
             };
+        }
+
+        // wasmi does not meter instantiation: every request copies the module's
+        // data and element segments before `_start` runs, and a 64 MiB module of
+        // compact segments would pin a blocking worker per request without
+        // spending a unit of the declared CPU budget. Price it up front, against
+        // the module's own length — an upper bound on what those segments can
+        // hold — so a budget that cannot cover instantiation is refused before
+        // the work is done rather than after.
+        let instantiation = u64::try_from(self.module_bytes)
+            .unwrap_or(u64::MAX)
+            .checked_div(BYTES_PER_FUEL)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        match limits.fuel.checked_sub(instantiation) {
+            Some(left) => {
+                if let Err(err) = store.set_fuel(left) {
+                    return SandboxOutcome {
+                        result: Err(SandboxFailure::Instantiation(err.to_string())),
+                        denials: Vec::new(),
+                        fuel_used: 0,
+                        peak_memory_bytes: 0,
+                        stderr: String::new(),
+                    };
+                }
+            }
+            None => {
+                return finish(
+                    store,
+                    limits,
+                    Err(SandboxFailure::FuelExhausted {
+                        budget: limits.fuel,
+                    }),
+                );
+            }
         }
 
         let mut linker = <Linker<HostState>>::new(&self.engine);
@@ -1836,6 +1874,40 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn instantiating_the_module_is_priced_against_the_budget() {
+        // wasmi meters guest instructions, not instantiation: every request
+        // copies the module's data and element segments before `_start` runs,
+        // and a 64 MiB module of compact segments would pin a blocking worker
+        // per request without spending a unit of the declared CPU budget.
+        let wasm = wat::parse_str(guests::HELLO).expect("valid WAT");
+        let charged = wasm.len() as u64 / 64;
+
+        // A budget that cannot even cover instantiation is refused before the
+        // module is instantiated at all.
+        let starved = ResourceLimits {
+            fuel: charged / 2,
+            ..ResourceLimits::default()
+        };
+        let outcome = try_host_with(guests::HELLO, starved)
+            .expect("loads")
+            .run(&get("/hello/greet"));
+        assert!(
+            matches!(outcome.result, Err(SandboxFailure::FuelExhausted { .. })),
+            "{:?}",
+            outcome.result
+        );
+
+        // …and an honest request pays for it out of the same budget.
+        let outcome = host(guests::HELLO).run(&get("/hello/greet"));
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.fuel_used >= charged,
+            "instantiation cost {} of a {charged}-unit module",
+            outcome.fuel_used
+        );
+    }
+
+    #[test]
     fn a_guest_that_floods_stderr_runs_out_of_fuel_rather_than_time() {
         let limits = ResourceLimits {
             fuel: 2_000_000,
@@ -2016,6 +2088,9 @@ path = "/hello/greet"
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
         }
@@ -2045,24 +2120,37 @@ path = "/hello/greet"
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    #[test]
-    fn a_denial_reaches_the_log_and_not_only_the_ledger() {
-        // The ledger is what tests read; the log is what an operator reads. If
-        // the two could drift, "each denial observable in logs" would be a
-        // claim about a field nobody sees.
-        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(DenialLog(std::sync::Arc::clone(&recorded)), || {
-            let _ = host(guests::READ_FILE).run(&get("/hello/greet"));
-        });
-        let lines = recorded.lock().expect("not poisoned").clone();
-        let denial = lines
-            .iter()
-            .find(|line| line.contains("operation=path_open"))
-            .unwrap_or_else(|| panic!("no denial line in {lines:#?}"));
-        assert!(denial.starts_with("WARN"), "{denial}");
-        assert!(denial.contains("capability=filesystem"), "{denial}");
-        assert!(denial.contains("plugin=autumn-plugin-hello"), "{denial}");
-        assert!(denial.contains("no filesystem"), "{denial}");
+    use rusty_fork::rusty_fork_test;
+
+    rusty_fork_test! {
+        #[test]
+        fn a_denial_reaches_the_log_and_not_only_the_ledger() {
+            // The ledger is what tests read; the log is what an operator reads.
+            // If the two could drift, "each denial observable in logs" would be
+            // a claim about a field nobody sees.
+            //
+            // Forked: `tracing`'s callsite-interest cache and max-level hint are
+            // process-global, so a sibling test that installs a global
+            // subscriber can filter this event out before any thread-local
+            // subscriber is consulted — which makes an in-process version of
+            // this test pass or fail on test ordering.
+            let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            tracing::subscriber::with_default(
+                DenialLog(std::sync::Arc::clone(&recorded)),
+                || {
+                    let _ = host(guests::READ_FILE).run(&get("/hello/greet"));
+                },
+            );
+            let lines = recorded.lock().expect("not poisoned").clone();
+            let denial = lines
+                .iter()
+                .find(|line| line.contains("operation=path_open"))
+                .unwrap_or_else(|| panic!("no denial line in {lines:#?}"));
+            assert!(denial.starts_with("WARN"), "{denial}");
+            assert!(denial.contains("capability=filesystem"), "{denial}");
+            assert!(denial.contains("plugin=autumn-plugin-hello"), "{denial}");
+            assert!(denial.contains("no filesystem"), "{denial}");
+        }
     }
 
     #[test]
@@ -2181,12 +2269,45 @@ path = "/hello/greet"
     }
 
     #[test]
-    fn a_response_splitting_header_is_refused() {
-        let outcome = host(guests::SPLIT_RESPONSE).run(&get("/hello/greet"));
-        let failure = outcome.result.expect_err("must not answer");
+    fn a_plugin_cannot_borrow_the_reverse_proxy_s_filesystem() {
+        let outcome = host(guests::PROXY_REDIRECT).run(&get("/hello/greet"));
+        let denied = denied(&outcome, DeniedCapability::ResponseHeader);
         assert!(
-            matches!(failure, SandboxFailure::ResponseRefused(_)),
-            "{failure}"
+            denied.contains(&"x-accel-redirect".to_owned()),
+            "{denied:?}"
+        );
+        assert!(denied.contains(&"x-sendfile".to_owned()), "{denied:?}");
+        let response = outcome.result.expect("answers without them");
+        assert!(
+            response
+                .headers
+                .iter()
+                .all(|(name, _)| name == "content-type"),
+            "{:?}",
+            response.headers
+        );
+    }
+
+    #[test]
+    fn a_response_splitting_header_never_reaches_a_response() {
+        // Two locks on this door: the header allowlist drops the name before
+        // anything looks at its value, and `SandboxResponse::validate` refuses a
+        // value carrying CRLF for a name that *is* allowed (asserted directly in
+        // `wire`). Here the first lock holds, so the guest is served — minus the
+        // header, with the attempt on the record.
+        let outcome = host(guests::SPLIT_RESPONSE).run(&get("/hello/greet"));
+        assert_eq!(
+            denied(&outcome, DeniedCapability::ResponseHeader),
+            vec!["x-evil".to_owned()]
+        );
+        let response = outcome.result.expect("answers without the header");
+        assert!(
+            response
+                .headers
+                .iter()
+                .all(|(name, _)| name == "content-type"),
+            "{:?}",
+            response.headers
         );
     }
 

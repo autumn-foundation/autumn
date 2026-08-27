@@ -54,7 +54,9 @@ pub mod wire;
 #[doc(hidden)]
 pub mod test_guests;
 
-pub use artifact::{ArtifactError, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact};
+pub use artifact::{
+    ArtifactError, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact,
+};
 pub use host::{
     CapabilityDenial, DeniedCapability, SandboxFailure, SandboxHost, SandboxLoadError,
     SandboxOutcome,
@@ -66,8 +68,8 @@ pub use manifest::{
 };
 pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
 pub use wire::{
-    ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, RESERVED_RESPONSE_HEADERS,
-    SENSITIVE_REQUEST_HEADERS, SandboxRequest, SandboxResponse, WireError, response_header_allowed,
+    ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS,
+    SandboxRequest, SandboxResponse, WireError, request_header_allowed, response_header_allowed,
 };
 
 // ── fuzzing seams (issue #1611's `__fuzz` convention) ────────────────────

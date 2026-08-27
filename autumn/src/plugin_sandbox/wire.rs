@@ -20,10 +20,11 @@
 //!
 //! # What never crosses, in either direction
 //!
-//! [`SENSITIVE_REQUEST_HEADERS`] are stripped before the request frame is
-//! built. The sandbox grants no session, auth or credential capability, so a
-//! cookie or bearer token reaching a plugin could only ever be a liability —
-//! and a plugin that echoed request headers would otherwise leak one.
+//! Both directions are **allowlists**. Only [`ALLOWED_REQUEST_HEADERS`] reach
+//! the guest: the sandbox grants no session, auth or credential capability, so
+//! a cookie or a bearer token reaching a plugin could only ever be a liability
+//! — and there is no finished list of what a credential is called, because
+//! every authenticating proxy invents its own header for one.
 //!
 //! On the way back, only [`ALLOWED_RESPONSE_HEADERS`] survive, and only the
 //! content types in [`ALLOWED_RESPONSE_CONTENT_TYPES`] are served at all. Both
@@ -62,40 +63,57 @@ use serde::{Deserialize, Serialize};
 
 use super::manifest::{SandboxCapability, WIRE_VERSION};
 
-/// Request headers that never reach a sandboxed plugin.
-pub const SENSITIVE_REQUEST_HEADERS: &[&str] = &[
-    "cookie",
-    "authorization",
-    "proxy-authorization",
-    "www-authenticate",
-    "proxy-authenticate",
-    // Not credentials in the RFC sense, but every one of them is a bearer
-    // token in practice. `x-csrf-token` is the load-bearing one: Autumn's own
-    // htmx integration attaches it to every same-origin request, so without
-    // this line a plugin route reached from an app page would be handed the
-    // caller's CSRF token — the exact thing that makes a forged same-origin
-    // POST possible.
-    "x-csrf-token",
-    "x-xsrf-token",
-    "x-api-key",
-    "x-auth-token",
-    "api-key",
+/// Request headers that may reach a sandboxed plugin.
+///
+/// An **allowlist**, for the same reason the response side is one. A denylist
+/// of credential headers is a losing game: the RFCs name `Cookie` and
+/// `Authorization`, but every authenticating proxy invents its own —
+/// `Cf-Access-Jwt-Assertion`, `X-Forwarded-User`, `X-Amzn-Oidc-Data`,
+/// `X-Ms-Client-Principal`, `X-Goog-Iap-Jwt-Assertion` — and each one is a
+/// bearer credential the sandbox promised would not cross. There is no version
+/// of that list that is finished.
+///
+/// What a plugin actually needs is content negotiation and conditional-request
+/// metadata, which is short and does not grow. Everything else is dropped
+/// silently: a request header is not something a plugin *asked* for, so a
+/// denial record would be noise on every request rather than evidence.
+pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-length",
+    "content-type",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "range",
+    "user-agent",
 ];
+
+/// Whether a request header of this (lower-cased) name may cross into a guest.
+#[must_use]
+pub fn request_header_allowed(name: &str) -> bool {
+    ALLOWED_REQUEST_HEADERS.contains(&name)
+}
 
 /// Response headers a sandboxed plugin may set.
 ///
-/// An **allowlist**, not a deny-list. A deny-list is a blocklist against a
-/// header registry that keeps growing: `Set-Cookie` forges a session,
-/// `Strict-Transport-Security` rewrites the whole origin's TLS posture,
-/// `Clear-Site-Data` destroys every user's session, and the next one has not
-/// been standardised yet. A plugin's legitimate response headers are few and
-/// predictable, so the boundary that does not rot is the one that names them.
+/// A closed allowlist, with no `x-` escape hatch. An allowlist that ends in
+/// "…and anything starting with `x-`" is not one: `X-Accel-Redirect` (nginx)
+/// and `X-Sendfile` (Apache) make a *reverse proxy* serve an internal URI or a
+/// local file, so that hatch would hand a filesystem-free plugin the
+/// filesystem, one hop upstream. `X-Accel-Buffering` alone can change the
+/// proxy's streaming behaviour for the whole connection.
 ///
-/// Anything outside this list — including the host's own
-/// `x-autumn-sandboxed` and `x-content-type-options`, which a guest must not be
-/// able to forge — is stripped and recorded as a denial. `x-`-prefixed headers
-/// are allowed as a general escape hatch for a plugin's own metadata, except
-/// the host-owned names in [`RESERVED_RESPONSE_HEADERS`].
+/// The names here are the ones a response genuinely needs, and the list is
+/// meant to grow by review rather than by pattern. Anything outside it —
+/// including the host's own `x-autumn-sandboxed` and `x-content-type-options`,
+/// which a guest must not be able to forge — is stripped and recorded as a
+/// denial.
 pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
     "accept-ranges",
     "age",
@@ -110,17 +128,6 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
     "location",
     "retry-after",
     "vary",
-];
-
-/// `x-`-prefixed response headers a plugin may **not** set, because the host
-/// sets them and their meaning depends on who did.
-pub const RESERVED_RESPONSE_HEADERS: &[&str] = &[
-    "x-autumn-sandboxed",
-    "x-content-type-options",
-    "x-frame-options",
-    "x-xss-protection",
-    "x-permitted-cross-domain-policies",
-    "x-dns-prefetch-control",
 ];
 
 /// Content types a sandboxed plugin's response may declare.
@@ -156,10 +163,7 @@ pub const ALLOWED_RESPONSE_CONTENT_TYPES: &[&str] = &[
 /// Whether a plugin may set a response header of this (lower-cased) name.
 #[must_use]
 pub fn response_header_allowed(name: &str) -> bool {
-    if RESERVED_RESPONSE_HEADERS.contains(&name) {
-        return false;
-    }
-    ALLOWED_RESPONSE_HEADERS.contains(&name) || name.starts_with("x-")
+    ALLOWED_RESPONSE_HEADERS.contains(&name)
 }
 
 /// Something that could not be parsed out of, or encoded onto, the wire.
@@ -470,8 +474,8 @@ pub(crate) enum GuestFrame {
     },
 }
 
-/// Lower-case header names, drop the ones that never cross, and sort by name
-/// with insertion order preserved within a name.
+/// Lower-case header names, keep only the ones [`ALLOWED_REQUEST_HEADERS`]
+/// names, and sort by name with insertion order preserved within a name.
 ///
 /// Sorting makes the frame a deterministic function of the request, which is
 /// what lets an author diff two runs of the same request and see only what
@@ -481,7 +485,7 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
     let mut out: Vec<(String, String)> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .filter(|(name, _)| !SENSITIVE_REQUEST_HEADERS.contains(&name.as_str()))
+        .filter(|(name, _)| request_header_allowed(name))
         .collect();
     out.sort_by(|(left, _), (right, _)| left.cmp(right));
     out
@@ -538,29 +542,30 @@ mod tests {
         let json = to_line(&frame).expect("serializes");
         assert!(!json.contains("session=secret"), "{json}");
         assert!(!json.contains("Bearer secret"), "{json}");
-        assert!(json.contains("x-trace"), "{json}");
+        // The list is closed, so an unrecognised header does not cross either —
+        // which is the property that survives the next proxy vendor inventing
+        // an identity header nobody has heard of.
+        assert!(!json.contains("x-trace"), "{json}");
         let HostFrame::Request { headers, .. } = frame;
-        let names: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
-        assert!(!names.contains(&"cookie"), "{names:?}");
-        assert!(!names.contains(&"authorization"), "{names:?}");
+        assert_eq!(headers, vec![("accept".to_owned(), "text/html".to_owned())]);
     }
 
     #[test]
     fn request_headers_are_lower_cased_and_sorted_with_stable_duplicates() {
         let mut req = request();
         req.headers = vec![
-            ("X-B".to_owned(), "2".to_owned()),
-            ("X-A".to_owned(), "first".to_owned()),
-            ("x-a".to_owned(), "second".to_owned()),
+            ("User-Agent".to_owned(), "curl".to_owned()),
+            ("Accept".to_owned(), "first".to_owned()),
+            ("accept".to_owned(), "second".to_owned()),
         ];
         let HostFrame::Request { headers, .. } =
             HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
         assert_eq!(
             headers,
             vec![
-                ("x-a".to_owned(), "first".to_owned()),
-                ("x-a".to_owned(), "second".to_owned()),
-                ("x-b".to_owned(), "2".to_owned()),
+                ("accept".to_owned(), "first".to_owned()),
+                ("accept".to_owned(), "second".to_owned()),
+                ("user-agent".to_owned(), "curl".to_owned()),
             ]
         );
     }
@@ -683,6 +688,71 @@ mod tests {
             let (clean, denied) = response.sanitize();
             assert_eq!(denied, vec![name.to_owned()], "{name} must be stripped");
             assert!(clean.headers.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_proxy_injected_identity_header_never_reaches_the_guest() {
+        // A denylist of credential headers is a losing game: an authenticating
+        // proxy injects names nobody standardised — `cf-access-jwt-assertion`,
+        // `x-forwarded-user`, `x-amzn-oidc-data`, `x-ms-client-principal` — and
+        // each one is a credential the sandbox promised would not cross.
+        let mut req = request();
+        req.headers = vec![
+            ("Accept".to_owned(), "text/plain".to_owned()),
+            ("Cf-Access-Jwt-Assertion".to_owned(), "ey.J.hdr".to_owned()),
+            ("X-Forwarded-User".to_owned(), "ada".to_owned()),
+            ("X-Amzn-Oidc-Data".to_owned(), "ey.J.aws".to_owned()),
+            ("X-Ms-Client-Principal".to_owned(), "ey.J.ms".to_owned()),
+            ("X-Goog-Iap-Jwt-Assertion".to_owned(), "ey.J.g".to_owned()),
+            ("X-Trace".to_owned(), "abc".to_owned()),
+        ];
+        let HostFrame::Request { headers, .. } =
+            HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
+        assert_eq!(
+            headers,
+            vec![("accept".to_owned(), "text/plain".to_owned())],
+            "only ordinary request metadata may cross"
+        );
+    }
+
+    #[test]
+    fn the_request_allowlist_carries_what_a_handler_needs() {
+        let mut req = request();
+        req.headers = vec![
+            ("accept".to_owned(), "application/json".to_owned()),
+            ("accept-language".to_owned(), "en".to_owned()),
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("if-none-match".to_owned(), "\"abc\"".to_owned()),
+            ("range".to_owned(), "bytes=0-99".to_owned()),
+            ("user-agent".to_owned(), "curl".to_owned()),
+        ];
+        let HostFrame::Request { headers, .. } =
+            HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
+        assert_eq!(headers.len(), 6, "{headers:?}");
+    }
+
+    #[test]
+    fn a_plugin_cannot_reach_a_reverse_proxy_through_an_x_header() {
+        // `X-Accel-Redirect` (nginx) and `X-Sendfile` (Apache) make the proxy
+        // serve an internal URI or a local file. An allowlist that ends in "and
+        // anything starting with x-" would hand a filesystem-free plugin the
+        // filesystem, one hop upstream.
+        for name in [
+            "x-accel-redirect",
+            "x-sendfile",
+            "x-accel-buffering",
+            "x-autumn-sandboxed",
+            "x-content-type-options",
+            "x-whatever",
+        ] {
+            assert!(
+                !response_header_allowed(name),
+                "{name} must not be settable by a plugin"
+            );
+        }
+        for name in ["content-type", "cache-control", "etag", "location", "vary"] {
+            assert!(response_header_allowed(name), "{name} must be settable");
         }
     }
 

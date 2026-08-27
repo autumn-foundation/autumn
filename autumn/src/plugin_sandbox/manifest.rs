@@ -73,10 +73,13 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound on the memory a plugin may hold across all in-flight requests
 /// (1 GiB).
 ///
-/// `memory_bytes × max_concurrency` is the real host exposure, and bounding the
-/// factors separately does not bound the product: 1 GiB × 1024 is two valid
-/// factors and a terabyte. This is the number a reviewer should look at, so it
-/// is the number the validator checks.
+/// Bounding the factors separately does not bound the product: 1 GiB × 1024 is
+/// two valid factors and a terabyte. And linear memory is not the only thing an
+/// in-flight request pins — the buffered request body, the pending stdout frame
+/// and the decoded response all live in *host* memory, outside the guest's
+/// limiter, so a manifest with a tiny `memory_bytes` and 64 MiB body/response
+/// ceilings would pass a memory-only product check and still allocate hundreds
+/// of gigabytes. See [`ResourceLimits::request_footprint_bytes`].
 pub const MAX_FOOTPRINT_BYTES: u128 = 1024 * 1024 * 1024;
 
 /// Upper bound on a manifest's declared concurrency ceiling.
@@ -206,6 +209,28 @@ impl Default for ResourceLimits {
 }
 
 impl ResourceLimits {
+    /// The host memory one in-flight request may hold at once.
+    ///
+    /// Every term is a buffer that exists while a request is being served:
+    ///
+    /// | Term | What holds it |
+    /// | --- | --- |
+    /// | `memory_bytes` | the guest instance's linear memory |
+    /// | `max_request_body_bytes` | the body, buffered before the frame is built |
+    /// | `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
+    /// | `max_response_bytes` | the decoded response, once the frame parses |
+    ///
+    /// Multiplied by `max_concurrency`, this is what the plugin can cost the
+    /// host at any instant — the number a reviewer should actually look at, so
+    /// it is the number the validator checks.
+    #[must_use]
+    pub const fn request_footprint_bytes(&self) -> u128 {
+        (self.memory_bytes as u128)
+            .saturating_add(self.max_request_body_bytes as u128)
+            .saturating_add((self.max_response_bytes as u128).saturating_mul(3))
+            .saturating_add(4096)
+    }
+
     fn validate(&self) -> Result<(), ManifestError> {
         let checks: [(&str, u128, u128); 5] = [
             ("fuel", u128::from(self.fuel), u128::from(MAX_FUEL)),
@@ -238,10 +263,12 @@ impl ResourceLimits {
                 return Err(ManifestError::LimitOutOfRange { field, value, max });
             }
         }
-        let footprint = (self.memory_bytes as u128).saturating_mul(self.max_concurrency as u128);
+        let footprint = self
+            .request_footprint_bytes()
+            .saturating_mul(self.max_concurrency as u128);
         if footprint > MAX_FOOTPRINT_BYTES {
             return Err(ManifestError::LimitOutOfRange {
-                field: "memory_bytes × max_concurrency",
+                field: "the per-request host footprint × max_concurrency",
                 value: footprint,
                 max: MAX_FOOTPRINT_BYTES,
             });
@@ -489,18 +516,35 @@ impl SandboxManifest {
     /// unproven.
     #[must_use]
     pub fn route_infos(&self) -> Vec<RouteInfo> {
-        self.routes
-            .iter()
-            .map(|route| RouteInfo {
-                method: route.method.clone(),
+        let mut infos = Vec::with_capacity(self.routes.len());
+        for route in &self.routes {
+            let info = |method: &str| RouteInfo {
+                method: method.to_owned(),
                 path: route.path.clone(),
                 handler: format!("sandbox:{}", self.name),
                 source: RouteSource::Plugin(self.name.clone()),
                 middleware: vec!["sandboxed".to_owned()],
                 classification: RouteClassification::Public,
                 ..RouteInfo::default()
-            })
-            .collect()
+            };
+            infos.push(info(&route.method));
+            // HTTP defines HEAD as GET without the body, and axum's method
+            // router dispatches a HEAD with no HEAD route to the GET one. That
+            // is correct behaviour, but it means a manifest listing only GET
+            // serves a method its own consent screen never named — so the
+            // implication is reported rather than left implicit.
+            if route.method == "GET" && !self.declares("HEAD", &route.path) {
+                infos.push(info("HEAD"));
+            }
+        }
+        infos
+    }
+
+    /// Whether the manifest declares this exact `(method, path)` pair.
+    fn declares(&self, method: &str, path: &str) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.method == method && route.path == path)
     }
 
     /// The operator-facing consent screen: what this plugin may do, what it
@@ -523,6 +567,13 @@ impl SandboxManifest {
         out.push_str("  routes it serves (and only these):\n");
         for route in &self.routes {
             let _ = writeln!(out, "    {} {}", route.method, route.path);
+            if route.method == "GET" && !self.declares("HEAD", &route.path) {
+                let _ = writeln!(
+                    out,
+                    "    HEAD {} (HTTP serves HEAD wherever it serves GET)",
+                    route.path
+                );
+            }
         }
         out.push_str("  capabilities granted:\n");
         for capability in &self.capabilities {
@@ -1094,6 +1145,38 @@ max_concurrency = 8
     }
 
     #[test]
+    fn the_footprint_counts_the_host_buffers_a_request_holds_too() {
+        // Linear memory is not the only thing a concurrent request pins: the
+        // buffered request body, the pending stdout frame and the decoded
+        // response all live in host memory outside the guest limiter. A
+        // manifest with tiny `memory_bytes` and 64 MiB body/response ceilings
+        // would otherwise pass the product check and still allocate hundreds of
+        // gigabytes.
+        let src = valid_toml()
+            .replace("memory_bytes = 33554432", "memory_bytes = 65536")
+            .replace(
+                "max_request_body_bytes = 1048576",
+                "max_request_body_bytes = 67108864",
+            )
+            .replace(
+                "max_response_bytes = 4194304",
+                "max_response_bytes = 67108864",
+            )
+            .replace("max_concurrency = 8", "max_concurrency = 1024");
+        let err = SandboxManifest::parse(&src).expect_err("must be refused");
+        assert!(
+            matches!(err, ManifestError::LimitOutOfRange { field, .. } if field.contains("footprint")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_default_limits_are_within_the_footprint_ceiling() {
+        let manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
+        assert_eq!(manifest.limits, ResourceLimits::default());
+    }
+
+    #[test]
     fn a_name_that_could_forge_a_log_line_is_refused() {
         for bad in ["", "a b", "../etc", "plugin:name", &"x".repeat(200)] {
             let src = valid_toml().replace("autumn-plugin-hello", bad);
@@ -1143,10 +1226,23 @@ max_concurrency = 8
     }
 
     #[test]
+    fn a_declared_get_reports_the_head_it_also_serves() {
+        // HTTP says HEAD is GET without the body, and axum's method router
+        // dispatches a HEAD with no HEAD route to the GET one. A manifest that
+        // listed only GET would therefore serve a method its own consent screen
+        // never named.
+        let manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
+        let infos = manifest.route_infos();
+        assert_eq!(infos.len(), 2, "{infos:?}");
+        assert!(infos.iter().any(|route| route.method == "HEAD"));
+        assert!(manifest.consent_summary().contains("HEAD /hello/greet"));
+    }
+
+    #[test]
     fn route_infos_carry_plugin_attribution_under_the_prefix() {
         let manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
         let infos = manifest.route_infos();
-        assert_eq!(infos.len(), 1);
+        assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].method, "GET");
         assert_eq!(infos[0].path, "/hello/greet");
         assert_eq!(
