@@ -348,7 +348,7 @@ mod tests {
             registry.record_comparison(
                 &context(),
                 diverging(&format!("{{\"a\":{n}}}"), "{}"),
-                1_000 + u64::from(n),
+                1_000 + n,
             );
         }
         let recent = registry.recent();

@@ -439,10 +439,7 @@ mod tests {
         let filter = ParameterFilter::default();
         let a = json(200, r#"{"id":1,"name":"ada"}"#);
         let b = json(200, r#"{"id":1,"name":"ada"}"#);
-        assert!(matches!(
-            compare(&a, &b, &filter, 2048),
-            Comparison::Match { .. }
-        ));
+        assert!(matches!(compare(&a, &b, &filter, 2048), Comparison::Match));
     }
 
     #[test]
@@ -450,10 +447,7 @@ mod tests {
         let filter = ParameterFilter::default();
         let a = json(200, r#"{"id":1,"name":"ada"}"#);
         let b = json(200, r#"{"name":"ada","id":1}"#);
-        assert!(matches!(
-            compare(&a, &b, &filter, 2048),
-            Comparison::Match { .. }
-        ));
+        assert!(matches!(compare(&a, &b, &filter, 2048), Comparison::Match));
     }
 
     #[test]
@@ -496,10 +490,7 @@ mod tests {
         let filter = ParameterFilter::default();
         let a = json(200, r#"{"id":1}"#);
         let b = json(201, r#"{"id":1}"#);
-        assert!(matches!(
-            compare(&a, &b, &filter, 2048),
-            Comparison::Match { .. }
-        ));
+        assert!(matches!(compare(&a, &b, &filter, 2048), Comparison::Match));
     }
 
     #[test]
@@ -568,7 +559,7 @@ mod tests {
                 &filter,
                 2048
             ),
-            Comparison::Match { .. }
+            Comparison::Match
         ));
     }
 
@@ -598,7 +589,7 @@ mod tests {
         };
         assert!(matches!(
             compare(&head(), &head(), &filter, 2048),
-            Comparison::Match { .. }
+            Comparison::Match
         ));
     }
 
@@ -607,10 +598,7 @@ mod tests {
         let filter = ParameterFilter::default();
         let a = json(200, "{not json");
         let b = json(200, "{not json");
-        assert!(matches!(
-            compare(&a, &b, &filter, 2048),
-            Comparison::Match { .. }
-        ));
+        assert!(matches!(compare(&a, &b, &filter, 2048), Comparison::Match));
         let c = json(200, "{not json!");
         assert!(matches!(
             compare(&a, &c, &filter, 2048),
@@ -623,10 +611,7 @@ mod tests {
         let filter = ParameterFilter::default();
         let a = json(200, r#"{"a":1,"b":2}"#);
         let b = json(200, "{ \"b\" : 2 , \"a\" : 1 }");
-        assert!(matches!(
-            compare(&a, &b, &filter, 2048),
-            Comparison::Match { .. }
-        ));
+        assert!(matches!(compare(&a, &b, &filter, 2048), Comparison::Match));
     }
 
     #[test]
