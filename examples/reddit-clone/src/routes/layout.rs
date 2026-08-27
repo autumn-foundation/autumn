@@ -199,6 +199,15 @@ pub fn layout_with_seo(
                         a href="https://github.com/autumn-foundation/autumn"
                           class="text-orange-600 hover:underline" { "Autumn" }
                         " — Rust + Diesel + Maud + htmx + Tailwind"
+                        " \u{00B7} "
+                        // GDPR Art. 7(3): withdrawing consent must be as easy
+                        // as giving it, so the preferences page is reachable
+                        // from every page rather than only from the banner.
+                        // See docs/guide/cookie-consent.md.
+                        a href=(super::consent::__autumn_path_manage())
+                          class="text-gray-500 hover:text-orange-600 hover:underline" {
+                            "Cookie preferences"
+                        }
                     }
                 }
             }
@@ -268,6 +277,30 @@ pub fn broadcast_vote_controls(post_id: i64, score: i64) -> Markup {
         .preserve_pressed_state(true)
         .label("Post score"),
     )
+}
+
+/// The app's one non-essential script, behind the cookie-consent gate.
+///
+/// This is the whole point of the consent feature, and the part a banner alone
+/// does not give you: showing a prompt while loading the tracker regardless of
+/// the answer is non-compliant theater. `Consent::allows` returns `false` for
+/// every category except `"necessary"` until the visitor has recorded a
+/// decision **under the current policy version**, so bumping
+/// `CONSENT_POLICY_VERSION` closes this gate again until they re-decide.
+///
+/// The snippet here is deliberately inert — this is a demo app with no real
+/// analytics vendor — but the call site is the real shape: one `if`, at the
+/// only place the non-essential thing is emitted.
+pub fn analytics_snippet(consent: &autumn_web::consent::Consent) -> Markup {
+    if !consent.allows("analytics", super::consent::CONSENT_POLICY_VERSION) {
+        return html! {};
+    }
+    html! {
+        // A real app would emit its vendor's <script> tag here. Everything
+        // that sets a non-essential cookie or contacts a third party belongs
+        // on this side of the gate.
+        div id="analytics-enabled" hidden data-analytics="on" {}
+    }
 }
 
 /// Timestamp display helper.
@@ -407,6 +440,30 @@ mod tests {
         assert!(
             rendered.contains(r#"<meta name="robots" content="noindex, nofollow">"#),
             "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_footer_offers_a_withdraw_route_on_every_page() {
+        // GDPR Art. 7(3): withdrawing must be as easy as consenting, which
+        // means reachable from every page rather than only from the banner.
+        let rendered = layout("Test", None, Some("token"), html! {}).into_string();
+
+        assert!(
+            rendered.contains("/consent/manage"),
+            "every page must link to the cookie-preferences page; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn analytics_stays_off_until_consent_is_recorded() {
+        use autumn_web::consent::Consent;
+
+        let undecided = super::analytics_snippet(&Consent::undecided()).into_string();
+
+        assert!(
+            undecided.is_empty(),
+            "a non-essential script must not render for an undecided visitor: {undecided}"
         );
     }
 

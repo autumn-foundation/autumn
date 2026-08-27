@@ -289,6 +289,128 @@ repository, cross-shard `across_tenants()` iteration is rejected (mirroring
 
 ---
 
+## Sorting and filtering: `ListQuery`
+
+Pagination rarely arrives alone. A list view usually also wants "sort by title
+descending" and "only the published ones" — and that is where list endpoints
+grow SQL injection holes, because the column name comes from the query string.
+
+`ListQuery` is the extractor for those parameters:
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `sort` | column key to order by | the model's default order |
+| `dir` | `asc` or `desc` | `asc` — anything unrecognized falls back to `asc` |
+| `filter[<col>]` | equality filter on column `<col>` | none |
+
+It composes with `PageRequest`, and the generated repository `list()` applies
+both in one call:
+
+```rust,ignore
+use autumn_web::prelude::*;   // ListQuery, PageRequest, Page, pagination_nav
+
+// GET /posts?sort=title&dir=desc&filter[published]=true&page=2&size=25
+#[get("/posts")]
+async fn index(
+    list_query: ListQuery,
+    page_req: PageRequest,
+    repo: PgPostRepository,
+) -> AutumnResult<Json<Page<Post>>> {
+    Ok(Json(repo.list(&list_query, &page_req).await?))
+}
+```
+
+### The allowlist is the security boundary
+
+`ListQuery` itself validates **nothing**. It carries the raw request intent and
+nothing more. The guarantee lives in the generated `list()`, which matches each
+requested key against the model's own columns through Diesel's typed DSL:
+
+- only the model's columns are sortable;
+- only its non-null `String` / integer / `bool` columns are filterable;
+- **any other key hits the default arm and is silently ignored** — it can never
+  be interpolated into SQL.
+
+That is why `?sort=id;DROP TABLE users` is inert rather than dangerous:
+`id;DROP TABLE users` is not a column, so the query falls back to the model's
+default ordering. There is no escaping step to get wrong, because no user text
+ever reaches the SQL string.
+
+Filters are applied to the `COUNT` query **and** the page query, so `total` and
+`total_pages` describe the filtered set rather than the whole table.
+
+### It never rejects a request
+
+Like `PageRequest`, `ListQuery`'s extraction is infallible. An empty `sort`
+falls back to the default order, an unrecognized `dir` falls back to `asc`, and
+unknown parameters are dropped. A malformed list URL — from a stale bookmark, a
+crawler, or a hand-edited address bar — renders the list rather than a 400.
+
+### Sortable table headers
+
+The `data_table` widget renders header links that toggle `sort`/`dir` and carry
+the matching `aria-sort` attribute, preserving the rest of the query string. It
+shares the `SortDir` type with `ListQuery`, so the request half and the view
+half cannot drift:
+
+```rust,ignore
+use autumn_web::widgets::{Column, DataTableConfig, data_table};
+
+data_table(&page.content, &columns, &DataTableConfig {
+    caption: Some("Posts"),
+    empty_message: "No posts yet.",
+    base_path: "/posts",
+    query: &raw_query,      // the current request's query string
+    ..Default::default()
+})
+```
+
+---
+
+## Costs, and how to keep them down
+
+Pagination is where a fast page quietly becomes a slow one. Four things account
+for most of it.
+
+**`COUNT(*)` is not free.** Offset pagination runs two queries, and on a large
+table the count is usually the expensive one. If the total exists only to render
+"page 3 of 412", consider whether the UI needs it — a cursor feed does not run
+it at all.
+
+**Deep offsets scan.** `OFFSET 50000` makes the database walk fifty thousand
+rows before discarding them. The cost grows with the page number, so the last
+page of a big list is the slowest request on the site. Cursor pagination is
+O(1) in page depth; that is the reason to prefer it for large tables, not
+fashion.
+
+**Offset pages are not stable under concurrent inserts.** A row inserted at the
+head while a user reads page 1 pushes one row from page 1 onto page 2, so they
+see it twice — or, on a delete, never see it at all. For a feed, that is a bug
+report. Cursor pagination is keyset-based and does not have the problem.
+
+**Two extractors, two connections.** A handler that holds `Db` *and* takes a
+repository extractor holds two pooled connections at once. Under the default
+ten-connection pool, ten such concurrent requests deadlock. Drop the first
+before acquiring the second:
+
+```rust,ignore
+let total: i64 = posts::table.count().get_result(&mut db).await?;
+let items = load_page(&mut db, &page_req).await?;
+drop(db);                       // release before the repository checks out
+let extras = repo.something_else().await?;
+```
+
+Two more things worth doing once:
+
+- **Cap the page size.** `size` is already clamped to `MAX_PAGE_SIZE`, so
+  `?size=100000` cannot turn a list route into a denial-of-service vector. Do
+  not undo that clamp by reading `size` yourself.
+- **Give paginated pages a canonical URL.** Page 2 of a list is not a duplicate
+  of page 1, and self-referential canonicals on each page are the right answer.
+  See the [SEO guide](./seo.md).
+
+---
+
 ## htmx wiring
 
 Scaffold-generated pagination links carry `hx-get` and `hx-target="body"`
@@ -383,8 +505,20 @@ let opts = PagerOptions::new("/feed");
 
 ---
 
+## In the examples
+
+| Example | Shows |
+|---|---|
+| `examples/reddit-clone` | offset pagination on a community listing (`/r/{slug}`): `PageRequest`, a filtered `COUNT`, `pagination_nav` below the list, a self-referential canonical on deeper pages, and page links that work with JavaScript disabled |
+| `examples/todo-app` | `PageRequest` plus a hand-rolled prev/next pager over `Page<Todo>`, for when you want the markup |
+
+---
+
 ## Further reading
 
 - [`autumn_web::pagination`](https://docs.rs/autumn-web/latest/autumn_web/pagination/index.html) — API reference
+- [Extractors guide](./extractors.md) — `PageRequest`, `CursorRequest` and
+  `ListQuery` among the rest, and why their extraction is infallible
 - [`#[repository]` macro](./macro-transparency.md) — generated method inventory
 - [Generators guide](./generators.md) — `autumn generate scaffold` options
+- [SEO guide](./seo.md) — canonical URLs on paginated pages

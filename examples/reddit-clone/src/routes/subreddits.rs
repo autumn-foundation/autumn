@@ -198,9 +198,16 @@ pub async fn create(
 ///
 /// The name and the description come from the row, so the handler refines the
 /// attribute defaults after it reads the community.
+///
+/// This is also the app's pagination showcase (`docs/guide/pagination.md`).
+/// Offset pagination is the right flavour here: a community listing is a
+/// browse-style UI where "page 3" is a meaningful, linkable place, unlike the
+/// front page's live feed. `PageRequest` clamps `?page=` and `?size=` rather
+/// than rejecting them, so a hand-edited or stale URL renders the list instead
+/// of a 400.
 #[get("/r/{slug}", seo(og_type = "website"))]
 // Every argument is a distinct extractor: path, SEO defaults, session, CSRF
-// token, CSRF field name, repository, connection, flash.
+// token, CSRF field name, page request, repository, connection, flash.
 #[allow(clippy::too_many_arguments)]
 pub async fn show(
     Path(slug): Path<String>,
@@ -210,6 +217,7 @@ pub async fn show(
     // Same as the post detail page: the widget's hidden input must be named
     // whatever `security.csrf.form_field` configured, or the first submit 403s.
     csrf_field: CsrfFormField,
+    page_req: PageRequest,
     repo: PgSubredditRepository,
     mut db: Db,
     flash: Flash,
@@ -222,12 +230,26 @@ pub async fn show(
         .next()
         .ok_or_else(|| AutumnError::not_found_msg(format!("r/{slug} not found")))?;
 
-    // Load posts for this subreddit ordered by hot_rank
-    let posts: Vec<(i64, String, String, i64, i64, String, chrono::NaiveDateTime)> =
+    // Offset pagination, in the two queries it always takes: the filtered
+    // COUNT, then the page slice. The COUNT carries the SAME `subreddit_id`
+    // filter as the slice — a total computed over the whole table would
+    // render a pager with pages that do not exist.
+    let total: i64 = crate::schema::posts::table
+        .filter(crate::schema::posts::subreddit_id.eq(sub.id))
+        .count()
+        .get_result(&mut *db)
+        .await?;
+
+    // `page_req.limit()` / `page_req.offset()` come pre-clamped: `?size=0` and
+    // `?size=99999` both land inside `1..=MAX_PAGE_SIZE`, so this route cannot
+    // be turned into an unbounded read by a query parameter.
+    let rows: Vec<(i64, String, String, i64, i64, String, chrono::NaiveDateTime)> =
         crate::schema::posts::table
             .filter(crate::schema::posts::subreddit_id.eq(sub.id))
             .inner_join(users::table.on(crate::schema::posts::author_id.eq(users::id)))
             .order(crate::schema::posts::hot_rank.desc())
+            .limit(page_req.limit())
+            .offset(page_req.offset())
             .select((
                 crate::schema::posts::id,
                 crate::schema::posts::title,
@@ -239,6 +261,8 @@ pub async fn show(
             ))
             .load(&mut *db)
             .await?;
+    let page = Page::new(rows, total, &page_req);
+    let posts = page.content.as_slice();
 
     // Release this request's pooled connection before the comment read. The
     // repository helper takes its OWN connection from the pool -- it does not
@@ -279,13 +303,31 @@ pub async fn show(
             .sign_in_prompt("Log in to join the discussion.");
     }
 
+    let first_page = page.page <= 1;
+
+    // A paginated listing gets a SELF-referential canonical: page 2 is not a
+    // duplicate of page 1, and pointing every page at page 1 asks a crawler to
+    // drop the deeper pages from the index. See docs/guide/seo.md.
+    let canonical_path = if first_page {
+        __autumn_path_show(&sub.slug)
+    } else {
+        format!("{}?page={}", __autumn_path_show(&sub.slug), page.page)
+    };
+
     let seo = crate::seo::with_canonical(
-        seo.title(format!("r/{} \u{2022} Autumn Reddit", sub.name))
-            .description(
-                crate::seo::summarize(&sub.description, 155)
-                    .unwrap_or_else(|| format!("The r/{} community on Autumn Reddit.", sub.name)),
-            ),
-        &__autumn_path_show(&sub.slug),
+        seo.title(if first_page {
+            format!("r/{} \u{2022} Autumn Reddit", sub.name)
+        } else {
+            format!(
+                "r/{} \u{2022} page {} \u{2022} Autumn Reddit",
+                sub.name, page.page
+            )
+        })
+        .description(
+            crate::seo::summarize(&sub.description, 155)
+                .unwrap_or_else(|| format!("The r/{} community on Autumn Reddit.", sub.name)),
+        ),
+        &canonical_path,
     );
 
     // Consume the flash only after all fallible work above.
@@ -319,10 +361,18 @@ pub async fn show(
                 }
             }
 
-            // Post list
+            // Post list. The live SSE feed appends new posts to the TOP of
+            // the list, which is only correct on page 1 — on page 2 a
+            // just-published post belongs at the head of page 1, not here, and
+            // appending it would show the reader a row that is not part of the
+            // slice they asked for. So the feed is wired on the first page
+            // only; deeper pages are a plain, stable listing.
             ul id="posts-list" class="space-y-2"
-                hx-ext="sse" sse-connect=(format!("/r/{}/posts/stream", sub.slug)) sse-swap="message" hx-swap="none" {
-                @for (post_id, title, post_slug, score, comment_count, author, created_at) in &posts {
+                hx-ext=[first_page.then_some("sse")]
+                sse-connect=[first_page.then(|| format!("/r/{}/posts/stream", sub.slug))]
+                sse-swap=[first_page.then_some("message")]
+                hx-swap=[first_page.then_some("none")] {
+                @for (post_id, title, post_slug, score, comment_count, author, created_at) in posts {
                     li id=(format!("post-{}", post_id)) class="posts-feed-item transition-all" {
                         div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
                             div class="flex items-start gap-3 p-4" {
@@ -356,10 +406,22 @@ pub async fn show(
                 }
                 @if posts.is_empty() {
                     p class="text-gray-400 text-center py-12" {
-                        "No posts yet. Be the first!"
+                        @if page.page > 1 {
+                            "No posts on this page."
+                        } @else {
+                            "No posts yet. Be the first!"
+                        }
                     }
                 }
             }
+
+            // One line renders the whole pager: a <nav aria-label="Pagination">
+            // with a windowed page-number sequence, `aria-current="page"` on
+            // the active page, and non-focusable `aria-disabled` prev/next at
+            // the ends. `PagerOptions` has no `hx_target` here on purpose, so
+            // every link is a plain <a href> and pagination keeps working with
+            // JavaScript disabled. See docs/guide/pagination.md.
+            (pagination_nav(&page, &PagerOptions::new(&__autumn_path_show(&sub.slug))))
 
             // Community discussion -- the second `#[commentable]` model (#1367).
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mt-6" {

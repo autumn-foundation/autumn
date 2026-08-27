@@ -31,6 +31,12 @@ showcasing the framework's major features in a single cohesive application.
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
 | Audit logging (`AuditLogger` + `TracingAuditSink`, actor auto-attribution via `Current::actor()`) | `main.rs`, `routes/posts.rs` (`delete_post`) |
 | **Route-level SEO** (`seo(...)` + `SeoMeta` extractor, canonical URLs, `robots = "noindex"`, DB-backed `SitemapSource`, auto-mounted `/robots.txt` + `/sitemap.xml`) | `seo.rs`, `autumn.toml`, `routes/posts.rs`, `routes/subreddits.rs`, `routes/about.rs`, `routes/layout.rs` |
+| **Forms & validation** (`ChangesetForm` round-trip — a rejected submission comes back with the author's input and one message per field) | `routes/posts.rs` (`submit`, `update`) |
+| **Typed accessible form primitives** (`a11y::TextField` / `TextArea` / `Select` / `Button` / `Link`; an unlabeled field does not compile) | `routes/posts.rs` (`submit_form_markup`, `edit_form_markup`) |
+| **Rich text** (user-submitted Markdown rendered through `markdown::render_user_content`) | `routes/posts.rs` (`show`) |
+| **Cookie consent** (`inject_consent_banner`, POST accept/reject/withdraw, a preferences page, the `analytics` gate) | `routes/consent.rs`, `routes/layout.rs`, `main.rs` |
+| **Pagination** (`PageRequest` + `Page` + `pagination_nav`, plain `<a href>` page links) | `routes/subreddits.rs` (`show`) |
+| **No-JavaScript fallbacks** (forms and pagination carry no `hx-*` attributes; vote and comment controls degrade to form POSTs) | `routes/posts.rs`, `routes/subreddits.rs`, `routes/layout.rs` |
 
 ## Prerequisites
 
@@ -173,6 +179,41 @@ Where each part lives:
 
 Change `base_url` to the real host before you deploy. See
 [`docs/guide/seo.md`](../../docs/guide/seo.md) for the full guide.
+
+## UI: forms, accessibility, rich text, consent and pagination
+
+The post submit/edit pair is the app's showcase for the framework's UI surface,
+and each piece has a guide:
+
+```bash
+# Typed a11y controls: every field has a real <label>, and an invalid one
+# carries aria-invalid + aria-describedby pointing at a role="alert" message.
+curl -s http://localhost:3000/submit | grep -E '<label|aria-invalid|aria-describedby'
+
+# No JavaScript required: the form has no hx-* attributes at all.
+curl -s http://localhost:3000/submit | grep -c 'hx-'   # 0 inside the <form>
+
+# Offset pagination, with plain <a href> page links.
+curl -s 'http://localhost:3000/r/rust?page=2' | grep -E '<nav aria-label="Pagination"|aria-current'
+
+# The consent banner, until a choice is recorded.
+curl -s http://localhost:3000/ | grep 'autumn-consent-banner'
+```
+
+| Part | File | Guide |
+|------|------|-------|
+| `ChangesetForm` round-trip, re-rendering a 422 with the author's input | `src/routes/posts.rs` | [`forms.md`](../../docs/guide/forms.md) |
+| Typed accessible controls and their error wiring | `src/routes/posts.rs` | [`accessibility.md`](../../docs/guide/accessibility.md) |
+| Sanitized user-submitted Markdown post bodies | `src/routes/posts.rs` (`show`) | [`rich-text.md`](../../docs/guide/rich-text.md) |
+| Consent routes, the banner layer, the `analytics` gate | `src/routes/consent.rs`, `src/main.rs` | [`cookie-consent.md`](../../docs/guide/cookie-consent.md) |
+| `PageRequest` + `pagination_nav` on the community listing | `src/routes/subreddits.rs` | [`pagination.md`](../../docs/guide/pagination.md) |
+
+Two details in there are worth reading the code for. Rich text is sanitized at
+**render** time, not on write, so the database keeps the author's original
+Markdown (an edit shows them what they typed) and a later allowlist change
+protects posts already written. And the community page wires its live SSE feed
+on **page 1 only** — appending a just-published post to page 2 would show the
+reader a row that is not part of the slice they asked for.
 
 ## API Endpoints
 

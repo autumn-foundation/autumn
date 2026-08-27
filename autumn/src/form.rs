@@ -1,5 +1,8 @@
 //! Changeset-style form helpers with validation and Maud rendering.
 //!
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/forms.md)
+//! for the narrative version of everything below.
+//!
 //! # Overview
 //!
 //! [`Changeset<T>`] captures submitted form values together with per-field

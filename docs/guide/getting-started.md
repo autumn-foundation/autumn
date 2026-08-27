@@ -358,10 +358,12 @@ What the excerpt above leaves out is worth opening the file for. The scaffold's
 link, flash messages, and the framework's widget CSS. Alongside it is a working
 cookie-consent flow — a banner injected by a `.layer(...)` on the builder,
 CSRF-protected accept/reject routes, and a preferences page linked from the
-footer so withdrawing consent is as easy as giving it. There is also a
-`#[cfg(feature = "embed-assets")]` block that bakes `static/` into the binary
-for `autumn build --embed`. All of it is ordinary user code: delete what you do
-not need.
+footer so withdrawing consent is as easy as giving it — see the
+[cookie-consent guide](./cookie-consent.md) for how to gate your own
+non-essential cookies on it, since the banner alone is not the compliance.
+There is also a `#[cfg(feature = "embed-assets")]` block that bakes `static/`
+into the binary for `autumn build --embed`. All of it is ordinary user code:
+delete what you do not need.
 
 To see everything that is actually mounted, including framework routes and
 per-route middleware:

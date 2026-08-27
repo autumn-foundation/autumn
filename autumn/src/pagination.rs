@@ -1,5 +1,9 @@
 //! Standardized pagination primitives.
 //!
+//! See the [pagination guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/pagination.md)
+//! for the offset-versus-cursor decision, [`ListQuery`] sorting and filtering,
+//! and the cost pitfalls.
+//!
 //! Autumn ships two complementary flavours of pagination:
 //!
 //! 1. **Offset pagination** ([`PageRequest`] / [`Page<T>`]) — classic
@@ -759,6 +763,13 @@ const BASE64URL_ALPHABET: &[u8; 64] =
 // exact MSRV — CI builds a `1.88.0` lane, so adopting it leaves zero margin for
 // an MSRV the project may want to hold. Not a trade worth making for an
 // incidental cleanup; revisit when the MSRV moves past 1.88.
+//
+// `unknown_lints` is allowed alongside it because the lint has since been
+// renamed away on current stable clippy, where a bare `allow` of a name it no
+// longer knows is itself an error under `-D warnings`. Keeping both means the
+// intent above holds on the MSRV toolchain that still has the lint AND on a
+// newer one that does not, without pinning either.
+#[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn base64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
