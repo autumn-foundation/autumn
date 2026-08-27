@@ -928,7 +928,23 @@ struct Handoff {
 #[cfg(unix)]
 impl Drop for Handoff {
     fn drop(&mut self) {
-        if !self.completed {
+        // `completed` is this process's *observation* that the successor took
+        // over, and it lags the fact by up to one poll interval. A successor
+        // that has already published readiness and is still running owns the
+        // socket and the state whether or not this process got to notice —
+        // so a cancellation inside that window (a `SIGTERM` between the
+        // successor's rename and our next poll) must not kill it, and must not
+        // hand this process's state back: the successor is writable, and two
+        // writable copies of one block is exactly the divergence the freeze
+        // exists to prevent.
+        let ready_path = self.dir.join("ready");
+        let taken_over = self.completed
+            || self
+                .child
+                .as_mut()
+                .is_some_and(|child| successor_took_over(&ready_path, child));
+
+        if !taken_over {
             if let Some(child) = &mut self.child {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -943,6 +959,18 @@ impl Drop for Handoff {
         // the handoff, completed or abandoned.
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Whether the successor has taken over: it published readiness *and* is still
+/// running.
+///
+/// Both halves matter. Readiness is a file, so it outlives the process that
+/// wrote it — a successor that published and then died has not taken over, and
+/// this process must resume. A successor that published and is running has,
+/// even if this process has not observed it yet.
+#[cfg(unix)]
+fn successor_took_over(ready_path: &std::path::Path, child: &mut std::process::Child) -> bool {
+    ready_path.exists() && matches!(child.try_wait(), Ok(None))
 }
 
 /// Snapshot, spawn, and wait — the fallible middle of [`upgrade_in_place`],
@@ -1019,6 +1047,12 @@ async fn spawn_and_await_successor(
             Err(error) => return Err(UpgradeError::Io(error)),
         }
         if plan.clock.monotonic() >= deadline {
+            // One last look before calling it: the successor may have published
+            // readiness in the very tick the budget ran out, and abandoning it
+            // then would kill a build that is already serving and writable.
+            if successor_took_over(&ready_path, child) {
+                return Ok(successor_pid);
+            }
             return Err(UpgradeError::ReadyTimeout(plan.ready_timeout));
         }
         tokio::time::sleep(READY_POLL_INTERVAL).await;
@@ -1549,6 +1583,116 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a `Handoff` around a live child process, for the drop-guard tests.
+    #[cfg(unix)]
+    fn handoff_for_test(dir: std::path::PathBuf, registry: Arc<LiveStateRegistry>) -> Handoff {
+        // Long enough to outlive the drop under test, short enough that a
+        // panic before the explicit kill cannot leave it behind for long.
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a stand-in successor process");
+        Handoff {
+            dir,
+            child: Some(child),
+            registry: Some(registry),
+            completed: false,
+        }
+    }
+
+    /// Whether `pid` names a live process, portably: `/proc` is Linux-only,
+    /// and these tests run wherever `cfg(unix)` does.
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn scratch_dir(line: u32) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("autumn-upgrade-test-{}-{line}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_abandoned_upgrade_kills_a_successor_that_never_took_over() {
+        let dir = scratch_dir(line!());
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+        // No readiness file: this successor never took over.
+        drop(handoff);
+
+        assert!(
+            !handle.is_frozen(),
+            "an abandoned upgrade must hand the state back, or the old build serves the rest \
+             of its life refusing writes"
+        );
+        assert!(
+            !dir.exists(),
+            "the handoff directory must not outlive the handoff"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "the half-started successor must not be left holding the port"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_already_published_readiness_survives_an_abandoned_wait() {
+        // The window: the successor renames its readiness file and becomes
+        // writable, and a `SIGTERM` reaches this process before its next poll
+        // observes it. The successor owns the socket and the state by then —
+        // killing it would discard writes it has already acknowledged, and
+        // unfreezing here would leave two writable copies of one block.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join("ready"), "1").expect("the successor published readiness");
+
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+        drop(handoff);
+
+        assert!(
+            handle.is_frozen(),
+            "the successor is writable, so this process must stay frozen: two writable copies \
+             of one block is the divergence the freeze exists to prevent"
+        );
+        assert!(
+            process_is_alive(pid),
+            "a successor that has taken over must not be killed by a wait this process \
+             abandoned"
+        );
+        assert!(
+            !dir.exists(),
+            "the snapshot has been read and readiness published, so the directory holding \
+             application state goes on this path too"
+        );
+
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
     }
 
     #[test]
