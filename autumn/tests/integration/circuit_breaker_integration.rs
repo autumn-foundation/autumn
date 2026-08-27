@@ -55,7 +55,6 @@ async fn unrelated() -> &'static str {
     "unrelated ok"
 }
 
-
 /// Latency budget for a request that must not be slowed by an open circuit
 /// breaker, derived from a warm baseline measured on the same app.
 ///
