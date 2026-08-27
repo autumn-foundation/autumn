@@ -476,6 +476,32 @@ pub struct HttpEffect {
     pub error: Option<String>,
 }
 
+impl HttpEffect {
+    /// The placeholder a reserved-but-unfinished tape slot holds.
+    ///
+    /// A concurrent call takes its tape position when it *starts*, so a slot
+    /// exists before its response does. A run cut short mid-call leaves one of
+    /// these behind, and a placeholder that names itself is far easier to read
+    /// in a capsule than a silently zeroed record.
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            method: String::new(),
+            url: String::new(),
+            request_headers: Vec::new(),
+            request_body: CapsuleBody::Absent,
+            status: 0,
+            response_headers: Vec::new(),
+            response_body: CapsuleBody::Absent,
+            error: Some(PENDING_EFFECT.to_owned()),
+        }
+    }
+}
+
+/// The `error` text a reserved-but-never-completed effect carries.
+pub const PENDING_EFFECT: &str =
+    "the recording ended before this effect completed; the capsule is incomplete";
+
 /// A background job the recorded run enqueued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobEffect {
@@ -487,6 +513,28 @@ pub struct JobEffect {
     /// enqueue.
     #[serde(default)]
     pub delay_secs: Option<i64>,
+    /// The error the backend returned, when the enqueue **failed**.
+    ///
+    /// A handler whose recorded 500 was caused by `enqueue(..).await?` — the
+    /// queue was down, the channel was closed — must meet that error again on
+    /// replay. Recording only the attempt would hand it `Ok(())` and send it
+    /// down the success path the failing run never took.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl JobEffect {
+    /// The placeholder a reserved-but-unfinished tape slot holds; see
+    /// [`HttpEffect::pending`].
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            name: String::new(),
+            payload: serde_json::Value::Null,
+            delay_secs: None,
+            error: Some(PENDING_EFFECT.to_owned()),
+        }
+    }
 }
 
 /// The job a job-scoped capsule replays.
@@ -557,6 +605,21 @@ pub struct MailEffect {
     /// The delivery error the recorded send produced, when it failed.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl MailEffect {
+    /// The placeholder a reserved-but-unfinished tape slot holds; see
+    /// [`HttpEffect::pending`].
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            to: Vec::new(),
+            from: None,
+            subject: String::new(),
+            body: CapsuleBody::Absent,
+            error: Some(PENDING_EFFECT.to_owned()),
+        }
+    }
 }
 
 /// The tenant context the recorded run resolved.

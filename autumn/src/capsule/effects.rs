@@ -66,6 +66,8 @@ pub enum EffectSeam {
     Cache,
     /// Mail handed to the mailer.
     Mail,
+    /// The tenant context the run resolved.
+    Tenant,
 }
 
 impl EffectSeam {
@@ -77,6 +79,7 @@ impl EffectSeam {
             Self::Job => "job enqueue",
             Self::Cache => "cache",
             Self::Mail => "mail",
+            Self::Tenant => "tenancy",
         }
     }
 }
@@ -140,7 +143,24 @@ pub enum CachedValue {
     Hit(Vec<u8>),
 }
 
+/// What the tape can say about a job enqueue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnqueueVerdict {
+    /// Matched a recorded enqueue that succeeded; nothing reaches a queue.
+    Queued,
+    /// Matched a recorded enqueue that the backend **rejected**; the caller
+    /// reproduces the error.
+    Failed(String),
+    /// Did not match the recording. A divergence has been logged.
+    Diverged,
+}
+
 /// What the tape can say about a mail send.
+///
+/// Gated with the seam that consumes it: a build without `mail` has no
+/// `Mailer::send` to serve, though a capsule recorded by a `mail` build still
+/// carries — and still reports — its mail tape.
+#[cfg(any(test, feature = "mail"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MailVerdict {
     /// Matched a recorded successful send; nothing is delivered.
@@ -175,12 +195,22 @@ pub struct ReplayEffects {
     http: Mutex<Ordered<HttpEffect>>,
     jobs: Mutex<Ordered<JobEffect>>,
     mail: Mutex<Ordered<MailEffect>>,
-    /// Cache entries by key, rather than in order: one key is legitimately
-    /// read many times in a run, and a recorded read order would make an
-    /// innocent extra hit look like a divergence. `None` is a recorded miss,
-    /// `Some(bytes)` a recorded hit.
+    /// Recorded cache *reads*, by key rather than in order: one key is
+    /// legitimately read many times in a run, and a recorded read order would
+    /// make an innocent extra hit look like a divergence.
     cache: Mutex<BTreeMap<String, CacheSlot>>,
+    /// Recorded cache *writes*, in order. Writes are ordered effects like an
+    /// enqueue or a send — dropping one, or changing what it stores, is a
+    /// behaviour change the capsule can see — so they are consumed and
+    /// compared rather than merely applied.
+    cache_writes: Mutex<Ordered<CacheWrite>>,
+    /// The recorded tenant, and whether the replayed run ever asked for it.
+    ///
+    /// Tracked like every other seam: a router whose updated code no longer
+    /// resolves a tenant would otherwise leave the recording untouched and
+    /// still report `Reproduced` on an unchanged response.
     tenant: Option<String>,
+    tenant_read: std::sync::atomic::AtomicBool,
     divergences: Mutex<Vec<EffectDivergence>>,
     /// Total effects the tape was built with, so the verdict can say how much
     /// of the recording the run actually met.
@@ -194,6 +224,15 @@ pub struct ReplayEffects {
     /// serving stable non-consuming values and still be able to report
     /// `Reproduced`. The verdict warns instead of pretending.
     scope_entered: std::sync::atomic::AtomicBool,
+}
+
+/// One recorded cache write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheWrite {
+    key: String,
+    /// `None` when the recorded value was not decodable; the key still has to
+    /// match.
+    value: Option<Vec<u8>>,
 }
 
 /// One cache key's recorded value and whether the run has read it.
@@ -235,18 +274,32 @@ impl ReplayEffects {
                 });
             }
         }
+        let cache_writes: Vec<CacheWrite> = effects
+            .cache
+            .iter()
+            .filter_map(|entry| match entry {
+                CacheEffect::Insert { key, value } => Some(CacheWrite {
+                    key: key.clone(),
+                    value: decode(value),
+                }),
+                CacheEffect::Get { .. } => None,
+            })
+            .collect();
         let recorded = effects
             .http
             .len()
             .saturating_add(effects.jobs.len())
             .saturating_add(effects.mail.len())
-            .saturating_add(cache.len());
+            .saturating_add(cache.len())
+            .saturating_add(cache_writes.len());
         Self {
             http: Mutex::new(Ordered::new(effects.http)),
             jobs: Mutex::new(Ordered::new(effects.jobs)),
             mail: Mutex::new(Ordered::new(effects.mail)),
             cache: Mutex::new(cache),
+            cache_writes: Mutex::new(Ordered::new(cache_writes)),
             tenant: effects.tenant.and_then(|tenant| tenant.id),
+            tenant_read: std::sync::atomic::AtomicBool::new(false),
             divergences: Mutex::new(Vec::new()),
             recorded,
             served: AtomicUsize::new(0),
@@ -366,9 +419,9 @@ impl ReplayEffects {
         name: &str,
         payload: &serde_json::Value,
         delay_secs: Option<i64>,
-    ) -> bool {
+    ) -> EnqueueVerdict {
         let Ok(mut seam) = self.jobs.lock() else {
-            return false;
+            return EnqueueVerdict::Diverged;
         };
         let index = seam.consumed;
         let Some(next) = seam.pending.front() else {
@@ -385,7 +438,7 @@ impl ReplayEffects {
                      ({actual}); nothing was written to a queue"
                 ),
             });
-            return false;
+            return EnqueueVerdict::Diverged;
         };
         // The delay is compared only when the *caller* stated one. Not every
         // enqueue entry point knows its delay in seconds at the point the guard
@@ -408,13 +461,13 @@ impl ReplayEffects {
                      enqueue was {expected}"
                 ),
             });
-            return false;
+            return EnqueueVerdict::Diverged;
         }
-        seam.pending.pop_front();
+        let error = seam.pending.pop_front().and_then(|recorded| recorded.error);
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
         self.served.fetch_add(1, Ordering::SeqCst);
-        true
+        error.map_or(EnqueueVerdict::Queued, EnqueueVerdict::Failed)
     }
 
     /// What the capsule recorded for a cache key.
@@ -471,27 +524,80 @@ impl ReplayEffects {
         value.map_or(CachedValue::Miss, CachedValue::Hit)
     }
 
-    /// Record a cache write made during replay, so a later read in the same
-    /// run sees it. Writes are never sent to a live backend.
-    pub(crate) fn cache_insert(&self, key: &str, value: Vec<u8>) {
+    /// Apply a cache write made during replay, and check it against the
+    /// recording.
+    ///
+    /// Two jobs at once. The value lands in the read map so a read-back later
+    /// in the same run finds it, exactly as it did in production. And the write
+    /// is *consumed* from the recorded write tape and compared — a write the
+    /// code dropped, added, or changed the value of is a behaviour change, and
+    /// without this it could ride along under an unchanged response and still
+    /// report `Reproduced`. Nothing is ever sent to a live backend.
+    pub(crate) fn cache_insert(&self, key: &str, value: &[u8]) {
         if let Ok(mut cache) = self.cache.lock() {
             cache
                 .entry(key.to_owned())
                 .and_modify(|slot| {
-                    slot.value = Some(value.clone());
+                    slot.value = Some(value.to_vec());
                     slot.touched = true;
                 })
-                .or_insert(CacheSlot {
-                    value: Some(value),
+                .or_insert_with(|| CacheSlot {
+                    value: Some(value.to_vec()),
                     was_read: false,
                     touched: true,
                 });
         }
+        let Ok(mut seam) = self.cache_writes.lock() else {
+            return;
+        };
+        let index = seam.consumed;
+        let Some(next) = seam.pending.front() else {
+            drop(seam);
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Cache,
+                kind: EffectDivergenceKind::Unrecorded,
+                index,
+                expected: None,
+                actual: key.to_owned(),
+                detail: format!(
+                    "the replayed run wrote cache key {key:?}, which the capsule has no \
+                     recording for"
+                ),
+            });
+            return;
+        };
+        // The recorded value may have been masked on its way to disk, so it is
+        // compared the way every other redacted recording is.
+        let value_matches = next
+            .value
+            .as_ref()
+            .is_none_or(|recorded| bytes_match_redacted(recorded, value));
+        if !matches_redacted(&next.key, key) || !value_matches {
+            let expected = next.key.clone();
+            drop(seam);
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Cache,
+                kind: EffectDivergenceKind::Mismatch,
+                index,
+                expected: Some(expected.clone()),
+                actual: key.to_owned(),
+                detail: format!(
+                    "the replayed run wrote cache key {key:?}, but the capsule's next recorded \
+                     write was {expected:?}"
+                ),
+            });
+            return;
+        }
+        seam.pending.pop_front();
+        seam.consumed = seam.consumed.saturating_add(1);
+        drop(seam);
+        self.served.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Whether the next recorded mail send is the one the run just made, and
     /// the delivery error the recording produced for it.
     ///
+    #[cfg(any(test, feature = "mail"))]
     #[must_use]
     pub(crate) fn next_mail(&self, to: &[String], subject: &str) -> MailVerdict {
         let Ok(mut seam) = self.mail.lock() else {
@@ -547,6 +653,9 @@ impl ReplayEffects {
     /// The tenant the recording resolved, when it resolved one.
     #[must_use]
     pub(crate) fn tenant(&self) -> Option<String> {
+        if self.tenant.is_some() {
+            self.tenant_read.store(true, Ordering::SeqCst);
+        }
         self.tenant.clone()
     }
 
@@ -585,6 +694,24 @@ impl ReplayEffects {
                 seam.consumed,
                 seam.pending.len(),
                 seam.pending.front().map(|next| next.subject.clone()),
+            ));
+        }
+        if self.tenant.is_some() && !self.tenant_read.load(Ordering::SeqCst) {
+            divergences.push(unconsumed(
+                EffectSeam::Tenant,
+                0,
+                1,
+                self.tenant.clone(),
+            ));
+        }
+        if let Ok(seam) = self.cache_writes.lock()
+            && !seam.pending.is_empty()
+        {
+            divergences.push(unconsumed(
+                EffectSeam::Cache,
+                seam.consumed,
+                seam.pending.len(),
+                seam.pending.front().map(|next| next.key.clone()),
             ));
         }
         if let Ok(cache) = self.cache.lock() {
@@ -689,6 +816,7 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
 ///
 /// Recipients are the PII here, so only their count and domains reach the
 /// report — the report is printed to a terminal and to CI logs.
+#[cfg(any(test, feature = "mail"))]
 fn describe_mail(to: &[String], subject: &str) -> String {
     let domains: Vec<&str> = to
         .iter()
@@ -765,6 +893,21 @@ fn matches_redacted(recorded: &str, actual: &str) -> bool {
     true
 }
 
+/// Whether recorded bytes match what the replayed run produced, tolerating
+/// redaction placeholders in a UTF-8 recording.
+///
+/// Binary values are compared exactly: there is nothing in them for a
+/// placeholder to stand in.
+fn bytes_match_redacted(recorded: &[u8], actual: &[u8]) -> bool {
+    if recorded == actual {
+        return true;
+    }
+    match (std::str::from_utf8(recorded), std::str::from_utf8(actual)) {
+        (Ok(recorded), Ok(actual)) => matches_redacted(recorded, actual),
+        _ => false,
+    }
+}
+
 /// Whether a recorded JSON payload matches the one the replayed run produced,
 /// with redaction placeholders treated as wildcards.
 ///
@@ -834,7 +977,9 @@ pub fn tape_active() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::capsule::effects::{CachedValue, EffectSeam, MailVerdict, ReplayEffects};
+    use crate::capsule::effects::{
+        CachedValue, EffectDivergenceKind, EffectSeam, EnqueueVerdict, MailVerdict, ReplayEffects,
+    };
     use crate::capsule::schema::{
         CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect, TenantEffect,
     };
@@ -867,6 +1012,7 @@ mod tests {
                 name: "notify".to_owned(),
                 payload: serde_json::json!({"to": "a@example.com", "token": "[FILTERED]"}),
                 delay_secs: None,
+                error: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -876,11 +1022,14 @@ mod tests {
                 .is_some(),
             "a masked query value must match whatever really stood there"
         );
-        assert!(tape.next_job(
-            "notify",
-            &serde_json::json!({"to": "a@example.com", "token": "real-token"}),
-            None
-        ));
+        assert_eq!(
+            tape.next_job(
+                "notify",
+                &serde_json::json!({"to": "a@example.com", "token": "real-token"}),
+                None
+            ),
+            EnqueueVerdict::Queued
+        );
         assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
@@ -909,15 +1058,19 @@ mod tests {
                 name: "notify".to_owned(),
                 payload: serde_json::json!({"token": "[FILTERED]"}),
                 delay_secs: None,
+                error: None,
             }],
             ..CapsuleEffects::default()
         });
         // An extra key is a real change, placeholder or not.
-        assert!(!tape.next_job(
-            "notify",
-            &serde_json::json!({"token": "real", "extra": 1}),
-            None
-        ));
+        assert_eq!(
+            tape.next_job(
+                "notify",
+                &serde_json::json!({"token": "real", "extra": 1}),
+                None
+            ),
+            EnqueueVerdict::Diverged
+        );
         assert_eq!(tape.divergences().len(), 1);
     }
 
@@ -1000,16 +1153,19 @@ mod tests {
                 name: "send_receipt".to_owned(),
                 payload: serde_json::json!({"order": 7}),
                 delay_secs: None,
+                error: None,
             }],
             ..CapsuleEffects::default()
         });
-        assert!(
+        assert_eq!(
             tape.next_job("send_receipt", &serde_json::json!({"order": 7}), None),
+            EnqueueVerdict::Queued,
             "the recorded enqueue is satisfied from the tape"
         );
         assert!(tape.divergences().is_empty());
-        assert!(
-            !tape.next_job("send_receipt", &serde_json::json!({"order": 8}), None),
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({"order": 8}), None),
+            EnqueueVerdict::Diverged,
             "an enqueue the recording never made must not be satisfied"
         );
         assert_eq!(tape.divergences().len(), 1);
@@ -1024,10 +1180,14 @@ mod tests {
                 name: "send_receipt".to_owned(),
                 payload: serde_json::json!({}),
                 delay_secs: None,
+                error: None,
             }],
             ..CapsuleEffects::default()
         });
-        assert!(!tape.next_job("send_receipt", &serde_json::json!({}), Some(3600)));
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), Some(3600)),
+            EnqueueVerdict::Diverged
+        );
         assert_eq!(tape.divergences().len(), 1);
     }
 
@@ -1054,7 +1214,7 @@ mod tests {
             CachedValue::Miss,
             "the recorded miss must replay as a miss"
         );
-        tape.cache_insert("widgets", b"41".to_vec());
+        tape.cache_insert("widgets", b"41");
         assert_eq!(
             tape.cache_get("widgets"),
             CachedValue::Hit(b"41".to_vec()),
@@ -1156,6 +1316,91 @@ mod tests {
             MailVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
+    }
+
+    #[test]
+    fn a_recorded_enqueue_failure_is_reproduced_as_a_failure() {
+        // A handler whose 500 came from `enqueue(..).await?` must meet the
+        // rejection again, not be handed the success it never got.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                delay_secs: None,
+                error: Some("queue is down".to_owned()),
+            }],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), None),
+            EnqueueVerdict::Failed("queue is down".to_owned())
+        );
+        assert!(tape.divergences().is_empty());
+    }
+
+    #[test]
+    fn a_cache_write_the_code_dropped_is_a_divergence() {
+        // A recorded write nobody performs must not ride along under an
+        // unchanged response.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Insert {
+                key: "widgets".to_owned(),
+                value: base64_of(b"41"),
+            }],
+            ..CapsuleEffects::default()
+        });
+        let divergences = tape.finish();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unconsumed);
+    }
+
+    #[test]
+    fn a_cache_write_with_a_changed_value_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Insert {
+                key: "widgets".to_owned(),
+                value: base64_of(b"41"),
+            }],
+            ..CapsuleEffects::default()
+        });
+        tape.cache_insert("widgets", b"42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Mismatch);
+    }
+
+    #[test]
+    fn a_matching_cache_write_is_consumed_and_readable_back() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Insert {
+                key: "widgets".to_owned(),
+                value: base64_of(b"41"),
+            }],
+            ..CapsuleEffects::default()
+        });
+        tape.cache_insert("widgets", b"41");
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        assert_eq!(
+            tape.cache_get("widgets"),
+            CachedValue::Hit(b"41".to_vec()),
+            "the run's own write is readable back, as it was in production"
+        );
+    }
+
+    #[test]
+    fn a_recorded_tenant_the_replayed_run_never_read_is_a_divergence() {
+        // A router whose updated code no longer resolves a tenant would
+        // otherwise leave the recording untouched and still report a clean
+        // reproduction on an unchanged response.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            tenant: Some(TenantEffect {
+                id: Some("acme".to_owned()),
+            }),
+            ..CapsuleEffects::default()
+        });
+        let divergences = tape.finish();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].seam, EffectSeam::Tenant);
     }
 
     #[test]

@@ -599,12 +599,17 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The whole seam is behind the `reporting` feature, which is what gates the
+// `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
+// the same on either build.
 
 /// Serve one outbound call from a capsule's effect tape.
 ///
 /// A recorded transport failure is reproduced as one, not as a status: a
 /// handler whose bug is "we do not handle a connection reset" must meet the
 /// reset again.
+#[cfg(feature = "reporting")]
 fn replayed_response(
     tape: &crate::capsule::effects::ReplayEffects,
     method: &str,
@@ -645,8 +650,13 @@ fn replayed_response(
 /// scope is active — which is every request in an application that has not
 /// turned `[failure_capture]` on, so the cost on the ordinary path is one
 /// task-local probe.
+#[cfg(feature = "reporting")]
 struct OutboundRecorder {
     scope: Option<Arc<crate::capsule::CaptureScope>>,
+    /// Tape position, taken when the call *starts*. Two calls a handler
+    /// `join!`s therefore land in initiation order rather than completion
+    /// order — which is the order replay consumes them in.
+    slot: Option<usize>,
     /// Cached from the scope's settings so `finish` need not re-read them.
     max_body_bytes: usize,
     method: String,
@@ -655,6 +665,7 @@ struct OutboundRecorder {
     request_body: crate::capsule::CapsuleBody,
 }
 
+#[cfg(feature = "reporting")]
 impl OutboundRecorder {
     /// Snapshot the request half, if a capsule is being recorded.
     ///
@@ -668,6 +679,7 @@ impl OutboundRecorder {
         let Some(scope) = scope else {
             return Self {
                 scope: None,
+                slot: None,
                 max_body_bytes: 0,
                 method: String::new(),
                 url: String::new(),
@@ -676,6 +688,7 @@ impl OutboundRecorder {
             };
         };
         let max_body_bytes = scope.settings().max_body_bytes;
+        let slot = scope.reserve_http();
         let request_headers = builder
             .extra_headers
             .iter()
@@ -688,6 +701,7 @@ impl OutboundRecorder {
             .collect();
         Self {
             scope: Some(scope),
+            slot,
             max_body_bytes,
             method: builder.method.to_string(),
             url: builder.url.clone(),
@@ -701,9 +715,9 @@ impl OutboundRecorder {
         }
     }
 
-    /// Record the finished exchange.
+    /// Complete the reserved slot with the finished exchange.
     fn finish(self, result: &Result<Response, ClientError>) {
-        let Some(scope) = self.scope else {
+        let (Some(scope), Some(slot)) = (self.scope, self.slot) else {
             return;
         };
         let (status, response_headers, response_body, error) = match result {
@@ -729,16 +743,19 @@ impl OutboundRecorder {
                 Some(error.to_string()),
             ),
         };
-        scope.record_http(crate::capsule::HttpEffect {
-            method: self.method,
-            url: self.url,
-            request_headers: self.request_headers,
-            request_body: self.request_body,
-            status,
-            response_headers,
-            response_body,
-            error,
-        });
+        scope.fill_http(
+            slot,
+            crate::capsule::HttpEffect {
+                method: self.method,
+                url: self.url,
+                request_headers: self.request_headers,
+                request_body: self.request_body,
+                status,
+                response_headers,
+                response_body,
+                error,
+            },
+        );
     }
 }
 
@@ -746,6 +763,7 @@ impl OutboundRecorder {
 ///
 /// Text is what makes a capsule diffable and what lets redaction parse a JSON
 /// payload by key; base64 is the honest fallback for a protobuf or an image.
+#[cfg(feature = "reporting")]
 fn encode_body(bytes: &Bytes, max_body_bytes: usize) -> crate::capsule::CapsuleBody {
     if bytes.is_empty() {
         return crate::capsule::CapsuleBody::Absent;
@@ -767,6 +785,20 @@ fn encode_body(bytes: &Bytes, max_body_bytes: usize) -> crate::capsule::CapsuleB
         },
         |text| crate::capsule::CapsuleBody::Text(text.to_owned()),
     )
+}
+
+/// No capsule support compiled in: the recorder is an empty value the
+/// optimizer removes.
+#[cfg(not(feature = "reporting"))]
+struct OutboundRecorder;
+
+#[cfg(not(feature = "reporting"))]
+impl OutboundRecorder {
+    const fn arm(_builder: &RequestBuilder) -> Self {
+        Self
+    }
+
+    const fn finish(self, _result: &Result<Response, ClientError>) {}
 }
 
 /// Newtype stored in [`AppState`](crate::AppState) extensions so the
@@ -1562,6 +1594,7 @@ impl RequestBuilder {
         // the client because a handler can build one any way it likes
         // (`Client::new()`, `from_state`, a stored one) and every path must be
         // closed.
+        #[cfg(feature = "reporting")]
         if let Some(tape) = crate::capsule::effects::current_tape() {
             let method = self.method.to_string();
             return replayed_response(&tape, &method, &self.url);

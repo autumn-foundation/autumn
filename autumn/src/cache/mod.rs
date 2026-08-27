@@ -306,6 +306,10 @@ where
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The `capsule` module is behind the `reporting` feature, so each helper here
+// has a no-op twin for builds without it — the seam stays one line at each
+// call site whatever the feature set.
 
 /// What a replay has to say about a cache read.
 ///
@@ -324,6 +328,7 @@ enum ReplayedRead<V> {
 }
 
 /// Serve a cache read from the capsule's effect tape, when one is active.
+#[cfg(feature = "reporting")]
 fn replayed_cache_get<V>(key: &str) -> ReplayedRead<V>
 where
     V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -340,12 +345,22 @@ where
     }
 }
 
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_cache_get<V>(_key: &str) -> ReplayedRead<V>
+where
+    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    ReplayedRead::NoTape
+}
+
 /// Tee a cache read into the in-flight request's capsule.
 ///
 /// A miss, and a hit whose value will not serialize, are both recorded as a
 /// *keyed* entry with no value: replay then knows the key was read (so it does
 /// not call it unrecorded) while still being honest that it has nothing to
 /// serve, and the handler takes its miss branch.
+#[cfg(feature = "reporting")]
 fn record_cache_get<V: serde::Serialize>(key: &str, value: Option<&V>) {
     let Some(scope) = crate::capsule::current_scope() else {
         return;
@@ -362,14 +377,19 @@ fn record_cache_get<V: serde::Serialize>(key: &str, value: Option<&V>) {
     });
 }
 
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_cache_get<V: serde::Serialize>(_key: &str, _value: Option<&V>) {}
+
 /// Record a cache write, or divert it into the replay tape.
 ///
 /// Returns `true` when a replay handled the write and the live backend must
 /// not be touched.
+#[cfg(feature = "reporting")]
 fn record_or_replay_cache_insert(key: &str, bytes: Option<&[u8]>) -> bool {
     if let Some(tape) = crate::capsule::effects::current_tape() {
         if let Some(bytes) = bytes {
-            tape.cache_insert(key, bytes.to_vec());
+            tape.cache_insert(key, bytes);
         }
         return true;
     }
@@ -382,6 +402,12 @@ fn record_or_replay_cache_insert(key: &str, bytes: Option<&[u8]>) -> bool {
             value: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
     }
+    false
+}
+
+/// No capsule support compiled in: the live backend always takes the write.
+#[cfg(not(feature = "reporting"))]
+const fn record_or_replay_cache_insert(_key: &str, _bytes: Option<&[u8]>) -> bool {
     false
 }
 

@@ -70,8 +70,7 @@ pub async fn extract_tenant_from_parts(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
-    if let Some(tenant_id) = crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
-    {
+    if let Some(tenant_id) = replayed_tenant() {
         return Ok(tenant_id);
     }
     // A capsule with no recorded tenant falls through to the real resolver.
@@ -80,15 +79,40 @@ pub async fn extract_tenant_from_parts(
     // reproduces that error instead of being handed a different 503 saying the
     // capsule is too old.
     let resolved = extract_tenant_from_parts_inner(parts, config).await;
-    if let Ok(tenant_id) = resolved.as_ref()
-        && let Some(scope) = crate::capsule::current_scope()
-    {
-        scope.record_tenant(crate::capsule::TenantEffect {
-            id: Some(tenant_id.clone()),
-        });
+    if let Ok(tenant_id) = resolved.as_ref() {
+        record_tenant(tenant_id);
     }
     resolved
 }
+
+// The `capsule` module is behind the `reporting` feature, so both halves of the
+// seam have a no-op twin for builds without it.
+
+/// The tenant a capsule replay serves, when one is serving this task.
+#[cfg(feature = "reporting")]
+fn replayed_tenant() -> Option<String> {
+    crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_tenant() -> Option<String> {
+    None
+}
+
+/// Tee the resolved tenant into the in-flight request's capsule.
+#[cfg(feature = "reporting")]
+fn record_tenant(tenant_id: &str) {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.record_tenant(crate::capsule::TenantEffect {
+            id: Some(tenant_id.to_owned()),
+        });
+    }
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_tenant(_tenant_id: &str) {}
 
 // Tenant extraction logic based on configuration
 #[allow(

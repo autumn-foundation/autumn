@@ -2334,6 +2334,10 @@ async fn run_enqueue_interceptor(
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The `capsule` module is behind the `reporting` feature, so each helper here
+// has a no-op twin for builds without it — the seam stays one line at each of
+// the nine enqueue entry points whatever the feature set.
 
 /// Answer an enqueue from the capsule's effect tape, when one is serving this
 /// task.
@@ -2347,24 +2351,36 @@ async fn run_enqueue_interceptor(
 /// runtime: there is no client to route through, and the "job runtime is not
 /// initialized" error a replayed handler would otherwise get is a failure the
 /// recording never produced.
+#[cfg(feature = "reporting")]
 fn replayed_enqueue(
     name: &str,
     payload: &Value,
     delay_secs: Option<i64>,
 ) -> Option<AutumnResult<()>> {
+    use crate::capsule::effects::EnqueueVerdict;
+
     let tape = crate::capsule::effects::current_tape()?;
-    if tape.next_job(name, &capsule_job_payload(payload), delay_secs) {
-        return Some(Ok(()));
-    }
-    // `next_job` already logged the divergence; the enqueue fails closed so
-    // the handler sees an error rather than a silent success against a queue
-    // that was never touched.
-    Some(Err(AutumnError::internal_server_error(
-        std::io::Error::other(format!(
-            "the replayed run enqueued '{name}', which the capsule has no recording for; \
-             nothing was written to a queue"
-        )),
-    )))
+    Some(
+        match tape.next_job(name, &capsule_job_payload(payload), delay_secs) {
+            EnqueueVerdict::Queued => Ok(()),
+            // A recorded backend *rejection* is reproduced as one. A handler
+            // whose 500 came from `enqueue(..).await?` — the queue was down,
+            // the channel closed — must meet that error again, not be handed
+            // the success it never got.
+            EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
+                std::io::Error::other(format!("replayed from the capsule: {error}")),
+            )),
+            // `next_job` already logged the divergence; the enqueue fails
+            // closed so the handler sees an error rather than a silent success
+            // against a queue that was never touched.
+            EnqueueVerdict::Diverged => Err(AutumnError::internal_server_error(
+                std::io::Error::other(format!(
+                    "the replayed run enqueued '{name}', which the capsule has no recording \
+                     for; nothing was written to a queue"
+                )),
+            )),
+        },
+    )
 }
 
 /// A relative delay in whole seconds, for the capsule's enqueue comparison.
@@ -2374,6 +2390,16 @@ fn replayed_enqueue(
 /// caller error, not something to wrap around on.
 fn delay_seconds(delay: std::time::Duration) -> i64 {
     i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_enqueue(
+    _name: &str,
+    _payload: &Value,
+    _delay_secs: Option<i64>,
+) -> Option<AutumnResult<()>> {
+    None
 }
 
 /// The payload form both sides of a replay agree on: the caller's own args,
@@ -2389,6 +2415,7 @@ fn delay_seconds(delay: std::time::Duration) -> i64 {
 /// Peeling the tracking envelope also removes a value that could never match:
 /// it carries a hash of a freshly-minted polling token, different on every
 /// enqueue.
+#[cfg(feature = "reporting")]
 fn capsule_job_payload(payload: &Value) -> Value {
     let (_, unversioned) = crate::payload_version::split_version(payload);
     let (_, untracked) = crate::job_tracking::take_tracked_payload(unversioned.clone());
@@ -2400,23 +2427,82 @@ fn capsule_job_payload(payload: &Value) -> Value {
 /// Recorded at the one point every client path funnels through, and only after
 /// the enqueue is about to be performed for real: an enqueue that was rejected
 /// before reaching a backend is not an effect the failing run had.
-fn record_enqueue(
+/// A reserved enqueue tape slot, held across the backend call.
+///
+/// Zero-sized without `reporting`, so the two-phase seam costs an enqueue
+/// nothing on a build with no capsules.
+#[cfg(not(feature = "reporting"))]
+type EnqueueSlot = ();
+
+/// No capsule support compiled in: nothing to reserve.
+#[cfg(not(feature = "reporting"))]
+const fn reserve_enqueue(_payload: &Value) -> Option<EnqueueSlot> {
+    None
+}
+
+/// No capsule support compiled in: nothing to fill.
+#[cfg(not(feature = "reporting"))]
+const fn fill_enqueue(
+    _slot: Option<EnqueueSlot>,
+    _name: &str,
+    _due_at: Option<chrono::DateTime<chrono::Utc>>,
+    _now: chrono::DateTime<chrono::Utc>,
+    _error: Option<&AutumnError>,
+) {
+}
+
+/// A reserved enqueue tape slot, held across the backend call.
+///
+/// Two-phase for the same two reasons the outbound-HTTP recorder is: the tape
+/// *position* is taken before the backend is asked, so concurrent enqueues land
+/// in initiation order — the order replay consumes them in — and the *outcome*
+/// is filled in afterwards, so a backend rejection is recorded as the failure
+/// it was rather than as a success the handler never saw.
+#[cfg(feature = "reporting")]
+struct EnqueueSlot {
+    scope: Arc<crate::capsule::CaptureScope>,
+    index: usize,
+    payload: Value,
+}
+
+/// Reserve an enqueue slot, when a capsule is being recorded.
+#[cfg(feature = "reporting")]
+fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
+    let scope = crate::capsule::current_scope()?;
+    let index = scope.reserve_job_enqueue()?;
+    Some(EnqueueSlot {
+        scope,
+        index,
+        // Cloned only once a slot exists, so an app with capture off never
+        // pays for it.
+        payload: payload.clone(),
+    })
+}
+
+/// Complete a reserved enqueue slot with what the backend actually did.
+#[cfg(feature = "reporting")]
+fn fill_enqueue(
+    slot: Option<EnqueueSlot>,
     name: &str,
-    payload: &Value,
     due_at: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
+    error: Option<&AutumnError>,
 ) {
-    let Some(scope) = crate::capsule::current_scope() else {
+    let Some(slot) = slot else {
         return;
     };
-    scope.record_job_enqueue(crate::capsule::JobEffect {
-        name: name.to_owned(),
-        payload: capsule_job_payload(payload),
-        // `signed_duration_since` rather than `-`: this module's panic gate
-        // denies `arithmetic_side_effects`, and the subtraction operator on
-        // `DateTime` is not total.
-        delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
-    });
+    slot.scope.fill_job_enqueue(
+        slot.index,
+        crate::capsule::JobEffect {
+            name: name.to_owned(),
+            payload: capsule_job_payload(&slot.payload),
+            // `signed_duration_since` rather than `-`: this module's panic gate
+            // denies `arithmetic_side_effects`, and the subtraction operator on
+            // `DateTime` is not total.
+            delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
+            error: error.map(ToString::to_string),
+        },
+    );
 }
 
 /// Retrieves the global initialized job client.
@@ -2671,7 +2757,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, Some(delay_seconds(delay))) {
         return answer;
     }
     let client = require_job_client()?;
@@ -2768,7 +2854,7 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, Some(delay_seconds(delay))) {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -3003,6 +3089,51 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         // Capture the reference instant once so every downstream decision
         // (filter, admin record status, local-backend sleep) uses a consistent
+        // clock reading and near-due jobs cannot be misclassified. Read here
+        // rather than in the inner method so the capsule's clock tape gains
+        // exactly one entry per enqueue, however the seam wraps it.
+        let now = self.due_origin();
+        // Only treat a due time strictly in the future as "delayed"; a past or
+        // absent due time enqueues for immediate execution exactly as before.
+        let due_at = due_at.filter(|due| *due > now);
+
+        // Failure-capsule seam (#1634). The free enqueue functions guard ahead
+        // of the client lookup (a replay starts no job runtime), so by the time
+        // control reaches here a replay can only have come through a *held*
+        // `JobClient` — the event bus's durable dispatch, or `enqueue_tracked`.
+        // Guarding here too closes those without ever double-consuming the
+        // tape: a free-function enqueue returned long before this line.
+        if let Some(answer) = replayed_enqueue(name, &payload, None) {
+            return answer.map(|()| EnqueueOutcome::Queued);
+        }
+        // Reserve before the backend is asked and fill in after, so concurrent
+        // enqueues keep initiation order and a backend *rejection* is recorded
+        // as the failure the handler actually saw.
+        let slot = reserve_enqueue(&payload);
+        let result = self
+            .enqueue_with_outcome_due_inner(name, payload, due_at, now)
+            .await;
+        fill_enqueue(slot, name, due_at, now, result.as_ref().err());
+        result
+    }
+
+    /// [`enqueue_with_outcome_due`](Self::enqueue_with_outcome_due), minus the
+    /// failure-capsule seam.
+    ///
+    /// Takes the reference instant rather than reading the clock itself: the
+    /// wrapper already read it, and a second read would land an extra entry on
+    /// the capsule's clock tape that replay — which never reaches this method —
+    /// could not consume.
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_with_outcome_due_inner(
+        &self,
+        name: &str,
+        payload: Value,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> AutumnResult<EnqueueOutcome> {
+        // Capture the reference instant once so every downstream decision
+        // (filter, admin record status, local-backend sleep) uses a consistent
         // clock reading and near-due jobs cannot be misclassified.
         //
         // This must be [`Self::due_origin`], not `self.clock.now()`: it is the
@@ -3014,10 +3145,6 @@ impl JobClient {
         // immediately-runnable job. For the local and redis backends
         // `due_origin` *is* `self.clock.now()`, so this is unchanged there —
         // including the local-backend sleep computed from `now` below.
-        let now = self.due_origin();
-        // Only treat a due time strictly in the future as "delayed"; a past or
-        // absent due time enqueues for immediate execution exactly as before.
-        let due_at = due_at.filter(|due| *due > now);
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -3034,19 +3161,6 @@ impl JobClient {
             self.default_initial_backoff_ms
         };
         let job_queue = normalize_queue_name(&settings.queue);
-        // Failure-capsule seam (#1634). The free enqueue functions guard ahead
-        // of the client lookup (a replay starts no job runtime), so by the time
-        // control reaches here a replay can only have come through a *held*
-        // `JobClient` — the event bus's durable dispatch, or `enqueue_tracked`.
-        // Guarding here too closes those without ever double-consuming the
-        // tape: a free-function enqueue returned long before this line.
-        if let Some(answer) = replayed_enqueue(name, &payload, None) {
-            return answer.map(|()| EnqueueOutcome::Queued);
-        }
-        // Capture tees at the same point, after the registration check, so an
-        // enqueue rejected before reaching a backend is not recorded as an
-        // effect the failing run had.
-        record_enqueue(name, &payload, due_at, now);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = self.entropy.uuid_v4().to_string();
         if let Some(due) = due_at {
@@ -3273,6 +3387,8 @@ impl JobClient {
             }
         })
     }
+
+
 
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
     ///
@@ -3626,9 +3742,37 @@ impl JobClient {
         conn: &mut diesel_async::AsyncPgConnection,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
-        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
-        let due_at = due_at.filter(|due| *due > self.due_origin());
+        let now = self.due_origin();
+        let due_at = due_at.filter(|due| *due > now);
+        // Failure-capsule seam (#1634). This is the transactional chokepoint —
+        // it never funnels through `enqueue_with_outcome_due`, so without its
+        // own seam an `enqueue_on_conn` would be missing from the capsule and
+        // then report an unrecorded-effect divergence on replay.
+        if let Some(answer) = replayed_enqueue(name, &payload, None) {
+            return answer;
+        }
+        let slot = reserve_enqueue(&payload);
+        let result = self
+            .enqueue_on_conn_due_inner(name, payload, conn, due_at)
+            .await;
+        fill_enqueue(slot, name, due_at, now, result.as_ref().err());
+        result
+    }
+
+    /// [`enqueue_on_conn_due`](Self::enqueue_on_conn_due), minus the
+    /// failure-capsule seam. Takes the reference instant for the same reason
+    /// [`enqueue_with_outcome_due_inner`](Self::enqueue_with_outcome_due_inner)
+    /// does.
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_on_conn_due_inner(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -3658,14 +3802,6 @@ impl JobClient {
         } else {
             payload
         };
-        // Failure-capsule seam (#1634). This is the transactional chokepoint —
-        // it never funnels through `enqueue_with_outcome_due`, so without its
-        // own tee an `enqueue_on_conn` would be missing from the capsule and
-        // then report an unrecorded-effect divergence on replay.
-        if let Some(answer) = replayed_enqueue(name, &payload, None) {
-            return answer;
-        }
-        record_enqueue(name, &payload, due_at, self.due_origin());
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = self.entropy.uuid_v4().to_string();
 
@@ -3750,6 +3886,8 @@ impl JobClient {
         // and concurrency metadata — including the failure-capsule tee.
         self.enqueue_due(name, payload, due_at).await
     }
+
+
 }
 
 /// Starts the background job execution runtime.

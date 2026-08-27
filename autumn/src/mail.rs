@@ -637,6 +637,11 @@ pub struct Mail {
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The `capsule` module is behind the `reporting` feature, so each seam helper
+// has a no-op twin for builds without it. Shims rather than `#[cfg]` at the
+// call sites: the seam is then one line in `send`, whatever the feature set,
+// and a future reader cannot miss it among conditional compilation.
 
 /// Answer a mail send from the capsule's effect tape, when one is serving this
 /// task.
@@ -645,6 +650,7 @@ pub struct Mail {
 /// delivered**; `Some(Err(..))` is either a recorded delivery failure being
 /// reproduced or a divergence failing closed. `None` means no replay is in
 /// progress.
+#[cfg(feature = "reporting")]
 fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     use crate::capsule::effects::MailVerdict;
 
@@ -668,15 +674,49 @@ fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     })
 }
 
-/// Tee a mail send into the in-flight request's capsule.
+/// Reserve this send's tape position, before the transport is asked.
+#[cfg(feature = "reporting")]
+fn reserve_mail_slot() -> Option<(std::sync::Arc<crate::capsule::CaptureScope>, usize)> {
+    let scope = crate::capsule::current_scope()?;
+    let index = scope.reserve_mail()?;
+    Some((scope, index))
+}
+
+/// Complete a reserved send slot with what the transport actually did.
+#[cfg(feature = "reporting")]
+fn fill_mail_slot(
+    slot: Option<(std::sync::Arc<crate::capsule::CaptureScope>, usize)>,
+    mail: &Mail,
+    error: Option<&MailError>,
+) {
+    if let Some((scope, index)) = slot {
+        scope.fill_mail(index, mail_effect(mail, error));
+    }
+}
+
+/// No capsule support compiled in: nothing to reserve.
+#[cfg(not(feature = "reporting"))]
+const fn reserve_mail_slot() -> Option<()> {
+    None
+}
+
+/// No capsule support compiled in: nothing to fill.
+#[cfg(not(feature = "reporting"))]
+const fn fill_mail_slot(_slot: Option<()>, _mail: &Mail, _error: Option<&MailError>) {}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_send(_mail: &Mail) -> Option<Result<(), MailError>> {
+    None
+}
+
+/// The capsule record for one message.
 ///
 /// The plain-text body is preferred over the HTML one: it is the same content,
 /// it is what redaction can scan, and an inlined HTML body is mostly markup
 /// that would dominate the capsule's size budget for no reproduction value.
-fn record_send(mail: &Mail, error: Option<&MailError>) {
-    let Some(scope) = crate::capsule::current_scope() else {
-        return;
-    };
+#[cfg(feature = "reporting")]
+fn mail_effect(mail: &Mail, error: Option<&MailError>) -> crate::capsule::MailEffect {
     let body = mail
         .text
         .as_ref()
@@ -684,14 +724,27 @@ fn record_send(mail: &Mail, error: Option<&MailError>) {
         .map_or(crate::capsule::CapsuleBody::Absent, |body| {
             crate::capsule::CapsuleBody::Text(body.clone())
         });
-    scope.record_mail(crate::capsule::MailEffect {
+    crate::capsule::MailEffect {
         to: mail.to.clone(),
         from: mail.from.clone(),
         subject: mail.subject.clone(),
         body,
         error: error.map(ToString::to_string),
-    });
+    }
 }
+
+/// Tee a send that never reaches [`Mailer::send`] into the capsule.
+///
+/// Only the deferred path needs this: it spawns, so the awaited two-phase
+/// recording in `send` cannot cover it.
+#[cfg(feature = "reporting")]
+fn record_send(mail: &Mail, error: Option<&MailError>) {
+    fill_mail_slot(reserve_mail_slot(), mail, error);
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_send(_mail: &Mail, _error: Option<&MailError>) {}
 
 /// Stable root path for the dev mail preview UI.
 pub const MAIL_PREVIEW_PATH: &str = "/_autumn/mail";
@@ -1780,13 +1833,19 @@ impl Mailer {
         if let Some(answer) = replayed_send(&mail) {
             return answer;
         }
-        // Capture records the *finished* send, error included: a handler whose
-        // bug is "we do not handle `AllRecipientsSuppressed`" must meet that
-        // error again on replay, and recording up front would tell the capsule
-        // the message went out when it never did.
+        // Two-phase, for two reasons that pull in opposite directions. The
+        // tape *position* is taken before the send, so two messages a handler
+        // sends concurrently land in initiation order — the order replay
+        // consumes them in — rather than in whichever order their transports
+        // happened to finish. The *content* is filled in afterwards, error
+        // included, because a handler whose bug is "we do not handle
+        // `AllRecipientsSuppressed`" must meet that error again on replay, and
+        // recording up front would tell the capsule the message went out when
+        // it never did.
+        let slot = reserve_mail_slot();
         let recorded = mail.clone();
         let result = self.send_inner(mail).await;
-        record_send(&recorded, result.as_ref().err());
+        fill_mail_slot(slot, &recorded, result.as_ref().err());
         result
     }
 

@@ -247,6 +247,60 @@ impl EffectBuffer {
         self.bytes
     }
 
+    /// Reserve a slot on a seam and return its index, so a *concurrent* effect
+    /// takes its tape position when it **starts** rather than when it
+    /// finishes.
+    ///
+    /// This is the whole reason the ordered seams are two-phase. A handler that
+    /// `join!`s two outbound calls records them in completion order if the
+    /// entry is only appended at the end — but replay consumes the tape when
+    /// each call *starts*, so the moment the second response beats the first,
+    /// an unchanged handler is compared against the wrong tape entry and
+    /// reports a divergence that is entirely an artefact of recording.
+    ///
+    /// `None` when the seam is full or the budget is spent; the caller then has
+    /// nothing to fill in and the capsule is already marked truncated.
+    fn reserve<T>(
+        &mut self,
+        seam: fn(&mut CapsuleEffects) -> &mut Vec<T>,
+        placeholder: T,
+        budget: usize,
+    ) -> Option<usize> {
+        let list = seam(&mut self.effects);
+        if list.len() >= MAX_EFFECTS_PER_SEAM {
+            self.overflowed = true;
+            return None;
+        }
+        if self.bytes > budget {
+            self.overflowed = true;
+            return None;
+        }
+        let index = list.len();
+        list.push(placeholder);
+        Some(index)
+    }
+
+    /// Fill in a slot [`reserve`](Self::reserve) handed out, charging its
+    /// weight now that the effect's real size is known.
+    fn fill<T>(
+        &mut self,
+        seam: fn(&mut CapsuleEffects) -> &mut Vec<T>,
+        index: usize,
+        entry: T,
+        weight: usize,
+        budget: usize,
+    ) {
+        let charged = self.bytes.saturating_add(weight);
+        if charged > budget {
+            self.overflowed = true;
+            return;
+        }
+        self.bytes = charged;
+        if let Some(slot) = seam(&mut self.effects).get_mut(index) {
+            *slot = entry;
+        }
+    }
+
     /// Push onto a seam, refusing (and flagging) once it is full.
     ///
     /// `weight` is the entry's approximate serialized size, charged against
@@ -362,6 +416,16 @@ enum BodyTap {
 /// Note recorded when a streaming body grew past `max_body_bytes`.
 const BODY_OVERFLOW_NOTE: &str =
     "request body exceeded max_body_bytes while streaming; it was not captured";
+
+/// Note recorded when an outbound body was too large to keep.
+///
+/// The capsule is marked truncated alongside it: replay serves a skipped body
+/// as empty bytes, and a handler that parses the response it recorded would
+/// then be judged on input the failing run never had — the same falsification
+/// an unrecorded *request* body already refuses to commit.
+const HTTP_BODY_SKIPPED_NOTE: &str =
+    "an outbound HTTP body exceeded `[failure_capture] max_body_bytes` and was not captured; \
+     replaying would drive the handler with an empty body";
 
 /// Note recorded when a run resolved two different tenants.
 ///
@@ -670,15 +734,37 @@ impl CaptureScope {
         Some(result)
     }
 
-    /// Record one outbound HTTP request/response pair.
+    /// Reserve this run's next outbound-HTTP tape position, before the call is
+    /// made.
+    ///
+    /// Returns the index [`fill_http`](Self::fill_http) completes. See
+    /// [`EffectBuffer::reserve`] for why the position is taken at initiation.
+    #[must_use]
+    pub fn reserve_http(&self) -> Option<usize> {
+        let budget = self.settings.max_capsule_bytes;
+        self.with_effects(|buffer| {
+            buffer.reserve(|effects| &mut effects.http, HttpEffect::pending(), budget)
+        })
+        .flatten()
+    }
+
+    /// Complete a reserved outbound-HTTP slot.
     ///
     /// Bodies over `max_body_bytes` are recorded as skipped rather than
     /// copied: a capsule must not become the place a large download is
-    /// buffered.
-    pub fn record_http(&self, mut effect: HttpEffect) {
+    /// buffered. A skipped body also **marks the capsule truncated**, because
+    /// a replayed handler that parses that response would be driven with an
+    /// empty body the recording never gave it.
+    pub fn fill_http(&self, index: usize, mut effect: HttpEffect) {
         let cap = self.settings.max_body_bytes;
+        let request_over = body_weight(&effect.request_body) > cap;
+        let response_over = body_weight(&effect.response_body) > cap;
         effect.request_body = clamp_body(effect.request_body, cap);
         effect.response_body = clamp_body(effect.response_body, cap);
+        if request_over || response_over {
+            self.note(HTTP_BODY_SKIPPED_NOTE);
+            self.mark_truncated();
+        }
         let weight = effect
             .url
             .len()
@@ -686,22 +772,63 @@ impl CaptureScope {
             .saturating_add(body_weight(&effect.response_body));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.http, effect, weight, budget);
+            buffer.fill(|effects| &mut effects.http, index, effect, weight, budget);
         });
     }
 
-    /// Record one job enqueue the run performed.
-    pub fn record_job_enqueue(&self, effect: JobEffect) {
-        let weight = effect
-            .name
-            .len()
-            .saturating_add(json_weight(&effect.payload));
+    /// Reserve this run's next job-enqueue tape position, before the backend
+    /// is asked.
+    #[must_use]
+    pub fn reserve_job_enqueue(&self) -> Option<usize> {
+        let budget = self.settings.max_capsule_bytes;
+        self.with_effects(|buffer| {
+            buffer.reserve(|effects| &mut effects.jobs, JobEffect::pending(), budget)
+        })
+        .flatten()
+    }
+
+    /// Complete a reserved job-enqueue slot with the backend's outcome.
+    pub fn fill_job_enqueue(&self, index: usize, effect: JobEffect) {
+        let weight = effect.name.len().saturating_add(json_weight(&effect.payload));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.jobs, effect, weight, budget);
+            buffer.fill(|effects| &mut effects.jobs, index, effect, weight, budget);
         });
     }
 
+    /// Reserve this run's next mail tape position, before the send is made.
+    #[must_use]
+    pub fn reserve_mail(&self) -> Option<usize> {
+        let budget = self.settings.max_capsule_bytes;
+        self.with_effects(|buffer| {
+            buffer.reserve(|effects| &mut effects.mail, MailEffect::pending(), budget)
+        })
+        .flatten()
+    }
+
+    /// Complete a reserved mail slot.
+    pub fn fill_mail(&self, index: usize, mut effect: MailEffect) {
+        effect.body = clamp_body(effect.body, self.settings.max_body_bytes);
+        let weight = effect
+            .subject
+            .len()
+            .saturating_add(body_weight(&effect.body));
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.fill(|effects| &mut effects.mail, index, effect, weight, budget);
+        });
+    }
+
+    /// Record one outbound HTTP request/response pair.
+    ///
+    /// Bodies over `max_body_bytes` are recorded as skipped rather than
+    /// copied: a capsule must not become the place a large download is
+    /// buffered.
+    #[cfg(any(test, feature = "test-support"))]
+ 
+    /// Record one job enqueue the run performed.
+    #[cfg(any(test, feature = "test-support"))]
+ 
     /// Record one cache read or write.
     pub fn record_cache(&self, effect: CacheEffect) {
         let weight = effect.key().len().saturating_add(match &effect {
@@ -715,18 +842,8 @@ impl CaptureScope {
     }
 
     /// Record one message handed to the mailer.
-    pub fn record_mail(&self, mut effect: MailEffect) {
-        effect.body = clamp_body(effect.body, self.settings.max_body_bytes);
-        let weight = effect
-            .subject
-            .len()
-            .saturating_add(body_weight(&effect.body));
-        let budget = self.settings.max_capsule_bytes;
-        let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.mail, effect, weight, budget);
-        });
-    }
-
+    #[cfg(any(test, feature = "test-support"))]
+ 
     /// Record the tenant context the run resolved. Later resolutions of the
     /// *same* tenant are idempotent; a different one is a second resolution
     /// the capsule cannot represent, so the capsule is marked truncated rather

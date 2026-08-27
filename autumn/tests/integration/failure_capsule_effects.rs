@@ -64,15 +64,13 @@ async fn cached() -> Result<&'static str, AutumnError> {
         return Err(AutumnError::internal_server_error_msg("no cache"));
     };
     let hit: Option<u32> = autumn_web::cache::get_cached(cache.as_ref(), "widgets:count");
-    match hit {
-        Some(count) => Err(AutumnError::internal_server_error_msg(format!(
-            "cache said {count}"
-        ))),
-        None => {
-            autumn_web::cache::insert_cached(cache.as_ref(), "widgets:count", 41_u32, None);
-            Err(AutumnError::internal_server_error_msg("cache miss"))
-        }
-    }
+    let Some(count) = hit else {
+        autumn_web::cache::insert_cached(cache.as_ref(), "widgets:count", 41_u32, None);
+        return Err(AutumnError::internal_server_error_msg("cache miss"));
+    };
+    Err(AutumnError::internal_server_error_msg(format!(
+        "cache said {count}"
+    )))
 }
 
 /// Mints an identifier through the framework's entropy seam and fails with it.
@@ -409,7 +407,9 @@ async fn a_failure_inside_a_job_produces_a_job_scoped_capsule() {
                 "the job's own error must be recorded: {message}"
             );
         }
-        other => panic!("expected a status outcome, got {other:?}"),
+        other @ CapsuleOutcome::Panic { .. } => {
+            panic!("expected a status outcome, got {other:?}")
+        }
     }
 
     // A job capsule is not replayable against a router, and says so rather
@@ -709,8 +709,7 @@ async fn a_capsule_from_an_incompatible_format_version_fails_loudly_not_vacuousl
     capsule.format_version = 1;
     let json = serde_json::to_string(&capsule).expect("serializes");
     let error = RegressionCase::from_json(&json)
-        .err()
-        .expect("an incompatible capsule must not load");
+        .expect_err("an incompatible capsule must not load");
     let message = error.to_string();
     assert!(
         message.contains("older") && message.contains("guide"),

@@ -51,6 +51,13 @@ pub fn generate(opts: &GenerateOptions<'_>) {
 
 /// The fallible half of [`generate`], so every failure is one `Err` with a
 /// message rather than a scattering of `process::exit` calls.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear conversion: validate, slug, write the fixture, write \
+              the test, scaffold the hook, register the module. Splitting it \
+              would scatter the refusal conditions that have to be checked \
+              before anything is written."
+)]
 fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
     let source = Path::new(opts.capsule);
     let json = std::fs::read_to_string(source)
@@ -84,7 +91,7 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
 
     let slug = opts
         .name
-        .map_or_else(|| slugify(&capsule.id), |name| slugify(name));
+        .map_or_else(|| slugify(&capsule.id), slugify);
     if slug.is_empty() {
         return Err(
             "the capsule's id has no characters usable in a test name; pass --name".to_owned(),
@@ -92,10 +99,10 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
     }
 
     let tests_dir = PathBuf::from(opts.tests_dir);
-    let fixture_dir = tests_dir.join(FIXTURE_SUBDIR);
-    let test_dir = tests_dir.join(TEST_SUBDIR);
-    let fixture_path = fixture_dir.join(format!("{slug}.json"));
-    let test_path = test_dir.join(format!("capsule_{slug}.rs"));
+    let capsules = tests_dir.join(FIXTURE_SUBDIR);
+    let suite = tests_dir.join(TEST_SUBDIR);
+    let fixture_path = capsules.join(format!("{slug}.json"));
+    let test_path = suite.join(format!("capsule_{slug}.rs"));
 
     if !opts.force {
         for existing in [&fixture_path, &test_path] {
@@ -109,10 +116,10 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
         }
     }
 
-    std::fs::create_dir_all(&fixture_dir)
-        .map_err(|error| format!("could not create {}: {error}", fixture_dir.display()))?;
-    std::fs::create_dir_all(&test_dir)
-        .map_err(|error| format!("could not create {}: {error}", test_dir.display()))?;
+    std::fs::create_dir_all(&capsules)
+        .map_err(|error| format!("could not create {}: {error}", capsules.display()))?;
+    std::fs::create_dir_all(&suite)
+        .map_err(|error| format!("could not create {}: {error}", suite.display()))?;
 
     // The fixture is the capsule's own bytes, copied verbatim. Nothing is
     // re-derived, re-read from a live system, or re-serialized: whatever
@@ -128,7 +135,7 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
     let _ = writeln!(report, "wrote {}", fixture_path.display());
     let _ = writeln!(report, "wrote {}", test_path.display());
 
-    let support_path = test_dir.join(format!("{SUPPORT_MODULE}.rs"));
+    let support_path = suite.join(format!("{SUPPORT_MODULE}.rs"));
     if support_path.exists() {
         let _ = writeln!(
             report,
@@ -145,7 +152,7 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
         );
     }
 
-    let mod_path = test_dir.join("mod.rs");
+    let mod_path = suite.join("mod.rs");
     match register_module(&mod_path, &format!("capsule_{slug}"), SUPPORT_MODULE) {
         Ok(true) => {
             let _ = writeln!(report, "registered the modules in {}", mod_path.display());
@@ -188,12 +195,31 @@ fn slugify(id: &str) -> String {
     }
     let trimmed = slug.trim_matches('_').to_owned();
     // A Rust identifier cannot start with a digit, and a capsule id routinely
-    // does (request ids are often ULIDs).
-    if trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+    // does (request ids are often ULIDs). A keyword is prefixed for the same
+    // reason: the slug becomes a module name, a file name *and* a test
+    // function name, and `mod type;` does not compile — a generated test that
+    // cannot build is worse than no generated test.
+    if trimmed.starts_with(|c: char| c.is_ascii_digit()) || is_rust_keyword(&trimmed) {
         format!("c{trimmed}")
     } else {
         trimmed
     }
+}
+
+/// Whether `word` is a Rust keyword (including the reserved-for-future set).
+///
+/// Raw identifiers (`r#type`) would cover most positions, but not all — `r#`
+/// is not valid in a file name, and `crate`/`self`/`super`/`Self` cannot be
+/// raw at all — so the generator prefixes instead of escaping.
+fn is_rust_keyword(word: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+        "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "box", "become", "do", "final", "gen", "macro",
+        "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+    ];
+    KEYWORDS.contains(&word)
 }
 
 /// Add `mod` declarations to the consolidated test module, idempotently.
@@ -283,7 +309,7 @@ async fn capsule_{slug}_still_reproduces() {{
 }
 
 /// The router hook, written once and then owned by the developer.
-const SUPPORT_SCAFFOLD: &str = r#"//! Router factory shared by every generated capsule regression test.
+const SUPPORT_SCAFFOLD: &str = r"//! Router factory shared by every generated capsule regression test.
 //!
 //! `autumn capsule test` scaffolds this file once and never overwrites it —
 //! only you know which routes your capsules need. Add them below; everything
@@ -304,7 +330,7 @@ pub fn router(ctx: &RegressionContext<'_>) -> axum::Router {
         .build()
         .into_router()
 }
-"#;
+";
 
 // ── Whole-corpus verification ───────────────────────────────────────────────
 
@@ -456,6 +482,12 @@ mod tests {
         assert_eq!(slugify("01JB2K7Q"), "c01jb2k7q");
         assert_eq!(slugify("a//b__c"), "a_b_c");
         assert_eq!(slugify("---"), "");
+        // A slug that lands on a keyword would generate `mod type;`, which does
+        // not compile — and a generated regression test that cannot build is
+        // worse than none.
+        assert_eq!(slugify("type"), "ctype");
+        assert_eq!(slugify("mod"), "cmod");
+        assert_eq!(slugify("Self"), "cself");
     }
 
     #[test]

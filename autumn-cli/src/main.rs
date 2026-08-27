@@ -702,7 +702,7 @@ enum Commands {
     /// # Examples
     ///
     ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json
-    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json --name checkout_500
+    ///   autumn capsule test tmp/autumn-capsules/01JB2K7Q.json --name `checkout_500`
     ///   autumn capsule verify
     #[command(verbatim_doc_comment)]
     Capsule {
