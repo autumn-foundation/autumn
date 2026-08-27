@@ -170,10 +170,18 @@ async fn a_failing_request_records_one_replayable_capsule() {
     client.get(RECORDED_ROUTE).send().await.assert_status(500);
 
     let paths = await_capsules(dir.path(), 1).await;
+    assert_eq!(paths.len(), 1, "a 500 must leave exactly one capsule");
+
+    // Capsules are written on a detached task, so `await_capsules` returns the
+    // moment the first file lands. Settle before claiming the 404 wrote
+    // nothing: without this, a 404 that *did* leak a capsule would still leave
+    // a count of one here simply because its write had not finished yet.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let settled = capsule_paths(dir.path());
     assert_eq!(
-        paths.len(),
+        settled.len(),
         1,
-        "one failing request must leave exactly one capsule, and the 404 none"
+        "a 4xx must write no capsule; found {settled:?}"
     );
 
     let json = std::fs::read_to_string(&paths[0]).expect("the capsule file is readable");

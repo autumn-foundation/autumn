@@ -73,7 +73,7 @@ pub fn record_created(outcome: &'static str) {
 /// The returned guard records when it **drops**, so every exit path is
 /// covered — including the `?` on a failing query. Bind it to a named
 /// variable: `let _ = ...` drops it immediately and records ~0s.
-#[must_use]
+/// (`TimerGuard` is itself `#[must_use]`, so the compiler says so.)
 pub fn time_stats_query() -> TimerGuard {
     metrics::timer(STATS_QUERY_SECONDS).start()
 }
