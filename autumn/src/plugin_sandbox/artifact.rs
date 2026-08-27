@@ -13,6 +13,15 @@
 //! `head -c 4096 hello.autumn-plugin` shows an operator the whole review
 //! surface with no tooling at all.
 //!
+//! # What the digest proves, and what it does not
+//!
+//! The digest binds the manifest to the module **inside the same file**, so a
+//! byte flipped in either one is caught. It is not a signature: anyone who can
+//! rewrite the file can also recompute the digest. Reviewing an artifact
+//! therefore means recording the digest `autumn plugin inspect` prints and
+//! comparing it against the one your deployment loads — which is why the digest
+//! is on the consent screen at all.
+//!
 //! # Reading is the gate
 //!
 //! [`SandboxArtifact::read`] refuses a container whose magic, format version,
@@ -148,7 +157,8 @@ impl fmt::Display for ArtifactError {
             Self::DigestMismatch { declared, actual } => write!(
                 f,
                 "sandboxed plugin module digest mismatch: the manifest declares {declared} but \
-                 the module hashes to {actual}. The artifact was modified after it was reviewed"
+                 the module hashes to {actual}. The manifest and the module in this file do not \
+                 belong together"
             ),
             Self::Io { path, detail, .. } => write!(
                 f,

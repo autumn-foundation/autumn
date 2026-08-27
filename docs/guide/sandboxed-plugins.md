@@ -270,8 +270,11 @@ async fn main() {
 }
 ```
 
-`from_file` verifies the digest before the module is compiled, so an artifact
-modified after you reviewed it is refused with a message naming the mismatch.
+`from_file` verifies the digest before the module is compiled, so a file whose
+manifest and module have come apart is refused with a message naming the
+mismatch. The digest is a binding, not a signature: anyone who can rewrite the
+file can recompute it, so reviewing an artifact means **recording the digest
+`inspect` printed** and comparing it against the one your deployment loads.
 At mount time the resolved grant is written to the log at `info`, so "what did
 we agree to run" is answerable from a production log alone.
 
