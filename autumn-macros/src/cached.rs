@@ -32,9 +32,11 @@ use std::collections::BTreeSet;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::ext::IdentExt as _;
 use syn::parse::Parser as _;
 use syn::visit_mut::VisitMut;
-use syn::{Expr, ItemFn, LitInt, LitStr};
+use syn::punctuated::Punctuated;
+use syn::{Expr, Ident, ItemFn, LitInt, LitStr, Token};
 
 struct CachedAttrs {
     ttl: Option<String>,
@@ -103,34 +105,37 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
             result.result = true;
             Ok(())
         } else if meta.path.is_ident("key") {
-            meta.parse_nested_meta(|nested| {
-                let ident = nested.path.get_ident().cloned().ok_or_else(|| {
-                    nested.error("`key(...)` takes plain parameter names, e.g. `key(tenant_id)`")
-                })?;
-                result.key.push(ident);
-                Ok(())
-            })?;
-            if result.key.is_empty() {
+            // Parsed through an explicit `parenthesized!` rather than
+            // `parse_nested_meta` so that the EMPTY case reaches our own
+            // diagnostic instead of syn's "expected nested attribute": an empty
+            // list is the mistake worth explaining.
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let params: Punctuated<Ident, Token![,]> =
+                content.parse_terminated(Ident::parse_any, Token![,])?;
+            if params.is_empty() {
                 return Err(meta.error(
                     "`key()` must name at least one parameter, e.g. `key(tenant_id)`; omit it \
                      entirely to key on every parameter",
                 ));
             }
+            result.key.extend(params);
             Ok(())
         } else if meta.path.is_ident("reads") {
-            // `reads(Post, crate::models::Comment)` — every nested entry is a
-            // model *path*, so a typo is a rustc error at the declaration site
-            // rather than a silently-unmatched string in the manifest.
-            meta.parse_nested_meta(|nested| {
-                result.reads.push(nested.path.clone());
-                Ok(())
-            })?;
-            if result.reads.is_empty() {
+            // `reads(Post, crate::models::Comment)` — every entry is a model
+            // *path*, so a typo is a rustc error at the declaration site rather
+            // than a silently-unmatched string in the manifest.
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let models: Punctuated<syn::Path, Token![,]> =
+                content.parse_terminated(syn::Path::parse_mod_style, Token![,])?;
+            if models.is_empty() {
                 return Err(meta.error(
                     "`reads()` must name at least one model, e.g. `reads(Post)`; omit it \
                      entirely to let the macro derive the dependency set",
                 ));
             }
+            result.reads.extend(models);
             Ok(())
         } else if meta.path.is_ident("acknowledge_stale") {
             let value: LitStr = meta.value()?.parse()?;
@@ -349,6 +354,19 @@ fn generate_coherence_items(
     }
 }
 
+/// The name a parameter is referred to by, for `key(...)` matching and for the
+/// diagnostic that lists the declared parameters.
+///
+/// `mut tenant_id: String` is the `tenant_id` parameter — the binding mode is
+/// not part of its name, and matching on the rendered pattern would make
+/// `key(tenant_id)` fail to find it.
+fn param_name(pat: &syn::Pat) -> String {
+    match pat {
+        syn::Pat::Ident(ident) if ident.subpat.is_none() => ident.ident.to_string(),
+        other => quote!(#other).to_string(),
+    }
+}
+
 /// Generate the cache wrapper body for a single function.
 fn generate_cache_body(
     attrs: &CachedAttrs,
@@ -487,10 +505,7 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let key_params: Vec<&syn::Pat> = if attrs.key.is_empty() {
         param_names.clone()
     } else {
-        let declared: Vec<String> = param_names
-            .iter()
-            .map(|pat| quote!(#pat).to_string())
-            .collect();
+        let declared: Vec<String> = param_names.iter().map(|pat| param_name(pat)).collect();
         if let Some(unknown) = attrs
             .key
             .iter()
@@ -510,16 +525,33 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .copied()
             .filter(|pat| {
-                let name = quote!(#pat).to_string();
+                let name = param_name(pat);
                 attrs.key.iter().any(|k| k.to_string() == name)
             })
             .collect()
     };
 
-    let key_args = if key_params.is_empty() {
+    // Refer to each key parameter by the expression that names its *value*.
+    // For the ordinary `a: i64` that is the bare ident — and it must be the
+    // bare ident, because a `mut a: i64` binding would otherwise splice as
+    // `mut a.clone()`. A destructuring pattern like `(a, b): (i64, i64)` has no
+    // single ident, so the pattern itself is spliced, which reconstructs the
+    // tuple and clones correctly.
+    let key_exprs: Vec<TokenStream> = key_params
+        .iter()
+        .map(|pat| match pat {
+            syn::Pat::Ident(ident) if ident.subpat.is_none() => {
+                let name = &ident.ident;
+                quote! { #name }
+            }
+            other => quote! { #other },
+        })
+        .collect();
+
+    let key_args = if key_exprs.is_empty() {
         quote! { &() }
     } else {
-        quote! { &(#(#key_params.clone(),)*) }
+        quote! { &(#(#key_exprs.clone(),)*) }
     };
 
     let ret_type = match &sig.output {
@@ -752,6 +784,31 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("& (a . clone () , b . clone () ,)"), "{out}");
+    }
+
+
+    #[test]
+    fn key_matches_a_mut_binding_by_its_name() {
+        // `mut tenant_id: String` is still the `tenant_id` parameter, and the
+        // key expression must be the bare ident — `mut tenant_id.clone()` is
+        // not an expression.
+        let out = cached_macro(
+            quote! { key(tenant_id) },
+            quote! { async fn f(mut tenant_id: String, other: i64) -> i64 { 0 } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("& (tenant_id . clone () ,)"), "{out}");
+    }
+
+    #[test]
+    fn a_destructuring_parameter_still_enters_the_key_as_a_pattern() {
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! { fn f((a, b): (i64, i64)) -> i64 { a + b } },
+        )
+        .to_string();
+        assert!(out.contains("(a , b) . clone ()"), "{out}");
     }
 
     // ── #1716: cache-coherence dependency declaration ────────────────

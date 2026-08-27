@@ -429,19 +429,17 @@ fn parse_method_coherence_attrs(
         let name = method.sig.ident.to_string();
         for attr in &method.attrs {
             if attr.path().is_ident("invalidates") {
-                let entry = out.entry(name.clone()).or_default();
-                let before = entry.invalidates.len();
-                attr.parse_nested_meta(|nested| {
-                    entry.invalidates.push(nested.path.clone());
-                    Ok(())
-                })?;
-                if entry.invalidates.len() == before {
+                let paths = attr.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )?;
+                if paths.is_empty() {
                     return Err(syn::Error::new_spanned(
                         attr,
                         "`#[invalidates(...)]` must name at least one #[cached] function, \
                          e.g. `#[invalidates(crate::views::recent_posts)]`",
                     ));
                 }
+                out.entry(name.clone()).or_default().invalidates.extend(paths);
             } else if attr.path().is_ident("acknowledge_stale") {
                 let mut reason: Option<LitStr> = None;
                 attr.parse_nested_meta(|nested| {
@@ -621,18 +619,21 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     syn::meta::parser(|meta| {
         // #1716 keys are checked before the catch-all model_name case below.
         if meta.path.is_ident("invalidates") {
-            let before = invalidates.len();
-            meta.parse_nested_meta(|nested| {
-                invalidates.push(nested.path.clone());
-                Ok(())
-            })?;
-            if invalidates.len() == before {
+            // Parsed through an explicit `parenthesized!` rather than
+            // `parse_nested_meta` so the EMPTY case reaches our own diagnostic
+            // instead of syn's "expected nested attribute".
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let paths: syn::punctuated::Punctuated<syn::Path, syn::Token![,]> =
+                content.parse_terminated(syn::Path::parse_mod_style, syn::Token![,])?;
+            if paths.is_empty() {
                 return Err(meta.error(
                     "`invalidates()` must name at least one #[cached] function, e.g. \
                      `invalidates(crate::views::recent_posts)`; omit it entirely if this \
                      repository's writes cannot strand a cached read",
                 ));
             }
+            invalidates.extend(paths);
             return Ok(());
         }
         if meta.path.is_ident("acknowledge_stale") {

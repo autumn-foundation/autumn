@@ -16,9 +16,7 @@
 
 use std::process::Command;
 
-use autumn_web::cache::coherence::{
-    CoherenceManifest, audit_exit_code, format_diagnostic, format_summary, parse_manifest_dump,
-};
+use autumn_web::cache::coherence::{CoherenceManifest, format_diagnostic, parse_manifest_dump};
 
 use crate::routes;
 
@@ -39,11 +37,9 @@ pub struct CacheAuditOptions<'a> {
 /// Render the human report for a manifest.
 #[must_use]
 pub fn format_report(manifest: &CoherenceManifest, strict: bool) -> String {
-    let mut out = String::new();
-    out.push_str(&format_summary_from_manifest(manifest));
+    let mut out = manifest.summary();
     if !manifest.violations.is_empty() {
-        out.push('\n');
-        out.push('\n');
+        out.push_str("\n\n");
         out.push_str(&format_diagnostic(&manifest.violations));
     }
     if !manifest.undetermined_reads.is_empty() {
@@ -54,56 +50,6 @@ pub fn format_report(manifest: &CoherenceManifest, strict: bool) -> String {
         ));
     }
     out
-}
-
-/// One-line summary, reconstructed from the manifest's own entries so the CLI
-/// and the framework can never disagree about the counts.
-#[must_use]
-pub fn format_summary_from_manifest(manifest: &CoherenceManifest) -> String {
-    let reads = manifest
-        .dimensions
-        .cached_reads
-        .entries
-        .iter()
-        .map(|e| autumn_web::cache::coherence::CachedRead {
-            id: e.id.clone(),
-            kind: match e.kind.as_str() {
-                "fragment" => autumn_web::cache::coherence::ReadKind::Fragment,
-                "read_through" => autumn_web::cache::coherence::ReadKind::ReadThrough,
-                _ => autumn_web::cache::coherence::ReadKind::Cached,
-            },
-            reads: e.reads.clone(),
-            provenance: match e.provenance.as_str() {
-                "declared" => autumn_web::cache::coherence::DependencyProvenance::Declared,
-                "derived" => autumn_web::cache::coherence::DependencyProvenance::Derived,
-                _ => autumn_web::cache::coherence::DependencyProvenance::Undetermined,
-            },
-            acknowledged_stale: e.acknowledged_stale.clone(),
-            location: e.location.clone(),
-        })
-        .collect::<Vec<_>>();
-    let mutations = manifest
-        .dimensions
-        .mutations
-        .entries
-        .iter()
-        .map(|e| {
-            let (repository, method) = e
-                .name
-                .split_once("::")
-                .unwrap_or(("", e.name.as_str()));
-            autumn_web::cache::coherence::Mutation {
-                repository: repository.to_string(),
-                method: method.to_string(),
-                model: e.model.clone(),
-                table: e.table.clone(),
-                invalidates: Vec::new(),
-                acknowledged_stale: e.acknowledged_stale.clone(),
-                location: e.location.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
-    format_summary(&reads, &mutations)
 }
 
 /// Diagnostic for reads whose dependency set could not be established.
@@ -185,10 +131,12 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
         eprintln!("\u{2713} No cached read can be left stale by a repository write.");
     }
 
-    let undetermined: Vec<&autumn_web::cache::coherence::CachedRead> = Vec::new();
-    let strict_failure = opts.strict && !manifest.undetermined_reads.is_empty();
-    let code = audit_exit_code(&manifest.violations, &undetermined, false);
-    std::process::exit(if strict_failure { 1 } else { code });
+    // The gate fails on a proven violation always, and on an undetermined
+    // dependency set only under `--strict` — the default never fails on what it
+    // merely could not read.
+    let failed = !manifest.violations.is_empty()
+        || (opts.strict && !manifest.undetermined_reads.is_empty());
+    std::process::exit(i32::from(failed));
 }
 
 #[cfg(test)]
@@ -242,7 +190,7 @@ mod tests {
             ],
             &[mutation("Post")],
         );
-        let summary = format_summary_from_manifest(&manifest);
+        let summary = manifest.summary();
         assert!(summary.contains("3 cached reads"), "{summary}");
         assert!(summary.contains("1 declared"), "{summary}");
         assert!(summary.contains("1 derived"), "{summary}");

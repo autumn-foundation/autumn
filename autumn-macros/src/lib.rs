@@ -711,7 +711,29 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// // Reads pinned to the primary even when a replica is configured.
 /// #[repository(LedgerEntry, primary_reads)]
 /// trait LedgerEntryRepository {}
+///
+/// // Cache coherence (#1716): every write below can strand
+/// // `views::recent_posts`, so the edge is declared here. The path resolves
+/// // to the identity constant `#[cached]` generates beside that function, so
+/// // naming anything else does not compile.
+/// #[repository(Post, invalidates(crate::views::recent_posts))]
+/// trait CoherentPostRepository {
+///     // A per-method edge adds to the trait-level ones.
+///     #[invalidates(crate::views::by_author)]
+///     fn delete_by_author_id(author_id: i64) -> ();
+/// }
 /// ```
+///
+/// # Cache coherence (issue #1716)
+///
+/// Every generated write method publishes which model it mutates, so
+/// `autumn cache audit` can fail the build when a write's model appears in a
+/// `#[cached]` read's dependency set with no invalidation covering the pair.
+/// Discharge the obligation with `invalidates(...)` — on the attribute for
+/// every write, or as `#[invalidates(...)]` on one trait method — or opt out
+/// with `acknowledge_stale = "reason"`. A repository that declares any edge
+/// also gets a generated `invalidate_declared_caches()` for its write paths to
+/// call. See `docs/guide/cache-coherence.md`.
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
     repository::repository_macro(attr.into(), item.into()).into()

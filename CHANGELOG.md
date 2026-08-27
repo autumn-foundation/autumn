@@ -50,6 +50,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cache coherence is now proven at build time — the build fails when a write
+  can leave a cached read stale (#1716):** Autumn’s cache was powerful and its
+  coherence was entirely manual. `Cache::invalidate(key)` was hand-called,
+  `#[cached]` memoized by argument hash, and nothing linked a cached value to
+  the rows it was derived from or to the `#[repository]` write that dirties
+  them. A forgotten invalidation shipped as a silent staleness bug — the most
+  common and hardest-to-catch class of cache defect, and one no mainstream
+  framework catches before production, because everywhere else cache keys are
+  stringly typed and invalidation is convention. Autumn owns both ends of that
+  dependency, so it can assemble the graph instead of hoping. `#[cached]` now
+  publishes which models a value is derived from — declared with
+  `reads(Post, Comment)`, or derived by the macro from the function’s own
+  signature and body — and `#[repository]` publishes which model each of its
+  write methods mutates. `autumn cache audit` reads both back out of the built
+  binary (whole-app, so a read in one crate and a write in another or in a
+  plugin are still compared), emits a stable-ordered, provenance-tagged
+  cache-coherence manifest as a build artifact, and exits non-zero on any
+  uncovered pair — naming the read, the write, the model they share, both
+  source locations, and the two ways to discharge it. The obligation is
+  discharged with `invalidates(path::to::cached_fn)` on the repository (or
+  `#[invalidates(...)]` on one method), which is resolved by **rustc**: the path
+  rewrites to the identity constant `#[cached]` emits beside the function, so an
+  edge that names a non-cached function does not compile — it is a resolved
+  path, not a string in a table somebody has to keep in sync. Alternatively
+  `acknowledge_stale = "reason"` opts out, with a mandatory non-blank reason that
+  lands in the manifest so every escape hatch is visible in review. A repository
+  that declares any edge also gets a generated `invalidate_declared_caches()`
+  that really does clear those reads. Deliberately conservative in the direction
+  that keeps the gate alive: a read whose dependency set could not be
+  established is `undetermined` — reported in the manifest and the summary, never
+  failed, unless `--strict` — because a checker that fails on what it merely
+  could not read is a checker that gets deleted from CI. Reads the macros cannot
+  see (fragment, read-through) declare themselves with `declare_cached_read!`.
+  `#[cached]` also gained `key(a, b)` to build the cache key from named
+  parameters only, which is what lets a cached read take the repository handle it
+  reads through — the handle is `Clone` but not `Hash`, and was never part of the
+  value’s identity. What is proven and what is not is stated on the tin: the
+  `invalidations` dimension is tagged `declared`, not `provable`, with a
+  `runtime_caveat` saying the edge’s target is proven but its *invocation* is
+  not, and the manifest’s `excluded` list names row/column granularity,
+  cross-service coherence and TTL semantics as out of this slice. `examples/saas`
+  demonstrates both halves — the app audits clean, and deleting the one
+  `invalidates(...)` clause turns the build red. See
+  `docs/guide/cache-coherence.md`.
+
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
   shipped until now — rolling, blue/green, canary — routes **real** traffic to

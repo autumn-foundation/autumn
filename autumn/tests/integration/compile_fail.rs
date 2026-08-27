@@ -230,6 +230,8 @@ fn cache_coherence_compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_invalidates_unknown_read.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_invalidates_empty.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 

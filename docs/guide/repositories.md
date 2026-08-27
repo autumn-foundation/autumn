@@ -467,6 +467,11 @@ A route's query count can also be pinned at compile time: annotate the handler
 with [`#[query_budget(N)]`](query-budgets.md) and the build fails if any
 reachable path — including a repository call inside a loop — can exceed `N`.
 
+Caching a repository read is safe to be aggressive about, because coherence is
+proven too: every generated write method publishes the model it mutates, and
+[`autumn cache audit`](cache-coherence.md) fails the build when one of them can
+leave a `#[cached]` read stale with no `invalidates(...)` covering the pair.
+
 
 Bulk operations are built for maximum performance, with the following built-in safeguards:
 

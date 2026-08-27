@@ -365,28 +365,13 @@ pub fn format_diagnostic(findings: &[StalenessFinding]) -> String {
 }
 
 /// Render the human summary line printed by `autumn cache audit`.
+///
+/// A convenience over [`CoherenceManifest::summary`] for callers that hold the
+/// values rather than the assembled manifest; both share one implementation of
+/// the counting.
 #[must_use]
 pub fn format_summary(reads: &[CachedRead], mutations: &[Mutation]) -> String {
-    let declared = reads
-        .iter()
-        .filter(|r| r.provenance == DependencyProvenance::Declared)
-        .count();
-    let derived = reads
-        .iter()
-        .filter(|r| r.provenance == DependencyProvenance::Derived)
-        .count();
-    let undetermined = reads.len() - declared - derived;
-    let acknowledged = reads.iter().filter(|r| r.acknowledged_stale.is_some()).count()
-        + mutations
-            .iter()
-            .filter(|m| m.acknowledged_stale.is_some())
-            .count();
-    format!(
-        "{} cached reads ({declared} declared, {derived} derived, {undetermined} undetermined), \
-         {} repository mutations, {acknowledged} acknowledged-stale",
-        reads.len(),
-        mutations.len(),
-    )
+    CoherenceManifest::build(reads, mutations).summary()
 }
 
 // ── Manifest ─────────────────────────────────────────────────────────
@@ -571,6 +556,38 @@ impl CoherenceManifest {
             undetermined_reads: undetermined,
             excluded: excluded_dimensions(),
         }
+    }
+
+    /// The one-line human summary printed by `autumn cache audit`.
+    ///
+    /// Computed from the manifest's own entries rather than from the values it
+    /// was built from, so the CLI and the framework can never disagree about
+    /// the counts — and so a manifest read back from a file summarizes exactly
+    /// the same way as one just built.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let reads = &self.dimensions.cached_reads.entries;
+        let count = |class: &str| reads.iter().filter(|e| e.provenance == class).count();
+        let declared = count("declared");
+        let derived = count("derived");
+        let undetermined = reads.len() - declared - derived;
+        let acknowledged = reads
+            .iter()
+            .filter(|e| e.acknowledged_stale.is_some())
+            .count()
+            + self
+                .dimensions
+                .mutations
+                .entries
+                .iter()
+                .filter(|e| e.acknowledged_stale.is_some())
+                .count();
+        format!(
+            "{} cached reads ({declared} declared, {derived} derived, {undetermined} \
+             undetermined), {} repository mutations, {acknowledged} acknowledged-stale",
+            reads.len(),
+            self.dimensions.mutations.entries.len(),
+        )
     }
 
     /// Serialize the manifest as pretty JSON.

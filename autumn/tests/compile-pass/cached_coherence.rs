@@ -30,11 +30,13 @@ pub async fn article_ticker() -> i64 {
     0
 }
 
-// A read the macro derives on its own, from the repository type in the
-// signature.
-#[cached]
-pub async fn derived_reader(_repo: &PgArticleRepository) -> i64 {
-    0
+// A read whose dependency set the macro derives on its own, from the
+// repository type in the signature — and the shape that makes `key(...)` load
+// bearing: the handle is `Clone` but not `Hash`, so it must stay out of the
+// key.
+#[cached(key(article_id), acknowledge_stale = "derived reads are demo-only here")]
+pub async fn derived_reader(article_id: i64, _repo: &PgArticleRepository) -> i64 {
+    article_id
 }
 
 #[autumn_web::repository(Article, invalidates(recent_titles))]
