@@ -100,9 +100,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when enabled, *and* the `ImpersonationGate`) and `POST
   {prefix}/impersonate/stop`, deliberately mounted **outside** the role gate —
   while impersonating, the session carries the target's role, so a gated revert
-  would trap the operator in the target's identity with no way back. Every admin
-  page then renders a persistent "Viewing as … — Stop impersonating" banner with
-  one-click revert. The same banner goes in an application's own layout — the
+  would trap the operator in the target's identity with no way back. The admin
+  router also publishes the request's current actor unconditionally —
+  attribution must not depend on the *optional* role check — so admin-surface
+  writes are attributed at all (previously `SYSTEM_ACTOR`) and correctly while
+  impersonating; runtime-config changes are recorded against the operator rather
+  than the customer for the same reason. Every admin page then renders a
+  persistent "Viewing as … — Stop impersonating" banner with one-click revert. The same banner goes in an application's own layout — the
   surface an operator actually looks at while impersonating a non-admin — via
   `autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
   csrf_token, csrf_form_field)` plus the exported
