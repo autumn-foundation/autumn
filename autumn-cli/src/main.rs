@@ -4,6 +4,7 @@ mod a11y;
 mod alert;
 mod assets;
 mod build;
+mod cache_audit;
 mod canary;
 mod check;
 mod cold_start_driver;
@@ -94,6 +95,36 @@ pub enum RoutesSubcommands {
         json: bool,
         /// Reserved for tightening the gate; fail-on-unclassified is already the
         /// default behavior.
+        #[arg(long)]
+        strict: bool,
+    },
+}
+
+/// Subcommands for `autumn cache`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CacheSubcommands {
+    /// Prove cached reads are never left stale by a repository write (#1716).
+    ///
+    /// Compiles the app, reads back the cache-coherence manifest the framework
+    /// assembles from every `#[cached]` read and every `#[repository]` write it
+    /// links, and exits non-zero when a mutation's model appears in a cached
+    /// read's dependency set with no invalidation covering the pair — naming
+    /// the read, the mutation and the shared model. This is the CI gate.
+    Audit {
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Write the JSON cache-coherence manifest to this file path.
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<String>,
+        /// Emit the JSON manifest to stdout instead of the human report.
+        #[arg(long)]
+        json: bool,
+        /// Also fail when a cached read's dependency set could not be
+        /// established (the default only warns, so the gate never cries wolf).
         #[arg(long)]
         strict: bool,
     },
@@ -1168,6 +1199,11 @@ enum Commands {
     /// Rows are stable-sorted by path, then method, so the output is
     /// diff-friendly. Redirect to a file and `git diff` two snapshots to
     /// audit route changes between commits.
+    /// Cache-coherence tooling (issue #1716).
+    Cache {
+        #[command(subcommand)]
+        command: CacheSubcommands,
+    },
     Routes {
         /// Package to inspect (for workspaces).
         #[arg(short, long)]
@@ -3601,6 +3637,24 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Cache {
+            command:
+                CacheSubcommands::Audit {
+                    package,
+                    bin,
+                    manifest,
+                    json,
+                    strict,
+                },
+        } => {
+            cache_audit::run(&cache_audit::CacheAuditOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                manifest: manifest.as_deref(),
+                json,
+                strict,
+            });
+        }
         Commands::Routes {
             package,
             bin,

@@ -1280,8 +1280,11 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Cache the return value of a function based on its arguments.
 ///
 /// Wraps a function with an in-memory cache backed by a per-function
-/// static `Cache` (from `autumn_web::cache::Cache`). Arguments
+/// static `Cache` (from `autumn_web::cache::Cache`). Key arguments
 /// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
+///
+/// Apply this to a **free function**: the expansion emits items beside it (the
+/// coherence registration below), which an `impl` block cannot hold.
 ///
 /// # Attributes
 ///
@@ -1290,6 +1293,19 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `ttl` | `"5m"` | Time-to-live per entry (uses `parse_duration` syntax) |
 /// | `max` | `1000` | Max entries; oldest evicted on overflow |
 /// | `result` | (flag) | Only cache `Ok` values; pass `Err` through uncached |
+/// | `key` | `key(tenant_id)` | Build the key from *these* parameters only |
+/// | `reads` | `reads(Post, Comment)` | Declared cache-coherence dependency set |
+/// | `acknowledge_stale` | `"5s TTL is tight enough"` | Opt out of the coherence gate |
+///
+/// # Cache coherence (issue #1716)
+///
+/// Every annotated function publishes which models its value is derived from,
+/// and `autumn cache audit` fails the build when a `#[repository]` write can
+/// leave that value stale with no invalidation covering the pair. `reads(...)`
+/// declares the dependency set; without it the macro derives what it can from
+/// the signature and body, and a function nothing could be recovered from is
+/// recorded as `undetermined` — reported, never gated. See
+/// `docs/guide/cache-coherence.md`.
 ///
 /// # Examples
 ///
@@ -1300,6 +1316,16 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[cached(ttl = "5m", max = 100, result)]
 /// async fn get_user(id: i64) -> AutumnResult<User> {
 ///     db.find(id).await
+/// }
+///
+/// // A repository-backed read: the handle is not part of the value's
+/// // identity, so `key(...)` keeps it out of the cache key, and `reads(...)`
+/// // tells the coherence gate what a write to `Project` would strand.
+/// #[cached(ttl = "30s", key(tenant_id), reads(Project), result)]
+/// async fn project_count(tenant_id: String, repo: &PgProjectRepository)
+///     -> AutumnResult<i64>
+/// {
+///     repo.count().await
 /// }
 ///
 /// // Cache forever with no size limit

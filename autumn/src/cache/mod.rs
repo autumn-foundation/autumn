@@ -35,6 +35,7 @@
 
 #[cfg(feature = "maud")]
 mod fragment;
+pub mod coherence;
 mod layer;
 #[cfg(feature = "cache-moka")]
 mod moka_impl;
