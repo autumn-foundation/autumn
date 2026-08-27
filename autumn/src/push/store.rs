@@ -333,6 +333,43 @@ pub const MAX_SUBSCRIPTIONS_PER_PRINCIPAL: usize = 20;
 ///   silently cutting the victim off and redirecting their notifications.
 /// - **Removal is idempotent.** [`remove`](Self::remove) returns how many rows
 ///   it deleted; a missing endpoint is `Ok(0)`, not an error.
+///
+/// # Example
+///
+/// A store is registered once and then never mentioned again — the `WebPush`
+/// extractor picks it up:
+///
+/// ```rust,ignore
+/// use autumn_web::push::{PushError, PushSubscriptionStore, StoredSubscription};
+///
+/// struct RedisPushStore { /* … */ }
+///
+/// impl PushSubscriptionStore for RedisPushStore {
+///     async fn save(&self, subscription: StoredSubscription) -> Result<(), PushError> {
+///         // `subscription` is already validated: an https endpoint, a real
+///         // P-256 point, a 16-byte auth secret. Key on `endpoint()`.
+///         self.upsert(subscription.endpoint(), &subscription).await
+///     }
+///
+///     async fn list_for(&self, principal_id: &str) -> Result<Vec<StoredSubscription>, PushError> {
+///         self.by_principal(principal_id).await
+///     }
+///
+///     async fn remove(
+///         &self,
+///         endpoint: &str,
+///         principal_id: Option<&str>,
+///     ) -> Result<u64, PushError> {
+///         self.delete(endpoint, principal_id).await
+///     }
+/// }
+///
+/// autumn_web::app()
+///     .with_push_subscription_store(RedisPushStore::new())
+///     .merge(autumn_web::push::router())
+///     .run()
+///     .await;
+/// ```
 pub trait PushSubscriptionStore: Send + Sync + 'static {
     /// Persist a subscription, replacing any existing row for the same
     /// endpoint.
