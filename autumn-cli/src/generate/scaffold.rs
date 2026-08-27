@@ -10888,7 +10888,25 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
     let __DISCARDED_MUT__discarded_seen = false;
     let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {__DISCARDED_PROBE__
         let encoded = url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(row.iter().map(|(key, value)| (key.as_str(), __CELL_CALL__)))
+            .extend_pairs(row.iter().map(|(key, value)| {
+                // The column name with surrounding whitespace removed. Some
+                // exporters write `a, b, c`, and RFC 4180 treats that space as
+                // part of the name — so the raw key would be `" b"`, which
+                // matches no field on `{Pascal}Form` and no entry in the column
+                // lists the cell rules below consult. `decode_form` ignores a key
+                // it does not know and serde defaults the field that key was
+                // meant to fill, so without this a padded header would import a
+                // column's values as `false`/`None` while reporting success.
+                //
+                // This MUST match how `CSV_REQUIRED_COLUMNS` is compared against
+                // the header above: that check trims too, so a padded file gets
+                // past it, and the two have to agree about what a column is
+                // called or the check would be guaranteeing something this line
+                // then breaks. A column whose name is genuinely padded cannot
+                // exist here — form fields are Rust identifiers.
+                let key = key.trim();
+                (key, __CELL_CALL__)
+            }))
             .finish();
         let form = match decode_form(Bytes::from(encoded)) {
             Ok(form) => form,

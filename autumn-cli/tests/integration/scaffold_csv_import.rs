@@ -696,20 +696,70 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
     );
 }
 
+/// The header check and the row decoder must agree about what a column is
+/// CALLED. The check compares trimmed names, so a file headed `a, b, c` — RFC
+/// 4180 keeps that space, and plenty of exporters write it — gets past it. If
+/// the decoder then saw the raw `" b"`, it would match no field on the form,
+/// serde would default the one that key was meant to fill, and the import would
+/// report success while storing `false`/`None`: the same silent-default hole the
+/// header check exists to close, reopened through a narrower door.
+#[test]
+fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
+    let (_tmp, routes) = import_routes("import-padded", &[]);
+    let import = handler_slice(&routes, "import");
+    assert!(
+        import.contains("let key = key.trim();"),
+        "the decoder's keys must be normalized like the header check's:\n{import}"
+    );
+    // The trimmed name must reach the cell rules too — they look their column up
+    // by name (`CSV_BOOL_COLUMNS`, `CSV_TEXT_COLUMNS`), so a raw padded key would
+    // skip the blank-checkbox and formula-guard handling as well.
+    assert!(
+        import.contains("(key, csv_bool_cell(key, csv_unguard_cell(key, value)))"),
+        "the cell rules must receive the normalized key:\n{import}"
+    );
+    // Both sides of the agreement, asserted together so neither can drift alone.
+    assert!(
+        import.contains("found.trim() == *column"),
+        "the header check trims, which is what makes the above necessary:\n{import}"
+    );
+}
+
 #[test]
 fn the_header_check_is_omitted_when_no_column_could_be_missing() {
     // Every column is `--default`ed, so the form can set none of them and there
     // is nothing a file could lack — emitting the const and the check would be
     // dead code in the generated app.
+    // EVERY column defaulted — one column, and it is the defaulted one — so
+    // `form_carried` is empty and there is nothing a file could lack.
     let (_tmp, project, _) = scaffold_project(
         "import-noheaders",
         &["tag:String", "--default", "tag=general"],
         &["--import"],
     );
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // Premise check: a model that still has a settable column DOES emit the
+    // const, so the assertion below is about the all-defaulted case rather than
+    // passing because the feature is missing everywhere.
+    let (_tmp2, settable, _) = scaffold_project(
+        "import-noheaders-control",
+        &["title:String", "tag:String", "--default", "tag=general"],
+        &["--import"],
+    );
+    let control = fs::read_to_string(settable.join("src/routes/posts.rs")).unwrap();
     assert!(
-        !routes.contains("CSV_REQUIRED_COLUMNS"),
+        control.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["title"];"#),
+        "a model with a settable column must still emit the check:\n{control}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // The const DEFINITION, not the word: the row decoder's comment names the
+    // const to explain why it trims keys the same way the check does.
+    assert!(
+        !routes.contains("const CSV_REQUIRED_COLUMNS:"),
         "no settable column means no header check to emit:\n{routes}"
+    );
+    assert!(
+        !routes.contains("read_header(&uploaded[..])"),
+        "...and no header to read for it:\n{routes}"
     );
 }
 
