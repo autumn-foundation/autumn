@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CSV import row numbers are now the same for CRLF and LF files:**
+  `autumn_web::data::csv::import_csv` reports a 1-based line number for every
+  `CsvRowError`, but the underlying CSV parser's own counter runs exactly one
+  behind on a CRLF file — the dialect Excel and most Windows tools write — so a
+  row a spreadsheet shows on line 7 was blamed on line 6, while a byte-identical
+  LF copy of the same file correctly said 7. An error report whose row numbers
+  depend on the file's line endings is worse than no row number at all, so
+  `import_csv` now calibrates against the header (whose true span is known: it
+  is line 1) and shifts every reported position by the same amount, and it strips
+  the parser's own uncalibrated line number out of the message text so a report
+  never shows two different lines for one row. Multi-line quoted fields still
+  push the rows after them down, in both dialects. The shift is measured once,
+  so a file that *mixes* terminators still drifts — noted where the calibration
+  lives. The header's true span is measured (a quoted header field may carry
+  embedded newlines) rather than assumed to be one line, so the correction fixes
+  the CRLF case without disturbing rows under a multi-line header.
+
 - **TLS-enabled migrations no longer panic when applied from an app's own
   async `on_startup` hook:** the sync migration/wait-check path bridges to
   Postgres through diesel-async's `AsyncConnectionWrapper` whenever the
@@ -33,6 +50,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn_web::data::csv::read_header`:** returns a CSV source's header column
+  names in file order (empty for a source with no readable header). It exists so
+  a caller can reject a file that is simply the WRONG FILE before importing any
+  of it: `import_csv` decodes rows by column name and a decoder may legitimately
+  default an absent field, so a spreadsheet sharing none of the expected names
+  can parse cleanly into a run of blank records. The scaffolded CSV import below
+  checks it against the columns the form can set.
+
+- **`autumn_web::data::csv::count_data_rows`:** counts the data rows in a CSV
+  source without retaining any of them — the header excluded, a malformed row
+  included. It exists for callers that must bound how much work an untrusted
+  upload can ask for *before* handing it to `import_csv`: a malformed row never
+  reaches `import_csv`'s row handler (it is recorded as a `CsvRowError` and the
+  parse moves on), so a counter inside that handler cannot see the very file
+  that costs the most to accumulate. The scaffolded CSV import below uses it to
+  enforce its row cap.
+
+- **`autumn generate scaffold --import` — a CSV import route with a dry-run
+  preview and per-row errors (#1393):** the symmetric counterpart to the
+  scaffolded CSV export (#1315). One flag emits `GET /<plural>/import` (an
+  upload form that prints the expected header row straight from the model's
+  generated `CsvSchema`) and `POST /<plural>/import`, which parses the uploaded
+  multipart CSV and — unless the submit explicitly confirms a commit — runs
+  `import_csv` in `ImportMode::DryRun` and renders the `ImportReport`: rows
+  read, rows that *would* insert, and a table of row errors with line numbers
+  and messages. Ticking "Import for real" runs the same parse in write mode and
+  commits through the repository's `save_many_skip_invalid`, so a row the
+  database rejects is isolated and reported against its own CSV line instead of
+  aborting the batch — inserted-versus-failed always adds up, with no silent
+  drops. Each row is decoded, blank-normalized and validated through the module's
+  own `decode_form` + `Changeset`, i.e. exactly the code path a browser form
+  submission takes, and against the **same** `CsvSchema` impl the export writes
+  from — one column map for both directions, so a file this app exported can be
+  edited and uploaded straight back. The POST is `#[secured]`, renders the
+  shipped CSRF and one-time submit-token inputs first (so both land inside the
+  multipart token-scan window), caps the upload at an emitted
+  `MAX_IMPORT_BYTES` on top of `security.upload.max_file_size_bytes`, and checks
+  the file's extension and declared content type, and refuses a file whose
+  header is missing any column the form can set — the check that catches an
+  operator uploading the wrong spreadsheet, which row-level validation cannot
+  see because each decoded row is valid. Work is bounded by rows as
+  well as bytes (`MAX_IMPORT_ROWS`, mirroring the export's cap), rows past the
+  cap is refused whole rather than imported as a prefix, and a write that fails
+  partway through says which rows may already be committed instead of 500ing.
+  The generated `tests/<name>.rs` gains a database-free test that uploads a
+  2-row CSV (1 valid, 1 invalid) through the real `Multipart` extractor and
+  `import_csv`, exercising the dry-run report (1 insertable row plus 1 row error
+  on the right line, nothing written) and then the commit (exactly the valid row
+  persists). Like every generated scaffold test it drives a stand-in resource
+  rather than the app's own handler; the emitted handler itself is compiled and
+  its import test run by the generator conformance suite.
+  A file this app exported re-imports as the same VALUES: the import undoes the
+  export's spreadsheet-formula apostrophe guard (on the text columns it applies
+  to, and only those), normalizes the boolean spellings a spreadsheet writes,
+  and an `--import` scaffold's `parse_local_datetime` also accepts the timestamp
+  format the export writes. It re-imports as new RECORDS, though — the slice is
+  insert-only, so re-uploading an exported file duplicates it; the upload page
+  and the guide both say so. Columns the form does not carry (`id`,
+  `created_at`, an `Attachment`, a `Bytea` — whose lossy export cannot
+  round-trip — a `--default`ed column) are named on the page as
+  ones the import cannot set, and a model with an at-rest `#[encrypted]` column —
+  which the export omits but the form requires — or with no CSV-settable column
+  at all (every column an `Attachment`, a `Bytea`, or `--default`ed, so an
+  importer could only ever commit rows of defaults) — or a non-nullable `Bytea`
+  column, which the import must skip but the form requires — refuses the surface
+  outright
+  with a warning naming the column.
+  Additive: without the flag the scaffold's output is byte-identical, and
+  `--import` on a variant that emits no `CsvSchema` (`--api`, `--live`,
+  `--sharded`, an owner-scoped `--live-validation`) generates nothing and warns
+  with the reason.
 - **SEO guide and a runnable SEO example (#2320, T1 Gap 1):** `seo.rs` was
   rustdoc-only and `docs/guide/` had zero `sitemap`/`robots` mentions, even
   though the `seo(...)` route attribute shipped in 0.7.0. The new
