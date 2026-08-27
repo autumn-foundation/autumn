@@ -1029,6 +1029,25 @@ fn assert_no_import_anywhere(project: &Path) {
 /// The strongest form of "additive": for a variant that cannot have the import,
 /// passing `--import` must change NOTHING. A grep only sees the strings it was
 /// told to look for; this compares the whole generated tree.
+/// Replace a migration directory's 14-digit generation timestamp with a fixed
+/// placeholder, so two scaffolds generated a second apart compare equal.
+///
+/// Deliberately narrow: it rewrites only a `migrations/<14 digits>_` prefix, so
+/// a digit run anywhere else in a path — or in a file's contents — is untouched.
+fn normalize_migration_timestamp(rel: &str) -> String {
+    let Some(rest) = rel.strip_prefix("migrations/") else {
+        return rel.to_owned();
+    };
+    let Some((stamp, tail)) = rest.split_once('_') else {
+        return rel.to_owned();
+    };
+    if stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()) {
+        format!("migrations/<timestamp>_{tail}")
+    } else {
+        rel.to_owned()
+    }
+}
+
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     let mut flags = vec!["--import"];
     flags.extend_from_slice(extra);
@@ -1046,11 +1065,21 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(body) = fs::read_to_string(&path) {
-                    let rel = path
-                        .strip_prefix(root)
-                        .expect("under root")
-                        .display()
-                        .to_string();
+                    // The migration directory embeds a generation timestamp to
+                    // the SECOND (`migrations/20260827030722_create_posts/`), and
+                    // the two scaffolds this compares are two separate process
+                    // runs — so they straddle a second boundary often enough to
+                    // matter, and the raw paths would then differ for a reason
+                    // that has nothing to do with the flag under test. Normalize
+                    // the timestamp away; the rest of the path (and every file
+                    // body) is still compared exactly.
+                    let rel = normalize_migration_timestamp(
+                        &path
+                            .strip_prefix(root)
+                            .expect("under root")
+                            .display()
+                            .to_string(),
+                    );
                     // Freshly generated secrets differ by construction; every
                     // other file is the generator's own output.
                     if rel.contains("master.key") || rel.contains("credentials.enc") {

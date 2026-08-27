@@ -15101,7 +15101,9 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src/models")).unwrap();
         fs::write(
             tmp.path().join(format!("src/models/{base}.rs")),
-            format!("#[autumn_web::model]\npub struct {pascal} {{\n #[id]\n pub id: i64,\n}}\n"),
+            format!(
+                "#[autumn_web::model]\npub struct {pascal} {{\n    #[id]\n    pub id: i64,\n}}\n"
+            ),
         )
         .unwrap();
     }
@@ -20404,7 +20406,9 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
-            routes.contains(" .first(&mut *db)\n .await\n .map_err(AutumnError::not_found)?;"),
+            routes.contains(
+                "        .first(&mut *db)\n        .await\n        .map_err(AutumnError::not_found)?;"
+            ),
             "show/edit must map a missing row to a 404 via AutumnError::not_found: {routes}"
         );
     }
