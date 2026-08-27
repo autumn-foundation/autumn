@@ -1719,6 +1719,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_handoff_directory_is_private_to_this_user() {
         // It holds a serialized copy of the application's state.
         let base = std::env::temp_dir().join(format!(
