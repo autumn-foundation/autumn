@@ -2,17 +2,26 @@
 //! Postgres.
 //!
 //! The guide for this feature is `docs/guide/seo.md`. These tests prove the
-//! three parts the guide describes:
+//! parts the guide describes:
 //!
 //! 1. `sitemap_lists_every_public_page` — `RedditSitemapSource` reads the
 //!    database and produces one absolute URL for each community and each post,
-//!    plus the two hub pages. It also proves the `<lastmod>` value comes from
-//!    `posts.updated_at`.
-//! 2. `sitemap_and_robots_render_the_expected_documents` — the entries and the
+//!    plus the two hub pages, and leaves `#[static_get]` paths to the
+//!    framework.
+//! 2. `lastmod_follows_comment_activity_not_just_post_edits` — `<lastmod>` is
+//!    **derived**, not read from `posts.updated_at`: it is the latest of that
+//!    column, the newest live comment, and the newest comment deletion. Also
+//!    covers the ordering that derivation drives, and the polymorphic
+//!    discriminator that keeps a community's comment off a post with the same
+//!    id.
+//! 3. `sitemap_and_robots_render_the_expected_documents` — the entries and the
 //!    `[seo.robots]` rules become a valid `sitemap.xml` and a `robots.txt`
 //!    that points back at the sitemap.
-//! 3. `sitemap_is_empty_without_a_database` — a source with no database does
+//! 4. `sitemap_is_empty_without_a_database` — a source with no database does
 //!    not fail the boot. It contributes no entries.
+//! 5. `robots_txt_never_blocks_a_url_that_relies_on_a_noindex_tag` — the
+//!    committed `autumn.toml` keeps `Disallow` and `noindex` off the same URL.
+//!    Needs no database, so it runs unignored.
 //!
 //! The Docker-backed tests are `#[ignore]` (like the other PG integration
 //! tests here) and run through testcontainers by default. When Docker is not
