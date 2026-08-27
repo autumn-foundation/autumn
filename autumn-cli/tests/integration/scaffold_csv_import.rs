@@ -819,6 +819,70 @@ fn omitting_the_flag_leaves_the_scaffold_untouched() {
     assert!(!test.contains("csv_import"), "{test}");
 }
 
+/// `update_main_rs` only ADDS entries, so a re-run that stops emitting the
+/// import leaves `main.rs` mounting two handlers the fresh routes module no
+/// longer defines — and the project stops compiling. `--import` is exactly the
+/// kind of flag someone forgets to repeat on a `--force` regeneration, and the
+/// variant gates can turn the surface off without the flag changing at all.
+#[test]
+fn regenerating_without_the_flag_unmounts_the_import_routes() {
+    let (_tmp, project, _) = scaffold_project("import-regen", &default_cols(), &["--import"]);
+    let mounted = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        mounted.contains("routes::posts::import_form,")
+            && mounted.contains("routes::posts::import,"),
+        "the import routes start out mounted:\n{mounted}"
+    );
+
+    // The same scaffold again, WITHOUT `--import`.
+    let mut args = vec!["generate", "scaffold", "Post"];
+    args.extend_from_slice(&default_cols());
+    args.push("--force");
+    run_autumn_ok(&project, &args);
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        !routes.contains("pub async fn import"),
+        "the re-render emits no import handlers:\n{routes}"
+    );
+    let pruned = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !pruned.contains("routes::posts::import"),
+        "main.rs must not keep mounting handlers the module no longer defines:\n{pruned}"
+    );
+    // ...and the prune is surgical: every other entry survives, including the
+    // export, whose name is not a prefix relationship away from the import's.
+    for kept in [
+        "routes::posts::index,",
+        "routes::posts::show,",
+        "routes::posts::create,",
+        "routes::posts::destroy,",
+        "routes::posts::export_csv,",
+    ] {
+        assert!(
+            pruned.contains(kept),
+            "`{kept}` must survive the import prune:\n{pruned}"
+        );
+    }
+}
+
+/// The same hazard reached through a VARIANT gate rather than a dropped flag:
+/// `--import` is still on the command line, but adding `--sharded` turns the
+/// surface off, so the stale entries must go just the same.
+#[test]
+fn a_variant_that_gates_the_import_off_also_unmounts_it() {
+    let (_tmp, project, _) = scaffold_project("import-regen-gate", &default_cols(), &["--import"]);
+    let mut args = vec!["generate", "scaffold", "Post"];
+    args.extend_from_slice(&default_cols());
+    args.extend_from_slice(&["--import", "--sharded", "--force"]);
+    run_autumn_ok(&project, &args);
+    let pruned = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !pruned.contains("routes::posts::import"),
+        "a gated-off variant must unmount the import too:\n{pruned}"
+    );
+}
+
 // ── Gated-off variants warn instead of emitting a broken module ───────────────
 
 /// The import shares the export's `CsvSchema`, so it is emitted exactly where

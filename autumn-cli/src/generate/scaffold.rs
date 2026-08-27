@@ -2144,6 +2144,25 @@ fn plan_scaffold_with_options_impl(
             ],
         )
     };
+    // Issue #1393: the same for the CSV import pair, and for the same reason —
+    // `--import` is a flag someone forgets to repeat on a `--force`
+    // regeneration, and the variant gates can also turn it off without the flag
+    // changing at all (adding `--sharded`, or adding an `#[encrypted]` column,
+    // is enough). Either way the fresh routes module stops defining the two
+    // handlers while `main.rs` keeps mounting them, and the project stops
+    // compiling. Not reached when the surface IS emitted: the entries are
+    // re-added above.
+    let updated = if import_enabled {
+        updated
+    } else {
+        super::schema_edit::remove_routes_entries(
+            &updated,
+            &[
+                format!("routes::{plural}::import_form"),
+                format!("routes::{plural}::import"),
+            ],
+        )
+    };
     // Fold the policy/scope registration into the same `updated` content
     // (issue #1125) so main.rs gets a single `Modify` action.
     let updated = if policy_on {
