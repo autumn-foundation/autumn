@@ -249,10 +249,74 @@ mod tests {
 
     #[test]
     fn undetermined_reads_are_a_warning_by_default_and_an_error_under_strict() {
-        let ids = vec!["blog::mystery".to_string()];
-        assert!(format_undetermined_diagnostic(&ids, false).starts_with("warning:"));
-        assert!(format_undetermined_diagnostic(&ids, true).starts_with("error:"));
-        assert!(format_undetermined_diagnostic(&ids, false).contains("blog::mystery"));
+        let reads = vec![UndeterminedRead {
+            id: "blog::mystery".to_string(),
+            location: "src/views.rs:7".to_string(),
+        }];
+        assert!(format_undetermined_diagnostic(&reads, false).starts_with("warning:"));
+        assert!(format_undetermined_diagnostic(&reads, true).starts_with("error:"));
+        let text = format_undetermined_diagnostic(&reads, false);
+        assert!(text.contains("blog::mystery"), "{text}");
+        assert!(
+            text.contains("src/views.rs:7"),
+            "an id with no location makes the reader grep: {text}"
+        );
+    }
+
+    #[test]
+    fn the_report_names_every_acknowledged_stale_opt_out() {
+        // A hatch that shows only as a number in the summary is a hatch nobody
+        // reviews.
+        let mut r = read("blog::ticker", &["Post"], DependencyProvenance::Declared);
+        r.acknowledged_stale = Some("5s lag is fine on the ticker".to_string());
+        let mut m = mutation("Post");
+        m.acknowledged_stale = Some("seed-only writes".to_string());
+
+        let report = format_report(&CoherenceManifest::build(&[r], &[m]), false);
+        assert!(report.contains("2 acknowledged-stale opt-outs"), "{report}");
+        assert!(report.contains("5s lag is fine on the ticker"), "{report}");
+        assert!(report.contains("seed-only writes"), "{report}");
+        assert!(report.contains("src/views.rs:10"), "{report}");
+        assert!(report.contains("PostRepository::save"), "{report}");
+    }
+
+    #[test]
+    fn a_report_with_no_opt_outs_says_nothing_about_them() {
+        let manifest = CoherenceManifest::build(
+            &[read(
+                "blog::recent",
+                &["Tag"],
+                DependencyProvenance::Declared,
+            )],
+            &[mutation("Post")],
+        );
+        assert!(format_acknowledged_report(&manifest).is_empty());
+        assert!(!format_report(&manifest, false).contains("acknowledged-stale opt-out"));
+    }
+
+    #[test]
+    fn the_report_groups_a_missing_edge_and_still_names_every_write() {
+        let manifest = CoherenceManifest::build(
+            &[read(
+                "blog::recent",
+                &["Post"],
+                DependencyProvenance::Declared,
+            )],
+            &[
+                mutation("Post"),
+                Mutation {
+                    method: "delete_by_id".to_string(),
+                    ..mutation("Post")
+                },
+            ],
+        );
+        let report = format_report(&manifest, false);
+        assert_eq!(
+            report.matches("fix: add invalidates(").count(),
+            1,
+            "{report}"
+        );
+        assert!(report.contains("PostRepository::delete_by_id"), "{report}");
     }
 
     #[test]
