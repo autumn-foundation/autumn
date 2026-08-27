@@ -193,6 +193,8 @@ pub mod migrate;
 pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
+#[cfg(feature = "plugin-sandbox")]
+pub mod plugin_sandbox;
 pub mod probe;
 pub mod query_string;
 

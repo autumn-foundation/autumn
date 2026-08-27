@@ -218,9 +218,25 @@ acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 # `edge_routes!` macros are re-exported unconditionally — a route can be *marked*
 # without this feature; the feature is what wires the seam at the origin.
 edge = ["dep:autumn-edge"]
+# Capability-sandboxed WASM plugins (issue #1609). Loads a third-party plugin as
+# a portable `.autumn-plugin` artifact — a manifest plus a `wasm32-wasip1`
+# module — and serves HTTP requests from it under the manifest's declared
+# prefix, in-process, with deny-by-default ambient authority, hard CPU/memory
+# ceilings and fault isolation.
+#
+# Purely additive and host-only: the native `Plugin` trait is untouched and no
+# existing app changes shape. `wasmi` is a pure-Rust interpreter (no codegen
+# backend, no C toolchain), so enabling this keeps the single-binary deploy
+# story intact. Off by default — without it none of `plugin_sandbox` compiles.
+plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
 autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
+# Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
+# resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
+# new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
+# floor); licensed MIT OR Apache-2.0.
+wasmi = { version = "0.40", optional = true }
 autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
@@ -392,6 +408,11 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["timeout", "util"] }
 trybuild = "1"
+# Compiles the hand-written WAT guest modules the plugin-sandbox suite uses as
+# fixtures (a hello guest and the adversarial escape corpus) into wasm bytes at
+# test time. Pure Rust, so the escape suite runs on any CI runner with no
+# `wasm32-wasip1` toolchain installed. Test-only.
+wat = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 redis.workspace = true
@@ -417,6 +438,7 @@ features = [
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
+  "plugin-sandbox",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
