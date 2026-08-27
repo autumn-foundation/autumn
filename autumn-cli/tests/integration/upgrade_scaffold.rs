@@ -440,3 +440,148 @@ fn check_does_not_pass_a_project_whose_scaffold_it_could_not_render() {
     // ...and the manifest it could not use is still intact afterwards.
     assert!(root.join(".autumn/scaffold.toml").is_file());
 }
+
+#[test]
+fn new_announces_the_scaffold_manifest_and_says_to_commit_it() {
+    // `autumn new` lists every file it creates, and this is one of them. It
+    // also only has value once it is committed — a manifest that never reaches
+    // the next checkout is a manifest that never becomes a baseline — so the
+    // summary is where a developer finds that out.
+    let tmp = TempDir::new().expect("tempdir");
+    let output = Command::new(autumn_bin())
+        .arg("new")
+        .arg("announced")
+        .current_dir(tmp.path())
+        .output()
+        .expect("failed to run autumn new");
+    assert!(output.status.success(), "{}", report(&output));
+
+    let out = stdout_of(&output);
+    assert!(out.contains(".autumn/scaffold.toml"), "{out}");
+    assert!(out.contains("commit"), "{out}");
+}
+
+#[test]
+fn accepting_a_conflict_lets_the_ci_gate_go_green_again() {
+    // Without this, a team whose Dockerfile is deliberately theirs can never
+    // make `--check` pass — and a permanently red gate is a deleted gate.
+    let (_tmp, root) = new_project("accepted", &[]);
+    let mine = "FROM scratch\n# ours, on purpose\n";
+    fs::write(root.join("Dockerfile"), mine).unwrap();
+    assert_eq!(run(&root, &["--check"]).status.code(), Some(3));
+
+    let accept = run(&root, &["--accept", "Dockerfile"]);
+    assert!(accept.status.success(), "{}", report(&accept));
+    assert!(
+        stdout_of(&accept).contains("Dockerfile"),
+        "{}",
+        report(&accept)
+    );
+
+    let check = run(&root, &["--check"]);
+    assert!(check.status.success(), "{}", report(&check));
+    assert!(stdout_of(&check).contains("pinned") || !stdout_of(&check).contains("conflict"));
+
+    // ...and it is still never written.
+    let applied = run(&root, &["--apply"]);
+    assert!(applied.status.success(), "{}", report(&applied));
+    assert_eq!(fs::read_to_string(root.join("Dockerfile")).unwrap(), mine);
+    assert!(
+        fs::read_to_string(root.join(MANIFEST))
+            .unwrap()
+            .contains("pinned"),
+        "the pin must be recorded where a later checkout can read it"
+    );
+}
+
+#[test]
+fn accept_refuses_a_path_the_scaffold_does_not_own() {
+    let (_tmp, root) = new_project("refused", &[]);
+    let output = run(&root, &["--accept", "src/main.rs"]);
+    assert_eq!(output.status.code(), Some(2), "{}", report(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("src/main.rs"),
+        "{}",
+        report(&output)
+    );
+}
+
+#[test]
+fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
+    // A crate-local `clippy.toml` SHADOWS the workspace's rather than adding to
+    // it, silently dropping its lints and MSRV pin; `.github/` only runs from
+    // the repository root. Seeding those into a member is a regression that
+    // looks like an upgrade.
+    let (tmp, root) = new_project("member", &[]);
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    for path in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+        fs::remove_file(root.join(path)).unwrap();
+    }
+    fs::remove_dir_all(root.join(".github")).unwrap();
+    fs::remove_dir_all(root.join(".autumn")).unwrap();
+
+    let output = run(&root, &["--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+    for path in [
+        "clippy.toml",
+        "rustfmt.toml",
+        "rust-toolchain.toml",
+        ".github/workflows/ci.yml",
+    ] {
+        assert!(
+            !root.join(path).exists(),
+            "{path} was seeded into a workspace member:\n{}",
+            stdout_of(&output)
+        );
+    }
+    assert!(
+        stdout_of(&output).contains("workspace"),
+        "{}",
+        stdout_of(&output)
+    );
+    // ...and the per-crate files are still reconciled.
+    assert!(root.join("Dockerfile").is_file());
+}
+
+#[test]
+fn check_and_list_migrations_together_are_a_usage_error() {
+    // `--list-migrations` exits before anything is checked, so accepting the
+    // pair would give CI a gate that silently gates nothing.
+    let (_tmp, root) = new_project("bothflags", &[]);
+    let output = run(&root, &["--check", "--list-migrations"]);
+    assert_eq!(output.status.code(), Some(2), "{}", report(&output));
+}
+
+#[test]
+fn the_check_json_report_has_the_same_shape_as_a_normal_run() {
+    // One `jq '.scaffold.drift'` has to work against both, or a CI author
+    // following the documented example reads null and passes.
+    let (_tmp, root) = new_project("shape", &[]);
+    age_to(&root, "0.5.0", &["rustfmt.toml"]);
+
+    let checked: serde_json::Value =
+        serde_json::from_str(&stdout_of(&run(&root, &["--check", "--json"]))).unwrap();
+    let normal: serde_json::Value =
+        serde_json::from_str(&stdout_of(&run(&root, &["--json"]))).unwrap();
+    assert_eq!(checked["scaffold"]["drift"], true, "{checked}");
+    assert_eq!(normal["scaffold"]["drift"], true, "{normal}");
+    // A preview plans writes but performs none, and the two counts say so.
+    assert_eq!(checked["scaffold"]["writable"], 1, "{checked}");
+    assert_eq!(checked["scaffold"]["written"], 0, "{checked}");
+}
+
+#[test]
+fn a_removed_only_report_does_not_talk_about_conflicts_that_do_not_exist() {
+    let (_tmp, root) = new_project("removedonly", &[]);
+    fs::remove_file(root.join(".env.example")).unwrap();
+
+    let out = stdout_of(&run(&root, &["--check"]));
+    assert!(out.contains("removed"), "{out}");
+    assert!(!out.contains("conflict(s) need review"), "{out}");
+    // ...and `--check` never points at diffs it deliberately suppressed.
+    assert!(!out.contains("diffs above"), "{out}");
+}

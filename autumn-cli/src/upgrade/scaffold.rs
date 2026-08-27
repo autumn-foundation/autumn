@@ -88,6 +88,13 @@ struct ManifestFile {
     daemon: bool,
     #[serde(default)]
     bundled_pg: bool,
+    /// Paths the developer has claimed as theirs. A plain list of names, on
+    /// purpose: unlike the digests it is meant to be hand-editable — removing a
+    /// line is how a file comes back under reconciliation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pinned: BTreeSet<String>,
+    // Last: TOML serialises a table's scalars before its sub-tables, so a
+    // field declared after `files` would be emitted inside it.
     #[serde(default)]
     files: BTreeMap<String, String>,
 }
@@ -111,6 +118,8 @@ pub struct Manifest {
     pub options: GenerateOptions,
     /// Project-relative path → digest of the file as Autumn wrote it.
     pub digests: BTreeMap<String, String>,
+    /// Paths the developer has accepted as their own; never reconciled.
+    pub pinned: BTreeSet<String>,
 }
 
 impl Manifest {
@@ -128,6 +137,7 @@ impl Manifest {
                 .iter()
                 .map(|(path, contents)| ((*path).to_owned(), digest(contents)))
                 .collect(),
+            pinned: BTreeSet::new(),
         }
     }
 
@@ -147,6 +157,7 @@ impl Manifest {
             daemon: self.options.with_daemon,
             bundled_pg: self.options.with_bundled_pg,
             files: self.digests.clone(),
+            pinned: self.pinned.clone(),
         };
         // Serialization cannot fail for this shape (plain strings, bools, and a
         // string map), but a panic here would abort a scaffold over
@@ -182,6 +193,7 @@ impl Manifest {
                 with_bundled_pg: file.bundled_pg,
             },
             digests: file.files,
+            pinned: file.pinned,
         })
     }
 
@@ -220,9 +232,15 @@ pub enum ConflictReason {
     /// the process cannot open it. What it holds is unknown, so it is
     /// untouchable.
     Unreadable,
-    /// The path is a symbolic link. Writing through it would write wherever it
-    /// points, which need not be inside the project at all.
+    /// The path, or a directory on the way to it, is a symbolic link. Writing
+    /// through it would write wherever it points, which need not be inside the
+    /// project at all.
     Symlink,
+    /// This same run's app-code migrations rewrote the file. `build.rs` is both
+    /// a framework-owned file and a `.rs` file the codemods scan, so the two
+    /// halves can land on it in one run — and blaming the developer for an edit
+    /// the tool made four lines earlier would be simply false.
+    MigratedThisRun,
 }
 
 impl ConflictReason {
@@ -234,6 +252,9 @@ impl ConflictReason {
             Self::NoBaseline => "no recorded baseline, so an edit cannot be ruled out",
             Self::Unreadable => "on disk but unreadable as text, so its contents are unknown",
             Self::Symlink => "a symlink; writing through it could write outside the project",
+            Self::MigratedThisRun => {
+                "this run's app-code migrations rewrote it; reconcile it by hand"
+            }
         }
     }
 }
@@ -254,6 +275,10 @@ pub enum Status {
     /// Autumn wrote this file once and the developer removed it. Reported so
     /// the drift is visible, never written back: deleting it was a decision.
     Removed,
+    /// The developer has said this file is theirs (`autumn upgrade --accept`).
+    /// Reported, never written, and not drift — so a team that customises its
+    /// `Dockerfile` can still hold a green `--check`.
+    Pinned,
 }
 
 impl Status {
@@ -265,9 +290,10 @@ impl Status {
 
     /// Whether this counts as drift for `--check`.
     ///
-    /// [`Status::Removed`] does not. A CI gate that can never go green again
-    /// because someone deliberately deleted `.env.example` teaches people to
-    /// delete the gate.
+    /// [`Status::Removed`] and [`Status::Pinned`] do not. A CI gate that can
+    /// never go green again — because someone deliberately deleted
+    /// `.env.example`, or because the team's `Dockerfile` is theirs on purpose
+    /// — teaches people to delete the gate.
     #[must_use]
     pub const fn is_drift(self) -> bool {
         matches!(self, Self::Add | Self::Update | Self::Conflict(_))
@@ -282,6 +308,7 @@ impl Status {
             Self::Update => "update",
             Self::Conflict(_) => "conflict",
             Self::Removed => "removed",
+            Self::Pinned => "pinned",
         }
     }
 
@@ -293,7 +320,10 @@ impl Status {
             Self::Add => "this release's scaffold has it; your project does not",
             Self::Update => "the template changed and your copy is untouched",
             Self::Conflict(reason) => reason.describe(),
-            Self::Removed => "you deleted this; it is not restored",
+            Self::Removed => {
+                "you deleted this; it is not restored (drop its line from the manifest to be offered it again)"
+            }
+            Self::Pinned => "you accepted this file as yours; it is left alone",
         }
     }
 }
@@ -370,8 +400,15 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
     // flavour guessed from a weak signal does not mislabel a report, it seeds
     // Tailwind into an app that has no use for it. Any one of these is enough,
     // so deleting a single file cannot reclassify a fullstack project either.
+    // Each of these is a file the fullstack scaffold writes and the API
+    // scaffold never does. A `static/` directory — or even a `static/css/` one
+    // — is not evidence: a JSON API serves its `openapi.json`, its favicon, or
+    // a stylesheet for a docs page out of exactly those. Getting this wrong is
+    // not a mislabelled report: `add` writes with no baseline behind it, so a
+    // weak signal seeds Tailwind into an app with no view stack, and the first
+    // `--apply` then records the guess as fact.
     let fullstack = root.join("tailwind.config.js").exists()
-        || root.join("static/css").is_dir()
+        || root.join("static/css/input.css").exists()
         || root.join("static/js/htmx.min.js").exists();
     GenerateOptions {
         with_api: !fullstack,
@@ -382,6 +419,43 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
         with_daemon: bundled_pg || autumn_toml.contains("this app uses no database"),
         with_bundled_pg: bundled_pg,
     }
+}
+
+/// Files that a Cargo workspace owns at its root, not per crate.
+///
+/// `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are all resolved
+/// from the *nearest ancestor* of the crate being built, so a crate-local copy
+/// does not add to the workspace's — it **shadows** it, silently dropping its
+/// lints and its MSRV pin with no diagnostic. GitHub only runs workflows from
+/// the repository root, so a member's `.github/workflows/ci.yml` never runs at
+/// all. Seeding any of them into a workspace member is not an upgrade; it is a
+/// regression that looks like one.
+const WORKSPACE_ROOT_OWNED: &[&str] = &[
+    "clippy.toml",
+    "rustfmt.toml",
+    "rust-toolchain.toml",
+    ".github/workflows/ci.yml",
+];
+
+/// Whether `root` is a crate inside an enclosing Cargo workspace.
+///
+/// Answered from the `[workspace]` table of an ancestor manifest rather than
+/// from its `members` list: a path dependency, an `exclude`d fixture and a
+/// listed member all sit under the same root config, and all three shadow it
+/// the same way.
+#[must_use]
+pub fn workspace_root_above(root: &Path) -> Option<PathBuf> {
+    let absolute = root.canonicalize().ok()?;
+    absolute
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| {
+            std::fs::read_to_string(ancestor.join("Cargo.toml"))
+                .ok()
+                .and_then(|text| text.parse::<toml::Table>().ok())
+                .is_some_and(|table| table.contains_key("workspace"))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// The current release's framework-owned files, rendered for the project at
@@ -399,45 +473,85 @@ pub fn current_files(
         autumn_version: env!("CARGO_PKG_VERSION"),
         rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
     };
-    Some(framework_owned_files(&vars, options))
+    let mut files = framework_owned_files(&vars, options);
+    if workspace_root_above(root).is_some() {
+        for path in WORKSPACE_ROOT_OWNED {
+            files.remove(path);
+        }
+    }
+    Some(files)
 }
 
 /// What is at a framework-owned path right now.
 ///
-/// Three states, not two. Collapsing "there but unreadable" into "absent" — the
-/// shape `read_to_string(..).ok()` gives you — is the bug that turns a
-/// latin-1 `input.css` or a root-owned `.gitignore` into an `add`, and then
-/// truncates it. A file whose contents cannot be read is the *last* thing that
-/// may be overwritten, not the first.
+/// Four states, not two. Collapsing "there but unreadable" into "absent" — the
+/// shape `read_to_string(..).ok()` gives you — is the bug that turns a latin-1
+/// `input.css` or a root-owned `.gitignore` into an `add`, and then truncates
+/// it. A file whose contents cannot be read is the *last* thing that may be
+/// overwritten, not the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OnDisk {
     /// Nothing at this path.
     Absent,
     /// Readable text, line endings normalised.
     Text(String),
+    /// Reached through a symbolic link. The contents are known — so a link
+    /// whose target already matches the scaffold is simply current — but the
+    /// path is never written, because the write would land wherever the link
+    /// points, which need not be inside the project.
+    Linked(Option<String>),
     /// Present, and untouchable for this reason.
     Opaque(ConflictReason),
 }
 
-fn read_current(absolute: &Path) -> OnDisk {
+/// Read the path `relative` under `root`, refusing to resolve through a link.
+///
+/// The whole chain is checked, not just the leaf. A project whose `.github` is
+/// a symlink to a shared workflows tree would otherwise have
+/// `.github/workflows/ci.yml` classified as an ordinary missing file — and
+/// `--apply` would then create it outside the project, somewhere the project's
+/// own `git status` can never show.
+fn read_current(root: &Path, relative: &str) -> OnDisk {
+    let mut cursor = root.to_path_buf();
+    let components: Vec<&str> = relative.split('/').collect();
+    let (_leaf, parents) = components
+        .split_last()
+        .expect("a framework-owned path always has at least one component");
+    for directory in parents {
+        cursor.push(directory);
+        match std::fs::symlink_metadata(&cursor) {
+            // A directory that is not there yet is not a link, and creating it
+            // is exactly what an `add` of a nested file does.
+            Err(_) => break,
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return OnDisk::Linked(read_text(&root.join(relative)));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    let absolute = root.join(relative);
     // `symlink_metadata` does not follow, which is the point: a link's own
-    // metadata is what says it is a link. `metadata` would report the target
+    // metadata is what says it is a link. `metadata` would report the target,
     // and a dangling link would read as absent — the exact combination that
     // lets `--apply` create a file outside the project.
-    match std::fs::symlink_metadata(absolute) {
+    match std::fs::symlink_metadata(&absolute) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => OnDisk::Absent,
         Err(_) => OnDisk::Opaque(ConflictReason::Unreadable),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            OnDisk::Opaque(ConflictReason::Symlink)
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => OnDisk::Linked(read_text(&absolute)),
         // It exists. Reading it can still fail — a directory, a device,
         // non-UTF-8 bytes, a permission the process does not have — and every
         // one of those is untouchable rather than absent.
-        Ok(_) => std::fs::read_to_string(absolute)
-            .map_or(OnDisk::Opaque(ConflictReason::Unreadable), |text| {
-                OnDisk::Text(normalize(&text))
-            }),
+        Ok(_) => {
+            read_text(&absolute).map_or(OnDisk::Opaque(ConflictReason::Unreadable), OnDisk::Text)
+        }
     }
+}
+
+fn read_text(absolute: &Path) -> Option<String> {
+    std::fs::read_to_string(absolute)
+        .ok()
+        .map(|text| normalize(&text))
 }
 
 /// Reconcile `files` against what is on disk under `root`.
@@ -446,15 +560,30 @@ pub fn classify(
     root: &Path,
     files: &BTreeMap<&'static str, String>,
     manifest: Option<&Manifest>,
+    migrated: &BTreeSet<String>,
 ) -> Vec<Entry> {
     let recorded = |path: &str| manifest.and_then(|manifest| manifest.digests.get(path));
+    let pinned = |path: &str| manifest.is_some_and(|manifest| manifest.pinned.contains(path));
 
     let mut entries: Vec<Entry> = files
         .iter()
         .map(|(path, template)| {
             let absolute = root.join(path);
-            let current = read_current(&absolute);
+            let current = read_current(root, path);
+            let normalized = normalize(template);
+            let differs = |text: &str| {
+                let diff = super::diff::render(text, template);
+                (text != normalized, diff)
+            };
             let (status, diff) = match &current {
+                // Already what this release writes. Checked before anything
+                // else, including the pin: a pinned file that happens to match
+                // is current, not an exception.
+                OnDisk::Text(text) | OnDisk::Linked(Some(text)) if *text == normalized => {
+                    (Status::UpToDate, String::new())
+                }
+                // The developer has said this one is theirs.
+                _ if pinned(path) => (Status::Pinned, String::new()),
                 // Not there at all. Autumn wrote it once and it is gone → a
                 // deliberate deletion. Never wrote it → this release added it.
                 OnDisk::Absent if recorded(path).is_some() => (Status::Removed, String::new()),
@@ -463,16 +592,25 @@ pub fn classify(
                 // whole reason to look is that writing would destroy whatever
                 // is really in the file.
                 OnDisk::Opaque(reason) => (Status::Conflict(*reason), String::new()),
-                OnDisk::Text(text) if *text == normalize(template) => {
-                    (Status::UpToDate, String::new())
-                }
+                // Reachable, but only through a link. Readable or not, it is
+                // never written.
+                OnDisk::Linked(text) => (
+                    Status::Conflict(ConflictReason::Symlink),
+                    text.as_ref()
+                        .map(|text| differs(text).1)
+                        .unwrap_or_default(),
+                ),
                 OnDisk::Text(text) => {
-                    let status = match recorded(path) {
-                        Some(baseline) if *baseline == digest(text) => Status::Update,
-                        Some(_) => Status::Conflict(ConflictReason::Edited),
-                        None => Status::Conflict(ConflictReason::NoBaseline),
+                    let status = if migrated.contains(*path) {
+                        Status::Conflict(ConflictReason::MigratedThisRun)
+                    } else {
+                        match recorded(path) {
+                            Some(baseline) if *baseline == digest(text) => Status::Update,
+                            Some(_) => Status::Conflict(ConflictReason::Edited),
+                            None => Status::Conflict(ConflictReason::NoBaseline),
+                        }
                     };
-                    (status, super::diff::render(text, template))
+                    (status, differs(text).1)
                 }
             };
             Entry {
@@ -543,6 +681,9 @@ pub struct ScaffoldReport {
     /// not, the scaffold cannot be rendered for comparison and [`Self::entries`]
     /// is empty — which is a refusal to answer, not an "all clear".
     pub named: bool,
+    /// Whether this project is a crate inside an enclosing Cargo workspace, in
+    /// which case the files that workspace owns at its root are out of scope.
+    pub workspace_member: bool,
     /// Every framework-owned file, up-to-date ones included.
     pub entries: Vec<Entry>,
     /// What the apply step actually did.
@@ -574,6 +715,21 @@ impl ScaffoldReport {
             .iter()
             .filter(|entry| matches!(entry.status, Status::Conflict(_)))
             .collect()
+    }
+
+    /// Whether the report should explain that this project has no baseline.
+    ///
+    /// True while any file still has none — not merely on the first run. A
+    /// legacy project's first `--apply` writes a manifest covering only the
+    /// files it wrote, so "a manifest exists" would drop the explanation while
+    /// every remaining file was still reported as having no baseline.
+    #[must_use]
+    pub fn needs_baseline_note(&self) -> bool {
+        !self.has_manifest
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.status == Status::Conflict(ConflictReason::NoBaseline))
     }
 
     /// Every entry that is not already current, in report order.
@@ -631,6 +787,9 @@ impl ScaffoldReport {
             version,
             options: self.options,
             digests,
+            pinned: previous
+                .map(|manifest| manifest.pinned.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -655,7 +814,19 @@ pub struct WriteFailure {
 /// selects which *codemods* run; a scaffold report claiming to reconcile to
 /// 0.6.0 while rendering 0.7.0's files would simply be false.
 #[must_use]
-pub fn plan(root: &Path, _target: &str) -> ScaffoldReport {
+pub fn plan(root: &Path, target: &str) -> ScaffoldReport {
+    plan_after(root, target, &BTreeSet::new())
+}
+
+/// Plan a reconciliation, knowing which paths this run's app-code migrations
+/// have already rewritten.
+///
+/// `build.rs` is both a framework-owned file and a `.rs` file the codemods
+/// scan, so one `--apply` can land on it twice. Told which files the first half
+/// touched, the second half reports them honestly instead of accusing the
+/// developer of an edit this command made moments earlier.
+#[must_use]
+pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> ScaffoldReport {
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
@@ -665,14 +836,62 @@ pub fn plan(root: &Path, _target: &str) -> ScaffoldReport {
         options,
         baseline: manifest.as_ref().and_then(|m| m.version.clone()),
         named: files.is_some(),
+        workspace_member: workspace_root_above(root).is_some(),
         entries: files
-            .map(|files| classify(root, &files, manifest.as_ref()))
+            .map(|files| classify(root, &files, manifest.as_ref(), migrated))
             .unwrap_or_default(),
         guide: release_guide(&target),
         target,
         has_manifest: manifest.is_some(),
         outcome: super::Outcome::Preview,
     }
+}
+
+/// Record `paths` as the developer's own, so reconciliation leaves them alone.
+///
+/// This is what lets a conflict *conclude*. Without it a team whose `Dockerfile`
+/// is deliberately theirs can never make `autumn upgrade --check` green again —
+/// and a gate that is permanently red is a gate that gets deleted.
+///
+/// Only the manifest is written; no project file is touched.
+///
+/// # Errors
+///
+/// Returns a message naming any path the current scaffold does not own, and
+/// changes nothing. Accepting a path is a promise that reconciliation will skip
+/// it, and a promise about a file this command never touches is meaningless.
+pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
+    let manifest = Manifest::load(root);
+    let options = resolve_options(root, manifest.as_ref());
+    let owned = current_files(root, options).ok_or_else(|| {
+        "this project's `Cargo.toml` gives no usable `[package] name`, so the scaffold \
+         cannot be rendered and there is nothing to accept against"
+            .to_owned()
+    })?;
+    let unknown: Vec<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !owned.contains_key(path))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "not framework-owned in this project, so there is nothing to accept: {}",
+            unknown.join(", ")
+        ));
+    }
+
+    let mut manifest = manifest.unwrap_or_else(|| Manifest {
+        version: None,
+        options,
+        digests: BTreeMap::new(),
+        pinned: BTreeSet::new(),
+    });
+    manifest.options = options;
+    manifest.pinned.extend(paths.iter().cloned());
+    manifest
+        .save(root)
+        .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))?;
+    Ok(manifest)
 }
 
 /// Write the additions and updates in `report`, then refresh the manifest.
@@ -747,9 +966,7 @@ fn record_baseline(report: &ScaffoldReport) {
 /// interrupted by Ctrl-C or ENOSPC leaves a half-written `Dockerfile` and no
 /// copy of the original anywhere.
 fn write_one(entry: &Entry) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let on_disk = read_current(&entry.absolute);
+    let on_disk = read_current_absolute(entry);
     if on_disk != entry.current {
         return Err(match entry.current {
             OnDisk::Absent => "something appeared at this path after the preview was \
@@ -761,10 +978,11 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         });
     }
     // A plan is only ever built for `add` and `update`, and `read_current`
-    // classifies a symlink as a conflict, so reaching this with a link would be
-    // a bug rather than a race. Checked anyway: this is the last line before a
-    // write, and the cost of being wrong here is a file outside the project.
-    if matches!(on_disk, OnDisk::Opaque(_)) {
+    // classifies a link or an unreadable file as a conflict, so reaching this
+    // with either would be a bug rather than a race. Checked anyway: this is
+    // the last line before a write, and the cost of being wrong is a file
+    // outside the project.
+    if matches!(on_disk, OnDisk::Opaque(_) | OnDisk::Linked(_)) {
         return Err(
             "this path is a symlink or is unreadable; it was left exactly as it is".to_owned(),
         );
@@ -775,6 +993,23 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+
+    // Nothing is here, so there is nothing an interrupted write could destroy
+    // — and a plain write is what gives the new file the same mode `autumn new`
+    // would have given it. `tempfile` deliberately creates 0600, and renaming
+    // that into place would leave an added `ci.yml` or `input.css` unreadable
+    // to every other uid: fatal to a Docker stage that drops privileges, and
+    // invisible in `git diff`, which tracks only the executable bit.
+    if entry.current == OnDisk::Absent {
+        return std::fs::write(&entry.absolute, &entry.template).map_err(|error| error.to_string());
+    }
+    replace_in_place(entry, directory)
+}
+
+/// Replace an existing file's contents atomically, keeping its mode.
+fn replace_in_place(entry: &Entry, directory: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
     let mut temp = tempfile::Builder::new()
         .prefix(".autumn-upgrade-")
         .suffix(".tmp")
@@ -797,6 +1032,18 @@ fn write_one(entry: &Entry) -> Result<(), String> {
     temp.persist(&entry.absolute)
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Re-read what an entry's path holds now, by the same rules the plan used —
+/// the parent-link check included.
+fn read_current_absolute(entry: &Entry) -> OnDisk {
+    // The entry's own root is its absolute path with its relative path removed,
+    // so the chain checked here is exactly the chain checked at plan time.
+    let mut root = entry.absolute.clone();
+    for _ in 0..=entry.path.matches('/').count() {
+        root.pop();
+    }
+    read_current(&root, &entry.path)
 }
 
 /// The human report, with a diff for every file that differs.
@@ -838,6 +1085,28 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         target = report.target
     );
 
+    // Said up front, and on every run that still has an unbaselined file — not
+    // only on the first. A project's first `--apply` writes a partial manifest,
+    // and gating this on "a manifest exists" made the explanation vanish while
+    // every remaining file was still reported as having no baseline.
+    if report.needs_baseline_note() {
+        let _ = writeln!(
+            out,
+            "  This project predates scaffold provenance, so there is no record of\n  \
+             what Autumn originally wrote. Files it is missing are offered; every\n  \
+             file that differs is a conflict for you to review."
+        );
+    }
+    if report.workspace_member {
+        let _ = writeln!(
+            out,
+            "  This crate sits inside a Cargo workspace, so the files that workspace owns\n  \
+             at its root — clippy.toml, rustfmt.toml, rust-toolchain.toml and the CI\n  \
+             workflow — are out of scope here: a crate-local copy would shadow the\n  \
+             workspace's, not add to it. Reconcile those at the workspace root."
+        );
+    }
+
     let changed = report.changed();
     if changed.is_empty() {
         let _ = writeln!(
@@ -846,15 +1115,6 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         );
         let _ = writeln!(out, "  Upgrade guide: {}", report.guide);
         return out;
-    }
-
-    if !report.has_manifest {
-        let _ = writeln!(
-            out,
-            "  This project predates scaffold provenance, so there is no record of\n  \
-             what Autumn originally wrote. Files it is missing are offered; every\n  \
-             file that differs is a conflict for you to review."
-        );
     }
 
     let width = changed.iter().map(|e| e.path.len()).max().unwrap_or(0);
@@ -879,32 +1139,36 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         }
     }
 
-    render_outcome(&mut out, report);
+    render_outcome(&mut out, report, diffs);
     let _ = writeln!(out, "Upgrade guide: {}", report.guide);
     out
 }
 
 /// The closing paragraph: what happened, or what would, and how to undo it.
-fn render_outcome(out: &mut String, report: &ScaffoldReport) {
+fn render_outcome(out: &mut String, report: &ScaffoldReport, diffs: bool) {
     use std::fmt::Write as _;
 
     let applicable = report.applicable().len();
     let conflicts = report.conflicts().len();
     let _ = writeln!(out);
     match report.outcome {
-        // Nothing to apply is its own message. Pointing someone at `--apply`
-        // when every remaining difference is a conflict sends them to run a
-        // command that would do nothing at all.
+        // Nothing to write and nothing to resolve: everything listed is a file
+        // the developer removed or accepted. "0 conflict(s) need review" as the
+        // headline of a report that just listed findings reads as a bug.
+        super::Outcome::Preview if applicable == 0 && conflicts == 0 => {
+            let _ = writeln!(
+                out,
+                "Nothing to do: everything above is a file you removed or accepted as your own."
+            );
+        }
+        // Pointing someone at `--apply` when every remaining difference is a
+        // conflict sends them to run a command that would do nothing at all.
         super::Outcome::Preview if applicable == 0 => {
             let _ = writeln!(
                 out,
                 "{conflicts} conflict(s) need review; nothing here can be written for you."
             );
-            let _ = writeln!(
-                out,
-                "Take what you want from the diffs above; `git diff` shows your edits and\n\
-                 `git checkout -- <path>` puts any one file back."
-            );
+            let _ = writeln!(out, "{}", review_advice(diffs));
         }
         super::Outcome::Preview => {
             let _ = writeln!(
@@ -913,37 +1177,50 @@ fn render_outcome(out: &mut String, report: &ScaffoldReport) {
             );
             let _ = writeln!(
                 out,
-                "Nothing was written. Re-run with `--apply` to take the writable ones, then\n\
-                 review with `git diff` -- `git checkout -- <path>` puts any one file back."
+                "Nothing was written. Re-run with `--apply` to take the writable ones."
             );
+            let _ = writeln!(out, "{}", review_advice(diffs));
         }
         super::Outcome::Applied => {
             let _ = writeln!(
                 out,
                 "{applicable} file(s) written; {conflicts} conflict(s) left for you."
             );
-            let _ = writeln!(
-                out,
-                "Review with `git diff`; undo any single file with `git checkout -- <path>`."
-            );
+            let _ = writeln!(out, "{REVERT_ADVICE}");
         }
         super::Outcome::Partial { written } => {
             let _ = writeln!(
                 out,
                 "{written} of {applicable} file(s) written before the run stopped."
             );
-            let _ = writeln!(
-                out,
-                "Review with `git diff`; undo any single file with `git checkout -- <path>`."
-            );
+            let _ = writeln!(out, "{REVERT_ADVICE}");
         }
     }
     if conflicts > 0 {
         let _ = writeln!(
             out,
-            "Conflicts are never overwritten. Compare each against this release's\n\
-             scaffold above, take what you want, and re-run to confirm."
+            "Conflicts are never overwritten. Take what you want from this release's\n\
+             version, or `autumn upgrade --accept <path>` to keep yours for good."
         );
+    }
+}
+
+/// How to undo an apply.
+///
+/// `git checkout --` restores a file that was *updated*; it does nothing for
+/// one that was *added*, because git has never heard of it. Naming only the
+/// first leaves the majority case — an aged project is mostly additions — with
+/// advice that fails at the prompt.
+const REVERT_ADVICE: &str = "`git status` and `git diff` show everything this touched: \
+                             `git checkout -- <path>`\nrestores an updated file, `rm <path>` \
+                             removes an added one.";
+
+/// What to read next, given whether this report carried its diffs.
+const fn review_advice(diffs: bool) -> &'static str {
+    if diffs {
+        "Each file's diff is above; `git status` and `git diff` show what is yours."
+    } else {
+        "Re-run without `--check` to see each file's diff."
     }
 }
 
@@ -957,8 +1234,23 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
         "has_manifest": report.has_manifest,
         "outcome": report.outcome.label(),
         "drift": report.drifted(),
-        "written": report.applicable().len(),
+        "workspace_member": report.workspace_member,
+        // The plan, and the part of it that reached disk — the same split the
+        // app-code report draws, for the same reason: "what would this do" and
+        // "what is on disk now" are different questions, and a gate that reads
+        // the wrong one calls a preview a completed upgrade.
+        "writable": report.applicable().len(),
+        "written": match report.outcome {
+            super::Outcome::Preview => 0,
+            super::Outcome::Applied => report.applicable().len(),
+            super::Outcome::Partial { written } => written,
+        },
         "conflicts": report.conflicts().len(),
+        "pinned": report
+            .entries
+            .iter()
+            .filter(|entry| entry.status == Status::Pinned)
+            .count(),
         "guide": report.guide,
         "files": report
             .entries
@@ -1011,6 +1303,7 @@ mod tests {
                 ..GenerateOptions::default()
             },
             digests,
+            pinned: BTreeSet::new(),
         };
 
         let parsed = Manifest::parse(&manifest.render()).expect("round trip");
@@ -1032,6 +1325,7 @@ mod tests {
             version: Some("0.7.0".to_owned()),
             options: GenerateOptions::default(),
             digests: digests.clone(),
+            pinned: BTreeSet::new(),
         };
         assert_eq!(
             Manifest::parse(&manifest.render()).unwrap().digests,
@@ -1064,6 +1358,7 @@ mod tests {
             version: Some("0.7.0".to_owned()),
             options: GenerateOptions::default(),
             digests,
+            pinned: BTreeSet::new(),
         };
         manifest.save(tmp.path()).unwrap();
         let loaded = Manifest::load(tmp.path()).expect("written manifest loads");
@@ -1673,5 +1968,180 @@ mod tests {
         let report = plan_in(tmp.path());
         assert!(!report.named);
         assert!(render_summary(&report).contains("Skipped"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_directory_is_a_conflict_too() {
+        // Checking only the leaf is not enough: `.github` symlinked to a shared
+        // workflows tree lets `--apply` create a file outside the project
+        // entirely, which the project's own `git status` would never show.
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside-workflows");
+        fs::create_dir_all(&outside).unwrap();
+        fs::remove_dir_all(tmp.path().join(".github")).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(".github")).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        assert_eq!(
+            status_of(&report.entries, ".github/workflows/ci.yml"),
+            &Status::Conflict(ConflictReason::Symlink)
+        );
+        apply(&mut report).expect("apply");
+        assert!(
+            !outside.join("workflows/ci.yml").exists(),
+            "nothing may be written through a symlinked parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_whose_content_is_already_current_is_not_drift() {
+        // Refusing to *write* through a link is right. Calling it drift when the
+        // bytes already match makes `--check` red forever with no remedy.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = scaffolded(GenerateOptions::default());
+        let shared = tmp.path().join("shared-clippy.toml");
+        let current = current_files(tmp.path(), GenerateOptions::default()).unwrap();
+        fs::write(&shared, &current["clippy.toml"]).unwrap();
+        fs::remove_file(tmp.path().join("clippy.toml")).unwrap();
+        std::os::unix::fs::symlink(&shared, tmp.path().join("clippy.toml")).unwrap();
+        let _ = fs::metadata(&shared).map(|m| m.permissions().mode());
+
+        let entries = plan_in(tmp.path()).entries;
+        assert_eq!(status_of(&entries, "clippy.toml"), &Status::UpToDate);
+        assert!(!drifted(&entries));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_added_file_is_as_readable_as_one_the_scaffold_writes() {
+        // `tempfile` creates 0600 by design. Renaming that into place gives an
+        // added `ci.yml` or `input.css` a mode no other uid can read — invisible
+        // in `git diff`, and fatal to a Docker stage that drops privileges.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+
+        let added = fs::metadata(tmp.path().join("rustfmt.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        let scaffolded_by_new = fs::metadata(tmp.path().join("clippy.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            added & 0o777,
+            scaffolded_by_new & 0o777,
+            "an added file must be as readable as one `autumn new` writes"
+        );
+    }
+
+    #[test]
+    fn an_api_project_serving_its_own_stylesheet_is_still_an_api_project() {
+        // `static/css/` existing is not evidence of the fullstack scaffold —
+        // `static/css/input.css` is. Getting this wrong writes Tailwind into a
+        // JSON API and then freezes the guess in the manifest.
+        let tmp = scaffolded(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        fs::remove_dir_all(tmp.path().join(".autumn")).unwrap();
+        write(tmp.path(), "static/css/site.css", "body{}\n");
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert!(!tmp.path().join("tailwind.config.js").exists());
+        assert!(!tmp.path().join("static/css/input.css").exists());
+        assert!(Manifest::load(tmp.path()).unwrap().options.with_api);
+    }
+
+    #[test]
+    fn a_workspace_member_is_not_given_the_files_a_workspace_root_owns() {
+        // `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` resolve from
+        // the nearest ancestor, so a crate-local copy SHADOWS the workspace's —
+        // silently dropping its lints and MSRV pin. `.github/` only runs from
+        // the repository root. Seeding those into a member is not an upgrade.
+        let outer = TempDir::new().unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        let root = outer.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+
+        let report = plan(&root, "0.7.0");
+        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
+        for root_owned in [
+            "clippy.toml",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(
+                !offered.contains(&root_owned),
+                "{root_owned} in {offered:?}"
+            );
+        }
+        // ...but the per-crate files are still reconciled.
+        assert!(offered.contains(&"Dockerfile"), "{offered:?}");
+        assert!(offered.contains(&"build.rs"), "{offered:?}");
+        assert!(
+            render_text(&report).contains("workspace"),
+            "{}",
+            render_text(&report)
+        );
+    }
+
+    #[test]
+    fn an_accepted_conflict_stops_holding_the_gate_red() {
+        // A team that customises its Dockerfile must be able to finish the
+        // review. Without this, `--check` is red forever and gets deleted.
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "Dockerfile", "FROM scratch\n# ours\n");
+        assert!(plan_in(tmp.path()).drifted());
+
+        accept(tmp.path(), &["Dockerfile".to_owned()]).expect("accept");
+
+        let report = plan_in(tmp.path());
+        assert_eq!(status_of(&report.entries, "Dockerfile"), &Status::Pinned);
+        assert!(!report.drifted());
+        // ...and it is still never written.
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
+            "FROM scratch\n# ours\n"
+        );
+        assert!(
+            Manifest::load(tmp.path())
+                .unwrap()
+                .pinned
+                .contains("Dockerfile")
+        );
+    }
+
+    #[test]
+    fn accepting_a_path_the_scaffold_does_not_own_is_refused() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let error = accept(tmp.path(), &["src/main.rs".to_owned()]).expect_err("must refuse");
+        assert!(error.contains("src/main.rs"), "{error}");
+        assert!(Manifest::load(tmp.path()).unwrap().pinned.is_empty());
     }
 }

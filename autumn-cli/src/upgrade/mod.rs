@@ -70,6 +70,9 @@ pub struct UpgradeOptions {
     /// scanning app code and without writing. The CI gate for scaffold
     /// freshness (issue #1593).
     pub check: bool,
+    /// Framework-owned paths to record as the developer's own, so
+    /// reconciliation leaves them alone from now on. Writes only the manifest.
+    pub accept: Vec<String>,
 }
 
 /// A site the user has to handle themselves, with where to read about it.
@@ -1350,6 +1353,90 @@ mod write_guard_tests {
     }
 }
 
+/// Plan the scaffold half of the run, when the root is an Autumn project.
+///
+/// Framework-owned scaffold files are reconciled in the same run as the app
+/// code (issue #1593), so "bring me up to this release" is one command rather
+/// than two. Only in an actual Autumn project: `autumn upgrade` also runs over
+/// plain crates that merely depend on autumn-web, and offering to seed a
+/// Dockerfile into one of those would be nonsense.
+///
+/// Planned *after* the app-code step, not alongside it: `build.rs` is both a
+/// framework-owned file and a `.rs` file the codemods scan, so a plan made
+/// before the rewrites would be a plan about bytes that no longer exist — and
+/// `rewrote` names the files this run touched, so the report attributes them to
+/// this command rather than to the developer.
+fn plan_scaffold(
+    root: &Path,
+    target: &str,
+    report: &Report,
+    rewrote: bool,
+) -> Option<scaffold::ScaffoldReport> {
+    let migrated: BTreeSet<String> = if rewrote {
+        report.files.iter().map(|file| file.path.clone()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
+}
+
+/// Reject flag combinations whose meanings contradict each other.
+///
+/// Each of these would otherwise "work" while doing something other than what
+/// was asked — the worst kind of CLI behaviour, because nothing reports it.
+fn reject_bad_combination(opts: &UpgradeOptions) -> Option<i32> {
+    if opts.check && opts.apply {
+        eprintln!(
+            "autumn upgrade: `--check` reports drift and writes nothing; it cannot be combined with `--apply`."
+        );
+        return Some(2);
+    }
+    // `--list-migrations` short-circuits everything below it, so accepting it
+    // alongside `--check` would print the registry, exit 0, and gate nothing —
+    // a CI job silently not doing its job.
+    if opts.list && (opts.check || !opts.accept.is_empty()) {
+        eprintln!(
+            "autumn upgrade: `--list-migrations` prints the registry and exits; it cannot be \
+             combined with `--check` or `--accept`."
+        );
+        return Some(2);
+    }
+    None
+}
+
+/// Record framework-owned paths as the developer's own (issue #1593).
+fn accept_scaffold(root: &Path, paths: &[String]) -> i32 {
+    if !scaffold::is_project(root) {
+        eprintln!(
+            "autumn upgrade: `{}` is not an Autumn project (no `autumn.toml`).",
+            root.display()
+        );
+        return 2;
+    }
+    match scaffold::accept(root, paths) {
+        Ok(manifest) => {
+            println!(
+                "Accepted as yours; `autumn upgrade` will leave {} alone:",
+                if paths.len() == 1 { "it" } else { "them" }
+            );
+            for path in paths {
+                println!("  {path}");
+            }
+            println!(
+                "Recorded in {}. Delete a line from its `pinned` list to bring a file back\n\
+                 under reconciliation.",
+                scaffold::MANIFEST_PATH
+            );
+            let _ = manifest;
+            0
+        }
+        Err(error) => {
+            eprintln!("autumn upgrade: {error}");
+            2
+        }
+    }
+}
+
 /// Print one run's reports — app code, and the scaffold section when there is
 /// one.
 ///
@@ -1387,10 +1474,15 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
     }
     let report = scaffold::plan(root, target);
     if json {
+        // The same shape a normal `--json` run emits, so one `jq
+        // '.scaffold.drift'` works against both. Two shapes for one field is
+        // how a CI gate ends up reading `null` and passing.
         println!(
             "{}",
-            serde_json::to_string_pretty(&scaffold::json(&report))
-                .unwrap_or_else(|_| "{}".to_owned())
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "scaffold": scaffold::json(&report) })
+            )
+            .unwrap_or_else(|_| "{}".to_owned())
         );
     } else {
         print!("{}", scaffold::render_summary(&report));
@@ -1444,16 +1536,12 @@ fn list_migrations(json: bool) {
 /// drift.
 #[must_use]
 pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
+    if let Some(code) = reject_bad_combination(opts) {
+        return code;
+    }
     if opts.list {
         list_migrations(opts.json);
         return 0;
-    }
-
-    if opts.check && opts.apply {
-        eprintln!(
-            "autumn upgrade: `--check` reports drift and writes nothing; it cannot be combined with `--apply`."
-        );
-        return 2;
     }
 
     let target = opts
@@ -1482,6 +1570,10 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     // scaffold drift is measured against the recorded provenance manifest, not
     // against the `autumn-web` requirement, so a project whose manifest Cargo
     // cannot give a single floor for can still be gated on scaffold freshness.
+    if !opts.accept.is_empty() {
+        return accept_scaffold(root, &opts.accept);
+    }
+
     if opts.check {
         return check_scaffold(root, &target, opts.json);
     }
@@ -1522,16 +1614,8 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         }
     }
 
-    // Framework-owned scaffold files are reconciled in the same run as the app
-    // code (issue #1593), so "bring me up to this release" is one command
-    // rather than two. Only in an actual Autumn project: `autumn upgrade` also
-    // runs over plain crates that merely depend on autumn-web, and offering to
-    // seed a Dockerfile into one of those would be nonsense.
-    //
-    // Planned *after* the app-code step, not alongside it: `build.rs` is both a
-    // framework-owned file and a `.rs` file the codemods scan, so a plan made
-    // before the rewrites could be a plan about bytes that no longer exist.
-    let mut scaffold_report = scaffold::is_project(root).then(|| scaffold::plan(root, &target));
+    let mut scaffold_report =
+        plan_scaffold(root, &target, &report, opts.apply && failure.is_none());
     // Only when the app-code step completed. A half-migrated tree is not a tree
     // to start rewriting project files in.
     if opts.apply
@@ -1542,6 +1626,22 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     }
 
     emit(&report, scaffold_report.as_ref(), opts.json);
+
+    // `--to` selects codemods; the scaffold half can only ever reconcile to the
+    // release this CLI ships templates for. Silently ignoring the flag would
+    // leave a reader believing the whole run targeted what they asked for.
+    if scaffold_report.is_some()
+        && opts
+            .to
+            .as_deref()
+            .is_some_and(|to| to != env!("CARGO_PKG_VERSION"))
+    {
+        eprintln!(
+            "autumn upgrade: `--to` selects which app-code migrations run. The scaffold\n\
+             files were reconciled against {}, the only scaffold this CLI ships.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 
     if let Some(WriteFailure { path, error, .. }) = failure {
         eprintln!(

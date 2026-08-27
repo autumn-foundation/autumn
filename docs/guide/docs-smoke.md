@@ -74,8 +74,8 @@ autumn upgrade --check ; echo "exit=$?"
 Passing output:
 
 - the first `--check` prints `add  rust-toolchain.toml` and `exit=3`;
-- the bare `autumn upgrade` prints the same file under `Scaffold files`, ends
-  with `Nothing was written`, and leaves `rust-toolchain.toml` absent;
+- the bare `autumn upgrade` prints the same file under `Scaffold files`, prints
+  `Nothing was written`, and leaves `rust-toolchain.toml` absent;
 - `--apply` recreates `rust-toolchain.toml`;
 - the second `--check` prints `up to date` and `exit=0`.
 

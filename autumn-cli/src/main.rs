@@ -293,6 +293,10 @@ struct UpgradeArgs {
     /// release and exit 3 if any have. Writes nothing; for CI.
     #[arg(long, conflicts_with = "apply")]
     check: bool,
+    /// Record a framework-owned file as yours, so reconciliation leaves it
+    /// alone from now on. Repeatable. Writes only the provenance manifest.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["apply", "check"])]
+    accept: Vec<String>,
 }
 
 /// Available subcommands.
@@ -444,6 +448,7 @@ enum Commands {
     ///   autumn upgrade                     # preview
     ///   autumn upgrade --apply             # write the rewrites
     ///   autumn upgrade --check             # CI gate: exit 3 on scaffold drift
+    ///   autumn upgrade --accept Dockerfile # this file is mine; stop offering it
     ///   autumn upgrade --list-migrations   # what ships today
     #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
@@ -3724,6 +3729,7 @@ fn run_command(command: Commands) {
             json,
             list_migrations,
             check,
+            accept,
         }) => {
             let code = upgrade::run_in(
                 std::path::Path::new(&path),
@@ -3734,6 +3740,7 @@ fn run_command(command: Commands) {
                     json,
                     list: list_migrations,
                     check,
+                    accept,
                 },
             );
             std::process::exit(code);

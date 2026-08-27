@@ -59,7 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and exits `3` when anything has drifted, so CI can gate on scaffold freshness
   (`1` still means the apply step died partway, and a deliberately deleted file
   does not hold the gate red forever). It prints verdicts without the per-file
-  diffs, so a CI log does not accumulate the working contents of `autumn.toml`. Every report ends with a link to that
+  diffs, so a CI log does not accumulate the working contents of `autumn.toml`.
+  `autumn upgrade --accept <path>` records a file as yours for good, so a team
+  whose `Dockerfile` is deliberately theirs can still hold a green gate rather
+  than deleting it. A crate inside a Cargo workspace is not offered the files
+  that workspace owns at its root — a crate-local `clippy.toml` shadows the
+  workspace's rather than adding to it. Every report ends with a link to that
   release's migration guide, so file reconciliation and API migration are one
   workflow. `--json` carries the whole thing under a `scaffold` key.
   [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end

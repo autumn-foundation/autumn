@@ -542,6 +542,10 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
     println!("  Created {name}/config/credentials/development.toml.enc");
+    // Named with its purpose attached: it is the only generated file whose
+    // value depends entirely on being committed, and the only one a developer
+    // would otherwise be tempted to gitignore as machine bookkeeping.
+    println!("  Created {name}/.autumn/scaffold.toml (commit it — `autumn upgrade` reads it)");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }

@@ -136,20 +136,24 @@ project files forever unless something reconciles them.
 
 That something is the second half of `autumn upgrade`. It renders the current
 release's scaffold in memory, compares it against what is on disk, and prints a
-per-file verdict:
+per-file verdict. Here is a real run in an app scaffolded before this feature
+existed — which is every app that exists today:
 
 ```text
-Scaffold files (0.5.0 -> 0.7.0)
+Scaffold files (unknown -> 0.7.0)
+  This project predates scaffold provenance, so there is no record of
+  what Autumn originally wrote. Files it is missing are offered; every
+  file that differs is a conflict for you to review.
 
   3 file(s) differ:
-  conflict  Dockerfile           you changed this since it was scaffolded
+  conflict  Dockerfile           no recorded baseline, so an edit cannot be ruled out
   add       clippy.toml          this release's scaffold has it; your project does not
   add       rust-toolchain.toml  this release's scaffold has it; your project does not
 
 Dockerfile (conflict)
 @@ lines 65-66 @@
 -
--# my own tweak
+-# our own base image pin
 
 clippy.toml (add)
 @@ line 1 @@
@@ -162,12 +166,18 @@ rust-toolchain.toml (add)
 +components = ["rustfmt", "clippy"]
 
 2 file(s) would be written; 1 conflict(s) need review.
-Nothing was written. Re-run with `--apply` to take the writable ones, then
-review with `git diff` -- `git checkout -- <path>` puts any one file back.
-Conflicts are never overwritten. Compare each against this release's
-scaffold above, take what you want, and re-run to confirm.
+Nothing was written. Re-run with `--apply` to take the writable ones.
+Each file's diff is above; `git status` and `git diff` show what is yours.
+Conflicts are never overwritten. Take what you want from this release's
+version, or `autumn upgrade --accept <path>` to keep yours for good.
 Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md
 ```
+
+Once the project has a baseline — see [How it knows you edited a
+file](#how-it-knows-you-edited-a-file) — the header names the release it was
+last reconciled to (`Scaffold files (0.7.0 -> 0.8.0)`), the banner goes away,
+and an edited file is reported as `you changed this since it was scaffolded`
+rather than as an unprovable one.
 
 In every diff, `-` is what your project has now and `+` is what this release's
 scaffold writes. For a `conflict` that is a description of the difference, not
@@ -203,7 +213,8 @@ your release's [migration guide](../migrations/README.md) to work through.
 | `add` | This release's scaffold has the file and your project does not — including every file a release *after* yours introduced. | yes |
 | `update` | The template changed and your copy is provably untouched since Autumn wrote it. | yes |
 | `conflict` | The template changed and your copy may be yours now. | **no** |
-| `removed` | Autumn wrote this file once and you deleted it. | **no** |
+| `removed` | Autumn wrote this file once and you deleted it. Delete its line from the manifest's `[files]` to be offered it again. | **no** |
+| `pinned` | You ran `autumn upgrade --accept <path>` on it. It is yours. | **no** |
 
 A `conflict` says which of four things it is:
 
@@ -213,6 +224,28 @@ A `conflict` says which of four things it is:
 | `no recorded baseline, so an edit cannot be ruled out` | Nothing was recorded for this file — see [Projects older than this feature](#projects-older-than-this-feature). |
 | `on disk but unreadable as text, so its contents are unknown` | It is not UTF-8, it is a directory, or the process cannot open it. What it holds is unknown, so it is untouchable. |
 | `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. |
+
+### Finishing a conflict
+
+Reviewing a conflict has to be able to *conclude*. Sometimes you take this
+release's version; sometimes the file is deliberately yours and always will be —
+a `Dockerfile` with your own base image, a CI workflow with your own jobs. For
+that second case:
+
+```bash
+autumn upgrade --accept Dockerfile
+```
+
+That records the path in the manifest's `pinned` list and writes nothing else.
+From then on the file reports as `pinned`, is never offered or written, and does
+not count as drift — so `--check` can go green again. Without it a team that
+customises one file has a CI gate that is red forever, which is a gate that gets
+deleted.
+
+`pinned` is a plain list of paths, not digests, precisely so you can undo it:
+delete a line from `.autumn/scaffold.toml` and the file comes back under
+reconciliation. `--accept` refuses a path the current scaffold does not own —
+promising to skip a file this command never touches would mean nothing.
 
 ### How it knows you edited a file
 
@@ -228,8 +261,10 @@ seed = false
 daemon = false
 bundled_pg = false
 
+pinned = ["Dockerfile"]
+
 [files]
-"clippy.toml" = "5e884898da280471…"
+"clippy.toml" = "<64 hex characters of SHA-256>"
 ```
 
 **Commit that file.** Its entire value is being the baseline a *later* checkout
@@ -248,7 +283,7 @@ place, keeping the original's permissions, so an interrupted `--apply` cannot
 leave you with a half-written `Dockerfile`.
 
 Line endings are normalised before hashing, so a `core.autocrlf` checkout on
-Windows is not mistaken for you having personally rewritten all twelve files.
+Windows is not mistaken for you having personally rewritten every one of them.
 
 ### Projects older than this feature
 
@@ -277,25 +312,48 @@ The project's name comes from `[package] name` in `Cargo.toml` and from nowhere
 else — never the directory name. `autumn.toml`, `.env.example`, the CI workflow
 and the `Dockerfile`'s `CMD` all interpolate it, so a guessed name would render
 a *different* scaffold and could rewrite `COPY --from=builder
-/app/target/release/<name>` into an image that cannot start. If your manifest
-gives no usable package name, the scaffold half says so and reconciles nothing
-rather than comparing against a fiction — and `--check` exits `2` there, because
-"we could not look" is not "clean".
+/app/target/release/<name>` into an image that cannot start. If your
+`Cargo.toml` gives no usable package name, the scaffold half says so and
+reconciles nothing rather than comparing against a fiction — and `--check` exits
+`2` there, because "we could not look" is not "clean".
 
 ### Reverting
 
 `--apply` edits files in place, and your VCS is the undo:
 
 ```bash
-git status                       # what changed
-git diff                         # exactly what changed, line by line
-git checkout -- rust-toolchain.toml   # put one file back
-git checkout -- .                # put everything back
+git status                            # what changed, added files included
+git diff                              # exactly what changed, line by line
+git checkout -- Dockerfile            # put back a file it UPDATED
+rm rust-toolchain.toml                # remove a file it ADDED
 ```
+
+The distinction matters: `git checkout --` restores a tracked file's contents,
+and does nothing at all for a file that was just created — git has never heard
+of it. An aged project is mostly `add`s, so `git status` (which lists untracked
+files) is the one to start from. A legacy project's first `--apply` also creates
+`.autumn/scaffold.toml`; it is new too.
 
 Commit or stash before you apply, the same as for the codemods. The preview is
 the review step, `git diff` is the proof, and `git checkout --` is the escape
 hatch.
+
+### Inside a Cargo workspace
+
+If the project is a crate inside an enclosing workspace, the files that
+workspace owns at *its* root are out of scope here, and the report says so:
+
+- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
+  nearest ancestor of the crate being built, so a crate-local copy does not add
+  to the workspace's — it **shadows** it, silently dropping its lints and its
+  MSRV pin with no diagnostic.
+- GitHub only runs workflows from the repository root, so a member's
+  `.github/workflows/ci.yml` never runs at all.
+
+Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
+`build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
+usual. Reconcile the workspace-level files by running the command at the
+workspace root, if that root is itself an Autumn project.
 
 ### Gating CI on scaffold freshness
 
@@ -317,28 +375,54 @@ It exits `0` on a clean project. A file you deliberately deleted is reported as
 a gate that can never go green again is a gate people delete.
 
 `--check` cannot be combined with `--apply`; that is a usage error (exit `2`).
-Run it outside an Autumn project — a directory with no `autumn.toml` — and it
-says so and exits `2` rather than reporting a spurious pass.
+Run it outside an Autumn project — a directory with neither an `autumn.toml` nor
+a `.autumn/scaffold.toml` — and it says so and exits `2` rather than reporting a
+spurious pass.
 
-`--json` works with `--check` too, and with a normal run the scaffold report is
-a `scaffold` key alongside the app-code report:
+`--json` works with `--check` too, and both emit the scaffold report under the
+same `scaffold` key, so one `jq '.scaffold.drift'` works against either:
 
 ```json
 {
   "scaffold": {
-    "baseline": "0.5.0",
+    "baseline": "0.7.0",
     "target": "0.7.0",
+    "named": true,
     "has_manifest": true,
+    "workspace_member": false,
+    "outcome": "preview",
     "drift": true,
-    "written": 2,
+    "writable": 2,
+    "written": 0,
     "conflicts": 1,
+    "pinned": 0,
     "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md",
     "files": [
-      { "path": "clippy.toml", "status": "add", "applied": true }
+      { "path": "clippy.toml", "status": "add", "reason": "…", "applied": true }
     ]
   }
 }
 ```
+
+`writable` and `written` are different questions, the same split the app-code
+report draws. `writable` is the plan — how many files `--apply` *would* write,
+and `applied` on each file means the same thing. `written` is what actually
+reached disk: `0` for a preview or a `--check`, the whole plan after a complete
+apply, and only the prefix that landed after an interrupted one. Gate on
+`written` when you care about the state of the working tree, and on `drift` when
+you care whether there is work to do.
+
+A run that could not render the scaffold at all reports `"named": false`, and
+`--check` exits `2` rather than reporting `"drift": false` as though it had
+looked.
+
+### What it does not report
+
+A file an *older* release generated and the current one no longer does is not
+listed. The reconciler compares against the current scaffold, so a retired file
+simply falls out of scope and stays on disk untouched. Retiring a scaffold file
+is rare; when it happens the release's migration guide is where it is called
+out.
 
 ### A whole upgrade, end to end
 
@@ -352,11 +436,15 @@ autumn upgrade
 # 3. Take them.
 autumn upgrade --apply
 
-# 4. Read what it did.
+# 4. Read what it did. `git checkout -- <path>` puts back a file it updated;
+#    `rm <path>` removes one it added (git has never heard of that one).
+git status
 git diff
 
-# 5. Work the conflicts it refused to touch, one file at a time.
-#    Each one's diff is in the report above.
+# 5. Work the conflicts it refused to touch, one file at a time. Each one's
+#    diff is in the report above. Take this release's version where you want
+#    it; where the file is deliberately yours, say so once and for all:
+#      autumn upgrade --accept Dockerfile
 
 # 6. Confirm the skeleton is current.
 autumn upgrade --check
@@ -383,6 +471,7 @@ Only step 3 writes anything, and step 4 shows you all of it.
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |
 | `--check` | Reconcile the scaffold files only, write nothing, print verdicts without diffs, and exit `3` if any have drifted. For CI. Cannot be combined with `--apply`. |
+| `--accept PATH` | Record a framework-owned file as yours, so reconciliation leaves it alone. Repeatable. Writes only `.autumn/scaffold.toml`. |
 
 ## Exit codes
 
