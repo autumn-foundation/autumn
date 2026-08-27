@@ -99,6 +99,26 @@ impl Cache for MokaCache {
         self.inner.insert(key.to_owned(), value);
     }
 
+    fn invalidate_namespace(&self, namespace: &str) -> bool {
+        // Iterate rather than `invalidate_entries_if`: moka's predicate API
+        // requires the cache to be built with `support_invalidation_closures()`,
+        // which taxes every ordinary get/insert, and applies lazily on the next
+        // read. Namespace invalidation is rare and must take effect
+        // immediately, so paying O(entries) here — and nothing on the hot path
+        // — is the right trade.
+        let prefix = format!("{namespace}:");
+        let doomed: Vec<String> = self
+            .inner
+            .iter()
+            .map(|(k, _)| (*k).clone())
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        for key in doomed {
+            self.inner.invalidate(&key);
+        }
+        true
+    }
+
     fn invalidate(&self, key: &str) {
         self.inner.invalidate(key);
     }

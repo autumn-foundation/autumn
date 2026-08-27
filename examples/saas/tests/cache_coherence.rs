@@ -68,7 +68,10 @@ fn the_coherence_manifest_is_emitted_as_a_build_artifact() {
             .unwrap()
             .iter()
             .any(|e| e["mutation"] == "ProjectRepository::save"
-                && e["read"].as_str().unwrap().ends_with("cached_project_count"))
+                && e["read"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("cached_project_count"))
     );
 }
 
@@ -92,9 +95,12 @@ fn removing_the_invalidation_edge_turns_the_build_red() {
 
     let diagnostic = coherence::format_diagnostic(&findings);
     assert!(diagnostic.contains("cached_project_count"), "{diagnostic}");
-    assert!(diagnostic.contains("ProjectRepository::save"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("ProjectRepository::save"),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("Project"), "{diagnostic}");
-    assert!(diagnostic.contains("#[invalidates("), "{diagnostic}");
+    assert!(diagnostic.contains("invalidates("), "{diagnostic}");
 }
 
 #[test]

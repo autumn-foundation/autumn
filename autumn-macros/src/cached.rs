@@ -25,8 +25,10 @@
 //! the function's own signature and body, and a function nothing could be
 //! recovered from is recorded as `undetermined` (reported, never gated).
 //!
-//! Because the registration is an item, `#[cached]` must be applied to a **free
-//! function**, not to an associated function inside an `impl` block.
+//! The registration is split so this stays usable everywhere `#[cached]` already
+//! was: the identity constant and the invalidator are valid associated items, and
+//! the `inventory` submission — an anonymous `const _`, which an `impl` block
+//! cannot hold — goes inside the function body.
 
 use std::collections::BTreeSet;
 
@@ -34,8 +36,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::ext::IdentExt as _;
 use syn::parse::Parser as _;
-use syn::visit_mut::VisitMut;
 use syn::punctuated::Punctuated;
+use syn::visit_mut::VisitMut;
 use syn::{Expr, Ident, ItemFn, LitInt, LitStr, Token};
 
 struct CachedAttrs {
@@ -161,7 +163,6 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
     Ok(result)
 }
 
-
 // ── #1716: dependency derivation ─────────────────────────────────────
 
 /// Associated functions on a model type that read persistent rows.
@@ -197,11 +198,7 @@ fn model_from_repository_ident(ident: &str) -> Option<String> {
 
 /// Whether an ident looks like a model type: `Post`, `LineItem`.
 fn is_model_ident(ident: &str) -> bool {
-    ident
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_uppercase())
-        && !ident.contains('_')
+    ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !ident.contains('_')
 }
 
 /// Walks a function looking for evidence of which models it reads.
@@ -273,6 +270,21 @@ fn invalidator_ident(fn_name: &syn::Ident) -> syn::Ident {
     format_ident!("__autumn_cache_invalidate__{}", fn_name)
 }
 
+/// The cache-coherence artifacts a `#[cached]` expansion carries, split by
+/// where each may legally be placed.
+struct CoherenceItems {
+    /// The identity constant and the invalidator. Both are valid *associated*
+    /// items, so they sit beside the function wherever it lives.
+    items: TokenStream,
+    /// The `inventory` registration. It expands to an anonymous `const _`,
+    /// which an `impl` block cannot hold — so it goes inside the function body,
+    /// where a block-scoped anonymous const is legal and the linker section is
+    /// registered exactly the same. Without this split, adding coherence
+    /// registration would have silently broken every `#[cached]` associated
+    /// function in existing code.
+    registration: TokenStream,
+}
+
 /// The cache-coherence registration items emitted alongside the wrapped
 /// function: the identity constant `#[invalidates(...)]` resolves to, the
 /// callable invalidator, and the `inventory` descriptor the manifest is built
@@ -282,7 +294,7 @@ fn generate_coherence_items(
     input_fn: &ItemFn,
     fn_name: &syn::Ident,
     fn_name_str: &str,
-) -> TokenStream {
+) -> CoherenceItems {
     let vis = &input_fn.vis;
     let id_const = read_id_const_ident(fn_name);
     let invalidator = invalidator_ident(fn_name);
@@ -300,10 +312,7 @@ fn generate_coherence_items(
         // model type is often not in scope at the cached function at all (a
         // `PgPostRepository` parameter does not bring `Post` with it). The
         // checker matches on the last path segment for exactly this reason.
-        let exprs: Vec<TokenStream> = derived
-            .iter()
-            .map(|m| quote! { || #m })
-            .collect();
+        let exprs: Vec<TokenStream> = derived.iter().map(|m| quote! { || #m }).collect();
         (exprs, provenance)
     } else {
         let exprs: Vec<TokenStream> = attrs
@@ -319,7 +328,21 @@ fn generate_coherence_items(
         |reason| quote! { ::core::option::Option::Some(#reason) },
     );
 
-    quote! {
+    let registration = quote! {
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::cache::coherence::CachedReadDescriptor {
+                id: #id_const,
+                kind: ::autumn_web::cache::coherence::ReadKind::Cached,
+                reads: &[#(#read_exprs),*],
+                provenance:
+                    ::autumn_web::cache::coherence::DependencyProvenance::#provenance,
+                acknowledged_stale: #acknowledged,
+                location: concat!(file!(), ":", line!()),
+            }
+        }
+    };
+
+    let items = quote! {
         /// Cache-coherence identity of the adjacent `#[cached]` function: the
         /// namespace every one of its cache keys is prefixed with.
         ///
@@ -339,18 +362,11 @@ fn generate_coherence_items(
         #vis fn #invalidator() -> bool {
             ::autumn_web::cache::coherence::invalidate_namespace(#id_const)
         }
+    };
 
-        ::autumn_web::reexports::inventory::submit! {
-            ::autumn_web::cache::coherence::CachedReadDescriptor {
-                id: #id_const,
-                kind: ::autumn_web::cache::coherence::ReadKind::Cached,
-                reads: &[#(#read_exprs),*],
-                provenance:
-                    ::autumn_web::cache::coherence::DependencyProvenance::#provenance,
-                acknowledged_stale: #acknowledged,
-                location: concat!(file!(), ":", line!()),
-            }
-        }
+    CoherenceItems {
+        items,
+        registration,
     }
 }
 
@@ -506,10 +522,14 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         param_names.clone()
     } else {
         let declared: Vec<String> = param_names.iter().map(|pat| param_name(pat)).collect();
-        if let Some(unknown) = attrs
+        // Rendered once rather than per comparison: both the validation below
+        // and the filter after it walk this list for every parameter.
+        let wanted: Vec<String> = attrs.key.iter().map(ToString::to_string).collect();
+        if let Some((unknown, _)) = attrs
             .key
             .iter()
-            .find(|k| !declared.iter().any(|d| d == &k.to_string()))
+            .zip(&wanted)
+            .find(|(_, name)| !declared.contains(*name))
         {
             return syn::Error::new_spanned(
                 unknown,
@@ -524,10 +544,7 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         param_names
             .iter()
             .copied()
-            .filter(|pat| {
-                let name = param_name(pat);
-                attrs.key.iter().any(|k| k.to_string() == name)
-            })
+            .filter(|pat| wanted.contains(&param_name(pat)))
             .collect()
     };
 
@@ -577,15 +594,19 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // #1716: publish what this read is derived from, so the build can prove no
     // repository write strands it.
-    let coherence = generate_coherence_items(&attrs, &input_fn, fn_name, &fn_name_str);
+    let CoherenceItems {
+        items: coherence_items,
+        registration,
+    } = generate_coherence_items(&attrs, &input_fn, fn_name, &fn_name_str);
 
     quote! {
         #(#fn_attrs)*
         #vis #sig {
+            #registration
             #body
         }
 
-        #coherence
+        #coherence_items
     }
 }
 
@@ -733,7 +754,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn parse_key_selects_the_key_parameters() {
         let attrs = parse_cached_args(quote! { key(tenant_id, page) }).unwrap();
@@ -785,7 +805,6 @@ mod tests {
         .to_string();
         assert!(out.contains("& (a . clone () , b . clone () ,)"), "{out}");
     }
-
 
     #[test]
     fn key_matches_a_mut_binding_by_its_name() {
@@ -966,11 +985,8 @@ mod tests {
 
     #[test]
     fn cached_read_id_constant_matches_the_cache_key_namespace() {
-        let out = cached_macro(
-            TokenStream::new(),
-            quote! { async fn recent() -> u8 { 0 } },
-        )
-        .to_string();
+        let out =
+            cached_macro(TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }).to_string();
         // The identity is defined ONCE and referenced everywhere: the runtime
         // cache-key prefix, the registered descriptor and the invalidator all
         // name the same constant, so the manifest's identity and the key space

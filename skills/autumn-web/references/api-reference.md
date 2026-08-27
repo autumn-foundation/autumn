@@ -112,14 +112,14 @@ copy of the publish order.
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)` |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
-| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (0.8, #1716) |
+| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
-| `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (0.8, #1716) |
+| `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
 | `#[job]`, `jobs![...]` | Request-triggered background jobs |
 | `#[task]`, `one_off_tasks![...]` | Operator tasks invoked by CLI |

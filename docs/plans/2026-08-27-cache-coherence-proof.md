@@ -52,8 +52,13 @@ readable, and enforceable.
 5. **Two models named `Post`.** Cross-module collision. → Matching is on the
    last path segment, so a collision over-approximates (a false failure, never
    a false pass); documented, with `acknowledge_stale` as the release valve.
-6. **Break every existing app.** → New attributes are additive; an untouched
-   `#[cached]` becomes `undetermined` and gates nothing.
+6. **Break every existing app.** → New attributes are additive, and the
+   `inventory` submission goes inside the function body so `#[cached]` keeps
+   working on an associated function. An untouched `#[cached]` is gated only by
+   what derivation can see in it — usually nothing, so `undetermined`; where the
+   body does name a repository or a model finder it is `derived`, and *is*
+   checked. That is intended, but it means "additive" is about compilation, not
+   about the gate's verdict.
 7. **Cost.** → `inventory` statics only; nothing runs unless the dump env var
    is set.
 

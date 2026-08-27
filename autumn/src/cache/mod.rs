@@ -33,9 +33,9 @@
 //! }
 //! ```
 
+pub mod coherence;
 #[cfg(feature = "maud")]
 mod fragment;
-pub mod coherence;
 mod layer;
 #[cfg(feature = "cache-moka")]
 mod moka_impl;
@@ -159,6 +159,20 @@ pub trait Cache: Send + Sync + 'static {
 
     /// Remove all entries.
     fn clear(&self);
+
+    /// Drop every entry belonging to one cached read — i.e. every key under
+    /// `"{namespace}:"`, the prefix
+    /// [`make_cache_key`] stamps on each of that read's keys.
+    ///
+    /// Returns whether the backend could actually do it. The default is
+    /// `false`: a backend that cannot enumerate or pattern-match its key space
+    /// must say so rather than silently leave stale entries behind, because the
+    /// build-time coherence gate (issue #1716) reports this answer to the
+    /// caller verbatim. Backends that CAN do it — `MokaCache` by iteration,
+    /// `RedisCache` by `SCAN MATCH` — override it and return `true`.
+    fn invalidate_namespace(&self, _namespace: &str) -> bool {
+        false
+    }
 
     /// Store pre-serialized JSON bytes for backends that persist data across
     /// process boundaries (e.g. Redis). The default is a no-op; in-process

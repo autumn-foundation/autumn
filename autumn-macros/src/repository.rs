@@ -336,8 +336,6 @@ const DEFAULT_RETENTION_SWEEP_INTERVAL: &str = "1h";
 /// "per-run cap" (issue #1342).
 const MAX_RETENTION_BATCHES_PER_RUN: u32 = 1000;
 
-#[allow(clippy::too_many_lines)]
-
 // ── #1716: cache-coherence mutation surface ──────────────────────────
 
 /// Write methods every `#[repository]` generates, whatever its configuration.
@@ -362,14 +360,19 @@ const POSITION_WRITES: &[&str] = &[
 
 /// Every method on this repository that mutates the model's table.
 ///
-/// The cache-coherence gate is model-granular, so this list decides how
-/// *precisely* a violation can be named, not whether it is caught: `save`,
-/// `update` and `delete_by_id` are unconditional, so a model with any
-/// repository at all always has at least one registered mutation. The families
-/// deliberately rolled up rather than enumerated (many-to-many `add_*`/
-/// `remove_*` helpers, `find_or_create_by_*`, the retention sweep) all mutate
-/// the same table those three do, so folding them in would add manifest rows
-/// without changing a single verdict.
+/// The cache-coherence gate is model-granular, so for a write against this
+/// model's own table the list decides how *precisely* a violation can be named,
+/// not whether it is caught: `save`, `update` and `delete_by_id` are
+/// unconditional, so a model with any repository at all always has at least one
+/// registered mutation. `find_or_create_by_*` and the retention sweep are
+/// therefore rolled up rather than enumerated — they write the same table those
+/// three do.
+///
+/// Two families are genuinely *not* covered and are named in the manifest's
+/// `excluded` list rather than pretended away: a many-to-many `add_*`/`remove_*`
+/// helper writes the JOIN table, and a `counter_cache` write updates the
+/// PARENT's table (a fact declared on the model, which this macro cannot see).
+/// A `dependent(...)` cascade IS covered — see [`dependent_child_models`].
 ///
 /// Returns the names sorted and deduplicated.
 fn write_method_names(config: &RepoConfig, trait_def: &ItemTrait) -> Vec<String> {
@@ -439,7 +442,10 @@ fn parse_method_coherence_attrs(
                          e.g. `#[invalidates(crate::views::recent_posts)]`",
                     ));
                 }
-                out.entry(name.clone()).or_default().invalidates.extend(paths);
+                out.entry(name.clone())
+                    .or_default()
+                    .invalidates
+                    .extend(paths);
             } else if attr.path().is_ident("acknowledge_stale") {
                 let mut reason: Option<LitStr> = None;
                 attr.parse_nested_meta(|nested| {
@@ -491,6 +497,37 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
     companion
 }
 
+/// The models a `dependent(...)` cascade writes, beyond this repository's own.
+///
+/// A `dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)`
+/// clause makes `delete_by_id`/`delete_many` delete or nullify rows in the
+/// CHILD's table. Registering those writes under the parent model only would be
+/// a false pass: a cached read derived from `Comment` really is stranded by
+/// `PostRepository::delete_by_id`.
+///
+/// The child model is recovered from the declared child repository type by the
+/// same `Pg{Model}Repository` convention the rest of the macro generates, so it
+/// is a bare ident rather than a `type_name` — the child's model type is not in
+/// scope here. `models_match` handles that asymmetry.
+fn dependent_child_models(config: &RepoConfig) -> Vec<String> {
+    let mut models: Vec<String> = config
+        .dependents
+        .iter()
+        .filter_map(|dep| {
+            let ident = dep.child_repo.segments.last()?.ident.to_string();
+            let base = ident.strip_suffix("Repository")?;
+            let base = base.strip_prefix("Pg").unwrap_or(base);
+            (!base.is_empty()).then(|| base.to_string())
+        })
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// Write methods that run the `dependent(...)` cascade.
+const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
+
 /// The `inventory` registrations and invalidator this repository publishes for
 /// the cache-coherence manifest (#1716).
 fn generate_coherence_items(
@@ -502,8 +539,36 @@ fn generate_coherence_items(
     let model_name = &config.model_name;
     let table_name = &config.table_name;
     let trait_name_str = trait_def.ident.to_string();
+    let writes = write_method_names(config, trait_def);
 
-    let submissions: Vec<TokenStream> = write_method_names(config, trait_def)
+    // A coherence attribute on a method that generates no write would be
+    // silently dropped — the trait is regenerated from scratch, so nothing else
+    // would ever mention it. A silently-dropped invalidation edge is exactly the
+    // bug this feature exists to prevent, so it is an error instead.
+    if let Some(orphan) = overrides.keys().find(|name| !writes.contains(name)) {
+        // Point the error at the method's own ident so the fix is where the
+        // reader is looking.
+        let span = trait_def
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TraitItem::Fn(f) if f.sig.ident == **orphan => Some(f.sig.ident.span()),
+                _ => None,
+            })
+            .unwrap_or_else(proc_macro2::Span::call_site);
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`{orphan}` is not a write method, so a cache-coherence attribute on it would \
+                 never reach the manifest. Only the generated mutations carry one: {}. Move the \
+                 attribute to the `#[repository(...)]` attribute to cover every write.",
+                writes.join(", ")
+            ),
+        ));
+    }
+
+    let submissions: Vec<TokenStream> = writes
+        .clone()
         .into_iter()
         .map(|method| {
             let method_override = overrides.get(&method);
@@ -513,7 +578,11 @@ fn generate_coherence_items(
             let edges: Vec<syn::Path> = config
                 .invalidates
                 .iter()
-                .chain(method_override.into_iter().flat_map(|o| o.invalidates.iter()))
+                .chain(
+                    method_override
+                        .into_iter()
+                        .flat_map(|o| o.invalidates.iter()),
+                )
                 .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
                 .collect();
             let acknowledged = method_override
@@ -540,15 +609,28 @@ fn generate_coherence_items(
         .collect();
 
     // The repository-wide invalidator: one call that drops every cached read
-    // this repository declares it dirties. Emitted only when edges exist, so
-    // an untouched repository's generated output is unchanged.
-    let invalidator = if config.invalidates.is_empty() {
+    // this repository declares it dirties, from EITHER the attribute or a
+    // method-level `#[invalidates(...)]`. Method-level edges are folded in
+    // deliberately: over-invalidating is safe, whereas an edge that discharges
+    // the gate with no callable counterpart is the paperwork this feature
+    // exists to prevent. Emitted only when edges exist, so an untouched
+    // repository's generated output is unchanged.
+    let mut declared_edges: Vec<syn::Path> = config.invalidates.clone();
+    for name in &writes {
+        if let Some(entry) = overrides.get(name) {
+            declared_edges.extend(entry.invalidates.iter().cloned());
+        }
+    }
+    let invalidator = if declared_edges.is_empty() {
         quote! {}
     } else {
-        let calls: Vec<syn::Path> = config
-            .invalidates
+        // Reference the id CONSTANT, not the generated invalidator function:
+        // a mistyped edge then produces one "cannot find value" error naming
+        // the user's own path, rather than two errors that also leak the
+        // invalidator's mangled name.
+        let ids: Vec<syn::Path> = declared_edges
             .iter()
-            .map(|p| cached_read_companion_path(p, "__autumn_cache_invalidate__"))
+            .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
             .collect();
         quote! {
             impl #pg_name {
@@ -557,18 +639,20 @@ fn generate_coherence_items(
                 ///
                 /// Returns whether every one of them was invalidated
                 /// **completely** — see
-                /// [`autumn_web::cache::coherence::invalidate_namespace`]. A
-                /// process-level shared cache backend cannot be cleared per
-                /// namespace, so this returns `false` when one is registered.
+                /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
+                /// `false` when a registered cache backend cannot drop a
+                /// namespace; the shipped `MokaCache` and `RedisCache` both can.
                 ///
                 /// Call this after a write (or from a commit hook). The
                 /// build-time gate proves the *edge* is declared and that it
                 /// names a real cached read; it does not prove this function
                 /// runs.
+                #[must_use = "an ignored `false` means the cached value is still being served"]
                 pub fn invalidate_declared_caches() -> bool {
                     let mut __autumn_complete = true;
                     #(
-                        __autumn_complete &= #calls();
+                        __autumn_complete &=
+                            ::autumn_web::cache::coherence::invalidate_namespace(#ids);
                     )*
                     __autumn_complete
                 }
@@ -576,12 +660,68 @@ fn generate_coherence_items(
         }
     };
 
+    // #1716: a `dependent(...)` cascade writes the CHILD's rows from the
+    // parent's delete. Without these the gate reports a clean build for a
+    // cached read the cascade really does strand.
+    let child_models = dependent_child_models(config);
+    let cascade_submissions: Vec<TokenStream> = CASCADING_WRITES
+        .iter()
+        .filter(|method| writes.contains(&(*method).to_string()))
+        .flat_map(|method| -> Vec<TokenStream> {
+            let edges: Vec<syn::Path> = config
+                .invalidates
+                .iter()
+                .chain(
+                    overrides
+                        .get(*method)
+                        .into_iter()
+                        .flat_map(|o| o.invalidates.iter()),
+                )
+                .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+                .collect();
+            let acknowledged = overrides
+                .get(*method)
+                .and_then(|o| o.acknowledge_stale.as_ref())
+                .or(config.acknowledge_stale.as_ref())
+                .map_or_else(
+                    || quote! { ::core::option::Option::None },
+                    |reason| quote! { ::core::option::Option::Some(#reason) },
+                );
+            child_models
+                .iter()
+                .map(|child| {
+                    let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    quote! {
+                    ::autumn_web::reexports::inventory::submit! {
+                        ::autumn_web::cache::coherence::MutationDescriptor {
+                            repository: #trait_name_str,
+                            method: #method,
+                            model: || #child,
+                            // Empty rather than guessed: the child's table name
+                            // lives on ITS `#[repository]`, which may override
+                            // the inferred one, and a wrong table string in the
+                            // manifest is worse than an absent one. Matching is
+                            // on the model, so nothing is lost.
+                            table: "",
+                            invalidates: &[#(#edges),*],
+                            acknowledged_stale: #acknowledged,
+                            location: concat!(file!(), ":", line!()),
+                        }
+                    }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
     Ok(quote! {
         #(#submissions)*
+        #(#cascade_submissions)*
         #invalidator
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;
@@ -19651,12 +19791,12 @@ mod tests {
         assert!(parse_query_name("find_by_a_and_b_or_c").is_none());
     }
 
-
     // ── #1716: cache-coherence mutation surface ──────────────────────
 
     #[test]
     fn parse_repo_args_parses_trait_level_invalidates() {
-        let attr: TokenStream = quote! { Post, invalidates(crate::views::recent_posts, home::sidebar) };
+        let attr: TokenStream =
+            quote! { Post, invalidates(crate::views::recent_posts, home::sidebar) };
         let config = parse_repo_args(attr).unwrap();
         let rendered: Vec<String> = config
             .invalidates
@@ -19704,7 +19844,10 @@ mod tests {
             "delete_many",
             "upsert_many",
         ] {
-            assert!(names.contains(&expected.to_string()), "missing {expected} in {names:?}");
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected} in {names:?}"
+            );
         }
         assert!(!names.contains(&"restore".to_string()));
         assert!(!names.contains(&"find_all".to_string()));
@@ -19790,18 +19933,12 @@ mod tests {
 
     #[test]
     fn repository_registers_a_mutation_descriptor_per_write_method() {
-        let out = repository_macro(
-            quote! { Post },
-            quote! { pub trait PostRepository {} },
-        )
-        .to_string();
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         assert!(out.contains("MutationDescriptor"), "{out}");
         assert!(out.contains("method : \"save\""), "{out}");
         assert!(out.contains("method : \"delete_by_id\""), "{out}");
-        assert!(
-            out.contains("repository : \"PostRepository\""),
-            "{out}"
-        );
+        assert!(out.contains("repository : \"PostRepository\""), "{out}");
         assert!(out.contains("table : \"posts\""), "{out}");
         // A read must never be registered as a mutation.
         assert!(!out.contains("method : \"find_all\""), "{out}");
@@ -19823,15 +19960,163 @@ mod tests {
             "a declared edge must come with a callable invalidator: {out}"
         );
         assert!(
-            out.contains("crate :: views :: __autumn_cache_invalidate__recent_posts"),
+            out.contains(
+                "invalidate_namespace (crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts)"
+            ),
+            "the invalidator must resolve through the same id constant, so a mistyped edge \
+             yields ONE error naming the user's own path: {out}"
+        );
+    }
+
+    #[test]
+    fn a_method_level_edge_also_reaches_the_invalidator() {
+        // An edge that discharges the gate but has no callable counterpart is
+        // exactly the paperwork this feature exists to prevent.
+        let out = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "invalidate_namespace (crate :: views :: __AUTUMN_CACHE_READ_ID__by_author)"
+            ),
             "{out}"
         );
     }
 
     #[test]
+    fn a_coherence_attribute_on_a_non_write_method_is_an_error() {
+        // The trait is regenerated from scratch, so an attribute the macro does
+        // not consume would vanish without a trace.
+        let out = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn find_by_author_id(&self, author_id: i64) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+        assert!(out.contains("compile_error"), "{out}");
+        assert!(out.contains("is not a write method"), "{out}");
+    }
+
+    #[test]
+    fn the_invalidator_is_must_use() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(out.contains("must_use"), "{out}");
+    }
+
+    #[test]
+    fn write_methods_drop_upsert_many_when_it_is_not_generated() {
+        // Mirrors `upsert_many_trait_method`'s own condition; a name listed here
+        // but never generated would put a phantom mutation in the manifest.
+        let trait_def: ItemTrait = syn::parse_quote! { pub trait PostRepository {} };
+        let hooked = parse_repo_args(quote! { Post, hooks = PostHooks }).unwrap();
+        assert!(!write_method_names(&hooked, &trait_def).contains(&"upsert_many".to_string()));
+        let no_upsert = parse_repo_args(quote! { Post, no_upsert_trait }).unwrap();
+        assert!(!write_method_names(&no_upsert, &trait_def).contains(&"upsert_many".to_string()));
+    }
+
+    #[test]
+    fn trait_level_and_method_level_edges_union_rather_than_replace() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! {
+                pub trait PostRepository {
+                    #[invalidates(crate::views::by_author)]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        // The annotated method carries BOTH edges...
+        assert!(
+            out.contains(
+                "method : \"delete_by_author_id\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts , crate :: views :: __AUTUMN_CACHE_READ_ID__by_author]"
+            ),
+            "{out}"
+        );
+        // ...and the others keep the trait-level one.
+        assert!(
+            out.contains(
+                "method : \"save\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_method_level_acknowledgement_overrides_the_repository_wide_one() {
+        let out = repository_macro(
+            quote! { Post, acknowledge_stale = "repository-wide reason" },
+            quote! {
+                pub trait PostRepository {
+                    #[acknowledge_stale(reason = "this one method only")]
+                    async fn delete_by_author_id(&self, author_id: i64) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "method : \"delete_by_author_id\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [] , acknowledged_stale : :: core :: option :: Option :: Some (\"this one method only\")"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "method : \"save\" , model : || :: core :: any :: type_name :: < Post > () , table : \"posts\" , invalidates : & [] , acknowledged_stale : :: core :: option :: Option :: Some (\"repository-wide reason\")"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn method_level_acknowledge_stale_rejects_an_unknown_key() {
+        let bad: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale(why = "nope")]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&bad).is_err());
+
+        let missing: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[acknowledge_stale]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&missing).is_err());
+    }
+
+    #[test]
+    fn method_level_invalidates_rejects_an_empty_list() {
+        let empty: ItemTrait = syn::parse_quote! {
+            pub trait PostRepository {
+                #[invalidates()]
+                async fn delete_by_author_id(&self, author_id: i64) -> ();
+            }
+        };
+        assert!(parse_method_coherence_attrs(&empty).is_err());
+    }
+
+    #[test]
     fn repository_without_invalidations_emits_no_invalidator() {
-        let out = repository_macro(quote! { Post }, quote! { pub trait PostRepository {} })
-            .to_string();
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         assert!(!out.contains("invalidate_declared_caches"), "{out}");
     }
 
@@ -19867,6 +20152,60 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("import path only"), "{out}");
+    }
+
+    #[test]
+    fn a_dependent_cascade_registers_a_write_against_the_child_model() {
+        // `PostRepository::delete_by_id` really does delete `Comment` rows, so
+        // a cached read derived from `Comment` is stranded by it. Registering
+        // only the parent model here would be a false pass.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("method : \"delete_by_id\" , model : || \"Comment\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("method : \"delete_many\" , model : || \"Comment\""),
+            "{out}"
+        );
+        // A non-cascading write must NOT claim to touch the child.
+        assert!(
+            !out.contains("method : \"save\" , model : || \"Comment\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_cascade_write_inherits_the_repositorys_invalidation_edges() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                invalidates(crate::views::recent_comments),
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains(
+                "method : \"delete_by_id\" , model : || \"Comment\" , table : \"\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_comments]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_repository_without_dependents_registers_no_cascade_writes() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("table : \"\""), "{out}");
     }
 
     #[test]

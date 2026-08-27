@@ -1305,9 +1305,7 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// static `Cache` (from `autumn_web::cache::Cache`). Key arguments
 /// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
 ///
-/// Apply this to a **free function**: the expansion emits items beside it (the
-/// coherence registration below), which an `impl` block cannot hold.
-///
+
 /// # Attributes
 ///
 /// | Attribute | Example | Description |

@@ -229,6 +229,39 @@ impl RedisCache {
             });
         });
     }
+
+    /// Delete every key matching `pattern`, walking the keyspace with `SCAN`
+    /// rather than `KEYS` so a large keyspace never blocks the server.
+    ///
+    /// Shared by [`Cache::clear`] and [`Cache::invalidate_namespace`], which
+    /// differ only in how many segments of the key they pin.
+    fn scan_and_delete(&self, pattern: &str) {
+        let pattern = pattern.to_owned();
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut cursor: u64 = 0;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(100u32)
+                        .query_async(&mut conn)
+                        .await
+                        .unwrap_or((0, vec![]));
+                    if !keys.is_empty() {
+                        let _: Result<(), _> = conn.del(keys).await;
+                    }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+            });
+        });
+    }
 }
 
 impl Cache for RedisCache {
@@ -306,34 +339,29 @@ impl Cache for RedisCache {
         debug!(key, "RedisCache: invalidated");
     }
 
+    fn invalidate_namespace(&self, namespace: &str) -> bool {
+        // The same SCAN sweep as `clear`, one segment narrower: cache keys are
+        // `{key_prefix}:{namespace}:{hash}`, so scoping the pattern to
+        // `{key_prefix}:{namespace}:*` drops exactly one cached read's entries
+        // and nothing else. This is what makes a declared invalidation edge
+        // (issue #1716) actually complete on a shared, cross-replica backend —
+        // the deployment shape where a per-process store cannot help.
+        //
+        // `namespace` is escaped for the same reason `key_prefix` is: it comes
+        // from `module_path!()`, but an unescaped `*` or `[` anywhere in a
+        // MATCH pattern would widen the sweep beyond the namespace it names.
+        self.scan_and_delete(&format!(
+            "{}:{}:*",
+            escape_redis_glob(&self.key_prefix),
+            escape_redis_glob(namespace)
+        ));
+        true
+    }
+
     fn clear(&self) {
         // Use SCAN instead of KEYS to avoid blocking the Redis server on large
         // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
-        let pattern = format!("{}:*", escape_redis_glob(&self.key_prefix));
-        let mut conn = self.manager.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(100u32)
-                        .query_async(&mut conn)
-                        .await
-                        .unwrap_or((0, vec![]));
-                    if !keys.is_empty() {
-                        let _: Result<(), _> = conn.del(keys).await;
-                    }
-                    cursor = next_cursor;
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-            });
-        });
+        self.scan_and_delete(&format!("{}:*", escape_redis_glob(&self.key_prefix)));
     }
 
     /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are

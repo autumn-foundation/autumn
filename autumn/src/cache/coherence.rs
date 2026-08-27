@@ -46,7 +46,6 @@
 //!
 //! See `docs/guide/cache-coherence.md`.
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -237,21 +236,51 @@ pub struct StalenessFinding {
 
 // ── Identity ─────────────────────────────────────────────────────────
 
-/// Reduce a model name to the identity two independently-derived spellings can
-/// agree on: the last path segment, with references and generic arguments
-/// stripped.
+/// Normalize a model name to its bare type name: the last path segment, with
+/// references and generic arguments stripped.
 ///
-/// `&blog::models::Post` and `Post` are the same model; `Wrapper<Post>` is a
-/// `Wrapper`. See the module docs for why matching is deliberately this coarse.
+/// `&blog::models::Post` and `Post` both key on `Post`; `Wrapper<Post>` keys on
+/// `Wrapper`. Use [`models_match`] to compare two names — this is the fallback
+/// half of that comparison, not the whole of it.
 #[must_use]
 pub fn model_key(name: &str) -> &str {
-    let name = name.trim();
-    // Strip references/pointers, then take everything before the first generic
-    // argument list so `Wrapper<Post>` keys on `Wrapper`, not on `Post`.
-    let name = name.trim_start_matches(['&', '*']).trim();
+    let name = normalize_model_path(name);
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
+/// Strip the decoration around a model's path: references, pointers, a `mut`
+/// binding mode, and any generic argument list.
+fn normalize_model_path(name: &str) -> &str {
+    let name = name.trim().trim_start_matches(['&', '*']).trim();
     let name = name.strip_prefix("mut ").unwrap_or(name).trim();
-    let head = name.split_once('<').map_or(name, |(head, _)| head);
-    head.rsplit("::").next().unwrap_or(head).trim()
+    name.split_once('<')
+        .map_or(name, |(head, _)| head)
+        .trim_end()
+}
+
+/// Whether two model names refer to the same model.
+///
+/// The two sides of a dependency learn the name differently. A `#[repository]`
+/// always has the model *type* in scope and publishes `core::any::type_name`
+/// (`blog::models::Post`); so does a `#[cached(reads(...))]` declaration. But a
+/// dependency the macro *derived* from a function body may only be the bare
+/// ident (`Post`), because the model type is often not in scope at the cached
+/// function at all — a `PgPostRepository` parameter does not bring `Post` with
+/// it.
+///
+/// So: when both sides are fully qualified, compare the full paths. That keeps
+/// `plugin::models::User` and `crate::models::User` apart — two same-named
+/// models in different modules are an ordinary shape, and collapsing them would
+/// fail a correct app. Fall back to the bare type name only when at least one
+/// side is all the analysis could recover, where over-approximating is the safe
+/// direction.
+#[must_use]
+pub fn models_match(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_model_path(a), normalize_model_path(b));
+    if a.contains("::") && b.contains("::") {
+        return a == b;
+    }
+    model_key(a) == model_key(b)
 }
 
 // ── The rule ─────────────────────────────────────────────────────────
@@ -275,17 +304,18 @@ pub fn check(reads: &[CachedRead], mutations: &[Mutation]) -> Vec<StalenessFindi
         {
             continue;
         }
-        // A read may legitimately name the same model twice (declared *and*
-        // derived spellings of one dependency); dedupe so one model can only
-        // produce one finding per mutation.
-        let dependency_keys: BTreeSet<&str> =
-            read.reads.iter().map(|m| model_key(m)).collect();
-
         for mutation in mutations {
             if mutation.acknowledged_stale.is_some() {
                 continue;
             }
-            if !dependency_keys.contains(model_key(&mutation.model)) {
+            // `any` — not a count — so a read that names one model twice (a
+            // `declare_cached_read!` listing it under two paths, say) still
+            // yields a single finding per mutation.
+            if !read
+                .reads
+                .iter()
+                .any(|dep| models_match(dep, &mutation.model))
+            {
                 continue;
             }
             if mutation.invalidates.iter().any(|id| id == &read.id) {
@@ -301,9 +331,8 @@ pub fn check(reads: &[CachedRead], mutations: &[Mutation]) -> Vec<StalenessFindi
         }
     }
 
-    findings.sort_by(|a, b| {
-        (&a.read, &a.mutation, &a.model).cmp(&(&b.read, &b.mutation, &b.model))
-    });
+    findings
+        .sort_by(|a, b| (&a.read, &a.mutation, &a.model).cmp(&(&b.read, &b.mutation, &b.model)));
     findings
 }
 
@@ -320,45 +349,95 @@ pub fn undetermined_reads(reads: &[CachedRead]) -> Vec<&CachedRead> {
         .collect()
 }
 
-/// Exit code for the gate: non-zero when a violation was proven, or — under
-/// `strict` — when any read's dependency set is undetermined.
+/// Whether the gate fails for this manifest.
+///
+/// The one place the rule lives, so `autumn cache audit`, an app's own test,
+/// and the tests that pin the behavior are all asking the same function rather
+/// than three copies of one condition.
+///
+/// Fails on a proven violation always, and on an undetermined dependency set
+/// only under `strict` — the default never fails on what the analysis merely
+/// could not read.
 #[must_use]
-pub fn audit_exit_code(
-    findings: &[StalenessFinding],
-    undetermined: &[&CachedRead],
-    strict: bool,
-) -> i32 {
-    i32::from(!findings.is_empty() || (strict && !undetermined.is_empty()))
+pub fn gate_failed(manifest: &CoherenceManifest, strict: bool) -> bool {
+    !manifest.violations.is_empty() || (strict && !manifest.undetermined_reads.is_empty())
+}
+
+/// Exit code for the gate: `1` when [`gate_failed`], `0` otherwise.
+#[must_use]
+pub fn audit_exit_code(manifest: &CoherenceManifest, strict: bool) -> i32 {
+    i32::from(gate_failed(manifest, strict))
 }
 
 // ── Diagnostics ──────────────────────────────────────────────────────
 
 /// Render the precise diagnostic for a set of findings: for each, the cached
-/// read, the mutation, the model they share, and the two ways to discharge it.
+/// read, the mutations that can strand it, the model they share, and the two
+/// ways to discharge it.
+///
+/// Grouped by `(read, model)` rather than printed one block per pair. A single
+/// missing `invalidates(...)` on a `soft_delete` repository produces a dozen
+/// findings — one per generated write method — and a dozen identical six-line
+/// blocks with the same one-line fix is the output shape that gets a gate
+/// switched off. The manifest keeps every pair; the human report names the one
+/// edit.
 #[must_use]
 pub fn format_diagnostic(findings: &[StalenessFinding]) -> String {
     if findings.is_empty() {
         return String::new();
     }
+
+    // Preserves `check`'s ordering: findings arrive sorted, so first-seen order
+    // of each (read, model) group is already deterministic.
+    let mut groups: Vec<(&StalenessFinding, Vec<&StalenessFinding>)> = Vec::new();
+    for finding in findings {
+        match groups
+            .iter_mut()
+            .find(|(head, _)| head.read == finding.read && head.model == finding.model)
+        {
+            Some((_, members)) => members.push(finding),
+            None => groups.push((finding, vec![finding])),
+        }
+    }
+
+    let stale_reads: usize = {
+        let mut reads: Vec<&str> = groups.iter().map(|(head, _)| head.read.as_str()).collect();
+        reads.sort_unstable();
+        reads.dedup();
+        reads.len()
+    };
+
     let mut out = format!(
-        "error: {} cached read{} can be left stale by a repository write\n\n",
-        findings.len(),
-        if findings.len() == 1 { "" } else { "s" }
+        "error: {stale_reads} cached read{} can be left stale by a repository write\n\n",
+        if stale_reads == 1 { "" } else { "s" }
     );
-    for f in findings {
+    for (head, members) in &groups {
+        let writes: Vec<&str> = members.iter().map(|f| f.mutation.as_str()).collect();
+        // Every write method generated by one `#[repository]` carries that
+        // attribute's own location, so this is normally a single site — but a
+        // model with two repositories has two, and naming both is the point.
+        let mut sites: Vec<&str> = members
+            .iter()
+            .map(|f| f.mutation_location.as_str())
+            .collect();
+        sites.dedup();
         let _ = writeln!(
             out,
-            "  {mutation} mutates {model}\n    \
-             but the cached read {read} is derived from it and is never invalidated.\n      \
-             read     {read_loc}\n      \
-             mutation {mut_loc}\n    \
-             fix: add #[invalidates({read})] to the write, or\n         \
+            "  the cached read {read} is derived from {model},\n    \
+             which {count} repository write{plural} mutate{verb} without invalidating it:\n      \
+             {writes}\n    \
+             read at    {read_loc}\n    \
+             written at {sites}\n    \
+             fix: add invalidates({read}) to the repository, or\n         \
              acknowledge the staleness with #[acknowledge_stale(reason = \"…\")].\n",
-            mutation = f.mutation,
-            model = f.model,
-            read = f.read,
-            read_loc = f.read_location,
-            mut_loc = f.mutation_location,
+            read = head.read,
+            model = head.model,
+            count = writes.len(),
+            plural = if writes.len() == 1 { "" } else { "s" },
+            verb = if writes.len() == 1 { "s" } else { "" },
+            writes = writes.join(", "),
+            read_loc = head.read_location,
+            sites = sites.join(", "),
         );
     }
     out
@@ -433,6 +512,18 @@ pub struct ManifestInvalidation {
     pub read: String,
 }
 
+/// A cached read the analysis could not link to any model.
+///
+/// Carries its source location for the same reason every other diagnostic in
+/// this feature does: an id alone makes the reader grep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndeterminedRead {
+    /// The read's cache-key namespace.
+    pub id: String,
+    /// `file:line` of the declaration.
+    pub location: String,
+}
+
 /// A dimension deliberately left out of the manifest, and why.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExcludedDimension {
@@ -466,7 +557,7 @@ pub struct CoherenceManifest {
     /// Proven staleness bugs, stable-ordered.
     pub violations: Vec<StalenessFinding>,
     /// Reads whose dependency set could not be established.
-    pub undetermined_reads: Vec<String>,
+    pub undetermined_reads: Vec<UndeterminedRead>,
     /// Dimensions deliberately not emitted, and why.
     pub excluded: Vec<ExcludedDimension>,
 }
@@ -491,7 +582,7 @@ impl CoherenceManifest {
                 }
             })
             .collect();
-        read_entries.sort_by(|a, b| a.id.cmp(&b.id));
+        read_entries.sort_by(|a, b| (&a.id, &a.location).cmp(&(&b.id, &b.location)));
 
         let mut mutation_entries: Vec<ManifestMutation> = mutations
             .iter()
@@ -503,7 +594,18 @@ impl CoherenceManifest {
                 location: m.location.clone(),
             })
             .collect();
-        mutation_entries.sort_by(|a, b| (&a.name, &a.model).cmp(&(&b.name, &b.model)));
+        // `location` and `table` join the key so a tie cannot fall back to
+        // `inventory`'s link order, which is unspecified: two same-named
+        // repository traits in different modules would otherwise swap rows
+        // between byte-identical builds.
+        mutation_entries.sort_by(|a, b| {
+            (&a.name, &a.model, &a.table, &a.location).cmp(&(
+                &b.name,
+                &b.model,
+                &b.table,
+                &b.location,
+            ))
+        });
 
         let mut invalidation_entries: Vec<ManifestInvalidation> = mutations
             .iter()
@@ -516,11 +618,14 @@ impl CoherenceManifest {
             .collect();
         invalidation_entries.sort_by(|a, b| (&a.mutation, &a.read).cmp(&(&b.mutation, &b.read)));
 
-        let mut undetermined: Vec<String> = undetermined_reads(reads)
+        let mut undetermined: Vec<UndeterminedRead> = undetermined_reads(reads)
             .into_iter()
-            .map(|r| r.id.clone())
+            .map(|r| UndeterminedRead {
+                id: r.id.clone(),
+                location: r.location.clone(),
+            })
             .collect();
-        undetermined.sort();
+        undetermined.sort_by(|a, b| a.id.cmp(&b.id));
 
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -528,17 +633,39 @@ impl CoherenceManifest {
                 cached_reads: Dimension {
                     provenance: "provable".to_string(),
                     source: "macro:#[cached] / declare_cached_read!".to_string(),
-                    runtime_caveat: String::new(),
+                    runtime_caveat:
+                        "each entry's EXISTENCE is proven — a `#[cached]` function registers \
+                         itself — but its dependency set is only as strong as the entry's own \
+                         `provenance` field says: `declared` is trusted verbatim (a `reads(...)` \
+                         naming the wrong model audits clean), `derived` is what a syntactic \
+                         analysis of the function could see, and `undetermined` is nothing at \
+                         all. A `declare_cached_read!` entry is hand-written throughout, \
+                         including the fact that the call site exists; an undeclared \
+                         `cache_fragment` / `get_or_compute` call is invisible here — see the \
+                         undeclared_cache_call_sites entry in `excluded`."
+                            .to_string(),
                     entries: read_entries,
                 },
                 mutations: Dimension {
                     provenance: "provable".to_string(),
                     source: "macro:#[repository]".to_string(),
-                    runtime_caveat: String::new(),
+                    runtime_caveat: "every entry is proven, but the SET is not exhaustive: only \
+                         `#[repository]` write methods are here. Nothing proves an app's writes \
+                         all go through one — see the writes_outside_repository entry in \
+                         `excluded` — and a write that reaches another model's table through a \
+                         `counter_cache` is registered under its own model, not the counter's."
+                        .to_string(),
                     entries: mutation_entries,
                 },
                 invalidations: Dimension {
-                    provenance: "declared".to_string(),
+                    // `provable`, not `declared`: the edge is recovered from
+                    // macro-expanded code with no config read and no process
+                    // started, which is question 1 of the provenance rubric in
+                    // docs/guide/security-posture-manifest.md. The weak step is
+                    // an ADJACENT one — whether the invalidator is called — and
+                    // the rubric's tie-breaker is a runtime_caveat, not a
+                    // demotion that would understate what the build proves.
+                    provenance: "provable".to_string(),
                     source: "macro:#[repository(..., invalidates(...))]".to_string(),
                     runtime_caveat:
                         "the edge's target is proven — `invalidates(path)` resolves to the \
@@ -623,6 +750,43 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
                 .to_string(),
         },
         ExcludedDimension {
+            dimension: "writes_outside_repository".to_string(),
+            eventual_provenance: "provable".to_string(),
+            reason: "only `#[repository]` write methods are in the mutated set. A hand-rolled \
+                     repository, a raw diesel `update`/`insert`/`delete` against the handle, a \
+                     migration, or a job that writes directly is invisible here, so a cached \
+                     read those dirty audits clean. Declare such a write's effect by routing it \
+                     through a `#[repository]`, or acknowledge the read"
+                .to_string(),
+        },
+        ExcludedDimension {
+            dimension: "undeclared_cache_call_sites".to_string(),
+            eventual_provenance: "provable".to_string(),
+            reason: "`cache_fragment` and `get_or_compute` are plain function calls with a \
+                     runtime key — there is no annotated item for a macro to find, so a call \
+                     site that does not opt in with `declare_cached_read!` is not in this \
+                     manifest at all. A clean audit says nothing about it"
+                .to_string(),
+        },
+        ExcludedDimension {
+            dimension: "counter_cache_and_cascade_writes".to_string(),
+            eventual_provenance: "provable".to_string(),
+            reason: "a `#[belongs_to(Parent, counter_cache)]` column is declared on the MODEL, \
+                     which `#[repository]` cannot see, so a child's write updating the parent's \
+                     counter is registered under the child's model only. `dependent(...)` \
+                     cascades ARE registered against the child model they delete or nullify"
+                .to_string(),
+        },
+        ExcludedDimension {
+            dimension: "http_response_cache".to_string(),
+            eventual_provenance: "provable".to_string(),
+            reason: "`CacheResponseLayer` caches whole HTTP responses keyed by URI, with no \
+                     annotated item naming what the response was derived from. It has no \
+                     ReadKind and no declaration form in this slice; a response cache over \
+                     mutable data is not covered by this gate"
+                .to_string(),
+        },
+        ExcludedDimension {
             dimension: "cross_service_coherence".to_string(),
             eventual_provenance: "runtime-only".to_string(),
             reason: "a second service's writes are not in this binary's dependency graph; \
@@ -663,35 +827,45 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
 /// An acknowledged-stale opt-out takes a trailing `acknowledge_stale = "…"`.
 #[macro_export]
 macro_rules! declare_cached_read {
+    // At least one model is required, for the same reason `#[cached(reads())]`
+    // is a compile error: an EMPTY declared set is trivially coherent and would
+    // silence the gate while inflating the `declared` count — a hatch with none
+    // of the visibility the real hatches carry.
     (
         id = $id:expr,
         kind = $kind:ident,
-        reads = [$($model:ty),* $(,)?] $(,)?
+        reads = [$first:path $(, $rest:path)* $(,)?] $(,)?
     ) => {
         $crate::declare_cached_read!(
             id = $id,
             kind = $kind,
-            reads = [$($model),*],
+            reads = [$first $(, $rest)*],
             acknowledged_stale = ::core::option::Option::None,
         );
     };
     (
         id = $id:expr,
         kind = $kind:ident,
-        reads = [$($model:ty),* $(,)?],
-        acknowledge_stale = $reason:expr $(,)?
+        reads = [$first:path $(, $rest:path)* $(,)?],
+        acknowledge_stale = $reason:literal $(,)?
     ) => {
+        // Same rule the attribute macros enforce: an escape hatch without a
+        // justification is the one nobody can review.
+        const _: () = assert!(
+            !$reason.is_empty(),
+            "acknowledge_stale requires a non-empty reason",
+        );
         $crate::declare_cached_read!(
             id = $id,
             kind = $kind,
-            reads = [$($model),*],
+            reads = [$first $(, $rest)*],
             acknowledged_stale = ::core::option::Option::Some($reason),
         );
     };
     (
         id = $id:expr,
         kind = $kind:ident,
-        reads = [$($model:ty),* $(,)?],
+        reads = [$($model:path),+ $(,)?],
         acknowledged_stale = $ack:expr $(,)?
     ) => {
         $crate::reexports::inventory::submit! {
@@ -738,28 +912,44 @@ pub fn register_namespace_store(namespace: &'static str, store: std::sync::Arc<d
 
 /// Drop every entry belonging to one cached read.
 ///
-/// Returns whether the invalidation was **complete**. It is complete when the
-/// read is served only from its own dedicated in-process store (which was just
-/// cleared, or was never created because the function has not run yet). It is
-/// *incomplete* — `false` — when a process-level shared backend is registered
-/// via [`set_global_cache`](super::set_global_cache): that backend keys every
-/// cached function into one store and exposes no way to enumerate a namespace,
-/// so entries there survive. Callers that need cross-replica invalidation must
-/// use a backend-specific mechanism; this is the honest signal that they do.
+/// Clears the read's own dedicated in-process store **and**, when a
+/// process-level shared backend is registered via
+/// [`set_global_cache`](super::set_global_cache), asks that backend to drop the
+/// namespace too — which is where the value actually lives once one is
+/// configured.
+///
+/// Returns whether the invalidation was **complete**. It is complete when there
+/// is no shared backend, or when the shared backend could drop the namespace
+/// ([`MokaCache`](super::MokaCache) by iteration, `RedisCache` by `SCAN
+/// MATCH`). A custom [`Cache`](super::Cache) implementation that cannot
+/// pattern-match its key space returns `false` from
+/// [`Cache::invalidate_namespace`](super::Cache::invalidate_namespace), and that
+/// `false` is reported here verbatim — the honest signal that a
+/// backend-specific mechanism is needed.
 ///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn invalidate_namespace(namespace: &str) -> bool {
-    if let Some(map) = NAMESPACE_STORES
+    // Clone the handle out and DROP the guard before calling into the backend.
+    // `register_namespace_store` is public and `Cache` is user-implementable, so
+    // a `clear()` that happens to call a `#[cached]` function would otherwise
+    // re-enter this non-reentrant `RwLock` and deadlock.
+    let dedicated = NAMESPACE_STORES
         .read()
         .expect("cache namespace store lock poisoned")
         .as_ref()
-        && let Some(store) = map.get(namespace)
-    {
+        .and_then(|map| map.get(namespace).cloned());
+    if let Some(store) = dedicated {
         store.clear();
     }
-    super::global_cache().is_none()
+
+    // The dedicated store is only half the story: once a process-level backend
+    // is registered, that is where the value actually lives, and the per-
+    // function store holds nothing. Ask the backend — `MokaCache` and
+    // `RedisCache` both drop the namespace; a backend that cannot says so, and
+    // that `false` is what the caller reports.
+    super::global_cache().is_none_or(|global| global.invalidate_namespace(namespace))
 }
 
 // ── Reading the binary's own registrations ───────────────────────────
@@ -859,6 +1049,8 @@ mod tests {
         }
     }
 
+    // ── The rule ─────────────────────────────────────────────────────
+
     #[test]
     fn intersecting_model_without_invalidation_is_a_violation() {
         let reads = vec![read("blog::views::recent_posts", &["blog::models::Post"])];
@@ -929,22 +1121,6 @@ mod tests {
     }
 
     #[test]
-    fn model_identity_matches_on_the_last_path_segment() {
-        // The read names the bare ident recovered by derivation; the mutation
-        // names the fully-qualified `type_name`. They are the same model.
-        let reads = vec![read("blog::views::recent_posts", &["Post"])];
-        let muts = vec![mutation("PostRepository", "save", "blog::models::Post")];
-        assert_eq!(check(&reads, &muts).len(), 1);
-    }
-
-    #[test]
-    fn model_identity_ignores_generic_arguments_and_references() {
-        assert_eq!(model_key("&blog::models::Post"), "Post");
-        assert_eq!(model_key("blog::models::Wrapper<blog::models::Post>"), "Wrapper");
-        assert_eq!(model_key("  Post  "), "Post");
-    }
-
-    #[test]
     fn one_read_over_two_models_reports_one_finding_per_mutation() {
         let reads = vec![read("blog::views::feed", &["Post", "Comment"])];
         let muts = vec![
@@ -955,11 +1131,17 @@ mod tests {
     }
 
     #[test]
+    fn a_model_named_twice_by_one_read_still_yields_one_finding() {
+        // A read may carry both a declared and a derived spelling of the same
+        // dependency; that must not double-report.
+        let reads = vec![read("blog::views::feed", &["Post", "Post"])];
+        let muts = vec![mutation("PostRepository", "save", "blog::models::Post")];
+        assert_eq!(check(&reads, &muts).len(), 1);
+    }
+
+    #[test]
     fn findings_are_stable_ordered() {
-        let reads = vec![
-            read("z::read", &["Post"]),
-            read("a::read", &["Post"]),
-        ];
+        let reads = vec![read("z::read", &["Post"]), read("a::read", &["Post"])];
         let muts = vec![
             mutation("PostRepository", "update", "Post"),
             mutation("PostRepository", "delete_by_id", "Post"),
@@ -971,8 +1153,58 @@ mod tests {
             .collect();
         let mut sorted = keys.clone();
         sorted.sort();
-        assert_eq!(keys, sorted, "findings must come back deterministically ordered");
+        assert_eq!(
+            keys, sorted,
+            "findings must come back deterministically ordered"
+        );
     }
+
+    // ── Model identity ───────────────────────────────────────────────
+
+    #[test]
+    fn model_key_ignores_generic_arguments_and_references() {
+        assert_eq!(model_key("&blog::models::Post"), "Post");
+        assert_eq!(
+            model_key("blog::models::Wrapper<blog::models::Post>"),
+            "Wrapper"
+        );
+        assert_eq!(model_key("  Post  "), "Post");
+        assert_eq!(model_key("&mut blog::Post"), "Post");
+        assert_eq!(model_key("*const blog::Post"), "Post");
+    }
+
+    #[test]
+    fn a_derived_bare_ident_matches_a_qualified_type_name() {
+        // The read names the bare ident derivation recovered; the mutation
+        // names the fully-qualified `type_name`. Same model.
+        let reads = vec![read("blog::views::recent_posts", &["Post"])];
+        let muts = vec![mutation("PostRepository", "save", "blog::models::Post")];
+        assert_eq!(check(&reads, &muts).len(), 1);
+    }
+
+    #[test]
+    fn two_qualified_same_named_models_are_kept_apart() {
+        // `plugin::models::User` and `crate::models::User` are different models.
+        // Collapsing them would fail a perfectly correct app.
+        assert!(!models_match("plugin::models::User", "app::models::User"));
+        assert!(models_match("app::models::User", "app::models::User"));
+
+        let reads = vec![read("app::views::roster", &["app::models::User"])];
+        let muts = vec![mutation("UserRepository", "save", "plugin::models::User")];
+        assert!(
+            check(&reads, &muts).is_empty(),
+            "a different module's same-named model must not be flagged"
+        );
+    }
+
+    #[test]
+    fn a_bare_ident_still_over_approximates_across_modules() {
+        // When one side is all the analysis could recover, matching falls back
+        // to the bare name — a false failure, never a false pass.
+        assert!(models_match("User", "plugin::models::User"));
+    }
+
+    // ── Diagnostics ──────────────────────────────────────────────────
 
     #[test]
     fn diagnostic_names_read_mutation_and_shared_model() {
@@ -984,21 +1216,90 @@ mod tests {
         assert!(text.contains("blog::models::Post"), "{text}");
         assert!(text.contains("src/views.rs:10"), "{text}");
         assert!(text.contains("src/repositories.rs:20"), "{text}");
-        assert!(text.contains("#[invalidates("), "must name the fix: {text}");
+        assert!(text.contains("invalidates("), "must name the fix: {text}");
     }
 
     #[test]
+    fn diagnostic_groups_one_missing_edge_into_one_block() {
+        // A missing `invalidates(...)` on a repository produces one finding per
+        // generated write method. Twelve identical blocks with the same one-line
+        // fix is the output shape that gets a gate switched off.
+        let reads = vec![read("blog::views::recent_posts", &["Post"])];
+        let muts: Vec<Mutation> = [
+            "save",
+            "update",
+            "delete_by_id",
+            "save_many",
+            "update_many",
+            "delete_many",
+        ]
+        .iter()
+        .map(|m| mutation("PostRepository", m, "Post"))
+        .collect();
+
+        let findings = check(&reads, &muts);
+        assert_eq!(findings.len(), 6, "the manifest still carries every pair");
+
+        let text = format_diagnostic(&findings);
+        assert_eq!(
+            text.matches("fix: add invalidates(").count(),
+            1,
+            "one edit, one fix line: {text}"
+        );
+        assert!(text.contains("1 cached read can be left stale"), "{text}");
+        for method in ["save", "update", "delete_by_id", "delete_many"] {
+            assert!(
+                text.contains(&format!("PostRepository::{method}")),
+                "every uncovered write is still named: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_separates_two_reads_over_the_same_model() {
+        let reads = vec![read("a::read", &["Post"]), read("b::read", &["Post"])];
+        let muts = vec![mutation("PostRepository", "save", "Post")];
+        let text = format_diagnostic(&check(&reads, &muts));
+        assert_eq!(text.matches("fix: add invalidates(").count(), 2, "{text}");
+        assert!(text.contains("2 cached reads can be left stale"), "{text}");
+    }
+
+    #[test]
+    fn diagnostic_is_empty_when_nothing_is_wrong() {
+        assert!(format_diagnostic(&[]).is_empty());
+    }
+
+    #[test]
+    fn summary_counts_each_provenance_class_and_every_acknowledgement() {
+        let mut undetermined = read("u", &[]);
+        undetermined.provenance = DependencyProvenance::Undetermined;
+        let mut derived = read("d", &["Post"]);
+        derived.provenance = DependencyProvenance::Derived;
+        let mut declared = read("c", &["Post"]);
+        declared.acknowledged_stale = Some("deliberate".to_string());
+        let mut m = mutation("PostRepository", "save", "Post");
+        m.acknowledged_stale = Some("seed only".to_string());
+
+        let text = format_summary(&[undetermined, derived, declared], &[m]);
+        assert!(text.contains("3 cached reads"), "{text}");
+        assert!(text.contains("1 declared"), "{text}");
+        assert!(text.contains("1 derived"), "{text}");
+        assert!(text.contains("1 undetermined"), "{text}");
+        assert!(text.contains("1 repository mutations"), "{text}");
+        assert!(text.contains("2 acknowledged-stale"), "{text}");
+    }
+
+    // ── Manifest ─────────────────────────────────────────────────────
+
+    #[test]
     fn manifest_is_provenance_tagged_and_stable_ordered() {
-        let reads = vec![
-            read("z::read", &["Post"]),
-            read("a::read", &["Post"]),
-        ];
+        let reads = vec![read("z::read", &["Post"]), read("a::read", &["Post"])];
         let muts = vec![mutation("PostRepository", "save", "Post")];
         let manifest = CoherenceManifest::build(&reads, &muts);
         assert_eq!(manifest.schema_version, MANIFEST_SCHEMA_VERSION);
         assert_eq!(manifest.dimensions.cached_reads.provenance, "provable");
         assert_eq!(manifest.dimensions.mutations.provenance, "provable");
-        assert_eq!(manifest.dimensions.invalidations.provenance, "declared");
+        assert_eq!(manifest.dimensions.invalidations.provenance, "provable");
         assert!(
             !manifest.dimensions.invalidations.runtime_caveat.is_empty(),
             "a `declared` dimension must carry its caveat"
@@ -1015,40 +1316,152 @@ mod tests {
     }
 
     #[test]
-    fn manifest_serializes_to_stable_json() {
-        let manifest = CoherenceManifest::build(&[], &[]);
-        let json = manifest.to_json();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], MANIFEST_SCHEMA_VERSION);
-        assert!(parsed["dimensions"]["cached_reads"].is_object());
-        assert!(parsed["excluded"].is_array());
+    fn manifest_carries_every_entry_through_json() {
+        let mut r = read("blog::views::recent_posts", &["blog::models::Post"]);
+        r.acknowledged_stale = Some("deliberate".to_string());
+        let mut m = mutation("PostRepository", "save", "blog::models::Post");
+        m.invalidates = vec!["blog::views::recent_posts".to_string()];
+
+        let manifest = CoherenceManifest::build(&[r], &[m]);
+        let json: serde_json::Value = serde_json::from_str(&manifest.to_json()).unwrap();
+
+        assert_eq!(json["schema_version"], MANIFEST_SCHEMA_VERSION);
+        let entry = &json["dimensions"]["cached_reads"]["entries"][0];
+        assert_eq!(entry["id"], "blog::views::recent_posts");
+        assert_eq!(entry["kind"], "cached");
+        assert_eq!(entry["provenance"], "declared");
+        assert_eq!(entry["reads"][0], "blog::models::Post");
+        assert_eq!(entry["acknowledged_stale"], "deliberate");
+        assert_eq!(entry["location"], "src/views.rs:10");
+
+        let write = &json["dimensions"]["mutations"]["entries"][0];
+        assert_eq!(write["name"], "PostRepository::save");
+        assert_eq!(write["model"], "blog::models::Post");
+        assert_eq!(write["table"], "posts");
+
+        let edge = &json["dimensions"]["invalidations"]["entries"][0];
+        assert_eq!(edge["mutation"], "PostRepository::save");
+        assert_eq!(edge["read"], "blog::views::recent_posts");
     }
 
     #[test]
-    fn summary_counts_each_provenance_class() {
-        let mut undetermined = read("u", &[]);
-        undetermined.provenance = DependencyProvenance::Undetermined;
-        let mut derived = read("d", &["Post"]);
-        derived.provenance = DependencyProvenance::Derived;
-        let declared = read("c", &["Post"]);
-        let text = format_summary(&[undetermined, derived, declared], &[]);
-        assert!(text.contains("3 cached reads"), "{text}");
-        assert!(text.contains("1 declared"), "{text}");
-        assert!(text.contains("1 derived"), "{text}");
-        assert!(text.contains("1 undetermined"), "{text}");
+    fn manifest_omits_an_absent_runtime_caveat_rather_than_emitting_an_empty_one() {
+        let json: serde_json::Value =
+            serde_json::from_str(&CoherenceManifest::build(&[], &[]).to_json()).unwrap();
+        // Every dimension here carries a caveat, so the `skip_serializing_if`
+        // is exercised by constructing one directly rather than via `build`.
+        let bare: Dimension<ManifestRead> = Dimension {
+            provenance: "provable".to_string(),
+            source: "test".to_string(),
+            runtime_caveat: String::new(),
+            entries: Vec::new(),
+        };
+        let bare_json: serde_json::Value = serde_json::to_value(&bare).unwrap();
+        assert!(bare_json["runtime_caveat"].is_null());
+        assert!(json["dimensions"]["invalidations"]["runtime_caveat"].is_string());
     }
+
+    #[test]
+    fn manifest_undetermined_entries_carry_their_location() {
+        let mut r = read("blog::views::mystery", &[]);
+        r.provenance = DependencyProvenance::Undetermined;
+        let manifest = CoherenceManifest::build(&[r], &[]);
+        assert_eq!(manifest.undetermined_reads.len(), 1);
+        assert_eq!(manifest.undetermined_reads[0].id, "blog::views::mystery");
+        assert_eq!(manifest.undetermined_reads[0].location, "src/views.rs:10");
+    }
+
+    #[test]
+    fn excluded_dimensions_name_the_holes_this_slice_leaves() {
+        // The manifest's whole discipline is "say what we did not look at". A
+        // reader must be able to tell "checked and fine" from "never looked".
+        let named: Vec<&str> = excluded_dimensions()
+            .iter()
+            .map(|d| d.dimension.as_str())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|s| Box::leak(s.to_string().into_boxed_str()) as &str)
+            .collect();
+        for expected in [
+            "row_and_column_scoped_dependencies",
+            "invalidation_call_sites",
+            "writes_outside_repository",
+            "undeclared_cache_call_sites",
+            "counter_cache_and_cascade_writes",
+            "http_response_cache",
+            "cross_service_coherence",
+            "ttl_expiry",
+        ] {
+            assert!(named.contains(&expected), "missing {expected} in {named:?}");
+        }
+        assert!(
+            excluded_dimensions().iter().all(|d| !d.reason.is_empty()),
+            "an exclusion without a reason is not an exclusion"
+        );
+    }
+
+    #[test]
+    fn round_trips_through_the_dump_protocol() {
+        let reads = vec![read("blog::views::recent_posts", &["Post"])];
+        let muts = vec![mutation("PostRepository", "save", "Post")];
+        let manifest = CoherenceManifest::build(&reads, &muts);
+        let dump = format!(
+            "some unrelated startup logging\n{COHERENCE_MANIFEST_MARKER}{}\n",
+            serde_json::to_string(&manifest).unwrap()
+        );
+        let parsed = parse_manifest_dump(&dump).expect("marker line must be found");
+        assert_eq!(parsed.violations.len(), 1);
+        assert_eq!(parsed.summary(), manifest.summary());
+    }
+
+    #[test]
+    fn a_dump_without_the_marker_is_not_mistaken_for_an_empty_manifest() {
+        assert!(parse_manifest_dump("no marker here\n").is_none());
+    }
+
+    #[test]
+    fn a_corrupt_manifest_is_not_mistaken_for_an_empty_one() {
+        let dump = format!("{COHERENCE_MANIFEST_MARKER}{{\"schema_version\": \n");
+        assert!(parse_manifest_dump(&dump).is_none());
+    }
+
+    // ── The gate ─────────────────────────────────────────────────────
 
     #[test]
     fn exit_code_is_nonzero_iff_a_violation_exists() {
         let reads = vec![read("r", &["Post"])];
         let muts = vec![mutation("PostRepository", "save", "Post")];
-        assert_eq!(audit_exit_code(&check(&reads, &muts), &[], false), 1);
-        assert_eq!(audit_exit_code(&[], &[], false), 0);
+        assert_eq!(
+            audit_exit_code(&CoherenceManifest::build(&reads, &muts), false),
+            1
+        );
+        assert_eq!(
+            audit_exit_code(&CoherenceManifest::build(&[], &[]), false),
+            0
+        );
     }
 
+    #[test]
+    fn strict_mode_fails_on_undetermined_reads() {
+        let mut r = read("blog::views::mystery", &[]);
+        r.provenance = DependencyProvenance::Undetermined;
+        let manifest = CoherenceManifest::build(std::slice::from_ref(&r), &[]);
+        assert!(!gate_failed(&manifest, false));
+        assert!(gate_failed(&manifest, true));
+    }
 
+    // ── Namespace invalidation ───────────────────────────────────────
+
+    #[cfg(feature = "cache-moka")]
     #[test]
     fn invalidating_a_namespace_clears_only_that_reads_store() {
+        // Serialized against every other test that mutates the process-wide
+        // global cache: `invalidate_namespace` reads it.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+
         let a = std::sync::Arc::new(super::super::MokaCache::new(16, None));
         let b = std::sync::Arc::new(super::super::MokaCache::new(16, None));
         register_namespace_store("tests::ns_a", a.clone());
@@ -1062,17 +1475,143 @@ mod tests {
         assert_eq!(super::super::get::<i32>(&*b, "tests::ns_b:1"), Some(2));
     }
 
+    #[cfg(feature = "cache-moka")]
     #[test]
     fn invalidating_an_unregistered_namespace_is_complete_and_harmless() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
         assert!(invalidate_namespace("tests::never_registered"));
     }
 
+    #[cfg(feature = "cache-moka")]
     #[test]
-    fn strict_mode_fails_on_undetermined_reads() {
-        let mut r = read("blog::views::mystery", &[]);
-        r.provenance = DependencyProvenance::Undetermined;
-        let undetermined = undetermined_reads(std::slice::from_ref(&r));
-        assert_eq!(audit_exit_code(&[], &undetermined, false), 0);
-        assert_eq!(audit_exit_code(&[], &undetermined, true), 1);
+    fn a_shared_backend_is_asked_to_drop_the_namespace_too() {
+        // Once a process-level backend is registered THAT is where the value
+        // lives; clearing only the per-function store would be a no-op dressed
+        // up as an invalidation.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let global = std::sync::Arc::new(super::super::MokaCache::new(64, None));
+        super::super::set_global_cache(global.clone());
+        super::super::insert(&*global, "tests::shared_ns:aaa", 1_i32);
+        super::super::insert(&*global, "tests::shared_ns:bbb", 2_i32);
+        super::super::insert(&*global, "tests::other_ns:aaa", 3_i32);
+
+        assert!(
+            invalidate_namespace("tests::shared_ns"),
+            "a backend that can drop a namespace reports a complete invalidation"
+        );
+        assert_eq!(
+            super::super::get::<i32>(&*global, "tests::shared_ns:aaa"),
+            None
+        );
+        assert_eq!(
+            super::super::get::<i32>(&*global, "tests::shared_ns:bbb"),
+            None
+        );
+        assert_eq!(
+            super::super::get::<i32>(&*global, "tests::other_ns:aaa"),
+            Some(3),
+            "a neighbouring namespace must survive"
+        );
+
+        super::super::clear_global_cache();
+    }
+
+    #[test]
+    fn a_backend_that_cannot_enumerate_reports_an_incomplete_invalidation() {
+        // The honest signal: a custom backend with no way to pattern-match its
+        // key space must not let a caller believe the value is gone.
+        struct OpaqueBackend;
+        impl super::super::Cache for OpaqueBackend {
+            fn get_value(
+                &self,
+                _key: &str,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                None
+            }
+            fn insert_value(
+                &self,
+                _key: &str,
+                _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            ) {
+            }
+            fn invalidate(&self, _key: &str) {}
+            fn clear(&self) {}
+        }
+
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(OpaqueBackend));
+        assert!(!invalidate_namespace("tests::opaque_ns"));
+        super::super::clear_global_cache();
+    }
+
+    // ── declare_cached_read! ─────────────────────────────────────────
+
+    struct DeclaredModelA;
+    struct DeclaredModelB;
+
+    crate::declare_cached_read! {
+        id = "autumn_web::cache::coherence::tests::declared_fragment",
+        kind = Fragment,
+        reads = [DeclaredModelA, DeclaredModelB],
+    }
+
+    crate::declare_cached_read! {
+        id = "autumn_web::cache::coherence::tests::declared_read_through",
+        kind = ReadThrough,
+        reads = [DeclaredModelA],
+        acknowledge_stale = "the sidebar tolerates a stale count",
+    }
+
+    #[test]
+    fn a_manually_declared_read_reaches_the_manifest() {
+        let declared = registered_reads()
+            .into_iter()
+            .find(|r| r.id.ends_with("tests::declared_fragment"))
+            .expect("declare_cached_read! must register the read");
+        assert_eq!(declared.kind, ReadKind::Fragment);
+        assert_eq!(declared.provenance, DependencyProvenance::Declared);
+        assert_eq!(declared.reads.len(), 2);
+        assert!(
+            declared
+                .reads
+                .iter()
+                .any(|m| model_key(m) == "DeclaredModelA"),
+            "{:?}",
+            declared.reads
+        );
+        assert!(declared.location.contains("coherence.rs"));
+    }
+
+    #[test]
+    fn a_manually_declared_read_can_acknowledge_staleness() {
+        let declared = registered_reads()
+            .into_iter()
+            .find(|r| r.id.ends_with("tests::declared_read_through"))
+            .expect("declare_cached_read! must register the read");
+        assert_eq!(declared.kind, ReadKind::ReadThrough);
+        assert_eq!(
+            declared.acknowledged_stale.as_deref(),
+            Some("the sidebar tolerates a stale count")
+        );
+    }
+
+    #[test]
+    fn read_kind_spellings_are_stable() {
+        // These strings are the manifest's schema; renaming one silently would
+        // break every consumer.
+        assert_eq!(ReadKind::Cached.as_str(), "cached");
+        assert_eq!(ReadKind::Fragment.as_str(), "fragment");
+        assert_eq!(ReadKind::ReadThrough.as_str(), "read_through");
+        assert_eq!(DependencyProvenance::Declared.as_str(), "declared");
+        assert_eq!(DependencyProvenance::Derived.as_str(), "derived");
+        assert_eq!(DependencyProvenance::Undetermined.as_str(), "undetermined");
     }
 }

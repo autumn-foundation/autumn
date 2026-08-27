@@ -14,9 +14,12 @@
 //!
 //! See `docs/guide/cache-coherence.md`.
 
+use std::fmt::Write as _;
 use std::process::Command;
 
-use autumn_web::cache::coherence::{CoherenceManifest, format_diagnostic, parse_manifest_dump};
+use autumn_web::cache::coherence::{
+    CoherenceManifest, UndeterminedRead, format_diagnostic, gate_failed, parse_manifest_dump,
+};
 
 use crate::routes;
 
@@ -49,6 +52,11 @@ pub fn format_report(manifest: &CoherenceManifest, strict: bool) -> String {
             strict,
         ));
     }
+    let acknowledged = format_acknowledged_report(manifest);
+    if !acknowledged.is_empty() {
+        out.push('\n');
+        out.push_str(&acknowledged);
+    }
     out
 }
 
@@ -57,23 +65,52 @@ pub fn format_report(manifest: &CoherenceManifest, strict: bool) -> String {
 /// A warning by default — a checker that fails on what it merely could not read
 /// gets deleted from CI — and an error under `--strict`.
 #[must_use]
-pub fn format_undetermined_diagnostic(ids: &[String], strict: bool) -> String {
+pub fn format_undetermined_diagnostic(reads: &[UndeterminedRead], strict: bool) -> String {
     let level = if strict { "error" } else { "warning" };
     let mut out = format!(
         "{level}: {} cached read{} could not be linked to any model, so nothing about \
          {} coherence was proven\n",
-        ids.len(),
-        if ids.len() == 1 { "" } else { "s" },
-        if ids.len() == 1 { "its" } else { "their" },
+        reads.len(),
+        if reads.len() == 1 { "" } else { "s" },
+        if reads.len() == 1 { "its" } else { "their" },
     );
-    for id in ids {
-        out.push_str(&format!("  {id}\n"));
+    for read in reads {
+        let _ = writeln!(out, "  {} at {}", read.id, read.location);
     }
     out.push_str(
         "  fix: declare the dependency set with #[cached(reads(Model, …))], or acknowledge \
          the gap with #[cached(acknowledge_stale = \"…\")].\n",
     );
     out
+}
+
+/// Every acknowledged-stale opt-out in the manifest, so a hatch is never merely
+/// a number in the summary line.
+#[must_use]
+pub fn format_acknowledged_report(manifest: &CoherenceManifest) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for read in &manifest.dimensions.cached_reads.entries {
+        if let Some(reason) = &read.acknowledged_stale {
+            lines.push(format!("  {} at {}\n    {reason}", read.id, read.location));
+        }
+    }
+    for mutation in &manifest.dimensions.mutations.entries {
+        if let Some(reason) = &mutation.acknowledged_stale {
+            lines.push(format!(
+                "  {} at {}\n    {reason}",
+                mutation.name, mutation.location
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "note: {} acknowledged-stale opt-out{} are silencing the gate:\n{}\n",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
+        lines.join("\n"),
+    )
 }
 
 /// Run `autumn cache audit`.
@@ -84,6 +121,11 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_CACHE_COHERENCE", "1")
+        // Both of these are checked BEFORE the coherence dump in `AppBuilder::run`,
+        // so an exported one in the ambient environment would silently win and
+        // hand us a marker-less stdout.
+        .env_remove("AUTUMN_BUILD_STATIC")
+        .env_remove("AUTUMN_DUMP_ROUTES")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -105,8 +147,11 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Some(manifest) = parse_manifest_dump(&stdout) else {
         eprintln!(
-            "\u{2717} No cache-coherence manifest in the app's output. Rebuild against an \
-             autumn-web that supports `autumn cache audit` (0.8+)."
+            "\u{2717} The app produced no cache-coherence manifest. Either it was built against \
+             an autumn-web without `autumn cache audit` support, or it took a different startup \
+             path first \u{2014} `AUTUMN_BUILD_STATIC` and `AUTUMN_DUMP_ROUTES` are both handled \
+             before the manifest dump and are cleared for this run, so an app that exits earlier \
+             for its own reasons will land here too."
         );
         eprintln!("Raw output: {stdout}");
         std::process::exit(1);
@@ -127,15 +172,15 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
         println!("{}", format_report(&manifest, opts.strict));
     }
 
-    if manifest.violations.is_empty() && !(opts.strict && !manifest.undetermined_reads.is_empty()) {
+    if !gate_failed(&manifest, opts.strict) {
         eprintln!("\u{2713} No cached read can be left stale by a repository write.");
     }
 
     // The gate fails on a proven violation always, and on an undetermined
     // dependency set only under `--strict` — the default never fails on what it
     // merely could not read.
-    let failed = !manifest.violations.is_empty()
-        || (opts.strict && !manifest.undetermined_reads.is_empty());
+    let failed =
+        !manifest.violations.is_empty() || (opts.strict && !manifest.undetermined_reads.is_empty());
     std::process::exit(i32::from(failed));
 }
 
@@ -171,13 +216,17 @@ mod tests {
     #[test]
     fn report_names_the_violation() {
         let manifest = CoherenceManifest::build(
-            &[read("blog::recent", &["Post"], DependencyProvenance::Declared)],
+            &[read(
+                "blog::recent",
+                &["Post"],
+                DependencyProvenance::Declared,
+            )],
             &[mutation("blog::models::Post")],
         );
         let report = format_report(&manifest, false);
         assert!(report.contains("blog::recent"), "{report}");
         assert!(report.contains("PostRepository::save"), "{report}");
-        assert!(report.contains("#[invalidates("), "{report}");
+        assert!(report.contains("invalidates("), "{report}");
     }
 
     #[test]
@@ -209,7 +258,11 @@ mod tests {
     #[test]
     fn a_coherent_app_reports_nothing() {
         let manifest = CoherenceManifest::build(
-            &[read("blog::recent", &["Tag"], DependencyProvenance::Declared)],
+            &[read(
+                "blog::recent",
+                &["Tag"],
+                DependencyProvenance::Declared,
+            )],
             &[mutation("Post")],
         );
         let report = format_report(&manifest, false);
@@ -220,7 +273,11 @@ mod tests {
     #[test]
     fn manifest_round_trips_through_the_dump_protocol() {
         let manifest = CoherenceManifest::build(
-            &[read("blog::recent", &["Post"], DependencyProvenance::Declared)],
+            &[read(
+                "blog::recent",
+                &["Post"],
+                DependencyProvenance::Declared,
+            )],
             &[mutation("Post")],
         );
         let mut dump = String::from("some unrelated startup logging\n");

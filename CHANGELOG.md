@@ -76,8 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, not a string in a table somebody has to keep in sync. Alternatively
   `acknowledge_stale = "reason"` opts out, with a mandatory non-blank reason that
   lands in the manifest so every escape hatch is visible in review. A repository
-  that declares any edge also gets a generated `invalidate_declared_caches()`
-  that really does clear those reads. Deliberately conservative in the direction
+  that declares any edge also gets a generated `invalidate_declared_caches()` that
+  really does clear those reads — including on a shared cross-replica backend, via
+  a new `Cache::invalidate_namespace` that `MokaCache` implements by iteration and
+  `RedisCache` by a `SCAN MATCH` one segment narrower than its existing `clear`; a
+  custom backend that cannot pattern-match its key space returns `false`, and the
+  caller is told so rather than left believing the value is gone.
+  Deliberately conservative in the direction
   that keeps the gate alive: a read whose dependency set could not be
   established is `undetermined` — reported in the manifest and the summary, never
   failed, unless `--strict` — because a checker that fails on what it merely

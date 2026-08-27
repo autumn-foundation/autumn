@@ -17,24 +17,32 @@ build can assemble the dependency graph and **prove** coherence rather than
 test for it.
 
 ```console
-$ autumn cache audit
+$ autumn cache audit -p saas          # after deleting the invalidates(...) clause
 🍂 autumn cache audit
 
-4 cached reads (3 declared, 1 derived, 0 undetermined), 8 repository mutations, 0 acknowledged-stale
+1 cached reads (1 declared, 0 derived, 0 undetermined), 16 repository mutations, 0 acknowledged-stale
 
 error: 1 cached read can be left stale by a repository write
 
-  ProjectRepository::save mutates saas::models::Project
-    but the cached read saas::repositories::cached_project_count is derived from it
-    and is never invalidated.
-      read     examples/saas/src/repositories.rs:41
-      mutation examples/saas/src/repositories.rs:33
-    fix: add #[invalidates(saas::repositories::cached_project_count)] to the write, or
+  the cached read saas::repositories::cached_project_count is derived from saas::models::Project,
+    which 8 repository writes mutate without invalidating it:
+      ProjectRepository::delete_by_id, ProjectRepository::delete_many, ProjectRepository::save, ProjectRepository::save_many, ProjectRepository::save_many_skip_invalid, ProjectRepository::update, ProjectRepository::update_many, ProjectRepository::upsert_many
+    read at    examples/saas/src/repositories.rs:50
+    written at examples/saas/src/repositories.rs:29
+    fix: add invalidates(saas::repositories::cached_project_count) to the repository, or
          acknowledge the staleness with #[acknowledge_stale(reason = "…")].
 
 $ echo $?
 1
 ```
+
+That is the shipped `examples/saas` with one clause removed; put it back and the
+same command exits `0` with `✓ No cached read can be left stale by a repository
+write.`
+
+One missing edge is one finding block, not one per generated write method — the
+fix is a single attribute, so the report names a single edit and lists the
+writes it covers.
 
 ## Quick start
 
@@ -123,6 +131,12 @@ async fn feed() -> Vec<Entry> { … }
 Each entry is a **path**, so a typo is a compile error at the declaration site.
 The manifest tags these `declared`.
 
+Declared beats derived: an explicit `reads(...)` replaces the analysis rather
+than being cross-checked against it. That is the point — you know what the
+function reads and the analysis only guesses — but it does mean
+`#[cached(reads(Tag))]` on a function that actually reads `Post` audits clean.
+The declaration is trusted; make it true.
+
 ### Derivation — the fallback
 
 Omit `reads(...)` and the macro recovers what it can from the function's own
@@ -130,13 +144,23 @@ signature and body:
 
 * a repository type anywhere in scope — `PgPostRepository`, `impl PostRepository`,
   a parameter, a turbofish — names `Post`;
-* a reading associated call — `Post::find_all(db)`, `Post::find_by_id(…)` — names
-  `Post`.
+* a reading associated call on a model type, from a **closed list** of verbs
+  (`find_all`, `find_by_id`, `count`, `exists_by_id`, `list`, `page`, `all`,
+  `load`, `first`) — `Post::find_all(db)` names `Post`, `Post::find_by_slug(…)`
+  does not.
 
-The manifest tags these `derived`. Derivation is sound for what it finds and
-**silent about what it cannot see**: a dependency reached through a helper
-function the analysis cannot read is missed. That is why a read it recovers
-nothing from is not treated as having no dependencies.
+The manifest tags these `derived`, and that tag is doing real work — it is a
+weaker claim than `declared` in two directions:
+
+* **Incomplete.** A dependency reached through a helper function the analysis
+  cannot read is missed. That is why a read it recovers nothing from is recorded
+  as `undetermined` rather than as having no dependencies.
+* **Approximate.** The model is recovered from the repository *type name* by the
+  `Pg{Model}Repository` convention the macro itself generates. A repository trait
+  deliberately named against that convention — `StatsRepository` over a `Stat`
+  model — yields `Stats`, which matches nothing.
+
+Declare `reads(...)` wherever the answer matters.
 
 ### `undetermined` — reported, never failed
 
@@ -154,6 +178,9 @@ Read the summary line before you trust a green build:
 ```
 
 A green audit over mostly-`undetermined` reads proves very little, and says so.
+Each undetermined read is listed with its `file:line`, as is every
+acknowledged-stale opt-out and its reason — a hatch should never be just a
+number in a summary line.
 
 ## Discharging an obligation
 
@@ -175,11 +202,19 @@ A repository that declares any edge also gets a generated invalidator:
 
 ```rust
 repo.save(&new).await?;
-PgPostRepository::invalidate_declared_caches();
+if !PgPostRepository::invalidate_declared_caches() {
+    tracing::warn!("cache backend cannot drop a namespace; entries may still be served");
+}
 ```
 
-It returns whether every declared read was invalidated **completely** — see
-[What this does not prove](#what-this-does-not-prove).
+It is `#[must_use]`: it returns whether every declared read was invalidated
+**completely**, and an ignored `false` means the stale value is still being
+served. See [What this does not prove](#what-this-does-not-prove).
+
+A method-level `#[invalidates(...)]` is folded into the same call. That
+over-invalidates on other write paths, which is safe; the alternative — an edge
+that discharges the gate with nothing callable behind it — is the paperwork this
+feature exists to prevent.
 
 ### 2. Or acknowledge the staleness
 
@@ -210,13 +245,26 @@ autumn_web::declare_cached_read! {
 }
 ```
 
-`id` must be the namespace the call site passes to the cache, so an invalidation
-edge and the runtime key agree. `kind` is `Cached`, `Fragment` or `ReadThrough`.
-A trailing `acknowledge_stale = "…"` opts the read out.
+`id` is the read's identity in the manifest, and — for a read-through entry —
+the key prefix to invalidate by. It is **not** derived from the call site:
+`cache_fragment` builds its own key (`fragment:{len}:{identity}:{version}`) and
+`get_or_compute` takes a whole key, so keeping the two in step is on you.
+Namespace the id like a module path so it cannot collide with a `#[cached]`
+function's. `kind` is `Cached`, `Fragment` or `ReadThrough`; each model is a
+path (not an arbitrary type — `Vec<Post>` is rejected, because a wrapper's name
+is not a model's); a trailing `acknowledge_stale = "…"` opts the read out, with
+the same non-empty-reason rule the attributes enforce.
+
+A call site that does **not** declare itself is invisible to the gate. A clean
+audit says nothing about it, which is why `undeclared_cache_call_sites` is named
+in the manifest's `excluded` list.
 
 Because a manual declaration has no `#[cached]` function to hang an identity
 constant on, `invalidates(...)` cannot name it; today such a read is covered by
 `acknowledge_stale`, or by keeping it out of the mutated model's blast radius.
+Invalidate it at runtime with
+`autumn_web::cache::coherence::invalidate_namespace(id)`, which takes the same
+id string.
 
 ## Asserting coherence from your own tests
 
@@ -253,34 +301,39 @@ $ autumn cache audit --manifest target/cache-coherence.json --json
     "cached_reads": {
       "provenance": "provable",
       "source": "macro:#[cached] / declare_cached_read!",
+      "runtime_caveat": "each entry's EXISTENCE is proven … but its dependency set is only as strong as the entry's own `provenance` field says …",
       "entries": [
         {
           "id": "saas::repositories::cached_project_count",
           "kind": "cached",
           "reads": ["saas::models::Project"],
           "provenance": "declared",
-          "location": "examples/saas/src/repositories.rs:41"
+          "location": "examples/saas/src/repositories.rs:50"
         }
       ]
     },
     "mutations": {
       "provenance": "provable",
       "source": "macro:#[repository]",
+      "runtime_caveat": "every entry is proven, but the SET is not exhaustive: only `#[repository]` write methods are here …",
       "entries": [
         {
-          "name": "ProjectRepository::save",
-          "model": "saas::models::Project",
-          "table": "projects",
-          "location": "examples/saas/src/repositories.rs:33"
+          "name": "PasswordResetTokenRepository::delete_by_id",
+          "model": "saas::models::PasswordResetToken",
+          "table": "password_reset_tokens",
+          "location": "examples/saas/src/repositories.rs:71"
         }
       ]
     },
     "invalidations": {
-      "provenance": "declared",
+      "provenance": "provable",
       "source": "macro:#[repository(..., invalidates(...))]",
-      "runtime_caveat": "the edge's target is proven … that the invalidator is actually CALLED on the write path is not proven by this slice",
+      "runtime_caveat": "the edge's target is proven … That the invalidator is actually CALLED on the write path is not proven by this slice …",
       "entries": [
-        { "mutation": "ProjectRepository::save", "read": "saas::repositories::cached_project_count" }
+        {
+          "mutation": "ProjectRepository::delete_by_id",
+          "read": "saas::repositories::cached_project_count"
+        }
       ]
     }
   },
@@ -290,12 +343,26 @@ $ autumn cache audit --manifest target/cache-coherence.json --json
 }
 ```
 
-Dimensions carry a **provenance class** with the same meaning as in the
-[security posture manifest](security-posture-manifest.md): `provable` is
-recovered from macro-expanded code alone, `declared` is something you wrote down
-that the runtime then has to honour. `excluded` names what this slice
-deliberately does not look at, so a reader can tell "we checked and it was fine"
-from "we never looked".
+(Abridged: the real document lists all 16 mutations and the full caveat text.)
+
+### Two provenance vocabularies, deliberately
+
+The **dimension** level uses the same three classes as the
+[security posture manifest](security-posture-manifest.md) — `provable`,
+`declared`, `runtime-only` — with the same meanings and the same rubric. All
+three dimensions here are `provable`: each is recovered from macro-expanded code
+with no config read and no process started. Where a dimension has an adjacent
+weak step it carries a `runtime_caveat` rather than being demoted, which is that
+rubric's stated tie-breaker — the invalidation edge is genuinely proven, and
+what is *not* proven is that the invalidator runs.
+
+The **entry** level of `cached_reads` uses a second, narrower vocabulary —
+`declared` / `derived` / `undetermined` — describing how one read's dependency
+set was established. It shares the `declared` spelling with the dimension
+classes and means something different; read them as two scopes, not one scale.
+
+`excluded` names what this slice deliberately does not look at, so a reader can
+tell "we checked and it was fine" from "we never looked".
 
 ## What this does not prove
 
@@ -303,12 +370,28 @@ from "we never looked".
   names a real cached read. Whether `invalidate_declared_caches()` is actually
   called on the write path is the `invalidations` dimension's `runtime_caveat`;
   wiring it automatically through repository commit hooks is the next slice.
-* **Complete invalidation under a shared backend.** A per-function Moka store
-  holds only that function's entries, so clearing it *is* namespace
-  invalidation. A process-level shared backend (`set_global_cache`, e.g. Redis)
-  keys every cached function into one store with no way to enumerate a
-  namespace, so `invalidate_namespace` returns `false` there — the honest signal
-  that a backend-specific mechanism is needed.
+* **Complete invalidation under an opaque backend.** Namespace invalidation
+  clears the read's own per-function store *and* asks the registered backend to
+  drop the namespace — `MokaCache` by iteration, `RedisCache` by a `SCAN MATCH`
+  one segment narrower than its `clear`. A custom `Cache` implementation that
+  cannot pattern-match its key space returns `false` from
+  `Cache::invalidate_namespace`, and `invalidate_declared_caches()` reports that
+  `false` verbatim rather than letting you believe the value is gone. It is
+  `#[must_use]` for exactly that reason.
+* **Which writes exist.** Only `#[repository]` write methods are in the mutated
+  set. A hand-rolled repository, a raw diesel `update`/`insert`/`delete`, a
+  migration, or a job that writes directly is invisible to the gate — so a
+  cached read those dirty audits clean. The manifest names this under
+  `excluded`, along with `CacheResponseLayer`, whose entries are keyed by URI
+  with no annotated item to derive a dependency set from.
+* **That a declared dependency set is true.** `reads(...)` replaces the analysis
+  rather than being checked against it, so naming the wrong model audits clean.
+  A `derived` set is an approximation of a different kind — see
+  [Derivation](#derivation--the-fallback).
+* **That a declared dependency set is true.** `reads(...)` replaces the analysis
+  rather than being checked against it, so naming the wrong model audits clean.
+  A `derived` set is an approximation of a different kind — see
+  [Derivation](#derivation--the-fallback).
 * **Row- or column-level precision.** Granularity is the model/table. A read
   derived from one column of one row is treated as depending on the whole model,
   which over-approximates — a false *failure*, never a false pass.
@@ -319,15 +402,20 @@ from "we never looked".
 
 ## Model identity, and one way it over-approximates
 
-Models are matched on their **last path segment**, because the two sides learn
-the name differently: a `#[repository]` always has the model type in scope and
-publishes `core::any::type_name` (`blog::models::Post`), while a dependency
-recovered from a `#[cached]` body may only be the bare ident (`Post`).
+The two sides learn a model's name differently. A `#[repository]` always has the
+model type in scope and publishes `core::any::type_name` (`blog::models::Post`);
+so does `reads(...)`. But a dependency the macro *derived* from a function body
+may only be the bare ident (`Post`), because the model type is often not in
+scope at the cached function at all — a `PgPostRepository` parameter does not
+bring `Post` with it.
 
-Two same-named models in different modules therefore collide, and the gate
-over-approximates. That is the safe direction — a false failure, never a false
-pass — and `reads(...)` with a fully-qualified path plus `acknowledge_stale` are
-the release valves.
+So matching compares **full paths when both sides have one**, which keeps
+`plugin::models::User` and `crate::models::User` apart, and falls back to the
+bare type name only when one side is all the analysis could recover. In that
+fallback a same-named model in another module collides and the gate
+over-approximates — the safe direction, a false failure rather than a false
+pass. Declaring `reads(crate::models::User)` resolves it, because a declared set
+is always fully qualified.
 
 ## Reference
 
@@ -335,12 +423,13 @@ the release valves.
 
 | Attribute | Meaning |
 |-----------|---------|
-| `key(a, b)` | build the cache key from these parameters only — this is what lets a cached read take the repository handle it reads through |
+| `key(a, b)` | build the cache key from these parameters only — this is what lets a cached read take the repository handle it reads through. **Every parameter you leave out must not be able to change the result**, or the cache will serve one parameter's answer for another's; the gate does not check this |
 | `reads(Model, …)` | declared dependency set |
 | `acknowledge_stale = "…"` | opt out of the gate, with a mandatory reason |
 
-Apply `#[cached]` to a **free function**: the expansion emits items beside it,
-which an `impl` block cannot hold.
+`#[cached]` still works wherever it did before, associated functions included:
+the coherence registration is placed inside the function body precisely so an
+`impl` block can hold it.
 
 ### `#[repository]`
 

@@ -13,10 +13,13 @@ This is the view-layer companion to Autumn's other caching primitives:
 | `CacheResponseLayer` | whole HTTP responses | per-URL |
 | **`cache_fragment`** | **rendered `Markup`** | **per-fragment** |
 
-Whichever you reach for, [`autumn cache audit`](cache-coherence.md) proves at
-build time that no `#[repository]` write can leave it stale — declare a
-fragment's dependency set with `declare_cached_read!`, and a `#[cached]`
-function's with `reads(...)`.
+For the first two rows, [`autumn cache audit`](cache-coherence.md) proves at
+build time that no `#[repository]` write can leave the value stale — declare a
+`#[cached]` function's dependency set with `reads(...)`, and a fragment's with
+`declare_cached_read!`. Whole-response caching is **not** covered: a
+`CacheResponseLayer` entry is keyed by URI with no annotated item naming what it
+was derived from, and the coherence manifest lists it under `excluded` rather
+than pretending otherwise.
 
 Whole-response caching is too coarse — any per-user chrome (a CSRF token, a
 "signed in as…" banner) busts the entire page. Data caching skips the query but

@@ -1191,6 +1191,21 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
 
+    /// Cache-coherence tooling — prove no write can leave a cached read stale.
+    ///
+    /// `autumn cache audit` compiles the application, reads back the
+    /// cache-coherence manifest the framework assembles from every `#[cached]`
+    /// read and every `#[repository]` write it links, and exits non-zero when a
+    /// write can strand a cached value with no invalidation covering the pair.
+    ///
+    /// # Examples
+    ///
+    ///   autumn cache audit
+    ///   autumn cache audit --manifest target/cache-coherence.json
+    ///   autumn cache audit --strict -p blog
+    #[command(subcommand, verbatim_doc_comment)]
+    Cache(CacheSubcommands),
+
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -1199,11 +1214,6 @@ enum Commands {
     /// Rows are stable-sorted by path, then method, so the output is
     /// diff-friendly. Redirect to a file and `git diff` two snapshots to
     /// audit route changes between commits.
-    /// Cache-coherence tooling (issue #1716).
-    Cache {
-        #[command(subcommand)]
-        command: CacheSubcommands,
-    },
     Routes {
         /// Package to inspect (for workspaces).
         #[arg(short, long)]
@@ -3637,16 +3647,13 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
-        Commands::Cache {
-            command:
-                CacheSubcommands::Audit {
-                    package,
-                    bin,
-                    manifest,
-                    json,
-                    strict,
-                },
-        } => {
+        Commands::Cache(CacheSubcommands::Audit {
+            package,
+            bin,
+            manifest,
+            json,
+            strict,
+        }) => {
             cache_audit::run(&cache_audit::CacheAuditOptions {
                 package: package.as_deref(),
                 bin: bin.as_deref(),

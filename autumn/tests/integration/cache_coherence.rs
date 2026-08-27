@@ -67,7 +67,10 @@ pub async fn coherence_tag_labels() -> Vec<String> {
 }
 
 /// An opted-out read: the gate must leave it alone.
-#[autumn_web::cached(reads(CoherencePost), acknowledge_stale = "5s TTL is tight enough here")]
+#[autumn_web::cached(
+    reads(CoherencePost),
+    acknowledge_stale = "5s TTL is tight enough here"
+)]
 pub async fn coherence_ticker() -> i64 {
     0
 }
@@ -155,8 +158,17 @@ fn an_acknowledged_read_carries_its_reason() {
 fn every_repository_write_registers_a_mutation() {
     let mutations = this_modules_mutations();
     let methods: Vec<&str> = mutations.iter().map(|m| m.method.as_str()).collect();
-    for expected in ["save", "update", "delete_by_id", "update_many", "delete_many"] {
-        assert!(methods.contains(&expected), "missing {expected} in {methods:?}");
+    for expected in [
+        "save",
+        "update",
+        "delete_by_id",
+        "update_many",
+        "delete_many",
+    ] {
+        assert!(
+            methods.contains(&expected),
+            "missing {expected} in {methods:?}"
+        );
     }
     assert!(
         !methods.contains(&"find_all"),
@@ -187,7 +199,10 @@ fn the_gate_catches_the_seeded_bug_and_only_the_seeded_bug() {
     let mutations = this_modules_mutations();
     let findings = coherence::check(&reads, &mutations);
 
-    assert!(!findings.is_empty(), "the seeded staleness bug must be caught");
+    assert!(
+        !findings.is_empty(),
+        "the seeded staleness bug must be caught"
+    );
     let stale: std::collections::BTreeSet<&str> =
         findings.iter().map(|f| f.read.as_str()).collect();
     assert_eq!(
@@ -196,7 +211,11 @@ fn the_gate_catches_the_seeded_bug_and_only_the_seeded_bug() {
         "exactly one read is uncovered, got {stale:?}"
     );
     assert!(
-        stale.iter().next().unwrap().ends_with("coherence_post_count"),
+        stale
+            .iter()
+            .next()
+            .unwrap()
+            .ends_with("coherence_post_count"),
         "got {stale:?}"
     );
 
@@ -215,7 +234,10 @@ fn the_manifest_is_emitted_as_a_build_artifact() {
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["dimensions"]["cached_reads"]["provenance"], "provable");
     assert_eq!(json["dimensions"]["mutations"]["provenance"], "provable");
-    assert_eq!(json["dimensions"]["invalidations"]["provenance"], "declared");
+    assert_eq!(
+        json["dimensions"]["invalidations"]["provenance"],
+        "declared"
+    );
     assert!(
         !json["dimensions"]["invalidations"]["runtime_caveat"]
             .as_str()
@@ -234,20 +256,46 @@ fn the_manifest_is_emitted_as_a_build_artifact() {
 
 #[test]
 fn the_generated_invalidator_actually_drops_the_cached_value() {
-    // A runtime check that the declared edge is not merely paperwork: the
-    // helper the macro generates really does clear the read's namespace.
+    // A runtime check that the declared edge is not merely paperwork. Asserting
+    // only the returned bool would pass with an empty function body, so this
+    // watches the value itself: the read is memoized, the source changes, and
+    // the next call must see the change only because the invalidator ran.
+    static SOURCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+    #[autumn_web::cached(reads(CoherencePost))]
+    async fn coherence_memoized_source() -> i64 {
+        SOURCE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
+
     rt.block_on(async {
-        // Populate the per-function store.
-        let _ = coherence_recent_titles().await;
+        assert_eq!(coherence_memoized_source().await, 1);
+        SOURCE.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            coherence_memoized_source().await,
+            1,
+            "the value must really be memoized, or this test proves nothing"
+        );
+
+        assert!(
+            __autumn_cache_invalidate__coherence_memoized_source(),
+            "with no backend that refuses namespace invalidation, it must be complete"
+        );
+
+        assert_eq!(
+            coherence_memoized_source().await,
+            2,
+            "the invalidator must have dropped the memoized value"
+        );
     });
-    assert!(
-        PgCoherencePostRepository::invalidate_declared_caches(),
-        "with no shared backend registered, invalidation must be complete"
-    );
+
+    // And the repository-wide helper the macro generates reaches its declared
+    // edge the same way.
+    assert!(PgCoherencePostRepository::invalidate_declared_caches());
 }
 
 // ── The success metric ───────────────────────────────────────────────
