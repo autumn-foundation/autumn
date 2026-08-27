@@ -2,6 +2,7 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
+use autumn_web::seo::SeoMeta;
 use autumn_web::widgets::{ReactionControls, reaction_controls};
 use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, Markup, PreEscaped, html};
 
@@ -83,9 +84,43 @@ pub fn nav_auth_markup(username: Option<&str>) -> Markup {
 /// Base HTML layout wrapping page content.
 ///
 /// Accepts an optional `username` to show login/logout state in the nav.
+///
+/// This is the plain-title entry point, and most pages use it. It builds a
+/// [`SeoMeta`] that holds only the title and calls [`layout_with_seo`]. Pages
+/// that want more meta tags — a description, a canonical URL, Open Graph
+/// values, a `robots` directive — call [`layout_with_seo`] directly with the
+/// builder the `SeoMeta` extractor gave them.
 #[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
 pub fn layout(
     title: &str,
+    username: Option<&str>,
+    csrf_token: Option<&str>,
+    content: Markup,
+) -> Markup {
+    layout_with_seo(
+        SeoMeta::new().title(format!("{title} \u{2014} Autumn Reddit")),
+        username,
+        csrf_token,
+        content,
+    )
+}
+
+/// Base HTML layout that takes an explicit [`SeoMeta`] builder.
+///
+/// [`SeoMeta::render`] writes the `<title>` tag, so `seo` must carry a title.
+/// The route attribute usually supplies it:
+///
+/// ```rust,ignore
+/// #[get("/about", seo(title = "About \u{2022} Autumn Reddit"))]
+/// pub async fn about(seo: SeoMeta) -> Markup {
+///     layout_with_seo(seo, None, None, html! { /* ... */ })
+/// }
+/// ```
+///
+/// See `docs/guide/seo.md`.
+#[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
+pub fn layout_with_seo(
+    seo: SeoMeta,
     username: Option<&str>,
     csrf_token: Option<&str>,
     content: Markup,
@@ -96,7 +131,10 @@ pub fn layout(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " — Autumn Reddit" }
+                // One call writes <title>, the description, the canonical
+                // link, the Open Graph tags, and the Twitter card tags — but
+                // only the ones this page actually set (see docs/guide/seo.md).
+                (seo.render())
                 // Embed CSRF token in a meta tag so htmx JS can read it
                 // (the autumn-csrf cookie is HttpOnly and inaccessible to JS)
                 @if let Some(token) = csrf_token {
@@ -255,8 +293,122 @@ pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use autumn_web::html;
+    use autumn_web::seo::SeoMeta;
 
-    use super::layout;
+    use super::{layout, layout_with_seo};
+
+    #[test]
+    fn layout_still_renders_the_site_title_suffix() {
+        let rendered = layout("Front Page", None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>Front Page \u{2014} Autumn Reddit</title>"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_renders_every_declared_tag() {
+        let seo = SeoMeta::new()
+            .title("hello \u{2022} r/rust \u{2022} Autumn Reddit")
+            .description("A post about Rust.")
+            .canonical("https://autumn-reddit.example.com/r/rust/posts/hello")
+            .og_type("article")
+            .twitter_card("summary_large_image");
+
+        let rendered = layout_with_seo(seo, None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>hello \u{2022} r/rust \u{2022} Autumn Reddit</title>"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta name="description" content="A post about Rust.">"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#"<link rel="canonical" href="https://autumn-reddit.example.com/r/rust/posts/hello">"#
+            ),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta property="og:type" content="article">"#),
+            "rendered: {rendered}"
+        );
+        // og:title and og:description fall back to the page title and
+        // description, so the app sets each value one time.
+        assert!(
+            rendered.contains(r#"<meta property="og:title" content="hello"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"<meta name="twitter:card" content="summary_large_image">"#),
+            "rendered: {rendered}"
+        );
+        // og:url falls back to the canonical URL.
+        assert!(
+            rendered.contains(
+                r#"<meta property="og:url" content="https://autumn-reddit.example.com/r/rust/posts/hello">"#
+            ),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_emits_only_the_tags_a_page_sets() {
+        let rendered =
+            layout_with_seo(SeoMeta::new().title("Plain"), None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains("<title>Plain</title>"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("og:type"),
+            "an unset value must emit no tag; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("rel=\"canonical\""),
+            "an unset value must emit no tag; rendered: {rendered}"
+        );
+    }
+
+    /// `noindex, follow` is the directive a thin-but-linking page wants: keep
+    /// this page out of the index, but let crawlers walk through to the pages
+    /// that belong in it. `routes::auth::profile` declares exactly this.
+    #[test]
+    fn layout_with_seo_renders_noindex_follow_for_a_profile_page() {
+        let seo = SeoMeta::new()
+            .title("u/ferris \u{2022} Autumn Reddit")
+            .robots("noindex, follow")
+            .og_type("profile");
+
+        let rendered = layout_with_seo(seo, None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"<meta name="robots" content="noindex, follow">"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("nofollow"),
+            "`follow` must not be rendered as `nofollow`; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn layout_with_seo_renders_a_noindex_directive() {
+        let seo = SeoMeta::new()
+            .title("Submit a post \u{2022} Autumn Reddit")
+            .robots("noindex, nofollow");
+
+        let rendered = layout_with_seo(seo, Some("ferris"), None, html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"<meta name="robots" content="noindex, nofollow">"#),
+            "rendered: {rendered}"
+        );
+    }
 
     #[test]
     fn layout_loads_framework_csrf_script_from_same_origin() {
