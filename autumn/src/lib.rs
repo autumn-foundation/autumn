@@ -393,6 +393,17 @@ pub mod __fuzz {
     // Cookie / signed-session decode.
     pub use crate::session::__fuzz_decode_cookie as decode_cookie;
 
+    // Sandboxed-plugin decoders (#1609). Both parse bytes produced by an
+    // artifact the operator has explicitly NOT audited: the `.autumn-plugin`
+    // container and the NDJSON frames a guest writes. `plugin-sandbox` is not a
+    // default feature, so the `fuzz/` crate enables it.
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_guest_frame as parse_sandbox_guest_frame;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_parse_manifest as parse_sandbox_manifest;
+    #[cfg(feature = "plugin-sandbox")]
+    pub use crate::plugin_sandbox::__fuzz_read_artifact as read_sandbox_artifact;
+
     // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
     #[cfg(feature = "inbound-mail")]

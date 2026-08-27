@@ -69,3 +69,31 @@ pub use wire::{
     ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, RESERVED_RESPONSE_HEADERS,
     SENSITIVE_REQUEST_HEADERS, SandboxRequest, SandboxResponse, WireError, response_header_allowed,
 };
+
+// ── fuzzing seams (issue #1611's `__fuzz` convention) ────────────────────
+//
+// Everything here decodes bytes that came out of an artifact the operator
+// explicitly did not audit, which is exactly the shape #1611 asks to be fuzzed.
+// The functions are thin wrappers so `fuzz/` needs no knowledge of the module's
+// internals and the crate-private wire types stay crate-private.
+
+/// Decode a `.autumn-plugin` container. Fuzzing seam; not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_read_artifact(bytes: &[u8]) -> bool {
+    SandboxArtifact::read(bytes).is_ok()
+}
+
+/// Parse one NDJSON frame as a guest would have written it. Fuzzing seam.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
+    wire::from_line::<wire::GuestFrame>(line).is_ok()
+}
+
+/// Parse a manifest. Fuzzing seam; not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_parse_manifest(src: &str) -> bool {
+    SandboxManifest::parse(src).is_ok()
+}

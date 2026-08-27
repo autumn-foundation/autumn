@@ -227,7 +227,16 @@ edge = ["dep:autumn-edge"]
 # Purely additive and host-only: the native `Plugin` trait is untouched and no
 # existing app changes shape. `wasmi` is a pure-Rust interpreter (no codegen
 # backend, no C toolchain), so enabling this keeps the single-binary deploy
-# story intact. Off by default — without it none of `plugin_sandbox` compiles.
+# story intact.
+#
+# Not a default feature of `autumn-web`: an application opts in explicitly.
+# Note that `autumn-cli` enables it unconditionally (its `plugin package` /
+# `plugin inspect` commands read and write the container and load the module
+# into the same sandbox the runtime uses), so a `--workspace` build of this
+# repo does compile it via feature unification. That is deliberate — it means
+# the always-on workspace clippy and test lanes cover the module — but it is
+# why "off by default" is a statement about `autumn-web`'s feature set, not
+# about every build in the tree.
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]

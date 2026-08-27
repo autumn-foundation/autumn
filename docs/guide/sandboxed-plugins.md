@@ -139,9 +139,11 @@ ambient:
 
 - `SystemTime::now()` returns a **fixed** instant. The host's clock is not a
   capability a plugin was granted.
-- `random_get` returns a **deterministic** stream, identical on every request.
-  Do not derive anything security-relevant from it. (You have no capability to
-  do anything security-relevant with it either, which is the point.)
+- `random_get` returns a **deterministic** stream, seeded from the request. The
+  same request replays byte-for-byte, so you can reproduce a bug from the
+  request alone — but it is not entropy, and nothing security-relevant may be
+  derived from it. (You hold no capability that would make a secret useful,
+  which is the point.)
 
 Both make a plugin a function of its request, which is what lets an author
 reproduce a bug from the request alone.
@@ -200,6 +202,10 @@ Every one of these is a hard error, not a warning:
 | `prefix = "/"`, `/{tenant}`, `/a//b`, `/a/../b` | a boundary that matches dynamically is not one |
 | no `[[routes]]` | a sandboxed plugin serves exactly what it declares |
 | a zero or oversized limit | a zero ceiling means "cannot run", not "no limit" |
+| `memory_bytes × max_concurrency` over 1 GiB | that product, not its factors, is what the plugin can cost the host |
+| a route path the router would refuse — `:id`, `*rest`, `{id`, `{*rest}/more` | `axum::Router::route` *panics* on one, so a manifest that passed would take the app down at boot |
+| two routes that are one route to the router (`/{a}` and `/{b}`) | same |
+| a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
 
 ---
@@ -287,10 +293,10 @@ router at all.
 
 | Ceiling | What it bounds | What happens at the edge |
 |---|---|---|
-| `fuel` | instructions executed for one request | 504 on the plugin's prefix |
+| `fuel` | instructions executed for one request, **and** host-side bytes copied on the guest's behalf, at 64 bytes per unit | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
-| `max_response_bytes` | the frame accepted back | 504 (a guest that writes without ever ending a frame is cut off) |
+| `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
 
 `max_concurrency × memory_bytes` is the most memory this plugin can cost the
@@ -310,17 +316,49 @@ plugin does can abort, exit, or panic the host process.
 
 Stripped from the **request** before it reaches the guest: `cookie`,
 `authorization`, `proxy-authorization`, `www-authenticate`,
-`proxy-authenticate`. The sandbox grants no session or auth capability, so a
-credential reaching a plugin could only ever be a liability — and a plugin that
-echoed request headers would leak one.
+`proxy-authenticate`, and the headers that are bearer tokens in practice even
+though the RFCs do not call them credentials — `x-csrf-token`, `x-xsrf-token`,
+`x-api-key`, `x-auth-token`, `api-key`. The CSRF one is load-bearing: Autumn's
+own htmx integration attaches it to every same-origin request, so without it a
+plugin route reached from one of your pages would be handed the caller's token.
+The sandbox grants no session or auth capability, so a credential reaching a
+plugin could only ever be a liability — and a plugin that echoed request headers
+would leak one.
 
-Stripped from the **response**, each strip logged as a denial: `set-cookie`
-(a plugin that could set a cookie could forge a session in your origin),
-`content-length`, `content-encoding`, `transfer-encoding`, `connection`,
-`keep-alive`, `upgrade`, `te`, `trailer`. A header name or value carrying
-`\r\n` is refused outright — that would be response splitting.
+On the way back, an **allowlist** — because a deny-list is a blocklist against
+a header registry that keeps growing. A plugin may set `content-type`,
+`content-language`, `content-disposition`, `cache-control`, `etag`, `expires`,
+`last-modified`, `location`, `retry-after`, `vary`, `age`, `accept-ranges`,
+`content-range`, and any `x-`-prefixed header of its own. Everything else is
+stripped and each strip is logged as a denial — `set-cookie` (a plugin that
+could set a cookie could forge a session in your origin),
+`strict-transport-security` and `clear-site-data` (origin-wide and persistent),
+the framing headers your HTTP stack owns, and the host's own
+`x-autumn-sandboxed` / `x-content-type-options`, which a plugin must not be able
+to forge. A header name or value carrying `\r\n` is refused outright — that
+would be response splitting.
 
-Every response carries `x-autumn-sandboxed: <plugin-name>` and
+The **content type** is part of the same boundary, and it is the one most worth
+understanding. A response is served from *your* origin, so an
+`application/javascript` body under a default `script-src 'self'` is script
+execution in your origin, and a `text/html` body is a document in it. Neither is
+a capability this slice grants and neither can be made safe by a header your own
+security middleware is entitled to overwrite. So the first slice serves data,
+not documents:
+
+| Allowed | Refused |
+| --- | --- |
+| `text/plain`, `text/csv` | `text/html`, `application/xhtml+xml` |
+| `application/json` | `application/javascript`, `text/css` |
+| `application/octet-stream` | `image/svg+xml` (a document that can script) |
+| `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/avif` | everything else |
+
+Anything else is a 502 with the type named in the log. Widening this is a later
+slice's job, and the honest way to do it is to serve a plugin's documents from
+an origin of their own.
+
+Every response — including the 413, the 503 and the 502 the guest never ran for
+— carries `x-autumn-sandboxed: <plugin-name>` and
 `x-content-type-options: nosniff`, and a response with no `content-type` gets
 `application/octet-stream` rather than being left for a browser to guess at.
 
@@ -330,7 +368,7 @@ Every refused reach is recorded and logged at `warn` with the capability class
 and the operation:
 
 ```text
-WARN sandboxed plugin was denied a capability during a request
+WARN sandboxed plugin was denied a capability it reached for
      plugin="autumn-plugin-hello" capability="filesystem" operation="path_open"
      detail="a sandboxed plugin has no filesystem"
 ```
@@ -353,6 +391,10 @@ means exactly what it says: it asked, and it did not get.
   overhead is sub-millisecond, but a sandboxed plugin is not where compute-heavy
   work belongs.
 - Existing first-party plugins stay on the native `Plugin` trait.
+- Nothing stops a manifest declaring a prefix that shadows a namespace your app
+  already uses. Your own static routes still win, but unmatched paths under it
+  become the plugin's. The prefix is on the consent screen for exactly this
+  reason — read it.
 
 ## See also
 

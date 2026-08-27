@@ -227,6 +227,7 @@ jobs:
         run: |
           cargo test -p autumn-web --features plugin-sandbox --lib plugin_sandbox
           cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
+          cargo test -p autumn-web --features plugin-sandbox --doc plugin_sandbox
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends
@@ -418,10 +419,17 @@ jobs:
           # Coverage is not bound by the crates.io baseline, so this list is a
           # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
           # `acme`, `managed-pg*`, `system-tests`, `test-support`, …).
-          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme"
+          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
           cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli \
             --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          # The plugin-sandbox suites have their own merge-blocking test lane
+          # above; without a coverage leg the whole module is instrumented and
+          # never executed, which reads as a large new uncovered surface.
+          cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
+            --lib plugin_sandbox
+          cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
+            --test integration_tests plugin_sandbox
           # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
           # the only place the `--all-features` catch-all compiled autumn-web
           # under the `sqlite` + `mail` union — which is exactly the

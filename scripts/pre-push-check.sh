@@ -110,6 +110,13 @@ cargo clippy -p autumn-web \
   --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" \
   --lib -- -D warnings
 
+step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --lib -- -D warnings"
+# ci.yml runs `plugin-sandbox` as its own clippy lane rather than folding it into
+# the list above, so a `wasmi`-linking build is not forced on every gated-feature
+# run. Mirrored here for the same reason the lane above is: a gate you cannot
+# reproduce locally is one you find out about on the PR.
+cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --lib -- -D warnings
+
 # --- 5. Compile every workspace test target (compile-only) -------------------
 # Mirrors ci.yml `test` job (`cargo test --workspace`), but `--no-run` so it
 # compiles — and never executes — every test binary, including the autumn-web

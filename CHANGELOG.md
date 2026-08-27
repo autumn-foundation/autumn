@@ -61,11 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the other lane. A sandboxed plugin ships as a `.autumn-plugin` artifact — a
   `wasm32-wasip1` module plus a manifest declaring its route prefix, the exact
   `(method, path)` pairs it mounts, its capabilities, and its per-request CPU
-  and memory ceilings — and the runtime enforces every word of it.
+  and memory ceilings — and the runtime enforces every word of it, refusing at load anything it cannot
+  fully understand — including a route path `axum::Router::route` would panic on,
+  which is validated through the same `matchit` engine axum routes through so a
+  manifest can never take the application down at boot.
   Deny-by-default is structural rather than configured: the guest's whole
   authority is the host-function table the shim registers, so filesystem,
   network, environment and database access are not "off" but absent, each
-  attempt answered with `ENOTCAPABLE` and recorded as a logged denial, and an
+  attempt answered with `ENOTCAPABLE`/`EBADF` and recorded as a logged denial,
+  and an
   import no host function defines is refused at load before the artifact runs
   once. The manifest is the mount, not a description of it: the router is built
   from its declared routes, so an undeclared path under the prefix is a 404 the
@@ -85,8 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conformance checks over the manifest, offline. The app still deploys as one
   binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
   subprocess and no native codegen backend. Purely additive — the native
-  `Plugin` trait and every existing plugin are untouched, and the feature is off
-  by default. First slice: request handling under the declared prefix is the
+  `Plugin` trait and every existing plugin are untouched, and the feature is not
+  in `autumn-web`'s default set. First slice: request handling under the declared prefix is the
   only capability that exists, so no manifest can ask for a database, a session
   or an outbound call. See `docs/guide/sandboxed-plugins.md`.
 

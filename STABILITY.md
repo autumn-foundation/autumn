@@ -104,6 +104,17 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   in any release. The protocol carries a version field precisely so a host and
   an artifact built from different Autumn versions degrade to origin-serving
   instead of guessing.
+- **The capability-sandboxed plugin lane (issue #1609).** Everything behind the
+  `plugin-sandbox` feature — `autumn_web::plugin_sandbox` in full, including the
+  sandbox **wire protocol** (`WIRE_VERSION`, its NDJSON frames), the
+  `.autumn-plugin` **artifact container** and its format version, the
+  `SandboxManifest` schema and its capability vocabulary, `SandboxHost` /
+  `SandboxOutcome` / `SandboxFailure`, and the `autumn plugin package` /
+  `autumn plugin inspect` output — is experimental and may change in any
+  release. The capability vocabulary is deliberately one word long in the first
+  slice and is expected to grow; both the wire and the container carry version
+  fields so a host refuses an artifact it cannot fully understand rather than
+  guessing at it.
 
 When in doubt: if `cargo doc --no-deps` doesn't list it, it is not part of
 the public API.

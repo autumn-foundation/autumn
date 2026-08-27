@@ -566,7 +566,7 @@ so the fuzzers exercise the real parsers, not stubs.
 
 ### Targets
 
-There are five targets, one per parsing surface:
+There are six targets, one per parsing surface:
 
 | Target | Surface under test |
 |--------|--------------------|
@@ -575,8 +575,16 @@ There are five targets, one per parsing surface:
 | `headers` | request header parsing |
 | `session` | session cookie decode/verify |
 | `body` | request body decoding **and the inbound-mail parsers** |
+| `sandbox` | the `.autumn-plugin` container, the manifest validator, and the NDJSON frames a sandboxed plugin writes |
 
 Each target has a committed seed corpus at `fuzz/corpus/<target>/`.
+
+`sandbox` splits its input on a NUL byte so one entry can carry a binary
+container and a text frame; a single-field entry drives all three decoders. Every
+byte it sees came out of an artifact the operator explicitly did not audit
+(issue #1609), which is why the surface is fuzzed rather than merely
+unit-tested — a length field in that container is chosen by the same person who
+chose the module.
 
 `body` multiplexes on its first input byte, so one target covers several
 parsers: urlencoded form decoding plus `inbound_mail`'s SES/SNS JSON reader, the
