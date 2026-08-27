@@ -216,8 +216,7 @@ where
                 headers: forwarded_headers(
                     req.headers(),
                     req.extensions()
-                        .get::<crate::security::ResolvedClientIdentity>()
-                        .and_then(|id| id.host.as_deref()),
+                        .get::<crate::security::ResolvedClientIdentity>(),
                 ),
                 // Prefer axum's matched route template over the configured
                 // pattern: this layer is applied with `Router::layer`, which

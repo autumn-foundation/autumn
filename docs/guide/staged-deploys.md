@@ -657,10 +657,14 @@ request target is redacted the same way, matching on the percent-decoded
 parameter name and on each of its structural segments — so `?token=`,
 `?%74oken=`, `?auth[access_token]=` and `?filter.password=` are all caught.
 
-Only **JSON** bodies are sampled. A JSON body has named keys the filter can
-reason about; an HTML or binary body does not, so for those Autumn records the
-digest, the byte length, and how the body was normalized — enough to prove the
-builds disagree, without an excerpt no redaction rule could vet.
+An excerpt is recorded only when **every scalar in the body sits under an
+object key** — because that is exactly when the filter has a name to match
+against. An HTML or binary body has no keys; so does a bare scalar (a
+`text/plain` one-time code parses as a JSON number) and so does an array of
+bare strings. All of those record the digest, the byte length, and how the body
+was normalized — enough to prove the builds disagree, without an excerpt no
+redaction rule could vet. An object, or an array of objects, is sampled
+normally.
 
 **Know what that redaction is and is not.** It is a *key-name allowlist*: a JSON
 field is replaced only when its name matches `[log] filter_parameters` (whose

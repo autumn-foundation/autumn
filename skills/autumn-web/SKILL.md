@@ -1957,7 +1957,8 @@ autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
 noise), its own side effects are real so it must be contained by environment
 (scratch database / writes disabled), and recorded samples are redacted by a
 **key-name allowlist** (`[log] filter_parameters`) — not a PII classifier — so
-any other field of a response body is stored verbatim on that actuator endpoint.
+any other *keyed* field of a response body is stored verbatim on that actuator
+endpoint. (Bodies with unkeyed scalars record only a digest.)
 
 See `docs/guide/staged-deploys.md`.
 

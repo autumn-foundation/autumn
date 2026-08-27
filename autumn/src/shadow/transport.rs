@@ -160,17 +160,20 @@ pub trait ShadowTransport: std::fmt::Debug + Send + Sync + 'static {
 /// address and the authority are separate things, and only the address comes
 /// from the target.
 ///
-/// `resolved_host` is the authority the trusted-proxy layer accepted, when it
-/// ran. It takes precedence over the raw `Host`: behind a proxy the raw header
-/// carries the *internal* address while the public one arrives in
-/// `X-Forwarded-Host`, which is stripped here for the reasons above. Sending
-/// the internal host would have the candidate resolve the wrong tenant, or
-/// reject the request outright — so the validated authority is what travels,
-/// never the unvalidated header it came from. This mirrors
-/// `tenancy::extract_tenant_from_parts`, which prefers the same resolved value
-/// over the raw header for the same reason.
+/// `resolved` is what the trusted-proxy layer accepted, when it ran, and it is
+/// re-stamped over the stripped forwarding family: the candidate is told the
+/// *validated* host, client address, and scheme rather than the client's own
+/// claims. Behind a proxy the raw `Host` is the internal address while the
+/// public one arrives in `X-Forwarded-Host` — forwarding that header would let
+/// a client forge it, and dropping it silently would have the candidate resolve
+/// the wrong tenant or reject the request. Preferring the resolved value
+/// mirrors `tenancy::extract_tenant_from_parts`, which makes the same choice
+/// for the same reason.
 #[must_use]
-pub fn forwarded_headers(source: &HeaderMap, resolved_host: Option<&str>) -> HeaderMap {
+pub fn forwarded_headers(
+    source: &HeaderMap,
+    resolved: Option<&crate::security::ResolvedClientIdentity>,
+) -> HeaderMap {
     let connection_named = connection_named_headers(source);
     let mut out = HeaderMap::with_capacity(source.len().saturating_add(1));
     for (name, value) in source {
@@ -183,10 +186,30 @@ pub fn forwarded_headers(source: &HeaderMap, resolved_host: Option<&str>) -> Hea
         }
         out.append(name.clone(), value.clone());
     }
-    if let Some(host) = resolved_host
-        && let Ok(value) = HeaderValue::from_str(host)
-    {
-        out.insert(axum::http::header::HOST, value);
+    // Re-stamp the forwarding family from the VALIDATED identity — never from
+    // the client's raw claims, which were stripped above. Dropping them
+    // entirely left the candidate resolving this process as the client: its
+    // per-IP rate limiter would bucket every mirror together (and answer `429`,
+    // a divergence), and `ClientScheme` would fall back to `http`, diverging on
+    // any route that behaves differently under TLS. A candidate that does not
+    // trust this process as a proxy simply ignores these, which is exactly
+    // where it was before.
+    if let Some(identity) = resolved {
+        if let Some(host) = identity.host.as_deref()
+            && let Ok(value) = HeaderValue::from_str(host)
+        {
+            out.insert(axum::http::header::HOST, value);
+        }
+        if let Some(addr) = identity.addr
+            && let Ok(value) = HeaderValue::from_str(&addr.to_string())
+        {
+            out.insert("x-forwarded-for", value);
+        }
+        if let Some(scheme) = identity.scheme.as_deref()
+            && let Ok(value) = HeaderValue::from_str(scheme)
+        {
+            out.insert("x-forwarded-proto", value);
+        }
     }
     if let Ok(name) = HeaderName::from_bytes(SHADOW_HEADER.as_bytes()) {
         out.insert(name, HeaderValue::from_static(SHADOW_HEADER_VALUE));
@@ -455,27 +478,68 @@ mod tests {
         );
     }
 
+    fn identity(host: &str, addr: &str, scheme: &str) -> crate::security::ResolvedClientIdentity {
+        crate::security::ResolvedClientIdentity {
+            addr: Some(addr.parse().expect("valid ip")),
+            host: Some(host.to_owned()),
+            scheme: Some(scheme.to_owned()),
+        }
+    }
+
     #[test]
-    fn the_trusted_proxys_resolved_host_wins_over_the_raw_one() {
+    fn the_validated_identity_replaces_the_clients_own_claims() {
         // Behind a proxy the raw `Host` is the INTERNAL address and the public
-        // one arrives in `X-Forwarded-Host`, which is stripped here (a client
-        // could have forged it). The validated authority the trusted-proxy
-        // layer accepted is what travels instead — otherwise the candidate
-        // resolves the wrong tenant, or rejects the request outright.
+        // one arrives in `X-Forwarded-Host` — which is stripped here, because a
+        // client can forge it. What travels instead is what the trusted-proxy
+        // layer ACCEPTED: host, client address, and scheme. Dropping the last
+        // two left the candidate resolving this process as the client, so its
+        // per-IP limiter bucketed every mirror together and `ClientScheme` fell
+        // back to `http`.
         let forwarded = forwarded_headers(
             &headers(&[
                 ("host", "10.0.0.7:3000"),
-                ("x-forwarded-host", "app.example.com"),
+                ("x-forwarded-host", "evil.example"),
+                ("x-forwarded-for", "203.0.113.9"),
+                ("x-forwarded-proto", "http"),
             ]),
-            Some("app.example.com"),
+            Some(&identity("app.example.com", "198.51.100.4", "https")),
         );
         assert_eq!(
             forwarded.get("host").and_then(|v| v.to_str().ok()),
             Some("app.example.com")
         );
+        assert_eq!(
+            forwarded
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok()),
+            Some("198.51.100.4"),
+            "the resolved client address, not the one the client claimed"
+        );
+        assert_eq!(
+            forwarded
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok()),
+            Some("https"),
+            "the resolved scheme, not the one the client claimed"
+        );
         assert!(
             !forwarded.contains_key("x-forwarded-host"),
-            "the unvalidated header itself must still not travel"
+            "the unvalidated header itself must never travel"
+        );
+    }
+
+    #[test]
+    fn no_forwarding_headers_are_synthesized_without_a_resolved_identity() {
+        // Nothing validated the client's claims, so nothing is asserted to the
+        // candidate on its behalf.
+        let forwarded = forwarded_headers(
+            &headers(&[("x-forwarded-for", "203.0.113.9"), ("host", "app.local")]),
+            None,
+        );
+        assert!(!forwarded.contains_key("x-forwarded-for"));
+        assert_eq!(
+            forwarded.get("host").and_then(|v| v.to_str().ok()),
+            Some("app.local")
         );
     }
 

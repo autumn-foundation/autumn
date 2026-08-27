@@ -26,11 +26,14 @@
 //!
 //! Recorded samples pass through [`ParameterFilter`] — the same filter the
 //! access log, error pages, and failure capsules use, driven by the same
-//! `[log] filter_parameters` / `[log] unfilter_parameters` config. Only **JSON**
-//! bodies are sampled: a JSON body has named keys the filter can reason about,
-//! whereas an HTML or binary body does not, so for those only a digest, a
-//! length, and the content type are recorded. A divergence is still reported —
-//! just without a body excerpt that no redaction rule could vet.
+//! `[log] filter_parameters` / `[log] unfilter_parameters` config.
+//!
+//! That filter redacts by **key name**, so an excerpt is recorded only when
+//! every scalar in the body sits under one. An HTML or binary body has no keys;
+//! neither does a bare scalar (a `text/plain` one-time code parses as a JSON
+//! number) nor an array of bare strings. Those record a digest, a length, and
+//! how the body was normalized. A divergence is still reported — just without a
+//! body excerpt that no redaction rule could vet.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -378,6 +381,14 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     let NormalizedBody::Json(value) = body else {
         return None;
     };
+    // Parsing as JSON is not on its own a licence to record. `ParameterFilter`
+    // redacts by KEY NAME, so a value only has protection if it sits under one:
+    // a `text/plain` six-digit OTP parses as a JSON number, and a bare scalar —
+    // or a scalar inside an array — offers the filter nothing to match. Those
+    // record a digest and a length like any other unsamplable body.
+    if !scalars_are_all_keyed(value) {
+        return None;
+    }
     let scrubbed = filter.scrub_json(value);
     let rendered = serde_json::to_string(&scrubbed).unwrap_or_default();
     if rendered.len() <= sample_limit {
@@ -395,6 +406,25 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     truncated.push_str(rendered.get(..cut).unwrap_or_default());
     truncated.push_str(TRUNCATION_MARKER);
     Some(Value::String(truncated))
+}
+
+/// Whether every scalar in `value` sits under an object key, and is therefore
+/// something [`ParameterFilter`] can be asked about.
+///
+/// A scalar at the top level, or as an array element, has no key above it — no
+/// redaction rule can vet it, so a body containing one is not sampled at all.
+/// An array *of objects* is fine: each scalar inside them is keyed.
+fn scalars_are_all_keyed(value: &Value) -> bool {
+    match value {
+        // Nothing above this to name it.
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+        Value::Array(items) => items.iter().all(scalars_are_all_keyed),
+        Value::Object(map) => map.values().all(|child| match child {
+            // Directly under a key: the filter can match it.
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+            nested => scalars_are_all_keyed(nested),
+        }),
+    }
 }
 
 /// Redact a request target (`/path?query`) for recording.
@@ -668,6 +698,75 @@ mod tests {
                 "scalar JSON body {body:?} diverged on a header-only difference"
             );
         }
+    }
+
+    #[test]
+    fn a_scalar_body_is_never_sampled_however_it_is_labelled() {
+        // A `text/plain` six-digit OTP parses as a JSON number. Comparing it
+        // structurally is right; RECORDING it is not — `ParameterFilter`
+        // redacts by key name, and a bare scalar gives it nothing to match.
+        let filter = ParameterFilter::default();
+        for (content_type, body) in [
+            (Some("text/plain".to_owned()), "482913"),
+            (Some("application/json".to_owned()), "482913"),
+            (Some("application/json".to_owned()), "\"a-bearer-token\""),
+            (None, "482913"),
+        ] {
+            let primary = ResponseFacts::new(200, content_type.clone(), Bytes::from(body));
+            let shadow = ResponseFacts::new(200, content_type, Bytes::from_static(b"0"));
+            let Comparison::Diverged(d) = compare(&primary, &shadow, &filter, 2048) else {
+                panic!("expected divergence for {body}");
+            };
+            assert!(
+                d.primary_sample.is_none(),
+                "a scalar body must record a digest only, got a sample for {body}"
+            );
+            assert!(!d.primary_digest.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_array_of_bare_scalars_is_not_sampled_either() {
+        // Array elements have no key above them, so the filter cannot vet them.
+        let filter = ParameterFilter::default();
+        let list = |body: &str| {
+            ResponseFacts::new(
+                200,
+                Some("application/json".to_owned()),
+                Bytes::from(body.to_owned()),
+            )
+        };
+        let Comparison::Diverged(d) =
+            compare(&list(r#"["a-bearer-token"]"#), &list("[]"), &filter, 2048)
+        else {
+            panic!("expected divergence");
+        };
+        assert!(d.primary_sample.is_none());
+    }
+
+    #[test]
+    fn keyed_bodies_are_still_sampled_including_arrays_of_objects() {
+        // The common shape must keep its excerpt: every scalar here sits under
+        // a key the filter can be asked about.
+        let filter = ParameterFilter::default();
+        let json_body = |body: &str| {
+            ResponseFacts::new(
+                200,
+                Some("application/json".to_owned()),
+                Bytes::from(body.to_owned()),
+            )
+        };
+        let Comparison::Diverged(d) = compare(
+            &json_body(r#"[{"id":1,"password":"hunter2"},{"id":2}]"#),
+            &json_body("[]"),
+            &filter,
+            2048,
+        ) else {
+            panic!("expected divergence");
+        };
+        let rendered = serde_json::to_string(&d.primary_sample).unwrap();
+        assert!(rendered.contains("[FILTERED]"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
     }
 
     #[test]
