@@ -53,7 +53,7 @@ use crate::shadow::sample::{SHADOW_HEADER, SHADOW_HEADER_VALUE};
 /// candidate answers uncompressed: the primary body is teed *inside* the
 /// compression layer, so an encoded shadow body would diff against a plain
 /// primary one and every route would look divergent.
-const STRIPPED_HEADERS: [&str; 18] = [
+const STRIPPED_HEADERS: [&str; 17] = [
     // Hop-by-hop (RFC 9110 §7.6.1) plus `proxy-connection`.
     "connection",
     "proxy-connection",
@@ -64,9 +64,7 @@ const STRIPPED_HEADERS: [&str; 18] = [
     "trailer",
     "transfer-encoding",
     "upgrade",
-    // Re-derived from the shadow target, or describing a body a GET/HEAD
-    // mirror does not carry.
-    "host",
+    // Describes a body a GET/HEAD mirror does not carry.
     "content-length",
     // Dropped so the candidate answers uncompressed — see the module note on
     // why an encoded shadow body would diff against a plain primary one.
@@ -151,6 +149,16 @@ pub trait ShadowTransport: std::fmt::Debug + Send + Sync + 'static {
 /// redirect or a `401`, and the diff degenerates into noise. The consequence —
 /// the shadow target receives live credentials and must be as trusted as the
 /// primary — is stated in `docs/guide/staged-deploys.md`.
+///
+/// **So is `Host`.** The candidate is dialed at the operator's target address
+/// (`127.0.0.1:9091`, say), but the request's *logical* authority is the one
+/// the live build accepted. Letting the client re-derive `Host` from the dial
+/// address breaks any route whose behaviour depends on it: a candidate that
+/// clones production's `[security.trusted_hosts]` rejects every mirror with a
+/// `400`, and a subdomain-keyed multi-tenant app resolves the wrong tenant —
+/// either way manufacturing a divergence on every single request. The dial
+/// address and the authority are separate things, and only the address comes
+/// from the target.
 #[must_use]
 pub fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
     let connection_named = connection_named_headers(source);
@@ -353,13 +361,23 @@ mod tests {
     }
 
     #[test]
-    fn host_and_framing_headers_are_stripped() {
-        let forwarded = forwarded_headers(&headers(&[
-            ("host", "app.example.com"),
-            ("content-length", "0"),
-        ]));
-        assert!(!forwarded.contains_key("host"));
+    fn framing_headers_are_stripped() {
+        let forwarded = forwarded_headers(&headers(&[("content-length", "0")]));
         assert!(!forwarded.contains_key("content-length"));
+    }
+
+    #[test]
+    fn the_accepted_host_is_preserved() {
+        // The candidate is dialed at the operator's target address, but the
+        // request's logical authority is the one the live build accepted.
+        // Re-deriving it from the dial address would make a candidate that
+        // clones production's trusted-host policy reject every mirror with a
+        // 400, and a subdomain-keyed tenant app resolve the wrong tenant.
+        let forwarded = forwarded_headers(&headers(&[("host", "app.example.com")]));
+        assert_eq!(
+            forwarded.get("host").and_then(|v| v.to_str().ok()),
+            Some("app.example.com")
+        );
     }
 
     #[test]

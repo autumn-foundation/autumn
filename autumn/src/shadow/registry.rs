@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn a_match_is_counted_but_not_recorded() {
         let registry = ShadowRegistry::new(10);
-        registry.record_comparison(&context(), diverging("{\"a\":1}", "{\"a\":1}"), 1_000);
+        let _ = registry.record_comparison(&context(), diverging("{\"a\":1}", "{\"a\":1}"), 1_000);
         let stats = registry.stats();
         assert_eq!(stats.compared, 1);
         assert_eq!(stats.matched, 1);
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn a_divergence_is_counted_and_recorded() {
         let registry = ShadowRegistry::new(10);
-        registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 1_000);
+        let _ = registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 1_000);
         let stats = registry.stats();
         assert_eq!(stats.compared, 1);
         assert_eq!(stats.matched, 0);
@@ -513,7 +513,7 @@ mod tests {
     fn repeat_divergences_collapse_by_fingerprint() {
         let registry = ShadowRegistry::new(10);
         for at in [1_000, 2_000, 3_000] {
-            registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), at);
+            let _ = registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), at);
         }
         let recent = registry.recent();
         assert_eq!(
@@ -531,7 +531,7 @@ mod tests {
     fn the_record_ring_is_bounded() {
         let registry = ShadowRegistry::new(3);
         for n in 0_u64..10 {
-            registry.record_comparison(
+            let _ = registry.record_comparison(
                 &context(),
                 diverging(&format!("{{\"a\":{n}}}"), "{}"),
                 1_000 + n,
@@ -558,7 +558,7 @@ mod tests {
                 target: route.to_owned(),
                 route: route.to_owned(),
             };
-            registry.record_comparison(&context, diverging("{\"a\":1}", "{}"), 1_000);
+            let _ = registry.record_comparison(&context, diverging("{\"a\":1}", "{}"), 1_000);
         }
         let recent = registry.recent();
         assert_eq!(recent.len(), 2);
@@ -623,7 +623,7 @@ mod tests {
     fn the_snapshot_serializes_the_shape_the_actuator_publishes() {
         let registry = ShadowRegistry::new(10);
         registry.record_mirrored();
-        registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 1_000);
+        let _ = registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 1_000);
         let snapshot = registry.snapshot(true, Some("http://127.0.0.1:9091"));
         let json = serde_json::to_value(&snapshot).expect("must serialize");
         assert_eq!(json["enabled"], serde_json::json!(true));

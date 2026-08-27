@@ -71,7 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not cover before you point this at a route returning personal data. Requests
   the live build itself refuses (`429`/`503` from maintenance mode, load
   shedding, or the rate limiter) are not mirrored at all, so a planned
-  maintenance window does not read as a divergence storm. Off by default, and
+  maintenance window does not read as a divergence storm. The candidate is
+  dialed at `target` but sees the `Host` the live build accepted, so a candidate
+  cloning production's `[security.trusted_hosts]` — or a subdomain-keyed
+  multi-tenant app — does not diverge on every request; and in an SSG/ISG build
+  the mirror sits outside the static-first middleware, so pre-rendered pages are
+  compared rather than silently skipped. Off by default, and
   requires the `http-client` cargo feature (on by default) — a build without it
   says so at startup and mirrors nothing rather than pretending to. See
   `docs/guide/staged-deploys.md` for how it differs from canary and for the

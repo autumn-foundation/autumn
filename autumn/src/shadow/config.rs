@@ -126,20 +126,28 @@ impl ShadowConfig {
                     .to_owned(),
             );
         };
-        if !(target.starts_with("http://") || target.starts_with("https://")) {
+        // Parsed, not prefix-matched: `"http://"` passes a `starts_with` check
+        // but has no authority to dial, so the replica would boot reporting an
+        // enabled mirror while every selected request failed as a transport
+        // error. A target that cannot be dialed must fail boot, which is what
+        // the rest of this function promises.
+        let parsed = url::Url::parse(target)
+            .map_err(|error| format!("shadow.target is not a valid URL ({error}): {target:?}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
             return Err(format!(
                 "shadow.target must be an absolute http(s) URL, got {target:?}"
             ));
         }
-        // Userinfo in the target would be echoed by the actuator endpoint and
-        // by the startup log line. Refuse it rather than quietly publishing a
-        // credential; the candidate should be reached without one, or behind
-        // something that adds it.
-        if target
-            .split_once("//")
-            .and_then(|(_, rest)| rest.split('/').next())
-            .is_some_and(|authority| authority.contains('@'))
-        {
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(format!(
+                "shadow.target must name a host to dial, got {target:?}"
+            ));
+        }
+        // Userinfo would be echoed by the actuator endpoint and by the startup
+        // log line. Refuse it rather than quietly publishing a credential; the
+        // candidate should be reached without one, or behind something that
+        // adds it.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(
                 "shadow.target must not embed credentials — the value is published by the \
                  shadow actuator endpoint and logged at startup"
@@ -347,6 +355,26 @@ mod tests {
         assert_eq!(config.routes, vec!["/api/*".to_owned()]);
         // Unspecified keys still carry their bounded defaults.
         assert_eq!(config.timeout_ms, ShadowConfig::default().timeout_ms);
+    }
+
+    #[test]
+    fn a_target_with_no_host_to_dial_is_rejected() {
+        // `"http://"` passes a `starts_with` check but has nothing to dial, so
+        // the replica would boot reporting an enabled mirror while every
+        // request failed as a transport error.
+        // NB `"http:///path"` is deliberately absent: WHATWG normalizes it to
+        // host `path`, which is dialable, so rejecting it would be wrong.
+        for bad in ["http://", "https://"] {
+            let config = ShadowConfig {
+                enabled: true,
+                target: Some(bad.to_owned()),
+                ..ShadowConfig::default()
+            };
+            let error = config
+                .validate()
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(error.contains("shadow.target"), "{error}");
+        }
     }
 
     #[test]

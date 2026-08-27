@@ -540,6 +540,15 @@ container, another port, another machine) and point `target` at it.
   `X-Real-IP` are stripped: this layer runs before the primary's trusted-proxy
   policy, so forwarding them would hand the candidate a client-spoofed value
   arriving from an address it *does* trust.
+- **`Host` is preserved.** The candidate is *dialed* at `target`, but it sees
+  the authority the live build accepted. Those are separate things, and only the
+  address comes from `target`: a candidate that clones your
+  `[security.trusted_hosts]` would otherwise reject every mirror with a `400`,
+  and a subdomain-keyed multi-tenant app would resolve the wrong tenant.
+- **Pages served from the static cache are mirrored too.** In an SSG/ISG build
+  the static-first middleware answers matching `GET`/`HEAD` requests before the
+  dynamic router runs; the mirror sits outside it, so a pre-rendered page the
+  candidate generates differently is still compared.
 
 ### What is compared
 

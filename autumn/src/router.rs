@@ -711,6 +711,7 @@ fn build_router_pre_state(
         ctx.session_store,
         route_timeouts,
         load_shed_layer,
+        defer_security_headers,
     )?;
 
     if dev_reload_enabled {
@@ -4301,6 +4302,12 @@ fn apply_middleware(
     // `LoadShedLayer` here would give `/mcp` its own independent (always-zero)
     // counter that never sheds. See `build_load_shed_layer`.
     load_shed_layer: Option<crate::middleware::LoadShedLayer>,
+    // When true (SSG/ISG path), the shadow-mirroring layer is NOT installed
+    // here. `try_build_router_with_static_inner` installs a single one OUTSIDE
+    // the static-first middleware, so that a request served from the static
+    // cache is mirrored too — installing one here as well would double-mirror
+    // every dynamic miss against a second, unpublished registry.
+    defer_shadow: bool,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -4749,7 +4756,13 @@ fn apply_middleware(
         // handler's own bytes, which is what the candidate build returns too.
         // Teeing a gzip-encoded body would diff against the candidate's plain
         // one and report every route as divergent.
-        tower::util::option_layer(build_shadow_layer(config, state)),
+        //
+        // `None` in the SSG/ISG path — see `defer_shadow`.
+        tower::util::option_layer(
+            (!defer_shadow)
+                .then(|| build_shadow_layer(config, state))
+                .flatten(),
+        ),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
@@ -5315,6 +5328,18 @@ pub fn try_build_router_with_static_inner(
     // Compression must also be applied OUTSIDE the static-first middleware so
     // that pre-rendered HTML pages (served directly by StaticFileLayer without
     // reaching inner_router) are also compressed. This mirrors the placement in
+    // Shadow mirroring (#1653) goes here — OUTSIDE the static-first middleware
+    // and inside compression — rather than in `apply_middleware` (which is why
+    // that call was made with `defer_shadow = true`). A request the static
+    // cache answers never reaches the inner router at all, so a layer installed
+    // in there would see only dynamic misses: a shadow run over an SSG/ISG app
+    // would report clean while every pre-rendered page the candidate generates
+    // differently went uncompared. Outer to the user layers and inner to
+    // compression, matching its position in the dynamic path.
+    if let Some(shadow) = build_shadow_layer(config, &state) {
+        router = router.layer(shadow);
+    }
+
     // apply_middleware for the dynamic-only path.
     router = apply_compression_middleware(router, config);
 

@@ -58,12 +58,16 @@ async fn create_order() -> Json<Value> {
 #[derive(Debug, Default)]
 struct CandidateLog {
     requests: std::sync::Mutex<Vec<(String, String, bool)>>,
+    hosts: std::sync::Mutex<Vec<String>>,
 }
 
 impl CandidateLog {
-    fn record(&self, method: &str, path: &str, loop_guard: bool) {
+    fn record(&self, method: &str, path: &str, loop_guard: bool, host: Option<&str>) {
         if let Ok(mut requests) = self.requests.lock() {
             requests.push((method.to_owned(), path.to_owned(), loop_guard));
+        }
+        if let Ok(mut hosts) = self.hosts.lock() {
+            hosts.push(host.unwrap_or_default().to_owned());
         }
     }
 
@@ -72,6 +76,10 @@ impl CandidateLog {
             .lock()
             .map(|requests| requests.clone())
             .unwrap_or_default()
+    }
+
+    fn hosts(&self) -> Vec<String> {
+        self.hosts.lock().map(|h| h.clone()).unwrap_or_default()
     }
 }
 
@@ -109,6 +117,9 @@ async fn spawn_candidate() -> (SocketAddr, Arc<CandidateLog>) {
                         req.method().as_str(),
                         req.uri().path(),
                         req.headers().contains_key(SHADOW_HEADER),
+                        req.headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok()),
                     );
                     next.run(req).await
                 }
@@ -602,6 +613,41 @@ async fn the_shadow_metric_families_are_absent_without_a_mirror() {
     let body = app.get("/actuator/prometheus").send().await.text();
     assert!(!body.contains(autumn_web::shadow::COMPARISONS_METRIC));
     assert!(!body.contains(autumn_web::shadow::DIVERGENCES_METRIC));
+}
+
+#[tokio::test]
+async fn the_candidate_sees_the_host_the_live_build_accepted() {
+    // Not the dial address. A candidate that clones production's
+    // `[security.trusted_hosts]` would reject every mirror with a 400 if the
+    // client re-derived `Host` from the target, and a subdomain-keyed tenant
+    // app would resolve the wrong tenant — either way a divergence on every
+    // request. This also pins that the HTTP client honours an explicit `Host`
+    // rather than overwriting it with the URL's authority.
+    let (addr, candidate) = spawn_candidate().await;
+    let mut config = mirroring_config(addr);
+    // The live build accepts this host; the candidate is dialed at a loopback
+    // address that has nothing to do with it.
+    config
+        .security
+        .trusted_hosts
+        .hosts
+        .push("app.example.com".to_owned());
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders])
+        .build();
+
+    app.get("/api/orders")
+        .header("host", "app.example.com")
+        .send()
+        .await
+        .assert_status(200);
+
+    settle("the mirror to reach the candidate", || {
+        !candidate.seen().is_empty()
+    })
+    .await;
+    assert_eq!(candidate.hosts(), vec!["app.example.com".to_owned()]);
 }
 
 #[tokio::test]

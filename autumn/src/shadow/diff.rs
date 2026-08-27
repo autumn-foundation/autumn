@@ -484,19 +484,16 @@ fn percent_decode(raw: &str) -> String {
         out.extend_from_slice(first);
     }
     for part in parts {
-        match (
+        if let (Some(high), Some(low)) = (
             part.first().copied().and_then(hex_value),
             part.get(1).copied().and_then(hex_value),
         ) {
-            (Some(high), Some(low)) => {
-                out.push(high.wrapping_shl(4) | low);
-                out.extend_from_slice(part.get(2..).unwrap_or_default());
-            }
+            out.push(high.wrapping_shl(4) | low);
+            out.extend_from_slice(part.get(2..).unwrap_or_default());
+        } else {
             // Not a valid escape — keep the `%` and the rest verbatim.
-            _ => {
-                out.push(b'%');
-                out.extend_from_slice(part);
-            }
+            out.push(b'%');
+            out.extend_from_slice(part);
         }
     }
     String::from_utf8_lossy(&out).into_owned()

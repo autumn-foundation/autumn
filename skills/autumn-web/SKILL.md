@@ -1922,7 +1922,9 @@ Every key has an env override (`AUTUMN_SHADOW__ENABLED`,
 `AUTUMN_SHADOW__TARGET`, `AUTUMN_SHADOW__SAMPLE_RATE`, …).
 
 **What it guarantees.** The client never waits on the mirror (detached task; the
-primary body is teed, not buffered) and never receives a candidate byte. Only
+primary body is teed, not buffered) and never receives a candidate byte. The
+candidate is dialed at `target` but sees the `Host` the live build accepted, and
+pages served from an SSG/ISG static cache are mirrored too. Only
 `GET`/`HEAD` are mirrored, and that is a constant, not a config key — replaying
 a `POST` needs effect virtualization, which does not exist yet. Requests the
 live build refuses (`429`/`503`) are not mirrored. Actuator and probe paths are

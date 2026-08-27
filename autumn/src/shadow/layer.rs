@@ -365,13 +365,10 @@ async fn run_mirror(
     // silently off for the rest of the process's life. `Err` on the channel
     // means the same thing arrived sooner — the client disconnected, or the
     // response was aborted mid-stream.
-    let primary = match tokio::time::timeout(ctx.settings.timeout, primary_rx).await {
-        Ok(Ok(primary)) => primary,
-        Ok(Err(_)) | Err(_) => {
-            ctx.registry.record_primary_incomplete();
-            record_outcome(&ctx.registry, &context.route, "incomplete");
-            return;
-        }
+    let Ok(Ok(primary)) = tokio::time::timeout(ctx.settings.timeout, primary_rx).await else {
+        ctx.registry.record_primary_incomplete();
+        record_outcome(&ctx.registry, &context.route, "incomplete");
+        return;
     };
 
     // `None` means the primary body blew the capture budget; a shadow body may
