@@ -28,12 +28,13 @@
 //! access log, error pages, and failure capsules use, driven by the same
 //! `[log] filter_parameters` / `[log] unfilter_parameters` config.
 //!
-//! That filter redacts by **key name**, so an excerpt is recorded only when
-//! every scalar in the body sits under one. An HTML or binary body has no keys;
-//! neither does a bare scalar (a `text/plain` one-time code parses as a JSON
-//! number) nor an array of bare strings. Those record a digest, a length, and
-//! how the body was normalized. A divergence is still reported — just without a
-//! body excerpt that no redaction rule could vet.
+//! That filter redacts by **key name**, replacing a matched key's whole value,
+//! so an excerpt is recorded only when every scalar has some object key above
+//! it — that is exactly when naming a key could reach it. An HTML or binary
+//! body has no keys; neither does a bare scalar (a `text/plain` one-time code
+//! parses as a JSON number) nor a top-level array of strings. Those record a
+//! digest, a length, and how the body was normalized. A divergence is still
+//! reported — just without a body excerpt that no redaction rule could vet.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -408,22 +409,27 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     Some(Value::String(truncated))
 }
 
-/// Whether every scalar in `value` sits under an object key, and is therefore
-/// something [`ParameterFilter`] can be asked about.
+/// Whether every scalar in `value` has an object key somewhere above it, and is
+/// therefore something [`ParameterFilter`] can be asked about.
 ///
-/// A scalar at the top level, or as an array element, has no key above it — no
-/// redaction rule can vet it, so a body containing one is not sampled at all.
-/// An array *of objects* is fine: each scalar inside them is keyed.
+/// The question is not whether a scalar is *directly* under a key — it is
+/// whether naming a key in `[log] filter_parameters` could redact it.
+/// `scrub_json` replaces a matched key's **whole value**, so everything inside
+/// an object is covered by that object's keys, however deeply nested:
+/// `{"tags": ["x"]}` is redacted entirely by listing `tags`.
+///
+/// What cannot be covered is a value with no key above it at all — a bare
+/// scalar body, or a top-level array of scalars. There is no name an operator
+/// could write down that would reach those, so a body containing one is not
+/// sampled and records only a digest and a length.
 fn scalars_are_all_keyed(value: &Value) -> bool {
     match value {
+        // Every descendant has this object's keys above it.
+        Value::Object(_) => true,
+        // Elements have no key of their own, so each must supply one.
+        Value::Array(items) => items.iter().all(scalars_are_all_keyed),
         // Nothing above this to name it.
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
-        Value::Array(items) => items.iter().all(scalars_are_all_keyed),
-        Value::Object(map) => map.values().all(|child| match child {
-            // Directly under a key: the filter can match it.
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
-            nested => scalars_are_all_keyed(nested),
-        }),
     }
 }
 
@@ -742,6 +748,57 @@ mod tests {
             panic!("expected divergence");
         };
         assert!(d.primary_sample.is_none());
+    }
+
+    #[test]
+    fn a_list_of_strings_under_a_key_is_still_sampled() {
+        // Regression: an earlier form of this rule demanded that every scalar be
+        // DIRECTLY under a key, which refused `{"items": ["a", "b"]}` — an
+        // extremely ordinary shape whose array IS governed by `items`. Listing
+        // `items` in `filter_parameters` redacts the whole array, so the filter
+        // can be asked about it and the excerpt is safe to record.
+        let filter = ParameterFilter::default();
+        let body = |raw: &str| {
+            ResponseFacts::new(
+                200,
+                Some("application/json".to_owned()),
+                Bytes::from(raw.to_owned()),
+            )
+        };
+        let Comparison::Diverged(d) = compare(
+            &body(r#"{"id":7,"total":42,"items":["a","b"]}"#),
+            &body(r#"{"id":7,"items":["a","b"]}"#),
+            &filter,
+            2048,
+        ) else {
+            panic!("expected divergence");
+        };
+        let sample = d.primary_sample.expect("a keyed body must be sampled");
+        assert_eq!(sample["total"], serde_json::json!(42));
+        assert_eq!(sample["items"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn a_list_under_a_filtered_key_is_redacted_whole() {
+        let filter = ParameterFilter::default();
+        let body = |raw: &str| {
+            ResponseFacts::new(
+                200,
+                Some("application/json".to_owned()),
+                Bytes::from(raw.to_owned()),
+            )
+        };
+        let Comparison::Diverged(d) = compare(
+            &body(r#"{"id":1,"token":["abc","def"]}"#),
+            &body(r#"{"id":2,"token":["abc","def"]}"#),
+            &filter,
+            2048,
+        ) else {
+            panic!("expected divergence");
+        };
+        let rendered = serde_json::to_string(&d.primary_sample).unwrap();
+        assert!(!rendered.contains("abc"), "{rendered}");
+        assert!(rendered.contains("[FILTERED]"), "{rendered}");
     }
 
     #[test]

@@ -65,11 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extra request rather than an exponential storm) and the seam a candidate build
   uses to refuse writes. Recorded samples pass through the same
   `[log] filter_parameters` redaction as the access log and failure capsules,
-  and an excerpt is recorded only when every scalar in the body sits under an
-  object key, since that is exactly when the key-name filter has something to
-  match — an HTML body, a bare scalar (a `text/plain` one-time code parses as a
-  JSON number) and an array of bare strings all record a digest and a length
-  instead — and the guide is explicit about what that redaction does and does
+  and an excerpt is recorded only when every scalar in the body has an object key
+  above it, since the filter replaces a matched key's whole value and that is
+  exactly when naming a key could reach it — an HTML body, a bare scalar (a
+  `text/plain` one-time code parses as a JSON number) and a top-level array of
+  strings all record a digest and a length instead — and the guide is explicit about what that redaction does and does
   not cover before you point this at a route returning personal data. Requests
   the live build itself refuses (`429`/`503` from maintenance mode, load
   shedding, or the rate limiter) are not mirrored at all, so a planned
