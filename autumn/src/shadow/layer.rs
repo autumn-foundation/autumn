@@ -336,8 +336,15 @@ async fn run_mirror(
     // The permit is released when this task ends, whatever the outcome.
     let _permit = permit;
 
-    let shadow = match tokio::time::timeout(ctx.settings.timeout, ctx.transport.send(request)).await
-    {
+    // ONE deadline for the whole mirror, stamped at dispatch and shared by both
+    // waits below. Two independent `timeout(settings.timeout, ..)` calls would
+    // let a shadow that answers just under the deadline be followed by a fresh
+    // full deadline on the primary wait — up to `2 * timeout_ms` holding a slot,
+    // which at capacity keeps every later mirror dropped for twice as long as
+    // the operator configured, against this module's stated guarantee.
+    let deadline = tokio::time::Instant::now() + ctx.settings.timeout;
+
+    let shadow = match tokio::time::timeout_at(deadline, ctx.transport.send(request)).await {
         Err(_) | Ok(Err(ShadowError::Timeout)) => {
             ctx.registry.record_shadow_timeout();
             record_outcome(&ctx.registry, &context.route, ShadowError::Timeout.as_str());
@@ -365,7 +372,7 @@ async fn run_mirror(
     // silently off for the rest of the process's life. `Err` on the channel
     // means the same thing arrived sooner — the client disconnected, or the
     // response was aborted mid-stream.
-    let Ok(Ok(primary)) = tokio::time::timeout(ctx.settings.timeout, primary_rx).await else {
+    let Ok(Ok(primary)) = tokio::time::timeout_at(deadline, primary_rx).await else {
         ctx.registry.record_primary_incomplete();
         record_outcome(&ctx.registry, &context.route, "incomplete");
         return;
@@ -983,6 +990,41 @@ mod tests {
         })
         .await;
         assert_eq!(registry.stats().shadow_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn one_deadline_covers_both_mirror_waits() {
+        // A shadow that answers just under the deadline must not then start a
+        // fresh full deadline on the primary wait: that would hold the permit
+        // for up to 2x the configured timeout, and at capacity would keep every
+        // later mirror dropped for twice as long as the operator asked for.
+        let transport = FakeTransport::new(Behaviour::Stall(Duration::from_millis(120)));
+        let registry = ShadowRegistry::new(10);
+        let mut settings = settings();
+        settings.timeout = Duration::from_millis(200);
+        settings.max_in_flight = 1;
+        let service =
+            layer(transport.clone(), &registry, settings).layer(primary(r#"{"ok":true}"#));
+
+        // Drop the response unread, so the primary wait never resolves on its
+        // own and only the shared deadline can end the mirror.
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let started = std::time::Instant::now();
+        drop(response);
+
+        settle("the mirror to give up", || {
+            registry.stats().primary_incomplete == 1
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(360),
+            "the mirror lived {elapsed:?}, close to twice the 200ms deadline"
+        );
     }
 
     #[tokio::test]

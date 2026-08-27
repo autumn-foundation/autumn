@@ -558,8 +558,14 @@ Two things, and deliberately only two:
 2. **Normalized body.** JSON is parsed and object keys sorted, so two builds
    serialising the same map in a different order agree. **Array order is
    preserved** — a reordered list *is* a divergence, because that is exactly the
-   class of regression this exists to catch. Text bodies have `\r\n` folded to
-   `\n` and outer whitespace trimmed. Anything else is compared byte-for-byte.
+   class of regression this exists to catch. Any other UTF-8 body has `\r\n`
+   folded to `\n` and outer whitespace trimmed; anything that is not valid UTF-8
+   is compared byte-for-byte.
+
+   Which of those applies is decided by the **bytes**, never by `Content-Type`.
+   Headers are outside the contract, so two builds returning an identical body
+   must not diverge merely because one of them labelled it and the other did
+   not.
 
 Headers, latency, and fuzzy JSON tolerance are **not** compared. A response
 whose body is larger than `max_body_bytes` is not compared at all (counted as

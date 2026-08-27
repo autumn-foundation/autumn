@@ -293,9 +293,14 @@ pub fn normalize_body(facts: &ResponseFacts) -> NormalizedBody {
         return NormalizedBody::Json(canonicalize(&value));
     }
 
-    if is_textual(&content_type)
-        && let Ok(text) = std::str::from_utf8(&facts.body)
-    {
+    // UTF-8 decides this, NOT the content type. Headers are explicitly outside
+    // the comparison contract, so two builds returning the identical bytes
+    // `hello` must not diverge merely because only one of them said
+    // `text/plain` — that would put a header back inside the contract through
+    // the back door, as a difference in normalized *form* rather than in
+    // content. A genuinely binary body is not valid UTF-8 and still lands in
+    // `Bytes`.
+    if let Ok(text) = std::str::from_utf8(&facts.body) {
         return NormalizedBody::Text(normalize_text(text));
     }
 
@@ -310,15 +315,6 @@ fn looks_like_json(content_type: &str, body: &[u8]) -> bool {
     body.iter()
         .find(|byte| !byte.is_ascii_whitespace())
         .is_some_and(|byte| matches!(byte, b'{' | b'['))
-}
-
-/// Whether a content type describes text whose whitespace can be normalized.
-fn is_textual(content_type: &str) -> bool {
-    content_type.starts_with("text/")
-        || content_type.contains("xml")
-        || content_type.contains("javascript")
-        || content_type.contains("csv")
-        || content_type.contains("x-www-form-urlencoded")
 }
 
 /// Fold `\r\n` to `\n` and trim the body's outer whitespace.
@@ -635,6 +631,50 @@ mod tests {
         assert!(d.primary_sample.is_none());
         assert!(d.shadow_sample.is_none());
         assert_ne!(d.primary_digest, d.shadow_digest);
+    }
+
+    #[test]
+    fn identical_bytes_do_not_diverge_because_only_one_side_named_a_content_type() {
+        // Headers are outside the comparison contract, so a header difference
+        // must not reappear as a difference in normalized *form*.
+        let filter = ParameterFilter::default();
+        let labelled = ResponseFacts::new(
+            200,
+            Some("text/plain".to_owned()),
+            Bytes::from_static(b"hello"),
+        );
+        let unlabelled = ResponseFacts::new(200, None, Bytes::from_static(b"hello"));
+        assert!(matches!(
+            compare(&labelled, &unlabelled, &filter, 2048),
+            Comparison::Match
+        ));
+
+        // ...and a genuinely different body still diverges.
+        let other = ResponseFacts::new(200, None, Bytes::from_static(b"goodbye"));
+        assert!(matches!(
+            compare(&labelled, &other, &filter, 2048),
+            Comparison::Diverged(_)
+        ));
+    }
+
+    #[test]
+    fn a_body_that_is_not_utf8_is_compared_byte_for_byte() {
+        let filter = ParameterFilter::default();
+        let png = |trailer: u8| {
+            ResponseFacts::new(
+                200,
+                Some("image/png".to_owned()),
+                Bytes::from(vec![0x89, b'P', b'N', b'G', 0xFF, trailer]),
+            )
+        };
+        assert!(matches!(
+            compare(&png(1), &png(1), &filter, 2048),
+            Comparison::Match
+        ));
+        assert!(matches!(
+            compare(&png(1), &png(2), &filter, 2048),
+            Comparison::Diverged(_)
+        ));
     }
 
     #[test]

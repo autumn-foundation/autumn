@@ -143,6 +143,25 @@ impl ShadowConfig {
                 "shadow.target must name a host to dial, got {target:?}"
             ));
         }
+        // A query or fragment on the base is unusable: `shadow_url` appends the
+        // live request target to it, so `http://candidate/base?token=x` would
+        // produce `…/base?token=x/api/orders?page=2` — the request path folded
+        // into the query — and a fragment is never transmitted at all. Every
+        // mirrored request would reach the wrong resource on the candidate,
+        // quietly. A base *path* (`http://candidate/base`) is fine and is what
+        // an operator mounting the candidate under a prefix needs.
+        if parsed.query().is_some() {
+            return Err(format!(
+                "shadow.target must not carry a query string — the request target is \
+                 appended to it, so the mirrored path would fold into the query: {target:?}"
+            ));
+        }
+        if parsed.fragment().is_some() {
+            return Err(format!(
+                "shadow.target must not carry a fragment — a fragment is never sent over \
+                 the wire: {target:?}"
+            ));
+        }
         // Userinfo would be echoed by the actuator endpoint and by the startup
         // log line. Refuse it rather than quietly publishing a credential; the
         // candidate should be reached without one, or behind something that
@@ -375,6 +394,37 @@ mod tests {
                 .expect_err(&format!("{bad} must be rejected"));
             assert!(error.contains("shadow.target"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_target_carrying_a_query_or_fragment_is_rejected() {
+        // The request target is appended to the base, so a query on the base
+        // would swallow the mirrored path (`…?token=x/api/orders`) and a
+        // fragment is never sent at all — either way every mirrored request
+        // would silently reach the wrong resource.
+        for bad in [
+            "http://candidate/base?token=x",
+            "http://candidate#fragment",
+            "http://candidate/base?a=1#f",
+        ] {
+            let config = ShadowConfig {
+                enabled: true,
+                target: Some(bad.to_owned()),
+                ..ShadowConfig::default()
+            };
+            let error = config
+                .validate()
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(error.contains("shadow.target"), "{error}");
+        }
+
+        // A base *path* is legitimate — mounting the candidate under a prefix.
+        let config = ShadowConfig {
+            enabled: true,
+            target: Some("http://candidate/base".to_owned()),
+            ..ShadowConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
