@@ -82,7 +82,9 @@ use crate::time::ClockSource;
 /// of `match`, `diverged`, `error`, `timeout`, `skipped` (a body over the
 /// capture budget), `dropped` (the in-flight ceiling was full), `refused` (the
 /// live build answered `429`/`503`, so the request never reached a handler), or
-/// `incomplete` (the client never finished reading the primary response).
+/// `incomplete` (the client never finished reading the primary response), or
+/// `primary_error` (the LIVE build's own response could not be decoded — not a
+/// candidate failure, and counted apart from one).
 pub const COMPARISONS_METRIC: &str = "autumn_shadow_comparisons_total";
 
 /// Metric recording divergences only, labelled by route and divergence kind.
@@ -414,10 +416,10 @@ async fn run_mirror(
     // does not decode is an *error*. Folding both into `skipped_oversize` would
     // show an operator a size-budget skip for what is actually a malformed
     // encoding, and lose the reason entirely.
-    let Some(primary_body) = decode_side(&ctx, &context, "primary", &primary) else {
+    let Some(primary_body) = decode_side(&ctx, &context, PRIMARY, &primary) else {
         return;
     };
-    let Some(shadow_body) = decode_side(&ctx, &context, "shadow", &shadow) else {
+    let Some(shadow_body) = decode_side(&ctx, &context, SHADOW, &shadow) else {
         return;
     };
     let primary = ResponseFacts::encoded(primary.status, primary.content_type, None, primary_body);
@@ -464,7 +466,13 @@ async fn run_mirror(
     }
 }
 
-/// Decode one side's body, counting the two failure modes distinctly.
+/// Label for the live build in [`decode_side`].
+const PRIMARY: &str = "primary";
+
+/// Label for the candidate build in [`decode_side`].
+const SHADOW: &str = "shadow";
+
+/// Decode one side's body, counting the failure modes distinctly.
 ///
 /// `None` means the comparison cannot proceed and has already been counted.
 fn decode_side(
@@ -485,8 +493,17 @@ fn decode_side(
             None
         }
         Err(error) => {
-            ctx.registry.record_shadow_error();
-            record_outcome(&ctx.registry, &context.route, error.as_str());
+            // Attributed to the side that produced it. `shadow_errors` is
+            // documented as candidate failures, so counting the live build's
+            // own malformed response there would send an operator hunting
+            // candidate connectivity for a body their own handler emitted.
+            if side == PRIMARY {
+                ctx.registry.record_primary_error();
+                record_outcome(&ctx.registry, &context.route, "primary_error");
+            } else {
+                ctx.registry.record_shadow_error();
+                record_outcome(&ctx.registry, &context.route, error.as_str());
+            }
             tracing::debug!(
                 target: "autumn::shadow",
                 route = %context.route,
@@ -1413,6 +1430,49 @@ mod tests {
             stats.shadow_errors, 0,
             "an empty body is not a decode failure"
         );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_primary_body_is_not_blamed_on_the_candidate() {
+        // `shadow_errors` is documented as CANDIDATE failures. Counting the
+        // live build's own undecodable response there sends an operator hunting
+        // candidate connectivity for a body their own handler emitted.
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(service_fn(
+            |_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-encoding", "gzip")
+                        .body(Body::from("this is definitely not gzip"))
+                        .expect("valid response"),
+                )
+            },
+        ));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let _ = read_body(response).await;
+
+        settle("the primary decode failure to be counted", || {
+            registry.stats().primary_errors == 1
+        })
+        .await;
+        let stats = registry.stats();
+        assert_eq!(stats.primary_errors, 1);
+        assert_eq!(
+            stats.shadow_errors, 0,
+            "the candidate answered fine; it must not be blamed"
+        );
+        assert_eq!(stats.compared, 0);
     }
 
     #[tokio::test]

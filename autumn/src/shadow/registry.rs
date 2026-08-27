@@ -54,8 +54,14 @@ pub struct ShadowStats {
     /// Comparisons where they did not.
     pub diverged: u64,
     /// Shadow requests that failed at the transport (connection refused, DNS,
-    /// TLS, a malformed response).
+    /// TLS, a malformed response) — failures of the **candidate**.
     pub shadow_errors: u64,
+    /// Responses from the **live** build that could not be decoded, so no
+    /// comparison was possible. Counted apart from `shadow_errors` because that
+    /// series is documented as candidate transport failures: folding the two
+    /// together points an operator at candidate connectivity when the malformed
+    /// response was their own.
+    pub primary_errors: u64,
     /// Shadow requests abandoned at the configured deadline.
     pub shadow_timeouts: u64,
     /// Requests dropped without being mirrored because the in-flight ceiling
@@ -230,6 +236,7 @@ struct Counters {
     matched: AtomicU64,
     diverged: AtomicU64,
     shadow_errors: AtomicU64,
+    primary_errors: AtomicU64,
     shadow_timeouts: AtomicU64,
     dropped_at_capacity: AtomicU64,
     skipped_oversize: AtomicU64,
@@ -312,6 +319,11 @@ impl ShadowRegistry {
     /// Count a shadow request that failed at the transport.
     pub fn record_shadow_error(&self) {
         bump(&self.counters.shadow_errors);
+    }
+
+    /// Count a response from the live build that could not be decoded.
+    pub fn record_primary_error(&self) {
+        bump(&self.counters.primary_errors);
     }
 
     /// Count a shadow request abandoned at its deadline.
@@ -401,6 +413,7 @@ impl ShadowRegistry {
             matched: self.counters.matched.load(Ordering::Relaxed),
             diverged: self.counters.diverged.load(Ordering::Relaxed),
             shadow_errors: self.counters.shadow_errors.load(Ordering::Relaxed),
+            primary_errors: self.counters.primary_errors.load(Ordering::Relaxed),
             shadow_timeouts: self.counters.shadow_timeouts.load(Ordering::Relaxed),
             dropped_at_capacity: self.counters.dropped_at_capacity.load(Ordering::Relaxed),
             skipped_oversize: self.counters.skipped_oversize.load(Ordering::Relaxed),

@@ -264,14 +264,12 @@ pub(crate) fn decode_body(
     body: bytes::Bytes,
     max_body_bytes: usize,
 ) -> Result<bytes::Bytes, ShadowError> {
-    use std::io::Read as _;
-
     // Nothing to decode. A `HEAD` response carries no body while keeping its
     // representation headers, so it arrives here as zero bytes still declaring
     // `Content-Encoding: gzip` — and a decoder handed zero bytes fails with an
     // unexpected EOF. Reporting that as a transport error would have two
-    // identical builds increment `shadow_errors` and never be compared at all,
-    // on every precompressed route that answers `HEAD`.
+    // identical builds counted as errors and never compared at all, on every
+    // precompressed route that answers `HEAD`.
     if body.is_empty() {
         return Ok(body);
     }
@@ -279,10 +277,48 @@ pub(crate) fn decode_body(
     let Some(encoding) = content_encoding else {
         return Ok(body);
     };
-    // `identity` means "not encoded"; anything unrecognised is left alone.
-    if matches!(encoding, "identity" | "") {
+
+    // `Content-Encoding` is a LIST: `gzip, br` means brotli was applied to the
+    // gzip output, so it unwinds in reverse. Matching the header as a single
+    // string left a stacked value unrecognised and passed encoded bytes through
+    // to be compared against a plain body — a divergence produced by a header,
+    // which the contract says is not compared. `identity` contributes nothing
+    // and drops out of the chain.
+    let codings: Vec<&str> = encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|coding| !coding.is_empty() && *coding != "identity")
+        .collect();
+    if codings.is_empty() {
         return Ok(body);
     }
+    // An unrecognised coding anywhere makes the whole chain unsafe to unwind:
+    // decoding the layers around it would produce bytes that were never a
+    // representation of anything. Pass the body through untouched — exactly
+    // what a single unknown coding does — and let the byte comparison show it.
+    if !codings.iter().all(|coding| is_known_coding(coding)) {
+        return Ok(body);
+    }
+
+    let mut current = body;
+    for coding in codings.iter().rev() {
+        current = decode_one(coding, &current, max_body_bytes)?;
+    }
+    Ok(current)
+}
+
+/// Whether this content coding can be unwound.
+fn is_known_coding(coding: &str) -> bool {
+    matches!(coding, "gzip" | "x-gzip" | "deflate" | "br")
+}
+
+/// Unwind one content coding, bounding the output at `max_body_bytes`.
+fn decode_one(
+    coding: &str,
+    body: &bytes::Bytes,
+    max_body_bytes: usize,
+) -> Result<bytes::Bytes, ShadowError> {
+    use std::io::Read as _;
 
     // One byte past the budget, so an over-budget body is detectable rather
     // than silently truncated into a false divergence.
@@ -290,7 +326,7 @@ pub(crate) fn decode_body(
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let mut decoded = Vec::new();
-    let read = match encoding {
+    let read = match coding {
         "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body.as_ref())
             .take(limit)
             .read_to_end(&mut decoded),
@@ -300,12 +336,10 @@ pub(crate) fn decode_body(
         "br" => brotli::Decompressor::new(body.as_ref(), 4096)
             .take(limit)
             .read_to_end(&mut decoded),
-        _ => return Ok(body),
+        _ => return Ok(body.clone()),
     };
     read.map_err(|error| {
-        ShadowError::Transport(format!(
-            "could not decode a {encoding} shadow body: {error}"
-        ))
+        ShadowError::Transport(format!("could not decode a {coding} body: {error}"))
     })?;
     if decoded.len() > max_body_bytes {
         return Err(ShadowError::Oversize);
@@ -533,6 +567,56 @@ mod tests {
 
         let decoded = decode_body(Some("gzip"), gzipped, 4096).expect("decode");
         assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn a_stacked_content_encoding_is_unwound_in_reverse() {
+        // `gzip, br` means brotli was applied to the gzip output, so it unwinds
+        // br-then-gzip. Treating the header as one opaque string left it
+        // unrecognised and passed encoded bytes through to be compared against
+        // a plain body.
+        use std::io::Write as _;
+        let plain = br#"{"ok":true}"#;
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(plain).expect("gzip");
+        let gzipped = gz.finish().expect("finish");
+
+        let mut brotlied = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut brotlied, 4096, 5, 22);
+            writer.write_all(&gzipped).expect("br");
+        }
+
+        let decoded = decode_body(Some("gzip, br"), bytes::Bytes::from(brotlied), 4096)
+            .expect("decode chain");
+        assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn identity_inside_a_chain_is_ignored() {
+        use std::io::Write as _;
+        let plain = b"hello";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(plain).expect("gzip");
+        let gzipped = bytes::Bytes::from(gz.finish().expect("finish"));
+
+        let decoded = decode_body(Some("identity, gzip"), gzipped, 4096).expect("decode");
+        assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn an_unknown_coding_anywhere_leaves_the_whole_chain_alone() {
+        // Unwinding the layers around an unknown coding would produce bytes
+        // that were never a representation of anything.
+        let body = bytes::Bytes::from_static(b"opaque");
+        for encoding in ["exotic-v2", "gzip, exotic-v2", "exotic-v2, gzip"] {
+            assert_eq!(
+                decode_body(Some(encoding), body.clone(), 4096).expect("pass through"),
+                body,
+                "{encoding}"
+            );
+        }
     }
 
     #[test]

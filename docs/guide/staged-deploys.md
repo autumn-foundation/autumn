@@ -548,6 +548,8 @@ container, another port, another machine) and point `target` at it.
   *precompressed* representation, in which case the live build's captured bytes
   are encoded too — so `gzip`/`deflate`/`br` decoding is applied to **both**
   sides before comparison, under the same size budget as the wire read. A
+  stacked `Content-Encoding` (`gzip, br`) unwinds in reverse; an unrecognised
+  coding anywhere leaves the body untouched rather than guessing. A
   decompression bomb is refused rather than buffered, and an encoding difference
   between the two builds is a header difference, which the contract does not
   compare.
@@ -647,10 +649,13 @@ record from the ring.
 Two labelled metrics carry the same signal into your dashboards:
 
 - `autumn_shadow_comparisons_total{version, route, outcome}` — `outcome` is
-  `match`, `diverged`, `error` (the candidate could not be reached), `timeout`,
-  `skipped` (a body over the capture budget), `dropped` (the in-flight ceiling
-  was full), `refused` (the live build answered `429`/`503`), or `incomplete`
-  (the client never finished reading the primary response).
+  `match`, `diverged`, `error` (the candidate could not be reached, or its
+  response could not be decoded), `timeout`, `skipped` (a body over the capture
+  budget), `dropped` (the in-flight ceiling was full), `refused` (the live build
+  answered `429`/`503`), `incomplete` (the client never finished reading the
+  primary response), or `primary_error` (the **live** build's own response could
+  not be decoded — counted apart, so a malformed response of your own never
+  reads as a candidate connectivity problem).
 - `autumn_shadow_divergences_total{version, route, kind}` — the series to alert
   on; it stays at zero on a clean run.
 
