@@ -87,7 +87,7 @@ impl std::fmt::Display for PushPrincipal {
 ///
 /// This is the request body the built-in subscribe endpoint accepts. Fields
 /// the browser adds and Autumn does not use (`expirationTime`) are ignored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSubscription {
     /// The push service URL this user agent listens on.
     pub endpoint: String,
@@ -96,7 +96,7 @@ pub struct BrowserSubscription {
 }
 
 /// The `keys` object of a browser `PushSubscription`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionKeys {
     /// The user agent's P-256 public key, base64url-encoded.
     pub p256dh: String,
@@ -112,7 +112,7 @@ pub struct SubscriptionKeys {
 /// 16-byte `auth` secret. A custom [`PushSubscriptionStore`] therefore never
 /// has to re-validate what it is handed — and cannot be handed anything a
 /// hostile client shaped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredSubscription {
     /// Who this subscription delivers to.
     principal_id: String,
@@ -160,6 +160,43 @@ impl StoredSubscription {
     #[must_use]
     pub fn auth_base64url(&self) -> String {
         URL_SAFE_NO_PAD.encode(&self.auth)
+    }
+}
+
+/// Redacted: a derived `Debug` would print the endpoint, `p256dh` and `auth`
+/// together — which is everything needed to send arbitrary notifications to
+/// that device. One `tracing::debug!(?subscription)` in an application's own
+/// subscribe handler would put a working send capability into its log
+/// pipeline, which is exactly what the send path already avoids by logging
+/// origins only.
+impl std::fmt::Debug for BrowserSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserSubscription")
+            .field("endpoint.origin", &endpoint_origin(&self.endpoint))
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Redacted for the same reason as [`BrowserSubscription`]'s.
+impl std::fmt::Debug for SubscriptionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriptionKeys")
+            .field("p256dh", &"<redacted>")
+            .field("auth", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Redacted for the same reason as [`BrowserSubscription`]'s.
+impl std::fmt::Debug for StoredSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredSubscription")
+            .field("principal_id", &self.principal_id)
+            .field("endpoint.origin", &endpoint_origin(&self.endpoint))
+            .field("p256dh", &"<redacted>")
+            .field("auth", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -231,6 +268,19 @@ impl BrowserSubscription {
 ///
 /// See [`BrowserSubscription::decode`]'s "Endpoint safety" section for why
 /// each rule is here.
+/// The origin of an endpoint URL, for logging and `Debug`.
+///
+/// A full push endpoint URL is a **capability**: anyone holding it — with the
+/// subscription's keys — can send to that device. Logs are copied, shipped and
+/// retained far more widely than the subscription table, so nothing in this
+/// module ever renders more than the origin.
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
+    url::Url::parse(endpoint).map_or_else(
+        |_| "<unparseable>".to_owned(),
+        |parsed| parsed.origin().ascii_serialization(),
+    )
+}
+
 /// The longest endpoint URL that will be stored.
 ///
 /// Real push service endpoints are a few hundred bytes. A generous ceiling
@@ -1116,6 +1166,42 @@ mod tests {
             0
         );
     }
+    // ── Credential redaction ────────────────────────────────────────────────
+
+    #[test]
+    fn debug_never_prints_a_working_send_capability() {
+        // endpoint + p256dh + auth together are everything needed to send
+        // arbitrary notifications to that device. The send path already logs
+        // origins only; the types themselves must not undo that the moment an
+        // app writes `tracing::debug!(?subscription)`.
+        let secret_path = "SECRET-DEVICE-TOKEN";
+        let browser = browser_subscription(&format!("https://push.example.com/{secret_path}"));
+        let stored = browser.decode(&7_i64.into()).expect("valid");
+
+        for rendered in [format!("{browser:?}"), format!("{stored:?}")] {
+            assert!(
+                !rendered.contains(secret_path),
+                "the endpoint path is a capability and must not be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains(AUTH),
+                "the auth secret must not be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains(P256DH),
+                "the subscription key must not be printed: {rendered}"
+            );
+            assert!(
+                rendered.contains("push.example.com"),
+                "…but the origin stays, so a delivery problem is still diagnosable: {rendered}"
+            );
+        }
+
+        // The nested keys struct is just as reachable on its own.
+        let keys = format!("{:?}", browser.keys);
+        assert!(!keys.contains(AUTH) && !keys.contains(P256DH), "{keys}");
+    }
+
     // ── Endpoint hardening ──────────────────────────────────────────────────
 
     #[test]

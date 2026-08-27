@@ -28,7 +28,7 @@ use super::PushError;
 use super::encryption;
 use super::store::{
     BoxedPushSubscriptionStore, BrowserSubscription, PushPrincipal, PushSubscriptionStore,
-    StoredSubscription,
+    StoredSubscription, endpoint_origin,
 };
 use super::transport::{PushRequest, PushTransport};
 use super::vapid::VapidKey;
@@ -663,20 +663,6 @@ impl axum::extract::FromRequestParts<AppState> for WebPush {
         // memory store's contents) stable across requests.
         Ok((*state.extension_or_insert_with::<Self>(|| resolved)).clone())
     }
-}
-
-/// The origin of an endpoint URL, for logging.
-///
-/// A full push endpoint URL is a **capability**: anyone holding one can send
-/// to that device. Logs are copied, shipped, and retained far more widely than
-/// the subscription table, so framework logs record only the origin — enough
-/// to tell FCM apart from Mozilla autopush when diagnosing a delivery problem,
-/// and useless to anyone who reads the log.
-fn endpoint_origin(endpoint: &str) -> String {
-    url::Url::parse(endpoint).map_or_else(
-        |_| "<unparseable>".to_owned(),
-        |parsed| parsed.origin().ascii_serialization(),
-    )
 }
 
 impl std::fmt::Debug for WebPush {
