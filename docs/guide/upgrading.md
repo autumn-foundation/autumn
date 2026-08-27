@@ -500,7 +500,7 @@ Only steps 3 and 6 write anything, and step 4 shows you everything step 3 did.
 | Code | Meaning |
 |------|---------|
 | `0` | The scan completed. This includes a run that reported `manual` sites or skipped an unparsable file — both are in the report, and neither is a failure of the command. |
-| `1` | The apply step failed partway through. The report names the file it died on; the ones listed before it were already written. |
+| `1` | The apply step failed partway through, or it wrote the files but could not record their new baseline in `.autumn/scaffold.toml` — in which case the files are correct and the next run will report them as conflicts until the manifest can be written. The report names the file it died on; the ones listed before it were already written. |
 | `2` | A bad argument, a `PATH` that is not a readable directory, a version this command cannot parse, or `--check` outside an Autumn project (or in one whose `Cargo.toml` gives no usable `[package] name`). Nothing was scanned. |
 | `3` | `--check` found scaffold drift. Its own code rather than `1`, so a CI job can tell "your skeleton is stale" from "the apply step died partway". |
 

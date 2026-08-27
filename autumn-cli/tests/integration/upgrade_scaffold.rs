@@ -608,3 +608,26 @@ fn accept_honours_json_mode() {
         serde_json::from_str(&stdout_of(&output)).expect("stdout must be JSON");
     assert_eq!(value["accepted"][0], "Dockerfile", "{value}");
 }
+
+#[cfg(unix)]
+#[test]
+fn an_apply_that_cannot_record_its_baseline_exits_nonzero() {
+    // Exit 0 here would tell a CI script the upgrade succeeded, when in fact
+    // the very next `--check` is guaranteed to exit 3 on the files this run
+    // just wrote correctly.
+    let (tmp, root) = new_project("baseline", &[]);
+    let outside = tmp.path().join("outside.toml");
+    fs::write(&outside, "not mine\n").unwrap();
+    fs::remove_file(root.join(MANIFEST)).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(MANIFEST)).unwrap();
+    fs::remove_file(root.join("rustfmt.toml")).unwrap();
+
+    let output = run(&root, &["--apply"]);
+    assert_eq!(output.status.code(), Some(1), "{}", report(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline"), "{}", report(&output));
+
+    // The file it did write is still correct, and the link target is untouched.
+    assert!(root.join("rustfmt.toml").is_file());
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine\n");
+}

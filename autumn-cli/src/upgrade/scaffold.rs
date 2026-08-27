@@ -974,24 +974,34 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
         }
     }
 
-    record_baseline(report);
+    // The files are all written, so the outcome is `Applied` whatever happens
+    // next — but recording the baseline is part of the job, not a courtesy.
+    let written = report.applicable().len();
     report.outcome = super::Outcome::Applied;
-    Ok(())
+    record_baseline(report).map_err(|error| WriteFailure {
+        path: MANIFEST_PATH.to_owned(),
+        error,
+        written,
+    })
 }
 
 /// Refresh the provenance manifest after a completed apply.
 ///
-/// Best effort by design: the manifest is bookkeeping, so failing to write it
-/// must not read as a failure to upgrade — the files on disk are already
-/// correct and the next run simply has a staler baseline.
-fn record_baseline(report: &ScaffoldReport) {
+/// # Errors
+///
+/// Fails when the manifest cannot be written. Deliberately *not* best effort:
+/// the files on disk are correct, but without their new digests the very next
+/// `autumn upgrade --check` reports them as conflicts and exits 3. An apply
+/// that guarantees a red gate afterwards has not succeeded, and returning
+/// success would tell a CI script otherwise.
+fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
     // A report with no entries reconciled nothing, and rebuilding the manifest
     // from no entries would prune every digest in it. That is the baseline the
     // whole feature rests on, destroyed by a run that did not even look at the
     // files. The only report shaped like this is one whose project name could
     // not be read, which is a refusal to answer, not an answer.
     if !report.named {
-        return;
+        return Ok(());
     }
     let previous = Manifest::load(&report.root);
     let next = report.next_manifest(previous.as_ref());
@@ -1000,9 +1010,15 @@ fn record_baseline(report: &ScaffoldReport) {
     let rendered = next.render();
     let path = report.root.join(MANIFEST_PATH);
     if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
-        return;
+        return Ok(());
     }
-    let _ = next.save(&report.root);
+    next.save(&report.root).map_err(|error| {
+        format!(
+            "the scaffold files were written, but the baseline could not be recorded: \
+             {error}. Until it is, every file this run updated will be reported as a \
+             conflict and `--check` will not go green."
+        )
+    })
 }
 
 /// Write one entry, refusing to clobber anything that moved since the plan.
@@ -2357,7 +2373,8 @@ mod tests {
 
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut report = plan_in(tmp.path());
-        apply(&mut report).expect("the scaffold files still reconcile");
+        let failure = apply(&mut report).expect_err("the baseline cannot be recorded");
+        assert_eq!(failure.path, MANIFEST_PATH);
 
         assert_eq!(
             fs::read_to_string(&outside).unwrap(),
@@ -2377,7 +2394,8 @@ mod tests {
 
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut report = plan_in(tmp.path());
-        apply(&mut report).expect("the scaffold files still reconcile");
+        let failure = apply(&mut report).expect_err("the baseline cannot be recorded");
+        assert_eq!(failure.path, MANIFEST_PATH);
 
         assert!(
             !outside.join("scaffold.toml").exists(),
@@ -2588,5 +2606,34 @@ mod tests {
             ordinary & 0o777,
             "the manifest must be as readable as the files it describes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_apply_that_cannot_record_its_baseline_is_not_a_success() {
+        // The scaffold files are written correctly, but without the baseline
+        // the very next `--check` reports them as conflicts and exits 3. An
+        // apply that guarantees a red gate afterwards has not succeeded, and
+        // reporting exit 0 tells a CI script otherwise.
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside.toml");
+        fs::write(&outside, "not mine\n").unwrap();
+        fs::remove_file(tmp.path().join(MANIFEST_PATH)).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(MANIFEST_PATH)).unwrap();
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        let failure = apply(&mut report).expect_err("must not report success");
+        assert_eq!(failure.path, MANIFEST_PATH);
+        assert!(failure.error.contains("baseline"), "{}", failure.error);
+
+        // The files it did write are still correct, and the run says how many.
+        let files = current_files(tmp.path(), GenerateOptions::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("rustfmt.toml")).unwrap(),
+            files["rustfmt.toml"]
+        );
+        assert_eq!(failure.written, report.applicable().len());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine\n");
     }
 }
