@@ -130,6 +130,30 @@ async fn seed_subreddit(conn: &mut AsyncPgConnection, creator_id: i64, slug: &st
     .id
 }
 
+/// Insert a live comment on a post, at an explicit `created_at`.
+///
+/// The comments table is polymorphic, so the parent is
+/// `(commentable_type, commentable_id)` and carries no foreign key.
+async fn seed_comment(
+    conn: &mut AsyncPgConnection,
+    author_id: i64,
+    post_id: i64,
+    created_at: &str,
+) -> i64 {
+    diesel::sql_query(
+        "INSERT INTO comments (body, author_id, commentable_type, commentable_id, created_at) \
+         VALUES ('a reply', $1, $2, $3, $4::timestamp) RETURNING id",
+    )
+    .bind::<BigInt, _>(author_id)
+    .bind::<Text, _>(reddit_clone::models::Post::COMMENTABLE_TYPE)
+    .bind::<BigInt, _>(post_id)
+    .bind::<Text, _>(created_at)
+    .get_result::<IdRow>(conn)
+    .await
+    .expect("seed comment")
+    .id
+}
+
 async fn seed_post(
     conn: &mut AsyncPgConnection,
     author_id: i64,
@@ -252,6 +276,88 @@ async fn sitemap_lists_every_public_page() {
     assert!(
         !locs.contains(&format!("{BASE_URL}/about").as_str()),
         "the source must leave static routes to the framework: {locs:?}"
+    );
+}
+
+/// `<lastmod>` must describe the *page*, not the `posts` row.
+///
+/// A comment changes what a visitor reads but never touches `posts.updated_at`
+/// (the comment router writes only the polymorphic `comments` table), so the
+/// source derives the date as `GREATEST(posts.updated_at, newest live
+/// comment)`. This is the regression test for that derivation, including the
+/// ordering it drives: a busy thread must outrank a recently edited but quiet
+/// post, or the entry cap would drop the wrong pages first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn lastmod_follows_comment_activity_not_just_post_edits() {
+    let (_handle, url, pool) = start_postgres().await;
+    let mut conn = pool.get().await.expect("checkout");
+    setup_schema(&mut conn).await;
+
+    let author = seed_user(&mut conn, "ferris").await;
+    let rust = seed_subreddit(&mut conn, author, "rust").await;
+
+    // Edited long ago, but the discussion is alive.
+    let busy = seed_post(
+        &mut conn,
+        author,
+        rust,
+        "busy-thread",
+        "2026-01-10 08:00:00",
+    )
+    .await;
+    seed_comment(&mut conn, author, busy, "2026-06-20 17:45:00").await;
+    // A deleted comment must not count: it is not on the page any more.
+    let deleted = seed_comment(&mut conn, author, busy, "2026-07-30 10:00:00").await;
+    diesel::sql_query("UPDATE comments SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(deleted)
+        .execute(&mut conn)
+        .await
+        .expect("soft-delete the comment");
+
+    // Edited more recently than `busy`, but nobody has replied.
+    seed_post(&mut conn, author, rust, "quiet-post", "2026-03-15 09:00:00").await;
+    drop(conn);
+
+    let config = test_config(Some(&url));
+    reddit_clone::seo::init_base_url(&config);
+    let entries = RedditSitemapSource::from_config(&config).entries().await;
+
+    let busy_entry = entries
+        .iter()
+        .find(|e| e.loc.ends_with("/posts/busy-thread"))
+        .expect("busy-thread entry");
+    let quiet_entry = entries
+        .iter()
+        .find(|e| e.loc.ends_with("/posts/quiet-post"))
+        .expect("quiet-post entry");
+
+    assert_eq!(
+        busy_entry.lastmod.as_deref(),
+        Some("2026-06-20"),
+        "lastmod must follow the newest LIVE comment, not posts.updated_at \
+         and not the soft-deleted reply",
+    );
+    assert_eq!(
+        quiet_entry.lastmod.as_deref(),
+        Some("2026-03-15"),
+        "a post with no comments keeps its own updated_at",
+    );
+
+    // Ordering drives which posts survive the entry cap, so the busy thread
+    // must come first despite its older `posts.updated_at`.
+    let busy_pos = entries
+        .iter()
+        .position(|e| e.loc.ends_with("/posts/busy-thread"))
+        .expect("busy-thread position");
+    let quiet_pos = entries
+        .iter()
+        .position(|e| e.loc.ends_with("/posts/quiet-post"))
+        .expect("quiet-post position");
+    assert!(
+        busy_pos < quiet_pos,
+        "the busy thread must outrank the quiet post; entries: {:?}",
+        entries.iter().map(|e| &e.loc).collect::<Vec<_>>(),
     );
 }
 

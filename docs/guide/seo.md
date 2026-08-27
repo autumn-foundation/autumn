@@ -369,11 +369,45 @@ let source = PostSitemapSource { pool };
 ```
 
 `examples/reddit-clone/src/seo.rs` does this. It lists the communities and the
-posts, and it puts `posts.updated_at` in `lastmod`.
+posts.
 
 Bound the query. It runs at boot, so a row count you did not choose must not
 decide how long it takes. Log a warning when the bound bites, so a partial
 sitemap is never a silent one.
+
+### Give `lastmod` the page, not one column
+
+`lastmod` tells a crawler whether it must fetch the page again. It must
+therefore describe the whole page. One timestamp column rarely does.
+
+A post page is its body plus its comment thread. An edit advances
+`posts.updated_at`. A new comment does not: it writes a different table
+through a different route. A `lastmod` read straight from `posts.updated_at`
+therefore tells the crawler nothing changed, and the new comments stay out of
+the index.
+
+You have two ways to fix that:
+
+1. **Write** the timestamp from each subsystem that changes the page.
+2. **Derive** it in the sitemap query.
+
+Prefer the second. One query then owns the definition, and no write path has
+to remember to take part:
+
+```sql
+SELECT GREATEST(p.updated_at, COALESCE(MAX(c.created_at), p.updated_at)) AS last_modified
+  FROM posts p
+  LEFT JOIN comments c ON c.commentable_id = p.id AND c.deleted_at IS NULL
+ GROUP BY p.id
+ ORDER BY last_modified DESC
+```
+
+Order on the derived value, not on the column. Your entry cap cuts the list,
+and it must cut the pages that really are the oldest.
+
+Leave out the changes a reader does not come for. A vote count is one of them.
+Search engines ask you not to advertise a trivial change. A sitemap that moves
+every date on every vote also teaches crawlers to distrust all of its dates.
 
 Handle a query failure inside the source. Log the failure and return the
 entries you have. A short sitemap is better than a failed boot.

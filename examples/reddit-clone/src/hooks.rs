@@ -46,9 +46,14 @@ impl MutationHooks for PostHooks {
         // form, the generated API routes, a bulk update. `posts.updated_at`
         // carries a `DEFAULT NOW()` that only fires on INSERT, so without this
         // line an edited post keeps reporting its creation date forever. That
-        // matters beyond the column itself: `/sitemap.xml` publishes it as each
+        // matters beyond the column itself: `/sitemap.xml` feeds it into each
         // post's `<lastmod>` (see `crate::seo`), which is how a crawler decides
         // whether to fetch the page again. A stale `<lastmod>` tells it not to.
+        //
+        // This covers edits only. A comment changes the page without touching
+        // the `posts` row at all, so `crate::seo` derives the final
+        // `<lastmod>` as the later of this column and the newest live comment
+        // rather than expecting every subsystem to write a timestamp here.
         //
         // `ctx.now` is the framework's injected mutation timestamp, so this
         // stays deterministic under `#[sim_test]`; `chrono::Utc::now()` would
@@ -126,9 +131,14 @@ mod tests {
 
     #[tokio::test]
     async fn before_update_advances_updated_at_even_without_a_field_change() {
-        // A no-op save still counts as a modification for `<lastmod>`: the
-        // hook must not make the timestamp conditional on a diff it cannot
-        // see (tags, votes and comments all change the rendered page).
+        // A no-op save still counts as a modification: the hook cannot see
+        // every reason a caller saved (a normalizer may have rewritten a
+        // field, or the caller may be re-persisting a value it recomputed),
+        // so it must not make the timestamp conditional on a column diff.
+        //
+        // This hook covers the `PgPostRepository::update` path only. Comments
+        // never touch the `posts` row -- `crate::seo` derives their effect on
+        // `<lastmod>` at read time instead.
         let mut ctx = context_at(2026, 7, 4);
         let mut draft = UpdateDraft::new(stale_post());
 

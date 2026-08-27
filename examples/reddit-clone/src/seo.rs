@@ -25,7 +25,22 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 
-use crate::schema::{posts, subreddits};
+use crate::models::Post;
+use crate::schema::subreddits;
+
+/// One post's sitemap row, as the derived-`lastmod` query returns it.
+///
+/// `last_modified` is not a column: it is `GREATEST(posts.updated_at, the
+/// newest live comment)`. See the query in [`RedditSitemapSource::collect`].
+#[derive(diesel::QueryableByName)]
+struct PostSitemapRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    sub_slug: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    post_slug: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    last_modified: chrono::NaiveDateTime,
+}
 
 /// The maximum number of posts in `/sitemap.xml`.
 ///
@@ -36,8 +51,9 @@ use crate::schema::{posts, subreddits};
 /// table holds.
 ///
 /// The consequence is real and this example accepts it: past this many posts
-/// the sitemap is **partial**, and it drops the least recently updated posts
-/// first. `collect` logs a warning when it hits the cap, so the truncation is
+/// the sitemap is **partial**, and it drops the least recently changed posts
+/// first -- "changed" by the derived `<lastmod>`, so a busy comment thread
+/// keeps its place even when nobody has edited the post itself. `collect` logs a warning when it hits the cap, so the truncation is
 /// never silent. A site that outgrows one file needs a sitemap index served
 /// from its own `/sitemap.xml` route — see `docs/guide/seo.md`.
 const MAX_POST_ENTRIES: i64 = 5_000;
@@ -141,6 +157,11 @@ pub fn summarize(text: &str, max_chars: usize) -> Option<String> {
 /// posts. Both caps log a warning when they bite; read their doc comments for
 /// why the example bounds a boot-time query.
 ///
+/// Each post's `<lastmod>` is **derived**, not read from one column: it is the
+/// later of `posts.updated_at` and the post's newest live comment, because a
+/// comment changes the page without touching the `posts` row. See the query in
+/// [`Self::collect`] for the two changes deliberately left out.
+///
 /// The framework calls [`SitemapSource::entries`] one time, while it builds
 /// the router. It renders the result into a static `/sitemap.xml` body. The
 /// sitemap is therefore a snapshot of the database at start-up. That is the
@@ -234,19 +255,53 @@ impl RedditSitemapSource {
             );
         }
 
-        // `updated_at` becomes each post's `<lastmod>`, which tells a crawler
-        // whether it must fetch the page again. `PostHooks::before_update`
-        // advances that column on every update path, so the date is a real
-        // modification date and not the row's creation date.
+        // `<lastmod>` tells a crawler whether it must fetch the page again, so
+        // it has to describe the *page*, not one row. A post page is its body
+        // plus its comment thread, and the two change through different write
+        // paths:
         //
-        // The `ORDER BY updated_at DESC` pairs with the cap below: when the
-        // table outgrows `MAX_POST_ENTRIES`, the posts that survive into the
-        // sitemap are the ones that changed most recently.
-        let rows: Vec<(String, String, chrono::NaiveDateTime)> = match posts::table
-            .inner_join(subreddits::table)
-            .order(posts::updated_at.desc())
-            .limit(MAX_POST_ENTRIES)
-            .select((subreddits::slug, posts::slug, posts::updated_at))
+        //   * an edit goes through `PgPostRepository::update`, and
+        //     `PostHooks::before_update` advances `posts.updated_at`;
+        //   * a comment goes through the framework's comment router, which
+        //     never touches the `posts` row at all.
+        //
+        // So the modification time is derived here, at read time, rather than
+        // written by every subsystem that can change the page: `GREATEST` of
+        // the post's own timestamp and its newest live comment. Deriving beats
+        // fanning timestamp writes out across the comment router, the vote
+        // path and the tag path -- one query owns the definition, and no write
+        // path has to remember to participate.
+        //
+        // Two deliberate exclusions. **Votes** do not count: a score tick is
+        // exactly the trivial change search engines ask you not to advertise,
+        // and bumping every post on every vote would make the whole sitemap
+        // churn and teach crawlers to distrust its dates. **Tags** do not
+        // count either -- they are page chrome, not the content someone
+        // arrives to read.
+        //
+        // Raw SQL here on purpose: the cap below has to keep the genuinely
+        // freshest pages, so the ORDER BY must run on the same derived
+        // expression the SELECT returns. Ordering on `posts.updated_at` and
+        // computing the real date afterwards in Rust would cut a busy but
+        // rarely-edited thread before its freshness was ever known.
+        let post_sql = r#"
+            SELECT s.slug AS sub_slug,
+                   p.slug AS post_slug,
+                   GREATEST(p.updated_at, COALESCE(MAX(c.created_at), p.updated_at))
+                       AS last_modified
+              FROM posts p
+              JOIN subreddits s ON s.id = p.subreddit_id
+              LEFT JOIN comments c
+                     ON c.commentable_type = $1
+                    AND c.commentable_id = p.id
+                    AND c.deleted_at IS NULL
+             GROUP BY p.id, s.id
+             ORDER BY last_modified DESC
+             LIMIT $2
+        "#;
+        let rows: Vec<PostSitemapRow> = match diesel::sql_query(post_sql)
+            .bind::<diesel::sql_types::Text, _>(Post::COMMENTABLE_TYPE)
+            .bind::<diesel::sql_types::BigInt, _>(MAX_POST_ENTRIES)
             .load(&mut conn)
             .await
         {
@@ -260,13 +315,13 @@ impl RedditSitemapSource {
             tracing::warn!(
                 limit = MAX_POST_ENTRIES,
                 "sitemap: post cap reached; the sitemap is partial and omits the least \
-                 recently updated posts"
+                 recently changed posts"
             );
         }
-        for (sub_slug, post_slug, updated_at) in rows {
+        for row in rows {
             entries.push(
-                SitemapEntry::new(format!("{base}/r/{sub_slug}/posts/{post_slug}"))
-                    .lastmod(updated_at.format("%Y-%m-%d").to_string())
+                SitemapEntry::new(format!("{base}/r/{}/posts/{}", row.sub_slug, row.post_slug))
+                    .lastmod(row.last_modified.format("%Y-%m-%d").to_string())
                     .changefreq(SitemapChangefreq::Weekly)
                     .priority(0.6),
             );
