@@ -1468,6 +1468,37 @@ impl AppBuilder {
         self
     }
 
+    /// The route manifest this builder would dump for `autumn routes` —
+    /// enumerable routes plus everything declared via
+    /// [`declare_plugin_routes`](Self::declare_plugin_routes).
+    ///
+    /// This is the seam a plugin author's conformance test needs: it runs the
+    /// same collection the `AUTUMN_DUMP_ROUTES` path runs, in-process, so
+    /// `autumn_web::plugin_conformance::run_conformance` can be pointed at a
+    /// host app built in a test without compiling and executing a binary.
+    ///
+    /// Framework-owned routes (probes, actuator, docs) are **not** included:
+    /// they depend on the loaded configuration, and a conformance run is about
+    /// what the plugin contributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterBuildError::UnregisteredApiVersion`](crate::router::RouterBuildError::UnregisteredApiVersion)
+    /// if a route names an API version this builder has not registered — the
+    /// same refusal `autumn routes` reports.
+    pub fn plugin_route_infos(
+        &self,
+    ) -> Result<Vec<crate::route_listing::RouteInfo>, crate::router::RouterBuildError> {
+        let mut infos = crate::route_listing::collect_route_infos(
+            &self.routes,
+            &self.route_sources,
+            &self.scoped_groups,
+            &self.api_versions,
+        )?;
+        infos.extend(self.declared_routes.iter().cloned());
+        Ok(infos)
+    }
+
     /// Register an async startup hook that runs after [`AppState`] exists and
     /// before the server begins accepting requests.
     ///
