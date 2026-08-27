@@ -378,23 +378,9 @@ async fn serve(
                 error = %err,
                 "the sandbox worker did not complete; serving 502 on the plugin's prefix"
             );
-            return sandbox_error(
-                &plugin,
-                StatusCode::BAD_GATEWAY,
-                "the plugin did not complete",
-            );
+            return sandbox_error(&plugin, StatusCode::BAD_GATEWAY);
         }
     };
-
-    for denial in &outcome.denials {
-        tracing::warn!(
-            plugin,
-            capability = denial.capability.as_str(),
-            operation = denial.operation,
-            detail = denial.detail,
-            "sandboxed plugin was denied a capability during a request"
-        );
-    }
 
     match outcome.result {
         Ok(response) => build_response(&plugin, &response),
@@ -406,7 +392,7 @@ async fn serve(
                 fuel_used = outcome.fuel_used,
                 "sandboxed plugin failed to answer; serving an error on its own prefix"
             );
-            sandbox_error(&plugin, failure.status(), &failure.to_string())
+            sandbox_error(&plugin, failure.status())
         }
     }
 }
@@ -416,7 +402,7 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
     let Ok(status) = StatusCode::from_u16(response.status) else {
         // `SandboxResponse::validate` already refused anything outside the HTTP
         // range, so this cannot happen; refusing again is cheaper than trusting.
-        return sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid response status");
+        return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
     };
 
     let mut out = Response::builder().status(status);
@@ -426,7 +412,7 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
             HeaderName::try_from(name.as_str()),
             HeaderValue::try_from(value.as_str()),
         ) else {
-            return sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid response header");
+            return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
         };
         if name == http::header::CONTENT_TYPE {
             saw_content_type = true;
@@ -443,11 +429,11 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
 
     match attribution(plugin) {
         Some(value) => out = out.header(SANDBOX_ATTRIBUTION_HEADER, value),
-        None => return sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid plugin name"),
+        None => return sandbox_error(plugin, StatusCode::BAD_GATEWAY),
     }
 
     out.body(Body::from(response.body.clone())).map_or_else(
-        |_| sandbox_error(plugin, StatusCode::BAD_GATEWAY, "invalid response"),
+        |_| sandbox_error(plugin, StatusCode::BAD_GATEWAY),
         axum::response::IntoResponse::into_response,
     )
 }
@@ -458,7 +444,7 @@ fn attribution(plugin: &str) -> Option<HeaderValue> {
 
 /// The error a sandboxed plugin's own prefix serves. Never leaks a guest's
 /// stderr or trap text to the caller — that is for the operator's log.
-fn sandbox_error(plugin: &str, status: StatusCode, _detail: &str) -> Response {
+fn sandbox_error(plugin: &str, status: StatusCode) -> Response {
     let mut response = (
         status,
         [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],

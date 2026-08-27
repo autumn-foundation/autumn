@@ -425,7 +425,7 @@ impl SandboxHost {
         let granted: Vec<SandboxCapability> = self.manifest.capabilities.clone();
         let frame = HostFrame::request(request, &granted);
 
-        let mut state = HostState::new(limits);
+        let mut state = HostState::new(self.manifest.name.clone(), limits);
         match to_line(&frame) {
             Ok(line) => state.stdin.extend(line.as_bytes()),
             Err(err) => {
@@ -659,6 +659,10 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
 }
 
 struct HostState {
+    /// The plugin's name, so a denial line names who was refused. Carried here
+    /// rather than logged by the caller so the refusal is logged exactly once,
+    /// at the point it happens, whoever is driving the host.
+    plugin: String,
     /// Bytes of the request frame the guest has not read yet.
     stdin: VecDeque<u8>,
     /// The partial stdout line being accumulated.
@@ -680,8 +684,9 @@ impl HostState {
     /// same artifact see the same bytes.
     const RANDOM_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
-    const fn new(limits: ResourceLimits) -> Self {
+    fn new(plugin: String, limits: ResourceLimits) -> Self {
         Self {
+            plugin,
             stdin: VecDeque::new(),
             stdout_line: Vec::new(),
             stderr: Vec::new(),
@@ -716,6 +721,7 @@ impl HostState {
             detail: detail.to_owned(),
         };
         tracing::warn!(
+            plugin = self.plugin,
             capability = capability.as_str(),
             operation,
             detail,
