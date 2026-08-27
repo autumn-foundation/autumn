@@ -283,9 +283,12 @@ through. The planner auto-enables autumn-web's `multipart` feature (`csv` comes
 from the export). **Insert-only** — no row is matched against an existing
 record, so re-uploading an exported file duplicates it; use
 `ImportMode::Upsert { by }` by hand for update-in-place. Bounded by
-`MAX_IMPORT_BYTES` (2 MiB) *and* `MAX_IMPORT_ROWS` (10 000, rows past it counted
-and reported as skipped); the upload is checked by extension **and** declared
-content type. Not emitted for `--live`, `--sharded`, owner-scoped
+`MAX_IMPORT_BYTES` (2 MiB) *and* `MAX_IMPORT_ROWS` (10 000): a file over the row
+cap is **refused whole** with a 422 before anything is imported — never
+partially imported — so an over-cap file must be split and the parts uploaded
+separately. The count is taken by `autumn_web::data::csv::count_data_rows`
+*before* `import_csv` runs, because a malformed row never reaches the row
+handler. The upload is checked by extension **and** declared content type. Not emitted for `--live`, `--sharded`, owner-scoped
 `--live-validation`, `--api`, or a model with an at-rest `{encrypted}` column
 (the export omits that column but the form requires it) — the generator warns
 and emits nothing, naming the reason and what to drop.
