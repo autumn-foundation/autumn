@@ -231,7 +231,12 @@ impl PushTransport for HttpPushTransport {
                     // follow a redirect, so neither DNS rebinding nor a `307`
                     // can steer this POST at an internal host.
                     .pin_to(addr)
-                    .no_redirect();
+                    .no_redirect()
+                    // The endpoint host is client-chosen and this transport
+                    // reads only the status. Without this, a registered
+                    // endpoint that streams indefinitely costs one unbounded
+                    // allocation per notification until the timeout fires.
+                    .discard_response_body();
                 for (name, value) in &request.headers {
                     builder = builder.header(name, value);
                 }

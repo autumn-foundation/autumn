@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated snippet, which is what keeps push opt-in working under the
   production defaults without exempting the push routes from CSRF.
 
+  Because every endpoint is client-chosen, the delivery path is written for a
+  hostile one: a principal's devices are dispatched to concurrently (bounded),
+  so a device that accepts a connection and never answers cannot hold up its
+  live siblings; the transport reads only the status code and discards the
+  response body unread, so a registered endpoint cannot stream unbounded memory
+  into the process; and the generated snippet unsubscribes on sign-out, so a
+  subscription never outlives the session that created it.
+
   Failure posture is deliberate: a `[push] private_key` that is present but
   unusable fails the **boot** rather than leaving push silently dead, and
   sending with no key configured is an error raised before any dispatch, never

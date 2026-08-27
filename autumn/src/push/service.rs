@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use super::PushError;
@@ -40,6 +41,15 @@ use crate::state::AppState;
 /// the re-engagement case this exists for — a notification is still worth
 /// delivering when the user's laptop comes back online tomorrow.
 pub const DEFAULT_TTL_SECS: u32 = 4 * 7 * 24 * 60 * 60;
+
+/// How many of one principal's devices are dispatched to at once.
+///
+/// Push endpoints are client-chosen, so a device that accepts a connection and
+/// never answers is a case to design for, not an accident: delivered serially
+/// it would hold the whole send for the transport's timeout. Concurrency keeps
+/// a stalled device from blocking its live siblings, and the bound keeps a
+/// fan-out from opening one connection per subscription at once.
+const MAX_CONCURRENT_DELIVERIES: usize = 8;
 
 // ── Message ─────────────────────────────────────────────────────────────────
 
@@ -322,10 +332,31 @@ impl WebPush {
             );
         }
 
+        // Dispatched concurrently, with a bound.
+        //
+        // Serially, one device that accepts the connection and then never
+        // answers holds the whole send for the transport's full timeout, and
+        // `send_many` queues every later recipient behind it — a principal at
+        // the subscription cap could stall one notification for minutes.
+        // Since every endpoint is client-chosen, that is reachable on purpose.
+        //
+        // Bounded rather than unbounded: a fan-out is still someone's
+        // connection pool, and `MAX_CONCURRENT_DELIVERIES` at a time is plenty
+        // to keep a stalled device from blocking its live siblings.
         let mut report = PushDeliveryReport::default();
-        for subscription in subscriptions {
-            report.merge(self.deliver_one(vapid, &subscription, &payload).await?);
+        let mut deliveries = futures::stream::iter(
+            subscriptions
+                .iter()
+                .map(|subscription| self.deliver_one(vapid, subscription, &payload)),
+        )
+        .buffer_unordered(MAX_CONCURRENT_DELIVERIES);
+        while let Some(outcome) = futures::StreamExt::next(&mut deliveries).await {
+            report.merge(outcome?);
         }
+        drop(deliveries);
+        // Deterministic order regardless of which device answered first, so a
+        // caller (and a test) can compare reports.
+        report.pruned.sort();
         Ok(report)
     }
 
@@ -1162,6 +1193,116 @@ mod tests {
             "the error must say how to fix it: {err}"
         );
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_device_does_not_hold_up_its_live_siblings() {
+        // Serially, one endpoint that accepts the connection and never answers
+        // holds the whole send for the transport's full timeout. Every
+        // endpoint is client-chosen, so this is reachable on purpose.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Blocks on the endpoint named `stall` until the others are done.
+        #[derive(Debug)]
+        struct StallingTransport {
+            in_flight: Arc<AtomicUsize>,
+        }
+
+        impl PushTransport for StallingTransport {
+            fn deliver<'a>(
+                &'a self,
+                request: &'a crate::push::PushRequest,
+            ) -> crate::push::transport::PushTransportFuture<'a> {
+                Box::pin(async move {
+                    if request.endpoint.contains("stall") {
+                        // Resolves only once every other device has been
+                        // dispatched — impossible unless they run
+                        // concurrently with this one.
+                        for _ in 0..1_000 {
+                            if self.in_flight.load(Ordering::SeqCst) >= 2 {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        return Ok(201);
+                    }
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    Ok(201)
+                })
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let push = WebPush::new(
+            MemoryPushSubscriptionStore::new(),
+            VapidKey::generate(),
+            "mailto:ops@example.com",
+            StallingTransport {
+                in_flight: in_flight.clone(),
+            },
+        );
+        for endpoint in [
+            "https://push.example.com/stall",
+            "https://push.example.com/live-a",
+            "https://push.example.com/live-b",
+        ] {
+            push.subscribe(7_i64, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+
+        // Serial dispatch would deadlock here: the stalled device is first and
+        // would wait forever for siblings that never start.
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            push.send(7_i64, &PushMessage::new("Hi", "There")),
+        )
+        .await
+        .expect("a stalled device must not block the others")
+        .expect("send");
+        assert_eq!(report.delivered, 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_delivery_still_prunes_and_reports_deterministically() {
+        // Concurrency must not change what a send reports, only how fast it
+        // gets there — including the order of `pruned`, which callers compare.
+        let transport = RecordingPushTransport::new()
+            .responding_with("https://push.example.com/dead-a", 410)
+            .responding_with("https://push.example.com/dead-b", 404);
+        let (push, _) = web_push_with(transport.clone());
+        for endpoint in [
+            "https://push.example.com/dead-b",
+            "https://push.example.com/live",
+            "https://push.example.com/dead-a",
+        ] {
+            push.subscribe(7_i64, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+
+        let report = push
+            .send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+        assert_eq!(report.delivered, 1);
+        assert_eq!(
+            report.pruned,
+            vec![
+                "https://push.example.com/dead-a".to_owned(),
+                "https://push.example.com/dead-b".to_owned(),
+            ],
+            "pruned must be stably ordered whichever device answered first"
+        );
+        // And the pruning really happened.
+        assert_eq!(
+            push.send(7_i64, &PushMessage::new("Hi", "again"))
+                .await
+                .expect("send")
+                .delivered,
+            1
+        );
     }
 
     #[tokio::test]

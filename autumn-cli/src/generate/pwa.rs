@@ -676,6 +676,41 @@ window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
   return subscription.unsubscribe();
 }};
 
+// Unsubscribe on the way out of a session.
+//
+// A subscription outliving the session that created it is a privacy leak, not
+// just untidiness: the row stays bound to the user who logged out, so the app
+// keeps pushing their notifications to that browser — in front of whoever uses
+// the device next. Nothing in a logout flow knows about push, so this hooks
+// the submit instead, while the session is still valid enough for the
+// server-side unsubscribe to authorize.
+//
+// Matches any form posting to `/logout` (what `autumn generate auth` emits) and
+// anything explicitly marked `data-autumn-push-unsubscribe`, for an app whose
+// sign-out is shaped differently.
+document.addEventListener('submit', (event) => {{
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement) || form.dataset.autumnPushHandled) {{
+    return;
+  }}
+  const action = form.getAttribute('action') || '';
+  const isSignOut =
+    form.hasAttribute('data-autumn-push-unsubscribe') || /\/logout\/?$/.test(action);
+  if (!isSignOut) {{
+    return;
+  }}
+  event.preventDefault();
+  // Re-entrancy guard: `form.submit()` below does not re-fire this handler in
+  // any current browser, but the flag makes that independent of that detail.
+  form.dataset.autumnPushHandled = 'true';
+  // `finally`, not `then`: a failed unsubscribe must never trap the user in a
+  // session they asked to leave.
+  window
+    .autumnPushUnsubscribe()
+    .catch(console.error)
+    .finally(() => form.submit());
+}});
+
 // Declarative opt-in: no application JavaScript required.
 document.addEventListener('click', (event) => {{
   // A synthetic `document.dispatchEvent(new MouseEvent('click'))` — the common
@@ -2360,6 +2395,46 @@ async fn main() {
                 .count(),
             1,
             "and a second run must not add another"
+        );
+    }
+
+    #[test]
+    fn client_snippet_unsubscribes_when_the_user_signs_out() {
+        // A subscription outliving its session is a privacy leak: the row
+        // stays bound to the user who logged out, so the app keeps pushing
+        // their notifications to that browser — in front of whoever uses the
+        // device next.
+        let js = render_push_opt_in();
+        assert!(
+            js.contains("addEventListener('submit'"),
+            "sign-out must be hooked; nothing in a logout flow knows about push:\n{js}"
+        );
+        assert!(
+            js.contains("/logout"),
+            "…matching what `autumn generate auth` emits:\n{js}"
+        );
+        assert!(
+            js.contains("data-autumn-push-unsubscribe"),
+            "…plus an opt-in attribute for a differently-shaped sign-out:\n{js}"
+        );
+        assert!(
+            js.contains("autumnPushUnsubscribe()"),
+            "…and it must actually unsubscribe:\n{js}"
+        );
+    }
+
+    #[test]
+    fn a_failed_unsubscribe_never_traps_the_user_in_their_session() {
+        // The logout POST is preventDefault'd, so if the unsubscribe promise
+        // is not always followed by a submit the user cannot sign out at all.
+        let js = render_push_opt_in();
+        assert!(
+            js.contains(".finally(() => form.submit())"),
+            "the form must submit whether or not the unsubscribe succeeded:\n{js}"
+        );
+        assert!(
+            js.contains("autumnPushHandled"),
+            "…guarded against re-entering the handler:\n{js}"
         );
     }
 

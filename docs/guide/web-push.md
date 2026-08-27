@@ -382,6 +382,23 @@ async fn build_failure_pushes_the_owner() {
 }
 ```
 
+## Signing out
+
+A subscription that outlives the session that created it is a privacy leak: the
+row stays bound to the user who signed out, so the app keeps pushing their
+notifications to that browser — in front of whoever uses the device next.
+
+The generated snippet handles it. It intercepts any form posting to `/logout`
+(what `autumn generate auth` emits) and unsubscribes first, while the session
+is still valid enough for the server to authorize it. If your sign-out is
+shaped differently, mark it:
+
+```html
+<form action="/session/end" method="post" data-autumn-push-unsubscribe>
+```
+
+A failed unsubscribe never blocks the sign-out itself.
+
 ## Payload limits
 
 Push services are only required to accept a 4096-byte encrypted body, which
