@@ -419,3 +419,24 @@ fn check_mode_does_not_print_file_contents_into_the_build_log() {
     let full = stdout_of(&run(&root, &[]));
     assert!(full.contains("hunter2"), "{full}");
 }
+
+#[test]
+fn check_does_not_pass_a_project_whose_scaffold_it_could_not_render() {
+    // A gate that goes green because the tool could not look is worse than no
+    // gate. Without a usable `[package] name` the scaffold cannot be rendered,
+    // so there is no verdict to report — and "no verdict" is not "clean".
+    let (_tmp, root) = new_project("nameless", &[]);
+    fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+    let output = run(&root, &["--check"]);
+    assert_eq!(output.status.code(), Some(2), "{}", report(&output));
+    let combined = format!(
+        "{}{}",
+        stdout_of(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("package"), "{combined}");
+
+    // ...and the manifest it could not use is still intact afterwards.
+    assert!(root.join(".autumn/scaffold.toml").is_file());
+}

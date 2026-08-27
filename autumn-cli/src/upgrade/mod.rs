@@ -1395,6 +1395,18 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
     } else {
         print!("{}", scaffold::render_summary(&report));
     }
+    // A refusal to answer is not an all-clear. Without a usable `[package]
+    // name` the scaffold cannot be rendered, so there is no verdict — and a
+    // gate that goes green because the tool could not look is worse than no
+    // gate at all.
+    if !report.named {
+        eprintln!(
+            "autumn upgrade: `{}` has no usable `[package] name` in Cargo.toml, and the\n\
+             scaffold interpolates it. Nothing was checked.",
+            root.display()
+        );
+        return 2;
+    }
     if report.drifted() { DRIFT_EXIT_CODE } else { 0 }
 }
 

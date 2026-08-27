@@ -704,14 +704,35 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
         }
     }
 
-    // The manifest is bookkeeping, so a failure to write it must not read as a
-    // failure to upgrade: the files are already correct and the next run simply
-    // has a staler baseline.
-    let previous = Manifest::load(&report.root);
-    let _ = report.next_manifest(previous.as_ref()).save(&report.root);
-
+    record_baseline(report);
     report.outcome = super::Outcome::Applied;
     Ok(())
+}
+
+/// Refresh the provenance manifest after a completed apply.
+///
+/// Best effort by design: the manifest is bookkeeping, so failing to write it
+/// must not read as a failure to upgrade — the files on disk are already
+/// correct and the next run simply has a staler baseline.
+fn record_baseline(report: &ScaffoldReport) {
+    // A report with no entries reconciled nothing, and rebuilding the manifest
+    // from no entries would prune every digest in it. That is the baseline the
+    // whole feature rests on, destroyed by a run that did not even look at the
+    // files. The only report shaped like this is one whose project name could
+    // not be read, which is a refusal to answer, not an answer.
+    if !report.named {
+        return;
+    }
+    let previous = Manifest::load(&report.root);
+    let next = report.next_manifest(previous.as_ref());
+    // Rewriting an identical file would touch its mtime and show up in every
+    // `--apply` as a modified file with no diff.
+    let rendered = next.render();
+    let path = report.root.join(MANIFEST_PATH);
+    if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
+        return;
+    }
+    let _ = next.save(&report.root);
 }
 
 /// Write one entry, refusing to clobber anything that moved since the plan.
@@ -1592,5 +1613,65 @@ mod tests {
             status_of(&entries, "static/css/input.css"),
             &Status::UpToDate
         );
+    }
+
+    #[test]
+    fn a_project_whose_name_cannot_be_read_keeps_its_baseline() {
+        // With no name there are no entries, and a manifest rebuilt from no
+        // entries would prune every digest in it — destroying the baseline that
+        // is the whole point of the file, in a run that reconciled nothing.
+        let tmp = scaffolded(GenerateOptions::default());
+        let before = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+        let mut report = plan_in(tmp.path());
+        assert!(!report.named);
+        assert!(report.entries.is_empty());
+        apply(&mut report).expect("apply");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap(),
+            before,
+            "the baseline must survive a run that could not read the project name"
+        );
+    }
+
+    #[test]
+    fn a_run_that_changes_nothing_does_not_rewrite_the_manifest() {
+        // `--apply` on an already-current project should leave the working tree
+        // alone; rewriting an identical file is git noise on every run.
+        let tmp = scaffolded(GenerateOptions::default());
+        let before = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+        let mtime = fs::metadata(tmp.path().join(MANIFEST_PATH))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::metadata(tmp.path().join(MANIFEST_PATH))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime,
+            "an unchanged manifest must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_project_is_not_reported_as_drift_free() {
+        // The refusal must not read as an all-clear: a CI gate that passes
+        // because the tool could not look is worse than no gate.
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let report = plan_in(tmp.path());
+        assert!(!report.named);
+        assert!(render_summary(&report).contains("Skipped"));
     }
 }

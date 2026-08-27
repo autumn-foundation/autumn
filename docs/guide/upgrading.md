@@ -279,7 +279,8 @@ and the `Dockerfile`'s `CMD` all interpolate it, so a guessed name would render
 a *different* scaffold and could rewrite `COPY --from=builder
 /app/target/release/<name>` into an image that cannot start. If your manifest
 gives no usable package name, the scaffold half says so and reconciles nothing
-rather than comparing against a fiction.
+rather than comparing against a fiction — and `--check` exits `2` there, because
+"we could not look" is not "clean".
 
 ### Reverting
 
@@ -389,7 +390,7 @@ Only step 3 writes anything, and step 4 shows you all of it.
 |------|---------|
 | `0` | The scan completed. This includes a run that reported `manual` sites or skipped an unparsable file — both are in the report, and neither is a failure of the command. |
 | `1` | The apply step failed partway through. The report names the file it died on; the ones listed before it were already written. |
-| `2` | A bad argument, a `PATH` that is not a readable directory, a version this command cannot parse, or `--check` outside an Autumn project. Nothing was scanned. |
+| `2` | A bad argument, a `PATH` that is not a readable directory, a version this command cannot parse, or `--check` outside an Autumn project (or in one whose `Cargo.toml` gives no usable `[package] name`). Nothing was scanned. |
 | `3` | `--check` found scaffold drift. Its own code rather than `1`, so a CI job can tell "your skeleton is stale" from "the apply step died partway". |
 
 There is no "found something" exit code: a preview that finds work is the
