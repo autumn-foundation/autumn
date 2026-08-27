@@ -112,6 +112,26 @@ pub const INHERITED_LISTENER_FD: i32 = 0;
 /// [`state_migration!`](crate::state_migration) from the old shape. A successor that finds a snapshot
 /// it can neither decode nor migrate refuses to start, which aborts the
 /// upgrade and leaves the predecessor serving.
+///
+/// # A live-state block must be plain data
+///
+/// **No interior mutability.** A block that carries an `AtomicU64`, a `Mutex`,
+/// a `Cell`/`RefCell`, or anything else mutable through a shared reference can
+/// be mutated through [`LiveStateHandle::read`], which hands out `&T` — and
+/// that path cannot be refused the way [`write`](LiveStateHandle::write) is.
+/// A mutation made that way during a handover is exactly the silent loss this
+/// module exists to prevent: the predecessor's snapshot was already taken, or
+/// the successor's upgrade can still be abandoned.
+///
+/// Use plain fields and mutate them through
+/// [`write`](LiveStateHandle::write), which is refused (never lost) for the
+/// moment a handover is in flight. The handle already provides the
+/// synchronisation an `Atomic*`/`Mutex` field would be reaching for.
+///
+/// This is a contract rather than a compiler-checked bound because stable Rust
+/// has no way to name "contains no `UnsafeCell`" — that is `Freeze`, still
+/// unstable. Add `T: Freeze` here when it lands and the contract becomes a
+/// build error.
 pub trait LiveState: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Wire version of this state shape.
     const VERSION: u32;
@@ -191,6 +211,12 @@ impl<T> LiveStateHandle<T> {
     ///
     /// Reads keep working after a snapshot: the process is still serving while
     /// it drains, it just no longer owns the state's future.
+    ///
+    /// `f` receives `&T`, so this is the one path a freeze cannot guard: a
+    /// block carrying interior mutability (`AtomicU64`, `Mutex`, `Cell`, …)
+    /// could be *mutated* from here, and that mutation would be lost by a
+    /// handover exactly as an unrefused write would be. Live state must be
+    /// plain data — see [`LiveState`].
     pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let guard = self
             .inner

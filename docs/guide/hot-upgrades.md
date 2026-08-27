@@ -303,6 +303,14 @@ the listening socket.
   from the one `Old` version registered with `with_live_state_from`. Anything
   else refuses to start, which abandons the upgrade rather than guessing.
 
+* **A live-state block must be plain data.** Not `AtomicU64`, `Mutex`, `Cell`
+  — anything mutable through a shared reference can be written through
+  `read(|s| …)`, which the freeze cannot refuse the way it refuses `write`,
+  and such a mutation is lost by a handover exactly as an unrefused write
+  would be. Mutate through `write` and let the handle do the synchronising.
+  (Stable Rust cannot express "no interior mutability" as a bound — that is
+  the unstable `Freeze` trait — so this one is a contract, not a compile
+  error. Everything else on this page is enforced.)
 * **Handle `LiveStateFrozen` fail-closed.** If the block holds anything
   security-relevant — rate-limit counters, one-time tokens, replay nonces,
   idempotency keys — a refused write must mean "reject the request", never
