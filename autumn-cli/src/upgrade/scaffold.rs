@@ -186,7 +186,20 @@ impl Manifest {
         Some(Self {
             version: file.version,
             options: GenerateOptions {
-                with_api: file.flavor == FLAVOR_API,
+                // Anything but the two flavours this CLI knows is treated as no
+                // manifest at all. Falling back to `fullstack` would keep
+                // trusting the recorded *digests* while rendering the wrong
+                // templates against them — so an API project's `Dockerfile`,
+                // untouched and matching its baseline, would classify as
+                // `update` and be replaced with the fullstack one while its
+                // `Cargo.toml` stayed API-shaped. A value written by a newer
+                // release, or a typo, is exactly when the conservative
+                // no-baseline path is wanted.
+                with_api: match file.flavor.as_str() {
+                    FLAVOR_API => true,
+                    FLAVOR_FULLSTACK => false,
+                    _ => return None,
+                },
                 with_i18n: file.i18n,
                 with_seed: file.seed,
                 with_daemon: file.daemon,
@@ -211,12 +224,26 @@ impl Manifest {
     }
 
     /// Write the manifest under `root`, creating `.autumn/` if needed.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path cannot be written — including when `.autumn` or the
+    /// manifest itself is a symbolic link. The manifest is written by a
+    /// different code path than the scaffold files and would otherwise have had
+    /// none of their protection: following the link would truncate a file
+    /// outside the project, invisibly to that project's own `git diff`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
+        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
+            return Err(std::io::Error::other(format!(
+                "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
+                 writing through it could write outside the project"
+            )));
+        }
         let path = root.join(MANIFEST_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, self.render())
+        publish(&path, &self.render()).map_err(std::io::Error::other)
     }
 }
 
@@ -994,10 +1021,7 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    if entry.current == OnDisk::Absent {
-        return create_atomically(entry);
-    }
-    replace_in_place(entry, directory)
+    publish(&entry.absolute, &entry.template)
 }
 
 /// Where an in-progress write to `absolute` is staged.
@@ -1013,24 +1037,25 @@ fn scratch_path(absolute: &Path) -> PathBuf {
     absolute.with_file_name(format!(".autumn-upgrade-{}.tmp", name.to_string_lossy()))
 }
 
-/// Publish a file at a path nothing occupies yet.
+/// Publish `contents` at `absolute`, atomically.
 ///
-/// Staged and renamed, not written in place. A plain `fs::write` interrupted by
-/// Ctrl-C or a full disk leaves a truncated file at the destination — and that
-/// file has no recorded baseline, so the *next* run classifies it as a conflict
-/// and refuses to touch it. The crash would be permanent: a corrupted file this
-/// command can never repair.
+/// Staged beside the destination and renamed into place, never written in
+/// place. A plain `fs::write` interrupted by Ctrl-C or a full disk leaves a
+/// truncated file — and for a file this command *added*, that is permanent: the
+/// truncated file has no recorded baseline, so the next run classifies it as a
+/// conflict and refuses to touch it.
 ///
 /// Staged by hand rather than through `tempfile`, which deliberately creates
 /// its temporaries 0600. Renaming one of those into place would leave an added
 /// `ci.yml` or `input.css` unreadable to every other uid — fatal to a Docker
 /// stage that drops privileges, and invisible in `git diff`, which tracks only
-/// the executable bit. `OpenOptions` honours the process umask, so the file
-/// lands with exactly the mode `autumn new` would have given it.
-fn create_atomically(entry: &Entry) -> Result<(), String> {
+/// the executable bit. `OpenOptions` honours the process umask, so a new file
+/// lands with exactly the mode `autumn new` would have given it; an existing
+/// one keeps the mode it already had.
+fn publish(absolute: &Path, contents: &str) -> Result<(), String> {
     use std::io::Write as _;
 
-    let scratch = scratch_path(&entry.absolute);
+    let scratch = scratch_path(absolute);
     // Debris from a killed run, cleared so a crash is not permanent. Only ever
     // this function's own scratch name, and never the destination.
     let _ = std::fs::remove_file(&scratch);
@@ -1042,49 +1067,26 @@ fn create_atomically(entry: &Entry) -> Result<(), String> {
         .create_new(true)
         .open(&scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    // Replacing a file keeps its mode; the umask default the scratch was
+    // created with is only right for a file that is genuinely new.
+    if let Ok(metadata) = std::fs::metadata(absolute) {
+        let _ = file.set_permissions(metadata.permissions());
+    }
 
     let staged = file
-        .write_all(entry.template.as_bytes())
+        .write_all(contents.as_bytes())
         .and_then(|()| file.flush())
         // The rename is atomic, but only against a crash if the bytes reached
         // the disk first: otherwise the rename can land before the data and
         // publish an empty file.
         .and_then(|()| file.sync_all());
     drop(file);
-    let published = staged.and_then(|()| std::fs::rename(&scratch, &entry.absolute));
+    let published = staged.and_then(|()| std::fs::rename(&scratch, absolute));
     if published.is_err() {
         // Nothing half-written survives, at the destination or beside it.
         let _ = std::fs::remove_file(&scratch);
     }
     published.map_err(|error| error.to_string())
-}
-
-/// Replace an existing file's contents atomically, keeping its mode.
-fn replace_in_place(entry: &Entry, directory: &Path) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut temp = tempfile::Builder::new()
-        .prefix(".autumn-upgrade-")
-        .suffix(".tmp")
-        .tempfile_in(directory)
-        .map_err(|error| error.to_string())?;
-    temp.write_all(entry.template.as_bytes())
-        .map_err(|error| error.to_string())?;
-    temp.flush().map_err(|error| error.to_string())?;
-    // The rename is atomic, but only against a crash if the bytes reached the
-    // disk first: otherwise the rename can land before the data and leave an
-    // empty file where a working one used to be.
-    temp.as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
-    // A fresh temporary is created 0600; renaming it over an existing file
-    // would otherwise silently tighten that file's mode.
-    if let Ok(metadata) = std::fs::metadata(&entry.absolute) {
-        let _ = temp.as_file().set_permissions(metadata.permissions());
-    }
-    temp.persist(&entry.absolute)
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -2271,5 +2273,80 @@ mod tests {
             fs::read_to_string(tmp.path().join("rustfmt.toml")).unwrap(),
             files["rustfmt.toml"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_manifest_is_never_written_through() {
+        // The manifest is written by a different path than the scaffold files,
+        // and had none of their symlink protection: a symlinked
+        // `.autumn/scaffold.toml` would have been followed and its target
+        // outside the project truncated, invisibly to the project's own
+        // `git diff`.
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside.toml");
+        fs::write(&outside, "not mine to touch\n").unwrap();
+        fs::remove_file(tmp.path().join(MANIFEST_PATH)).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(MANIFEST_PATH)).unwrap();
+
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("the scaffold files still reconcile");
+
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "not mine to touch\n",
+            "the link target must never be written through"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_autumn_directory_is_never_written_through() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside-dir");
+        fs::create_dir_all(&outside).unwrap();
+        fs::remove_dir_all(tmp.path().join(".autumn")).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(".autumn")).unwrap();
+
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("the scaffold files still reconcile");
+
+        assert!(
+            !outside.join("scaffold.toml").exists(),
+            "nothing may be written through a symlinked parent"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_flavor_is_no_baseline_rather_than_a_guess() {
+        // A `flavor` this CLI does not know — a typo, corruption, or a value a
+        // newer release writes — must not silently read as `fullstack`. The
+        // digests would still be trusted, so an API project's `Dockerfile`
+        // would be classified `update` and replaced with the fullstack one
+        // while its `Cargo.toml` stayed API-shaped.
+        let tmp = scaffolded(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        let text = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+        fs::write(
+            tmp.path().join(MANIFEST_PATH),
+            text.replace("flavor = \"api\"", "flavor = \"fullstack-v2\""),
+        )
+        .unwrap();
+
+        assert!(Manifest::load(tmp.path()).is_none());
+
+        let before = fs::read_to_string(tmp.path().join("Dockerfile")).unwrap();
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
+            before,
+            "an unreadable flavor must fall back to the conservative no-baseline path"
+        );
+        assert!(!tmp.path().join("tailwind.config.js").exists());
     }
 }
