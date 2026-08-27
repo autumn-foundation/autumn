@@ -31,6 +31,8 @@ showcasing the framework's major features in a single cohesive application.
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
 | Audit logging (`AuditLogger` + `TracingAuditSink`, actor auto-attribution via `Current::actor()`) | `main.rs`, `routes/posts.rs` (`delete_post`) |
 | **Route-level SEO** (`seo(...)` + `SeoMeta` extractor, canonical URLs, `robots = "noindex"`, DB-backed `SitemapSource`, auto-mounted `/robots.txt` + `/sitemap.xml`) | `seo.rs`, `autumn.toml`, `routes/posts.rs`, `routes/subreddits.rs`, `routes/about.rs`, `routes/layout.rs` |
+| **Failure capsules** (record a failing request, replay it offline with `autumn replay`) | `autumn-capsules.toml`, `capsules/`, `tests/failure_capsule.rs` |
+| **Deterministic simulation testing** (`#[sim_test]`, virtual clock, `always!` / `sometimes!`) | `tests/sim_hot_rank.rs` |
 
 ## Prerequisites
 
@@ -94,6 +96,131 @@ The live WebSocket feed keeps the app database as durable truth via
 - Redis mode also keeps Postgres `NOTIFY` as a safety net, so missed Redis
   publishes still wake web nodes from the durable event log
 - Polling is the last fallback when neither wake path is available
+
+## Failure capsules: record → `autumn replay`
+
+A stack trace tells you *where* a request died. A **failure capsule** tells you
+*what it was doing*: the request that failed, the rows the database handed back,
+the clock readings the handler took, and the response the client got — written
+to one JSON file the moment the failure happens, and replayable offline. See
+[`docs/guide/failure-capsules.md`](../../docs/guide/failure-capsules.md).
+
+Capture is off by default and lives in its own profile here, because turning it
+on is a deliberate decision rather than a dev convenience — see "What a capsule
+holds" below.
+
+```bash
+docker compose up -d
+AUTUMN_PROFILE=capsules cargo run -p reddit-clone
+```
+
+`autumn-capsules.toml` is a *custom* profile, not a dev overlay, so it carries
+the same database URL and file mail transport as `autumn-dev.toml` plus an
+explicit `auto_migrate = true` — only `dev` auto-applies migrations by
+convention. The dev error overlay and detailed health are dev-profile
+conveniences and stay off here; the capsule on disk is the artifact this
+profile exists for.
+
+Make it fail. `/dev/trigger-error` propagates a real `parse::<i32>()` error
+through `?`, so it is a genuine 500 rather than a hand-written one:
+
+```bash
+curl -i http://localhost:3000/dev/trigger-error   # 500
+ls tmp/autumn-capsules/
+# 20260812T101413.882104-000000-01JB2K7Q.json
+```
+
+One file per failing request. A `4xx` writes nothing and a successful request
+drops its buffer at the response boundary — capsules are for failures only.
+
+Replay it. The CLI compiles *your* app (only your app knows its routes, state
+and config) and runs it with the database served from the capsule's tape, the
+clock serving the recorded readings, outbound HTTP refused and no port bound:
+
+```bash
+autumn replay -p reddit-clone tmp/autumn-capsules/<file>.json
+```
+
+```text
+REPRODUCED  /…/tmp/autumn-capsules/<file>.json
+  expected: 500 invalid digit found in string
+  actual:   500 invalid digit found in string
+```
+
+The verdict is JSON on stdout and the human summary on stderr, so
+`autumn replay … | jq` works while you still read the summary. Four verdicts,
+and the exit code matches: `reproduced` (0) — the bug is still there;
+`mismatch` (1) — usually what you want *after* a fix; `diverged` (1) — your
+code asked the database something the recording never asked, so a matching
+status would have been luck; `refused` (2) — nothing was replayed, because the
+capsule is truncated or its body was never recorded.
+
+### The committed capsule
+
+`capsules/dev-trigger-error.json` is a real capsule recorded from that route,
+committed so the walkthrough has something to point at without a database.
+`tests/failure_capsule.rs` parses it through the same `Capsule::from_json` the
+replay CLI uses and asserts the shape this section describes, and re-records it
+on demand:
+
+```bash
+cargo test -p reddit-clone --test failure_capsule
+UPDATE_CAPSULE_FIXTURE=1 cargo test -p reddit-clone --test failure_capsule
+```
+
+See [`capsules/README.md`](capsules/README.md) for why that particular capsule
+is safe to commit and yours is not.
+
+### What a capsule holds
+
+**A capsule is production data.** It is a copy of what one of your users sent
+and what your database sent back. Autumn masks what it can identify by *name*,
+through the same `[log] filter_parameters` list the access log uses — but
+**database result rows are raw `PostgreSQL` protocol bytes and are not masked**,
+because replay depends on them being exact and Autumn has no idea which column
+is a national ID. `tmp/autumn-capsules` is gitignored at the workspace root for
+that reason; do not serve it, and treat a capsule you move off a host the way
+you would treat the original.
+
+Redaction is matched by **equality** after normalization, never by prefix — so
+`authorization` and `cookie` are covered out of the box, while a prefixed header
+like this app's `Stripe-Signature` intake header is not. That is why
+`autumn-capsules.toml` adds it (and `x-api-key`, `x-auth-token`) to
+`[log] filter_parameters`, and why `tests/failure_capsule.rs` asserts it stays
+there.
+
+Two limits worth knowing before you record against a real route here:
+authenticated and CSRF-protected routes do **not** replay faithfully (the
+`authorization` and `cookie` headers are masked, so the replayed request meets
+the auth layer without credentials and stops at a `401`/`403` — the capsule is
+still a faithful record, just not a re-runnable one), and a handler that draws
+from `Rng` draws different bytes on replay, which shows up as a bind divergence
+if those bytes reach a SQL bind.
+
+## Deterministic simulation testing
+
+`tests/sim_hot_rank.rs` carries a seeded `#[sim_test]` over this app's
+hot-rank decay curve — the `score / (age_hours + 2)^1.5` formula in `tasks.rs`.
+
+Every interesting property of that formula is a statement about time passing,
+which a conventional test cannot express without either sleeping for a day or
+bypassing the seam that decides what "now" means. `#[sim_test]` hands the test a
+seeded `Sim` with a **virtual clock** that the mounted app reads through the
+ordinary `Clock` extractor, so `sim.advance(24h)` ages the app by a day with
+zero wall-clock sleeping — through the seam, not around it.
+
+```bash
+cargo test -p reddit-clone --test sim_hot_rank              # 48 virtual hours, ~20ms
+AUTUMN_SIM_SEED=0x9f3a cargo test -p reddit-clone --test sim_hot_rank
+```
+
+The second form is the replay line `#[sim_test]` prints on failure: the scores
+are drawn from `sim.rng()`, so a seed reproduces a run bit for bit. The test
+uses both assertion macros for what each is for — `always!` for the hard
+invariants (a rank never climbs as a post ages; a positive score never decays to
+zero) and `sometimes!` for reachability, with an explicit
+`assert_all_sometimes_satisfied()` so a green run is provably non-vacuous. See
+[`docs/guide/simulation-testing.md`](../../docs/guide/simulation-testing.md).
 
 ## Why This Example Uses Jobs Instead Of Harvest
 
