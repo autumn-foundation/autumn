@@ -108,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format the export writes. It re-imports as new RECORDS, though — the slice is
   insert-only, so re-uploading an exported file duplicates it; the upload page
   and the guide both say so. Columns the form does not carry (`id`,
-  `created_at`, an `Attachment`, a `--default`ed column) are named on the page as
+  `created_at`, an `Attachment`, a `Bytea` — whose lossy export cannot
+  round-trip — a `--default`ed column) are named on the page as
   ones the import cannot set, and a model with an at-rest `#[encrypted]` column —
   which the export omits but the form requires — refuses the surface outright
   with a warning naming the column.

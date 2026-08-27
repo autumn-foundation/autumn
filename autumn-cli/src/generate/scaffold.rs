@@ -6427,9 +6427,27 @@ mod attachment_read_back_tests {{
         // dropped from the form — a `--default`ed one, for instance. Computed as
         // the difference rather than listed by kind, so it stays right whatever
         // the form's own exclusions become.
+        // Columns `{Pascal}Form` carries AND the import can faithfully set.
+        //
+        // `Attachment` is excluded because a storage key in a cell is not a
+        // file. `Bytea` is excluded because the CSV cannot carry it back: the
+        // export renders it with `String::from_utf8_lossy`, so any byte that is
+        // not valid UTF-8 is already a U+FFFD replacement character in the file,
+        // and `into_new`'s `into_bytes()` would then store THOSE bytes — an
+        // import of this app's own export silently replacing a binary column
+        // with mojibake. The lossy rendering is the export's (and the browser
+        // form's) pre-existing behaviour; what must not happen is writing it
+        // back. Excluded here rather than base64-encoded because a reversible
+        // encoding would have to change the EXPORT too, and that is #1315's
+        // surface, not this slice's.
+        //
+        // Excluded means: named on the upload page as a column the import
+        // cannot set, listed in `CSV_DISCARDED_COLUMNS` so the report says so
+        // when a file supplies one, and absent from `CSV_REQUIRED_COLUMNS` so a
+        // file that omits it is still accepted.
         let form_carried: BTreeSet<&str> = fields
             .iter()
-            .filter(|f| !f.kind.is_attachment())
+            .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
             .map(|f| f.name.as_str())
             .collect();
         let mut ignored_columns: Vec<&str> = vec!["id"];

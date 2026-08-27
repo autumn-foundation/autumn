@@ -1482,7 +1482,10 @@ autumn generate scaffold Post title:String body:Text published:bool --import
   and 1 row error **on the right line** and writes nothing, then commits and
   asserts exactly the valid row persists.
 
-**One column map, both directions.** The import decodes each row against the
+**One column map, both directions** — for every column the form can set. A
+column the CSV cannot faithfully carry back (`Attachment`, `Bytea`) is named on
+the upload page as one the import cannot set, rather than round-tripped
+lossily. The import decodes each row against the
 *same* generated `CsvSchema` impl the export writes from — there is no second
 list to keep in step. That also means a file this app exported can be edited and
 uploaded straight back: `id` and `created_at` are columns the form does not own,
@@ -1522,6 +1525,7 @@ Contract of the generated handler:
 | A value for a column the import cannot set | Named in a `role="alert"` note on the report when the uploaded file actually carries one (`id` and `created_at` excluded — every exported file has those, so flagging them would fire on every round trip). Silently dropping an operator's spreadsheet edit is the one failure the counts could otherwise hide entirely. |
 | Row volume | Capped at `MAX_IMPORT_ROWS` (10 000), mirroring the export. A file over the cap is **refused whole** with a 422, never imported as a prefix — a partially imported spreadsheet is the trap this route exists to avoid. The count is taken by `autumn_web::data::csv::count_data_rows` *before* the import, because a malformed row never reaches the row handler (`import_csv` records it and moves on), so an in-handler counter would miss exactly the file that costs the most to accumulate. The rendered error list is separately capped at `MAX_REPORT_ERRORS` (200) with a "further errors not listed" line; the counts above the table are always the whole truth. |
 | An oversized upload | A **413** from the framework's size guard, not the friendly 422 the other refusals use — the status is the accurate one, but the page is the generic error page. |
+| `Bytea` column | **Not importable.** The export renders it with `String::from_utf8_lossy`, so any non-UTF-8 byte is already a U+FFFD replacement character in the file — writing that back would silently replace a binary column with mojibake. It is listed among the columns the import cannot set, and supplying a value for it raises the report's discarded-column alert. A reversible encoding (base64/hex) would have to change the export too; that is out of this slice. |
 | `Attachment` column | Not importable — a storage key in a cell is not a file. The column is left NULL; upload the file through the record's own edit form afterwards. |
 | `datetime` column | Round-trips, naive and tz-aware alike: the export writes chrono's `Display` form (a space between date and time, plus a zone name for a tz-aware column) and an `--import` scaffold's `parse_local_datetime` accepts both shapes alongside the browser's `datetime-local` `T` form. Without the flag the helper is unchanged. |
 | A value that looks like a formula | Round-trips too. The export prefixes an apostrophe to a text cell beginning `=`, `+`, `-`, `@`, TAB or CR; the import strips it back off — but only in exactly that shape, so `'tis` is left alone. A value someone really typed as `'=x` is indistinguishable from a guarded `=x` in the file and resolves to the latter; drop the `csv_unguard_cell` call if you would rather store the apostrophe. |

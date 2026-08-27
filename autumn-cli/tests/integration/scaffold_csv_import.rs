@@ -725,6 +725,47 @@ fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
     );
 }
 
+/// A `Bytea` column must not be importable, because the CSV cannot carry it
+/// back. The export renders it with `String::from_utf8_lossy`, so a byte that
+/// is not valid UTF-8 is ALREADY a U+FFFD replacement character in the file —
+/// and `into_new`'s `into_bytes()` would store those bytes, so importing this
+/// app's own export would silently replace a binary column with mojibake.
+#[test]
+fn a_bytea_column_is_not_importable() {
+    let (_tmp, project, _) = scaffold_project(
+        "import-bytea",
+        &["title:String", "blob:Bytea"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // Not settable...
+    assert!(
+        routes.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["title"];"#),
+        "a Bytea column must not be one the import requires or sets:
+{routes}"
+    );
+    // ...named on the upload page as a column the import cannot set...
+    assert!(
+        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "blob", "created_at"];"#),
+        "a Bytea column must be named as unsettable:
+{routes}"
+    );
+    // ...and flagged in the report when a file actually supplies a value, since
+    // an operator editing that column would otherwise see nothing happen.
+    assert!(
+        routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
+        "a supplied Bytea value must raise the discarded-column alert:
+{routes}"
+    );
+    // The export still writes the column — this is an import-side exclusion, not
+    // a change to #1315's surface.
+    assert!(
+        routes.contains("String::from_utf8_lossy(&self.blob)"),
+        "the export must still carry the column:
+{routes}"
+    );
+}
+
 #[test]
 fn the_header_check_is_omitted_when_no_column_could_be_missing() {
     // Every column is `--default`ed, so the form can set none of them and there
