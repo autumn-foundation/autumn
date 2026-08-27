@@ -595,6 +595,11 @@ function autumnDecodeVapidKey(base64url) {{
 /// `window.autumnPushSubscribe` / `window.autumnPushUnsubscribe`, plus the
 /// declarative `data-autumn-push-subscribe` wiring.
 fn render_push_entry_points() -> String {
+    format!("{}{}", render_push_subscribe(), render_push_teardown())
+}
+
+/// `window.autumnPushSubscribe` — the opt-in half.
+fn render_push_subscribe() -> String {
     format!(
         r"// Opt the current visitor in to Web Push. Call it from a click handler — it
 // prompts for notification permission, so it needs a user gesture.
@@ -651,7 +656,19 @@ window.autumnPushSubscribe = async function autumnPushSubscribe() {{
 }};
 
 // Undo the above: forget this browser's subscription, server-side and locally.
-window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
+// Drop this browser's subscription SERVER-SIDE, leaving the browser's own
+// subscription intact.
+//
+// This is what sign-out wants, and revoking the browser subscription there
+// would be actively wrong: an origin has ONE `PushSubscription` shared by
+// every tab, so with two accounts open the row belongs to whichever signed in
+// last. A stale tab signing out gets a `204` from the scoped delete whether or
+// not it owned the row — the route is deliberately indistinguishable, so it
+// cannot be used to probe who owns an endpoint — and revoking on the strength
+// of that `204` would invalidate the OTHER account's endpoint. Its next push
+// would `410`, be pruned, and that account would silently stop receiving
+// notifications until it opted in again.
+window.autumnPushForget = async function autumnPushForget() {{
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
     return false;
   }}
@@ -660,20 +677,47 @@ window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
   if (!subscription) {{
     return true;
   }}
-  // Unsubscribe can be the first call of the page, before anything primed the
-  // token; one cheap GET is enough to obtain it.
+  // This can be the first call of the page, before anything primed the token;
+  // one cheap GET is enough to obtain it.
   if (!autumnPushCsrf) {{
     autumnPushCaptureCsrf(
       await fetch('{key_path}', {{ credentials: 'same-origin' }})
     );
   }}
-  await fetch('{unsubscribe_path}', {{
+  const response = await fetch('{unsubscribe_path}', {{
     method: 'POST',
     headers: autumnPushHeaders(),
     credentials: 'same-origin',
     body: JSON.stringify({{ endpoint: subscription.endpoint }}),
   }});
-  return subscription.unsubscribe();
+  return response.ok;
+}};
+
+",
+        key_path = autumn_web::push::VAPID_PUBLIC_KEY_PATH,
+        subscribe_path = autumn_web::push::SUBSCRIBE_PATH,
+        unsubscribe_path = autumn_web::push::UNSUBSCRIBE_PATH,
+    )
+}
+
+/// `window.autumnPushForget` / `window.autumnPushUnsubscribe`, the sign-out
+/// hook, and the declarative `data-autumn-push-subscribe` wiring.
+fn render_push_teardown() -> String {
+    format!(
+        r"// Fully opt this browser out: forget the row server-side AND revoke the
+// browser's subscription.
+//
+// Revoking is correct HERE and only here — the visitor is explicitly asking to
+// stop receiving on this device, so taking the shared subscription down with
+// them is the intent, not a side effect.
+window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+    return false;
+  }}
+  await window.autumnPushForget();
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  return subscription ? subscription.unsubscribe() : true;
 }};
 
 // Unsubscribe on the way out of a session.
@@ -712,8 +756,11 @@ document.addEventListener('submit', (event) => {{
   // called `preventDefault()`, the user cannot log out at all. Blocking a
   // sign-out is far worse than leaving a subscription behind, which the push
   // service prunes with a `410` soon enough anyway.
-  const cleanup = window.autumnPushUnsubscribe().catch(console.error);
-  const deadline = new Promise((resolve) => setTimeout(resolve, {logout_timeout_ms}));
+  // `autumnPushForget`, NOT `autumnPushUnsubscribe`: see that function's
+  // comment — revoking the shared browser subscription on sign-out would take
+  // another still-signed-in account's notifications down with it.
+  const cleanup = window.autumnPushForget().catch(console.error);
+  const deadline = new Promise((resolve) => setTimeout(resolve, {LOGOUT_UNSUBSCRIBE_TIMEOUT_MS}));
   Promise.race([cleanup, deadline]).then(() => form.submit());
 }});
 
@@ -731,10 +778,6 @@ document.addEventListener('click', (event) => {{
     window.autumnPushSubscribe().catch(console.error);
   }}
 }});",
-        key_path = autumn_web::push::VAPID_PUBLIC_KEY_PATH,
-        subscribe_path = autumn_web::push::SUBSCRIBE_PATH,
-        unsubscribe_path = autumn_web::push::UNSUBSCRIBE_PATH,
-        logout_timeout_ms = LOGOUT_UNSUBSCRIBE_TIMEOUT_MS,
     )
 }
 
@@ -2416,6 +2459,49 @@ async fn main() {
     }
 
     #[test]
+    fn signing_out_forgets_the_row_without_revoking_a_shared_subscription() {
+        // An origin has ONE `PushSubscription` shared by every tab. With two
+        // accounts open, the row belongs to whichever signed in last, and the
+        // scoped unsubscribe route returns `204` either way (deliberately, so
+        // it cannot be used to probe who owns an endpoint). Revoking the
+        // browser subscription on the strength of that `204` would invalidate
+        // the OTHER account's endpoint — its next push `410`s, gets pruned,
+        // and it silently stops receiving until it opts in again.
+        let js = render_push_opt_in();
+        assert!(
+            js.contains("window.autumnPushForget = "),
+            "sign-out needs a server-side-only path:\n{js}"
+        );
+        assert!(
+            js.contains("window.autumnPushForget().catch"),
+            "…and the sign-out hook must use it:\n{js}"
+        );
+
+        // The full opt-out keeps revoking — there the visitor is explicitly
+        // asking to stop receiving on this device.
+        let opt_out = js
+            .split_once("window.autumnPushUnsubscribe = ")
+            .expect("the full opt-out exists")
+            .1;
+        assert!(
+            opt_out.contains("subscription.unsubscribe()"),
+            "an explicit opt-out must still revoke the browser subscription:\n{opt_out}"
+        );
+        // And `autumnPushForget` must NOT revoke.
+        let forget = js
+            .split_once("window.autumnPushForget = ")
+            .expect("forget exists")
+            .1
+            .split_once("window.autumnPushUnsubscribe = ")
+            .expect("…and ends where the opt-out begins")
+            .0;
+        assert!(
+            !forget.contains("unsubscribe()"),
+            "the sign-out path must never revoke the shared subscription:\n{forget}"
+        );
+    }
+
+    #[test]
     fn client_snippet_unsubscribes_when_the_user_signs_out() {
         // A subscription outliving its session is a privacy leak: the row
         // stays bound to the user who logged out, so the app keeps pushing
@@ -2435,8 +2521,8 @@ async fn main() {
             "…plus an opt-in attribute for a differently-shaped sign-out:\n{js}"
         );
         assert!(
-            js.contains("autumnPushUnsubscribe()"),
-            "…and it must actually unsubscribe:\n{js}"
+            js.contains("autumnPushForget()"),
+            "…and it must actually drop the server-side row:\n{js}"
         );
     }
 
