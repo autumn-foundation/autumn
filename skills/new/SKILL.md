@@ -90,6 +90,7 @@ First-run checklist:
 | `src/main.rs` | AppBuilder setup — register routes, tasks, jobs, migrations here |
 | `migrations/` | Diesel migrations — one directory per migration |
 | `static/` | Static assets served at `/static/` |
+| `.autumn/scaffold.toml` | **Commit it.** Records which release's scaffold produced this project's framework-owned files (`Dockerfile`, `build.rs`, `autumn.toml`, the toolchain/style configs, the CI workflow) and a digest of each as Autumn wrote it, so a later `autumn upgrade` can tell a template that moved from a file the developer edited — and never overwrite their work. Machine-written; hand-editing it only costs conflict precision (issue #1593). |
 
 ## If autumn-cli is not installed
 
