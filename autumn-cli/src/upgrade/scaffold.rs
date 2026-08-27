@@ -235,6 +235,18 @@ impl Manifest {
         // `autumn new`'s own rule, so the two can never disagree about what is
         // possible.
         .filter(|manifest: &Self| crate::new::check_option_combination(manifest.options).is_ok())
+        // A release string that cannot be read cannot be compared, so it cannot
+        // be refused either — and a manifest left *trusted* with digests some
+        // newer renderer wrote is the downgrade path all over again. Unknown
+        // has to mean no baseline. Absent still does not: a project whose first
+        // upgrade left conflicts standing has no `version` line at all, and its
+        // digests are perfectly good.
+        .filter(|manifest: &Self| {
+            [manifest.version.as_deref(), manifest.written_by.as_deref()]
+                .into_iter()
+                .flatten()
+                .all(|recorded| super::migrations::parse_version_req(recorded).is_some())
+        })
     }
 
     /// Load the manifest under `root`, or `None` when there is not a readable
@@ -978,10 +990,12 @@ fn newest(previous: Option<&str>, candidate: &str) -> String {
 
 /// Whether `recorded` names a release newer than the one this CLI ships.
 ///
-/// An unparsable version is *not* newer: it is simply unknown, and the
-/// conservative answer there is the one the rest of the module already gives an
-/// unreadable manifest — no baseline, everything a conflict — rather than a
-/// refusal that a typo could trigger.
+/// Only ever reached with a value [`Manifest::parse`] has already proven
+/// readable: an unreadable one makes the whole manifest no baseline, so this
+/// never has to decide what "unknown" means. It answers `false` for one anyway,
+/// because a comparison that cannot be made is not evidence of anything — but
+/// that answer must never again be the *only* thing standing between a corrupt
+/// version string and a trusted set of digests, which is exactly what it was.
 fn is_newer_than_this_cli(recorded: &str) -> bool {
     let (Some(recorded), Some(ours)) = (
         super::migrations::parse_version_req(recorded),
@@ -2934,5 +2948,65 @@ mod tests {
             Manifest::load(tmp.path()).unwrap().written_by.as_deref(),
             Some("0.7.0")
         );
+    }
+
+    #[test]
+    fn an_unparsable_recorded_version_is_no_baseline() {
+        // A version that cannot be read cannot be compared, so it cannot be
+        // refused either — and a manifest left trusted with digests a newer
+        // renderer wrote is the downgrade path all over again. Unknown must
+        // mean no baseline, which is what the doc comment on the comparison
+        // already claimed and nothing implemented.
+        for field in ["version", "written_by"] {
+            let tmp = scaffolded(GenerateOptions::default());
+            let text = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+            fs::write(
+                tmp.path().join(MANIFEST_PATH),
+                text.replace(
+                    &format!("{field} = \"0.7.0\""),
+                    &format!("{field} = \"not-a-version\""),
+                ),
+            )
+            .unwrap();
+
+            assert!(
+                Manifest::load(tmp.path()).is_none(),
+                "{field}: an unreadable version vouches for nothing"
+            );
+
+            // ...so a file a newer renderer wrote is a conflict, never an
+            // update, and survives `--apply`.
+            let newer = "# written by a newer release\n";
+            write(tmp.path(), "clippy.toml", newer);
+            let entries = plan_in(tmp.path()).entries;
+            assert_eq!(
+                status_of(&entries, "clippy.toml"),
+                &Status::Conflict(ConflictReason::NoBaseline),
+                "{field}"
+            );
+
+            let mut report = plan_in(tmp.path());
+            apply(&mut report).expect("apply");
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("clippy.toml")).unwrap(),
+                newer,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_version_is_still_a_usable_baseline() {
+        // Absent is not the same as unreadable: a project whose first upgrade
+        // left conflicts standing has no `version` line at all, and its digests
+        // are still good.
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.version = None;
+        manifest.save(tmp.path()).unwrap();
+
+        let loaded = Manifest::load(tmp.path()).expect("still a baseline");
+        assert!(loaded.version.is_none());
+        assert!(!loaded.digests.is_empty());
     }
 }
