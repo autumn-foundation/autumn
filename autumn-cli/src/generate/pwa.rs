@@ -703,12 +703,18 @@ document.addEventListener('submit', (event) => {{
   // Re-entrancy guard: `form.submit()` below does not re-fire this handler in
   // any current browser, but the flag makes that independent of that detail.
   form.dataset.autumnPushHandled = 'true';
-  // `finally`, not `then`: a failed unsubscribe must never trap the user in a
-  // session they asked to leave.
-  window
-    .autumnPushUnsubscribe()
-    .catch(console.error)
-    .finally(() => form.submit());
+  // Raced against a deadline — `catch` alone is not enough here.
+  //
+  // `autumnPushUnsubscribe` awaits `navigator.serviceWorker.ready`, which by
+  // specification NEVER REJECTS: it stays pending until a worker becomes
+  // active. So if the service worker fails to install, a bare
+  // `.catch().finally()` never runs — and since this handler has already
+  // called `preventDefault()`, the user cannot log out at all. Blocking a
+  // sign-out is far worse than leaving a subscription behind, which the push
+  // service prunes with a `410` soon enough anyway.
+  const cleanup = window.autumnPushUnsubscribe().catch(console.error);
+  const deadline = new Promise((resolve) => setTimeout(resolve, {logout_timeout_ms}));
+  Promise.race([cleanup, deadline]).then(() => form.submit());
 }});
 
 // Declarative opt-in: no application JavaScript required.
@@ -728,6 +734,7 @@ document.addEventListener('click', (event) => {{
         key_path = autumn_web::push::VAPID_PUBLIC_KEY_PATH,
         subscribe_path = autumn_web::push::SUBSCRIBE_PATH,
         unsubscribe_path = autumn_web::push::UNSUBSCRIBE_PATH,
+        logout_timeout_ms = LOGOUT_UNSUBSCRIBE_TIMEOUT_MS,
     )
 }
 
@@ -869,6 +876,16 @@ pub fn inject_pwa_into_main(source: &str) -> String {
 /// developer had written themselves before ever running the generator — which
 /// `Plan::revert` documents it never does.
 const PUSH_ROUTER_MARKER: &str = "// added by `autumn generate pwa`";
+
+/// How long the generated sign-out waits for the push unsubscribe before
+/// submitting the form regardless.
+///
+/// `navigator.serviceWorker.ready` never rejects — it stays pending until a
+/// worker activates — so a worker that failed to install would otherwise hang
+/// the logout forever. Two seconds is generous for a local
+/// `getSubscription()` plus one same-origin POST, and short enough that a user
+/// who hits the broken case barely notices.
+const LOGOUT_UNSUBSCRIBE_TIMEOUT_MS: u32 = 2_000;
 
 /// The line [`inject_push_router`] inserts, and [`remove_push_router`] removes.
 ///
@@ -2424,13 +2441,34 @@ async fn main() {
     }
 
     #[test]
-    fn a_failed_unsubscribe_never_traps_the_user_in_their_session() {
-        // The logout POST is preventDefault'd, so if the unsubscribe promise
-        // is not always followed by a submit the user cannot sign out at all.
+    fn a_stalled_unsubscribe_never_traps_the_user_in_their_session() {
+        // The logout POST is preventDefault'd, so the form MUST submit
+        // regardless of what the unsubscribe promise does.
+        //
+        // `.catch(…).finally(…)` looks sufficient and is not:
+        // `autumnPushUnsubscribe` awaits `navigator.serviceWorker.ready`,
+        // which by specification never rejects — it stays pending until a
+        // worker activates. A worker that fails to install therefore leaves
+        // `finally` unreached and the user unable to log out. Only a race
+        // against a deadline actually secures the invariant this test names,
+        // so that is what is asserted.
         let js = render_push_opt_in();
         assert!(
-            js.contains(".finally(() => form.submit())"),
-            "the form must submit whether or not the unsubscribe succeeded:\n{js}"
+            js.contains("Promise.race("),
+            "the submit must be raced against a deadline, not chained off a \
+             promise that may never settle:\n{js}"
+        );
+        assert!(
+            js.contains("setTimeout(resolve"),
+            "…with an actual timer as the other racer:\n{js}"
+        );
+        assert!(
+            js.contains(&format!("{LOGOUT_UNSUBSCRIBE_TIMEOUT_MS}")),
+            "…bounded by the documented timeout:\n{js}"
+        );
+        assert!(
+            js.contains("form.submit()"),
+            "…and the form must actually be submitted:\n{js}"
         );
         assert!(
             js.contains("autumnPushHandled"),
