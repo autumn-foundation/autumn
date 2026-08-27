@@ -249,8 +249,10 @@ where
     // Failure-capsule seam (#1634). A replay is served entirely from the
     // capsule: the live backend is never consulted, because the value it holds
     // now is not the value the failing request read.
-    if let Some(replayed) = replayed_cache_get::<V>(key) {
-        return replayed;
+    match replayed_cache_get::<V>(key) {
+        ReplayedRead::NoTape => {}
+        ReplayedRead::Miss => return None,
+        ReplayedRead::Hit(value) => return Some(value),
     }
     let arc = cache.get_value(key);
     let value = arc.and_then(|arc| {
@@ -296,7 +298,7 @@ where
         return;
     }
     // In-memory path (MokaCache, CountingCache in tests, …)
-    cache.insert_value(key, Arc::new(value.clone()));
+    cache.insert_value(key, Arc::new(value));
     // Serialized path (RedisCache, any cross-replica backend)
     if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
@@ -305,23 +307,37 @@ where
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
 
-/// Serve a cache read from the capsule's effect tape, when one is active.
+/// What a replay has to say about a cache read.
 ///
-/// The outer `Option` is "is a replay in progress?" and the inner one is the
-/// answer: `Some(None)` means the tape says this key missed (or the recording
-/// could not serialize what it served, or the key was never recorded at all —
-/// `cache_get` logs a divergence for that last case), and `Some(Some(value))`
-/// is the recorded hit.
-fn replayed_cache_get<V>(key: &str) -> Option<Option<V>>
+/// A named type rather than a nested `Option`: "no replay is in progress" and
+/// "the replay says this key missed" are opposite instructions to the caller,
+/// and `Option<Option<V>>` spells them the same way round as each other.
+enum ReplayedRead<V> {
+    /// No replay is in progress; read the real cache.
+    NoTape,
+    /// The tape has no value to serve — a recorded miss, an unrecorded key
+    /// (already logged as a divergence), or a hit the recording could not
+    /// serialize. The read replays as a miss.
+    Miss,
+    /// The recorded hit.
+    Hit(V),
+}
+
+/// Serve a cache read from the capsule's effect tape, when one is active.
+fn replayed_cache_get<V>(key: &str) -> ReplayedRead<V>
 where
     V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    let tape = crate::capsule::effects::current_tape()?;
-    Some(
-        tape.cache_get(key)
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice::<V>(&bytes).ok()),
-    )
+    use crate::capsule::effects::CachedValue;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return ReplayedRead::NoTape;
+    };
+    match tape.cache_get(key) {
+        CachedValue::Hit(bytes) => {
+            serde_json::from_slice::<V>(&bytes).map_or(ReplayedRead::Miss, ReplayedRead::Hit)
+        }
+        CachedValue::Miss | CachedValue::Unrecorded => ReplayedRead::Miss,
+    }
 }
 
 /// Tee a cache read into the in-flight request's capsule.

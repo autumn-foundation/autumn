@@ -124,14 +124,12 @@ impl ReplayEntropy {
             return None;
         }
         let mut draws = self.draws.lock().ok()?;
-        match draws.pop_front() {
-            Some(bytes) => Some(bytes),
-            None => {
-                drop(draws);
-                self.over_draws.fetch_add(1, Ordering::SeqCst);
-                None
-            }
-        }
+        let Some(bytes) = draws.pop_front() else {
+            drop(draws);
+            self.over_draws.fetch_add(1, Ordering::SeqCst);
+            return None;
+        };
+        Some(bytes)
     }
 }
 

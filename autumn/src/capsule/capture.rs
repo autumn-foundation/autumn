@@ -686,7 +686,7 @@ impl CaptureScope {
             .saturating_add(body_weight(&effect.response_body));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.http, effect, weight, budget)
+            buffer.push(|effects| &mut effects.http, effect, weight, budget);
         });
     }
 
@@ -698,7 +698,7 @@ impl CaptureScope {
             .saturating_add(json_weight(&effect.payload));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.jobs, effect, weight, budget)
+            buffer.push(|effects| &mut effects.jobs, effect, weight, budget);
         });
     }
 
@@ -723,7 +723,7 @@ impl CaptureScope {
             .saturating_add(body_weight(&effect.body));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
-            buffer.push(|effects| &mut effects.mail, effect, weight, budget)
+            buffer.push(|effects| &mut effects.mail, effect, weight, budget);
         });
     }
 
@@ -891,6 +891,11 @@ pub async fn capture_job<T>(
             .unwrap_or_else(|_| axum::http::Uri::from_static("/jobs")),
         version: axum::http::Version::HTTP_11,
         headers: axum::http::HeaderMap::new(),
+        // Braces are the route-template syntax, not a format placeholder.
+        #[allow(
+            clippy::literal_string_with_formatting_args,
+            reason = "`{name}` is Autumn's route-template syntax, not an interpolation"
+        )]
         route: Some("/jobs/{name}".to_owned()),
     });
     register(&scope);

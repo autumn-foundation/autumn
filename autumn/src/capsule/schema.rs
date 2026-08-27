@@ -433,7 +433,7 @@ pub struct CapsuleEffects {
 impl CapsuleEffects {
     /// Whether the run recorded no effects at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.http.is_empty()
             && self.jobs.is_empty()
             && self.cache.is_empty()
@@ -811,12 +811,21 @@ mod tests {
 
     /// The effect tape is a semantic addition a v2 reader would skip while
     /// happily reporting a reproduction, so it bumps the format version.
+    ///
+    /// Asserted through the gate rather than against the constant: a bare
+    /// `CAPSULE_FORMAT_VERSION >= 3` is true forever and proves nothing about
+    /// what the reader actually does with a v2 document.
     #[test]
-    fn effect_tape_bumped_the_format_version_past_two() {
-        assert!(
-            CAPSULE_FORMAT_VERSION >= 3,
-            "adding effect seams must bump the version gate so a pre-effects \
-             capsule is refused rather than replayed with every seam empty"
+    fn a_capsule_without_the_effect_tape_cannot_be_read_by_this_build() {
+        let mut json = serde_json::to_value(sample()).expect("capsule serializes");
+        json["format_version"] = serde_json::json!(2);
+        // Exactly what a v2 capsule looks like: no `effects`, no `job`.
+        if let serde_json::Value::Object(map) = &mut json {
+            map.remove("effects");
+            map.remove("job");
+        }
+        Capsule::from_json(&json.to_string()).expect_err(
+            "a document with no effect tape must not load as one that has an empty one",
         );
     }
 

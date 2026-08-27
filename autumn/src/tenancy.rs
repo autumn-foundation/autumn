@@ -91,7 +91,13 @@ pub async fn extract_tenant_from_parts(
 }
 
 // Tenant extraction logic based on configuration
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_ref_mut,
+    reason = "the `&mut Parts` signature mirrors the public wrapper and axum's \
+              `FromRequestParts` contract; narrowing it here would force the \
+              caller to reborrow"
+)]
 async fn extract_tenant_from_parts_inner(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,

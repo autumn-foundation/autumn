@@ -365,6 +365,11 @@ fn is_identifier_char(character: char) -> bool {
 ///
 /// Splitting them is what makes an outbound body's secret get masked out of an
 /// error message recorded by a *different* seam.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass per seam, then one echo pass per seam; splitting them \
+              would hide the two-phase ordering the doc comment above explains"
+)]
 pub fn redact_effects(
     effects: &mut crate::capsule::schema::CapsuleEffects,
     job: Option<&mut crate::capsule::schema::CapsuleJob>,
@@ -552,13 +557,12 @@ fn redact_url_query(
     let head = url.get(..split).unwrap_or_default();
     let query = url.get(split.saturating_add(1)..).unwrap_or_default();
     // A fragment is not part of the query; leave it attached to the tail.
-    let (query, fragment) = match query.find('#') {
-        Some(hash) => (
+    let (query, fragment) = query.find('#').map_or((query, ""), |hash| {
+        (
             query.get(..hash).unwrap_or_default(),
             query.get(hash..).unwrap_or_default(),
-        ),
-        None => (query, ""),
-    };
+        )
+    });
     let Some(masked) = mask_raw_urlencoded(query, location, filter, values, keys) else {
         return url.to_owned();
     };
@@ -613,7 +617,7 @@ fn header_value(headers: &[(String, String)], name: &str) -> String {
 
 /// Blank every header the filter calls sensitive, retaining what was removed.
 fn redact_effect_headers(
-    headers: &mut Vec<(String, String)>,
+    headers: &mut [(String, String)],
     filter: &ParameterFilter,
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
@@ -624,7 +628,8 @@ fn redact_effect_headers(
             values.insert(value.as_bytes());
             record_credential_components(name, value.as_bytes(), values);
             keys.insert(format!("{location}:{name}"));
-            *value = FILTERED_PLACEHOLDER.to_owned();
+            value.clear();
+            value.push_str(FILTERED_PLACEHOLDER);
         }
     }
 }
@@ -1723,12 +1728,11 @@ mod tests {
                     .contains("sk-live-42"),
                 "a job capsule's own arguments are input, and are masked like any other"
             );
-            let decoded = match effects.cache.first().expect("one entry") {
-                CacheEffect::Insert { value, .. } => {
-                    STANDARD.decode(value.as_bytes()).expect("base64")
-                }
-                other => panic!("expected an insert, got {other:?}"),
+            let CacheEffect::Insert { value, .. } = effects.cache.first().expect("one entry")
+            else {
+                panic!("expected an insert, got {:?}", effects.cache.first());
             };
+            let decoded = STANDARD.decode(value.as_bytes()).expect("base64");
             assert!(
                 !String::from_utf8_lossy(&decoded).contains("sk-live-42"),
                 "cache values are masked inside their base64 envelope"

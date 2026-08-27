@@ -641,27 +641,31 @@ pub struct Mail {
 /// Answer a mail send from the capsule's effect tape, when one is serving this
 /// task.
 ///
-/// `Some(Ok(()))` means the send matched the recording and **nothing was
-/// delivered**; `Some(Err(..))` means it diverged (already logged by
-/// `next_mail`) and the send fails closed rather than reaching a transport.
+/// `Some(Ok(()))` means the send matched a recorded success and **nothing was
+/// delivered**; `Some(Err(..))` is either a recorded delivery failure being
+/// reproduced or a divergence failing closed. `None` means no replay is in
+/// progress.
 fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
+    use crate::capsule::effects::MailVerdict;
+
     let tape = crate::capsule::effects::current_tape()?;
-    if let Some(recorded) = tape.next_mail(&mail.to, &mail.subject) {
+    Some(match tape.next_mail(&mail.to, &mail.subject) {
+        MailVerdict::Sent => Ok(()),
         // A recorded delivery *failure* is reproduced as one. A handler whose
         // bug is that it does not handle a suppressed recipient or an SMTP
         // refusal has to meet that error again, not a synthesized success.
-        return Some(recorded.map_or(Ok(()), |error| {
-            Err(MailError::RuntimeUnavailable(format!(
-                "replayed from the capsule: {error}"
-            )))
-        }));
-    }
-    Some(Err(MailError::RuntimeUnavailable(format!(
-        "the replayed run sent mail ({:?} to {}) the capsule has no recording for; nothing \
-         was delivered",
-        mail.subject,
-        mail.to.join(", ")
-    ))))
+        MailVerdict::Failed(error) => Err(MailError::RuntimeUnavailable(format!(
+            "replayed from the capsule: {error}"
+        ))),
+        // `next_mail` already logged the divergence; the send fails closed
+        // rather than reaching a transport.
+        MailVerdict::Diverged => Err(MailError::RuntimeUnavailable(format!(
+            "the replayed run sent mail ({:?} to {} recipient(s)) the capsule has no \
+             recording for; nothing was delivered",
+            mail.subject,
+            mail.to.len()
+        ))),
+    })
 }
 
 /// Tee a mail send into the in-flight request's capsule.

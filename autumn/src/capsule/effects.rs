@@ -125,6 +125,32 @@ pub struct EffectDivergence {
     pub detail: String,
 }
 
+/// What the tape can say about a cache read.
+///
+/// A named three-state answer rather than a nested `Option`, because the three
+/// cases mean genuinely different things to the caller and to the verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachedValue {
+    /// The capsule never saw this key. A divergence has been logged; the read
+    /// replays as a miss.
+    Unrecorded,
+    /// The recording read this key and missed.
+    Miss,
+    /// The recording read this key and got these bytes.
+    Hit(Vec<u8>),
+}
+
+/// What the tape can say about a mail send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MailVerdict {
+    /// Matched a recorded successful send; nothing is delivered.
+    Sent,
+    /// Matched a recorded send that *failed*; the caller reproduces the error.
+    Failed(String),
+    /// Did not match the recording. A divergence has been logged.
+    Diverged,
+}
+
 // ── The tape ────────────────────────────────────────────────────────────────
 
 /// An ordered seam's recorded entries and how far the run has consumed them.
@@ -391,16 +417,15 @@ impl ReplayEffects {
         true
     }
 
-    /// The bytes the capsule recorded for a cache key.
+    /// What the capsule recorded for a cache key.
     ///
-    /// `Some(Some(bytes))` is a recorded hit, `Some(None)` a recorded miss and
-    /// `None` a key the capsule never saw — which is a divergence, because a
-    /// replayed run reading a key the recording never read has taken a
-    /// different path through the handler.
+    /// [`CachedValue::Unrecorded`] is a divergence: a replayed run reading a
+    /// key the recording never read has taken a different path through the
+    /// handler.
     #[must_use]
-    pub(crate) fn cache_get(&self, key: &str) -> Option<Option<Vec<u8>>> {
+    pub(crate) fn cache_get(&self, key: &str) -> CachedValue {
         let Ok(mut cache) = self.cache.lock() else {
-            return None;
+            return CachedValue::Unrecorded;
         };
         // A cache key is routinely built out of request values, so redaction
         // may have masked part of it on the way to disk; fall back to a
@@ -421,33 +446,29 @@ impl ReplayEffects {
                 _ => None,
             }
         };
-        match resolved.and_then(|recorded| cache.get_mut(&recorded)) {
-            Some(slot) => {
-                let first_touch = !slot.touched;
-                slot.touched = true;
-                let value = slot.value.clone();
-                drop(cache);
-                if first_touch {
-                    self.served.fetch_add(1, Ordering::SeqCst);
-                }
-                Some(value)
-            }
-            None => {
-                drop(cache);
-                self.diverge(EffectDivergence {
-                    seam: EffectSeam::Cache,
-                    kind: EffectDivergenceKind::Unrecorded,
-                    index: 0,
-                    expected: None,
-                    actual: key.to_owned(),
-                    detail: format!(
-                        "the replayed run read cache key {key:?}, which the capsule has no \
-                         recording for; it was served as a miss"
-                    ),
-                });
-                None
-            }
+        let Some(slot) = resolved.and_then(|recorded| cache.get_mut(&recorded)) else {
+            drop(cache);
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Cache,
+                kind: EffectDivergenceKind::Unrecorded,
+                index: 0,
+                expected: None,
+                actual: key.to_owned(),
+                detail: format!(
+                    "the replayed run read cache key {key:?}, which the capsule has no \
+                     recording for; it was served as a miss"
+                ),
+            });
+            return CachedValue::Unrecorded;
+        };
+        let first_touch = !slot.touched;
+        slot.touched = true;
+        let value = slot.value.clone();
+        drop(cache);
+        if first_touch {
+            self.served.fetch_add(1, Ordering::SeqCst);
         }
+        value.map_or(CachedValue::Miss, CachedValue::Hit)
     }
 
     /// Record a cache write made during replay, so a later read in the same
@@ -471,13 +492,10 @@ impl ReplayEffects {
     /// Whether the next recorded mail send is the one the run just made, and
     /// the delivery error the recording produced for it.
     ///
-    /// `Some(None)` means the send matched a recorded *success* and must
-    /// **not** be delivered; `Some(Some(error))` means it matched a recorded
-    /// failure, which the caller reproduces; `None` means it diverged.
     #[must_use]
-    pub(crate) fn next_mail(&self, to: &[String], subject: &str) -> Option<Option<String>> {
+    pub(crate) fn next_mail(&self, to: &[String], subject: &str) -> MailVerdict {
         let Ok(mut seam) = self.mail.lock() else {
-            return None;
+            return MailVerdict::Diverged;
         };
         let index = seam.consumed;
         let Some(next) = seam.pending.front() else {
@@ -494,7 +512,7 @@ impl ReplayEffects {
                      nothing was delivered"
                 ),
             });
-            return None;
+            return MailVerdict::Diverged;
         };
         let recipients_match = next.to.len() == to.len()
             && next
@@ -517,13 +535,13 @@ impl ReplayEffects {
                      {expected}"
                 ),
             });
-            return None;
+            return MailVerdict::Diverged;
         }
         let error = seam.pending.pop_front().and_then(|recorded| recorded.error);
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
         self.served.fetch_add(1, Ordering::SeqCst);
-        Some(error)
+        error.map_or(MailVerdict::Sent, MailVerdict::Failed)
     }
 
     /// The tenant the recording resolved, when it resolved one.
@@ -816,7 +834,7 @@ pub fn tape_active() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::capsule::effects::{EffectSeam, ReplayEffects};
+    use crate::capsule::effects::{CachedValue, EffectSeam, MailVerdict, ReplayEffects};
     use crate::capsule::schema::{
         CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect, TenantEffect,
     };
@@ -1033,13 +1051,13 @@ mod tests {
         });
         assert_eq!(
             tape.cache_get("widgets"),
-            Some(None),
+            CachedValue::Miss,
             "the recorded miss must replay as a miss"
         );
         tape.cache_insert("widgets", b"41".to_vec());
         assert_eq!(
             tape.cache_get("widgets"),
-            Some(Some(b"41".to_vec())),
+            CachedValue::Hit(b"41".to_vec()),
             "the run's own fill is readable back, as it was in production"
         );
         assert!(tape.divergences().is_empty());
@@ -1063,7 +1081,10 @@ mod tests {
             ],
             ..CapsuleEffects::default()
         });
-        assert_eq!(tape.cache_get("user:alice:a"), Some(Some(b"1".to_vec())));
+        assert_eq!(
+            tape.cache_get("user:alice:a"),
+            CachedValue::Hit(b"1".to_vec())
+        );
         // A key that matches both recorded patterns is refused rather than
         // guessed.
         let tape = ReplayEffects::new(CapsuleEffects {
@@ -1079,7 +1100,7 @@ mod tests {
             ],
             ..CapsuleEffects::default()
         });
-        assert_eq!(tape.cache_get("user:bobx"), None);
+        assert_eq!(tape.cache_get("user:bobx"), CachedValue::Unrecorded);
         assert_eq!(tape.divergences().len(), 1);
     }
 
@@ -1100,15 +1121,15 @@ mod tests {
         });
         assert_eq!(
             tape.cache_get("user:7"),
-            Some(Some(b"{\"a\":1}".to_vec())),
+            CachedValue::Hit(b"{\"a\":1}".to_vec()),
             "a recorded hit serves its bytes"
         );
         assert_eq!(
             tape.cache_get("user:9"),
-            Some(None),
+            CachedValue::Miss,
             "a recorded miss replays as a miss, not as a divergence"
         );
-        assert_eq!(tape.cache_get("user:404"), None);
+        assert_eq!(tape.cache_get("user:404"), CachedValue::Unrecorded);
         assert_eq!(tape.divergences().len(), 1, "the unrecorded key diverges");
     }
 
@@ -1126,13 +1147,13 @@ mod tests {
         });
         assert_eq!(
             tape.next_mail(&["a@example.com".to_owned()], "Receipt"),
-            Some(None),
+            MailVerdict::Sent,
             "a recorded success is served as one, and nothing is delivered"
         );
         assert!(tape.divergences().is_empty());
-        assert!(
-            tape.next_mail(&["b@example.com".to_owned()], "Receipt")
-                .is_none()
+        assert_eq!(
+            tape.next_mail(&["b@example.com".to_owned()], "Receipt"),
+            MailVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
     }
