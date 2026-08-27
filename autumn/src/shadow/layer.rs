@@ -211,7 +211,14 @@ where
         let pending = match decision {
             MirrorDecision::Mirror => Some(PendingMirror {
                 method: req.method().clone(),
-                headers: forwarded_headers(req.headers()),
+                // The trusted-proxy layer runs at the `axum::serve` boundary,
+                // outside this one, so its verdict is already stamped here.
+                headers: forwarded_headers(
+                    req.headers(),
+                    req.extensions()
+                        .get::<crate::security::ResolvedClientIdentity>()
+                        .and_then(|id| id.host.as_deref()),
+                ),
                 // Prefer axum's matched route template over the configured
                 // pattern: this layer is applied with `Router::layer`, which
                 // wraps each route's service, so routing — and the

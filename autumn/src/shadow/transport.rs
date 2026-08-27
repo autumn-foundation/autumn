@@ -159,8 +159,18 @@ pub trait ShadowTransport: std::fmt::Debug + Send + Sync + 'static {
 /// either way manufacturing a divergence on every single request. The dial
 /// address and the authority are separate things, and only the address comes
 /// from the target.
+///
+/// `resolved_host` is the authority the trusted-proxy layer accepted, when it
+/// ran. It takes precedence over the raw `Host`: behind a proxy the raw header
+/// carries the *internal* address while the public one arrives in
+/// `X-Forwarded-Host`, which is stripped here for the reasons above. Sending
+/// the internal host would have the candidate resolve the wrong tenant, or
+/// reject the request outright — so the validated authority is what travels,
+/// never the unvalidated header it came from. This mirrors
+/// `tenancy::extract_tenant_from_parts`, which prefers the same resolved value
+/// over the raw header for the same reason.
 #[must_use]
-pub fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
+pub fn forwarded_headers(source: &HeaderMap, resolved_host: Option<&str>) -> HeaderMap {
     let connection_named = connection_named_headers(source);
     let mut out = HeaderMap::with_capacity(source.len().saturating_add(1));
     for (name, value) in source {
@@ -172,6 +182,11 @@ pub fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
             continue;
         }
         out.append(name.clone(), value.clone());
+    }
+    if let Some(host) = resolved_host
+        && let Ok(value) = HeaderValue::from_str(host)
+    {
+        out.insert(axum::http::header::HOST, value);
     }
     if let Ok(name) = HeaderName::from_bytes(SHADOW_HEADER.as_bytes()) {
         out.insert(name, HeaderValue::from_static(SHADOW_HEADER_VALUE));
@@ -324,7 +339,7 @@ mod tests {
 
     #[test]
     fn the_loop_guard_header_is_always_added() {
-        let forwarded = forwarded_headers(&HeaderMap::new());
+        let forwarded = forwarded_headers(&HeaderMap::new(), None);
         assert_eq!(
             forwarded
                 .get(crate::shadow::sample::SHADOW_HEADER)
@@ -335,15 +350,18 @@ mod tests {
 
     #[test]
     fn hop_by_hop_headers_are_stripped() {
-        let forwarded = forwarded_headers(&headers(&[
-            ("connection", "keep-alive"),
-            ("keep-alive", "timeout=5"),
-            ("proxy-authorization", "secret"),
-            ("te", "trailers"),
-            ("trailer", "Expires"),
-            ("transfer-encoding", "chunked"),
-            ("upgrade", "websocket"),
-        ]));
+        let forwarded = forwarded_headers(
+            &headers(&[
+                ("connection", "keep-alive"),
+                ("keep-alive", "timeout=5"),
+                ("proxy-authorization", "secret"),
+                ("te", "trailers"),
+                ("trailer", "Expires"),
+                ("transfer-encoding", "chunked"),
+                ("upgrade", "websocket"),
+            ]),
+            None,
+        );
         for stripped in [
             "connection",
             "keep-alive",
@@ -362,7 +380,7 @@ mod tests {
 
     #[test]
     fn framing_headers_are_stripped() {
-        let forwarded = forwarded_headers(&headers(&[("content-length", "0")]));
+        let forwarded = forwarded_headers(&headers(&[("content-length", "0")]), None);
         assert!(!forwarded.contains_key("content-length"));
     }
 
@@ -373,7 +391,7 @@ mod tests {
         // Re-deriving it from the dial address would make a candidate that
         // clones production's trusted-host policy reject every mirror with a
         // 400, and a subdomain-keyed tenant app resolve the wrong tenant.
-        let forwarded = forwarded_headers(&headers(&[("host", "app.example.com")]));
+        let forwarded = forwarded_headers(&headers(&[("host", "app.example.com")]), None);
         assert_eq!(
             forwarded.get("host").and_then(|v| v.to_str().ok()),
             Some("app.example.com")
@@ -382,7 +400,7 @@ mod tests {
 
     #[test]
     fn accept_encoding_is_stripped_so_both_sides_are_compared_uncompressed() {
-        let forwarded = forwarded_headers(&headers(&[("accept-encoding", "gzip, br")]));
+        let forwarded = forwarded_headers(&headers(&[("accept-encoding", "gzip, br")]), None);
         assert!(!forwarded.contains_key("accept-encoding"));
     }
 
@@ -392,14 +410,17 @@ mod tests {
         // whatever the client sent. Forwarding them would launder a spoofed
         // client IP or host into a candidate that trusts this process's
         // address as a proxy.
-        let forwarded = forwarded_headers(&headers(&[
-            ("x-forwarded-for", "10.0.0.1"),
-            ("x-forwarded-host", "evil.example"),
-            ("x-forwarded-proto", "https"),
-            ("x-forwarded-port", "443"),
-            ("forwarded", "for=10.0.0.1;host=evil.example"),
-            ("x-real-ip", "10.0.0.1"),
-        ]));
+        let forwarded = forwarded_headers(
+            &headers(&[
+                ("x-forwarded-for", "10.0.0.1"),
+                ("x-forwarded-host", "evil.example"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-port", "443"),
+                ("forwarded", "for=10.0.0.1;host=evil.example"),
+                ("x-real-ip", "10.0.0.1"),
+            ]),
+            None,
+        );
         for stripped in [
             "x-forwarded-for",
             "x-forwarded-host",
@@ -417,12 +438,15 @@ mod tests {
 
     #[test]
     fn headers_named_by_connection_are_stripped() {
-        let forwarded = forwarded_headers(&headers(&[
-            ("connection", "X-Internal-Auth, Keep-Alive"),
-            ("x-internal-auth", "hop-scoped"),
-            ("proxy-connection", "keep-alive"),
-            ("accept", "application/json"),
-        ]));
+        let forwarded = forwarded_headers(
+            &headers(&[
+                ("connection", "X-Internal-Auth, Keep-Alive"),
+                ("x-internal-auth", "hop-scoped"),
+                ("proxy-connection", "keep-alive"),
+                ("accept", "application/json"),
+            ]),
+            None,
+        );
         assert!(!forwarded.contains_key("x-internal-auth"));
         assert!(!forwarded.contains_key("proxy-connection"));
         assert!(
@@ -432,11 +456,44 @@ mod tests {
     }
 
     #[test]
+    fn the_trusted_proxys_resolved_host_wins_over_the_raw_one() {
+        // Behind a proxy the raw `Host` is the INTERNAL address and the public
+        // one arrives in `X-Forwarded-Host`, which is stripped here (a client
+        // could have forged it). The validated authority the trusted-proxy
+        // layer accepted is what travels instead — otherwise the candidate
+        // resolves the wrong tenant, or rejects the request outright.
+        let forwarded = forwarded_headers(
+            &headers(&[
+                ("host", "10.0.0.7:3000"),
+                ("x-forwarded-host", "app.example.com"),
+            ]),
+            Some("app.example.com"),
+        );
+        assert_eq!(
+            forwarded.get("host").and_then(|v| v.to_str().ok()),
+            Some("app.example.com")
+        );
+        assert!(
+            !forwarded.contains_key("x-forwarded-host"),
+            "the unvalidated header itself must still not travel"
+        );
+    }
+
+    #[test]
+    fn without_a_resolved_host_the_raw_one_is_used() {
+        let forwarded = forwarded_headers(&headers(&[("host", "app.example.com")]), None);
+        assert_eq!(
+            forwarded.get("host").and_then(|v| v.to_str().ok()),
+            Some("app.example.com")
+        );
+    }
+
+    #[test]
     fn an_inbound_loop_guard_is_replaced_not_duplicated() {
-        let forwarded = forwarded_headers(&headers(&[(
-            crate::shadow::sample::SHADOW_HEADER,
-            "spoofed",
-        )]));
+        let forwarded = forwarded_headers(
+            &headers(&[(crate::shadow::sample::SHADOW_HEADER, "spoofed")]),
+            None,
+        );
         let values: Vec<_> = forwarded
             .get_all(crate::shadow::sample::SHADOW_HEADER)
             .iter()
@@ -449,12 +506,15 @@ mod tests {
     fn application_headers_including_credentials_are_forwarded() {
         // Documented trust boundary: the candidate build must see the same
         // request the live build saw, or every authenticated route diverges.
-        let forwarded = forwarded_headers(&headers(&[
-            ("cookie", "session=abc"),
-            ("authorization", "Bearer t"),
-            ("accept", "application/json"),
-            ("x-request-id", "r-1"),
-        ]));
+        let forwarded = forwarded_headers(
+            &headers(&[
+                ("cookie", "session=abc"),
+                ("authorization", "Bearer t"),
+                ("accept", "application/json"),
+                ("x-request-id", "r-1"),
+            ]),
+            None,
+        );
         for kept in ["cookie", "authorization", "accept", "x-request-id"] {
             assert!(forwarded.contains_key(kept), "{kept} must be forwarded");
         }

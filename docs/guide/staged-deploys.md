@@ -544,7 +544,10 @@ container, another port, another machine) and point `target` at it.
   the authority the live build accepted. Those are separate things, and only the
   address comes from `target`: a candidate that clones your
   `[security.trusted_hosts]` would otherwise reject every mirror with a `400`,
-  and a subdomain-keyed multi-tenant app would resolve the wrong tenant.
+  and a subdomain-keyed multi-tenant app would resolve the wrong tenant. Behind
+  a trusted proxy it is the **resolved** authority that travels — the one your
+  `[security.trusted_proxies]` policy accepted — not the internal address in the
+  raw `Host` header, and not the unvalidated `X-Forwarded-Host` itself.
 - **Pages served from the static cache are mirrored too.** In an SSG/ISG build
   the static-first middleware answers matching `GET`/`HEAD` requests before the
   dynamic router runs; the mirror sits outside it, so a pre-rendered page the

@@ -281,15 +281,15 @@ pub fn normalize_body(facts: &ResponseFacts) -> NormalizedBody {
         return NormalizedBody::Empty;
     }
 
-    let content_type = facts
-        .content_type
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if looks_like_json(&content_type, &facts.body)
-        && let Ok(value) = serde_json::from_slice::<Value>(&facts.body)
-    {
+    // NB: `facts.content_type` is deliberately unread. It is recorded for the
+    // operator's benefit and never consulted here — see the two branches below.
+    // Attempted on every body, with no content-type sniff in front of it. A
+    // sniff for `{`/`[` missed scalar JSON — `null`, `true`, `1`, `"ok"` — so a
+    // body that parsed as JSON on the labelled side fell through to `Text` on
+    // the unlabelled one, and a header-only difference became a body
+    // divergence. Parsing is the only symmetric test. A non-JSON body fails on
+    // its first byte, so this costs nothing on the common path.
+    if let Ok(value) = serde_json::from_slice::<Value>(&facts.body) {
         return NormalizedBody::Json(canonicalize(&value));
     }
 
@@ -305,16 +305,6 @@ pub fn normalize_body(facts: &ResponseFacts) -> NormalizedBody {
     }
 
     NormalizedBody::Bytes(facts.body.clone())
-}
-
-/// Whether this body is worth attempting to parse as JSON.
-fn looks_like_json(content_type: &str, body: &[u8]) -> bool {
-    if content_type.contains("json") {
-        return true;
-    }
-    body.iter()
-        .find(|byte| !byte.is_ascii_whitespace())
-        .is_some_and(|byte| matches!(byte, b'{' | b'['))
 }
 
 /// Fold `\r\n` to `\n` and trim the body's outer whitespace.
@@ -653,6 +643,43 @@ mod tests {
         let other = ResponseFacts::new(200, None, Bytes::from_static(b"goodbye"));
         assert!(matches!(
             compare(&labelled, &other, &filter, 2048),
+            Comparison::Diverged(_)
+        ));
+    }
+
+    #[test]
+    fn scalar_json_is_recognised_without_a_content_type() {
+        // `{`/`[` sniffing missed these, so a labelled side became `Json` while
+        // an unlabelled one became `Text` — a header-only difference surfacing
+        // as a body divergence.
+        let filter = ParameterFilter::default();
+        for body in ["null", "true", "1", "\"ok\"", "1.5"] {
+            let labelled = ResponseFacts::new(
+                200,
+                Some("application/json".to_owned()),
+                Bytes::from(body.to_owned()),
+            );
+            let unlabelled = ResponseFacts::new(200, None, Bytes::from(body.to_owned()));
+            assert!(
+                matches!(
+                    compare(&labelled, &unlabelled, &filter, 2048),
+                    Comparison::Match
+                ),
+                "scalar JSON body {body:?} diverged on a header-only difference"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_json_still_diverges_on_a_real_difference() {
+        let filter = ParameterFilter::default();
+        let scalar = |body: &str| ResponseFacts::new(200, None, Bytes::from(body.to_owned()));
+        assert!(matches!(
+            compare(&scalar("true"), &scalar("false"), &filter, 2048),
+            Comparison::Diverged(_)
+        ));
+        assert!(matches!(
+            compare(&scalar("1"), &scalar("2"), &filter, 2048),
             Comparison::Diverged(_)
         ));
     }
