@@ -136,7 +136,7 @@ pub async fn impersonation_banner_for(
 /// accepting it from the request would let an operator mint a session more
 /// privileged than the target really is.
 #[derive(Debug, Deserialize)]
-pub(crate) struct BeginForm {
+pub struct BeginForm {
     user_id: String,
     /// Where to send the browser afterwards. Validated as a same-origin
     /// relative path, so it can never become an open redirect.
@@ -150,7 +150,7 @@ pub(crate) struct BeginForm {
 /// enabled), then gated again by the app's
 /// [`ImpersonationGate`](autumn_web::auth::impersonation::ImpersonationGate):
 /// role membership alone is never sufficient.
-pub(crate) async fn impersonate_begin(
+pub async fn impersonate_begin(
     State(state): State<AppState>,
     session: Session,
     axum::extract::Form(form): axum::extract::Form<BeginForm>,
@@ -166,7 +166,7 @@ pub(crate) async fn impersonate_begin(
 /// session no longer carries the admin role, so a gated revert would trap the
 /// operator in the target's identity. It is self-gating — a session that is not
 /// impersonating gets a `400` and nothing changes.
-pub(crate) async fn impersonate_stop(
+pub async fn impersonate_stop(
     State(state): State<AppState>,
     session: Session,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,

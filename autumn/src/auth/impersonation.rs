@@ -390,9 +390,11 @@ pub async fn is_impersonating(state: &AppState, session: &Session) -> bool {
     impersonation_state(state, session).await.is_some()
 }
 
-/// The full [`ImpersonationState`] for the session, or `None` when it is not
-/// impersonating. Reads the effective user through the app's configured auth
-/// session key and verifies the record still describes that user.
+/// The full [`ImpersonationState`] for the session.
+///
+/// `None` when the session is not impersonating. Reads the effective user
+/// through the app's configured auth session key and verifies the record still
+/// describes that user.
 pub async fn impersonation_state(
     state: &AppState,
     session: &Session,
