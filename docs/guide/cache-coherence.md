@@ -388,10 +388,6 @@ tell "we checked and it was fine" from "we never looked".
   rather than being checked against it, so naming the wrong model audits clean.
   A `derived` set is an approximation of a different kind — see
   [Derivation](#derivation--the-fallback).
-* **That a declared dependency set is true.** `reads(...)` replaces the analysis
-  rather than being checked against it, so naming the wrong model audits clean.
-  A `derived` set is an approximation of a different kind — see
-  [Derivation](#derivation--the-fallback).
 * **Row- or column-level precision.** Granularity is the model/table. A read
   derived from one column of one row is treated as depending on the whole model,
   which over-approximates — a false *failure*, never a false pass.

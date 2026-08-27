@@ -528,6 +528,71 @@ fn dependent_child_models(config: &RepoConfig) -> Vec<String> {
 /// Write methods that run the `dependent(...)` cascade.
 const CASCADING_WRITES: &[&str] = &["delete_by_id", "delete_many"];
 
+/// Registrations for the writes a `dependent(...)` cascade performs against the
+/// CHILD's rows.
+///
+/// Without these the gate reports a clean build for a cached read the cascade
+/// really does strand: `PostRepository::delete_by_id` deletes `Comment` rows,
+/// but registering only the parent model would never intersect a read derived
+/// from `Comment`.
+fn cascade_mutation_registrations(
+    config: &RepoConfig,
+    overrides: &std::collections::HashMap<String, MethodCoherence>,
+    writes: &[String],
+    trait_name_str: &str,
+) -> Vec<TokenStream> {
+    let child_models = dependent_child_models(config);
+    CASCADING_WRITES
+        .iter()
+        .filter(|method| writes.contains(&(*method).to_string()))
+        .flat_map(|method| -> Vec<TokenStream> {
+            let edges: Vec<syn::Path> = config
+                .invalidates
+                .iter()
+                .chain(
+                    overrides
+                        .get(*method)
+                        .into_iter()
+                        .flat_map(|o| o.invalidates.iter()),
+                )
+                .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+                .collect();
+            let acknowledged = overrides
+                .get(*method)
+                .and_then(|o| o.acknowledge_stale.as_ref())
+                .or(config.acknowledge_stale.as_ref())
+                .map_or_else(
+                    || quote! { ::core::option::Option::None },
+                    |reason| quote! { ::core::option::Option::Some(#reason) },
+                );
+            child_models
+                .iter()
+                .map(|child| {
+                    let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    quote! {
+                    ::autumn_web::reexports::inventory::submit! {
+                        ::autumn_web::cache::coherence::MutationDescriptor {
+                            repository: #trait_name_str,
+                            method: #method,
+                            model: || #child,
+                            // Empty rather than guessed: the child's table name
+                            // lives on ITS `#[repository]`, which may override
+                            // the inferred one, and a wrong table string in the
+                            // manifest is worse than an absent one. Matching is
+                            // on the model, so nothing is lost.
+                            table: "",
+                            invalidates: &[#(#edges),*],
+                            acknowledged_stale: #acknowledged,
+                            location: concat!(file!(), ":", line!()),
+                        }
+                    }
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The `inventory` registrations and invalidator this repository publishes for
 /// the cache-coherence manifest (#1716).
 fn generate_coherence_items(
@@ -660,59 +725,8 @@ fn generate_coherence_items(
         }
     };
 
-    // #1716: a `dependent(...)` cascade writes the CHILD's rows from the
-    // parent's delete. Without these the gate reports a clean build for a
-    // cached read the cascade really does strand.
-    let child_models = dependent_child_models(config);
-    let cascade_submissions: Vec<TokenStream> = CASCADING_WRITES
-        .iter()
-        .filter(|method| writes.contains(&(*method).to_string()))
-        .flat_map(|method| -> Vec<TokenStream> {
-            let edges: Vec<syn::Path> = config
-                .invalidates
-                .iter()
-                .chain(
-                    overrides
-                        .get(*method)
-                        .into_iter()
-                        .flat_map(|o| o.invalidates.iter()),
-                )
-                .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
-                .collect();
-            let acknowledged = overrides
-                .get(*method)
-                .and_then(|o| o.acknowledge_stale.as_ref())
-                .or(config.acknowledge_stale.as_ref())
-                .map_or_else(
-                    || quote! { ::core::option::Option::None },
-                    |reason| quote! { ::core::option::Option::Some(#reason) },
-                );
-            child_models
-                .iter()
-                .map(|child| {
-                    let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
-                    quote! {
-                    ::autumn_web::reexports::inventory::submit! {
-                        ::autumn_web::cache::coherence::MutationDescriptor {
-                            repository: #trait_name_str,
-                            method: #method,
-                            model: || #child,
-                            // Empty rather than guessed: the child's table name
-                            // lives on ITS `#[repository]`, which may override
-                            // the inferred one, and a wrong table string in the
-                            // manifest is worse than an absent one. Matching is
-                            // on the model, so nothing is lost.
-                            table: "",
-                            invalidates: &[#(#edges),*],
-                            acknowledged_stale: #acknowledged,
-                            location: concat!(file!(), ":", line!()),
-                        }
-                    }
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let cascade_submissions =
+        cascade_mutation_registrations(config, &overrides, &writes, &trait_name_str);
 
     Ok(quote! {
         #(#submissions)*

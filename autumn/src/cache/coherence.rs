@@ -359,7 +359,7 @@ pub fn undetermined_reads(reads: &[CachedRead]) -> Vec<&CachedRead> {
 /// only under `strict` — the default never fails on what the analysis merely
 /// could not read.
 #[must_use]
-pub fn gate_failed(manifest: &CoherenceManifest, strict: bool) -> bool {
+pub const fn gate_failed(manifest: &CoherenceManifest, strict: bool) -> bool {
     !manifest.violations.is_empty() || (strict && !manifest.undetermined_reads.is_empty())
 }
 
@@ -566,121 +566,15 @@ impl CoherenceManifest {
     /// Assemble the manifest from the app's registered reads and mutations.
     #[must_use]
     pub fn build(reads: &[CachedRead], mutations: &[Mutation]) -> Self {
-        let mut read_entries: Vec<ManifestRead> = reads
-            .iter()
-            .map(|r| {
-                let mut models: Vec<String> = r.reads.clone();
-                models.sort();
-                models.dedup();
-                ManifestRead {
-                    id: r.id.clone(),
-                    kind: r.kind.as_str().to_string(),
-                    reads: models,
-                    provenance: r.provenance.as_str().to_string(),
-                    acknowledged_stale: r.acknowledged_stale.clone(),
-                    location: r.location.clone(),
-                }
-            })
-            .collect();
-        read_entries.sort_by(|a, b| (&a.id, &a.location).cmp(&(&b.id, &b.location)));
-
-        let mut mutation_entries: Vec<ManifestMutation> = mutations
-            .iter()
-            .map(|m| ManifestMutation {
-                name: m.qualified_name(),
-                model: m.model.clone(),
-                table: m.table.clone(),
-                acknowledged_stale: m.acknowledged_stale.clone(),
-                location: m.location.clone(),
-            })
-            .collect();
-        // `location` and `table` join the key so a tie cannot fall back to
-        // `inventory`'s link order, which is unspecified: two same-named
-        // repository traits in different modules would otherwise swap rows
-        // between byte-identical builds.
-        mutation_entries.sort_by(|a, b| {
-            (&a.name, &a.model, &a.table, &a.location).cmp(&(
-                &b.name,
-                &b.model,
-                &b.table,
-                &b.location,
-            ))
-        });
-
-        let mut invalidation_entries: Vec<ManifestInvalidation> = mutations
-            .iter()
-            .flat_map(|m| {
-                m.invalidates.iter().map(move |read| ManifestInvalidation {
-                    mutation: m.qualified_name(),
-                    read: read.clone(),
-                })
-            })
-            .collect();
-        invalidation_entries.sort_by(|a, b| (&a.mutation, &a.read).cmp(&(&b.mutation, &b.read)));
-
-        let mut undetermined: Vec<UndeterminedRead> = undetermined_reads(reads)
-            .into_iter()
-            .map(|r| UndeterminedRead {
-                id: r.id.clone(),
-                location: r.location.clone(),
-            })
-            .collect();
-        undetermined.sort_by(|a, b| a.id.cmp(&b.id));
-
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             dimensions: Dimensions {
-                cached_reads: Dimension {
-                    provenance: "provable".to_string(),
-                    source: "macro:#[cached] / declare_cached_read!".to_string(),
-                    runtime_caveat:
-                        "each entry's EXISTENCE is proven — a `#[cached]` function registers \
-                         itself — but its dependency set is only as strong as the entry's own \
-                         `provenance` field says: `declared` is trusted verbatim (a `reads(...)` \
-                         naming the wrong model audits clean), `derived` is what a syntactic \
-                         analysis of the function could see, and `undetermined` is nothing at \
-                         all. A `declare_cached_read!` entry is hand-written throughout, \
-                         including the fact that the call site exists; an undeclared \
-                         `cache_fragment` / `get_or_compute` call is invisible here — see the \
-                         undeclared_cache_call_sites entry in `excluded`."
-                            .to_string(),
-                    entries: read_entries,
-                },
-                mutations: Dimension {
-                    provenance: "provable".to_string(),
-                    source: "macro:#[repository]".to_string(),
-                    runtime_caveat: "every entry is proven, but the SET is not exhaustive: only \
-                         `#[repository]` write methods are here. Nothing proves an app's writes \
-                         all go through one — see the writes_outside_repository entry in \
-                         `excluded` — and a write that reaches another model's table through a \
-                         `counter_cache` is registered under its own model, not the counter's."
-                        .to_string(),
-                    entries: mutation_entries,
-                },
-                invalidations: Dimension {
-                    // `provable`, not `declared`: the edge is recovered from
-                    // macro-expanded code with no config read and no process
-                    // started, which is question 1 of the provenance rubric in
-                    // docs/guide/security-posture-manifest.md. The weak step is
-                    // an ADJACENT one — whether the invalidator is called — and
-                    // the rubric's tie-breaker is a runtime_caveat, not a
-                    // demotion that would understate what the build proves.
-                    provenance: "provable".to_string(),
-                    source: "macro:#[repository(..., invalidates(...))]".to_string(),
-                    runtime_caveat:
-                        "the edge's target is proven — `invalidates(path)` resolves to the \
-                         `#[cached]` function's own generated id constant, so rustc rejects a \
-                         path that names anything else. That the invalidator is actually CALLED \
-                         on the write path is not proven by this slice: the generated \
-                         `Repository::invalidate_declared_caches()` helper must be invoked by the \
-                         app (or a commit hook). Automatic invocation is deliberately out of the \
-                         first slice — see docs/guide/cache-coherence.md."
-                            .to_string(),
-                    entries: invalidation_entries,
-                },
+                cached_reads: cached_reads_dimension(reads),
+                mutations: mutations_dimension(mutations),
+                invalidations: invalidations_dimension(mutations),
             },
             violations: check(reads, mutations),
-            undetermined_reads: undetermined,
+            undetermined_reads: undetermined_dimension(reads),
             excluded: excluded_dimensions(),
         }
     }
@@ -727,6 +621,122 @@ impl CoherenceManifest {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("cache-coherence manifest is always serializable")
     }
+}
+
+/// The `cached_reads` dimension: every read the binary registers, stable-ordered.
+fn cached_reads_dimension(reads: &[CachedRead]) -> Dimension<ManifestRead> {
+    let mut entries: Vec<ManifestRead> = reads
+        .iter()
+        .map(|r| {
+            let mut models: Vec<String> = r.reads.clone();
+            models.sort();
+            models.dedup();
+            ManifestRead {
+                id: r.id.clone(),
+                kind: r.kind.as_str().to_string(),
+                reads: models,
+                provenance: r.provenance.as_str().to_string(),
+                acknowledged_stale: r.acknowledged_stale.clone(),
+                location: r.location.clone(),
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.id, &a.location).cmp(&(&b.id, &b.location)));
+    Dimension {
+        provenance: "provable".to_string(),
+        source: "macro:#[cached] / declare_cached_read!".to_string(),
+        runtime_caveat: "each entry's EXISTENCE is proven — a `#[cached]` function registers \
+                         itself — but its dependency set is only as strong as the entry's own \
+                         `provenance` field says: `declared` is trusted verbatim (a `reads(...)` \
+                         naming the wrong model audits clean), `derived` is what a syntactic \
+                         analysis of the function could see, and `undetermined` is nothing at \
+                         all. A `declare_cached_read!` entry is hand-written throughout, \
+                         including the fact that the call site exists; an undeclared \
+                         `cache_fragment` / `get_or_compute` call is invisible here — see the \
+                         undeclared_cache_call_sites entry in `excluded`."
+            .to_string(),
+        entries,
+    }
+}
+
+/// The `mutations` dimension: every repository write the binary registers.
+fn mutations_dimension(mutations: &[Mutation]) -> Dimension<ManifestMutation> {
+    let mut entries: Vec<ManifestMutation> = mutations
+        .iter()
+        .map(|m| ManifestMutation {
+            name: m.qualified_name(),
+            model: m.model.clone(),
+            table: m.table.clone(),
+            acknowledged_stale: m.acknowledged_stale.clone(),
+            location: m.location.clone(),
+        })
+        .collect();
+    // `location` and `table` join the key so a tie cannot fall back to
+    // `inventory`'s link order, which is unspecified: two same-named repository
+    // traits in different modules would otherwise swap rows between
+    // byte-identical builds.
+    entries.sort_by(|a, b| {
+        (&a.name, &a.model, &a.table, &a.location).cmp(&(&b.name, &b.model, &b.table, &b.location))
+    });
+    Dimension {
+        provenance: "provable".to_string(),
+        source: "macro:#[repository]".to_string(),
+        runtime_caveat: "every entry is proven, but the SET is not exhaustive: only \
+                         `#[repository]` write methods are here. Nothing proves an app's writes \
+                         all go through one — see the writes_outside_repository entry in \
+                         `excluded` — and a write that reaches another model's table through a \
+                         `counter_cache` is registered under its own model, not the counter's."
+            .to_string(),
+        entries,
+    }
+}
+
+/// The `invalidations` dimension: every declared edge from a write to a read.
+///
+/// `provable`, not `declared`: the edge is recovered from macro-expanded code
+/// with no config read and no process started, which is question 1 of the
+/// provenance rubric in `docs/guide/security-posture-manifest.md`. The weak step
+/// is an ADJACENT one — whether the invalidator is called — and the rubric's
+/// tie-breaker is a `runtime_caveat`, not a demotion that would understate what
+/// the build proves.
+fn invalidations_dimension(mutations: &[Mutation]) -> Dimension<ManifestInvalidation> {
+    let mut entries: Vec<ManifestInvalidation> = mutations
+        .iter()
+        .flat_map(|m| {
+            m.invalidates.iter().map(move |read| ManifestInvalidation {
+                mutation: m.qualified_name(),
+                read: read.clone(),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.mutation, &a.read).cmp(&(&b.mutation, &b.read)));
+    Dimension {
+        provenance: "provable".to_string(),
+        source: "macro:#[repository(..., invalidates(...))]".to_string(),
+        runtime_caveat: "the edge's target is proven — `invalidates(path)` resolves to the \
+                         `#[cached]` function's own generated id constant, so rustc rejects a \
+                         path that names anything else. That the invalidator is actually CALLED \
+                         on the write path is not proven by this slice: the generated \
+                         `Repository::invalidate_declared_caches()` helper must be invoked by the \
+                         app (or a commit hook). Automatic invocation is deliberately out of the \
+                         first slice — see docs/guide/cache-coherence.md."
+            .to_string(),
+        entries,
+    }
+}
+
+/// Reads whose dependency set could not be established, stable-ordered and
+/// carrying their locations.
+fn undetermined_dimension(reads: &[CachedRead]) -> Vec<UndeterminedRead> {
+    let mut entries: Vec<UndeterminedRead> = undetermined_reads(reads)
+        .into_iter()
+        .map(|r| UndeterminedRead {
+            id: r.id.clone(),
+            location: r.location.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.id, &a.location).cmp(&(&b.id, &b.location)));
+    entries
 }
 
 /// Dimensions this slice deliberately does not emit, and why — so a reader can
@@ -1003,6 +1013,11 @@ pub fn is_dump_mode() -> bool {
 }
 
 /// Print the manifest on the marker line `autumn cache audit` parses.
+///
+/// # Panics
+///
+/// Never in practice: every field is a plain owned value with an infallible
+/// `Serialize` impl.
 pub fn print_manifest_dump(manifest: &CoherenceManifest) {
     println!(
         "{COHERENCE_MANIFEST_MARKER}{}",

@@ -383,6 +383,64 @@ fn param_name(pat: &syn::Pat) -> String {
     }
 }
 
+/// Build the tuple expression the cache key is hashed from.
+///
+/// Without `key(...)` that is every parameter, exactly as before. With it, only
+/// the named ones — which is what lets a cached read take the repository handle
+/// it reads through, since the handle is `Clone` but not `Hash` and was never
+/// part of the value's identity.
+///
+/// Each parameter enters the tuple as the expression naming its *value*. For
+/// the ordinary `a: i64` that must be the bare ident, because a `mut a: i64`
+/// binding would otherwise splice as `mut a.clone()`. A destructuring pattern
+/// like `(a, b): (i64, i64)` has no single ident, so the pattern itself is
+/// spliced, which reconstructs the tuple and clones correctly.
+fn key_tuple(attrs: &CachedAttrs, param_names: &[&syn::Pat]) -> syn::Result<TokenStream> {
+    let key_params: Vec<&syn::Pat> = if attrs.key.is_empty() {
+        param_names.to_vec()
+    } else {
+        let declared: Vec<String> = param_names.iter().map(|pat| param_name(pat)).collect();
+        // Rendered once rather than per comparison: both the validation below
+        // and the filter after it walk this list for every parameter.
+        let wanted: Vec<String> = attrs.key.iter().map(ToString::to_string).collect();
+        if let Some((unknown, _)) = attrs
+            .key
+            .iter()
+            .zip(&wanted)
+            .find(|(_, name)| !declared.contains(*name))
+        {
+            return Err(syn::Error::new_spanned(
+                unknown,
+                format!(
+                    "`key({unknown})` names no parameter of this function; \
+                     declared parameters are: {}",
+                    declared.join(", ")
+                ),
+            ));
+        }
+        param_names
+            .iter()
+            .copied()
+            .filter(|pat| wanted.contains(&param_name(pat)))
+            .collect()
+    };
+
+    if key_params.is_empty() {
+        return Ok(quote! { &() });
+    }
+    let key_exprs: Vec<TokenStream> = key_params
+        .iter()
+        .map(|pat| match pat {
+            syn::Pat::Ident(ident) if ident.subpat.is_none() => {
+                let name = &ident.ident;
+                quote! { #name }
+            }
+            other => quote! { #other },
+        })
+        .collect();
+    Ok(quote! { &(#(#key_exprs.clone(),)*) })
+}
+
 /// Generate the cache wrapper body for a single function.
 fn generate_cache_body(
     attrs: &CachedAttrs,
@@ -516,59 +574,9 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // `key(...)` narrows the key to the named parameters; without it every
-    // parameter is hashed, as before.
-    let key_params: Vec<&syn::Pat> = if attrs.key.is_empty() {
-        param_names.clone()
-    } else {
-        let declared: Vec<String> = param_names.iter().map(|pat| param_name(pat)).collect();
-        // Rendered once rather than per comparison: both the validation below
-        // and the filter after it walk this list for every parameter.
-        let wanted: Vec<String> = attrs.key.iter().map(ToString::to_string).collect();
-        if let Some((unknown, _)) = attrs
-            .key
-            .iter()
-            .zip(&wanted)
-            .find(|(_, name)| !declared.contains(*name))
-        {
-            return syn::Error::new_spanned(
-                unknown,
-                format!(
-                    "`key({unknown})` names no parameter of this function; \
-                     declared parameters are: {}",
-                    declared.join(", ")
-                ),
-            )
-            .to_compile_error();
-        }
-        param_names
-            .iter()
-            .copied()
-            .filter(|pat| wanted.contains(&param_name(pat)))
-            .collect()
-    };
-
-    // Refer to each key parameter by the expression that names its *value*.
-    // For the ordinary `a: i64` that is the bare ident — and it must be the
-    // bare ident, because a `mut a: i64` binding would otherwise splice as
-    // `mut a.clone()`. A destructuring pattern like `(a, b): (i64, i64)` has no
-    // single ident, so the pattern itself is spliced, which reconstructs the
-    // tuple and clones correctly.
-    let key_exprs: Vec<TokenStream> = key_params
-        .iter()
-        .map(|pat| match pat {
-            syn::Pat::Ident(ident) if ident.subpat.is_none() => {
-                let name = &ident.ident;
-                quote! { #name }
-            }
-            other => quote! { #other },
-        })
-        .collect();
-
-    let key_args = if key_exprs.is_empty() {
-        quote! { &() }
-    } else {
-        quote! { &(#(#key_exprs.clone(),)*) }
+    let key_args = match key_tuple(&attrs, &param_names) {
+        Ok(args) => args,
+        Err(err) => return err.to_compile_error(),
     };
 
     let ret_type = match &sig.output {

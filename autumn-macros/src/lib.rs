@@ -1305,7 +1305,6 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// static `Cache` (from `autumn_web::cache::Cache`). Key arguments
 /// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
 ///
-
 /// # Attributes
 ///
 /// | Attribute | Example | Description |
