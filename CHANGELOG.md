@@ -58,9 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *customer* did it. A new additive API, `autumn_web::auth::impersonation`,
   makes the secure version the easy one. `begin_impersonation` swaps the
   session's effective user to the target and records the real admin separately
-  under a reserved `impersonator_id` key, so ordinary current-user resolution
-  (`#[secured]`, the `Auth<T>` extractor, `PolicyContext`) transparently sees the
-  **impersonated** user while the framework's ambient current actor (#1383) — the
+  under a reserved `impersonator_id` key, so the resolution the *framework* owns
+  (`#[secured]`, `RequireAuth`, `PolicyContext`) transparently sees the
+  **impersonated** user — `Auth<T>` is populated by the app's own loader
+  middleware from request extensions, so it follows only if that loader reads the
+  auth session key — while the framework's ambient current actor (#1383) — the
   value that seeds `#[repository(versioned)]` version rows and `AuditEvent`s — is
   published as the **real impersonator**. `end_impersonation` reverses it.
   Beginning is default-deny: it requires an `ImpersonationGate` in `AppState`
