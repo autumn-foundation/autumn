@@ -1492,6 +1492,7 @@ Contract of the generated handler:
 
 | Situation | Behaviour |
 | --------- | --------- |
+| The confirmation box | Comes back **unchecked** on every page the handler renders — the preview, the committed result and the 422 refusal alike. The operator's next move after any of them may be to choose a different file, and a carried-over tick would commit one nobody previewed. |
 | No `commit` confirmation | `ImportMode::DryRun`. Every row is parsed and validated, the report says what *would* happen, and the handler's only write call is not reached. This is the default: an unchecked checkbox submits nothing at all. |
 | How a row becomes a record | The row (`column -> value`) is re-encoded as a urlencoded body and handed to the module's own `decode_form`, so it is decoded, blank-normalized and validated by **exactly** the code path a browser form submission takes — the same `#[validate(...)]` rules, the same `into_new`. |
 | A row that fails to parse | A row error naming the parse failure, against that row's line. The rest of the file still imports. |

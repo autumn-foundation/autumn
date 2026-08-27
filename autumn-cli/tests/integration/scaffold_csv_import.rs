@@ -618,6 +618,34 @@ fn the_report_says_what_the_counts_cannot() {
     );
 }
 
+/// "Unconfirmed means dry run" has to hold for EVERY upload, not just the
+/// first. Every page this handler renders — the preview, the committed result,
+/// and the 422 refusal — comes back with the confirmation box unchecked, because
+/// the operator's next move after any of them may be to choose a DIFFERENT file,
+/// and a carried-over tick would commit one nobody has previewed.
+#[test]
+fn no_page_arms_a_commit_for_the_next_file_chosen() {
+    let (_tmp, routes) = import_routes("import-rearm", &[]);
+    let import = handler_slice(&routes, "import");
+    assert_eq!(
+        import.matches("import_form_body(").count(),
+        3,
+        "the handler renders the form on the refusal, the over-cap refusal and \
+         the report:\n{import}"
+    );
+    assert_eq!(
+        import.matches("submit_field.as_ref(), false,").count(),
+        3,
+        "every re-render must leave the confirmation unchecked:\n{import}"
+    );
+    // ...and the GET form, which has no submit to carry over anyway.
+    let form = handler_slice(&routes, "import_form");
+    assert!(
+        form.contains("submit_field.as_ref(), false, None)"),
+        "the upload form starts unconfirmed:\n{form}"
+    );
+}
+
 // ── AC5: CSRF, size limit, and a content-type/extension check ─────────────────
 
 #[test]

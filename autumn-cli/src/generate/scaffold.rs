@@ -10540,10 +10540,13 @@ __IGNORED_COLUMNS_CONST____DISCARDED_CONST____CELL_FNS__/// The CSV upload contr
 /// both fields first if you rearrange this form.
 ///
 /// `commit` pre-checks the confirmation box. Every caller passes `false`, and
-/// that is deliberate: a preview page that armed the box would arm it for
-/// WHATEVER FILE IS CHOSEN NEXT, so an operator who reads a bad report and
-/// picks a different file to preview would commit it instead. "Unconfirmed
-/// means dry run" has to hold for every upload, not just the first.
+/// that is deliberate: a page that armed the box would arm it for WHATEVER FILE
+/// IS CHOSEN NEXT, so an operator who reads a bad report — or a refusal — and
+/// picks a different file would commit it without ever previewing it.
+/// "Unconfirmed means dry run" has to hold for every upload, not just the first.
+/// The parameter stays because this is ordinary app code: pre-check it if your
+/// operators import the same vetted file repeatedly and you want the second
+/// submit to be one click.
 fn import_form_body(
     __LOCALE_REF_PARAM__csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
@@ -10800,8 +10803,12 @@ pub async fn import(
         }
     }
     // A refused or missing upload re-renders the form at 422 with the reason
-    // inline and the confirmation box left as the operator set it, rather than
-    // 400ing an ordinary form submission.
+    // inline, rather than 400ing an ordinary form submission. The confirmation
+    // box comes back UNCHECKED even if the refused submit had it ticked: the
+    // operator's next move is to choose a different file, and carrying the
+    // confirmation over would commit that one — a file nobody has previewed —
+    // on the first submit. "Unconfirmed means dry run" has to hold for every
+    // upload, and a refusal is not a preview.
     let refusal: Option<String> = if wrong_type {
         Some(__L_NOT_CSV__)
     } else if uploaded.as_ref().is_none_or(Vec::is_empty) {
@@ -10812,7 +10819,7 @@ pub async fn import(
     if let Some(message) = refusal {
         let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
             h1 { __L_HEADING__ }
-            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), commit, Some(&message)))
+            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&message)))
             (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
         });
         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());
