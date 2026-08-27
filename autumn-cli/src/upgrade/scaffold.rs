@@ -994,16 +994,69 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    // Nothing is here, so there is nothing an interrupted write could destroy
-    // — and a plain write is what gives the new file the same mode `autumn new`
-    // would have given it. `tempfile` deliberately creates 0600, and renaming
-    // that into place would leave an added `ci.yml` or `input.css` unreadable
-    // to every other uid: fatal to a Docker stage that drops privileges, and
-    // invisible in `git diff`, which tracks only the executable bit.
     if entry.current == OnDisk::Absent {
-        return std::fs::write(&entry.absolute, &entry.template).map_err(|error| error.to_string());
+        return create_atomically(entry);
     }
     replace_in_place(entry, directory)
+}
+
+/// Where an in-progress write to `absolute` is staged.
+///
+/// A deterministic name, in the same directory so the publishing rename never
+/// crosses a filesystem. Deterministic rather than random because a leftover
+/// then has an owner: this function names it, so the next run recognises its
+/// own scratch and clears it instead of failing forever on a crash's debris.
+fn scratch_path(absolute: &Path) -> PathBuf {
+    let name = absolute
+        .file_name()
+        .map_or_else(|| "scaffold".into(), std::ffi::OsStr::to_os_string);
+    absolute.with_file_name(format!(".autumn-upgrade-{}.tmp", name.to_string_lossy()))
+}
+
+/// Publish a file at a path nothing occupies yet.
+///
+/// Staged and renamed, not written in place. A plain `fs::write` interrupted by
+/// Ctrl-C or a full disk leaves a truncated file at the destination — and that
+/// file has no recorded baseline, so the *next* run classifies it as a conflict
+/// and refuses to touch it. The crash would be permanent: a corrupted file this
+/// command can never repair.
+///
+/// Staged by hand rather than through `tempfile`, which deliberately creates
+/// its temporaries 0600. Renaming one of those into place would leave an added
+/// `ci.yml` or `input.css` unreadable to every other uid — fatal to a Docker
+/// stage that drops privileges, and invisible in `git diff`, which tracks only
+/// the executable bit. `OpenOptions` honours the process umask, so the file
+/// lands with exactly the mode `autumn new` would have given it.
+fn create_atomically(entry: &Entry) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let scratch = scratch_path(&entry.absolute);
+    // Debris from a killed run, cleared so a crash is not permanent. Only ever
+    // this function's own scratch name, and never the destination.
+    let _ = std::fs::remove_file(&scratch);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        // Refuses to clobber, so a second `autumn upgrade --apply` racing this
+        // one is a loud error rather than two writers interleaving into one
+        // file.
+        .create_new(true)
+        .open(&scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+
+    let staged = file
+        .write_all(entry.template.as_bytes())
+        .and_then(|()| file.flush())
+        // The rename is atomic, but only against a crash if the bytes reached
+        // the disk first: otherwise the rename can land before the data and
+        // publish an empty file.
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let published = staged.and_then(|()| std::fs::rename(&scratch, &entry.absolute));
+    if published.is_err() {
+        // Nothing half-written survives, at the destination or beside it.
+        let _ = std::fs::remove_file(&scratch);
+    }
+    published.map_err(|error| error.to_string())
 }
 
 /// Replace an existing file's contents atomically, keeping its mode.
@@ -2143,5 +2196,80 @@ mod tests {
         let error = accept(tmp.path(), &["src/main.rs".to_owned()]).expect_err("must refuse");
         assert!(error.contains("src/main.rs"), "{error}");
         assert!(Manifest::load(tmp.path()).unwrap().pinned.is_empty());
+    }
+
+    #[test]
+    fn an_added_file_is_published_only_once_it_is_complete() {
+        // An addition interrupted partway — Ctrl-C, a full disk — must not
+        // leave a truncated file at the destination. That file would have no
+        // recorded baseline, so the next run would call it a conflict and
+        // refuse to touch it: a corrupted file the tool can never repair.
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+
+        // Occupy the scratch path with a directory, so publishing fails after
+        // the plan is made but before anything reaches the destination.
+        let scratch = scratch_path(&tmp.path().join("rustfmt.toml"));
+        fs::create_dir_all(&scratch).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        let failure = apply(&mut report).expect_err("the write must fail");
+        assert_eq!(failure.path, "rustfmt.toml");
+        assert!(
+            !tmp.path().join("rustfmt.toml").exists(),
+            "a failed addition must leave nothing at the destination"
+        );
+    }
+
+    #[test]
+    fn a_completed_apply_leaves_no_scratch_files_behind() {
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let stale = "# older\n";
+        write(tmp.path(), "clippy.toml", stale);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(stale));
+        manifest.save(tmp.path()).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+
+        let strays: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".autumn-upgrade-"))
+            .collect();
+        assert!(strays.is_empty(), "scratch files left behind: {strays:?}");
+    }
+
+    #[test]
+    fn a_stale_scratch_file_does_not_block_a_later_run() {
+        // A run killed mid-write leaves its scratch file behind. If that
+        // blocked every future addition, the crash would be permanent.
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+        fs::write(
+            scratch_path(&tmp.path().join("rustfmt.toml")),
+            "half-written leftovers",
+        )
+        .unwrap();
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("a stale scratch file is not a blocker");
+        let files = current_files(tmp.path(), GenerateOptions::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("rustfmt.toml")).unwrap(),
+            files["rustfmt.toml"]
+        );
     }
 }

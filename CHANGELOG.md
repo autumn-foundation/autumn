@@ -47,9 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlink, a directory, or not UTF-8 is reported as a conflict and left exactly
   as it is, rather than being mistaken for a missing file and truncated —
   which matters most for the projects with no manifest, where nothing else
-  vouches for the file. Writes go through a temporary file in the same
-  directory and are renamed into place, keeping the original's permissions, so
-  an interrupted apply cannot leave a half-written `Dockerfile`. The project
+  vouches for the file. Every write is staged in the same directory and
+  renamed into place, so an interrupted apply cannot leave a half-written
+  `Dockerfile` or a truncated new file — which would be permanent, since a file
+  with no recorded baseline is a conflict the command then refuses to repair.
+  An updated file keeps its permissions; an added one lands with the mode
+  `autumn new` would have given it. The project
   name is read from `[package] name` and validated, never guessed from the
   directory: it is interpolated into `autumn.toml`, the CI workflow and the
   `Dockerfile`'s `CMD`, so a guessed name would render a different scaffold and

@@ -278,9 +278,10 @@ once no conflicts are left — so a half-finished upgrade never reads as a
 finished one, and a project that has never been fully reconciled simply has no
 `version` line rather than a flattering guess.
 
-Writes go through a temporary file in the same directory and are renamed into
-place, keeping the original's permissions, so an interrupted `--apply` cannot
-leave you with a half-written `Dockerfile`.
+Every write is staged in the same directory and renamed into place, so an
+interrupted `--apply` cannot leave you with a half-written `Dockerfile` or a
+truncated new file. An updated file keeps its original permissions; an added
+one lands with exactly the mode `autumn new` would have given it.
 
 Line endings are normalised before hashing, so a `core.autocrlf` checkout on
 Windows is not mistaken for you having personally rewritten every one of them.
