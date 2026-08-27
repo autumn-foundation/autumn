@@ -3388,8 +3388,6 @@ impl JobClient {
         })
     }
 
-
-
     /// Enqueue a job that fires **only after the surrounding transaction commits**.
     ///
     /// When called inside a [`Db::tx`](crate::db::Db::tx) block, the enqueue is
@@ -3886,8 +3884,6 @@ impl JobClient {
         // and concurrency metadata — including the failure-capsule tee.
         self.enqueue_due(name, payload, due_at).await
     }
-
-
 }
 
 /// Starts the background job execution runtime.

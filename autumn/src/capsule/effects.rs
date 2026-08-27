@@ -697,12 +697,7 @@ impl ReplayEffects {
             ));
         }
         if self.tenant.is_some() && !self.tenant_read.load(Ordering::SeqCst) {
-            divergences.push(unconsumed(
-                EffectSeam::Tenant,
-                0,
-                1,
-                self.tenant.clone(),
-            ));
+            divergences.push(unconsumed(EffectSeam::Tenant, 0, 1, self.tenant.clone()));
         }
         if let Ok(seam) = self.cache_writes.lock()
             && !seam.pending.is_empty()

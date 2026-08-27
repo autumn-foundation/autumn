@@ -423,8 +423,7 @@ const BODY_OVERFLOW_NOTE: &str =
 /// as empty bytes, and a handler that parses the response it recorded would
 /// then be judged on input the failing run never had — the same falsification
 /// an unrecorded *request* body already refuses to commit.
-const HTTP_BODY_SKIPPED_NOTE: &str =
-    "an outbound HTTP body exceeded `[failure_capture] max_body_bytes` and was not captured; \
+const HTTP_BODY_SKIPPED_NOTE: &str = "an outbound HTTP body exceeded `[failure_capture] max_body_bytes` and was not captured; \
      replaying would drive the handler with an empty body";
 
 /// Note recorded when a run resolved two different tenants.
@@ -789,7 +788,10 @@ impl CaptureScope {
 
     /// Complete a reserved job-enqueue slot with the backend's outcome.
     pub fn fill_job_enqueue(&self, index: usize, effect: JobEffect) {
-        let weight = effect.name.len().saturating_add(json_weight(&effect.payload));
+        let weight = effect
+            .name
+            .len()
+            .saturating_add(json_weight(&effect.payload));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.fill(|effects| &mut effects.jobs, index, effect, weight, budget);
@@ -819,16 +821,6 @@ impl CaptureScope {
         });
     }
 
-    /// Record one outbound HTTP request/response pair.
-    ///
-    /// Bodies over `max_body_bytes` are recorded as skipped rather than
-    /// copied: a capsule must not become the place a large download is
-    /// buffered.
-    #[cfg(any(test, feature = "test-support"))]
- 
-    /// Record one job enqueue the run performed.
-    #[cfg(any(test, feature = "test-support"))]
- 
     /// Record one cache read or write.
     pub fn record_cache(&self, effect: CacheEffect) {
         let weight = effect.key().len().saturating_add(match &effect {
@@ -841,9 +833,6 @@ impl CaptureScope {
         });
     }
 
-    /// Record one message handed to the mailer.
-    #[cfg(any(test, feature = "test-support"))]
- 
     /// Record the tenant context the run resolved. Later resolutions of the
     /// *same* tenant are idempotent; a different one is a second resolution
     /// the capsule cannot represent, so the capsule is marked truncated rather

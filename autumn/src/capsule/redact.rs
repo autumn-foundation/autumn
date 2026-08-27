@@ -1699,6 +1699,7 @@ mod tests {
                     name: "notify".to_owned(),
                     payload: serde_json::json!({"api_key": "sk-live-42", "order": 7}),
                     delay_secs: None,
+                    error: None,
                 }],
                 cache: vec![CacheEffect::Insert {
                     key: "creds".to_owned(),
@@ -1752,6 +1753,7 @@ mod tests {
                     // `pw` is in no filter list.
                     payload: serde_json::json!({"pw": "hunter2secret"}),
                     delay_secs: None,
+                    error: None,
                 }],
                 mail: vec![MailEffect {
                     to: vec!["hunter2secret@example.com".to_owned()],

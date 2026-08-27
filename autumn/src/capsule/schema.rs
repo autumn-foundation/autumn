@@ -823,6 +823,7 @@ mod tests {
             name: "send_receipt".to_owned(),
             payload: serde_json::json!({"order": 7}),
             delay_secs: Some(30),
+            error: None,
         });
         capsule.effects.cache.push(CacheEffect::Get {
             key: "user:7".to_owned(),

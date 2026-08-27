@@ -708,8 +708,8 @@ async fn a_capsule_from_an_incompatible_format_version_fails_loudly_not_vacuousl
     let mut capsule = bare_capsule("GET", "/charge", 500, "boom");
     capsule.format_version = 1;
     let json = serde_json::to_string(&capsule).expect("serializes");
-    let error = RegressionCase::from_json(&json)
-        .expect_err("an incompatible capsule must not load");
+    let error =
+        RegressionCase::from_json(&json).expect_err("an incompatible capsule must not load");
     let message = error.to_string();
     assert!(
         message.contains("older") && message.contains("guide"),

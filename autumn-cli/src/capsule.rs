@@ -89,9 +89,7 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
         ));
     }
 
-    let slug = opts
-        .name
-        .map_or_else(|| slugify(&capsule.id), slugify);
+    let slug = opts.name.map_or_else(|| slugify(&capsule.id), slugify);
     if slug.is_empty() {
         return Err(
             "the capsule's id has no characters usable in a test name; pass --name".to_owned(),
