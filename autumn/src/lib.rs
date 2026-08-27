@@ -325,6 +325,15 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+/// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
+///
+/// See [`ledger`] module documentation for the full API (issue #1699).
+pub mod ledger;
+pub use ledger::{
+    LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
+    LedgerRevision, LedgerVerification, LedgeredRecord,
+};
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.

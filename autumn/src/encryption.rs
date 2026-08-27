@@ -690,6 +690,49 @@ pub fn merge_encrypted_columns_for_table(table: &str, columns: &mut Vec<&'static
     }
 }
 
+/// Decrypt `table`'s encrypted columns in `value` in place, returning the names
+/// of any that could not be recovered.
+///
+/// Used by the ledger's live-row cross-check (#1699), which compares a stored
+/// revision's snapshot against a freshly encoded live row. Ciphertext is never
+/// comparable between those two encodings — randomized mode draws a fresh nonce
+/// per write, and deterministic mode is stable only while the key is — but the
+/// *plaintext underneath* is, and that is what makes a revision whose only change
+/// was to an encrypted column still visible to the cross-check.
+///
+/// Key rotation is handled by the envelope itself: each carries the `key_id` that
+/// encrypted it, so a value written under a retired key still decrypts. A column
+/// whose key is gone entirely cannot be compared at all, so it is named in the
+/// return value; the caller drops it from **both** sides rather than treating two
+/// different ciphertexts as a divergence.
+///
+/// Unlike [`decrypt_persisted_columns_in_value`], which leaves an unrecoverable
+/// value in place so model reconstruction still succeeds, this reports it: the
+/// cross-check needs to know what it could not see.
+pub fn decrypt_snapshot_columns(table: &str, value: &mut serde_json::Value) -> Vec<&'static str> {
+    let mut unrecoverable = Vec::new();
+    let Some(obj) = value.as_object_mut() else {
+        return unrecoverable;
+    };
+    for d in registered_encrypted_columns() {
+        if d.table != table {
+            continue;
+        }
+        let Some(field) = obj.get_mut(d.column) else {
+            continue;
+        };
+        let Some(envelope) = field.as_str() else {
+            continue;
+        };
+        if let Ok(plaintext) = decrypt_text(envelope) {
+            *field = serde_json::Value::String(plaintext);
+        } else {
+            unrecoverable.push(d.column);
+        }
+    }
+    unrecoverable
+}
+
 /// Rewrite a model's JSON column-values snapshot (as produced for record version
 /// history) so that columns opted into `versioned_ciphertext` carry ciphertext
 /// rather than plaintext.

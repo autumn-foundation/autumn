@@ -492,6 +492,7 @@ jobs:
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
             --test sqlite_version_history \
+            --test sqlite_ledger \
             --test sqlite_searchable_repository \
             --test sqlite_immediate_transaction \
             --test sqlite_statement_timeout_fail_closed \

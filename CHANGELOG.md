@@ -50,6 +50,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ledgered entities — time-travelable and tamper-evident by construction
+  (#1699):** mark one entity `ledgered = true` and every insert, update and
+  soft-delete appends an immutable, hash-chained revision carrying a **full row
+  snapshot** and both time axes to the app's own Postgres or SQLite. You can then
+  ask what a record looked like at any past instant (`ledger_as_of`), diff it
+  across two instants (`ledger_diff`), and prove the stored history was never
+  rewritten (`ledger_verify`) — without adopting a separate event store. The
+  marker is the only per-model change: `ledgered` implies `versioned`, so every
+  write path version history already covers appends a revision automatically,
+  hand-written handlers, generated `api = "…"` endpoints, jobs, mailers, bulk
+  saves, upserts and dependent cascades included.
+
+  Reconstruction is byte-for-byte identical to what a plain query would have
+  returned at that instant, pinned in CI against an oracle recorded live at each
+  intermediate instant, on both storage tiers. Snapshots go through the model's
+  durable per-field codec rather than serde, so `#[private]` and `#[encrypted]`
+  columns — which a model omits from its public JSON — are preserved (encrypted
+  ones as recoverable ciphertext, decrypted on the way back out), and the
+  snapshot column is `TEXT` rather than `JSONB` so the stored bytes are exactly
+  the bytes that were hashed.
+
+  Revisions are bitemporal: `recorded_at` is transaction time, `valid_from` is
+  valid time (defaulting to transaction time, or read from your own column via
+  `ledgered(valid_time = "effective_at")`), so `LedgerAsOf::bitemporal` answers
+  the auditor's question — what the database believed *then* about *then*.
+
+  Each revision embeds its predecessor's hash, and `ledger_verify` reports the
+  first broken link, distinguishing an edited row (`HashMismatch`) from one that
+  was edited and re-hashed (`PrevHashMismatch` at the next link), a deleted
+  revision (`MissingRevision`) and an inserted one (`DuplicateSeq`). Because a
+  hash chain cannot prove that nothing is missing from its *end* — a truncated
+  chain is internally perfect — `ledger_verify` also cross-checks the head
+  against the live row, which additionally catches any write that reached the
+  table without appending a revision (`LiveStateMismatch`). What remains
+  undetectable is a *consistent* rewrite by someone with table access and the
+  open-source hashing rule, so `ledger_head` exports the head hash for pinning
+  outside the database; the migration's `(table, tenant, record, seq)` unique
+  index makes a forked chain a write error rather than silent corruption.
+
+  Because a ledgered entity's history *is* the record, every way of erasing or
+  redacting it is refused at the repository seam at compile time: `ledgered`
+  without `soft_delete` does not compile, `purge` (soft-delete's raw-`DELETE`
+  escape hatch, which writes no history at all) is not generated,
+  `#[version_history(sensitive = [...])]` is rejected because a redacted column
+  could not be reconstructed, and a `dependent(..., on_delete = destroy)` cascade
+  never erases a ledgered child — from a soft-deleting parent the child follows
+  suit and records a revision, and from a hard-deleting parent the cascade is
+  refused with a typed `LedgerError::HardDeleteCascade` naming the fix (the
+  parent's macro cannot see that the child is ledgered, so this is the one guard
+  that cannot be a compile error). `restore` — the inverse of a ledgered delete — records its own revision, so
+  the ledger never silently disagrees with the table. `tenant_scoped` ledgered
+  reads fail closed across tenants, and `across_tenants()` and cross-shard ledger
+  reads are rejected rather than interleaving chains that share a record id. See
+  `docs/guide/ledgered-entities.md`.
+
 - **`autumn_web::data::csv::read_header`:** returns a CSV source's header column
   names in file order (empty for a source with no readable header). It exists so
   a caller can reject a file that is simply the WRONG FILE before importing any
