@@ -475,15 +475,23 @@ prove the build holds up under real load.
 ```toml
 # autumn.toml
 [shadow]
-enabled        = true
-target         = "http://127.0.0.1:9091"  # the candidate build you started
-sample_rate    = 0.05                     # 5 % of eligible traffic
-routes         = ["/api/*"]               # empty = every eligible route
-timeout_ms     = 2000                     # per shadow request
-max_in_flight  = 8                        # concurrent mirrors; excess is dropped
-max_body_bytes = 262144                   # larger responses are not compared
-max_records    = 50                       # divergences kept for the actuator
+enabled          = true
+target           = "http://127.0.0.1:9091"  # the candidate build you started
+sample_rate      = 0.05    # fraction of ELIGIBLE traffic. Default: 1.0 — i.e.
+                           # every eligible request. Start low.
+routes           = ["/api/*"]  # empty (default) = every eligible route
+timeout_ms       = 2000    # deadline per shadow request, and per mirrored
+                           # primary response
+max_in_flight    = 8       # concurrent mirrors; excess is dropped, never queued
+max_body_bytes   = 262144  # larger responses are not compared, on either side
+max_records      = 50      # divergences kept for the actuator
+max_sample_bytes = 2048    # per recorded JSON sample, before truncation
 ```
+
+Mirroring requires the `http-client` cargo feature (on by default). A build
+without it logs a warning at startup and mirrors nothing; `/actuator/shadow`
+then reports the configured target with `enabled: false`, so the state is
+visible rather than silent.
 
 Every key has an environment override (`AUTUMN_SHADOW__ENABLED`,
 `AUTUMN_SHADOW__TARGET`, `AUTUMN_SHADOW__SAMPLE_RATE`, …), so a shadow run can
@@ -514,6 +522,24 @@ container, another port, another machine) and point `target` at it.
   refuse writes.
 - **Actuator and probe paths are never mirrored**, so load-balancer health
   checks do not drown the candidate.
+- **Requests the live build refuses are not mirrored.** A response of `429` or
+  `503` — the statuses maintenance mode, load shedding, the request deadline,
+  and the rate limiter produce — skips the mirror entirely (counted as
+  `refused`). The candidate is under none of those pressures, so it would answer
+  normally and every request through a planned maintenance window would look
+  like a status-class divergence. The trade is that a genuine handler-produced
+  `429`/`503` divergence is not reported either.
+- **A mirror cannot outlive its deadline.** `timeout_ms` bounds the shadow
+  request *and* the wait for the mirrored primary response, so a client that
+  stops reading — or a long-lived `text/event-stream` — cannot pin an
+  `max_in_flight` slot indefinitely. Those are counted as `incomplete`.
+- **Credentials never reach a proxy.** The mirroring client disables proxy
+  autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
+  a mirrored request (carrying the end user's cookie) to a third party.
+- **Forwarding headers are not replayed.** `X-Forwarded-*`, `Forwarded`, and
+  `X-Real-IP` are stripped: this layer runs before the primary's trusted-proxy
+  policy, so forwarding them would hand the candidate a client-spoofed value
+  arriving from an address it *does* trust.
 
 ### What is compared
 
@@ -546,19 +572,33 @@ $ curl -s localhost:3000/actuator/shadow | jq
     {
       "method": "GET",
       "target": "/api/orders?page=2",
-      "route": "/api/*",
+      "route": "/api/orders",
       "occurrences": 9,
+      "first_observed_at_ms": 1756300000000,
+      "last_observed_at_ms": 1756300310000,
       "kind": "body",
       "primary_status": 200,
       "shadow_status": 200,
+      "primary_body_kind": "json", "shadow_body_kind": "json",
+      "primary_body_bytes": 118, "shadow_body_bytes": 104,
       "primary_digest": "9f2c…", "shadow_digest": "41ab…",
       "primary_sample": { "id": 7, "total": 42 },
       "shadow_sample": { "id": 7 },
       "fingerprint": "3d91a2f0c4e7b158"
     }
+  ],
+  "comparisons_by_route": [
+    { "route": "/api/orders", "label": "diverged", "count": 9 },
+    { "route": "/api/orders", "label": "match", "count": 4109 }
+  ],
+  "divergences_by_route": [
+    { "route": "/api/orders", "label": "body", "count": 9 }
   ]
 }
 ```
+
+`stats` also carries `skipped_refused` and `primary_incomplete` (see the
+outcomes below).
 
 `/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),
 like `/actuator/tasks` — the samples are excerpts of real production responses.
@@ -573,26 +613,56 @@ record from the ring.
 
 Two labelled metrics carry the same signal into your dashboards:
 
-- `autumn_shadow_comparisons_total{route, outcome}` — `outcome` is `match`,
-  `diverged`, `error`, `timeout`, `skipped`, or `dropped`.
-- `autumn_shadow_divergences_total{route, kind}` — the series to alert on; it
-  stays at zero on a clean run.
+- `autumn_shadow_comparisons_total{version, route, outcome}` — `outcome` is
+  `match`, `diverged`, `error` (the candidate could not be reached), `timeout`,
+  `skipped` (a body over the capture budget), `dropped` (the in-flight ceiling
+  was full), `refused` (the live build answered `429`/`503`), or `incomplete`
+  (the client never finished reading the primary response).
+- `autumn_shadow_divergences_total{version, route, kind}` — the series to alert
+  on; it stays at zero on a clean run.
 
-The `route` label is the **configured pattern** the request matched (`"/api/*"`),
-or `"*"` when no `routes` allowlist is set — never the raw URL, so an unbounded
-URL space cannot become unbounded metric cardinality.
+Both are **built-in families**, rendered by `/actuator/prometheus` alongside
+`autumn_http_*`; they carry the same `version` label the canary cohort metrics
+do, so a shadow run and a canary can be read on one dashboard.
+
+The `route` label is axum's **matched route template** (`"/api/orders/{id}"`),
+falling back to the configured pattern and then to `"*"`. Never the raw URL: an
+unbounded URL space must not become unbounded metric cardinality. Past 200
+distinct routes, further ones fold into `__other__`.
 
 ### PII in recorded samples
 
 Recorded samples pass through the same `[log] filter_parameters` /
 `[log] unfilter_parameters` redaction the access log, error pages, and failure
-capsules use, and encrypted column names are always filtered. Sensitive query
-parameters in the recorded request target are redacted the same way.
+capsules use, and encrypted column names are always filtered. The recorded
+request target is redacted the same way, matching on the percent-decoded
+parameter name and on each of its structural segments — so `?token=`,
+`?%74oken=`, `?auth[access_token]=` and `?filter.password=` are all caught.
 
 Only **JSON** bodies are sampled. A JSON body has named keys the filter can
 reason about; an HTML or binary body does not, so for those Autumn records the
-digest, the byte length, and the content type — enough to prove the builds
-disagree, without an excerpt no redaction rule could vet.
+digest, the byte length, and how the body was normalized — enough to prove the
+builds disagree, without an excerpt no redaction rule could vet.
+
+**Know what that redaction is and is not.** It is a *key-name allowlist*: a JSON
+field is replaced only when its name matches `[log] filter_parameters` (whose
+defaults are `password`, `token`, `secret`, `api_key`, `ssn`, `credit_card`, and
+a handful more). Every other field of the response body is recorded verbatim —
+`email`, `phone`, `address`, `balance`, `csrf_token`, a top-level JSON string.
+This is a category of data no other Autumn surface writes down, so before
+enabling `[shadow]` on a route that returns personal data:
+
+- scope `routes` to endpoints whose bodies you are willing to see in
+  `/actuator/shadow`,
+- extend `[log] filter_parameters` with the field names those endpoints return,
+- and keep `[actuator] sensitive = false` anywhere the endpoint could be reached
+  by someone who should not read production responses.
+
+The recorded request target and the samples are published **only** on the
+sensitive actuator endpoint. The `WARN` log line for a divergence deliberately
+carries just the route, the kind, and the fingerprint — never the target or a
+sample — and is emitted once per distinct divergence rather than once per
+occurrence.
 
 ### ⚠️ Before you turn this on
 
@@ -602,9 +672,16 @@ disagree, without an excerpt no redaction rule could vet.
   the shadow target as exactly as trusted as production.
 - **The candidate's own side effects are real.** Autumn guarantees the mirror
   does not touch *primary* state. It cannot stop the candidate from writing to a
-  database you pointed it at. Run the candidate against a scratch database, a
-  read-only replica, or with writes disabled — the `X-Autumn-Shadow: 1` header
-  on every mirrored request is the hook for that.
+  database you pointed it at. Contain it by **environment** — a scratch
+  database, a read-only replica, a build with writes disabled.
+- **`X-Autumn-Shadow` is a convenience signal, not a security boundary.** It is
+  an ordinary request header, so anything that can reach your app can set it.
+  Using it inside the candidate to skip writes is fine *as a second line*; using
+  it as the only thing standing between mirrored traffic and your production
+  database is not, and on the primary it would be a client-controlled kill
+  switch for whatever you gated on it. (A client that sets it on production
+  traffic also opts that request out of being mirrored, which is the header's
+  loop guard doing its job.)
 - **Mirroring is extra load** on the candidate and on this process's outbound
   connections. Start at a low `sample_rate` and a narrow `routes` allowlist.
 - **Expect benign divergences.** Timestamps, generated ids, and CSRF tokens in a

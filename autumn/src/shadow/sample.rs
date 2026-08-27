@@ -60,9 +60,13 @@ const ALL_ROUTES_LABEL: &str = "*";
 
 /// Why a request was not mirrored.
 ///
-/// Each variant is a metric label value, so an operator can see at a glance
-/// whether their mirror is quiet because nothing matched, because the sample
-/// rate is low, or because they pointed it at itself.
+/// Emitted on the mirror layer's `TRACE` stream (target `autumn::shadow`), so
+/// an operator debugging a quiet mirror can see whether it is quiet because
+/// nothing matched, because the sample rate is low, or because they pointed it
+/// at itself. Deliberately not a metric: this fires on every inbound request
+/// while mirroring is enabled, and a labelled counter increment on the
+/// not-mirrored path is a cost every request would pay to report a
+/// configuration fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
     /// Not a [`MIRRORABLE_METHODS`] method.
@@ -78,7 +82,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    /// Stable snake_case name for metrics and diagnostics.
+    /// Stable `snake_case` name for diagnostics.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -210,13 +214,15 @@ impl MirrorSelector {
         }
     }
 
-    /// The bounded metric label for a path: the configured pattern it matched,
-    /// or [`ALL_ROUTES_LABEL`] when no allowlist is configured.
+    /// The bounded label for a path: the configured pattern it matched, or
+    /// [`ALL_ROUTES_LABEL`] when no allowlist is configured.
     ///
-    /// Never the raw path. A global tower layer runs outside axum's route
-    /// matching, so [`axum::extract::MatchedPath`] is not available here; using
-    /// the URL itself would let an unbounded URL space become unbounded metric
-    /// cardinality.
+    /// This is the **fallback**. The mirror layer prefers
+    /// [`axum::extract::MatchedPath`], which is a genuinely informative route
+    /// template and is available to it (`Router::layer` wraps each route's
+    /// service, so routing has already run); this covers the cases where no
+    /// route matched. Never the raw path either way — an unbounded URL space
+    /// must not become unbounded metric cardinality.
     #[must_use]
     pub fn route_label(&self, target: &str) -> &str {
         let path = path_of(target);

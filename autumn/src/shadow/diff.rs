@@ -384,25 +384,51 @@ fn fingerprint(
 
 /// Build the recorded excerpt for one side, or `None` when the body is not
 /// JSON (see the module docs on why non-JSON bodies are not sampled).
+///
+/// `sample_limit` is a budget in **bytes** of the serialized form, matching the
+/// `shadow.max_sample_bytes` config key: counting characters instead would let
+/// a body of multi-byte text store up to four times the nominal budget.
 fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) -> Option<Value> {
     let NormalizedBody::Json(value) = body else {
         return None;
     };
     let scrubbed = filter.scrub_json(value);
     let rendered = serde_json::to_string(&scrubbed).unwrap_or_default();
-    if rendered.chars().count() <= sample_limit {
+    if rendered.len() <= sample_limit {
         return Some(scrubbed);
     }
-    let mut truncated: String = rendered.chars().take(sample_limit).collect();
+    // Cut on a character boundary at or below the budget, so the excerpt is
+    // still valid UTF-8 and never exceeds what the operator asked for.
+    let cut = rendered
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= sample_limit)
+        .last()
+        .unwrap_or(0);
+    let mut truncated = String::with_capacity(cut.saturating_add(TRUNCATION_MARKER.len()));
+    truncated.push_str(rendered.get(..cut).unwrap_or_default());
     truncated.push_str(TRUNCATION_MARKER);
     Some(Value::String(truncated))
 }
 
 /// Redact a request target (`/path?query`) for recording.
 ///
-/// The path is kept verbatim — it is a route, not user data — while each query
-/// parameter whose name the filter matches is replaced with the filter's
-/// placeholder. Parameter order is preserved so the result stays deterministic.
+/// Each query parameter whose name the filter matches is replaced with the
+/// filter's placeholder; parameter order is preserved so the result stays
+/// deterministic.
+///
+/// Matching is done on the **percent-decoded** name and on each of its
+/// structural segments, mirroring how failure capsules redact a captured URL.
+/// Both matter: `?%74oken=…` hides a filtered name behind an encoding, and
+/// `?auth[access_token]=…` / `?filter.password=…` hide it inside a nested key
+/// that whole-string matching would miss. A parameter with no `=` is treated as
+/// a bare name and redacted to the placeholder when it matches, since
+/// `?SECRETVALUE`-style targets carry the secret in the name position.
+///
+/// The path itself is kept verbatim. It is the route, which is what makes a
+/// record actionable — but a path *can* carry user data
+/// (`/password-reset/{token}`), so the recorded target is only ever published
+/// on the sensitive actuator endpoint, never in the ordinary log stream.
 #[must_use]
 pub fn redact_path_and_query(target: &str, filter: &ParameterFilter) -> String {
     let Some((path, query)) = target.split_once('?') else {
@@ -411,13 +437,66 @@ pub fn redact_path_and_query(target: &str, filter: &ParameterFilter) -> String {
     let redacted: Vec<String> = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((key, _)) if filter.matches_key(key) => {
+            Some((key, _)) if key_is_filtered(key, filter) => {
                 format!("{key}={}", crate::log::filter::FILTERED_PLACEHOLDER)
+            }
+            None if !pair.is_empty() && key_is_filtered(pair, filter) => {
+                crate::log::filter::FILTERED_PLACEHOLDER.to_owned()
             }
             _ => pair.to_owned(),
         })
         .collect();
     format!("{path}?{}", redacted.join("&"))
+}
+
+/// Whether a raw query-parameter name should be filtered.
+///
+/// Checks the name as written, its percent-decoded form, and every structural
+/// segment of that decoded form (`a[b]` and `a.b` both yield `a` and `b`).
+fn key_is_filtered(raw_key: &str, filter: &ParameterFilter) -> bool {
+    if filter.matches_key(raw_key) {
+        return true;
+    }
+    let decoded = percent_decode(raw_key);
+    if filter.matches_key(&decoded) {
+        return true;
+    }
+    decoded
+        .split(['[', ']', '.'])
+        .any(|segment| !segment.is_empty() && filter.matches_key(segment))
+}
+
+/// Percent-decode a query-parameter name, treating `+` as a space.
+///
+/// Undecodable bytes are passed through as written: this feeds a filter-name
+/// comparison, so a best-effort decode that never fails is the right shape.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.replace('+', " ").into_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'%'
+            && let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2))
+            && let (Some(high), Some(low)) = (hex_value(*high), hex_value(*low))
+        {
+            out.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        out.push(*byte);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The numeric value of one ASCII hex digit.
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -564,18 +643,99 @@ mod tests {
     }
 
     #[test]
-    fn oversized_samples_are_truncated() {
+    fn oversized_samples_are_truncated_to_the_byte_budget() {
         let filter = ParameterFilter::default();
         let big = format!(r#"{{"blob":"{}"}}"#, "x".repeat(4096));
         let Comparison::Diverged(d) = compare(&json(200, &big), &json(200, "{}"), &filter, 64)
         else {
             panic!("expected divergence");
         };
-        let rendered = serde_json::to_string(&d.primary_sample).unwrap();
+        let Some(Value::String(sample)) = d.primary_sample else {
+            panic!("a truncated sample is recorded as a string");
+        };
+        assert!(sample.ends_with(TRUNCATION_MARKER), "{sample}");
+        let body = sample.strip_suffix(TRUNCATION_MARKER).expect("marker");
         assert!(
-            rendered.len() < 512,
-            "sample must be truncated: {}",
-            rendered.len()
+            body.len() <= 64,
+            "sample body is {} bytes, budget was 64",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn the_sample_budget_is_bytes_not_characters() {
+        let filter = ParameterFilter::default();
+        // Each `€` is three UTF-8 bytes. Counting characters would let this
+        // store roughly three times the operator's nominal budget.
+        let wide = format!(r#"{{"note":"{}"}}"#, "€".repeat(200));
+        let Comparison::Diverged(d) = compare(&json(200, &wide), &json(200, "{}"), &filter, 64)
+        else {
+            panic!("expected divergence");
+        };
+        let Some(Value::String(sample)) = d.primary_sample else {
+            panic!("a truncated sample is recorded as a string");
+        };
+        let body = sample.strip_suffix(TRUNCATION_MARKER).expect("marker");
+        assert!(body.len() <= 64, "{} bytes exceeds the budget", body.len());
+    }
+
+    #[test]
+    fn both_samples_are_redacted_not_just_the_primary() {
+        let filter = ParameterFilter::default();
+        let a = json(200, r#"{"id":1,"password":"hunter2","total":1}"#);
+        let b = json(200, r#"{"id":2,"password":"hunter2"}"#);
+        let Comparison::Diverged(d) = compare(&a, &b, &filter, 2048) else {
+            panic!("expected divergence");
+        };
+        for (side, sample) in [("primary", &d.primary_sample), ("shadow", &d.shadow_sample)] {
+            let rendered = serde_json::to_string(sample).unwrap();
+            assert!(
+                !rendered.contains("hunter2"),
+                "{side} sample leaked a filtered value: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_sees_through_percent_encoded_parameter_names() {
+        let filter = ParameterFilter::default();
+        assert_eq!(
+            redact_path_and_query("/x?%74oken=abc123", &filter),
+            "/x?%74oken=[FILTERED]"
+        );
+    }
+
+    #[test]
+    fn redaction_sees_into_nested_parameter_names() {
+        let filter = ParameterFilter::default();
+        for (raw, expected) in [
+            (
+                "/x?auth[access_token]=s",
+                "/x?auth[access_token]=[FILTERED]",
+            ),
+            ("/x?filter.password=s", "/x?filter.password=[FILTERED]"),
+            ("/x?auth%5Bapi_key%5D=s", "/x?auth%5Bapi_key%5D=[FILTERED]"),
+        ] {
+            assert_eq!(redact_path_and_query(raw, &filter), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_valueless_parameter_that_names_a_secret_is_redacted() {
+        let filter = ParameterFilter::default();
+        assert_eq!(
+            redact_path_and_query("/reset?token", &filter),
+            "/reset?[FILTERED]"
+        );
+        assert_eq!(redact_path_and_query("/list?debug", &filter), "/list?debug");
+    }
+
+    #[test]
+    fn redaction_preserves_unrelated_parameters_and_their_order() {
+        let filter = ParameterFilter::default();
+        assert_eq!(
+            redact_path_and_query("/x?a=1&token=t&b=2", &filter),
+            "/x?a=1&token=[FILTERED]&b=2"
         );
     }
 

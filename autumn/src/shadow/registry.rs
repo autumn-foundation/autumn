@@ -16,6 +16,24 @@
 //!   clock in here, so the whole recording path stays a pure function of its
 //!   inputs and a captured request replays to a byte-identical record.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -46,6 +64,17 @@ pub struct ShadowStats {
     /// Mirrored requests not compared because a response body exceeded
     /// `shadow.max_body_bytes`.
     pub skipped_oversize: u64,
+    /// Mirrors not dispatched because the live build answered with an
+    /// admission-control status (`429`/`503`) — see the mirror layer's
+    /// `ADMISSION_CONTROL_STATUSES`. Diffing those against a candidate under
+    /// none of the same pressure reports a divergence every time.
+    pub skipped_refused: u64,
+    /// Mirrored requests whose primary response never completed within the
+    /// deadline — the client disconnected, stopped reading, or the response was
+    /// a long-lived stream. Counted so `mirrored` always accounts for itself:
+    /// without this an operator sees `mirrored` far exceed every other counter
+    /// with nothing explaining the gap.
+    pub primary_incomplete: u64,
 }
 
 /// The request a divergence was observed on.
@@ -82,6 +111,62 @@ pub struct DivergenceRecord {
     pub divergence: Divergence,
 }
 
+/// Ceiling on the number of distinct route labels the per-route series retain.
+///
+/// The route label is already bounded — it is a matched route template or a
+/// configured pattern, never a raw URL — but an app with thousands of route
+/// templates would still make a scrape enormous. Past this many routes, further
+/// ones fold into [`OVERFLOW_ROUTE_LABEL`] so the series set stays bounded and
+/// the overflow is visible rather than silent.
+const MAX_ROUTE_SERIES: usize = 200;
+
+/// Route label every route past [`MAX_ROUTE_SERIES`] is folded into.
+pub const OVERFLOW_ROUTE_LABEL: &str = "__other__";
+
+/// One `{route, outcome}` (or `{route, kind}`) counter series.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LabelledCount {
+    /// The bounded route label.
+    pub route: String,
+    /// The second dimension: a comparison outcome, or a divergence kind.
+    pub label: String,
+    /// Occurrences.
+    pub count: u64,
+}
+
+/// Per-route counter series, bounded by [`MAX_ROUTE_SERIES`] distinct routes.
+#[derive(Debug, Default)]
+struct LabelledSeries {
+    counts: std::collections::BTreeMap<(String, String), u64>,
+    routes: std::collections::BTreeSet<String>,
+}
+
+impl LabelledSeries {
+    fn record(&mut self, route: &str, label: &str) {
+        let route = if self.routes.contains(route) {
+            route.to_owned()
+        } else if self.routes.len() < MAX_ROUTE_SERIES {
+            self.routes.insert(route.to_owned());
+            route.to_owned()
+        } else {
+            OVERFLOW_ROUTE_LABEL.to_owned()
+        };
+        let entry = self.counts.entry((route, label.to_owned())).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> Vec<LabelledCount> {
+        self.counts
+            .iter()
+            .map(|((route, label), count)| LabelledCount {
+                route: route.clone(),
+                label: label.clone(),
+                count: *count,
+            })
+            .collect()
+    }
+}
+
 /// Everything `{actuator-prefix}/shadow` publishes.
 #[derive(Clone, Debug, Serialize)]
 pub struct ShadowSnapshot {
@@ -92,8 +177,40 @@ pub struct ShadowSnapshot {
     pub target: Option<String>,
     /// Aggregate counters.
     pub stats: ShadowStats,
+    /// Per-`{route, outcome}` comparison counts — the series
+    /// `autumn_shadow_comparisons_total` is scraped from.
+    pub comparisons_by_route: Vec<LabelledCount>,
+    /// Per-`{route, kind}` divergence counts — the series
+    /// `autumn_shadow_divergences_total` is scraped from.
+    pub divergences_by_route: Vec<LabelledCount>,
     /// Most recent distinct divergences, oldest first.
     pub divergences: Vec<DivergenceRecord>,
+}
+
+/// What [`ShadowRegistry::record_comparison`] did with a comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recorded {
+    /// The two builds agreed; nothing was stored.
+    Match,
+    /// A divergence not previously seen on this route, now stored.
+    NewDivergence(Box<Divergence>),
+    /// A divergence already in the ring; its occurrence count moved.
+    RepeatDivergence,
+}
+
+impl ShadowSnapshot {
+    /// The payload a replica with no mirror publishes.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            target: None,
+            stats: ShadowStats::default(),
+            comparisons_by_route: Vec::new(),
+            divergences_by_route: Vec::new(),
+            divergences: Vec::new(),
+        }
+    }
 }
 
 /// Shared, cheaply cloneable shadow-run state.
@@ -101,6 +218,8 @@ pub struct ShadowSnapshot {
 pub struct ShadowRegistry {
     counters: Arc<Counters>,
     records: Arc<RwLock<VecDeque<DivergenceRecord>>>,
+    comparisons_by_route: Arc<RwLock<LabelledSeries>>,
+    divergences_by_route: Arc<RwLock<LabelledSeries>>,
     max_records: usize,
 }
 
@@ -114,6 +233,8 @@ struct Counters {
     shadow_timeouts: AtomicU64,
     dropped_at_capacity: AtomicU64,
     skipped_oversize: AtomicU64,
+    skipped_refused: AtomicU64,
+    primary_incomplete: AtomicU64,
 }
 
 /// Saturating increment: a long-lived replica must not wrap a counter back to
@@ -135,8 +256,47 @@ impl ShadowRegistry {
         Self {
             counters: Arc::new(Counters::default()),
             records: Arc::new(RwLock::new(VecDeque::new())),
+            comparisons_by_route: Arc::new(RwLock::new(LabelledSeries::default())),
+            divergences_by_route: Arc::new(RwLock::new(LabelledSeries::default())),
             max_records: max_records.max(1),
         }
+    }
+
+    /// Record one `{route, outcome}` comparison result.
+    ///
+    /// This is what `autumn_shadow_comparisons_total` is scraped from. It lives
+    /// here rather than going through [`crate::metrics::counter`] because that
+    /// facade — correctly — refuses the `autumn_` namespace, which belongs to
+    /// the framework's built-in families.
+    pub fn record_outcome(&self, route: &str, outcome: &str) {
+        if let Ok(mut series) = self.comparisons_by_route.write() {
+            series.record(route, outcome);
+        }
+    }
+
+    /// Record one `{route, kind}` divergence.
+    pub fn record_divergence_kind(&self, route: &str, kind: &str) {
+        if let Ok(mut series) = self.divergences_by_route.write() {
+            series.record(route, kind);
+        }
+    }
+
+    /// The per-`{route, outcome}` comparison series.
+    #[must_use]
+    pub fn comparisons_by_route(&self) -> Vec<LabelledCount> {
+        self.comparisons_by_route
+            .read()
+            .map(|series| series.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// The per-`{route, kind}` divergence series.
+    #[must_use]
+    pub fn divergences_by_route(&self) -> Vec<LabelledCount> {
+        self.divergences_by_route
+            .read()
+            .map(|series| series.snapshot())
+            .unwrap_or_default()
     }
 
     /// Count a request selected for mirroring.
@@ -164,18 +324,32 @@ impl ShadowRegistry {
         bump(&self.counters.skipped_oversize);
     }
 
+    /// Count a mirror not dispatched because the live build refused the request.
+    pub fn record_skipped_refused(&self) {
+        bump(&self.counters.skipped_refused);
+    }
+
+    /// Count a mirrored request whose primary response never completed.
+    pub fn record_primary_incomplete(&self) {
+        bump(&self.counters.primary_incomplete);
+    }
+
     /// Record the outcome of one comparison, observed at `observed_at_ms`.
+    ///
+    /// The return value distinguishes a divergence seen for the first time from
+    /// a repeat, so the caller can log once per distinct problem rather than
+    /// once per request.
     pub fn record_comparison(
         &self,
         context: &RequestContext,
         comparison: Comparison,
         observed_at_ms: u64,
-    ) {
+    ) -> Recorded {
         bump(&self.counters.compared);
         let divergence = match comparison {
             Comparison::Match => {
                 bump(&self.counters.matched);
-                return;
+                return Recorded::Match;
             }
             Comparison::Diverged(divergence) => *divergence,
         };
@@ -186,15 +360,21 @@ impl ShadowRegistry {
             // it. The counters above still tell the operator divergences are
             // happening; losing the sample is strictly better than propagating
             // a panic into a detached mirror task.
-            return;
+            return Recorded::RepeatDivergence;
         };
-        if let Some(existing) = records
-            .iter_mut()
-            .find(|record| record.divergence.fingerprint == divergence.fingerprint)
-        {
+        // Keyed on (route, fingerprint), not the fingerprint alone. The
+        // fingerprint is content-addressed over the two responses only, so two
+        // DIFFERENT routes that happen to answer identically — say a candidate
+        // that 500s with one generic error body everywhere — would otherwise
+        // collapse onto a single record attributed to whichever route was seen
+        // first, and the operator would fix one route believing it was the only
+        // one broken.
+        if let Some(existing) = records.iter_mut().find(|record| {
+            record.divergence.fingerprint == divergence.fingerprint && record.route == context.route
+        }) {
             existing.occurrences = existing.occurrences.saturating_add(1);
             existing.last_observed_at_ms = observed_at_ms;
-            return;
+            return Recorded::RepeatDivergence;
         }
         while records.len() >= self.max_records {
             records.pop_front();
@@ -206,8 +386,9 @@ impl ShadowRegistry {
             occurrences: 1,
             first_observed_at_ms: observed_at_ms,
             last_observed_at_ms: observed_at_ms,
-            divergence,
+            divergence: divergence.clone(),
         });
+        Recorded::NewDivergence(Box::new(divergence))
     }
 
     /// Current counters.
@@ -222,6 +403,8 @@ impl ShadowRegistry {
             shadow_timeouts: self.counters.shadow_timeouts.load(Ordering::Relaxed),
             dropped_at_capacity: self.counters.dropped_at_capacity.load(Ordering::Relaxed),
             skipped_oversize: self.counters.skipped_oversize.load(Ordering::Relaxed),
+            skipped_refused: self.counters.skipped_refused.load(Ordering::Relaxed),
+            primary_incomplete: self.counters.primary_incomplete.load(Ordering::Relaxed),
         }
     }
 
@@ -241,6 +424,8 @@ impl ShadowRegistry {
             enabled,
             target: target.map(ToOwned::to_owned),
             stats: self.stats(),
+            comparisons_by_route: self.comparisons_by_route(),
+            divergences_by_route: self.divergences_by_route(),
             divergences: self.recent(),
         }
     }
@@ -359,6 +544,51 @@ mod tests {
     }
 
     #[test]
+    fn identical_divergences_on_different_routes_stay_separate() {
+        // The fingerprint is content-addressed over the two responses only, so
+        // a candidate that 500s with one generic body everywhere produces the
+        // same fingerprint on every route. Collapsing those would attribute one
+        // record to whichever route happened to be seen first, and the operator
+        // would fix one route believing it was the only one broken.
+        let registry = ShadowRegistry::new(10);
+        for route in ["/api/orders", "/api/users"] {
+            let context = RequestContext {
+                method: "GET".to_owned(),
+                target: route.to_owned(),
+                route: route.to_owned(),
+            };
+            registry.record_comparison(&context, diverging("{\"a\":1}", "{}"), 1_000);
+        }
+        let recent = registry.recent();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].route, "/api/orders");
+        assert_eq!(recent[1].route, "/api/users");
+        // ...and the same route still collapses.
+        assert_eq!(
+            recent[0].divergence.fingerprint,
+            recent[1].divergence.fingerprint
+        );
+    }
+
+    #[test]
+    fn recording_reports_whether_a_divergence_was_new() {
+        let registry = ShadowRegistry::new(10);
+        assert_eq!(
+            registry.record_comparison(&context(), diverging("{\"a\":1}", "{\"a\":1}"), 1_000),
+            Recorded::Match
+        );
+        let first = registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 1_000);
+        assert!(
+            matches!(first, Recorded::NewDivergence(_)),
+            "the first sighting must be reported as new so the layer logs once"
+        );
+        assert_eq!(
+            registry.record_comparison(&context(), diverging("{\"a\":1}", "{}"), 2_000),
+            Recorded::RepeatDivergence
+        );
+    }
+
+    #[test]
     fn operational_counters_move_independently() {
         let registry = ShadowRegistry::new(10);
         registry.record_mirrored();
@@ -367,7 +597,11 @@ mod tests {
         registry.record_shadow_error();
         registry.record_shadow_timeout();
         registry.record_skipped_oversize();
+        registry.record_skipped_refused();
+        registry.record_primary_incomplete();
         let stats = registry.stats();
+        assert_eq!(stats.skipped_refused, 1);
+        assert_eq!(stats.primary_incomplete, 1);
         assert_eq!(stats.mirrored, 2);
         assert_eq!(stats.dropped_at_capacity, 1);
         assert_eq!(stats.shadow_errors, 1);

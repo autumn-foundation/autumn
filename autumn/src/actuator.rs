@@ -2723,7 +2723,7 @@ pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_to
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 21] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -2751,6 +2751,8 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 21] = [
     "autumn_cache_read_through_stale_serves_total",
     "autumn_cache_fill_lock_acquires_total",
     "autumn_cache_fill_lock_contended_total",
+    crate::shadow::COMPARISONS_METRIC,
+    crate::shadow::DIVERGENCES_METRIC,
 ];
 
 /// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
@@ -3097,6 +3099,55 @@ fn write_builtin_cache_metrics(
     }
 }
 
+/// Render the shadow-mirroring families (issue #1653) into `out`.
+///
+/// Written as built-in families rather than through the [`crate::metrics`]
+/// facade because that facade reserves the `autumn_` namespace for exactly
+/// these — a framework family registered through it would be silently inert.
+///
+/// A replica with no mirror writes nothing at all, so the families stay absent
+/// from the scrape until an operator turns mirroring on. Route labels are
+/// bounded by the registry (see its `MAX_ROUTE_SERIES`), and both label values
+/// are escaped defensively: the route can come from an app's own route
+/// template.
+fn write_builtin_shadow_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::shadow::ShadowSnapshot,
+) {
+    use std::fmt::Write;
+
+    for (name, help, label_name, series) in [
+        (
+            crate::shadow::COMPARISONS_METRIC,
+            "Mirrored requests by route and comparison outcome",
+            "outcome",
+            &snapshot.comparisons_by_route,
+        ),
+        (
+            crate::shadow::DIVERGENCES_METRIC,
+            "Primary/shadow response divergences by route and kind",
+            "kind",
+            &snapshot.divergences_by_route,
+        ),
+    ] {
+        if series.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        for entry in series.iter() {
+            let route = escape_prometheus_label_value(&entry.route);
+            let label = escape_prometheus_label_value(&entry.label);
+            let _ = writeln!(
+                out,
+                "{name}{{version=\"{version}\",route=\"{route}\",{label_name}=\"{label}\"}} {}",
+                entry.count
+            );
+        }
+    }
+}
+
 /// Render the app-defined [`crate::metrics`] facade instruments into `out`.
 ///
 /// Every family name written here is inserted into `emitted_families` —
@@ -3264,6 +3315,9 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         &version,
         &crate::cache::read_through_metrics().snapshot(),
     );
+    if let Some(handle) = state.shadow() {
+        write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
+    }
 
     // Name ownership, in precedence order: built-in families first, then the
     // app-metrics facade, then plugin-contributed sources — so neither the

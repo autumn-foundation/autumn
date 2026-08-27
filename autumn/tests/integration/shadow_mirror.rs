@@ -145,15 +145,19 @@ fn mirroring_config(target: SocketAddr) -> AutumnConfig {
     config
 }
 
-/// Poll `condition` every 10 ms for up to ~5 s. Mirroring runs on a detached
-/// task by design, so tests observe its effects rather than awaiting it.
-async fn settle(mut condition: impl FnMut() -> bool) {
-    for _ in 0..500 {
+/// Poll `condition` every 10 ms until it holds, or fail the test naming it.
+///
+/// Mirroring runs on a detached task by design, so tests observe its effects
+/// rather than awaiting it. Failing loudly on exhaustion keeps "the mirror
+/// never ran" from surfacing as a confusing assertion three lines later.
+async fn settle(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..1_000 {
         if condition() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    panic!("timed out after 10s waiting for: {what}");
 }
 
 fn stats(app: &TestClient) -> autumn_web::shadow::ShadowStats {
@@ -187,7 +191,11 @@ async fn a_seeded_regression_is_flagged_and_clean_routes_stay_clean() {
         app.get("/api/status").send().await.assert_status(200);
     }
 
-    settle(|| stats(&app).compared >= 10).await;
+    settle("all ten comparisons to be recorded", || {
+        let stats = stats(&app);
+        stats.matched + stats.diverged >= 10
+    })
+    .await;
     let stats = stats(&app);
     assert_eq!(stats.mirrored, 10);
     assert_eq!(stats.compared, 10, "every mirror must reach the differ");
@@ -200,6 +208,10 @@ async fn a_seeded_regression_is_flagged_and_clean_routes_stay_clean() {
 
     // One record, not five: the same divergence collapses by fingerprint.
     let handle = app.state().shadow().expect("mirror handle");
+    settle("the divergence record to land", || {
+        !handle.registry.recent().is_empty()
+    })
+    .await;
     let records = handle.registry.recent();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].target, "/api/orders");
@@ -244,8 +256,12 @@ async fn mutating_requests_are_never_replayed_against_the_candidate() {
     // not a false negative from a dead mirror.
     app.get("/api/orders").send().await.assert_status(200);
 
-    settle(|| stats(&app).compared >= 1).await;
+    settle("the comparison to be recorded", || {
+        stats(&app).compared >= 1
+    })
+    .await;
     let seen = candidate.seen();
+    assert_eq!(seen.len(), 1, "only the GET may be mirrored: {seen:?}");
     assert!(
         seen.iter().all(|(method, _, _)| method == "GET"),
         "a mutating method reached the candidate: {seen:?}"
@@ -269,7 +285,10 @@ async fn the_client_sees_identical_bytes_with_and_without_mirroring() {
 
     assert_eq!(plain_body, mirrored_body);
 
-    settle(|| stats(&mirrored).compared >= 1).await;
+    settle("the comparison to be recorded", || {
+        stats(&mirrored).compared >= 1
+    })
+    .await;
     assert_eq!(stats(&mirrored).diverged, 1, "and it still diffed");
 }
 
@@ -286,7 +305,7 @@ async fn the_primary_handler_runs_exactly_once_per_client_request() {
         .send()
         .await
         .assert_status(200);
-    settle(|| stats(&app).mirrored >= 1).await;
+    settle("the mirror to be dispatched", || stats(&app).mirrored >= 1).await;
     let after = COUNTED_ORDER_CALLS.load(Ordering::SeqCst);
 
     assert_eq!(
@@ -305,7 +324,15 @@ async fn the_actuator_endpoint_reports_the_mirror_run() {
         .build();
 
     app.get("/api/orders").send().await.assert_status(200);
-    settle(|| stats(&app).diverged >= 1).await;
+    settle("the divergence to be recorded", || {
+        !app.state()
+            .shadow()
+            .expect("mirror handle")
+            .registry
+            .recent()
+            .is_empty()
+    })
+    .await;
 
     let response = app.get("/actuator/shadow").send().await;
     response.assert_status(200);
@@ -358,7 +385,10 @@ async fn actuator_paths_that_would_amplify_the_candidate_are_never_mirrored() {
     // A real request afterwards, so we can wait on a definite signal rather
     // than on the absence of one.
     app.get("/api/orders").send().await.assert_status(200);
-    settle(|| stats(&app).compared >= 1).await;
+    settle("the comparison to be recorded", || {
+        stats(&app).compared >= 1
+    })
+    .await;
 
     let seen = candidate.seen();
     assert_eq!(
@@ -373,6 +403,205 @@ async fn actuator_paths_that_would_amplify_the_candidate_are_never_mirrored() {
 #[get("/api/huge")]
 async fn live_huge() -> String {
     "x".repeat(512 * 1024)
+}
+
+#[tokio::test]
+async fn a_compressed_response_still_diffs_clean_against_the_candidate() {
+    // The mirror layer must stay INNER to the compression layer: it tees the
+    // handler's own bytes, which is what the candidate returns too. If it ever
+    // moved outside, it would tee a gzip-encoded body, diff it against the
+    // candidate's plain one, and report every single route as divergent. This
+    // control route is byte-identical on both builds, so any divergence here is
+    // that regression. (`accept-encoding` is also stripped from the mirrored
+    // request, so the candidate answers uncompressed either way.)
+    let (addr, _candidate) = spawn_candidate().await;
+    let app = TestApp::new()
+        .config(mirroring_config(addr))
+        .routes(routes![live_status])
+        .build();
+
+    for _ in 0..3 {
+        let response = app
+            .get("/api/status")
+            .header("accept-encoding", "gzip, br")
+            .send()
+            .await;
+        response.assert_status(200);
+    }
+
+    settle("all three comparisons to be recorded", || {
+        let stats = stats(&app);
+        stats.matched + stats.diverged >= 3
+    })
+    .await;
+    let stats = stats(&app);
+    assert_eq!(stats.matched, 3);
+    assert_eq!(
+        stats.diverged, 0,
+        "a compressed response must not manufacture a divergence"
+    );
+}
+
+#[tokio::test]
+async fn a_request_carrying_the_loop_guard_is_never_mirrored_again() {
+    // This is what stops a shadow target pointed at the app itself from turning
+    // one client request into 2, then 4, then 8: a request that already carries
+    // the guard is not eligible. Driven through the whole ingress stack, not
+    // just the selector.
+    let (addr, candidate) = spawn_candidate().await;
+    let app = TestApp::new()
+        .config(mirroring_config(addr))
+        .routes(routes![live_orders])
+        .build();
+
+    for _ in 0..3 {
+        app.get("/api/orders")
+            .header(SHADOW_HEADER, "1")
+            .send()
+            .await
+            .assert_status(200);
+    }
+    // An ordinary request afterwards, so we wait on a definite signal rather
+    // than on the absence of one.
+    app.get("/api/orders").send().await.assert_status(200);
+    settle("the unguarded request to reach the candidate", || {
+        !candidate.seen().is_empty()
+    })
+    .await;
+
+    assert_eq!(
+        stats(&app).mirrored,
+        1,
+        "only the request without the guard may be mirrored"
+    );
+    assert_eq!(candidate.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn the_route_allowlist_and_sample_rate_reach_the_layer() {
+    // Proves `build_shadow_layer` actually threads `shadow.routes` and
+    // `shadow.sample_rate` through, rather than hard-coding "everything".
+    let (addr, candidate) = spawn_candidate().await;
+    let mut config = mirroring_config(addr);
+    config.shadow.routes = vec!["/api/status".to_owned()];
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders, live_status])
+        .build();
+
+    app.get("/api/orders").send().await.assert_status(200);
+    app.get("/api/status").send().await.assert_status(200);
+
+    settle("the allowlisted route to reach the candidate", || {
+        !candidate.seen().is_empty()
+    })
+    .await;
+    let seen = candidate.seen();
+    assert_eq!(seen.len(), 1, "only the allowlisted route: {seen:?}");
+    assert_eq!(seen[0].1, "/api/status");
+}
+
+#[tokio::test]
+async fn a_zero_sample_rate_mirrors_nothing() {
+    let (addr, candidate) = spawn_candidate().await;
+    let mut config = mirroring_config(addr);
+    config.shadow.sample_rate = 0.0;
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders])
+        .build();
+
+    for _ in 0..5 {
+        app.get("/api/orders").send().await.assert_status(200);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(stats(&app).mirrored, 0);
+    assert!(candidate.seen().is_empty());
+}
+
+#[tokio::test]
+async fn the_shadow_endpoint_is_gated_behind_sensitive_actuator() {
+    // The payload holds redacted excerpts of real production responses, so it
+    // must not be reachable on a replica that has sensitive surfaces closed.
+    let (addr, _candidate) = spawn_candidate().await;
+    let mut config = mirroring_config(addr);
+    config.actuator.sensitive = false;
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders])
+        .build();
+
+    app.get("/api/orders").send().await.assert_status(200);
+    app.get("/actuator/shadow").send().await.assert_status(404);
+}
+
+#[tokio::test]
+async fn a_divergence_is_reported_as_a_labelled_metric() {
+    // A route pattern unique to this test keeps the assertion independent of
+    // the other tests sharing this process's global metric registry.
+    let (addr, _candidate) = spawn_candidate().await;
+    let mut config = mirroring_config(addr);
+    config.shadow.routes = vec!["/api/orders".to_owned()];
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders])
+        .build();
+
+    app.get("/api/orders").send().await.assert_status(200);
+    settle("the divergence to be recorded", || {
+        stats(&app).diverged >= 1
+    })
+    .await;
+
+    // The framework's own `autumn_*` families are rendered by the actuator's
+    // Prometheus endpoint, not by the app-metrics facade — that facade reserves
+    // the `autumn_` namespace, so a family registered through it would be
+    // silently inert.
+    let scrape = app.get("/actuator/prometheus").send().await;
+    scrape.assert_status(200);
+    let body = scrape.text();
+
+    assert!(
+        body.contains(&format!(
+            "{}{{version=\"stable\",route=\"/api/orders\",kind=\"body\"}} 1",
+            autumn_web::shadow::DIVERGENCES_METRIC
+        )),
+        "divergence series missing from the scrape:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "{}{{version=\"stable\",route=\"/api/orders\",outcome=\"diverged\"}} 1",
+            autumn_web::shadow::COMPARISONS_METRIC
+        )),
+        "comparison series missing from the scrape:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "# TYPE {} counter",
+            autumn_web::shadow::DIVERGENCES_METRIC
+        )),
+        "the family must be declared as a counter:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_shadow_metric_families_are_absent_without_a_mirror() {
+    // Nothing to say, nothing written: the families stay out of the scrape
+    // until an operator turns mirroring on.
+    let mut config = AutumnConfig::default();
+    config.profile = Some("test".into());
+    config.security.csrf.enabled = false;
+
+    let app = TestApp::new()
+        .config(config)
+        .routes(routes![live_orders])
+        .build();
+    app.get("/api/orders").send().await.assert_status(200);
+
+    let body = app.get("/actuator/prometheus").send().await.text();
+    assert!(!body.contains(autumn_web::shadow::COMPARISONS_METRIC));
+    assert!(!body.contains(autumn_web::shadow::DIVERGENCES_METRIC));
 }
 
 #[tokio::test]
@@ -393,7 +622,10 @@ async fn an_oversized_candidate_response_is_skipped_not_buffered() {
         "the client still receives the whole body"
     );
 
-    settle(|| stats(&app).skipped_oversize >= 1).await;
+    settle("the oversize body to be skipped", || {
+        stats(&app).skipped_oversize >= 1
+    })
+    .await;
     let stats = stats(&app);
     assert_eq!(stats.mirrored, 1);
     assert_eq!(stats.skipped_oversize, 1);
@@ -403,12 +635,12 @@ async fn an_oversized_candidate_response_is_skipped_not_buffered() {
 
 #[tokio::test]
 async fn an_unreachable_candidate_is_counted_and_never_affects_the_client() {
-    // Bind and immediately drop, so the port is (almost certainly) closed.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
+    // Port 1 on loopback: privileged, never handed out by an ephemeral bind, so
+    // this cannot race a `spawn_candidate()` in a test running in parallel. (An
+    // ephemeral port that was bound and dropped can be re-handed to another
+    // test in this same binary, which would make the mirror unexpectedly
+    // succeed.)
+    let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
 
     let mut config = mirroring_config(addr);
     config.shadow.timeout_ms = 500;
@@ -424,7 +656,7 @@ async fn an_unreachable_candidate_is_counted_and_never_affects_the_client() {
         json!({ "id": 7, "total": 42, "items": ["a", "b"] })
     );
 
-    settle(|| {
+    settle("the unreachable candidate to be counted", || {
         let stats = stats(&app);
         stats.shadow_errors + stats.shadow_timeouts >= 1
     })

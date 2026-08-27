@@ -3427,11 +3427,15 @@ fn build_shadow_layer(
     // leave the ingress stack untouched rather than pretending to mirror.
     #[cfg(not(feature = "http-client"))]
     {
-        let _ = (state, target_base);
         tracing::warn!(
             "[shadow] enabled but this build has no `http-client` feature; \
              traffic mirroring is inactive"
         );
+        // Install an inactive handle anyway, so the actuator can say "this
+        // replica has a target configured but cannot mirror" rather than
+        // reporting the same thing as a replica that never configured
+        // `[shadow]` at all.
+        state.insert_extension(crate::shadow::ShadowHandle::inactive(target_base));
         return None;
     }
 

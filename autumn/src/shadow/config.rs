@@ -76,8 +76,8 @@ pub struct ShadowConfig {
     #[serde(default = "default_max_records")]
     pub max_records: usize,
 
-    /// Budget, in characters, for each recorded JSON sample before it is
-    /// truncated. Default: `2048`.
+    /// Budget, in bytes of the serialized form, for each recorded JSON sample
+    /// before it is truncated. Default: `2048`.
     #[serde(default = "default_max_sample_bytes")]
     pub max_sample_bytes: usize,
 }
@@ -130,6 +130,33 @@ impl ShadowConfig {
             return Err(format!(
                 "shadow.target must be an absolute http(s) URL, got {target:?}"
             ));
+        }
+        // Userinfo in the target would be echoed by the actuator endpoint and
+        // by the startup log line. Refuse it rather than quietly publishing a
+        // credential; the candidate should be reached without one, or behind
+        // something that adds it.
+        if target
+            .split_once("//")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .is_some_and(|authority| authority.contains('@'))
+        {
+            return Err(
+                "shadow.target must not embed credentials — the value is published by the \
+                 shadow actuator endpoint and logged at startup"
+                    .to_owned(),
+            );
+        }
+
+        for route in &self.routes {
+            if route.trim().is_empty() {
+                return Err("shadow.routes must not contain a blank pattern".to_owned());
+            }
+            if !route.starts_with('/') {
+                return Err(format!(
+                    "shadow.routes patterns must start with '/', got {route:?} — a pattern that \
+                     cannot match any request path would silently disable mirroring"
+                ));
+            }
         }
 
         if !self.sample_rate.is_finite() || !(0.0..=1.0).contains(&self.sample_rate) {
@@ -320,6 +347,82 @@ mod tests {
         assert_eq!(config.routes, vec!["/api/*".to_owned()]);
         // Unspecified keys still carry their bounded defaults.
         assert_eq!(config.timeout_ms, ShadowConfig::default().timeout_ms);
+    }
+
+    #[test]
+    fn a_target_carrying_credentials_is_rejected() {
+        // The value is echoed by the shadow actuator endpoint and logged at
+        // startup, so it must not be a place to put a password.
+        let config = ShadowConfig {
+            enabled: true,
+            target: Some("http://user:pass@candidate.internal".to_owned()),
+            ..ShadowConfig::default()
+        };
+        let error = config.validate().expect_err("must reject");
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn route_patterns_that_can_never_match_are_rejected() {
+        // A pattern without a leading slash matches no request path, so the
+        // allowlist would silently mirror nothing at all.
+        for bad in ["api/*", "  ", ""] {
+            let config = ShadowConfig {
+                enabled: true,
+                target: Some("http://127.0.0.1:9091".to_owned()),
+                routes: vec![bad.to_owned()],
+                ..ShadowConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "{bad:?} must be rejected as a route pattern"
+            );
+        }
+        let config = ShadowConfig {
+            enabled: true,
+            target: Some("http://127.0.0.1:9091".to_owned()),
+            routes: vec!["/api/*".to_owned(), "/status".to_owned()],
+            ..ShadowConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_errors_name_the_key_that_is_wrong() {
+        let base = ShadowConfig {
+            enabled: true,
+            target: Some("http://127.0.0.1:9091".to_owned()),
+            ..ShadowConfig::default()
+        };
+        for (name, mutate) in [
+            (
+                "shadow.timeout_ms",
+                (|c: &mut ShadowConfig| c.timeout_ms = 0) as fn(&mut ShadowConfig),
+            ),
+            ("shadow.max_in_flight", |c: &mut ShadowConfig| {
+                c.max_in_flight = 0;
+            }),
+            ("shadow.max_body_bytes", |c: &mut ShadowConfig| {
+                c.max_body_bytes = 0;
+            }),
+            ("shadow.max_records", |c: &mut ShadowConfig| {
+                c.max_records = 0;
+            }),
+            ("shadow.max_sample_bytes", |c: &mut ShadowConfig| {
+                c.max_sample_bytes = 0;
+            }),
+            ("shadow.sample_rate", |c: &mut ShadowConfig| {
+                c.sample_rate = 2.0;
+            }),
+        ] {
+            let mut config = base.clone();
+            mutate(&mut config);
+            let error = config.validate().expect_err("must reject");
+            assert!(
+                error.contains(name),
+                "the error for {name} must name it, got: {error}"
+            );
+        }
     }
 
     #[test]

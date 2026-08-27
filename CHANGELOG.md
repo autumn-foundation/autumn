@@ -66,8 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses to refuse writes. Recorded samples pass through the same
   `[log] filter_parameters` redaction as the access log and failure capsules,
   and only JSON bodies are sampled — an HTML or binary body records a digest and
-  a length instead of an excerpt no redaction rule could vet. Off by default;
-  see `docs/guide/staged-deploys.md` for how it differs from canary and for the
+  a length instead of an excerpt no redaction rule could vet — and the redaction
+  is a key-name allowlist, so the guide is explicit about what it does and does
+  not cover before you point this at a route returning personal data. Requests
+  the live build itself refuses (`429`/`503` from maintenance mode, load
+  shedding, or the rate limiter) are not mirrored at all, so a planned
+  maintenance window does not read as a divergence storm. Off by default, and
+  requires the `http-client` cargo feature (on by default) — a build without it
+  says so at startup and mirrors nothing rather than pretending to. See
+  `docs/guide/staged-deploys.md` for how it differs from canary and for the
   trust boundary (the candidate receives live credentials, and its own side
   effects are yours to contain). Effect virtualization for mutating traffic, and
   gating `autumn deploy` on a clean diff, are deliberate follow-ups.

@@ -7,6 +7,9 @@
 //! straight to the differ, so there is no code path on which a candidate's bytes
 //! could reach an end user.
 //!
+//! [`HttpShadowTransport`] also disables proxy autodetection and follows no
+//! redirects — see [`HttpShadowTransport::new`].
+//!
 //! [`HttpShadowTransport`] deliberately does **not** use
 //! [`crate::http_client::Client`]. That client carries a retry policy and a
 //! process-global per-host circuit breaker, both of which are wrong here: a
@@ -50,8 +53,10 @@ use crate::shadow::sample::{SHADOW_HEADER, SHADOW_HEADER_VALUE};
 /// candidate answers uncompressed: the primary body is teed *inside* the
 /// compression layer, so an encoded shadow body would diff against a plain
 /// primary one and every route would look divergent.
-const STRIPPED_HEADERS: [&str; 10] = [
+const STRIPPED_HEADERS: [&str; 18] = [
+    // Hop-by-hop (RFC 9110 §7.6.1) plus `proxy-connection`.
     "connection",
+    "proxy-connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
@@ -59,8 +64,28 @@ const STRIPPED_HEADERS: [&str; 10] = [
     "trailer",
     "transfer-encoding",
     "upgrade",
+    // Re-derived from the shadow target, or describing a body a GET/HEAD
+    // mirror does not carry.
     "host",
     "content-length",
+    // Dropped so the candidate answers uncompressed — see the module note on
+    // why an encoded shadow body would diff against a plain primary one.
+    "accept-encoding",
+    // The forwarding family. This layer runs OUTSIDE
+    // `TrustedProxiesLayer`, so these still hold whatever the client put on
+    // the wire: the primary is about to discard them (its peer is not a
+    // trusted proxy), but the candidate would receive them from *this
+    // process's* address, which a production-cloned `trusted_proxies` config
+    // very likely does trust. Forwarding them would launder a header the
+    // primary correctly rejects into one an internal build accepts — a
+    // spoofed client IP past the candidate's own IP allowlists and per-IP
+    // limits, or a poisoned absolute-URL host.
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "forwarded",
+    "x-real-ip",
 ];
 
 /// A request to replay against the candidate build.
@@ -75,9 +100,10 @@ pub struct ShadowRequest {
 }
 
 /// Why a shadow request produced no comparable response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ShadowError {
     /// The configured deadline elapsed first.
+    #[error("shadow request timed out")]
     Timeout,
     /// The candidate's response body exceeded `shadow.max_body_bytes`.
     ///
@@ -85,8 +111,10 @@ pub enum ShadowError {
     /// can only measure a body that has *already been read into memory* — which
     /// is the very thing this bound exists to prevent. The read stops the
     /// moment the budget is passed and the rest of the body is never buffered.
+    #[error("shadow response body exceeded the capture budget")]
     Oversize,
     /// Anything else: connection refused, DNS, TLS, a malformed response.
+    #[error("shadow request failed: {0}")]
     Transport(String),
 }
 
@@ -101,18 +129,6 @@ impl ShadowError {
         }
     }
 }
-
-impl std::fmt::Display for ShadowError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout => write!(f, "shadow request timed out"),
-            Self::Oversize => write!(f, "shadow response body exceeded the capture budget"),
-            Self::Transport(detail) => write!(f, "shadow request failed: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for ShadowError {}
 
 /// Boxed future a [`ShadowTransport`] returns.
 pub type ShadowFuture =
@@ -137,12 +153,13 @@ pub trait ShadowTransport: std::fmt::Debug + Send + Sync + 'static {
 /// primary — is stated in `docs/guide/staged-deploys.md`.
 #[must_use]
 pub fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
+    let connection_named = connection_named_headers(source);
     let mut out = HeaderMap::with_capacity(source.len().saturating_add(1));
     for (name, value) in source {
         let lower = name.as_str().to_ascii_lowercase();
         if STRIPPED_HEADERS.contains(&lower.as_str())
-            || lower == "accept-encoding"
             || lower == SHADOW_HEADER
+            || connection_named.iter().any(|named| named == &lower)
         {
             continue;
         }
@@ -152,6 +169,23 @@ pub fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
         out.insert(name, HeaderValue::from_static(SHADOW_HEADER_VALUE));
     }
     out
+}
+
+/// The header names an inbound `Connection:` header declares hop-by-hop.
+///
+/// RFC 9110 lets a message nominate its own connection-scoped headers
+/// (`Connection: X-Internal-Auth`). Those describe the hop the request arrived
+/// on, so copying them onto a different hop is exactly the mistake the fixed
+/// list above avoids for the well-known names.
+fn connection_named_headers(source: &HeaderMap) -> Vec<String> {
+    source
+        .get_all(axum::http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 /// Join a shadow target base with a request target.
@@ -194,6 +228,15 @@ impl HttpShadowTransport {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
+                // No ambient proxy. Mirrored requests carry the end user's
+                // session cookie and `Authorization` header, and reqwest
+                // honours `HTTP_PROXY`/`HTTPS_PROXY` by default with no
+                // loopback bypass — so on a host that sets those (a corporate
+                // egress proxy, a sidecar) every mirrored request would ship
+                // live credentials to a third party the operator never chose
+                // as a shadow target. The target is an address the operator
+                // named; this client dials it directly or not at all.
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             max_body_bytes,
@@ -323,6 +366,65 @@ mod tests {
     fn accept_encoding_is_stripped_so_both_sides_are_compared_uncompressed() {
         let forwarded = forwarded_headers(&headers(&[("accept-encoding", "gzip, br")]));
         assert!(!forwarded.contains_key("accept-encoding"));
+    }
+
+    #[test]
+    fn the_forwarding_family_is_stripped() {
+        // This layer runs outside TrustedProxiesLayer, so these still carry
+        // whatever the client sent. Forwarding them would launder a spoofed
+        // client IP or host into a candidate that trusts this process's
+        // address as a proxy.
+        let forwarded = forwarded_headers(&headers(&[
+            ("x-forwarded-for", "10.0.0.1"),
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-port", "443"),
+            ("forwarded", "for=10.0.0.1;host=evil.example"),
+            ("x-real-ip", "10.0.0.1"),
+        ]));
+        for stripped in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "forwarded",
+            "x-real-ip",
+        ] {
+            assert!(
+                !forwarded.contains_key(stripped),
+                "{stripped} must not be forwarded to the candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn headers_named_by_connection_are_stripped() {
+        let forwarded = forwarded_headers(&headers(&[
+            ("connection", "X-Internal-Auth, Keep-Alive"),
+            ("x-internal-auth", "hop-scoped"),
+            ("proxy-connection", "keep-alive"),
+            ("accept", "application/json"),
+        ]));
+        assert!(!forwarded.contains_key("x-internal-auth"));
+        assert!(!forwarded.contains_key("proxy-connection"));
+        assert!(
+            forwarded.contains_key("accept"),
+            "unrelated headers survive"
+        );
+    }
+
+    #[test]
+    fn an_inbound_loop_guard_is_replaced_not_duplicated() {
+        let forwarded = forwarded_headers(&headers(&[(
+            crate::shadow::sample::SHADOW_HEADER,
+            "spoofed",
+        )]));
+        let values: Vec<_> = forwarded
+            .get_all(crate::shadow::sample::SHADOW_HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec![crate::shadow::sample::SHADOW_HEADER_VALUE]);
     }
 
     #[test]

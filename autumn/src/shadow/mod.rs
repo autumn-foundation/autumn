@@ -35,19 +35,36 @@
 //! assembled into the ingress stack by the framework router; nothing here needs
 //! to be called by hand. See `docs/guide/staged-deploys.md`.
 
-pub mod config;
-pub mod diff;
-pub mod layer;
-pub mod registry;
-pub mod sample;
+// Private modules behind a curated re-export list, matching
+// `crate::middleware`: the module split is an implementation detail, and
+// everything below is deliberate public surface. `transport` stays public
+// because a third party may want to implement [`ShadowTransport`] against a
+// non-HTTP candidate.
+pub(crate) mod config;
+pub(crate) mod diff;
+pub(crate) mod layer;
+pub(crate) mod registry;
+pub(crate) mod sample;
 pub mod transport;
 
 pub use config::ShadowConfig;
-pub use diff::{Comparison, Divergence, DivergenceKind, ResponseFacts, compare};
-pub use layer::{MirrorSettings, ShadowMirrorLayer};
-pub use registry::{DivergenceRecord, RequestContext, ShadowRegistry, ShadowSnapshot, ShadowStats};
-pub use sample::{MirrorDecision, MirrorSelector, SHADOW_HEADER, SHADOW_HEADER_VALUE, SkipReason};
-pub use transport::{ShadowError, ShadowRequest, ShadowTransport};
+pub use diff::{
+    Comparison, Divergence, DivergenceKind, NormalizedBody, ResponseFacts, compare, normalize_body,
+    redact_path_and_query, status_class,
+};
+pub use layer::{
+    COMPARISONS_METRIC, DIVERGENCES_METRIC, MirrorSettings, ShadowMirrorLayer, ShadowMirrorService,
+};
+pub use registry::{
+    DivergenceRecord, Recorded, RequestContext, ShadowRegistry, ShadowSnapshot, ShadowStats,
+};
+pub use sample::{
+    MIRRORABLE_METHODS, MirrorDecision, MirrorSelector, SHADOW_HEADER, SHADOW_HEADER_VALUE,
+    SkipReason,
+};
+#[cfg(feature = "http-client")]
+pub use transport::HttpShadowTransport;
+pub use transport::{ShadowError, ShadowFuture, ShadowRequest, ShadowTransport};
 
 /// What `{actuator-prefix}/shadow` needs to report on a mirror run: the
 /// registry plus the two facts that live in config rather than in it.
@@ -75,11 +92,22 @@ impl ShadowHandle {
     /// The payload for a replica that never assembled a mirror.
     #[must_use]
     pub fn disabled_snapshot() -> ShadowSnapshot {
-        ShadowSnapshot {
+        ShadowSnapshot::disabled()
+    }
+
+    /// A handle for a replica that configured `[shadow]` but could not assemble
+    /// a mirror — today, a build without the `http-client` feature, which has
+    /// no way to dial the candidate.
+    ///
+    /// Installed so the actuator can distinguish "configured but inert here"
+    /// from "never configured": both report `enabled: false`, but only this one
+    /// reports the target the operator asked for.
+    #[must_use]
+    pub fn inactive(target: impl Into<String>) -> Self {
+        Self {
+            registry: ShadowRegistry::new(1),
             enabled: false,
-            target: None,
-            stats: ShadowStats::default(),
-            divergences: Vec::new(),
+            target: Some(target.into()),
         }
     }
 }
