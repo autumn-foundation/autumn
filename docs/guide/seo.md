@@ -395,12 +395,28 @@ Prefer the second. One query then owns the definition, and no write path has
 to remember to take part:
 
 ```sql
-SELECT GREATEST(p.updated_at, COALESCE(MAX(c.created_at), p.updated_at)) AS last_modified
+SELECT GREATEST(
+           p.updated_at,
+           COALESCE(MAX(c.created_at) FILTER (WHERE c.deleted_at IS NULL), p.updated_at),
+           COALESCE(MAX(c.deleted_at), p.updated_at)
+       ) AS last_modified
   FROM posts p
-  LEFT JOIN comments c ON c.commentable_id = p.id AND c.deleted_at IS NULL
+  LEFT JOIN comments c
+         ON c.commentable_type = 'Post'
+        AND c.commentable_id = p.id
  GROUP BY p.id
  ORDER BY last_modified DESC
 ```
+
+Two details in that query earn their place:
+
+- **Match the discriminator.** A `#[commentable]` table is polymorphic, so
+  `commentable_id` is unique only with `commentable_type`. Without the type,
+  a comment on community 7 moves post 7's date.
+- **Count a deletion too.** A removed comment changes the page as much as a
+  new one. Filter the deleted rows out of the *aggregate*, not out of the
+  *join*: drop them in the join and the date can move backward when somebody
+  deletes the newest reply.
 
 Order on the derived value, not on the column. Your entry cap cuts the list,
 and it must cut the pages that really are the oldest.

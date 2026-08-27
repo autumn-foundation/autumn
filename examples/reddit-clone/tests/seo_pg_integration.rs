@@ -279,14 +279,25 @@ async fn sitemap_lists_every_public_page() {
     );
 }
 
+/// Soft-delete a comment at an explicit time, so the assertions are exact.
+async fn soft_delete_comment(conn: &mut AsyncPgConnection, comment_id: i64, deleted_at: &str) {
+    diesel::sql_query("UPDATE comments SET deleted_at = $1::timestamp WHERE id = $2")
+        .bind::<Text, _>(deleted_at)
+        .bind::<BigInt, _>(comment_id)
+        .execute(conn)
+        .await
+        .expect("soft-delete the comment");
+}
+
 /// `<lastmod>` must describe the *page*, not the `posts` row.
 ///
-/// A comment changes what a visitor reads but never touches `posts.updated_at`
-/// (the comment router writes only the polymorphic `comments` table), so the
-/// source derives the date as `GREATEST(posts.updated_at, newest live
-/// comment)`. This is the regression test for that derivation, including the
-/// ordering it drives: a busy thread must outrank a recently edited but quiet
-/// post, or the entry cap would drop the wrong pages first.
+/// The comment router writes only the polymorphic `comments` table, so three
+/// separate things change a post page without necessarily touching
+/// `posts.updated_at`: an edit, a new reply, and the removal of a reply. The
+/// source takes the latest of all three. This is the regression test for that
+/// derivation, and for the ordering it drives -- a busy thread must outrank a
+/// recently edited but quiet post, or the entry cap would drop the wrong pages
+/// first.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn lastmod_follows_comment_activity_not_just_post_edits() {
@@ -297,67 +308,100 @@ async fn lastmod_follows_comment_activity_not_just_post_edits() {
     let author = seed_user(&mut conn, "ferris").await;
     let rust = seed_subreddit(&mut conn, author, "rust").await;
 
-    // Edited long ago, but the discussion is alive.
-    let busy = seed_post(
+    // (a) Edited long ago, but the discussion is alive.
+    let replied = seed_post(&mut conn, author, rust, "replied-to", "2026-01-10 08:00:00").await;
+    seed_comment(&mut conn, author, replied, "2026-06-20 17:45:00").await;
+
+    // (b) The deletion case. The newest reply was removed in August, which
+    // changed the page then -- so August is the answer, NOT June. Filtering
+    // deleted rows out of the join would give June, and the date would move
+    // backward across a restart.
+    let pruned = seed_post(
         &mut conn,
         author,
         rust,
-        "busy-thread",
-        "2026-01-10 08:00:00",
+        "pruned-thread",
+        "2026-01-11 08:00:00",
     )
     .await;
-    seed_comment(&mut conn, author, busy, "2026-06-20 17:45:00").await;
-    // A deleted comment must not count: it is not on the page any more.
-    let deleted = seed_comment(&mut conn, author, busy, "2026-07-30 10:00:00").await;
-    diesel::sql_query("UPDATE comments SET deleted_at = NOW() WHERE id = $1")
-        .bind::<BigInt, _>(deleted)
-        .execute(&mut conn)
-        .await
-        .expect("soft-delete the comment");
+    seed_comment(&mut conn, author, pruned, "2026-06-01 09:00:00").await;
+    let removed = seed_comment(&mut conn, author, pruned, "2026-07-30 10:00:00").await;
+    soft_delete_comment(&mut conn, removed, "2026-08-05 14:00:00").await;
 
-    // Edited more recently than `busy`, but nobody has replied.
+    // (c) Edited more recently than (a) and (b), but nobody has replied.
     seed_post(&mut conn, author, rust, "quiet-post", "2026-03-15 09:00:00").await;
+
+    // (d) The polymorphic trap: a comment on the COMMUNITY whose
+    // `commentable_id` equals a post id. Ids come from independent sequences,
+    // so line them up deliberately. It must not move that post's date.
+    let twin = seed_post(&mut conn, author, rust, "id-twin", "2026-02-01 08:00:00").await;
+    diesel::sql_query(
+        "INSERT INTO comments (body, author_id, commentable_type, commentable_id, created_at) \
+         VALUES ('community talk', $1, 'Subreddit', $2, '2026-09-09 12:00:00'::timestamp)",
+    )
+    .bind::<BigInt, _>(author)
+    .bind::<BigInt, _>(twin)
+    .execute(&mut conn)
+    .await
+    .expect("seed a Subreddit-typed comment sharing a post id");
     drop(conn);
 
     let config = test_config(Some(&url));
     reddit_clone::seo::init_base_url(&config);
     let entries = RedditSitemapSource::from_config(&config).entries().await;
 
-    let busy_entry = entries
-        .iter()
-        .find(|e| e.loc.ends_with("/posts/busy-thread"))
-        .expect("busy-thread entry");
-    let quiet_entry = entries
-        .iter()
-        .find(|e| e.loc.ends_with("/posts/quiet-post"))
-        .expect("quiet-post entry");
+    let lastmod_of = |suffix: &str| -> Option<String> {
+        entries
+            .iter()
+            .find(|e| e.loc.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no entry ending in {suffix}"))
+            .lastmod
+            .clone()
+    };
 
     assert_eq!(
-        busy_entry.lastmod.as_deref(),
+        lastmod_of("/posts/replied-to").as_deref(),
         Some("2026-06-20"),
-        "lastmod must follow the newest LIVE comment, not posts.updated_at \
-         and not the soft-deleted reply",
+        "a live reply must advance lastmod past the post's own updated_at",
     );
     assert_eq!(
-        quiet_entry.lastmod.as_deref(),
+        lastmod_of("/posts/pruned-thread").as_deref(),
+        Some("2026-08-05"),
+        "removing a comment changes the page, so the DELETION time wins -- \
+         never a fallback to an older live comment",
+    );
+    assert_eq!(
+        lastmod_of("/posts/quiet-post").as_deref(),
         Some("2026-03-15"),
         "a post with no comments keeps its own updated_at",
     );
+    assert_eq!(
+        lastmod_of("/posts/id-twin").as_deref(),
+        Some("2026-02-01"),
+        "a comment on a Subreddit whose id equals this post's id must not \
+         touch it -- the join has to match commentable_type as well",
+    );
 
-    // Ordering drives which posts survive the entry cap, so the busy thread
-    // must come first despite its older `posts.updated_at`.
-    let busy_pos = entries
-        .iter()
-        .position(|e| e.loc.ends_with("/posts/busy-thread"))
-        .expect("busy-thread position");
-    let quiet_pos = entries
-        .iter()
-        .position(|e| e.loc.ends_with("/posts/quiet-post"))
-        .expect("quiet-post position");
+    // Ordering drives which posts survive the entry cap, so the active
+    // threads must outrank the quiet post despite their older `updated_at`.
+    let position = |suffix: &str| {
+        entries
+            .iter()
+            .position(|e| e.loc.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no entry ending in {suffix}"))
+    };
+    let locs: Vec<&String> = entries.iter().map(|e| &e.loc).collect();
     assert!(
-        busy_pos < quiet_pos,
-        "the busy thread must outrank the quiet post; entries: {:?}",
-        entries.iter().map(|e| &e.loc).collect::<Vec<_>>(),
+        position("/posts/pruned-thread") < position("/posts/replied-to"),
+        "August (a deletion) must outrank June (a reply); entries: {locs:?}",
+    );
+    assert!(
+        position("/posts/replied-to") < position("/posts/quiet-post"),
+        "an active thread must outrank a quiet post; entries: {locs:?}",
+    );
+    assert!(
+        position("/posts/quiet-post") < position("/posts/id-twin"),
+        "March must outrank February; entries: {locs:?}",
     );
 }
 

@@ -30,8 +30,9 @@ use crate::schema::subreddits;
 
 /// One post's sitemap row, as the derived-`lastmod` query returns it.
 ///
-/// `last_modified` is not a column: it is `GREATEST(posts.updated_at, the
-/// newest live comment)`. See the query in [`RedditSitemapSource::collect`].
+/// `last_modified` is not a column: it is the latest of the post's own
+/// `updated_at`, its newest live comment, and its newest comment *deletion*.
+/// See the query in [`RedditSitemapSource::collect`].
 #[derive(diesel::QueryableByName)]
 struct PostSitemapRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -158,9 +159,10 @@ pub fn summarize(text: &str, max_chars: usize) -> Option<String> {
 /// why the example bounds a boot-time query.
 ///
 /// Each post's `<lastmod>` is **derived**, not read from one column: it is the
-/// later of `posts.updated_at` and the post's newest live comment, because a
-/// comment changes the page without touching the `posts` row. See the query in
-/// [`Self::collect`] for the two changes deliberately left out.
+/// latest of `posts.updated_at`, the post's newest live comment, and its
+/// newest comment deletion, because all three change the page without
+/// necessarily touching the `posts` row. See the query in [`Self::collect`]
+/// for the two changes deliberately left out.
 ///
 /// The framework calls [`SitemapSource::entries`] one time, while it builds
 /// the router. It renders the result into a static `/sitemap.xml` body. The
@@ -262,8 +264,8 @@ impl RedditSitemapSource {
         //
         //   * an edit goes through `PgPostRepository::update`, and
         //     `PostHooks::before_update` advances `posts.updated_at`;
-        //   * a comment goes through the framework's comment router, which
-        //     never touches the `posts` row at all.
+        //   * a comment -- added or removed -- goes through the framework's
+        //     comment router, which never touches the `posts` row at all.
         //
         // So the modification time is derived here, at read time, rather than
         // written by every subsystem that can change the page: `GREATEST` of
@@ -284,17 +286,42 @@ impl RedditSitemapSource {
         // expression the SELECT returns. Ordering on `posts.updated_at` and
         // computing the real date afterwards in Rust would cut a busy but
         // rarely-edited thread before its freshness was ever known.
+        // Three things can be the newest change to a post page, so the
+        // expression takes the latest of all three:
+        //
+        //   1. `p.updated_at`      -- somebody edited the post.
+        //   2. the newest LIVE comment's `created_at` -- somebody replied.
+        //   3. the newest `deleted_at` -- somebody removed a comment, which
+        //      changes the page just as much as adding one.
+        //
+        // (3) is why the join does not filter `deleted_at IS NULL`. Filtering
+        // there would drop the deleted rows before the aggregate could read
+        // their deletion time, and `<lastmod>` could then move BACKWARD across
+        // a restart: a July comment deleted in August would leave June's live
+        // comment as the newest date. The `FILTER` clause on (2) keeps a
+        // deleted comment's own `created_at` out while its `deleted_at` still
+        // counts.
+        //
+        // `c.commentable_type = $1` is load-bearing, not decoration. The
+        // comments table is polymorphic, so `commentable_id` is unique only
+        // together with the discriminator: without it, a comment on
+        // subreddit 7 would advance post 7's date.
         let post_sql = r#"
             SELECT s.slug AS sub_slug,
                    p.slug AS post_slug,
-                   GREATEST(p.updated_at, COALESCE(MAX(c.created_at), p.updated_at))
-                       AS last_modified
+                   GREATEST(
+                       p.updated_at,
+                       COALESCE(
+                           MAX(c.created_at) FILTER (WHERE c.deleted_at IS NULL),
+                           p.updated_at
+                       ),
+                       COALESCE(MAX(c.deleted_at), p.updated_at)
+                   ) AS last_modified
               FROM posts p
               JOIN subreddits s ON s.id = p.subreddit_id
               LEFT JOIN comments c
                      ON c.commentable_type = $1
                     AND c.commentable_id = p.id
-                    AND c.deleted_at IS NULL
              GROUP BY p.id, s.id
              ORDER BY last_modified DESC
              LIMIT $2

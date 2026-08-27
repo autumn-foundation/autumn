@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the start-up-snapshot semantics and the custom-route escape hatch for larger
   or live sitemaps), the 50,000-URL limit, `hreflang` alternates on
   locale-prefixed sites, and static builds. `examples/reddit-clone` is now the
-  runnable sample: a database-backed (and deliberately bounded) `RedditSitemapSource` whose `<lastmod>` is derived from the whole page — the later of `posts.updated_at` and the newest live comment — rather than read from one column, `[seo]` +
+  runnable sample: a database-backed (and deliberately bounded) `RedditSitemapSource` whose `<lastmod>` is derived from the whole page — the latest of `posts.updated_at`, the newest live comment, and the newest comment deletion — rather than read from one column, `[seo]` +
   `[seo.robots]` in `autumn.toml`, `seo(...)` on the front page, the community
   index, the community page, the post page, and the about page, canonical URLs
   on each of them, `robots = "noindex, nofollow"` on the submit form, and a
