@@ -1363,20 +1363,17 @@ mod write_guard_tests {
 ///
 /// Planned *after* the app-code step, not alongside it: `build.rs` is both a
 /// framework-owned file and a `.rs` file the codemods scan, so a plan made
-/// before the rewrites would be a plan about bytes that no longer exist — and
-/// `rewrote` names the files this run touched, so the report attributes them to
-/// this command rather than to the developer.
-fn plan_scaffold(
-    root: &Path,
-    target: &str,
-    report: &Report,
-    rewrote: bool,
-) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeSet<String> = if rewrote {
-        report.files.iter().map(|file| file.path.clone()).collect()
-    } else {
-        BTreeSet::new()
-    };
+/// before the rewrites would be a plan about bytes that no longer exist.
+///
+/// The codemods' *plan* is what the scaffold half is told about, not what the
+/// apply step happened to write. The two are the same set — `--apply` writes
+/// the plan — and using the narrower one would make the preview disagree with
+/// the run it is previewing: a bare `autumn upgrade` would offer `build.rs` as
+/// a writable `update` that `--apply` then refuses. A preview that does not
+/// predict its own apply is worse than no preview, and this is the one file
+/// that can be in both halves at once.
+fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
+    let migrated: BTreeSet<String> = report.files.iter().map(|file| file.path.clone()).collect();
     scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
 }
 
@@ -1614,8 +1611,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         }
     }
 
-    let mut scaffold_report =
-        plan_scaffold(root, &target, &report, opts.apply && failure.is_none());
+    let mut scaffold_report = plan_scaffold(root, &target, &report);
     // Only when the app-code step completed. A half-migrated tree is not a tree
     // to start rewriting project files in.
     if opts.apply

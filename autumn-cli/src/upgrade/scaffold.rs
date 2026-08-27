@@ -243,7 +243,7 @@ impl Manifest {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        publish(&path, &self.render()).map_err(std::io::Error::other)
+        publish(&path, &self.render(), Publish::Replace).map_err(std::io::Error::other)
     }
 }
 
@@ -263,10 +263,13 @@ pub enum ConflictReason {
     /// through it would write wherever it points, which need not be inside the
     /// project at all.
     Symlink,
-    /// This same run's app-code migrations rewrote the file. `build.rs` is both
-    /// a framework-owned file and a `.rs` file the codemods scan, so the two
+    /// This same run's app-code migrations cover the file. `build.rs` is both a
+    /// framework-owned file and a `.rs` file the codemods scan, so the two
     /// halves can land on it in one run — and blaming the developer for an edit
-    /// the tool made four lines earlier would be simply false.
+    /// the tool itself makes four lines earlier would be simply false.
+    ///
+    /// Set from the codemods' *plan*, so a preview says the same thing the
+    /// apply it is previewing will.
     MigratedThisRun,
 }
 
@@ -1021,7 +1024,15 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    publish(&entry.absolute, &entry.template)
+    publish(
+        &entry.absolute,
+        &entry.template,
+        if entry.current == OnDisk::Absent {
+            Publish::Create
+        } else {
+            Publish::Replace
+        },
+    )
 }
 
 /// Where an in-progress write to `absolute` is staged.
@@ -1037,13 +1048,22 @@ fn scratch_path(absolute: &Path) -> PathBuf {
     absolute.with_file_name(format!(".autumn-upgrade-{}.tmp", name.to_string_lossy()))
 }
 
+/// Whether a publish may take a destination that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publish {
+    /// The path was empty when the plan was made and must still be empty.
+    Create,
+    /// The path holds the contents the plan was computed from.
+    Replace,
+}
+
 /// Publish `contents` at `absolute`, atomically.
 ///
-/// Staged beside the destination and renamed into place, never written in
-/// place. A plain `fs::write` interrupted by Ctrl-C or a full disk leaves a
-/// truncated file — and for a file this command *added*, that is permanent: the
-/// truncated file has no recorded baseline, so the next run classifies it as a
-/// conflict and refuses to touch it.
+/// Staged beside the destination and published by a link operation, never
+/// written in place. A plain `fs::write` interrupted by Ctrl-C or a full disk
+/// leaves a truncated file — and for a file this command *added*, that is
+/// permanent: the truncated file has no recorded baseline, so the next run
+/// classifies it as a conflict and refuses to touch it.
 ///
 /// Staged by hand rather than through `tempfile`, which deliberately creates
 /// its temporaries 0600. Renaming one of those into place would leave an added
@@ -1052,7 +1072,20 @@ fn scratch_path(absolute: &Path) -> PathBuf {
 /// the executable bit. `OpenOptions` honours the process umask, so a new file
 /// lands with exactly the mode `autumn new` would have given it; an existing
 /// one keeps the mode it already had.
-fn publish(absolute: &Path, contents: &str) -> Result<(), String> {
+///
+/// [`Publish::Create`] publishes with a hard link rather than a rename, because
+/// `rename` *replaces* its destination on Unix. The plan's re-read happens
+/// before the bytes are written and synced, so a file another process creates
+/// inside that window would be silently clobbered by the very step that
+/// advertises it will not. `hard_link` fails instead, and the caller reports it
+/// like any other refusal.
+///
+/// [`Publish::Replace`] is a rename, since replacing is the point there. Its
+/// window is narrowed by the re-read, not closed: a writer that replaces the
+/// file between the re-read and the rename loses. Closing that needs an
+/// exchange primitive no portable API offers, and it is the same window every
+/// rename-based updater lives with.
+fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String> {
     use std::io::Write as _;
 
     let scratch = scratch_path(absolute);
@@ -1069,24 +1102,39 @@ fn publish(absolute: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
     // Replacing a file keeps its mode; the umask default the scratch was
     // created with is only right for a file that is genuinely new.
-    if let Ok(metadata) = std::fs::metadata(absolute) {
+    if mode == Publish::Replace
+        && let Ok(metadata) = std::fs::metadata(absolute)
+    {
         let _ = file.set_permissions(metadata.permissions());
     }
 
     let staged = file
         .write_all(contents.as_bytes())
         .and_then(|()| file.flush())
-        // The rename is atomic, but only against a crash if the bytes reached
-        // the disk first: otherwise the rename can land before the data and
-        // publish an empty file.
+        // The link is atomic, but only against a crash if the bytes reached the
+        // disk first: otherwise it can land before the data and publish an
+        // empty file.
         .and_then(|()| file.sync_all());
     drop(file);
-    let published = staged.and_then(|()| std::fs::rename(&scratch, absolute));
-    if published.is_err() {
-        // Nothing half-written survives, at the destination or beside it.
-        let _ = std::fs::remove_file(&scratch);
-    }
-    published.map_err(|error| error.to_string())
+
+    let published = staged.and_then(|()| match mode {
+        Publish::Create => std::fs::hard_link(&scratch, absolute),
+        Publish::Replace => std::fs::rename(&scratch, absolute),
+    });
+    // The link leaves the scratch behind by design (it is the same inode); the
+    // rename consumes it. Either way nothing half-written survives, at the
+    // destination or beside it.
+    let _ = std::fs::remove_file(&scratch);
+
+    published.map_err(|error| {
+        if mode == Publish::Create && error.kind() == std::io::ErrorKind::AlreadyExists {
+            "something appeared at this path while it was being written; \
+             it was left exactly as it is"
+                .to_owned()
+        } else {
+            error.to_string()
+        }
+    })
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -2348,5 +2396,71 @@ mod tests {
             "an unreadable flavor must fall back to the conservative no-baseline path"
         );
         assert!(!tmp.path().join("tailwind.config.js").exists());
+    }
+
+    #[test]
+    fn publishing_an_addition_never_replaces_a_destination_that_appeared() {
+        // `rename` replaces the destination on Unix, so a file another process
+        // creates during the staging window — after the plan's re-read, while
+        // the bytes are being synced — would be silently clobbered by the very
+        // step that advertises it will not.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("arrived.toml");
+        fs::write(&path, "someone else got here first\n").unwrap();
+
+        let error = publish(&path, "ours\n", Publish::Create).expect_err("must refuse");
+        assert!(error.contains("appeared"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "someone else got here first\n"
+        );
+        assert!(!scratch_path(&path).exists(), "no scratch left behind");
+    }
+
+    #[test]
+    fn publishing_a_replacement_takes_the_destination() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.toml");
+        fs::write(&path, "old\n").unwrap();
+
+        publish(&path, "new\n", Publish::Replace).expect("replace");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(!scratch_path(&path).exists(), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_preview_and_an_apply_agree_about_build_rs() {
+        // `build.rs` is the one framework-owned file the codemods also scan, so
+        // it is exactly the file whose preview must not disagree with what
+        // `--apply` then does. Classifying the preview against the old contents
+        // reported a writable `update` for a file the apply would refuse.
+        let tmp = scaffolded(GenerateOptions::default());
+        // Stale but provably untouched: without the codemods in the picture
+        // this is a writable `update`.
+        let stale = "fn main() { /* an older release's build.rs */ }\n";
+        write(tmp.path(), "build.rs", stale);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest
+            .digests
+            .insert("build.rs".to_owned(), digest(stale));
+        manifest.save(tmp.path()).unwrap();
+        assert_eq!(
+            status_of(&plan_in(tmp.path()).entries, "build.rs"),
+            &Status::Update
+        );
+
+        let migrated: BTreeSet<String> = std::iter::once("build.rs".to_owned()).collect();
+        let previewed = plan_after(tmp.path(), "0.7.0", &migrated);
+        assert_eq!(
+            status_of(&previewed.entries, "build.rs"),
+            &Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+        assert!(
+            !previewed
+                .applicable()
+                .iter()
+                .any(|entry| entry.path == "build.rs"),
+            "a file the codemods rewrite is never a writable scaffold update"
+        );
     }
 }
