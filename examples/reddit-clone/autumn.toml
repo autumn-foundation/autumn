@@ -22,6 +22,40 @@ path = "/health"
 [security.csrf]
 enabled = true
 
+# Route-level SEO (docs/guide/seo.md).
+#
+# `base_url` turns on /robots.txt and /sitemap.xml. The framework needs it
+# because both files hold absolute URLs. It also lets the handlers build a
+# canonical URL for each page (see src/seo.rs).
+#
+# Change this to the real host before you deploy. The value below is the demo
+# host, and a wrong `base_url` sends crawlers to URLs that do not exist.
+[seo]
+base_url = "https://autumn-reddit.example.com"
+
+[seo.robots]
+# The profile sets the default: `dev` and `test` disallow every crawler, `prod`
+# allows every crawler. Set `allow_all = false` here to keep a staging
+# deployment out of search results even when it runs the `prod` profile.
+#
+# `Disallow` and `noindex` are ALTERNATIVES for one URL, not layers. A
+# `Disallow` line stops the fetch, so a crawler never reads the page's
+# `noindex` tag -- and the URL can still be indexed from an inbound link, as a
+# bare result nobody can remove. Pick one tool per URL:
+#
+#   * "I do not want this URL in the index"  -> allow the crawl, serve
+#     `seo(robots = "noindex")`. That is why `/submit` and `/u/` are NOT
+#     listed below even though both declare the directive.
+#   * "I do not want crawlers here at all"   -> `Disallow`, and accept that
+#     URL-only indexing stays possible. That is the right trade for the
+#     machine endpoints below: they serve JSON or HTML fragments, so there is
+#     no page anyone could usefully index anyway.
+additional_rules = [
+  "Disallow: /_partials/",
+  "Disallow: /actuator/",
+  "Disallow: /api/",
+]
+
 [security.webhooks.replay]
 allow_memory_in_production = true
 

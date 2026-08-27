@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEO guide and a runnable SEO example (#2320, T1 Gap 1):** `seo.rs` was
+  rustdoc-only and `docs/guide/` had zero `sitemap`/`robots` mentions, even
+  though the `seo(...)` route attribute shipped in 0.7.0. The new
+  [`docs/guide/seo.md`](docs/guide/seo.md) covers the `seo(...)` argument and
+  its keys, the `SeoMeta` extractor and its Open Graph/Twitter fallbacks,
+  canonical URLs, `robots = "noindex"` and exactly which sitemap entries it
+  filters, `[seo]`/`[seo.robots]` configuration, `SitemapSource` (including
+  the start-up-snapshot semantics and the custom-route escape hatch for larger
+  or live sitemaps), the 50,000-URL limit, `hreflang` alternates on
+  locale-prefixed sites, and static builds. `examples/reddit-clone` is now the
+  runnable sample: a database-backed `RedditSitemapSource` (entry-capped, with the cap's cost characteristics documented) whose `<lastmod>` is derived from the whole page — the latest of `posts.updated_at`, the newest live comment, and the newest comment deletion — rather than read from one column, `[seo]` +
+  `[seo.robots]` in `autumn.toml`, `seo(...)` on the front page, the community
+  index, the community page, the post page, and the about page, canonical URLs
+  on each of them, `robots = "noindex, nofollow"` on the submit form, and a
+  single `SeoMeta::render()` call in the shared layout. Covered by unit tests
+  in `routes/layout.rs`/`seo.rs` and a Postgres integration suite in
+  `tests/seo_pg_integration.rs`.
+
 - **`#[query_budget(N)]` — a compile-time, per-route database query budget
   (#1667):** declare a handler's query ceiling and the build fails when any
   statically reachable path can exceed it. The canonical case is the N+1 — a
