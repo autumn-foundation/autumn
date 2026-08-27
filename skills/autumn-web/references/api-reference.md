@@ -146,6 +146,22 @@ builder), then refine them with per-request data before calling
 `seo.render()`. `#[static_get]` honours the argument too. The declared values
 are also recorded on `Route::seo` as a `SeoRouteDefaults`.
 
+**`sitemap.xml` / `robots.txt`** (0.7.0): `[seo] base_url` in `autumn.toml`
+mounts `GET /robots.txt` and `GET /sitemap.xml`.
+`[seo.robots]` takes `allow_all` (override the `dev`→`Disallow: /` /
+`prod`→`Allow: /` profile default), `additional_rules`, and `sitemap_url`.
+`AppBuilder::seo_source(source)` registers an
+`autumn_web::seo::SitemapSource` supplying `SitemapEntry` values
+(`loc` + optional `lastmod` / `changefreq` / `priority`); concrete
+`#[static_get]` paths are derived automatically. `entries()` is awaited once at
+router build, so the served body is a start-up snapshot — register your own
+`/sitemap.xml` route for live entries (Autumn detects the collision, warns, and
+mounts neither of its own SEO routes). `seo(robots = "noindex")` excludes a
+route from the sitemap only for derived `#[static_get]` paths, never for
+`SitemapSource` entries. Helpers: `seo::sitemap_xml` (truncates past 50,000
+URLs), `seo::robots_txt`, `seo::write_seo_files` (used by `autumn build`).
+Guide: `docs/guide/seo.md`.
+
 **Locale-prefixed routing** (0.7.0, #1251): `[i18n]
 locale_prefix_enabled = true` in `autumn.toml` (default `false`, no behavior
 change) makes every route registered via `routes(...)` also reachable under
