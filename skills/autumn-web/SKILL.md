@@ -1893,6 +1893,72 @@ The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
 that cannot exec into the replica can write it directly. The flag is sticky
 across restarts — clear it with `autumn canary promote` once traffic has moved.
 
+## Shadow (differential) deploys
+
+Canary decides from **cohort metrics** over traffic the new build really serves.
+Shadow decides from a **per-request diff** and serves nobody: Autumn mirrors
+sampled `GET`/`HEAD` traffic to a candidate build you run alongside production
+and compares the two responses. Use it to catch the subtly-wrong-but-`200`
+regression — a dropped JSON field, a reordered list, an off-by-one total — that
+cohort metrics cannot see. It composes with canary; it does not replace it.
+
+Off by default. Requires the `http-client` feature (on by default).
+
+```toml
+# autumn.toml
+[shadow]
+enabled          = true
+target           = "http://127.0.0.1:9091"  # the candidate build (you run it)
+sample_rate      = 0.05    # of ELIGIBLE traffic. Default 1.0 — start low.
+routes           = ["/api/*"]  # empty (default) = every eligible route
+timeout_ms       = 2000    # bounds the shadow request AND the primary wait
+max_in_flight    = 8       # excess mirrors are dropped, never queued
+max_body_bytes   = 262144  # larger responses are not compared, either side
+max_records      = 50      # divergences kept for the actuator
+max_sample_bytes = 2048    # per recorded JSON sample, before truncation
+```
+
+Every key has an env override (`AUTUMN_SHADOW__ENABLED`,
+`AUTUMN_SHADOW__TARGET`, `AUTUMN_SHADOW__SAMPLE_RATE`, …).
+
+**What it guarantees.** The client never waits on the mirror (detached task; the
+primary body is teed, not buffered) and never receives a candidate byte. Only
+`GET`/`HEAD` are mirrored, and that is a constant, not a config key — replaying
+a `POST` needs effect virtualization, which does not exist yet. Requests the
+live build refuses (`429`/`503`) are not mirrored. Actuator and probe paths are
+never mirrored. Every mirrored request carries `X-Autumn-Shadow: 1`, so
+mirroring cannot recurse.
+
+**What it compares.** Status class (`200` vs `201` is not a divergence; `200` vs
+`500` is) and a normalized body: JSON object key order is normalized away,
+**array order is not**. Headers, latency, and fuzzy JSON tolerance are out of
+scope.
+
+**Reading the results** — `{actuator-prefix}/shadow`, sensitive-gated like
+`/actuator/tasks`:
+
+```bash
+curl -s localhost:3000/actuator/shadow | jq '.stats, .divergences[0]'
+```
+
+Plus two built-in metric families on `/actuator/prometheus`:
+
+```
+autumn_shadow_comparisons_total{version,route,outcome}  # match|diverged|error|
+                                                        # timeout|skipped|dropped|
+                                                        # refused|incomplete
+autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
+```
+
+**Tell the user before they enable it**: the candidate receives live cookies and
+`Authorization` headers (a candidate that cannot authenticate makes every diff
+noise), its own side effects are real so it must be contained by environment
+(scratch database / writes disabled), and recorded samples are redacted by a
+**key-name allowlist** (`[log] filter_parameters`) — not a PII classifier — so
+any other field of a response body is stored verbatim on that actuator endpoint.
+
+See `docs/guide/staged-deploys.md`.
+
 ## CLI
 
 ```bash
