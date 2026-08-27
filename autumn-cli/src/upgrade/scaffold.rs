@@ -1035,19 +1035,6 @@ fn write_one(entry: &Entry) -> Result<(), String> {
     )
 }
 
-/// Where an in-progress write to `absolute` is staged.
-///
-/// A deterministic name, in the same directory so the publishing rename never
-/// crosses a filesystem. Deterministic rather than random because a leftover
-/// then has an owner: this function names it, so the next run recognises its
-/// own scratch and clears it instead of failing forever on a crash's debris.
-fn scratch_path(absolute: &Path) -> PathBuf {
-    let name = absolute
-        .file_name()
-        .map_or_else(|| "scaffold".into(), std::ffi::OsStr::to_os_string);
-    absolute.with_file_name(format!(".autumn-upgrade-{}.tmp", name.to_string_lossy()))
-}
-
 /// Whether a publish may take a destination that already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Publish {
@@ -1057,84 +1044,107 @@ enum Publish {
     Replace,
 }
 
+/// The mode a file newly created in `directory` should carry.
+///
+/// Derived from the directory's own mode rather than by reading the process
+/// umask, which has no race-free getter — the only way to read it is to set it
+/// and set it back. Masking the directory's mode down to the file permission
+/// bits reproduces the umask-derived answer in every ordinary case (`0755` ->
+/// `0644`, `0700` -> `0600`, `0775` -> `0664`), which is what matters: a file
+/// this command adds must be exactly as readable as the one `autumn new` would
+/// have written beside it. `tempfile` creates its temporaries `0600`, and
+/// publishing one of those unchanged would leave an added `ci.yml` or
+/// `input.css` unreadable to every other uid — fatal to a Docker stage that
+/// drops privileges, and invisible in `git diff`, which tracks only the
+/// executable bit.
+#[cfg(unix)]
+fn permissions_for_new_file(directory: &Path) -> Option<std::fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = std::fs::metadata(directory).ok()?.permissions().mode();
+    Some(std::fs::Permissions::from_mode(mode & 0o666))
+}
+
+#[cfg(not(unix))]
+fn permissions_for_new_file(_directory: &Path) -> Option<std::fs::Permissions> {
+    None
+}
+
 /// Publish `contents` at `absolute`, atomically.
 ///
-/// Staged beside the destination and published by a link operation, never
-/// written in place. A plain `fs::write` interrupted by Ctrl-C or a full disk
-/// leaves a truncated file — and for a file this command *added*, that is
+/// Staged beside the destination and published by a single link operation,
+/// never written in place. A plain `fs::write` interrupted by Ctrl-C or a full
+/// disk leaves a truncated file — and for a file this command *added*, that is
 /// permanent: the truncated file has no recorded baseline, so the next run
 /// classifies it as a conflict and refuses to touch it.
 ///
-/// Staged by hand rather than through `tempfile`, which deliberately creates
-/// its temporaries 0600. Renaming one of those into place would leave an added
-/// `ci.yml` or `input.css` unreadable to every other uid — fatal to a Docker
-/// stage that drops privileges, and invisible in `git diff`, which tracks only
-/// the executable bit. `OpenOptions` honours the process umask, so a new file
-/// lands with exactly the mode `autumn new` would have given it; an existing
-/// one keeps the mode it already had.
+/// The staging file is uniquely named and deletes itself when dropped, so this
+/// function never removes a path it did not create. A predictable name would
+/// have to be *reclaimed* before use, and reclaiming means deleting a file
+/// whose provenance cannot be checked: someone else's, or the staging file of a
+/// concurrent `autumn upgrade --apply` — defeating the very race protection
+/// staging exists for. The cost is that a hard crash can leave one
+/// `.autumn-upgrade-*.tmp` behind; it is inert, and never blocks a later run.
 ///
-/// [`Publish::Create`] publishes with a hard link rather than a rename, because
-/// `rename` *replaces* its destination on Unix. The plan's re-read happens
-/// before the bytes are written and synced, so a file another process creates
-/// inside that window would be silently clobbered by the very step that
-/// advertises it will not. `hard_link` fails instead, and the caller reports it
-/// like any other refusal.
+/// [`Publish::Create`] publishes without replacing, because `rename` *does*
+/// replace its destination on Unix. The plan's re-read happens before the bytes
+/// are written and synced, so a file another process creates inside that window
+/// would be silently clobbered by the very step that advertises it will not.
 ///
-/// [`Publish::Replace`] is a rename, since replacing is the point there. Its
-/// window is narrowed by the re-read, not closed: a writer that replaces the
-/// file between the re-read and the rename loses. Closing that needs an
-/// exchange primitive no portable API offers, and it is the same window every
+/// [`Publish::Replace`] does replace, since that is the point there. Its window
+/// is narrowed by the re-read, not closed: a writer that replaces the file
+/// between the re-read and the publish loses. Closing that needs an exchange
+/// primitive no portable API offers, and it is the same window every
 /// rename-based updater lives with.
 fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String> {
     use std::io::Write as _;
 
-    let scratch = scratch_path(absolute);
-    // Debris from a killed run, cleared so a crash is not permanent. Only ever
-    // this function's own scratch name, and never the destination.
-    let _ = std::fs::remove_file(&scratch);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        // Refuses to clobber, so a second `autumn upgrade --apply` racing this
-        // one is a loud error rather than two writers interleaving into one
-        // file.
-        .create_new(true)
-        .open(&scratch)
-        .map_err(|error| format!("{}: {error}", scratch.display()))?;
-    // Replacing a file keeps its mode; the umask default the scratch was
-    // created with is only right for a file that is genuinely new.
-    if mode == Publish::Replace
-        && let Ok(metadata) = std::fs::metadata(absolute)
-    {
-        let _ = file.set_permissions(metadata.permissions());
+    let directory = absolute
+        .parent()
+        .ok_or_else(|| "no parent directory".to_owned())?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".autumn-upgrade-")
+        .suffix(".tmp")
+        .tempfile_in(directory)
+        .map_err(|error| error.to_string())?;
+
+    // Replacing a file keeps the mode it already had; a genuinely new one takes
+    // the mode the directory implies.
+    let permissions = match mode {
+        Publish::Replace => std::fs::metadata(absolute)
+            .ok()
+            .map(|metadata| metadata.permissions()),
+        Publish::Create => permissions_for_new_file(directory),
+    };
+    if let Some(permissions) = permissions {
+        let _ = temp.as_file().set_permissions(permissions);
     }
 
-    let staged = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| file.flush())
-        // The link is atomic, but only against a crash if the bytes reached the
-        // disk first: otherwise it can land before the data and publish an
-        // empty file.
-        .and_then(|()| file.sync_all());
-    drop(file);
+    temp.write_all(contents.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.flush().map_err(|error| error.to_string())?;
+    // The publish is atomic, but only against a crash if the bytes reached the
+    // disk first: otherwise it can land before the data and publish an empty
+    // file.
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
 
-    let published = staged.and_then(|()| match mode {
-        Publish::Create => std::fs::hard_link(&scratch, absolute),
-        Publish::Replace => std::fs::rename(&scratch, absolute),
-    });
-    // The link leaves the scratch behind by design (it is the same inode); the
-    // rename consumes it. Either way nothing half-written survives, at the
-    // destination or beside it.
-    let _ = std::fs::remove_file(&scratch);
-
-    published.map_err(|error| {
-        if mode == Publish::Create && error.kind() == std::io::ErrorKind::AlreadyExists {
-            "something appeared at this path while it was being written; \
-             it was left exactly as it is"
-                .to_owned()
-        } else {
-            error.to_string()
-        }
-    })
+    match mode {
+        Publish::Create => temp.persist_noclobber(absolute).map_err(|error| {
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                "something appeared at this path while it was being written; \
+                 it was left exactly as it is"
+                    .to_owned()
+            } else {
+                error.error.to_string()
+            }
+        })?,
+        Publish::Replace => temp
+            .persist(absolute)
+            .map_err(|error| error.error.to_string())?,
+    };
+    Ok(())
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -2249,32 +2259,6 @@ mod tests {
     }
 
     #[test]
-    fn an_added_file_is_published_only_once_it_is_complete() {
-        // An addition interrupted partway — Ctrl-C, a full disk — must not
-        // leave a truncated file at the destination. That file would have no
-        // recorded baseline, so the next run would call it a conflict and
-        // refuse to touch it: a corrupted file the tool can never repair.
-        let tmp = scaffolded(GenerateOptions::default());
-        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
-        let mut manifest = Manifest::load(tmp.path()).unwrap();
-        manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
-
-        // Occupy the scratch path with a directory, so publishing fails after
-        // the plan is made but before anything reaches the destination.
-        let scratch = scratch_path(&tmp.path().join("rustfmt.toml"));
-        fs::create_dir_all(&scratch).unwrap();
-
-        let mut report = plan_in(tmp.path());
-        let failure = apply(&mut report).expect_err("the write must fail");
-        assert_eq!(failure.path, "rustfmt.toml");
-        assert!(
-            !tmp.path().join("rustfmt.toml").exists(),
-            "a failed addition must leave nothing at the destination"
-        );
-    }
-
-    #[test]
     fn a_completed_apply_leaves_no_scratch_files_behind() {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
@@ -2300,26 +2284,32 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_scratch_file_does_not_block_a_later_run() {
-        // A run killed mid-write leaves its scratch file behind. If that
-        // blocked every future addition, the crash would be permanent.
+    fn a_file_that_merely_looks_like_scratch_is_neither_deleted_nor_a_blocker() {
+        // Nothing outside the framework-owned set may be touched, and that
+        // includes a path that happens to resemble this command's own staging
+        // file — someone else's, or a concurrent `--apply`'s, whose deletion
+        // would defeat the very race protection staging exists for.
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.digests.remove("rustfmt.toml");
         manifest.save(tmp.path()).unwrap();
-        fs::write(
-            scratch_path(&tmp.path().join("rustfmt.toml")),
-            "half-written leftovers",
-        )
-        .unwrap();
+        let lookalike = tmp.path().join(".autumn-upgrade-rustfmt.toml.tmp");
+        fs::write(&lookalike, "not this command's to delete\n").unwrap();
 
         let mut report = plan_in(tmp.path());
-        apply(&mut report).expect("a stale scratch file is not a blocker");
+        apply(&mut report).expect("a lookalike is not a blocker");
+
         let files = current_files(tmp.path(), GenerateOptions::default()).unwrap();
         assert_eq!(
             fs::read_to_string(tmp.path().join("rustfmt.toml")).unwrap(),
-            files["rustfmt.toml"]
+            files["rustfmt.toml"],
+            "the addition still lands"
+        );
+        assert_eq!(
+            fs::read_to_string(&lookalike).unwrap(),
+            "not this command's to delete\n",
+            "an unowned file must survive untouched"
         );
     }
 
@@ -2414,7 +2404,7 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "someone else got here first\n"
         );
-        assert!(!scratch_path(&path).exists(), "no scratch left behind");
+        assert!(no_scratch_beside(&path), "no scratch left behind");
     }
 
     #[test]
@@ -2425,7 +2415,20 @@ mod tests {
 
         publish(&path, "new\n", Publish::Replace).expect("replace");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
-        assert!(!scratch_path(&path).exists(), "no scratch left behind");
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    /// Whether the directory holding `path` is free of staging files.
+    fn no_scratch_beside(path: &std::path::Path) -> bool {
+        !fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".autumn-upgrade-")
+            })
     }
 
     #[test]
