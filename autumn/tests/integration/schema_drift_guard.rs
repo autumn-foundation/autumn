@@ -383,6 +383,54 @@ fn cluster_child_keys_are_strictly_validated() {
     );
 }
 
+/// Regression guard for the `[shadow]` field ordering (issue #1653).
+///
+/// Same landmine as `deploy_child_keys_are_strictly_validated` and
+/// `cluster_child_keys_are_strictly_validated`: strict unknown-key validation
+/// only descends into a section the `SchemaDeserializer` walk actually reaches.
+/// A silently-accepted typo here is a mirror that never runs (`targt`), or one
+/// that mirrors far more traffic than the operator meant (`sample_rat` leaving
+/// the 1.0 default in place against production volume). If someone moves
+/// `shadow` below `database` and the walk stops reaching it, this fails.
+#[test]
+fn shadow_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "shadow.enabled",
+        "shadow.target",
+        "shadow.sample_rate",
+        "shadow.routes",
+        "shadow.timeout_ms",
+        "shadow.max_in_flight",
+        "shadow.max_body_bytes",
+        "shadow.max_records",
+        "shadow.max_sample_bytes",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [shadow]; \
+             if this fails, `shadow` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[shadow]\ntargt = \"http://127.0.0.1:9091\"\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "shadow.targt"),
+        "a bogus [shadow] child key must be rejected by strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[shadow]\nenabled = true\ntarget = \"http://127.0.0.1:9091\"\nsample_rate = 0.1\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a well-formed [shadow] section must be accepted, got: {ok:?}"
+    );
+}
+
 /// #1890: config.rs-internal sections declared AFTER `database` used to vanish
 /// from the derived schema because the `statement_timeout` duration field
 /// aborted the `SchemaDeserializer` walk. The tolerant `deserialize_any` probe

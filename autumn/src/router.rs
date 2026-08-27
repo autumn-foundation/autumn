@@ -3403,6 +3403,104 @@ fn build_load_shed_layer(
     )
 }
 
+/// Build the shadow-mirroring layer, or `None` when `[shadow]` is off.
+///
+/// Also installs the [`ShadowHandle`](crate::shadow::ShadowHandle) into the
+/// app state's runtime extension map, which is what
+/// `{actuator-prefix}/shadow` reads. A replica with mirroring off installs
+/// nothing and that endpoint reports a disabled mirror.
+///
+/// The clock and entropy source are taken from the app state rather than read
+/// ambiently, so a [`#[sim_test]`](crate::sim_test) controls both the sampling
+/// decision and the recorded timestamps.
+fn build_shadow_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Option<crate::shadow::ShadowMirrorLayer> {
+    if !config.shadow.is_active() {
+        return None;
+    }
+    let target_base = config.shadow.target_base()?.to_owned();
+
+    // The real transport needs an HTTP client. Without the `http-client`
+    // feature there is nothing to dial the candidate with, so say so once and
+    // leave the ingress stack untouched rather than pretending to mirror.
+    #[cfg(not(feature = "http-client"))]
+    {
+        let _ = (state, target_base);
+        tracing::warn!(
+            "[shadow] enabled but this build has no `http-client` feature; \
+             traffic mirroring is inactive"
+        );
+        return None;
+    }
+
+    #[cfg(feature = "http-client")]
+    {
+        let timeout = std::time::Duration::from_millis(config.shadow.timeout_ms);
+        let transport = match crate::shadow::transport::HttpShadowTransport::new(
+            timeout,
+            config.shadow.max_body_bytes,
+        ) {
+            Ok(transport) => std::sync::Arc::new(transport),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "[shadow] could not build the mirroring HTTP client; traffic mirroring \
+                     is inactive"
+                );
+                return None;
+            }
+        };
+
+        let registry = crate::shadow::ShadowRegistry::new(config.shadow.max_records);
+        state.insert_extension(crate::shadow::ShadowHandle {
+            registry: registry.clone(),
+            enabled: true,
+            target: Some(target_base.clone()),
+        });
+
+        // One `[log] filter_parameters` list governs the access log, error
+        // pages, failure capsules, and now the recorded divergence samples.
+        let mut filter_parameters = config.log.filter_parameters.clone();
+        filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+        let filter = Arc::new(crate::log::filter::ParameterFilter::new(
+            &filter_parameters,
+            &config.log.unfilter_parameters,
+        ));
+
+        let selector = crate::shadow::MirrorSelector::new(
+            config.shadow.sample_rate,
+            &config.shadow.routes,
+            &config.actuator.prefix,
+            &probe_bypass_paths(config),
+        );
+
+        tracing::info!(
+            target = %target_base,
+            sample_rate = config.shadow.sample_rate,
+            routes = ?config.shadow.routes,
+            "Shadow traffic mirroring enabled (GET/HEAD only)"
+        );
+
+        Some(crate::shadow::ShadowMirrorLayer::new(
+            crate::shadow::MirrorSettings {
+                target_base,
+                timeout,
+                max_in_flight: config.shadow.max_in_flight,
+                max_body_bytes: config.shadow.max_body_bytes,
+                max_sample_bytes: config.shadow.max_sample_bytes,
+            },
+            selector,
+            registry,
+            transport,
+            filter,
+            state.entropy_arc(),
+            state.clock_arc(),
+        ))
+    }
+}
+
 /// Per-route timeout lookup table, keyed by the fully-qualified route template
 /// (matching [`axum::extract::MatchedPath`]) and then by HTTP method, so an
 /// override on one handler never bleeds onto sibling methods sharing the path
@@ -4624,7 +4722,7 @@ fn apply_middleware(
     //   MCP dispatch clone, outside session and the static cache] ->
     //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
     //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
-    //   Compression -> Metrics -> ExceptionFilter -> ErrorPageContext ->
+    //   Compression -> ShadowMirror -> Metrics -> ExceptionFilter -> ErrorPageContext ->
     //   ReadYourWrites -> Session -> NormalizeBody ->
     //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
     //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
@@ -4642,6 +4740,12 @@ fn apply_middleware(
     //   `try_build_router_with_static_inner`.)
     // Listed OUTERMOST FIRST — see the warning at the top of this function.
     let outer_stack = (
+        // Shadow mirroring (#1653) is the outermost member of this group and
+        // therefore INNER to compression: the primary body it tees is the
+        // handler's own bytes, which is what the candidate build returns too.
+        // Teeing a gzip-encoded body would diff against the candidate's plain
+        // one and report every route as divergent.
+        tower::util::option_layer(build_shadow_layer(config, state)),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },

@@ -11,6 +11,7 @@ mode fit together to give you a safe rollout in each case.
 | Rolling | Standard incremental rollout | Full — probes + drain handle it automatically |
 | Blue/green | Instant cutover with easy rollback | Full — probe drain + LB switch |
 | Canary | Gradual traffic shift with automated promotion | Framework primitives — version-labelled metrics, a canary-route extractor, and a controller-driven rollback signal (see [Canary deploys](#canary-deploys)) |
+| Shadow / differential | Proving the candidate answers identically before cutover | Full — in-process traffic mirroring, response differ, and `/actuator/shadow` (see [Shadow deploys](#shadow-differential-deploys)) |
 | Rolling across your own VPS fleet | Several app servers you own, behind your own load balancer, with no orchestrator | Full — `autumn deploy up` with `[deploy] hosts` rolls the hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure); see the [fleet deploys guide](fleet-deploys.md) |
 
 ---
@@ -433,6 +434,186 @@ the controller triggers.
 
 ---
 
+## Shadow (differential) deploys
+
+Every strategy above decides go/no-go from **aggregate cohort metrics** — error
+rate, p99 — after routing **real** traffic to the new build. That catches a
+build that falls over. It does not catch the build that returns `200 OK` with a
+dropped JSON field, a reordered list, or an off-by-one total, because nothing
+ever compares two responses to the same request.
+
+Shadow mirroring does exactly that. Autumn samples live `GET`/`HEAD` traffic,
+replays each sampled request against a candidate build you run alongside
+production, and diffs the two responses. The candidate's output is consumed by
+the differ and nothing else.
+
+```text
+                       ┌──────────────────┐
+  client ──request──▶  │  live build      │ ──response──▶ client
+                       └────────┬─────────┘        │
+                                │ (copy)           │ (tee)
+                       ┌────────▼─────────┐   ┌────▼─────┐
+                       │ candidate build  │──▶│  differ  │──▶ /actuator/shadow
+                       └──────────────────┘   └──────────┘        + metrics
+```
+
+### How it differs from canary
+
+|  | Canary | Shadow |
+|---|---|---|
+| Does the new build serve real users? | **Yes** — a slice of live traffic | **No** — not one byte reaches a client |
+| What is the signal? | Cohort metrics (error rate, p99) over a population | A per-request diff: *did these two builds answer the same?* |
+| Catches a subtly-wrong `200`? | No — it is a `200` in both cohorts | **Yes** — that is the whole point |
+| Blast radius of a bad candidate | Real users see it | None on the response path; the candidate's own side effects are yours to contain (see the warning below) |
+| Needs a traffic split? | Yes, at the load balancer | No — the mirror is in-process |
+
+The two compose. Run a shadow to prove behaviour equivalence, *then* canary to
+prove the build holds up under real load.
+
+### Turning it on
+
+```toml
+# autumn.toml
+[shadow]
+enabled        = true
+target         = "http://127.0.0.1:9091"  # the candidate build you started
+sample_rate    = 0.05                     # 5 % of eligible traffic
+routes         = ["/api/*"]               # empty = every eligible route
+timeout_ms     = 2000                     # per shadow request
+max_in_flight  = 8                        # concurrent mirrors; excess is dropped
+max_body_bytes = 262144                   # larger responses are not compared
+max_records    = 50                       # divergences kept for the actuator
+```
+
+Every key has an environment override (`AUTUMN_SHADOW__ENABLED`,
+`AUTUMN_SHADOW__TARGET`, `AUTUMN_SHADOW__SAMPLE_RATE`, …), so a shadow run can
+be switched on for one replica without redeploying the config.
+
+Autumn does not build, start, or orchestrate the candidate — you run it (another
+container, another port, another machine) and point `target` at it.
+
+### What is guaranteed
+
+- **The live request never waits on the mirror.** The shadow request is
+  dispatched on a detached task before the primary handler finishes, and the
+  primary response body is *teed* — frames reach the client as they are
+  produced, with a copy accumulating on the side. A slow, erroring, or
+  unreachable candidate resolves to a counter and nothing else.
+- **Only idempotent methods are mirrored.** `GET` and `HEAD`, and the set is not
+  configurable. Mirroring a `POST` would let the candidate's writes land for
+  real; that needs effect virtualization, which is a follow-up.
+- **Mirrored requests never touch primary state.** The mirror path performs no
+  database, cache, mail, or job work of its own — it copies request bytes and
+  compares response bytes.
+- **The candidate's response never reaches a user.** It is read into a plain
+  struct inside the detached task and dropped there; it is never a `Response`.
+- **Mirroring cannot recurse.** Every mirrored request carries
+  `X-Autumn-Shadow: 1`, and a request carrying that header is never mirrored
+  again — so pointing a shadow target at the app itself costs one extra request,
+  not an exponential storm. Your candidate build can read the same header to
+  refuse writes.
+- **Actuator and probe paths are never mirrored**, so load-balancer health
+  checks do not drown the candidate.
+
+### What is compared
+
+Two things, and deliberately only two:
+
+1. **Status class.** `2xx` vs `5xx` diverges. `200` vs `201` does not.
+2. **Normalized body.** JSON is parsed and object keys sorted, so two builds
+   serialising the same map in a different order agree. **Array order is
+   preserved** — a reordered list *is* a divergence, because that is exactly the
+   class of regression this exists to catch. Text bodies have `\r\n` folded to
+   `\n` and outer whitespace trimmed. Anything else is compared byte-for-byte.
+
+Headers, latency, and fuzzy JSON tolerance are **not** compared. A response
+whose body is larger than `max_body_bytes` is not compared at all (counted as
+`skipped_oversize`) rather than partially buffered.
+
+### Reading the results
+
+```console
+$ curl -s localhost:3000/actuator/shadow | jq
+{
+  "enabled": true,
+  "target": "http://127.0.0.1:9091",
+  "stats": {
+    "mirrored": 4120, "compared": 4118, "matched": 4109, "diverged": 9,
+    "shadow_errors": 2, "shadow_timeouts": 0,
+    "dropped_at_capacity": 0, "skipped_oversize": 0
+  },
+  "divergences": [
+    {
+      "method": "GET",
+      "target": "/api/orders?page=2",
+      "route": "/api/*",
+      "occurrences": 9,
+      "kind": "body",
+      "primary_status": 200,
+      "shadow_status": 200,
+      "primary_digest": "9f2c…", "shadow_digest": "41ab…",
+      "primary_sample": { "id": 7, "total": 42 },
+      "shadow_sample": { "id": 7 },
+      "fingerprint": "3d91a2f0c4e7b158"
+    }
+  ]
+}
+```
+
+`/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),
+like `/actuator/tasks` — the samples are excerpts of real production responses.
+A replica with mirroring off answers `{"enabled": false, …}` rather than `404`,
+so you can tell "off here" from "not in this build".
+
+Identical divergences collapse onto one record by `fingerprint`, a
+content-addressed id derived only from the two responses. The same captured pair
+always produces the same fingerprint, so a divergence is reproducible and
+quotable in a bug report, and one loud regression cannot evict every other
+record from the ring.
+
+Two labelled metrics carry the same signal into your dashboards:
+
+- `autumn_shadow_comparisons_total{route, outcome}` — `outcome` is `match`,
+  `diverged`, `error`, `timeout`, `skipped`, or `dropped`.
+- `autumn_shadow_divergences_total{route, kind}` — the series to alert on; it
+  stays at zero on a clean run.
+
+The `route` label is the **configured pattern** the request matched (`"/api/*"`),
+or `"*"` when no `routes` allowlist is set — never the raw URL, so an unbounded
+URL space cannot become unbounded metric cardinality.
+
+### PII in recorded samples
+
+Recorded samples pass through the same `[log] filter_parameters` /
+`[log] unfilter_parameters` redaction the access log, error pages, and failure
+capsules use, and encrypted column names are always filtered. Sensitive query
+parameters in the recorded request target are redacted the same way.
+
+Only **JSON** bodies are sampled. A JSON body has named keys the filter can
+reason about; an HTML or binary body does not, so for those Autumn records the
+digest, the byte length, and the content type — enough to prove the builds
+disagree, without an excerpt no redaction rule could vet.
+
+### ⚠️ Before you turn this on
+
+- **The candidate receives live credentials.** Cookies and `Authorization`
+  headers are forwarded, because a candidate that cannot authenticate answers
+  every protected route with a `401` and the diff degenerates into noise. Treat
+  the shadow target as exactly as trusted as production.
+- **The candidate's own side effects are real.** Autumn guarantees the mirror
+  does not touch *primary* state. It cannot stop the candidate from writing to a
+  database you pointed it at. Run the candidate against a scratch database, a
+  read-only replica, or with writes disabled — the `X-Autumn-Shadow: 1` header
+  on every mirrored request is the hook for that.
+- **Mirroring is extra load** on the candidate and on this process's outbound
+  connections. Start at a low `sample_rate` and a narrow `routes` allowlist.
+- **Expect benign divergences.** Timestamps, generated ids, and CSRF tokens in a
+  response body differ between two builds by construction. This slice has no
+  fuzzy-tolerance knob (deliberately); scope `routes` to the endpoints whose
+  bodies are deterministic.
+
+---
+
 ## Choosing a strategy
 
 | Situation | Recommended strategy |
@@ -442,6 +623,7 @@ the controller triggers.
 | High-risk release requiring fast rollback | Blue/green |
 | Incident response — stop traffic immediately | [Maintenance mode](maintenance-mode.md) |
 | Gradual rollout with automated promotion | [Canary](#canary-deploys) — platform traffic weights gated on Autumn's version-labelled metrics, with `autumn canary rollback` for a clean drain |
+| Prove a build is behaviour-equivalent before it serves anyone | [Shadow](#shadow-differential-deploys) — mirror real `GET`/`HEAD` traffic to a candidate and diff responses request-for-request |
 | Several VPS hosts you own, no orchestrator | [`autumn deploy up` with `[deploy] hosts`](fleet-deploys.md) — serial rolling deploy driven by the CLI, per-host blue/green, one migration per fleet |
 | A whole fleet must pause writes at once | [`autumn deploy maintenance on`](fleet-deploys.md#runbook-a-fleet-wide-maintenance-window) — note it gates traffic, it does not drain hosts from the load balancer |
 
@@ -456,5 +638,8 @@ the controller triggers.
 - **Monitor drains**: the `autumn_shutdown_aborted_requests_total` metric
   increments when a request is abandoned during shutdown. Alert on it to catch
   an undersized `shutdown_timeout_secs`.
+- **Prove equivalence, not just health**: a [shadow run](#shadow-differential-deploys)
+  answers "does the candidate return the same bytes?" — the question cohort
+  metrics structurally cannot.
 - **Full cloud-native setup**: Kubernetes readiness probes, OTLP tracing, and
   structured logging are covered in the [Cloud-Native Guide](cloud-native.md).

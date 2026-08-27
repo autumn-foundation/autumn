@@ -384,6 +384,17 @@ pub trait ProvideActuatorState {
     fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
         None
     }
+
+    /// Returns the shadow-mirroring handle, when this replica assembled a
+    /// mirror (`[shadow] enabled = true` with a reachable target configured).
+    ///
+    /// The default returns `None` — mirroring is off — and
+    /// `{prefix}/shadow` then reports a disabled mirror rather than 404ing, so
+    /// an operator turning the feature on can tell "not enabled here" apart
+    /// from "endpoint not mounted".
+    fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
+        None
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -3508,6 +3519,26 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
+/// `GET <actuator-prefix>/shadow` -- shadow-mirroring counters and the most
+/// recent primary-vs-shadow divergences (issue #1653).
+///
+/// Sensitive-gated, like `/tasks` and `/jobs`: the recorded samples are
+/// redacted excerpts of real production responses, so this is not a public
+/// surface. A replica with mirroring switched off answers with
+/// `{"enabled": false, ...}` rather than `404`, so an operator can tell
+/// "mirroring is off here" apart from "this build has no such endpoint".
+pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<crate::shadow::ShadowSnapshot> {
+    Json(
+        state
+            .shadow()
+            .map_or_else(crate::shadow::ShadowHandle::disabled_snapshot, |handle| {
+                handle.snapshot()
+            }),
+    )
+}
+
 #[cfg(feature = "http-client")]
 /// Request body for `POST <actuator-prefix>/webhooks/replay`.
 #[derive(Deserialize)]
@@ -3868,6 +3899,7 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        paths.push(actuator_route_path(prefix, "/shadow"));
         #[cfg(feature = "system-info")]
         {
             paths.push(actuator_route_path(prefix, "/system"));
@@ -4012,6 +4044,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/shadow"),
+                axum::routing::get(shadow_endpoint::<S>),
             );
         #[cfg(feature = "http-client")]
         {

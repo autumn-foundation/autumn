@@ -33,6 +33,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shadow (differential) deploys — mirror live traffic to a candidate build and
+  diff its responses before cutover (#1653):** every deploy strategy Autumn
+  shipped until now — rolling, blue/green, canary — routes **real** traffic to
+  the new version and decides go/no-go from aggregate cohort metrics. That
+  catches a build that falls over; it structurally cannot catch the build that
+  returns `200 OK` with a dropped JSON field, a reordered list, or an off-by-one
+  total, because nothing ever compares two responses to the *same* request. A
+  new `[shadow]` section turns on in-process traffic mirroring: Autumn samples
+  live `GET`/`HEAD` requests, replays each against an operator-provided
+  candidate build, and diffs the two responses on status class and a normalized
+  body. Object key order is normalized away; array order is not, because a
+  reordered list is exactly the regression this exists to catch. Divergences are
+  reported at `{actuator-prefix}/shadow` (sensitive-gated, like
+  `/actuator/tasks`) and as the labelled metrics
+  `autumn_shadow_comparisons_total{route,outcome}` and
+  `autumn_shadow_divergences_total{route,kind}`; identical divergences collapse
+  onto one record by a content-addressed `fingerprint`, so a captured pair is
+  reproducible and one loud regression cannot evict every other record. The live
+  request cannot tell mirroring is on: the shadow request is dispatched on a
+  detached task and the primary response body is *teed* rather than buffered, so
+  a slow, erroring, or unreachable candidate resolves to a counter and nothing
+  else — bounded by `sample_rate`, `timeout_ms`, `max_in_flight` (excess is
+  dropped, never queued), and `max_body_bytes` (an oversize body is skipped, not
+  partially buffered). The candidate's response is read into a plain struct
+  inside that task and dropped there, so no code path exists on which it could
+  reach a user; only idempotent methods are mirrored, and the allowlist is a
+  constant rather than a config key. Every mirrored request carries
+  `X-Autumn-Shadow: 1`, which is both the recursion guard (a request carrying it
+  is never mirrored again, so pointing a shadow at the app itself costs one
+  extra request rather than an exponential storm) and the seam a candidate build
+  uses to refuse writes. Recorded samples pass through the same
+  `[log] filter_parameters` redaction as the access log and failure capsules,
+  and only JSON bodies are sampled — an HTML or binary body records a digest and
+  a length instead of an excerpt no redaction rule could vet. Off by default;
+  see `docs/guide/staged-deploys.md` for how it differs from canary and for the
+  trust boundary (the candidate receives live credentials, and its own side
+  effects are yours to contain). Effect virtualization for mutating traffic, and
+  gating `autumn deploy` on a clean diff, are deliberate follow-ups.
+
 - **`#[query_budget(N)]` — a compile-time, per-route database query budget
   (#1667):** declare a handler's query ceiling and the build fails when any
   statically reachable path can exceed it. The canonical case is the N+1 — a

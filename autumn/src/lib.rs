@@ -473,6 +473,9 @@ pub mod reporting;
 pub mod scheduler;
 pub mod security;
 pub mod session;
+/// Live-traffic shadow mirroring and primary-vs-shadow response diffing
+/// (issue #1653) — see `docs/guide/staged-deploys.md`.
+pub mod shadow;
 /// URL-safe slug generation (`slugify`), shared by the scaffold generator's
 /// `slug:slug{from:...}` DSL token and any hand-written app.
 pub mod slug;

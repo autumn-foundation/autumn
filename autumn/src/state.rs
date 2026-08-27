@@ -1091,6 +1091,18 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.health_detailed
     }
 
+    /// The shadow-mirroring handle, installed into the runtime extension map
+    /// when the framework router assembled a mirror layer for this app.
+    ///
+    /// Read from extensions rather than stored as an `AppState` field because
+    /// the mirror is built during router assembly — after the state exists —
+    /// and because an app that never enables `[shadow]` should carry no extra
+    /// bytes for it.
+    fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
+        self.extension::<crate::shadow::ShadowHandle>()
+            .map(|handle| (*handle).clone())
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),
