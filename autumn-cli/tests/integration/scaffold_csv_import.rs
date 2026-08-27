@@ -541,6 +541,53 @@ fn the_import_is_capped_by_rows_as_well_as_by_bytes() {
     );
 }
 
+/// Two things the counts alone cannot say, both raised by review:
+///
+/// * a row reported as FAILED may still be in the database — `after_create`
+///   hooks run once the insert has committed, and `save_many_skip_invalid`
+///   returns such a row's index among the failures with no way to tell it from
+///   a row that never landed;
+/// * a column the form does not carry is silently dropped, so an operator can
+///   edit it in a spreadsheet and watch nothing happen.
+#[test]
+fn the_report_says_what_the_counts_cannot() {
+    let (_tmp, routes) = import_routes("import-caveats", &[]);
+    let view = fn_slice(&routes, "import_report_view");
+    assert!(
+        view.contains("@if write_failures > 0 {") && view.contains("after-create hook"),
+        "a database-stage failure must carry the after-commit-hook caveat:\n{view}"
+    );
+
+    // The discarded-column alert is emitted only where a column can actually be
+    // discarded — `id`/`created_at` are in every exported file and warning about
+    // them would fire on every ordinary round trip.
+    assert!(
+        !routes.contains("CSV_DISCARDED_COLUMNS"),
+        "a model with no droppable column needs no discarded-column alert:\n{routes}"
+    );
+
+    let (_tmp2, project, _) = scaffold_project(
+        "import-discarded",
+        &["title:String", "tag:String", "--default", "tag=general"],
+        &["--import"],
+    );
+    let defaulted = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        defaulted.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["tag"];"#),
+        "a --default'ed column is one the import silently cannot set:\n{defaulted}"
+    );
+    let import = handler_slice(&defaulted, "import");
+    assert!(
+        import.contains("discarded_seen = CSV_DISCARDED_COLUMNS.iter().any(|column| {"),
+        "the parse pass must notice a value for a column it will drop:\n{import}"
+    );
+    let defaulted_view = fn_slice(&defaulted, "import_report_view");
+    assert!(
+        defaulted_view.contains("@if discarded_seen {"),
+        "the report must say so when a supplied value was dropped:\n{defaulted_view}"
+    );
+}
+
 // ── AC5: CSRF, size limit, and a content-type/extension check ─────────────────
 
 #[test]

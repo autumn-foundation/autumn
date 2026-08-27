@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never shows two different lines for one row. Multi-line quoted fields still
   push the rows after them down, in both dialects. The shift is measured once,
   so a file that *mixes* terminators still drifts — noted where the calibration
-  lives.
+  lives. The header's true span is measured (a quoted header field may carry
+  embedded newlines) rather than assumed to be one line, so the correction fixes
+  the CRLF case without disturbing rows under a multi-line header.
 
 - **TLS-enabled migrations no longer panic when applied from an app's own
   async `on_startup` hook:** the sync migration/wait-check path bridges to

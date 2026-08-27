@@ -10519,7 +10519,7 @@ fn is_csv_upload(file_name: Option<&str>, content_type: Option<&str>) -> bool {
     named_csv && declared_ok
 }
 
-__IGNORED_COLUMNS_CONST____CELL_FNS__/// The CSV upload control: the expected column list, the file input, and the
+__IGNORED_COLUMNS_CONST____DISCARDED_CONST____CELL_FNS__/// The CSV upload control: the expected column list, the file input, and the
 /// commit confirmation.
 ///
 /// Shared by `GET /__PLURAL__/import`, the 422 re-render when an upload is
@@ -10593,6 +10593,8 @@ fn import_report_view(
     __LOCALE_REF_PARAM__report: &autumn_web::data::csv::ImportReport,
     committed: bool,
     write_failure: Option<&str>,
+    write_failures: usize,
+    __DISCARDED_PARAM__: bool,
 ) -> Markup {
     html! {
         h2 {
@@ -10613,6 +10615,15 @@ fn import_report_view(
         @if let Some(failure) = write_failure {
             p role="alert" { __L_WRITE_FAILED__ ": " (failure) }
         }
+        // A row the DATABASE stage rejected is usually a row that was not
+        // written — but not always, and the difference matters to whoever is
+        // about to re-upload. `after_create` hooks run AFTER the insert commits,
+        // so a hook that fails puts an already-persisted row in this list. The
+        // repository returns no way to tell the two apart, so say so rather than
+        // let the count imply something it cannot promise.
+        @if write_failures > 0 {
+            p role="alert" { __L_WRITE_CAVEAT__ }
+        }__DISCARDED_MARKUP__
         // Rows the cap left unprocessed. Loud, and above the error table: an
         // import that quietly stopped two thirds of the way through a file is
         // the one failure an operator must not have to infer from arithmetic.
@@ -10822,8 +10833,10 @@ pub async fn import(
     let mut pending_lines: Vec<u64> = Vec::new();
     let mut pending_rows: Vec<New__PASCAL__> = Vec::new();
     let mut rows_seen: u64 = 0;
+    // Whether the file supplied a value for a column this import cannot set.
+    let __DISCARDED_MUT__discarded_seen = false;
     let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {
-        rows_seen += 1;
+        rows_seen += 1;__DISCARDED_PROBE__
         if rows_seen > MAX_IMPORT_ROWS {
             // Past the cap. Count the row and move on WITHOUT decoding,
             // validating, or allocating an error for it — those are exactly the
@@ -10869,6 +10882,10 @@ pub async fn import(
     // chunk may already be committed, so the page has to say so instead of
     // 500ing on a half-finished import.
     let mut write_failure: Option<String> = None;
+    // Rows the DATABASE stage rejected, as opposed to rows that failed to parse
+    // or validate. Only these carry the after-commit-hook caveat the report
+    // notes: a parse failure never reached the database at all.
+    let mut write_failures: usize = 0;
     if commit {
         // NOT `?`. `save_many_skip_invalid` isolates the row-level failures a
         // constraint causes, but a chunk that fails for another reason — a
@@ -10894,6 +10911,7 @@ pub async fn import(
         // unique race is a failure, and `inserted + errors = rows read` has to
         // keep holding or the report is lying about what happened.
         report.inserted = saved.len() as u64;
+        write_failures = failures.len();
         for (index, failure) in failures {
             let line = pending_lines.get(index).copied().unwrap_or_default();
             report.errors.push(autumn_web::data::csv::CsvRowError::row(line, failure.to_string()));
@@ -10906,7 +10924,7 @@ pub async fn import(
     }
     let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
         h1 { __L_HEADING__ }
-        (import_report_view(__LOCALE_ARG__&report, commit, write_failure.as_deref()))
+        (import_report_view(__LOCALE_ARG__&report, commit, write_failure.as_deref(), write_failures, discarded_seen))
         (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, None))
         (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
     });
@@ -10996,6 +11014,74 @@ fn render_csv_import_section(
     // does not carry them — so without this line an operator could edit one in a
     // spreadsheet, re-upload, and watch nothing happen, with no error and no row
     // in the report to explain it.
+    // The subset of the ignored columns whose presence in a file is genuinely
+    // surprising: `id` and `created_at` are assigned by the database and every
+    // exported file carries them, so flagging those would fire on every ordinary
+    // round trip. A `--default`ed column, a `position` column or an
+    // `Attachment`, though, is a column an operator can edit in a spreadsheet
+    // and watch silently do nothing — that is what the report warns about.
+    let discarded_columns: Vec<&str> = ignored_columns
+        .iter()
+        .copied()
+        .filter(|name| *name != "id" && *name != "created_at")
+        .collect();
+    // A model with no droppable column emits none of this: no const, no probe,
+    // no markup — and the local and the view's parameter lose their `mut` and
+    // gain a leading underscore, because an unused binding is a warning in the
+    // user's app and the scaffold's contract is that generated code compiles
+    // clean.
+    let (discarded_mut, discarded_param) = if discarded_columns.is_empty() {
+        ("", "_discarded_seen")
+    } else {
+        ("mut ", "discarded_seen")
+    };
+    let (discarded_const, discarded_probe, discarded_markup) = if discarded_columns.is_empty() {
+        (String::new(), String::new(), String::new())
+    } else {
+        let names = discarded_columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Recorded in this branch for the same reason as the ignored-columns
+        // label below: `ViewLabels` records a key the moment it is asked for, so
+        // a key looked up for markup this model does not emit would land in
+        // `i18n/en.ftl` unreferenced — what `autumn i18n check --strict` fails on.
+        let discarded_label = labels.markup(
+            "common.import.columns.discarded",
+            "This file carries values for columns the import cannot set, and they were ignored",
+        );
+        (
+            format!(
+                "/// Columns this import silently cannot set, EXCLUDING the two the\n\
+                 /// database always assigns (`id`, `created_at`) — those are in every\n\
+                 /// exported file and warning about them would fire on every ordinary\n\
+                 /// round trip. These are the ones an operator can edit in a\n\
+                 /// spreadsheet and watch do nothing, so the report says so when the\n\
+                 /// uploaded file actually carries a value for one.\n\
+                 const CSV_DISCARDED_COLUMNS: &[&str] = &[{names}];\n\n"
+            ),
+            "\n        if !discarded_seen {\n            \
+             discarded_seen = CSV_DISCARDED_COLUMNS.iter().any(|column| {\n                \
+             row.get(*column).is_some_and(|value| !value.trim().is_empty())\n            \
+             });\n        }"
+                .to_owned(),
+            [
+                "",
+                "        // The file supplied a value for a column this import cannot set.",
+                "        // Silently dropping an operator's edit is the one failure this",
+                "        // report could otherwise hide completely.",
+                "        @if discarded_seen {",
+                "            p role=\"alert\" {",
+                &format!("                {discarded_label}"),
+                "                \": \"",
+                "                code { (CSV_DISCARDED_COLUMNS.join(\", \")) }",
+                "            }",
+                "        }",
+            ]
+            .join("\n"),
+        )
+    };
     let (ignored_columns_const, ignored_columns_markup) = if ignored_columns.is_empty() {
         (String::new(), String::new())
     } else {
@@ -11004,6 +11090,14 @@ fn render_csv_import_section(
             .map(|name| format!("\"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        // Recorded in this branch, not in the `.replace(…)` chain below:
+        // `ViewLabels` records a key the moment it is asked for, so looking one
+        // up for markup this model does not emit would leave an unreferenced key
+        // in `i18n/en.ftl` — exactly what `autumn i18n check --strict` fails on.
+        let ignored_label = labels.markup(
+            "common.import.columns.ignored",
+            "Columns in the file that this import cannot set",
+        );
         (
             format!(
                 "/// Exported columns the import cannot set — the database assigns\n\
@@ -11013,8 +11107,15 @@ fn render_csv_import_section(
                  /// editing one and watching nothing happen.\n\
                  const CSV_IGNORED_COLUMNS: &[&str] = &[{names}];\n\n"
             ),
-            "\n        p {\n            __L_IGNORED_NOTE__\n            \": \"\n            code { (CSV_IGNORED_COLUMNS.join(\", \")) }\n        }"
-                .to_owned(),
+            [
+                "",
+                "        p {",
+                &format!("            {ignored_label}"),
+                "            \": \"",
+                "            code { (CSV_IGNORED_COLUMNS.join(\", \")) }",
+                "        }",
+            ]
+            .join("\n"),
         )
     };
     // Which cell rules this model needs, and the expression that applies them.
@@ -11065,15 +11166,13 @@ fn render_csv_import_section(
         ));
     }
     CSV_IMPORT_TEMPLATE
+        .replace("__DISCARDED_MUT__", discarded_mut)
+        .replace("__DISCARDED_PARAM__", discarded_param)
+        .replace("__DISCARDED_CONST__", &discarded_const)
+        .replace("__DISCARDED_PROBE__", &discarded_probe)
+        .replace("__DISCARDED_MARKUP__", &discarded_markup)
         .replace("__IGNORED_COLUMNS_CONST__", &ignored_columns_const)
         .replace("__IGNORED_COLUMNS_MARKUP__", &ignored_columns_markup)
-        .replace(
-            "__L_IGNORED_NOTE__",
-            &labels.markup(
-                "common.import.columns.ignored",
-                "Columns in the file that this import cannot set",
-            ),
-        )
         .replace("__CELL_FNS__", &cell_fns)
         .replace("__CELL_CALL__", cell_call)
         .replace("__LOCALE_REF_PARAM__", locale_ref_param)
@@ -11144,7 +11243,14 @@ fn render_csv_import_section(
             "__L_WRITE_FAILED__",
             &labels.markup(
                 "common.import.write.failed",
-                "The write failed partway through. Rows already committed are NOT                  listed below — check the list view before uploading this file again,                  or it will import them twice",
+                "The write failed partway through. Rows already committed are NOT listed below — check the list view before uploading this file again, or it will import them twice",
+            ),
+        )
+        .replace(
+            "__L_WRITE_CAVEAT__",
+            &labels.markup(
+                "common.import.write.caveat",
+                "A row listed as failed below may still have been written: an after-create hook runs once the insert has committed, and a failure there is reported here. Check the list view before importing this file again.",
             ),
         )
         .replace(
@@ -14859,9 +14965,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src/models")).unwrap();
         fs::write(
             tmp.path().join(format!("src/models/{base}.rs")),
-            format!(
-                "#[autumn_web::model]\npub struct {pascal} {{\n    #[id]\n    pub id: i64,\n}}\n"
-            ),
+            format!("#[autumn_web::model]\npub struct {pascal} {{\n #[id]\n pub id: i64,\n}}\n"),
         )
         .unwrap();
     }
@@ -20164,9 +20268,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
-            routes.contains(
-                "        .first(&mut *db)\n        .await\n        .map_err(AutumnError::not_found)?;"
-            ),
+            routes.contains(" .first(&mut *db)\n .await\n .map_err(AutumnError::not_found)?;"),
             "show/edit must map a missing row to a 404 via AutumnError::not_found: {routes}"
         );
     }

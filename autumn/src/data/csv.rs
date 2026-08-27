@@ -336,16 +336,27 @@ where
     // it share that number rather than climbing, which is the parser's limit,
     // not this offset's.
     //
-    // The shift is measured ONCE, so it assumes the file is internally
-    // consistent. Two inputs it cannot serve: a file that MIXES terminators (an
-    // editor that appended an LF row to a CRLF export, or two exports
-    // concatenated), where the rows after the switch drift by one; and a header
-    // carrying an embedded newline inside a quoted field, which mis-calibrates
-    // by however many lines it spans. Both are rare next to "the file came out
-    // of Excel", and the alternative — trusting a counter that disagrees with
-    // itself across dialects — is wrong on the common case instead of the
-    // exotic ones.
-    let line_offset: i64 = 2 - i64::try_from(rdr.position().line()).unwrap_or(2);
+    // The shift is measured ONCE, so it assumes the file's terminators are
+    // internally consistent. The one input it cannot serve is a file that MIXES
+    // them — an editor that appended an LF row to a CRLF export, or two exports
+    // concatenated — where the rows after the switch drift by one. That is rare
+    // next to "the file came out of Excel", and the alternative (trusting a
+    // counter that disagrees with itself across dialects) is wrong on the common
+    // case instead of the exotic one.
+    // The header's TRUE span, so the shift is the dialect's alone. A header is
+    // normally one line, but a quoted header field may carry embedded newlines
+    // — and assuming one line there would push every data row's number back by
+    // however many lines the header really spans, turning numbers that were
+    // right before this calibration into ones that are wrong. Count the
+    // newlines the parser kept inside the header's own fields instead.
+    let header_lines: u64 = 1 + headers
+        .iter()
+        .map(|field| field.matches('\n').count() as u64)
+        .sum::<u64>();
+    // The first data row therefore starts at `header_lines + 1`; whatever the
+    // parser calls that row is the convention to correct for.
+    let line_offset: i64 = i64::try_from(header_lines.saturating_add(1)).unwrap_or(2)
+        - i64::try_from(rdr.position().line()).unwrap_or(2);
     let absolute_line = move |raw: u64| -> u64 {
         let raw = i64::try_from(raw).unwrap_or(i64::MAX);
         u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
@@ -691,6 +702,26 @@ mod tests {
             report.errors[0].message
         );
         assert_eq!(report.total_rows(), 1);
+    }
+
+    /// A header that itself spans two lines (a quoted field with an embedded
+    /// newline in it) pushes every data row down by one — and the reported
+    /// numbers must move with it, in both dialects. This is what stops the
+    /// dialect calibration from assuming every header is one line: doing so
+    /// would take numbers that were RIGHT on an LF file and make them wrong.
+    #[test]
+    fn import_csv_line_numbers_survive_a_multi_line_header() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            import_csv(csv, &ImportOptions::default(), |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            });
+            seen
+        };
+        // The header occupies lines 1-2, so the data rows are on 3 and 4.
+        assert_eq!(lines(b"\"a\nz\",b\nr1,x\nr2,y\n"), vec![3, 4]);
+        assert_eq!(lines(b"\"a\r\nz\",b\r\nr1,x\r\nr2,y\r\n"), vec![3, 4]);
     }
 
     /// A quoted field carrying an embedded newline moves the rows after it down

@@ -265,6 +265,31 @@ injection (numeric/date/bool/enum columns are not guarded — guarding them
 would corrupt a negative number). Not emitted for `--live`, `--sharded`,
 owner-scoped `--live-validation`, or `--api` (issue #1315).
 
+**Scaffold CSV import `--import` (trunk-dev)**: the symmetric counterpart to the
+export (issue #1393). `autumn generate scaffold Post title:String --import` adds
+a `GET /<plural>/import` upload form (file input, an "Import for real" checkbox,
+the expected header row printed from the same `CsvSchema` the export writes, and
+the columns the import cannot set) and a `#[secured] POST /<plural>/import`
+handler. **A dry run is the default**: unless the submit carries the `commit`
+confirmation, the handler runs `autumn_web::data::csv::import_csv` in
+`ImportMode::DryRun` and renders the `ImportReport` — rows read, rows that
+*would* insert, and a table of row errors with **line numbers** — without
+writing. A confirmed submit runs the same parse in write mode and commits
+through the repository's `save_many_skip_invalid`, so a row the database rejects
+is isolated and reported against its own CSV line instead of aborting the batch.
+Each row is re-encoded and handed to the module's own `decode_form`, so it is
+validated by exactly the `#[validate(...)]` rules a browser submission goes
+through. The planner auto-enables autumn-web's `multipart` feature (`csv` comes
+from the export). **Insert-only** — no row is matched against an existing
+record, so re-uploading an exported file duplicates it; use
+`ImportMode::Upsert { by }` by hand for update-in-place. Bounded by
+`MAX_IMPORT_BYTES` (2 MiB) *and* `MAX_IMPORT_ROWS` (10 000, rows past it counted
+and reported as skipped); the upload is checked by extension **and** declared
+content type. Not emitted for `--live`, `--sharded`, owner-scoped
+`--live-validation`, `--api`, or a model with an at-rest `{encrypted}` column
+(the export omits that column but the form requires it) — the generator warns
+and emits nothing, naming the reason and what to drop.
+
 **Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
 also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page
 listing deleted rows through the repository's generated `page_only_deleted`
