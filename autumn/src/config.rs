@@ -171,6 +171,15 @@
 //! | `AUTUMN_CLUSTER__NODE_ID` | `cluster.node_id` | `String` |
 //! | `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` | `cluster.push_interval_ms` | `u64` |
 //! | `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` | `cluster.suspicion_timeout_ms` | `u64` |
+//! | `AUTUMN_SHADOW__ENABLED` | `shadow.enabled` | `bool` |
+//! | `AUTUMN_SHADOW__TARGET` | `shadow.target` | `String` |
+//! | `AUTUMN_SHADOW__SAMPLE_RATE` | `shadow.sample_rate` | `f64` |
+//! | `AUTUMN_SHADOW__ROUTES` | `shadow.routes` | comma-separated patterns |
+//! | `AUTUMN_SHADOW__TIMEOUT_MS` | `shadow.timeout_ms` | `u64` |
+//! | `AUTUMN_SHADOW__MAX_IN_FLIGHT` | `shadow.max_in_flight` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_BODY_BYTES` | `shadow.max_body_bytes` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_RECORDS` | `shadow.max_records` | `usize` |
+//! | `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` | `shadow.max_sample_bytes` | `usize` |
 
 use std::path::{Path, PathBuf};
 
@@ -1069,6 +1078,26 @@ pub struct AutumnConfig {
     /// this ordering breaks.
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    /// Live-traffic shadow mirroring and response diffing (`[shadow]` section,
+    /// issue #1653).
+    ///
+    /// Off by default. When enabled, a sampled slice of `GET`/`HEAD` traffic is
+    /// replayed against an operator-provided candidate build and the two
+    /// responses are diffed; see [`crate::shadow::ShadowConfig`] and
+    /// `docs/guide/staged-deploys.md`.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy) and `cluster` are: `DatabaseConfig`'s
+    /// `deserialize_with` duration field can abort the `SchemaDeserializer`
+    /// traversal, and a section it never descends into is recorded only as an
+    /// opaque root leaf — so a typo like `[shadow] targt = "…"` would be
+    /// silently accepted and the mirror would never run. The regression guard
+    /// `shadow_child_keys_are_strictly_validated` fails if this ordering breaks.
+    #[serde(default)]
+    pub shadow: crate::shadow::ShadowConfig,
 
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
@@ -4208,6 +4237,10 @@ impl AutumnConfig {
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         self.time_zone.validate()?;
+        // A `[shadow]` block that is switched on but cannot be honoured (no
+        // target, an unusable URL, an out-of-range sample rate) must fail boot
+        // rather than start a replica that silently mirrors nothing.
+        self.shadow.validate().map_err(ConfigError::Validation)?;
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
@@ -4297,6 +4330,15 @@ impl AutumnConfig {
     /// - `AUTUMN_CLUSTER__NODE_ID` → `cluster.node_id` (`String`)
     /// - `AUTUMN_CLUSTER__PUSH_INTERVAL_MS` → `cluster.push_interval_ms` (`u64`)
     /// - `AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS` → `cluster.suspicion_timeout_ms` (`u64`)
+    /// - `AUTUMN_SHADOW__ENABLED` → `shadow.enabled` (`bool`)
+    /// - `AUTUMN_SHADOW__TARGET` → `shadow.target` (`String`)
+    /// - `AUTUMN_SHADOW__SAMPLE_RATE` → `shadow.sample_rate` (`f64`)
+    /// - `AUTUMN_SHADOW__ROUTES` → `shadow.routes` (comma-separated patterns)
+    /// - `AUTUMN_SHADOW__TIMEOUT_MS` → `shadow.timeout_ms` (`u64`)
+    /// - `AUTUMN_SHADOW__MAX_IN_FLIGHT` → `shadow.max_in_flight` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_BODY_BYTES` → `shadow.max_body_bytes` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_RECORDS` → `shadow.max_records` (`usize`)
+    /// - `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` → `shadow.max_sample_bytes` (`usize`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -4340,6 +4382,47 @@ impl AutumnConfig {
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
         self.apply_cluster_env_overrides_with_env(env);
+        self.apply_shadow_env_overrides_with_env(env);
+    }
+
+    fn apply_shadow_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_SHADOW__ENABLED", &mut self.shadow.enabled);
+        parse_env_option_string(env, "AUTUMN_SHADOW__TARGET", &mut self.shadow.target);
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__SAMPLE_RATE",
+            &mut self.shadow.sample_rate,
+        );
+        // `_non_empty`: an unfilled template (`AUTUMN_SHADOW__ROUTES=`) must not
+        // become a one-element allowlist containing the empty pattern, which
+        // matches no path and would silently mirror nothing (issue #1621's
+        // failure shape).
+        parse_env_csv_non_empty(env, "AUTUMN_SHADOW__ROUTES", &mut self.shadow.routes);
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__TIMEOUT_MS",
+            &mut self.shadow.timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_IN_FLIGHT",
+            &mut self.shadow.max_in_flight,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_BODY_BYTES",
+            &mut self.shadow.max_body_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_RECORDS",
+            &mut self.shadow.max_records,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SHADOW__MAX_SAMPLE_BYTES",
+            &mut self.shadow.max_sample_bytes,
+        );
     }
 
     fn apply_cluster_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -11343,6 +11426,62 @@ path = "/healthz"
         assert!(
             config.cluster.validate().is_ok(),
             "…and a cluster_name at the cap must be accepted, or the rule is vacuous"
+        );
+    }
+
+    #[test]
+    fn shadow_env_overrides_apply() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SHADOW__ENABLED", "true")
+            .with("AUTUMN_SHADOW__TARGET", "http://127.0.0.1:9091")
+            .with("AUTUMN_SHADOW__SAMPLE_RATE", "0.25")
+            .with("AUTUMN_SHADOW__ROUTES", "/api/*, /status")
+            .with("AUTUMN_SHADOW__TIMEOUT_MS", "750")
+            .with("AUTUMN_SHADOW__MAX_IN_FLIGHT", "16")
+            .with("AUTUMN_SHADOW__MAX_BODY_BYTES", "4096")
+            .with("AUTUMN_SHADOW__MAX_RECORDS", "12")
+            .with("AUTUMN_SHADOW__MAX_SAMPLE_BYTES", "256");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.shadow.enabled);
+        assert_eq!(
+            config.shadow.target.as_deref(),
+            Some("http://127.0.0.1:9091")
+        );
+        assert!((config.shadow.sample_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.shadow.routes, vec!["/api/*", "/status"]);
+        assert_eq!(config.shadow.timeout_ms, 750);
+        assert_eq!(config.shadow.max_in_flight, 16);
+        assert_eq!(config.shadow.max_body_bytes, 4096);
+        assert_eq!(config.shadow.max_records, 12);
+        assert_eq!(config.shadow.max_sample_bytes, 256);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_empty_shadow_routes_override_does_not_disable_mirroring() {
+        // An unfilled compose/CI template (`AUTUMN_SHADOW__ROUTES=`) must not
+        // become a one-element allowlist holding the empty pattern: that
+        // matches no path, so the mirror would run and mirror nothing, with no
+        // diagnostic. Same failure shape `parse_env_csv_non_empty` was added
+        // for in #1621.
+        let env = MockEnv::new().with("AUTUMN_SHADOW__ROUTES", "");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.shadow.routes.is_empty());
+    }
+
+    #[test]
+    fn top_level_validation_rejects_an_unusable_shadow_section() {
+        // Guards the `self.shadow.validate()?` call in `AutumnConfig::validate`:
+        // without it a replica boots with mirroring "on" and no target.
+        let mut config = AutumnConfig::default();
+        config.shadow.enabled = true;
+        let error = config.validate().expect_err("must reject");
+        assert!(
+            error.to_string().contains("shadow.target"),
+            "the boot failure must name the missing key, got: {error}"
         );
     }
 

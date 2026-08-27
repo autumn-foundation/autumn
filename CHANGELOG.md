@@ -50,6 +50,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shadow (differential) deploys — mirror live traffic to a candidate build and
+  diff its responses before cutover (#1653):** every deploy strategy Autumn
+  shipped until now — rolling, blue/green, canary — routes **real** traffic to
+  the new version and decides go/no-go from aggregate cohort metrics. That
+  catches a build that falls over; it structurally cannot catch the build that
+  returns `200 OK` with a dropped JSON field, a reordered list, or an off-by-one
+  total, because nothing ever compares two responses to the *same* request. A
+  new `[shadow]` section turns on in-process traffic mirroring: Autumn samples
+  live `GET`/`HEAD` requests, replays each against an operator-provided
+  candidate build, and diffs the two responses on status class and a normalized
+  body. Object key order is normalized away; array order is not, because a
+  reordered list is exactly the regression this exists to catch. Divergences are
+  reported at `{actuator-prefix}/shadow` (sensitive-gated, like
+  `/actuator/tasks`) and as the labelled metrics
+  `autumn_shadow_comparisons_total{route,outcome}` and
+  `autumn_shadow_divergences_total{route,kind}`; identical divergences collapse
+  onto one record by a content-addressed `fingerprint`, so a captured pair is
+  reproducible and one loud regression cannot evict every other record. The live
+  request cannot tell mirroring is on: the shadow request is dispatched on a
+  detached task and the primary response body is *teed* rather than buffered, so
+  a slow, erroring, or unreachable candidate resolves to a counter and nothing
+  else — bounded by `sample_rate`, `timeout_ms`, `max_in_flight` (excess is
+  dropped, never queued), and `max_body_bytes` (an oversize body is skipped, not
+  partially buffered). The candidate's response is read into a plain struct
+  inside that task and dropped there, so no code path exists on which it could
+  reach a user; only idempotent methods are mirrored, and the allowlist is a
+  constant rather than a config key. Every mirrored request carries
+  `X-Autumn-Shadow: 1`, which is both the recursion guard (a request carrying it
+  is never mirrored again, so pointing a shadow at the app itself costs one
+  extra request rather than an exponential storm) and the seam a candidate build
+  uses to refuse writes. Recorded samples pass through the same
+  `[log] filter_parameters` redaction as the access log and failure capsules,
+  and an excerpt is recorded only when every scalar in the body has an object key
+  above it, since the filter replaces a matched key's whole value and that is
+  exactly when naming a key could reach it — an HTML body, a bare scalar (a
+  `text/plain` one-time code parses as a JSON number) and a top-level array of
+  strings all record a digest and a length instead — and the guide is explicit about what that redaction does and does
+  not cover before you point this at a route returning personal data. Requests
+  the live build itself refuses (`429`/`503` from maintenance mode, load
+  shedding, or the rate limiter) are not mirrored at all, so a planned
+  maintenance window does not read as a divergence storm. The candidate is
+  dialed at `target` but sees the `Host` the live build accepted — behind a
+  trusted proxy, the *resolved* authority rather than the internal raw header —
+  so a candidate cloning production's `[security.trusted_hosts]`, or a
+  subdomain-keyed multi-tenant app, does not diverge on every request; and in an SSG/ISG build
+  the mirror sits outside the static-first middleware, so pre-rendered pages are
+  compared rather than silently skipped. Off by default, and
+  requires the `http-client` cargo feature (on by default) — a build without it
+  says so at startup and mirrors nothing rather than pretending to. See
+  `docs/guide/staged-deploys.md` for how it differs from canary and for the
+  trust boundary (the candidate receives live credentials, and its own side
+  effects are yours to contain). Effect virtualization for mutating traffic, and
+  gating `autumn deploy` on a clean diff, are deliberate follow-ups.
+
 - **Ledgered entities — time-travelable and tamper-evident by construction
   (#1699):** mark one entity `ledgered = true` and every insert, update and
   soft-delete appends an immutable, hash-chained revision carrying a **full row

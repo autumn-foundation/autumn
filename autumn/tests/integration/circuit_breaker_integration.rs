@@ -55,6 +55,24 @@ async fn unrelated() -> &'static str {
     "unrelated ok"
 }
 
+/// Latency budget for a request that must not be slowed by an open circuit
+/// breaker, derived from a warm baseline measured on the same app.
+///
+/// Fixed wall-clock bounds make this class of assertion measure the *runner*:
+/// a single in-process request on a loaded CI box (the macOS lane routinely
+/// takes 20+ minutes for this suite) can exceed a 50 ms bound through
+/// scheduler contention alone, with nothing slow about the code under test.
+/// A multiple of a baseline taken on the same machine, in the same run, keeps
+/// the property the test actually asserts — "an open breaker adds no latency
+/// here" — while scaling with whatever the machine is doing.
+///
+/// The `20 ms` floor keeps the budget meaningful when the baseline is
+/// unrealistically fast; a genuine regression here is blocking I/O or a lock,
+/// which is orders of magnitude, not a small multiple.
+fn latency_budget(baseline: Duration) -> Duration {
+    baseline.max(Duration::from_millis(20)) * 8
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines, clippy::await_holding_lock)]
 async fn test_circuit_breaker_downstream_outage_flow() {
@@ -131,6 +149,20 @@ async fn test_circuit_breaker_downstream_outage_flow() {
         assert_eq!(val["status"], "UP");
     });
 
+    // Baseline for `/unrelated` while the breaker is still CLOSED, taken warm
+    // (after the requests above) so connection/lazy-init costs are already
+    // paid. The assertions below compare against THIS rather than against a
+    // fixed wall-clock bound: what the test means is "an open breaker on one
+    // host adds no latency to an unrelated route", which is a relative
+    // property. A fixed bound also measures the runner — on a loaded macOS CI
+    // box a single in-process request can exceed 50 ms from scheduler
+    // contention alone, failing a test whose subject is not slow at all.
+    let unrelated_baseline = {
+        let start = std::time::Instant::now();
+        client.get("/unrelated").send().await.assert_ok();
+        start.elapsed()
+    };
+
     // ── Downstream Outage triggers ──
     is_outage.store(true, Ordering::SeqCst);
 
@@ -166,9 +198,14 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     resp_open.assert_status(503);
     assert_eq!(resp_open.text(), "circuit breaker open");
     let fast_elapsed = start_fast.elapsed();
+    // An open breaker short-circuits without dialling downstream, so this must
+    // be in the same league as an ordinary in-process request — not a fixed
+    // wall-clock figure that also measures the runner's load.
+    let fast_budget = latency_budget(unrelated_baseline);
     assert!(
-        fast_elapsed < Duration::from_millis(100),
-        "Should fail fast under 100ms"
+        fast_elapsed < fast_budget,
+        "an open breaker must fail fast: took {fast_elapsed:?}, budget {fast_budget:?} \
+         (baseline {unrelated_baseline:?})"
     );
 
     // Unrelated route latency stays low
@@ -177,9 +214,11 @@ async fn test_circuit_breaker_downstream_outage_flow() {
     resp_unrelated.assert_ok();
     assert_eq!(resp_unrelated.text(), "unrelated ok");
     let unrelated_elapsed = start_unrelated.elapsed();
+    let unrelated_budget = latency_budget(unrelated_baseline);
     assert!(
-        unrelated_elapsed < Duration::from_millis(50),
-        "Unrelated latency must be very low"
+        unrelated_elapsed < unrelated_budget,
+        "an open breaker on one host must not slow an unrelated route: took \
+         {unrelated_elapsed:?}, budget {unrelated_budget:?} (baseline {unrelated_baseline:?})"
     );
 
     // /health (compatibility) stays UP!

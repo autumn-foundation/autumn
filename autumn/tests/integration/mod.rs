@@ -262,6 +262,8 @@ mod search_index_definition;
 mod security;
 mod seo;
 mod server_timing;
+#[cfg(feature = "http-client")]
+mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
 #[cfg(feature = "db")]
