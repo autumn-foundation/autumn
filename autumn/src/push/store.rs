@@ -342,7 +342,8 @@ pub const MAX_SUBSCRIPTIONS_PER_PRINCIPAL: usize = 20;
 ///   second one.
 /// - **A cross-principal move requires proof of possession.** Re-saving an
 ///   endpoint that currently belongs to a *different* principal is allowed
-///   only when the incoming `p256dh` matches the stored one; otherwise it is
+///   only when the incoming `p256dh` **and** `auth` both match the stored ones;
+///   otherwise it is
 ///   [`PushError::EndpointClaimed`]. This keeps the legitimate case working —
 ///   a shared device where a second user signs in re-subscribes and the
 ///   browser returns the *same* endpoint **and the same keys**, so the row
@@ -394,8 +395,8 @@ pub trait PushSubscriptionStore: Send + Sync + 'static {
     /// endpoint.
     ///
     /// Must return [`PushError::EndpointClaimed`] when the endpoint belongs to
-    /// a different principal and the incoming `p256dh` does not match the
-    /// stored one, and [`PushError::TooManySubscriptions`] when the principal
+    /// a different principal and the incoming `p256dh`/`auth` do not both
+    /// match the stored ones, and [`PushError::TooManySubscriptions`] when the principal
     /// is already at [`MAX_SUBSCRIPTIONS_PER_PRINCIPAL`]. See the trait docs.
     fn save(
         &self,
@@ -490,14 +491,15 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
         // Endpoint identity, not (principal, endpoint): re-subscribing on a
         // shared device must MOVE the row, never leave the previous owner
         // still receiving on it. But a move across principals is only honored
-        // when the caller presents the SAME `p256dh` the stored row has —
-        // otherwise merely knowing an endpoint URL would be enough to take a
-        // victim's device over. See the trait docs.
+        // when the caller presents BOTH stored keys — otherwise knowing an
+        // endpoint URL and its (public) `p256dh` would be enough to take a
+        // victim's device over, replacing `auth` in the process so the
+        // victim's browser can no longer decrypt anything. See the trait docs.
         if let Some(existing) = rows
             .iter()
             .find(|row| row.endpoint == subscription.endpoint)
             && existing.principal_id != subscription.principal_id
-            && existing.p256dh != subscription.p256dh
+            && (existing.p256dh != subscription.p256dh || existing.auth != subscription.auth)
         {
             return Err(PushError::EndpointClaimed);
         }
@@ -741,14 +743,18 @@ mod db_store {
                 // the same statement so it cannot race a concurrent subscribe:
                 // the update only applies when the row already belongs to this
                 // principal (an ordinary re-subscribe or key rotation), or when
-                // the caller presents the stored `p256dh` (the shared-device
-                // case, where the browser returns the same endpoint AND the
-                // same keys). Anyone who merely learned the endpoint URL fails
-                // both and the statement touches zero rows.
+                // the caller presents BOTH stored keys (the shared-device case,
+                // where the browser returns the same endpoint AND the same
+                // keys). `p256dh` alone is not enough: it is a *public* key, so
+                // requiring `auth` too means learning the endpoint and its
+                // public half still cannot take the row — which would cut the
+                // victim off AND replace `auth`, leaving their browser unable
+                // to decrypt. Anyone short of both fails and the statement
+                // touches zero rows.
                 .filter(
-                    dsl::principal_id
-                        .eq(principal_id.clone())
-                        .or(dsl::p256dh.eq(p256dh.clone())),
+                    dsl::principal_id.eq(principal_id.clone()).or(dsl::p256dh
+                        .eq(p256dh.clone())
+                        .and(dsl::auth.eq(auth.clone()))),
                 )
                 .execute(&mut conn)
                 .await
@@ -1207,6 +1213,36 @@ mod tests {
             "the original owner keeps receiving"
         );
         assert!(store.list_for("2").await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_matching_p256dh_alone_does_not_transfer_an_endpoint() {
+        // `p256dh` is a PUBLIC key. Accepting it alone as proof of possession
+        // would let anyone who learned the endpoint and its public half take
+        // the row — cutting the victim off AND replacing `auth`, so their
+        // browser could no longer decrypt anything sent to it.
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/a"))
+            .await
+            .expect("save");
+
+        let mut hostile = browser_subscription("https://push.example.com/a");
+        // Correct public key, attacker's own auth secret.
+        hostile.keys.auth = URL_SAFE_NO_PAD.encode([7_u8; 16]);
+        let hostile = hostile.decode(&2_i64.into()).expect("valid shape");
+
+        assert!(
+            matches!(store.save(hostile).await, Err(PushError::EndpointClaimed)),
+            "both keys must match for a cross-principal move"
+        );
+        let rows = store.list_for("1").await.expect("list");
+        assert_eq!(rows.len(), 1, "the original owner keeps the subscription");
+        assert_eq!(
+            rows[0].auth(),
+            URL_SAFE_NO_PAD.decode(AUTH).expect("decode").as_slice(),
+            "and its auth secret is untouched, so it can still decrypt"
+        );
     }
 
     #[tokio::test]

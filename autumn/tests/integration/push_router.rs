@@ -589,6 +589,72 @@ async fn the_public_key_response_carries_a_csrf_token_for_the_snippet() {
     );
 }
 
+/// The `503` (push unconfigured) response must carry the CSRF token too.
+///
+/// A deployment that removes its VAPID key still has browsers holding
+/// subscriptions, and the unsubscribe flow primes its token from this very
+/// endpoint. Without a token on the `503`, the follow-up unsubscribe is
+/// rejected while the client still drops its local subscription — stranding
+/// the server row forever, since nothing will push to it again to earn a
+/// `410`.
+#[tokio::test]
+async fn the_unconfigured_response_still_carries_a_csrf_token() {
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.security.csrf.enabled = true;
+    // No `[push] private_key` — the unconfigured case.
+
+    let client = TestApp::new()
+        .merge(autumn_web::push::router())
+        .config(config)
+        .build();
+
+    let response = client.get("/push/vapid-public-key").send().await;
+    response.assert_status(503);
+    let token = response
+        .header(autumn_web::push::CSRF_TOKEN_HEADER)
+        .expect("a 503 must still let the client unsubscribe");
+    assert!(!token.is_empty());
+    assert!(
+        response
+            .header(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER)
+            .is_some(),
+        "…including which header to send it back in"
+    );
+}
+
+/// …and that token actually works, so a stranded subscription can be cleaned
+/// up while push is unconfigured.
+#[tokio::test]
+async fn unsubscribe_works_while_push_is_unconfigured() {
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.security.csrf.enabled = true;
+
+    let client = TestApp::new()
+        .merge(autumn_web::push::router())
+        .config(config)
+        .build();
+    client.acting_as(7).await;
+
+    let key_response = client.get("/push/vapid-public-key").send().await;
+    key_response.assert_status(503);
+    let token = key_response
+        .header(autumn_web::push::CSRF_TOKEN_HEADER)
+        .expect("token")
+        .to_owned();
+    let header_name = key_response
+        .header(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER)
+        .expect("header name")
+        .to_owned();
+
+    client
+        .post("/push/unsubscribe")
+        .header(&header_name, &token)
+        .json(&serde_json::json!({ "endpoint": "https://push.example.com/stranded" }))
+        .send()
+        .await
+        .assert_status(204);
+}
+
 /// Subscribing with that token succeeds where an unaccompanied POST is
 /// rejected — the end-to-end shape of the fix.
 #[tokio::test]

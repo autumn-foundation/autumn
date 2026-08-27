@@ -255,7 +255,7 @@ what makes the upsert atomic. Two consequences worth knowing:
   normalized first, so `https://x/p` and `https://x:443/p` can never become two
   rows for one device.
 - Re-subscribing under a *different* principal **moves** the row, but only when
-  the request presents the same `p256dh` the stored row has. That is exactly
+  the request presents **both** stored keys — `p256dh` *and* `auth`. That is exactly
   the shared-device case — a second user signs in, the browser returns the same
   endpoint *and* the same keys — while refusing the attack it would otherwise
   allow: an endpoint URL is only a capability to *send*, so anyone who obtained

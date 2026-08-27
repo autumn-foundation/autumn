@@ -119,32 +119,19 @@ async fn vapid_public_key(
         (token.token().to_owned(), header_name)
     });
 
-    match push.vapid_public_key() {
-        Ok(key) => {
-            let mut response = (
-                StatusCode::OK,
-                [
-                    ("content-type", "text/plain; charset=utf-8"),
-                    // Per-deployment, not per-user, and stable — but never
-                    // worth a shared cache holding it across a key rotation.
-                    // The CSRF token below makes it per-visitor besides.
-                    ("cache-control", "no-store"),
-                ],
-                key,
-            )
-                .into_response();
-            if let Some((token, header_name)) = csrf_headers {
-                let headers = response.headers_mut();
-                if let (Ok(token), Ok(name)) = (
-                    axum::http::HeaderValue::from_str(&token),
-                    axum::http::HeaderValue::from_str(&header_name),
-                ) {
-                    headers.insert(CSRF_TOKEN_HEADER, token);
-                    headers.insert(CSRF_TOKEN_HEADER_NAME_HEADER, name);
-                }
-            }
-            response
-        }
+    let mut response = match push.vapid_public_key() {
+        Ok(key) => (
+            StatusCode::OK,
+            [
+                ("content-type", "text/plain; charset=utf-8"),
+                // Per-deployment, not per-user, and stable — but never
+                // worth a shared cache holding it across a key rotation.
+                // The CSRF token below makes it per-visitor besides.
+                ("cache-control", "no-store"),
+            ],
+            key,
+        )
+            .into_response(),
         // 503, not 200-with-empty-body: the client must be able to tell "push
         // is not configured here" from "here is your key", and a
         // `NotConfigured` app is expected to start working once configured.
@@ -154,7 +141,27 @@ async fn vapid_public_key(
             e.to_string(),
         )
             .into_response(),
+    };
+
+    // Attached AFTER the match, so both branches carry it.
+    //
+    // The `503` needs it just as much as the `200`: a deployment that removes
+    // its VAPID key still has browsers holding subscriptions, and the
+    // unsubscribe flow primes its token from exactly this endpoint. Without a
+    // token there, the follow-up `POST /push/unsubscribe` is rejected while
+    // the client still drops its local subscription — stranding the server row
+    // forever, since nothing will ever push to it again to earn a `410`.
+    if let Some((token, header_name)) = csrf_headers {
+        let headers = response.headers_mut();
+        if let (Ok(token), Ok(name)) = (
+            axum::http::HeaderValue::from_str(&token),
+            axum::http::HeaderValue::from_str(&header_name),
+        ) {
+            headers.insert(CSRF_TOKEN_HEADER, token);
+            headers.insert(CSRF_TOKEN_HEADER_NAME_HEADER, name);
+        }
     }
+    response
 }
 
 /// `POST /push/subscribe`
