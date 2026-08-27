@@ -234,9 +234,11 @@ fn the_manifest_is_emitted_as_a_build_artifact() {
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["dimensions"]["cached_reads"]["provenance"], "provable");
     assert_eq!(json["dimensions"]["mutations"]["provenance"], "provable");
+    // `provable`, not `declared`: the edge is recovered from macro-expanded
+    // code, and the adjacent step it cannot prove is carried as a caveat.
     assert_eq!(
         json["dimensions"]["invalidations"]["provenance"],
-        "declared"
+        "provable"
     );
     assert!(
         !json["dimensions"]["invalidations"]["runtime_caveat"]
@@ -245,12 +247,20 @@ fn the_manifest_is_emitted_as_a_build_artifact() {
             .is_empty()
     );
     assert!(!json["violations"].as_array().unwrap().is_empty());
+    // Each undetermined read carries its location, so the reader never has to
+    // grep for the one thing the manifest could not establish.
+    let opaque = json["undetermined_reads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"].as_str().unwrap().ends_with("coherence_opaque"))
+        .expect("the underivable read must be reported");
     assert!(
-        json["undetermined_reads"]
-            .as_array()
+        opaque["location"]
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|v| v.as_str().unwrap().ends_with("coherence_opaque"))
+            .contains("cache_coherence.rs"),
+        "{opaque}"
     );
 }
 
@@ -262,7 +272,16 @@ fn the_generated_invalidator_actually_drops_the_cached_value() {
     // the next call must see the change only because the invalidator ran.
     static SOURCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
-    #[autumn_web::cached(reads(CoherencePost))]
+    // Acknowledged deliberately: this fixture exists to be invalidated by hand,
+    // so it is not one of the app's obligations. Without the opt-out it would
+    // register as a second uncovered read and make
+    // `the_gate_catches_the_seeded_bug_and_only_the_seeded_bug` a lie — which is
+    // itself a small proof that the gate sees every `#[cached]` in the binary,
+    // including one declared inside a test body.
+    #[autumn_web::cached(
+        reads(CoherencePost),
+        acknowledge_stale = "a fixture for the invalidator, invalidated by hand below"
+    )]
     async fn coherence_memoized_source() -> i64 {
         SOURCE.load(std::sync::atomic::Ordering::SeqCst)
     }
