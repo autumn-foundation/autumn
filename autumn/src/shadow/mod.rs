@@ -31,7 +31,8 @@
 //!
 //! # Wiring
 //!
-//! Configured through [`ShadowConfig`] (`[shadow]` in `autumn.toml`) and
+//! Configured through [`ShadowConfig`](crate::shadow::ShadowConfig) (`[shadow]` in
+//! `autumn.toml`) and
 //! assembled into the ingress stack by the framework router; nothing here needs
 //! to be called by hand. See `docs/guide/staged-deploys.md`.
 
@@ -49,18 +50,19 @@ pub mod transport;
 
 pub use config::ShadowConfig;
 pub use diff::{
-    Comparison, Divergence, DivergenceKind, NormalizedBody, ResponseFacts, compare, normalize_body,
-    redact_path_and_query, status_class,
+    Comparison, Divergence, DivergenceKind, NormalizedBody, ResponseFacts, TRUNCATION_MARKER,
+    compare, normalize_body, redact_path_and_query, status_class,
 };
 pub use layer::{
     COMPARISONS_METRIC, DIVERGENCES_METRIC, MirrorSettings, ShadowMirrorLayer, ShadowMirrorService,
 };
 pub use registry::{
-    DivergenceRecord, Recorded, RequestContext, ShadowRegistry, ShadowSnapshot, ShadowStats,
+    DivergenceRecord, LabelledCount, OVERFLOW_ROUTE_LABEL, Recorded, RequestContext,
+    ShadowRegistry, ShadowSnapshot, ShadowStats,
 };
 pub use sample::{
     MIRRORABLE_METHODS, MirrorDecision, MirrorSelector, SHADOW_HEADER, SHADOW_HEADER_VALUE,
-    SkipReason,
+    SkipReason, roll_from,
 };
 #[cfg(feature = "http-client")]
 pub use transport::HttpShadowTransport;

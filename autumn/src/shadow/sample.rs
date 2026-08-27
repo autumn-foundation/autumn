@@ -215,7 +215,7 @@ impl MirrorSelector {
     }
 
     /// The bounded label for a path: the configured pattern it matched, or
-    /// [`ALL_ROUTES_LABEL`] when no allowlist is configured.
+    /// `"*"` when no allowlist is configured.
     ///
     /// This is the **fallback**. The mirror layer prefers
     /// [`axum::extract::MatchedPath`], which is a genuinely informative route
@@ -254,6 +254,11 @@ fn path_of(target: &str) -> &str {
 /// draws through [`Entropy`] rather than a thread RNG so a seeded source makes
 /// the whole mirroring decision reproducible.
 #[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the shift keeps the value in 53 bits, which an f64 represents exactly — \
+              that is the point of taking the top bits rather than the whole u64"
+)]
 pub fn roll_from(entropy: &dyn Entropy) -> f64 {
     /// `2^-53`, the spacing of the representable values this maps onto.
     const SCALE: f64 = 1.0 / (1u64 << 53) as f64;

@@ -470,31 +470,48 @@ fn key_is_filtered(raw_key: &str, filter: &ParameterFilter) -> bool {
 ///
 /// Undecodable bytes are passed through as written: this feeds a filter-name
 /// comparison, so a best-effort decode that never fails is the right shape.
+///
+/// Written as a split over `%` rather than an index walk so it carries no
+/// cursor arithmetic at all — this module is on the request path and its panic
+/// gate denies arithmetic that could overflow.
 fn percent_decode(raw: &str) -> String {
-    let bytes = raw.replace('+', " ").into_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while let Some(byte) = bytes.get(index) {
-        if *byte == b'%'
-            && let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2))
-            && let (Some(high), Some(low)) = (hex_value(*high), hex_value(*low))
-        {
-            out.push((high << 4) | low);
-            index += 3;
-            continue;
+    let replaced = raw.replace('+', " ");
+    let mut out: Vec<u8> = Vec::with_capacity(replaced.len());
+    let mut parts = replaced.as_bytes().split(|byte| *byte == b'%');
+
+    // Everything before the first `%` is literal.
+    if let Some(first) = parts.next() {
+        out.extend_from_slice(first);
+    }
+    for part in parts {
+        match (
+            part.first().copied().and_then(hex_value),
+            part.get(1).copied().and_then(hex_value),
+        ) {
+            (Some(high), Some(low)) => {
+                out.push(high.wrapping_shl(4) | low);
+                out.extend_from_slice(part.get(2..).unwrap_or_default());
+            }
+            // Not a valid escape — keep the `%` and the rest verbatim.
+            _ => {
+                out.push(b'%');
+                out.extend_from_slice(part);
+            }
         }
-        out.push(*byte);
-        index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The numeric value of one ASCII hex digit.
+///
+/// The `wrapping_*` calls cannot wrap — each arm's range guarantees the
+/// subtraction is in bounds — but they say so without arithmetic this module's
+/// panic gate has to take on faith.
 const fn hex_value(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'0'..=b'9' => Some(byte.wrapping_sub(b'0')),
+        b'a'..=b'f' => Some(byte.wrapping_sub(b'a').wrapping_add(10)),
+        b'A'..=b'F' => Some(byte.wrapping_sub(b'A').wrapping_add(10)),
         _ => None,
     }
 }

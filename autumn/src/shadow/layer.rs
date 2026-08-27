@@ -81,9 +81,8 @@ use crate::time::ClockSource;
 /// Labelled by route and one
 /// of `match`, `diverged`, `error`, `timeout`, `skipped` (a body over the
 /// capture budget), `dropped` (the in-flight ceiling was full), `refused` (the
-/// live build answered with an admission-control status — see
-/// [`ADMISSION_CONTROL_STATUSES`]), or `incomplete` (the client never finished
-/// reading the primary response).
+/// live build answered `429`/`503`, so the request never reached a handler), or
+/// `incomplete` (the client never finished reading the primary response).
 pub const COMPARISONS_METRIC: &str = "autumn_shadow_comparisons_total";
 
 /// Metric recording divergences only, labelled by route and divergence kind.

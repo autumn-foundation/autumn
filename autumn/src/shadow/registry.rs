@@ -120,7 +120,7 @@ pub struct DivergenceRecord {
 /// the overflow is visible rather than silent.
 const MAX_ROUTE_SERIES: usize = 200;
 
-/// Route label every route past [`MAX_ROUTE_SERIES`] is folded into.
+/// Route label every route past the per-registry route ceiling is folded into.
 pub const OVERFLOW_ROUTE_LABEL: &str = "__other__";
 
 /// One `{route, outcome}` (or `{route, kind}`) counter series.
@@ -339,6 +339,7 @@ impl ShadowRegistry {
     /// The return value distinguishes a divergence seen for the first time from
     /// a repeat, so the caller can log once per distinct problem rather than
     /// once per request.
+    #[must_use = "the caller decides whether to log; ignore it with `let _ =` when not"]
     pub fn record_comparison(
         &self,
         context: &RequestContext,

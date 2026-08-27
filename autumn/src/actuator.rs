@@ -3136,7 +3136,7 @@ fn write_builtin_shadow_metrics(
         }
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} counter");
-        for entry in series.iter() {
+        for entry in series {
             let route = escape_prometheus_label_value(&entry.route);
             let label = escape_prometheus_label_value(&entry.label);
             let _ = writeln!(
