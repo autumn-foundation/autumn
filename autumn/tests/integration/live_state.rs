@@ -121,14 +121,14 @@ async fn an_app_that_designates_nothing_has_no_live_state() {
 /// irreversible — never before.
 ///
 /// The window this closes is narrow and needs two processes to reach, so it is
-/// pinned where a refactor would break it: `run()` must unfreeze *after* the
-/// checks that can still abandon the upgrade, and *before* the signal that
-/// releases the predecessor to drain. Ordered the other way, a write the
-/// successor acknowledged could be discarded by an upgrade that then failed —
+/// pinned where a refactor would break it: `run()` must unfreeze *after* every
+/// step that can still abandon the upgrade — including publishing readiness,
+/// which fails if the handoff filesystem does — and it must never unfreeze on
+/// a path that then refuses to start. Ordered any other way, a write the
+/// successor acknowledged could be discarded by an upgrade that then failed:
 /// the exact loss the freeze exists to prevent.
 #[test]
-fn an_adopted_block_is_unfrozen_after_the_last_abort_point_and_before_the_predecessor_is_released()
-{
+fn an_adopted_block_is_unfrozen_only_after_the_handover_can_no_longer_be_abandoned() {
     let source = include_str!("../../src/app.rs");
     let ready_path = source
         .split_once("state.probes().mark_startup_complete();")
@@ -141,20 +141,21 @@ fn an_adopted_block_is_unfrozen_after_the_last_abort_point_and_before_the_predec
     let verify = ready_path
         .find("verify_handover_complete()")
         .expect("the handover is verified before the predecessor is released");
+    let publish = ready_path
+        .find("publish_upgrade_readiness()")
+        .expect("the predecessor is released by publishing readiness");
     let unfreeze = ready_path
         .find("unfreeze_adopted_live_state(&state)")
-        .expect("the adopted live state is unfrozen before the predecessor is released");
-    let release = ready_path
-        .find("signal_upgrade_ready()")
-        .expect("the predecessor is released");
+        .expect("the adopted live state is unfrozen once the handover is complete");
 
     assert!(
-        verify < unfreeze,
-        "the adopted state must stay frozen until the handover is known to be complete"
+        verify < publish,
+        "the handover must be verified before the predecessor is released"
     );
     assert!(
-        unfreeze < release,
-        "the successor must be writable before it releases the predecessor, or the first \
-         write after the cutover lands on a process that refuses it"
+        publish < unfreeze,
+        "readiness must be published *successfully* before the state becomes writable: a \
+         readiness signal that never lands means the predecessor kills this process, taking \
+         any write it acknowledged with it"
     );
 }

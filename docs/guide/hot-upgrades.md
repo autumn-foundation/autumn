@@ -245,6 +245,7 @@ up and the state stays whole.
 | the listener cannot be handed over (Unix socket, TLS) | refused with an error in the log |
 | this process supervises a managed Postgres cluster | refused with an error in the log |
 | the new build turns TLS on (the transport would change mid-socket) | it refuses to start; the old build keeps serving plaintext |
+| the new build cannot publish its readiness (a full or read-only handoff filesystem) | it refuses to start rather than serve a handover that cannot complete |
 | the new build was handed the socket but cannot adopt it (it switched to a Unix socket, say) | it refuses to start rather than serve a different address |
 | the new build dropped its `with_live_state(...)` call | it refuses to start rather than throw the carried state away |
 

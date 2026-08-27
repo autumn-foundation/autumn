@@ -793,21 +793,29 @@ pub(crate) fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
 ///
 /// Written to a temporary sibling and renamed into place, so the predecessor —
 /// which polls for the path — can never observe a half-written file.
-pub(crate) fn signal_upgrade_ready() {
+///
+/// Returns whether there was a predecessor to tell: `false` on an ordinary
+/// cold start, where nothing is waiting.
+///
+/// # Errors
+///
+/// Any IO error from writing or renaming the file. The caller must treat this
+/// as a failed handover and refuse to go on: readiness that never reached the
+/// predecessor means the predecessor will time out and kill this process, so
+/// anything this process acknowledged in the meantime would be discarded.
+pub(crate) fn publish_upgrade_readiness() -> Result<bool, std::io::Error> {
     let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|value| !value.is_empty()) else {
-        return;
+        return Ok(false);
     };
     let path = std::path::PathBuf::from(path);
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
-    let write = write_owner_only(&tmp, generation().to_string().as_bytes())
-        .and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(error) = write {
-        let _ = std::fs::remove_file(&tmp);
-        // The predecessor will time out and keep serving; say why.
-        tracing::error!(error = %error, path = %path.display(),
-            "could not signal in-place upgrade readiness to the previous build");
-    }
+    write_owner_only(&tmp, generation().to_string().as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    Ok(true)
 }
 
 /// What an upgrade handed over, once the successor is serving.
@@ -1472,6 +1480,49 @@ mod tests {
         LiveStateRegistry::new(&handle).unfreeze();
         assert_eq!(handle.write(|s| s.hits += 1), Ok(()));
         assert_eq!(handle.read(|s| s.hits), 1);
+    }
+
+    #[test]
+    fn readiness_that_cannot_be_published_is_an_error_not_a_shrug() {
+        // The predecessor is released by this file appearing. If it cannot be
+        // written, the predecessor times out and kills this process — so the
+        // caller has to know, rather than this logging and carrying on with a
+        // handover that will not complete.
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-upgrade-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The directory deliberately does not exist.
+        temp_env::with_var(READY_FILE_ENV, Some(dir.join("ready")), || {
+            publish_upgrade_readiness().expect_err("an unwritable readiness path must be an error");
+        });
+
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ready");
+        temp_env::with_var(READY_FILE_ENV, Some(&path), || {
+            assert!(
+                publish_upgrade_readiness().expect("publishes"),
+                "a successor with a waiting predecessor reports that it released it"
+            );
+        });
+        assert!(path.exists(), "the predecessor polls for this file");
+        assert!(
+            !dir.join("ready.tmp").exists(),
+            "the file is renamed into place, never left half-written beside it"
+        );
+
+        // A cold start has nobody to tell.
+        temp_env::with_vars_unset([READY_FILE_ENV], || {
+            assert!(
+                !publish_upgrade_readiness().expect("a cold start publishes nothing"),
+                "a cold start has no predecessor to release"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

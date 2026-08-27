@@ -4844,11 +4844,33 @@ impl AppBuilder {
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
-                // Strictly before the predecessor is released, and strictly
-                // after everything that could still abandon this upgrade: from
-                // here this build is the one keeping the state.
-                unfreeze_adopted_live_state(&state);
-                crate::upgrade::signal_upgrade_ready();
+                // Publishing readiness is the last thing that can fail, so the
+                // adopted state stays frozen until it has *succeeded*. A
+                // readiness signal that never reaches the predecessor (a full
+                // or read-only handoff filesystem) means the predecessor times
+                // out and kills this process — anything acknowledged in the
+                // meantime would go with it. Refusing here instead ends the
+                // predecessor's wait on this process exiting, ~20ms rather than
+                // the readiness timeout, and it resumes writable.
+                match crate::upgrade::publish_upgrade_readiness() {
+                    Ok(had_predecessor) => {
+                        if had_predecessor {
+                            unfreeze_adopted_live_state(&state);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "refusing to start: this build took over but could not tell the \
+                             previous build it is serving, so the handover cannot complete. \
+                             The previous build keeps serving"
+                        );
+                        // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+                        #[cfg(feature = "managed-pg")]
+                        crate::managed_pg::emergency_stop_async().await;
+                        std::process::exit(1);
+                    }
+                }
             }
             signal_serve_ready(
                 config
