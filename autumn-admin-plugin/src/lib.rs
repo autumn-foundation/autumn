@@ -347,8 +347,10 @@ impl Plugin for AdminPlugin {
             // Publish the gate so the core primitive can find it. Registered
             // here rather than asked of the application, so `with_impersonation`
             // is the single opt-in.
-            Some(gate) => app.state_initializer(move |state| {
-                state.insert_extension(gate);
+            // `impersonation_gate` registers the gate and reports a
+            // self-destructive `auth.session_key` at boot; the audit-sink check
+            // below is the plugin's own addition.
+            Some(gate) => app.impersonation_gate(gate).state_initializer(|state| {
                 // Surface the audit requirement at startup rather than at the
                 // first impersonation attempt: `begin_impersonation` refuses
                 // with 500 without a sink, and a 500 in front of a support

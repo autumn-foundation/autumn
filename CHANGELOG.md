@@ -85,7 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record describes, and a stale record (an operator walked away without
   reverting and somebody else logged in) is ignored for attribution and refused
   by the revert route rather than handing the newcomer the operator's identity
-  and role. `impersonation::clear` scrubs it from a login flow.
+  and role. `impersonation::clear` scrubs it from a login flow. An `auth.session_key`
+  configured as one of the reserved keys would make the swap clobber its own
+  record, so both directions refuse it and registering the gate logs it at
+  startup (`impersonation::is_reserved_session_key` /
+  `RESERVED_SESSION_KEYS` expose the check).
 
 - **`AdminPlugin::with_impersonation(gate)` — the impersonation UI (#1394):**
   opts an admin panel into the primitive above and mounts two routes:

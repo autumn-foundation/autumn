@@ -75,10 +75,10 @@
 //!
 //! # Reserved session keys
 //!
-//! [`IMPERSONATOR_SESSION_KEY`], [`IMPERSONATED_SESSION_KEY`],
-//! [`IMPERSONATOR_ROLE_SESSION_KEY`] and [`IMPERSONATOR_STEP_UP_SESSION_KEY`]
-//! belong to the framework; do not configure `[auth].session_key` to collide
-//! with them, and do not write them by hand. Call [`clear`] from any flow that
+//! [`RESERVED_SESSION_KEYS`] belong to the framework; do not configure
+//! `[auth].session_key` to collide with them (impersonation refuses outright if
+//! you do, and logs it at startup), and do not write them by hand. Call
+//! [`clear`] from any flow that
 //! replaces the session's user outright (a login, a magic-link or passkey
 //! promotion) so a record left behind by an operator who never reverted is not
 //! inherited by whoever logs in next.
@@ -130,6 +130,29 @@ pub const IMPERSONATOR_STEP_UP_SESSION_KEY: &str = "impersonator_last_strong_aut
 /// Session key holding the current role. Mirrors the key `#[secured("role")]`
 /// and the admin plugin's role middleware read.
 const ROLE_SESSION_KEY: &str = "role";
+
+/// Every session key impersonation writes for its own bookkeeping.
+///
+/// An app must not configure `[auth].session_key` (or write by hand) any key in
+/// this list: the swap would then clobber its own record.
+/// [`begin_impersonation`] refuses rather than corrupting the session, and
+/// `AppBuilder::impersonation_gate` logs the misconfiguration at startup.
+pub const RESERVED_SESSION_KEYS: [&str; 5] = [
+    IMPERSONATOR_SESSION_KEY,
+    IMPERSONATED_SESSION_KEY,
+    IMPERSONATOR_ROLE_SESSION_KEY,
+    IMPERSONATOR_STEP_UP_SESSION_KEY,
+    ROLE_SESSION_KEY,
+];
+
+/// Whether `key` is one of the [`RESERVED_SESSION_KEYS`].
+///
+/// Use it to validate a configured `[auth].session_key` at startup, the way the
+/// framework's TOTP-pending keys are validated.
+#[must_use]
+pub fn is_reserved_session_key(key: &str) -> bool {
+    RESERVED_SESSION_KEYS.contains(&key)
+}
 
 /// Audit action recorded when impersonation begins.
 pub const BEGIN_AUDIT_ACTION: &str = "auth.impersonation.begin";
@@ -614,6 +637,19 @@ pub async fn begin_impersonation(
     let target_id = target.user_id();
 
     let auth_key = state.auth_session_key().to_owned();
+    // A configured auth key that collides with one of this module's own keys
+    // makes the swap self-destructive: writing the target through `auth_key`
+    // would overwrite the record it just wrote, so attribution would follow the
+    // target and the revert could not restore the operator. Refuse the
+    // misconfiguration rather than corrupting the session — checked before the
+    // session is read at all, so the error names the real cause.
+    if is_reserved_session_key(&auth_key) {
+        return Err(crate::AutumnError::internal_server_error_msg(format!(
+            "impersonation refused: `auth.session_key` is set to \"{auth_key}\", which is \
+             reserved by the impersonation record; choose another key"
+        )));
+    }
+
     let Some(real_id) = session.get(&auth_key).await else {
         return Err(crate::AutumnError::unauthorized_msg(
             "authentication required",
@@ -757,6 +793,12 @@ pub async fn end_impersonation(
     session: &Session,
 ) -> crate::AutumnResult<ImpersonationState> {
     let auth_key = state.auth_session_key().to_owned();
+    if is_reserved_session_key(&auth_key) {
+        return Err(crate::AutumnError::internal_server_error_msg(format!(
+            "impersonation refused: `auth.session_key` is set to \"{auth_key}\", which is \
+             reserved by the impersonation record; choose another key"
+        )));
+    }
     let Some(active) = impersonation_state(state, session).await else {
         // Either there is no record, or there is a *stale* one describing a user
         // this session no longer resolves as — an operator walked away without

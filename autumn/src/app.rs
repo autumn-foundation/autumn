@@ -1559,6 +1559,16 @@ impl AppBuilder {
     #[must_use]
     pub fn impersonation_gate(self, gate: crate::auth::impersonation::ImpersonationGate) -> Self {
         self.state_initializer(move |state| {
+            // Surface a self-destructive `[auth].session_key` at boot rather
+            // than at the first impersonation attempt, which refuses outright.
+            let auth_key = state.auth_session_key();
+            if crate::auth::impersonation::is_reserved_session_key(auth_key) {
+                tracing::error!(
+                    auth_session_key = %auth_key,
+                    "impersonation is enabled but `auth.session_key` collides with a key the \
+                     impersonation record reserves; every attempt will be refused"
+                );
+            }
             state.insert_extension(gate);
         })
     }

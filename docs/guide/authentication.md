@@ -754,6 +754,13 @@ And what it refuses:
   consequence: sensitive, step-up-gated actions cannot be performed while
   impersonating.
 
+- **No self-destructive configuration.** `auth.session_key` must not be one of
+  the keys the impersonation record reserves (`impersonator_id`,
+  `impersonated_id`, `impersonator_role`, `impersonator_last_strong_auth_at`,
+  `role`) — the swap would clobber its own record. Both directions refuse the
+  misconfiguration, and registering the gate logs it at startup. Check it
+  yourself with `impersonation::is_reserved_session_key`.
+
 - **No inherited record.** The session records *which* user the impersonation
   describes. If the effective user later changes — someone logs in on that
   session after an operator walked away without reverting — the record is stale:

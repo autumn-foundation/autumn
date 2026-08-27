@@ -25,6 +25,7 @@ use autumn_web::auth::impersonation::{
     ImpersonationGate, ImpersonationPolicy, ImpersonationTarget,
 };
 use autumn_web::authorization::{BoxFuture, PolicyContext};
+use autumn_web::config::AutumnConfig;
 use autumn_web::current::Current;
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
@@ -709,6 +710,43 @@ async fn a_blank_target_is_rejected() {
         .send()
         .await
         .assert_status(400);
+}
+
+// ── A self-destructive auth session key is refused ────────────
+
+#[tokio::test]
+async fn an_auth_session_key_that_collides_with_a_reserved_key_is_refused() {
+    // With `auth.session_key = "impersonator_id"`, writing the target through
+    // the auth key would overwrite the record naming the operator: attribution
+    // would follow the target and the revert could not restore the admin. The
+    // misconfiguration is refused rather than silently corrupting the session.
+    for reserved in autumn_web::auth::impersonation::RESERVED_SESSION_KEYS {
+        let mut config = AutumnConfig::default();
+        config.auth.session_key = reserved.to_owned();
+        let client = TestApp::new()
+            .routes(routes())
+            .config(config)
+            .state_initializer(|state| {
+                state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+                state.insert_extension(
+                    AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+                );
+            })
+            .build();
+        client.post("/login-admin").send().await.assert_ok();
+
+        client
+            .post("/impersonate")
+            .form("user_id=user-9")
+            .send()
+            .await
+            .assert_status(500);
+        client
+            .post("/stop-impersonating")
+            .send()
+            .await
+            .assert_status(500);
+    }
 }
 
 // ── Step-up does not carry into the impersonated identity ─────

@@ -938,7 +938,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   nesting (`409`); the impersonated role comes only from
   `ImpersonationPolicy::target_role`, never request input; the operator's
   step-up claim is stashed for the duration; a record whose recorded target no
-  longer matches the session's effective user is stale and is ignored.
+  longer matches the session's effective user is stale and is ignored; an
+  `auth.session_key` colliding with `RESERVED_SESSION_KEYS` is refused
+  (`is_reserved_session_key`).
   Admin UI: `AdminPlugin::with_impersonation(gate)`,
   `autumn_admin_plugin::{impersonation_banner_for, impersonation_banner,
   ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes
