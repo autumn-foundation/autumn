@@ -1041,11 +1041,17 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
 /// success would tell a CI script otherwise.
 fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
     // A report with no entries reconciled nothing, and rebuilding the manifest
-    // from no entries would prune every digest in it. That is the baseline the
-    // whole feature rests on, destroyed by a run that did not even look at the
-    // files. The only report shaped like this is one whose project name could
-    // not be read, which is a refusal to answer, not an answer.
-    if !report.named {
+    // from no entries prunes every digest in it and stamps this CLI's version
+    // over whatever was recorded. That is the baseline the whole feature rests
+    // on, destroyed by a run that did not even look at the files.
+    //
+    // Keyed on the entries themselves rather than on *why* they are empty. That
+    // distinction has already cost once: this guard was written as `!named` for
+    // the unreadable-package-name case, and the newer-scaffold refusal then
+    // arrived with entries empty and `named` true, walking straight past it.
+    // Every reason to refuse produces an empty plan, so that is the thing to
+    // check.
+    if report.entries.is_empty() {
         return Ok(());
     }
     let previous = Manifest::load(&report.root);
@@ -1130,32 +1136,6 @@ enum Publish {
     Replace,
 }
 
-/// The mode a file newly created in `directory` should carry.
-///
-/// Derived from the directory's own mode rather than by reading the process
-/// umask, which has no race-free getter — the only way to read it is to set it
-/// and set it back. Masking the directory's mode down to the file permission
-/// bits reproduces the umask-derived answer in every ordinary case (`0755` ->
-/// `0644`, `0700` -> `0600`, `0775` -> `0664`), which is what matters: a file
-/// this command adds must be exactly as readable as the one `autumn new` would
-/// have written beside it. `tempfile` creates its temporaries `0600`, and
-/// publishing one of those unchanged would leave an added `ci.yml` or
-/// `input.css` unreadable to every other uid — fatal to a Docker stage that
-/// drops privileges, and invisible in `git diff`, which tracks only the
-/// executable bit.
-#[cfg(unix)]
-fn permissions_for_new_file(directory: &Path) -> Option<std::fs::Permissions> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mode = std::fs::metadata(directory).ok()?.permissions().mode();
-    Some(std::fs::Permissions::from_mode(mode & 0o666))
-}
-
-#[cfg(not(unix))]
-fn permissions_for_new_file(_directory: &Path) -> Option<std::fs::Permissions> {
-    None
-}
-
 /// Publish `contents` at `absolute`, atomically.
 ///
 /// Staged beside the destination and published by a single link operation,
@@ -1188,25 +1168,33 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
     let directory = absolute
         .parent()
         .ok_or_else(|| "no parent directory".to_owned())?;
+    // Created through ordinary `0o666` open semantics so the process umask
+    // applies, exactly as it does to the `fs::write` that `autumn new` uses.
+    // `tempfile`'s own constructor deliberately creates `0600`, and deriving a
+    // mode from the directory does not reproduce the umask either: a `0775`
+    // checkout under umask `022` yields `0664` that way and `0644` from a real
+    // write, quietly granting group write. `make_in` still supplies the unique
+    // name and the delete-on-drop, so nothing this function did not create is
+    // ever removed.
     let mut temp = tempfile::Builder::new()
         .prefix(".autumn-upgrade-")
         .suffix(".tmp")
-        .tempfile_in(directory)
+        .make_in(directory, |path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        })
         .map_err(|error| error.to_string())?;
 
     // A file that is really there keeps the mode it already has; anything else
-    // is genuinely new and takes the mode the directory implies. Keyed on what
-    // is on disk rather than on `mode`, which says whether replacing is
-    // *allowed*, not whether there is anything to replace: a `Publish::Replace`
-    // of an absent path — the manifest on every `autumn new` — would otherwise
-    // keep `tempfile`'s 0600, and a manifest another uid cannot read is
-    // discarded as unreadable, throwing away every baseline in it.
-    let permissions = std::fs::metadata(absolute)
-        .ok()
-        .map(|metadata| metadata.permissions())
-        .or_else(|| permissions_for_new_file(directory));
-    if let Some(permissions) = permissions {
-        let _ = temp.as_file().set_permissions(permissions);
+    // is genuinely new and keeps the umask-derived mode it was just created
+    // with. Keyed on what is on disk rather than on `mode`, which says whether
+    // replacing is *allowed*, not whether there is anything to replace — a
+    // `Publish::Replace` of an absent path is the manifest on every
+    // `autumn new`.
+    if let Ok(metadata) = std::fs::metadata(absolute) {
+        let _ = temp.as_file().set_permissions(metadata.permissions());
     }
 
     temp.write_all(contents.as_bytes())
@@ -2758,6 +2746,66 @@ mod tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("Dockerfile")).unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn refusing_a_newer_scaffold_leaves_its_manifest_untouched() {
+        // The refusal protects the files; it must protect their provenance too.
+        // A report with no entries rebuilds the manifest from nothing, pruning
+        // every digest and stamping this older CLI's version over the newer
+        // one — destroying the very record that triggered the refusal.
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.version = Some("99.0.0".to_owned());
+        manifest.save(tmp.path()).unwrap();
+        let before = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+
+        let mut report = plan_in(tmp.path());
+        assert!(report.scaffolded_by_newer.is_some());
+        apply(&mut report).expect("apply");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap(),
+            before,
+            "a refused run must not rewrite the baseline it refused over"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_added_file_gets_the_mode_an_ordinary_write_would_give_it() {
+        // A directory's access bits do not encode the umask: under umask 022 a
+        // `0775` checkout yields `0664` from `mode & 0o666` but `0644` from an
+        // ordinary write, quietly granting group write. The only way to get
+        // this right is to create the file with normal 0666 semantics and let
+        // the umask apply.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+
+        // What an ordinary write produces in this very directory, whatever the
+        // umask happens to be.
+        let probe = tmp.path().join("probe.txt");
+        fs::write(&probe, "x").unwrap();
+        let expected = fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+
+        let mut report = plan_in(tmp.path());
+        apply(&mut report).expect("apply");
+
+        let added = fs::metadata(tmp.path().join("rustfmt.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            added, expected,
+            "an added file must carry the mode an ordinary write would give it"
         );
     }
 }
