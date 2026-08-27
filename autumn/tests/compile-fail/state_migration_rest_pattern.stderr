@@ -1,0 +1,11 @@
+error: no rules expected `..`
+  --> tests/compile-fail/state_migration_rest_pattern.rs:31:9
+   |
+31 |         ..Default::default()
+   |         ^^ no rules expected this token in macro call
+   |
+note: while trying to match meta-variable `$field:ident`
+  --> src/upgrade.rs
+   |
+   |         $( $field:ident : $value:expr ),+ $(,)?
+   |            ^^^^^^^^^^^^

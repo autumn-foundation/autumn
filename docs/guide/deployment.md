@@ -31,6 +31,25 @@ internet connection.
 
 ---
 
+## Upgrading in place, without a restart
+
+A deploy does not have to be a process replacement. On Linux an Autumn app can
+swap itself to a newly-built binary while it is running — handing over its
+listening socket (so no connection is refused) and a designated block of typed
+in-memory state (so no cache starts cold), with the old→new state migration
+proven total by the compiler:
+
+```console
+$ cargo build --release      # install the new binary over the running path
+$ kill -USR2 $(pidof my-app)
+```
+
+See [In-place upgrades](hot-upgrades.md). The rest of this page covers the
+process-replacement path, which is what `autumn deploy` and the container
+images use.
+
+---
+
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a

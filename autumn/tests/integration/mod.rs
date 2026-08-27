@@ -127,6 +127,7 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
+mod live_state;
 mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;

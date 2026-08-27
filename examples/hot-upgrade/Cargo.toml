@@ -1,0 +1,41 @@
+[package]
+name = "hot-upgrade"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+# Two binaries, one worked example: `v1` is the running build, `v2` is the
+# newly-built one it upgrades into. `v2`'s live-state shape gained a field, so
+# it carries a `state_migration!` from `v1`'s shape — the whole point of the
+# example. The live-upgrade proof drives the real binaries.
+[[bin]]
+name = "hot-upgrade-v1"
+path = "src/bin/v1.rs"
+
+[[bin]]
+name = "hot-upgrade-v2"
+path = "src/bin/v2.rs"
+
+[[test]]
+name = "live_upgrade"
+path = "tests/live_upgrade.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Determinism seam gate (autumn #1797): `clippy.toml`'s workspace-global
+# `disallowed-methods` config arms `clippy::disallowed_methods` (warn-by-default)
+# in every crate that sees it. This package is outside the gate's manifest, so
+# grandfather the lint here. Crates that set `[lints] workspace = true` get the
+# same grandfathering from `[workspace.lints.clippy]` in the root Cargo.toml.
+# A package-level table (rather than a crate-root attribute) is used so it
+# covers every target — lib, bins, tests, benches — not just one root.
+[lints.clippy]
+disallowed_methods = "allow"

@@ -296,6 +296,35 @@ impl AppState {
             .and_then(|value| Arc::downcast::<T>(value).ok())
     }
 
+    /// Borrow the app's designated live-state block, if one was registered
+    /// with [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state).
+    ///
+    /// This is the block an in-place upgrade carries into the next build; see
+    /// [`upgrade`](crate::upgrade).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use autumn_web::AppState;
+    /// # use autumn_web::upgrade::LiveState;
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)] struct Stats { hits: u64 }
+    /// # impl LiveState for Stats { const VERSION: u32 = 1; }
+    /// # fn handler(state: &AppState) {
+    /// if let Some(stats) = state.live_state::<Stats>() {
+    ///     let hits = stats.read(|s| s.hits);
+    ///     let _ = hits;
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn live_state<T>(&self) -> Option<Arc<crate::upgrade::LiveStateHandle<T>>>
+    where
+        T: crate::upgrade::LiveState,
+    {
+        self.extension::<crate::upgrade::LiveStateHandle<T>>()
+    }
+
     /// Fetch the extension of type `T`, inserting `f()`'s result if absent.
     /// Atomic get-or-insert under the write lock: concurrent callers share one
     /// value. Used to lazily register process-wide registries.

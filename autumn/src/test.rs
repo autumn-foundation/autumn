@@ -1169,6 +1169,25 @@ impl TestApp {
         self
     }
 
+    /// Install a designated live-state block, so handlers that read it through
+    /// [`AppState::live_state`](crate::AppState::live_state) can be tested.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::with_live_state`]. A test app never
+    /// adopts a snapshot from a predecessor — there is no upgrade in flight —
+    /// so `initial` is always the value handlers see.
+    #[must_use]
+    pub fn with_live_state<T>(mut self, initial: T) -> Self
+    where
+        T: crate::upgrade::LiveState,
+    {
+        self.state_initializers.push(Box::new(move |state| {
+            let handle = crate::upgrade::LiveStateHandle::new(initial);
+            state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
+            state.insert_extension(handle);
+        }));
+        self
+    }
+
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend so
     /// the [`Flags`](crate::feature_flags::Flags) extractor works in test handlers.
     ///

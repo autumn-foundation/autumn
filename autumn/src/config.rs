@@ -5922,6 +5922,30 @@ pub struct RequestTimeoutsConfig {
     pub request_timeout_ms: Option<u64>,
 }
 
+/// `[server.upgrade]` — in-place upgrades (issue #1674).
+///
+/// On `SIGUSR2` a running app hands its listening socket and its designated
+/// live state to a freshly-execed build, waits for that build to serve, and
+/// only then drains itself. See `docs/guide/hot-upgrades.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HotUpgradeConfig {
+    /// Whether `SIGUSR2` triggers an in-place upgrade. Default: `true`.
+    ///
+    /// With this off the signal is logged and ignored — which is still safer
+    /// than the default disposition of `SIGUSR2`, which terminates the process.
+    #[serde(default = "default_upgrade_enabled")]
+    pub enabled: bool,
+
+    /// Seconds to wait for the successor to signal that it is serving before
+    /// abandoning the upgrade and carrying on with the current build.
+    /// Default: `30`.
+    ///
+    /// The wait ends early — with the upgrade abandoned — if the successor
+    /// exits first, so this only bounds a successor that hangs during startup.
+    #[serde(default = "default_upgrade_ready_timeout")]
+    pub ready_timeout_secs: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -5969,6 +5993,12 @@ pub struct ServerConfig {
     /// propagation time. Set to `0` to disable the grace period.
     #[serde(default = "default_prestop_grace")]
     pub prestop_grace_secs: u64,
+
+    /// In-place upgrade settings (`SIGUSR2` handoff to a new binary).
+    ///
+    /// See [`HotUpgradeConfig`] and `docs/guide/hot-upgrades.md`.
+    #[serde(default)]
+    pub upgrade: HotUpgradeConfig,
 
     /// Per-request timeout configuration.
     ///
@@ -8039,6 +8069,23 @@ fn default_live_path() -> String {
     "/live".to_owned()
 }
 
+const fn default_upgrade_enabled() -> bool {
+    true
+}
+
+const fn default_upgrade_ready_timeout() -> u64 {
+    30
+}
+
+impl Default for HotUpgradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upgrade_enabled(),
+            ready_timeout_secs: default_upgrade_ready_timeout(),
+        }
+    }
+}
+
 fn default_ready_path() -> String {
     "/ready".to_owned()
 }
@@ -8058,6 +8105,7 @@ impl Default for ServerConfig {
             strict_config_enforce_all: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
+            upgrade: HotUpgradeConfig::default(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
