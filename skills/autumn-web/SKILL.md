@@ -979,6 +979,41 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
+### Admin impersonation (0.7.0, issue #1394)
+
+"Log in as this user" without breaking the audit trail. Never hand-roll it
+with `session.insert("user_id", target)` — that makes every subsequent version
+row and audit event claim the *customer* did it.
+
+`autumn_web::auth::impersonation::begin_impersonation(&state, &session, target)`
+swaps the session's **effective** user and records the real admin separately
+under a reserved `impersonator_id` key, so `#[secured]` / `Auth<T>` /
+`PolicyContext` see the impersonated user while the ambient current actor
+(`Current::actor`, which seeds `#[repository(versioned)]` rows and audit
+events) stays the **real impersonator**. `end_impersonation(&state, &session)`
+reverts. `impersonator_id(&session)` is the separate accessor;
+`impersonation_state(&state, &session)` returns both ids.
+
+Default-deny: it needs an `ImpersonationGate` in `AppState` —
+`ImpersonationGate::allow_roles(["admin"])`, or `::custom(policy)` with an
+`ImpersonationPolicy` (the seam for tenancy checks and for
+`target_role`, which resolves the impersonated session's role **server-side**;
+never accept a role from request input). Missing gate or a refusal is `403`.
+Both edges rotate the session id and write `auth.impersonation.begin` /
+`.end` audit events carrying `{impersonator_id, target_id}`; a begin whose
+audit write fails is refused. No nesting (`409`), no self-impersonation, and
+the admin's own step-up claim is preserved rather than refreshed.
+
+For the UI, `AdminPlugin::with_impersonation(gate)` mounts
+`POST {prefix}/impersonate` (behind the role gate + the `ImpersonationGate`)
+and `POST {prefix}/impersonate/stop` — deliberately *outside* the role gate, so
+an operator impersonating a non-admin is never trapped — and renders a
+persistent "Viewing as … — Stop impersonating" banner on every admin page. Put
+the same banner in the app's own layout with
+`autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
+csrf_token, csrf_form_field)` plus `IMPERSONATION_BANNER_CSS`. Session-based
+auth only. See `docs/guide/authentication.md` and `docs/guide/admin.md`.
+
 ### Cookie consent (0.7.0, issue #1214)
 
 `autumn new` scaffolds a cookie-consent banner and a real consent gate by
