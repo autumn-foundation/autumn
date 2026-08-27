@@ -28,7 +28,7 @@ use futures::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::auth::check_role;
+use crate::auth::{check_role, publish_current_actor};
 use crate::impersonation::AdminImpersonation;
 use crate::registry::AdminRegistry;
 use crate::templates;
@@ -147,6 +147,9 @@ pub fn admin_router(
     impersonation_enabled: bool,
 ) -> axum::Router<AppState> {
     let has_config = config_svc.is_some();
+    // Cloned up front: the role-check closure below takes ownership of
+    // `auth_session_key`, but the actor layer needs it too.
+    let actor_session_key = auth_session_key.clone();
 
     let mut router = axum::Router::new()
         // Dashboard
@@ -229,7 +232,9 @@ pub fn admin_router(
     };
 
     if !impersonation_enabled {
-        return router;
+        return router.layer(from_fn(move |req, next| {
+            publish_current_actor(actor_session_key.clone(), req, next)
+        }));
     }
 
     // The revert route is merged *after* the role and step-up layers, so it is
@@ -237,14 +242,21 @@ pub fn admin_router(
     // target's role (usually none) — a gated revert would trap the operator in
     // the target's identity with no way back. The route is self-gating: a
     // session that is not impersonating gets a 400 and nothing changes.
-    router.merge(
-        axum::Router::new()
-            .route(
-                "/impersonate/stop",
-                routing::post(crate::impersonation::impersonate_stop),
-            )
-            .layer(axum::Extension(AdminPrefix(prefix.to_owned()))),
-    )
+    router
+        .merge(
+            axum::Router::new()
+                .route(
+                    "/impersonate/stop",
+                    routing::post(crate::impersonation::impersonate_stop),
+                )
+                .layer(axum::Extension(AdminPrefix(prefix.to_owned()))),
+        )
+        // Outermost, and applied after the merge so it covers the ungated
+        // revert route too. Attribution must not depend on the *optional* role
+        // check, so this is its own layer rather than part of `check_role`.
+        .layer(from_fn(move |req, next| {
+            publish_current_actor(actor_session_key.clone(), req, next)
+        }))
 }
 
 /// Typed Extension carrying the admin URL prefix so handlers can build links.
@@ -1371,15 +1383,29 @@ async fn config_set(
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
 ) -> AutumnResult<Response> {
     let value = form.get("value").map_or("", String::as_str);
-    let actor = session
-        .get(&auth_session_key)
-        .await
-        .unwrap_or_else(|| "admin-ui".to_owned());
+    let actor = config_actor(&session, &auth_session_key).await;
     match svc.set(&key, value, Some(&actor)) {
         Ok(()) => flash.success(format!("Updated {key} = {value}")).await,
         Err(e) => flash.error(format!("Failed to set {key}: {e}")).await,
     }
     Ok(Redirect::to(&format!("{prefix}/config")).into_response())
+}
+
+/// Who to record in the runtime-config change history for this request.
+///
+/// Reads the request's current actor, which the admin router publishes — so
+/// while impersonating (#1394) a config change is recorded against the **real
+/// operator**, not the customer whose session it is being made from. Falls back
+/// to the session's own user, then to `"admin-ui"`, so an app that resolves its
+/// principal some other way still gets a name rather than a blank.
+async fn config_actor(session: &autumn_web::session::Session, auth_session_key: &str) -> String {
+    if let Some(actor) = autumn_web::current::Current::actor() {
+        return actor;
+    }
+    session
+        .get(auth_session_key)
+        .await
+        .unwrap_or_else(|| "admin-ui".to_owned())
 }
 
 /// `POST /admin/config/{key}/unset` — Revert a config key to its default.
@@ -1391,10 +1417,7 @@ async fn config_unset(
     Path(key): Path<String>,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let actor = session
-        .get(&auth_session_key)
-        .await
-        .unwrap_or_else(|| "admin-ui".to_owned());
+    let actor = config_actor(&session, &auth_session_key).await;
     match svc.unset(&key, Some(&actor)) {
         Ok(()) => flash.success(format!("Reset {key} to default")).await,
         Err(e) => flash.error(format!("Failed to reset {key}: {e}")).await,

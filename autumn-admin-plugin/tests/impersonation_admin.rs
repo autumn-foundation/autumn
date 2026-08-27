@@ -285,6 +285,59 @@ async fn the_begin_route_ignores_a_role_supplied_by_the_client() {
     client.get("/admin").send().await.assert_status(403);
 }
 
+// ── Attribution does not depend on the optional role check ────
+
+/// A gate that admits anyone authenticated — the shape an app uses when it
+/// gates the admin panel some other way and calls `require_role(None)`.
+struct AllowAnyAuthenticated;
+
+impl autumn_web::auth::impersonation::ImpersonationPolicy for AllowAnyAuthenticated {
+    fn can_impersonate<'a>(
+        &'a self,
+        ctx: &'a autumn_web::authorization::PolicyContext,
+        _target: &'a autumn_web::auth::impersonation::ImpersonationTarget,
+    ) -> autumn_web::authorization::BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.is_authenticated() })
+    }
+}
+
+#[tokio::test]
+async fn writes_are_attributed_even_when_the_role_check_is_disabled() {
+    // `require_role(None)` is a supported configuration, so it must not silently
+    // disable actor attribution — otherwise admin-surface writes would land as
+    // `SYSTEM_ACTOR`, and writes made while impersonating would lose the
+    // operator entirely.
+    let sink = RecordingSink::default();
+    let client = TestApp::new()
+        .routes(routes![login_admin, app_write])
+        .plugin(
+            AdminPlugin::new()
+                .require_role(None)
+                .with_impersonation(ImpersonationGate::custom(AllowAnyAuthenticated)),
+        )
+        .state_initializer({
+            let sink = sink.clone();
+            move |state| {
+                state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink.clone())));
+            }
+        })
+        .build();
+    client.post("/login-admin").send().await.assert_ok();
+
+    client
+        .post("/admin/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_status(303);
+
+    let actor = client.post("/app/write").send().await.text();
+    assert_eq!(
+        actor, "admin-1",
+        "attribution must not depend on the optional role check"
+    );
+}
+
 // ── Default-deny: no gate configured, no route ────────────────
 
 #[tokio::test]

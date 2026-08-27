@@ -37,29 +37,44 @@ pub async fn check_role(
         .into_response();
     };
 
-    let Some(user_id) = session.get(&auth_session_key).await else {
+    if session.get(&auth_session_key).await.is_none() {
         return AutumnError::unauthorized_msg("authentication required").into_response();
-    };
-
-    // Publish the request's current actor (#1383) the way the framework's own
-    // auth seams do. Without this the admin router resolves no principal at
-    // all, so a `#[repository(versioned)]` write made from an admin page lands
-    // as `SYSTEM_ACTOR` — and, while impersonating (#1394), would lose the
-    // operator's identity exactly where it matters most. `audit_actor_id`
-    // returns the real impersonator when the session carries one, and the
-    // effective user otherwise. Seeded only when nothing stronger (an outer
-    // bearer layer, an explicit `with_actor` scope) already resolved a
-    // principal, matching the "first resolver wins" rule in `autumn_web::auth`.
-    if autumn_web::current::Current::actor().is_none() {
-        autumn_web::current::Current::set_actor(
-            autumn_web::auth::impersonation::audit_actor_id(&session, &user_id).await,
-        );
     }
-    autumn_web::log::context::set_user_id(user_id);
-
     let current = session.get("role").await.unwrap_or_default();
     if current != role {
         return AutumnError::forbidden_msg(format!("'{role}' role required")).into_response();
+    }
+    next.run(req).await
+}
+
+/// Middleware that publishes the request's [current actor] for the admin router.
+///
+/// Without this the admin router resolves no principal at all, so a
+/// `#[repository(versioned)]` write made from an admin page lands as
+/// `SYSTEM_ACTOR` — and, while impersonating (#1394), would lose the operator's
+/// identity exactly where it matters most.
+///
+/// Applied **unconditionally**, not folded into [`check_role`]: role checking is
+/// optional ([`AdminPlugin::require_role(None)`](crate::AdminPlugin::require_role)),
+/// and attribution must not depend on it.
+///
+/// [`audit_actor_id`](autumn_web::auth::impersonation::audit_actor_id) returns
+/// the real impersonator when the session carries a live record, and the
+/// effective user otherwise. Seeded only when nothing stronger (an outer bearer
+/// layer, an explicit `with_actor` scope) already resolved a principal, matching
+/// the "first resolver wins" rule in `autumn_web::auth`.
+///
+/// [current actor]: autumn_web::current::Current
+pub async fn publish_current_actor(auth_session_key: String, req: Request, next: Next) -> Response {
+    if let Some(session) = req.extensions().get::<Session>().cloned()
+        && let Some(user_id) = session.get(&auth_session_key).await
+    {
+        if autumn_web::current::Current::actor().is_none() {
+            autumn_web::current::Current::set_actor(
+                autumn_web::auth::impersonation::audit_actor_id(&session, &user_id).await,
+            );
+        }
+        autumn_web::log::context::set_user_id(user_id);
     }
     next.run(req).await
 }
