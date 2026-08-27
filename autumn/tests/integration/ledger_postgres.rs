@@ -6,8 +6,9 @@
 //!
 //! `tests/sqlite_ledger.rs` is the golden end-to-end test and runs Docker-free on
 //! every push. This file proves the *Postgres fork* of the same machinery — the
-//! `jsonb` snapshot cast, `Timestamptz` binds, and the `COALESCE(tenant_id, '')`
-//! expression unique index — behaves identically:
+//! `Timestamptz` binds, the `COALESCE(tenant_id, '')` expression unique index,
+//! and above all the `TEXT` snapshot column (a `JSONB` one would re-render
+//! numbers through `numeric` and break the hash) — behaves identically:
 //!
 //! * every write appends a chained revision carrying both time axes;
 //! * as-of reconstruction at a past transaction instant matches an oracle
@@ -271,11 +272,17 @@ async fn ledger_records_chains_and_reconstructs_on_postgres() {
     assert_eq!(head.seq, 3);
 
     // Out-of-band mutation is detected at the tampered link.
+    //
+    // `snapshot` is TEXT, not JSONB — the whole point of this tier's float
+    // column — so the jsonb helpers need explicit casts either side. Editing the
+    // text directly would work too; going through jsonb keeps the tamper
+    // expressed as "change this one field" rather than a string substitution
+    // coupled to the canonical formatting.
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
             "UPDATE _autumn_ledger_revisions \
-             SET snapshot = jsonb_set(snapshot, '{amount_cents}', '999999') \
+             SET snapshot = jsonb_set(snapshot::jsonb, '{amount_cents}', '999999')::text \
              WHERE table_name = 'test_ledger_invoices' AND record_id = $1 AND seq = 2",
         )
         .bind::<diesel::sql_types::BigInt, _>(id)
