@@ -13,6 +13,7 @@ pub mod policies;
 pub mod repositories;
 pub mod routes;
 pub mod schema;
+pub mod seo;
 pub mod tasks;
 
 use std::sync::{Arc, OnceLock};
