@@ -73,6 +73,18 @@ static EMERGENCY_PROVIDER: std::sync::Mutex<Option<ManagedPostgresPoolProvider>>
 /// destructors and would otherwise orphan the supervised Postgres child while it
 /// holds the data dir and port. Best-effort and idempotent: a no-op when no
 /// managed cluster is running or it was already stopped cleanly.
+/// Whether this process started and is supervising a managed Postgres child.
+///
+/// An in-place upgrade (#1674) refuses to run when this is true: the successor
+/// would try to start a second postmaster over the same data directory and
+/// port, and the predecessor's drain would stop the cluster out from under
+/// whichever one won.
+pub(crate) fn is_supervising() -> bool {
+    EMERGENCY_PROVIDER
+        .lock()
+        .is_ok_and(|provider| provider.is_some())
+}
+
 pub(crate) fn emergency_stop() {
     let Some(provider) = EMERGENCY_PROVIDER.lock().ok().and_then(|g| g.clone()) else {
         return;

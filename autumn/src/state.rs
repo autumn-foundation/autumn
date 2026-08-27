@@ -318,11 +318,14 @@ impl AppState {
     /// # }
     /// ```
     #[must_use]
-    pub fn live_state<T>(&self) -> Option<Arc<crate::upgrade::LiveStateHandle<T>>>
+    pub fn live_state<T>(&self) -> Option<crate::upgrade::LiveStateHandle<T>>
     where
         T: crate::upgrade::LiveState,
     {
+        // The handle is itself an `Arc` over the state, so hand back a clone of
+        // it rather than an `Arc<Arc<…>>` the caller has to keep alive.
         self.extension::<crate::upgrade::LiveStateHandle<T>>()
+            .map(|handle| (*handle).clone())
     }
 
     /// Fetch the extension of type `T`, inserting `f()`'s result if absent.

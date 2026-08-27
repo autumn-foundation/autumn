@@ -8,7 +8,7 @@
 //! snapshotted it.
 
 use autumn_web::test::TestApp;
-use autumn_web::upgrade::{LiveState, LiveStateFrozen, LiveStateHandle, LiveStateRegistry};
+use autumn_web::upgrade::{LiveState, LiveStateFrozen, LiveStateHandle};
 use autumn_web::{AppState, get, routes};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ impl LiveState for Stats {
     const VERSION: u32 = 1;
 }
 
-fn stats(state: &AppState) -> std::sync::Arc<LiveStateHandle<Stats>> {
+fn stats(state: &AppState) -> LiveStateHandle<Stats> {
     state
         .live_state::<Stats>()
         .expect("the designated live state is installed")
@@ -78,14 +78,13 @@ async fn a_snapshotted_block_refuses_writes_but_still_serves_reads() {
         })
         .build();
 
-    // Stand in for the upgrade path: freeze and snapshot the block exactly as
-    // `SIGUSR2` does before handing it to a successor.
+    // Stand in for the upgrade path: freeze the block exactly as `SIGUSR2`
+    // does before handing it to a successor.
     let state = client.state();
-    let registry = state
-        .extension::<LiveStateRegistry>()
-        .expect("designating live state registers it for handover");
-    let envelope = registry.freeze_and_snapshot(1).expect("snapshots");
-    assert_eq!(envelope.version, 1);
+    let handle = state
+        .live_state::<Stats>()
+        .expect("designating live state installs it");
+    handle.freeze_for_test();
 
     // A write is refused rather than accepted and thrown away with the process.
     let response = client.get("/write").send().await;
@@ -103,7 +102,7 @@ async fn a_snapshotted_block_refuses_writes_but_still_serves_reads() {
     assert_eq!(response.text(), "hits=7 note=carried");
 
     // An abandoned upgrade hands the state back.
-    registry.unfreeze();
+    handle.unfreeze_for_test();
     let response = client.get("/write").send().await;
     response.assert_ok();
     assert_eq!(response.text(), "hits=8");

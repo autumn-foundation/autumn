@@ -7,8 +7,6 @@
 //!
 //! See `docs/guide/hot-upgrades.md`.
 
-use std::sync::Arc;
-
 use autumn_web::prelude::*;
 use autumn_web::state_migration;
 use autumn_web::upgrade::{LiveState, LiveStateHandle};
@@ -57,7 +55,7 @@ fn line(stats: &Stats) -> String {
     )
 }
 
-fn stats(state: &AppState) -> AutumnResult<Arc<LiveStateHandle<Stats>>> {
+fn stats(state: &AppState) -> AutumnResult<LiveStateHandle<Stats>> {
     state
         .live_state::<Stats>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("live state is not installed"))

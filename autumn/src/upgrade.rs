@@ -16,7 +16,7 @@
 //!
 //! The successor adopts the listener, decodes the snapshot, and — when the
 //! state shape changed between the two builds — runs a migration whose
-//! totality the *compiler* proved: see [`state_migration!`].
+//! totality the *compiler* proved: see [`state_migration!`](crate::state_migration).
 //!
 //! # Designating state
 //!
@@ -93,18 +93,23 @@ pub const BINARY_ENV: &str = "AUTUMN_UPGRADE_BINARY";
 /// is created under. Defaults to the system temp directory.
 pub const DIR_ENV: &str = "AUTUMN_UPGRADE_DIR";
 
-/// The descriptor number the predecessor places the listening socket on.
+/// The descriptor the predecessor places the listening socket on: the
+/// successor's **stdin**.
 ///
-/// `0`/`1`/`2` are the standard streams, so the first free descriptor is `3` —
-/// the same convention systemd socket activation and unicorn use.
-pub const INHERITED_LISTENER_FD: i32 = 3;
+/// `inetd` has handed servers their socket this way for decades, and it is the
+/// one descriptor a successor can turn back into a listener without `unsafe`
+/// (this workspace forbids it) — `std::io::stdin().as_fd()` is a
+/// `BorrowedFd`, and `OwnedFd` converts into a `TcpListener` safely. The
+/// successor re-points its own stdin at `/dev/null` immediately after adopting,
+/// so nothing it later spawns inherits the listening socket.
+pub const INHERITED_LISTENER_FD: i32 = 0;
 
 /// A block of typed in-memory application state designated to survive an
 /// in-place upgrade.
 ///
 /// [`VERSION`](Self::VERSION) identifies the *shape*: bump it in the same
 /// commit that changes the fields, and give the new build a
-/// [`state_migration!`] from the old shape. A successor that finds a snapshot
+/// [`state_migration!`](crate::state_migration) from the old shape. A successor that finds a snapshot
 /// it can neither decode nor migrate refuses to start, which aborts the
 /// upgrade and leaves the predecessor serving.
 pub trait LiveState: Serialize + DeserializeOwned + Send + Sync + 'static {
@@ -114,7 +119,7 @@ pub trait LiveState: Serialize + DeserializeOwned + Send + Sync + 'static {
 
 /// A total mapping from an older live-state shape to this one.
 ///
-/// Write it with [`state_migration!`], which makes a missing field mapping (or
+/// Write it with [`state_migration!`](crate::state_migration), which makes a missing field mapping (or
 /// a missing enum variant) a compile error rather than a silent data loss.
 pub trait MigrateFrom<Old: LiveState>: LiveState + Sized {
     /// Carry `old` forward into this shape.
@@ -126,8 +131,9 @@ pub trait MigrateFrom<Old: LiveState>: LiveState + Sized {
 ///
 /// After the snapshot the successor owns the future of this state, so a write
 /// here would be thrown away when this process exits. Rather than lose it
-/// silently, the write is refused: return a `503`/retry from the handler and
-/// the client's retry lands on the successor.
+/// silently, the write is refused: return a retryable `503` from the handler.
+/// The freeze starts before the successor exists, so an immediate retry may be
+/// refused again by this same process until the successor is serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "live state is frozen: it has been snapshotted for an in-place upgrade and this process is draining"
@@ -214,6 +220,21 @@ impl<T> LiveStateHandle<T> {
         serde_json::to_value(&*guard).inspect_err(|_| self.frozen.store(false, Ordering::Release))
     }
 
+    /// Freeze this block as an in-place upgrade would, so an app can test the
+    /// [`LiveStateFrozen`] branch its handlers are expected to have.
+    ///
+    /// Only useful in tests: the framework freezes and unfreezes the real thing
+    /// around a handover. Nothing unfreezes this one but
+    /// [`unfreeze_for_test`](Self::unfreeze_for_test).
+    pub fn freeze_for_test(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Undo [`freeze_for_test`](Self::freeze_for_test).
+    pub fn unfreeze_for_test(&self) {
+        self.unfreeze();
+    }
+
     /// Release the freeze (an aborted upgrade, or a failed snapshot).
     fn unfreeze(&self) {
         self.frozen.store(false, Ordering::Release);
@@ -223,7 +244,7 @@ impl<T> LiveStateHandle<T> {
 /// The serialized form of a live-state block as it crosses the process
 /// boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StateEnvelope {
+pub(crate) struct StateEnvelope {
     /// Upgrade generation of the *successor* this snapshot was written for.
     pub generation: u64,
     /// [`LiveState::VERSION`] of the shape `payload` was serialized from.
@@ -282,9 +303,9 @@ pub enum UpgradeError {
          plain TCP listeners only in this release"
     )]
     UnsupportedListener(&'static str),
-    /// A previous upgrade is still waiting on its successor.
-    #[error("an in-place upgrade is already in progress; ignoring this request")]
-    AlreadyInProgress,
+    /// Something else about this process cannot be handed to a successor.
+    #[error("this process cannot be upgraded in place: {0}")]
+    Unsupported(&'static str),
     /// The binary to exec could not be resolved.
     #[error("could not resolve the binary to upgrade to: {0}")]
     Binary(String),
@@ -307,7 +328,7 @@ pub enum UpgradeError {
 /// Installed into the [`AppState`](crate::AppState) extension map by
 /// [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state) so
 /// the upgrade path can snapshot the block without knowing its type.
-pub struct LiveStateRegistry {
+pub(crate) struct LiveStateRegistry {
     freeze_and_snapshot: Box<dyn Fn(u64) -> Result<StateEnvelope, UpgradeError> + Send + Sync>,
     unfreeze: Box<dyn Fn() + Send + Sync>,
     type_name: &'static str,
@@ -324,7 +345,7 @@ impl std::fmt::Debug for LiveStateRegistry {
 impl LiveStateRegistry {
     /// Register `handle` as the app's designated live-state block.
     #[must_use]
-    pub fn new<T: LiveState>(handle: &LiveStateHandle<T>) -> Self {
+    pub(crate) fn new<T: LiveState>(handle: &LiveStateHandle<T>) -> Self {
         let for_snapshot = handle.clone();
         let for_unfreeze = handle.clone();
         Self {
@@ -349,19 +370,22 @@ impl LiveStateRegistry {
     /// # Errors
     ///
     /// [`UpgradeError::Snapshot`] if the state does not serialize.
-    pub fn freeze_and_snapshot(&self, generation: u64) -> Result<StateEnvelope, UpgradeError> {
+    pub(crate) fn freeze_and_snapshot(
+        &self,
+        generation: u64,
+    ) -> Result<StateEnvelope, UpgradeError> {
         (self.freeze_and_snapshot)(generation)
     }
 
     /// Release the freeze — used when an upgrade aborts and this process
     /// carries on serving.
-    pub fn unfreeze(&self) {
+    pub(crate) fn unfreeze(&self) {
         (self.unfreeze)();
     }
 
     /// Rust type name of the designated block, for diagnostics.
     #[must_use]
-    pub const fn type_name(&self) -> &'static str {
+    pub(crate) const fn type_name(&self) -> &'static str {
         self.type_name
     }
 }
@@ -379,7 +403,7 @@ pub fn generation() -> u64 {
 /// Path of the snapshot handed over by a predecessor, if this process was
 /// started by an in-place upgrade.
 #[must_use]
-pub fn carried_snapshot_path() -> Option<std::path::PathBuf> {
+pub(crate) fn carried_snapshot_path() -> Option<std::path::PathBuf> {
     let raw = std::env::var_os(STATE_FILE_ENV)?;
     if raw.is_empty() {
         return None;
@@ -396,7 +420,7 @@ pub fn carried_snapshot_path() -> Option<std::path::PathBuf> {
 ///
 /// [`AdoptError::Read`] or [`AdoptError::Envelope`] if it cannot be read or
 /// parsed.
-pub fn read_snapshot(path: &std::path::Path) -> Result<StateEnvelope, AdoptError> {
+pub(crate) fn read_snapshot(path: &std::path::Path) -> Result<StateEnvelope, AdoptError> {
     let raw = std::fs::read(path).map_err(|source| AdoptError::Read {
         path: path.display().to_string(),
         source,
@@ -414,24 +438,31 @@ pub fn read_snapshot(path: &std::path::Path) -> Result<StateEnvelope, AdoptError
 /// Any IO error from creating or writing the file, including
 /// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when something is
 /// already at `path`.
-pub fn write_snapshot(
+pub(crate) fn write_snapshot(
     path: &std::path::Path,
     envelope: &StateEnvelope,
 ) -> Result<(), std::io::Error> {
+    let bytes = serde_json::to_vec(envelope).map_err(std::io::Error::other)?;
+    write_owner_only(path, &bytes)
+}
+
+/// Create `path` owner-only and write `bytes` to it, failing if anything is
+/// already there.
+///
+/// Owner-only from the moment the file exists, never a `create` + later
+/// `chmod` window — everything this module writes is application data.
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    // The snapshot is application state at rest: owner-only from the moment it
-    // exists, never a `create` + later `chmod` window.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    let bytes = serde_json::to_vec(envelope).map_err(std::io::Error::other)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.flush()
 }
 
@@ -441,7 +472,7 @@ pub fn write_snapshot(
 ///
 /// [`AdoptError::VersionMismatch`] if the snapshot is a different shape
 /// version, [`AdoptError::Decode`] if the payload does not fit `T`.
-pub fn decode<T: LiveState>(envelope: &StateEnvelope) -> Result<T, AdoptError> {
+pub(crate) fn decode<T: LiveState>(envelope: &StateEnvelope) -> Result<T, AdoptError> {
     decode_as::<T>(envelope, String::new())
 }
 
@@ -473,12 +504,25 @@ fn decode_payload<T: DeserializeOwned>(envelope: &StateEnvelope) -> Result<T, Ad
 /// # Errors
 ///
 /// As [`decode`], with `Old::VERSION` additionally accepted.
-pub fn decode_migrating<Old, New>(envelope: &StateEnvelope) -> Result<New, AdoptError>
+pub(crate) fn decode_migrating<Old, New>(envelope: &StateEnvelope) -> Result<New, AdoptError>
 where
     Old: LiveState,
     New: MigrateFrom<Old>,
 {
-    if envelope.version == Old::VERSION && Old::VERSION != New::VERSION {
+    // Two shapes that declare the same VERSION are indistinguishable on the
+    // wire, so the migration below could never run and the old payload would be
+    // handed to the new shape's `Deserialize` — which, with a `#[serde(default)]`
+    // or an `Option` field, is exactly the silent loss this module exists to
+    // prevent. `state_migration!` refuses this at the migration itself; this
+    // catches a hand-written `impl MigrateFrom`, at monomorphization.
+    const {
+        assert!(
+            Old::VERSION != New::VERSION,
+            "a live-state migration needs two different LiveState::VERSIONs: bump the new \
+             shape's VERSION in the same commit that changes its fields"
+        );
+    }
+    if envelope.version == Old::VERSION {
         return decode_payload::<Old>(envelope).map(New::migrate_from);
     }
     decode_as::<New>(
@@ -502,7 +546,7 @@ where
 /// to a successor while this process goes on serving through the original.
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct HandoffSocket(std::os::fd::OwnedFd);
+pub(crate) struct HandoffSocket(std::os::fd::OwnedFd);
 
 #[cfg(unix)]
 impl HandoffSocket {
@@ -511,7 +555,7 @@ impl HandoffSocket {
     /// # Errors
     ///
     /// Any IO error from `dup`.
-    pub fn from_listener(listener: &tokio::net::TcpListener) -> std::io::Result<Self> {
+    pub(crate) fn from_listener(listener: &tokio::net::TcpListener) -> std::io::Result<Self> {
         use std::os::fd::AsFd as _;
         listener.as_fd().try_clone_to_owned().map(Self)
     }
@@ -532,18 +576,19 @@ impl HandoffSocket {
 /// variable by hand) is refused too.
 #[cfg(unix)]
 #[must_use]
-pub fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
+pub(crate) fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
     use std::os::fd::AsFd as _;
 
+    if !handoff_requested() {
+        return None;
+    }
     // Adoption consumes the handoff: a second caller must not get a second
     // listener on the same socket.
-    static ADOPTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-    let raw = std::env::var(LISTEN_FD_ENV).ok()?;
-    if ADOPTED.set(()).is_err() {
+    if ADOPTION_ATTEMPTED.set(()).is_err() {
         tracing::warn!("the inherited listening socket has already been adopted");
         return None;
     }
+    let raw = std::env::var(LISTEN_FD_ENV).unwrap_or_default();
     if raw.trim() != INHERITED_LISTENER_FD.to_string() {
         tracing::error!(
             requested_fd = raw,
@@ -561,30 +606,121 @@ pub fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
         }
     };
     let listener = std::net::TcpListener::from(fd);
-    // `From<OwnedFd>` does not check what the descriptor is. A listening socket
-    // has a local address; a terminal or a pipe does not.
-    match listener.local_addr() {
-        Ok(addr) => {
-            if let Err(error) = listener.set_nonblocking(true) {
-                tracing::error!(error = %error, "inherited listening socket is unusable");
-                return None;
-            }
-            tracing::info!(
-                addr = %addr,
-                generation = generation(),
-                predecessor = std::env::var(PREDECESSOR_PID_ENV).unwrap_or_default(),
-                "adopted the listening socket handed over by the previous build"
-            );
-            Some(listener)
-        }
+    // `From<OwnedFd>` does not check what the descriptor is, and neither this
+    // process nor the kernel will complain later: an accept loop over a
+    // non-listening socket spins on `EINVAL` forever while `/ready` says 200.
+    // A listening socket has a local address and *no peer*; a terminal or pipe
+    // has neither, and a connected socket has both.
+    let Ok(addr) = listener.local_addr() else {
+        tracing::error!("{LISTEN_FD_ENV} is set but stdin is not a socket; refusing to adopt it");
+        return None;
+    };
+    // `getpeername` answers only for a *connected* socket, so a duplicate
+    // viewed as a `TcpStream` is the cheap discriminator. The duplicate closes
+    // with the probe; the listener keeps its own descriptor.
+    let connected_peer = listener
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| std::net::TcpStream::from(fd).peer_addr().ok());
+    if let Some(peer) = connected_peer {
+        tracing::error!(
+            %peer,
+            "{LISTEN_FD_ENV} is set but stdin is a connected socket, not a listener; \
+             refusing to adopt it"
+        );
+        return None;
+    }
+    if let Err(error) = listener.set_nonblocking(true) {
+        tracing::error!(error = %error, "inherited listening socket is unusable");
+        return None;
+    }
+    // The socket is ours now (the `TcpListener` above holds its own descriptor),
+    // so re-point stdin at `/dev/null`: otherwise every subprocess this app ever
+    // spawns inherits the listening socket on fd 0 by default, and could accept
+    // connections on it or keep the port bound after the app exits.
+    match std::fs::File::open("/dev/null")
+        .and_then(|null| nix::unistd::dup2_stdin(&null).map_err(std::io::Error::from))
+    {
+        Ok(()) => {}
         Err(error) => {
             tracing::error!(
                 error = %error,
-                "{LISTEN_FD_ENV} is set but stdin is not a listening socket; binding normally"
+                "adopted the inherited listening socket but could not re-point stdin at \
+                 /dev/null; refusing to serve rather than leaking the listener into every \
+                 subprocess this app spawns"
             );
-            None
+            return None;
         }
     }
+    ADOPTED.set(addr).ok();
+    tracing::info!(
+        %addr,
+        generation = generation(),
+        predecessor = std::env::var(PREDECESSOR_PID_ENV).unwrap_or_default(),
+        "adopted the listening socket handed over by the previous build"
+    );
+    Some(listener)
+}
+
+/// Whether a predecessor handed this process a listening socket — i.e. whether
+/// this process is the successor half of an in-place upgrade.
+#[must_use]
+pub(crate) fn handoff_requested() -> bool {
+    std::env::var_os(LISTEN_FD_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// The address this process adopted from a predecessor, if it adopted one.
+#[must_use]
+pub(crate) fn adopted_addr() -> Option<std::net::SocketAddr> {
+    ADOPTED.get().copied()
+}
+
+/// Set once adoption has been attempted, so the handoff is consumed exactly
+/// once even if several code paths ask for it.
+static ADOPTION_ATTEMPTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Set once a listening socket has actually been adopted.
+static ADOPTED: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+
+/// Check that this process really completed the handover it was started for,
+/// *before* it releases its predecessor to drain.
+///
+/// A successor that boots without taking over is the worst outcome available:
+/// the predecessor exits believing the service moved, and the address it was
+/// serving either disappears or is served by a process with none of the state.
+/// Both ways of half-arriving are caught here — a listening socket that was
+/// handed over but not adopted (a build that switched to `server.unix_socket`,
+/// a descriptor that turned out not to be a listener), and a live-state
+/// snapshot that was handed over but never consumed (a build that dropped its
+/// `with_live_state(...)` call).
+///
+/// # Errors
+///
+/// A description of what was handed over and not taken up. The caller should
+/// refuse to start: the predecessor then times out and keeps serving.
+pub(crate) fn verify_handover_complete() -> Result<(), String> {
+    if handoff_requested() && adopted_addr().is_none() {
+        return Err(format!(
+            "this build was started by an in-place upgrade and was handed a listening socket, \
+             but never adopted it (see the errors above). Serving would abandon the address \
+             the previous build is still answering on, so this build refuses to start; the \
+             previous build keeps serving. In-place upgrade requires the new build to bind a \
+             plain TCP listener ({LISTEN_FD_ENV} was set)"
+        ));
+    }
+    if let Some(path) = carried_snapshot_path()
+        && path.exists()
+    {
+        return Err(format!(
+            "this build was handed the previous build's live state ({}) but never adopted it: \
+             nothing called AppBuilder::with_live_state(...) or with_live_state_from(...). \
+             Starting would silently drop that state, so this build refuses to start and the \
+             previous build keeps serving",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Record the path this process was started from, before a deploy can replace
@@ -594,7 +730,7 @@ pub fn adopt_inherited_listener() -> Option<std::net::TcpListener> {
 /// which reports `"… (deleted)"` after the binary is replaced — reading it at
 /// upgrade time instead of boot time would resolve to a path that no longer
 /// exists.
-pub fn record_startup_exe() {
+pub(crate) fn record_startup_exe() {
     if let Ok(path) = std::env::current_exe() {
         let _ = startup_exe_cell().set(path);
     }
@@ -613,7 +749,7 @@ fn startup_exe_cell() -> &'static std::sync::OnceLock<std::path::PathBuf> {
 /// [`UpgradeError::Binary`] when neither can be resolved, or when the resolved
 /// path no longer names a file — a half-finished deploy must abort *before* a
 /// successor is spawned, not after the old build has drained.
-pub fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
+pub(crate) fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
     let configured = std::env::var_os(BINARY_ENV).filter(|value| !value.is_empty());
     let path = match configured {
         Some(value) => std::path::PathBuf::from(value),
@@ -636,15 +772,15 @@ pub fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
 ///
 /// Written to a temporary sibling and renamed into place, so the predecessor —
 /// which polls for the path — can never observe a half-written file.
-pub fn signal_upgrade_ready() {
+pub(crate) fn signal_upgrade_ready() {
     let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|value| !value.is_empty()) else {
         return;
     };
     let path = std::path::PathBuf::from(path);
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
-    let write =
-        std::fs::write(&tmp, generation().to_string()).and_then(|()| std::fs::rename(&tmp, &path));
+    let write = write_owner_only(&tmp, generation().to_string().as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(error) = write {
         let _ = std::fs::remove_file(&tmp);
         // The predecessor will time out and keep serving; say why.
@@ -656,7 +792,7 @@ pub fn signal_upgrade_ready() {
 /// What an upgrade handed over, once the successor is serving.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
-pub struct Handover {
+pub(crate) struct Handover {
     /// Process id of the successor now sharing the listening socket.
     pub successor_pid: u32,
     /// Generation the successor is running as.
@@ -688,51 +824,88 @@ pub(crate) struct UpgradePlan<'a> {
 pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, UpgradeError> {
     let started = plan.clock.monotonic();
     let next_generation = generation().saturating_add(1);
+    // Resolved before anything is frozen, so a deploy that has not landed yet
+    // costs the running app nothing at all.
     let binary = upgrade_binary()?;
 
-    let dir = create_handoff_dir(next_generation)?;
-    let ready_path = dir.join("ready");
-    let outcome =
-        spawn_and_await_successor(&plan, &binary, &dir, &ready_path, next_generation).await;
+    // Everything one in-flight handoff owns, and the undo for every way it can
+    // fail to complete.
+    let mut handoff = Handoff {
+        dir: create_handoff_dir(next_generation)?,
+        child: None,
+        registry: plan.registry.clone(),
+        completed: false,
+    };
+    let successor_pid =
+        spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await?;
+    handoff.completed = true;
 
-    // The handoff directory carries application state; it never outlives the
-    // handoff, successful or not.
-    let _ = std::fs::remove_dir_all(&dir);
+    Ok(Handover {
+        successor_pid,
+        generation: next_generation,
+        elapsed: plan.clock.monotonic().saturating_duration_since(started),
+    })
+}
 
-    match outcome {
-        Ok(successor_pid) => Ok(Handover {
-            successor_pid,
-            generation: next_generation,
-            elapsed: plan.clock.monotonic().saturating_duration_since(started),
-        }),
-        Err(error) => {
+/// The state one in-flight handoff owns, and the undo for every way it can fail
+/// to complete — an error, or this task being dropped outright.
+///
+/// A dropped upgrade is not hypothetical: the watcher gives up on shutdown, so
+/// a `SIGTERM` arriving between "successor spawned" and "successor serving"
+/// runs exactly this path. Leaving the undo to the error arm alone would orphan
+/// a half-booted successor on the port, leave the app's state sitting on disk,
+/// and leave the live state frozen for the rest of the drain.
+#[cfg(unix)]
+struct Handoff {
+    /// Private directory holding this handoff's snapshot and ready file.
+    dir: std::path::PathBuf,
+    /// The successor, from the moment it is spawned.
+    child: Option<std::process::Child>,
+    /// The designated live state, frozen for the duration.
+    registry: Option<Arc<LiveStateRegistry>>,
+    /// Set once the successor is serving and the handover is this process's to
+    /// walk away from.
+    completed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             // The successor never took over, so this process still owns the
             // state's future: let it be written again.
-            if let Some(registry) = &plan.registry {
+            if let Some(registry) = &self.registry {
                 registry.unfreeze();
             }
-            Err(error)
         }
+        // The handoff directory carries application state; it never outlives
+        // the handoff, completed or abandoned.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 /// Snapshot, spawn, and wait — the fallible middle of [`upgrade_in_place`],
-/// split out so its caller can clean up on every path.
+/// with everything that needs undoing parked in `handoff`.
 #[cfg(unix)]
 async fn spawn_and_await_successor(
     plan: &UpgradePlan<'_>,
     binary: &std::path::Path,
-    dir: &std::path::Path,
-    ready_path: &std::path::Path,
+    handoff: &mut Handoff,
     next_generation: u64,
 ) -> Result<u32, UpgradeError> {
+    let ready_path = handoff.dir.join("ready");
+
     // 1. Freeze and snapshot the designated state. From here until the
     //    successor is serving, a write to that block is refused rather than
     //    lost — and if anything below fails, the freeze is lifted again.
     let state_path = match &plan.registry {
         Some(registry) => {
             let envelope = registry.freeze_and_snapshot(next_generation)?;
-            let path = dir.join("state.json");
+            let path = handoff.dir.join("state.json");
             write_snapshot(&path, &envelope)?;
             tracing::info!(
                 state = registry.type_name(),
@@ -750,13 +923,13 @@ async fn spawn_and_await_successor(
     command.env(LISTEN_FD_ENV, INHERITED_LISTENER_FD.to_string());
     command.env(GENERATION_ENV, next_generation.to_string());
     command.env(PREDECESSOR_PID_ENV, std::process::id().to_string());
-    command.env(READY_FILE_ENV, ready_path);
+    command.env(READY_FILE_ENV, &ready_path);
     match &state_path {
         Some(path) => command.env(STATE_FILE_ENV, path),
         None => command.env_remove(STATE_FILE_ENV),
     };
     command.stdin(plan.socket.stdio()?);
-    let mut child = command.spawn()?;
+    let child = handoff.child.insert(command.spawn()?);
     let successor_pid = child.id();
     tracing::info!(
         successor_pid,
@@ -766,23 +939,29 @@ async fn spawn_and_await_successor(
     );
 
     // 3. Wait for the successor to serve — or to die trying. A successor that
-    //    cannot boot (a bad binary, a state it cannot account for) is the case
-    //    this whole handshake exists for: the old build keeps serving.
+    //    cannot boot (a bad binary, a state it cannot account for, a socket it
+    //    cannot adopt) is the case this whole handshake exists for: the old
+    //    build keeps serving.
     let deadline = plan.clock.monotonic().saturating_add(plan.ready_timeout);
     loop {
         if ready_path.exists() {
-            return Ok(successor_pid);
+            // Readiness is a file, so it outlives the process that wrote it:
+            // check the successor is still alive before releasing the one
+            // process that is definitely serving.
+            return match child.try_wait() {
+                Ok(Some(status)) => Err(UpgradeError::SuccessorExited(format!(
+                    "{status}, immediately after signalling readiness"
+                ))),
+                Ok(None) => Ok(successor_pid),
+                Err(error) => Err(UpgradeError::Io(error)),
+            };
         }
         match child.try_wait() {
-            Ok(Some(status)) => {
-                return Err(UpgradeError::SuccessorExited(status.to_string()));
-            }
+            Ok(Some(status)) => return Err(UpgradeError::SuccessorExited(status.to_string())),
             Ok(None) => {}
             Err(error) => return Err(UpgradeError::Io(error)),
         }
         if plan.clock.monotonic() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(UpgradeError::ReadyTimeout(plan.ready_timeout));
         }
         tokio::time::sleep(READY_POLL_INTERVAL).await;
@@ -793,6 +972,26 @@ async fn spawn_and_await_successor(
 #[cfg(unix)]
 const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Where per-upgrade handoff directories are created.
+///
+/// `AUTUMN_UPGRADE_DIR` wins; otherwise `XDG_RUNTIME_DIR` (a per-user `0700`
+/// directory on any modern Linux) is preferred over the shared temp directory,
+/// because a directory only this user can write to leaves nothing for a local
+/// neighbour to squat on.
+#[cfg(unix)]
+fn handoff_base_dir() -> std::path::PathBuf {
+    if let Some(configured) = std::env::var_os(DIR_ENV).filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(configured);
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        let runtime = std::path::PathBuf::from(runtime);
+        if runtime.is_dir() {
+            return runtime;
+        }
+    }
+    std::env::temp_dir()
+}
+
 /// Create the private directory this handoff's files live in.
 ///
 /// `0700` and created (never opened) by us, so nothing pre-planted by another
@@ -801,9 +1000,7 @@ const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 fn create_handoff_dir(generation: u64) -> Result<std::path::PathBuf, std::io::Error> {
     use std::os::unix::fs::DirBuilderExt as _;
 
-    let base = std::env::var_os(DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let base = handoff_base_dir();
     std::fs::create_dir_all(&base)?;
     let pid = std::process::id();
     for attempt in 0..16u32 {
@@ -824,6 +1021,16 @@ fn create_handoff_dir(generation: u64) -> Result<std::path::PathBuf, std::io::Er
         ),
     ))
 }
+
+/// Why a designated live-state block could not be installed at startup.
+///
+/// Recorded into the app state rather than exiting on the spot: the
+/// initializer that discovers it runs inside the async runtime, and the
+/// managed-Postgres child that a bare `process::exit` would orphan can only be
+/// stopped from there. [`AppBuilder::run`](crate::app::AppBuilder::run) checks
+/// for it immediately afterwards and refuses to start.
+#[derive(Debug)]
+pub(crate) struct LiveStateInstallFailure(pub(crate) String);
 
 /// Declare a **total** migration from an older live-state shape to the current
 /// one, checked by the compiler.
@@ -895,6 +1102,14 @@ macro_rules! state_migration {
                => $arm:expr ),+ $(,)?
         }
     }) => {
+        const _: () = assert!(
+            <$old as $crate::upgrade::LiveState>::VERSION
+                != <$new as $crate::upgrade::LiveState>::VERSION,
+            "a live-state migration needs two different LiveState::VERSIONs: bump the new \
+             shape's VERSION in the same commit that changes its fields, or the snapshot \
+             cannot be told apart on the wire and this migration would never run"
+        );
+
         impl $crate::upgrade::MigrateFrom<$old> for $new {
             fn migrate_from($binding: $old) -> Self {
                 // A type alias, not a path, so the old shape may be any type
@@ -913,6 +1128,14 @@ macro_rules! state_migration {
     (from $old:ty as $binding:ident => $new:ty {
         $( $field:ident : $value:expr ),+ $(,)?
     }) => {
+        const _: () = assert!(
+            <$old as $crate::upgrade::LiveState>::VERSION
+                != <$new as $crate::upgrade::LiveState>::VERSION,
+            "a live-state migration needs two different LiveState::VERSIONs: bump the new \
+             shape's VERSION in the same commit that changes its fields, or the snapshot \
+             cannot be told apart on the wire and this migration would never run"
+        );
+
         impl $crate::upgrade::MigrateFrom<$old> for $new {
             fn migrate_from($binding: $old) -> Self {
                 Self { $( $field: $value ),+ }
@@ -1157,6 +1380,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handover_this_build_did_not_complete_is_refused_rather_than_half_taken() {
+        // A build handed a listening socket that it never adopted must not
+        // release its predecessor: the address the predecessor is still serving
+        // would be abandoned. (Adoption is a process-global one-shot, so this
+        // test asserts the guard, not the adoption.)
+        temp_env::with_var(LISTEN_FD_ENV, Some("0"), || {
+            let refusal = verify_handover_complete().expect_err("must refuse");
+            assert!(refusal.contains("never adopted it"), "{refusal}");
+        });
+
+        // ...and neither must a build that was handed live state and never
+        // installed it (an app that dropped its `with_live_state(...)` call).
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-upgrade-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("state.json");
+        write_snapshot(&path, &envelope_of(&StatsV1::default(), 1)).expect("writes");
+
+        temp_env::with_var(STATE_FILE_ENV, Some(&path), || {
+            let refusal = verify_handover_complete().expect_err("must refuse");
+            assert!(refusal.contains("never adopted it"), "{refusal}");
+        });
+
+        // A snapshot that *was* consumed leaves nothing behind, so the same
+        // check passes.
+        let _ = read_snapshot(&path).expect("reads");
+        temp_env::with_var(STATE_FILE_ENV, Some(&path), || {
+            verify_handover_complete().expect("a consumed snapshot is a completed handover");
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ordinary_cold_start_has_no_handover_to_complete() {
+        temp_env::with_vars_unset([LISTEN_FD_ENV, STATE_FILE_ENV], || {
+            assert!(!handoff_requested());
+            verify_handover_complete().expect("a cold start is not a half-completed handover");
+        });
+    }
+
+    #[test]
+    fn the_binary_to_upgrade_into_must_exist_before_anything_is_frozen() {
+        let missing = std::env::temp_dir().join("autumn-upgrade-no-such-binary");
+        let _ = std::fs::remove_file(&missing);
+
+        temp_env::with_var(BINARY_ENV, Some(&missing), || {
+            let error = upgrade_binary().expect_err("a binary that is not there is not a target");
+            assert!(
+                matches!(error, UpgradeError::Binary(_)),
+                "unexpected error: {error}"
+            );
+            assert!(error.to_string().contains("is not a file"), "{error}");
+        });
+    }
+
+    #[test]
+    fn the_handoff_directory_is_private_to_this_user() {
+        // It holds a serialized copy of the application's state.
+        let base = std::env::temp_dir().join(format!(
+            "autumn-upgrade-test-base-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let dir = temp_env::with_var(DIR_ENV, Some(&base), || {
+            create_handoff_dir(1).expect("creates a private directory")
+        });
+
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(&dir).expect("stat").permissions().mode()
+        };
+        assert_eq!(mode & 0o777, 0o700, "handoff directory must be owner-only");
+
+        // A name already taken (by anyone) is stepped over, never opened.
+        let second = temp_env::with_var(DIR_ENV, Some(&base), || {
+            create_handoff_dir(1).expect("creates another private directory")
+        });
+        assert_ne!(dir, second);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

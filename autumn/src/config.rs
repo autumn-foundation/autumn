@@ -52,6 +52,8 @@
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
+//! | `AUTUMN_SERVER__UPGRADE__ENABLED` | `server.upgrade.enabled` | `bool` |
+//! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
@@ -4266,6 +4268,9 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
     /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
+    /// - `AUTUMN_SERVER__UPGRADE__ENABLED` → `server.upgrade.enabled` (bool)
+    /// - `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` →
+    ///   `server.upgrade.ready_timeout_secs` (u64)
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -4769,6 +4774,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
             &mut self.server.prestop_grace_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__UPGRADE__ENABLED",
+            &mut self.server.upgrade.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS",
+            &mut self.server.upgrade.ready_timeout_secs,
         );
         parse_env_option(
             env,
@@ -5928,7 +5943,7 @@ pub struct RequestTimeoutsConfig {
 /// live state to a freshly-execed build, waits for that build to serve, and
 /// only then drains itself. See `docs/guide/hot-upgrades.md`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct HotUpgradeConfig {
+pub struct UpgradeConfig {
     /// Whether `SIGUSR2` triggers an in-place upgrade. Default: `true`.
     ///
     /// With this off the signal is logged and ignored — which is still safer
@@ -5996,9 +6011,9 @@ pub struct ServerConfig {
 
     /// In-place upgrade settings (`SIGUSR2` handoff to a new binary).
     ///
-    /// See [`HotUpgradeConfig`] and `docs/guide/hot-upgrades.md`.
+    /// See [`UpgradeConfig`] and `docs/guide/hot-upgrades.md`.
     #[serde(default)]
-    pub upgrade: HotUpgradeConfig,
+    pub upgrade: UpgradeConfig,
 
     /// Per-request timeout configuration.
     ///
@@ -8077,7 +8092,7 @@ const fn default_upgrade_ready_timeout() -> u64 {
     30
 }
 
-impl Default for HotUpgradeConfig {
+impl Default for UpgradeConfig {
     fn default() -> Self {
         Self {
             enabled: default_upgrade_enabled(),
@@ -8105,7 +8120,7 @@ impl Default for ServerConfig {
             strict_config_enforce_all: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
-            upgrade: HotUpgradeConfig::default(),
+            upgrade: UpgradeConfig::default(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
@@ -12775,6 +12790,44 @@ path = "/healthz"
             config.server.unix_socket.as_deref(),
             Some("/tmp/autumn.sock")
         );
+    }
+
+    // ── server.upgrade (#1674) ────────────────────────────────────
+
+    #[test]
+    fn server_upgrade_config_defaults_enabled_with_a_30s_readiness_budget() {
+        // On by default: SIGUSR2's own default disposition terminates the
+        // process, so an app that ignores this feature is strictly safer with
+        // the handler installed than without it.
+        let config = AutumnConfig::default();
+        assert!(config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 30);
+    }
+
+    #[test]
+    fn server_upgrade_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server.upgrade]
+            enabled = false
+            ready_timeout_secs = 5
+            ",
+        )
+        .expect("config with [server.upgrade] should parse");
+        assert!(!config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 5);
+    }
+
+    #[test]
+    fn env_overrides_server_upgrade() {
+        // The deploy-time knob an operator reaches for first is the env var.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__UPGRADE__ENABLED", "false")
+            .with("AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS", "90");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.server.upgrade.enabled);
+        assert_eq!(config.server.upgrade.ready_timeout_secs, 90);
     }
 
     // ── server.tls (#1603) ────────────────────────────────────────

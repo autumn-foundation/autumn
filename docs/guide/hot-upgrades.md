@@ -12,7 +12,9 @@ $ kill -USR2 $(pidof my-app)            # upgrade in place
 The running process hands its **listening socket** and a designated block of
 **typed in-memory state** to the new build, waits for that build to serve, and
 only then drains itself. Under sustained load the cutover refuses zero
-connections and fails zero requests.
+connections and fails zero reads; writes to the designated state block are
+refused with a retryable `503` for the moment it takes the new build to come
+up, rather than being accepted and thrown away.
 
 What makes this different from every "zero-downtime" deploy that is really a
 process replacement: the old→new state carry-over is a function the **compiler
@@ -177,7 +179,13 @@ Forget a variant and the `match` is non-exhaustive. Reach for a `_` catch-all
 and the macro refuses it — the grammar takes variant *names*, not patterns, so
 a wildcard cannot be written at all.
 
-All four refusals are pinned by negative tests
+A migration between two shapes that declare the **same** `LiveState::VERSION`
+is refused too: they would be indistinguishable on the wire, so the migration
+could never run and the old payload would be handed to the new shape's
+`Deserialize` — the very loss the migration exists to prevent. Bump `VERSION`
+in the same commit that changes the fields.
+
+All five refusals are pinned by negative tests
 (`autumn/tests/compile-fail/state_migration_*.rs`), so the guarantee cannot rot.
 
 What the compiler proves is **totality, not truth**: a field mapped to a
@@ -191,12 +199,19 @@ dropping state — reviewing what each field is mapped *to* is still yours.
 1. **Snapshot and freeze.** The designated block is serialized and frozen.
    From here until the successor serves, `handle.write(...)` returns
    `Err(LiveStateFrozen)` instead of accepting a write this process can no
-   longer carry. Reads keep working.
+   longer carry. Reads keep working. The freeze starts *before* the successor
+   exists, so a client retrying during that window is answered by this same
+   process until the successor comes up — usually milliseconds, but bounded by
+   `ready_timeout_secs` if the successor hangs, and lifted again if the upgrade
+   is abandoned.
 2. **Exec the new build**, handing it the listening socket (as the successor's
    stdin, the way `inetd` has passed sockets for decades) plus the snapshot.
 3. **Wait for it to serve.** The successor adopts the socket, adopts (and if
-   needed migrates) the state, finishes its startup hooks, and signals ready.
-   The predecessor is still accepting the whole time.
+   needed migrates) the state, and signals ready once its startup hooks have
+   finished. The predecessor is still accepting the whole time. Note the
+   successor starts accepting the moment it adopts the socket — before its
+   startup hooks finish, exactly as a cold start does — so both builds serve
+   for that window.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so
@@ -209,17 +224,24 @@ and the prestop grace is **not** waited out. A probe that hits the draining
 process still gets `200`, which is the truth: the address it is probing is
 being served.
 
-### When it goes wrong, nothing happens
+### When it goes wrong, the old build carries on
 
-Every failure path leaves the old build serving, its state writable again:
+Every failure path leaves the old build serving, its state writable again. It
+is not quite "nothing happened": a successor that got as far as accepting
+connections and then died took those requests with it — but the address stays
+up and the state stays whole.
 
 | Failure | Result |
 |---|---|
-| the new binary is missing, or half-uploaded | refused before anything is spawned |
+| the new binary is missing (or the path names no file) | refused before the state is even frozen |
+| the new binary is present but unrunnable (half-written, wrong architecture) | the spawn fails; the freeze is lifted and nothing else changes |
 | the new binary crashes on boot | the wait ends the moment the child exits |
 | the new build cannot decode or migrate the state | it refuses to start, so the wait ends the same way |
 | the new build hangs during startup | abandoned after `ready_timeout_secs`, and the successor is killed |
 | the listener cannot be handed over (Unix socket, TLS) | refused with an error in the log |
+| this process supervises a managed Postgres cluster | refused with an error in the log |
+| the new build was handed the socket but cannot adopt it (it switched to a Unix socket, say) | it refuses to start rather than serve a different address |
+| the new build dropped its `with_live_state(...)` call | it refuses to start rather than throw the carried state away |
 
 A later `SIGUSR2` — after fixing the binary — retries from scratch.
 
@@ -275,6 +297,26 @@ the listening socket.
   from the one `Old` version registered with `with_live_state_from`. Anything
   else refuses to start, which abandons the upgrade rather than guessing.
 
+* **Handle `LiveStateFrozen` fail-closed.** If the block holds anything
+  security-relevant — rate-limit counters, one-time tokens, replay nonces,
+  idempotency keys — a refused write must mean "reject the request", never
+  "allow it and skip the bookkeeping": the freeze window would otherwise be a
+  window with the limit switched off.
+* **Counters are duplicated across the cutover.** Once the successor is up,
+  both processes are serving from independent copies of the snapshot, so any
+  counter in the block is effectively doubled until the predecessor exits —
+  exactly the caveat that already applies across replicas.
+* **The snapshot is plaintext on disk during the handoff.** It is written
+  `0600` inside a `0700` directory and unlinked as soon as the successor reads
+  it, but it is not encrypted and unlinking is not shredding. Don't designate
+  secrets as live state; carry them through the same secret store a restart
+  would.
+* **Bind address changes need a real restart.** An adopted socket is the
+  predecessor's: a new `server.host`/`server.port` in the new build is logged
+  as a mismatch and ignored, because the socket is already bound.
+* **`state_migration!` proves variant *presence*, not payload completeness.**
+  An enum arm may bind a variant's payload as `..`, which compiles and drops
+  those fields — the macro cannot tell that apart from a deliberate mapping.
 * **Both builds are briefly alive.** Between the successor signalling ready and
   the predecessor finishing its drain, two processes are running: background
   workers, schedulers and cron loops overlap for that window, exactly as they do
@@ -289,8 +331,10 @@ the listening socket.
   under a supervisor that tolerates this (or none at all); `autumn deploy`'s
   generated unit does process replacement instead, which is unaffected.
 * **Managed Postgres** (`managed-pg`) supervises a database child process per
-  app process; that child is not handed over, so the two features do not
-  currently combine.
+  app process, and that child cannot be handed over: an upgrade is *refused*
+  with an error in the log while a managed cluster is running, rather than
+  letting the successor start a second postmaster over the same data
+  directory.
 * **Generations.** Each hop increments `AUTUMN_UPGRADE_GENERATION`, which is
   logged by both processes — the quickest way to confirm from the logs which
   build answered a request.

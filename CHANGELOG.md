@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The `Listening` log line now reports the address actually bound** rather
+  than the one configured, so `server.port = 0` (and a socket inherited from an
+  in-place upgrade) shows the real port instead of `0`. Issue #1674.
+
 ### Added
 
 - **Zero-downtime in-place upgrades with a compile-checked state migration
@@ -36,9 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused connections and 100% carry-over under sustained load across the
   cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
 
-- **The `Listening` log line now reports the address actually bound** rather
-  than the one configured, so `server.port = 0` (and a socket inherited from an
-  in-place upgrade) shows the real port instead of `0`.
 
 ### Fixed
 

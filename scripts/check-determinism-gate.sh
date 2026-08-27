@@ -121,10 +121,14 @@ GATED_MODULES=(
   autumn/src/cluster/wire.rs:default
   autumn/src/cluster/transport.rs:default
   autumn/src/cluster/node.rs:default
+  # In-place upgrades (#1674). The handoff measures the successor's readiness
+  # window on the injected `ClockSource`, so an upgrade's timing is as
+  # reproducible under a virtual clock as the drain it replaces.
+  autumn/src/upgrade.rs:default
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=15
+MODULE_COUNT_FLOOR=16
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

@@ -1181,6 +1181,13 @@ impl TestApp {
         T: crate::upgrade::LiveState,
     {
         self.state_initializers.push(Box::new(move |state| {
+            assert!(
+                state
+                    .extension::<crate::upgrade::LiveStateRegistry>()
+                    .is_none(),
+                "an app may designate only one block of live state; the real builder \
+                 refuses a second one at startup, so a test app does too"
+            );
             let handle = crate::upgrade::LiveStateHandle::new(initial);
             state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
             state.insert_extension(handle);

@@ -759,7 +759,11 @@ const BASE64URL_ALPHABET: &[u8; 64] =
 // exact MSRV — CI builds a `1.88.0` lane, so adopting it leaves zero margin for
 // an MSRV the project may want to hold. Not a trade worth making for an
 // incidental cleanup; revisit when the MSRV moves past 1.88.
-#[allow(clippy::chunks_exact_to_as_chunks)]
+// `unknown_lints` is allowed alongside because the lint above was renamed
+// after this suppression was written: a toolchain that no longer knows the old
+// name would otherwise fail the `-D warnings` lint gate on a suppression that
+// is still correct for the toolchains that do.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn base64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);

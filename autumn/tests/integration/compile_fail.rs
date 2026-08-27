@@ -212,6 +212,10 @@ fn state_migration_compile_fail_tests() {
     // ...and a catch-all arm is not expressible: the grammar takes variant
     // names, not patterns, so `_` is refused by the macro itself.
     t.compile_fail("tests/compile-fail/state_migration_wildcard_arm.rs");
+    // A shape change without the matching `VERSION` bump is refused too: the
+    // two shapes would be indistinguishable on the wire, so the migration
+    // could never run and the old payload would be fed to the new shape.
+    t.compile_fail("tests/compile-fail/state_migration_same_version.rs");
 }
 
 /// The `#[query_budget]` fixtures get their own `TestCases` rather than
