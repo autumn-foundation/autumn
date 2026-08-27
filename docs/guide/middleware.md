@@ -23,7 +23,7 @@ not a tower layer at all.
 | Require a logged-in user | `#[secured]` | route | Runs after the session layer, so it sees the session. |
 | Decide *whether this actor may act on this record* | `#[authorize(...)]` | route | Policies need the loaded record; middleware runs before the handler and has none. See [authorization](./authorization.md). |
 | Read something off the request in one handler | an **extractor** | handler | No layer needed. `ClientAddr`, `Session`, `CsrfToken`, `Query<T>`, your own `FromRequestParts`. See [extractors](./extractors.md). |
-| Wrap **one route or a handful** in a tower layer | `#[intercept(MyLayer::new(..))]` | route | Per-route layering with no router surgery. See below. |
+| Wrap **one route or a handful** in a tower layer | `#[intercept(MyLayer)]` | route | Per-route layering with no router surgery. See below for the path-only constraint. |
 | Wrap **a URL-prefixed group** in a tower layer | `AppBuilder::scoped(prefix, layer, routes)` | group | One registration for `/api/*` without touching each handler. |
 | Wrap **every** request | `AppBuilder::layer(..)` | app | Cross-cutting concerns that genuinely apply everywhere. |
 | Redirect/reject **before a cached page is served** | `AppBuilder::static_gate(..)` | app, outermost | The only hook that runs ahead of the SSG/ISG cache. |
@@ -46,15 +46,24 @@ Two rules of thumb behind the table:
 
 ## `#[intercept(...)]` — per-route tower layers
 
-`#[intercept(EXPR)]` attaches a [`tower::Layer`] to **one route**. `EXPR` is any
-expression that evaluates to a layer, so it can capture configuration:
+`#[intercept(PATH)]` attaches a [`tower::Layer`] to **one route**.
+
+> **The argument must be a path, not a call.** The route macro parses it as a
+> [`syn::Path`] and uses it directly as a value, so `MyLayer` works and
+> `MyLayer::new(config)` does **not** — the latter fails to parse and the
+> attribute is currently dropped **silently**, mounting no layer at all. Write
+> the layer as a unit struct (or a `const`/`static` path) and have it read
+> whatever it needs from application state at request time.
 
 ```rust,ignore
 use autumn_web::prelude::*;
-use autumn_web::cache::CacheResponseLayer;
+
+/// A unit-struct layer: nameable as a bare path, so the attribute accepts it.
+#[derive(Clone)]
+struct CacheExpensive;
 
 #[get("/expensive")]
-#[intercept(CacheResponseLayer::from_cache(store.clone()))]
+#[intercept(CacheExpensive)]
 async fn expensive() -> &'static str {
     "computed once, served many"
 }
@@ -66,10 +75,15 @@ sees the request first and the response last.
 
 ```rust,ignore
 #[get("/reports/{id}")]
-#[intercept(TenantLayer::new())]        // outermost: runs first on ingress
-#[intercept(CacheResponseLayer::new())] // innermost: closest to the handler
+#[intercept(TenantLayer)]     // outermost: runs first on ingress
+#[intercept(CacheExpensive)]  // innermost: closest to the handler
 async fn report(Path(id): Path<i64>) -> Markup { /* … */ }
 ```
+
+Because the argument cannot carry configuration, a layer that needs some has two
+options: read it from `State<AppState>`/an extension inside the service, or use
+`AppBuilder::scoped`, whose layer **is** an ordinary expression and can capture
+anything.
 
 ### When `#[intercept]` is the right answer
 
@@ -99,6 +113,10 @@ routes keep session cookies) is the second most common.
 
 ### Trade-offs worth knowing before you reach for it
 
+- **A non-path argument is silently ignored.** `#[intercept(MyLayer::new(..))]`
+  compiles and mounts nothing. Verify a new interceptor actually runs (a log
+  line, a test asserting its header) rather than assuming the attribute took —
+  this matters most for a layer whose whole job is to *reject* requests.
 - **`#[intercept]` is incompatible with `#[edge]`.** Interceptor layers are
   origin-only tower middleware; combining the two is a compile error, because
   the edge capsule has no tower stack to host the layer.
@@ -575,6 +593,7 @@ header for downstream services.
 [`AppBuilder::layer`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.layer
 [`AppBuilder::scoped`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.scoped
 [`tower::Layer`]: https://docs.rs/tower/latest/tower/trait.Layer.html
+[`syn::Path`]: https://docs.rs/syn/latest/syn/struct.Path.html
 [`tower::ServiceBuilder`]: https://docs.rs/tower/latest/tower/struct.ServiceBuilder.html
 [`axum::error_handling::HandleErrorLayer`]: https://docs.rs/axum/latest/axum/error_handling/struct.HandleErrorLayer.html
 

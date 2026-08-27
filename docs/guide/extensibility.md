@@ -17,7 +17,7 @@ points you at the per-tier how-tos.
 | Tier | Mechanism | Scope | Typical use case |
 |------|-----------|-------|------------------|
 | **1** | `AppBuilder::with_<subsystem>(impl Trait)` | Boot-time, one-per-app | Replace a framework subsystem (config loader, DB pool, session store, telemetry, error pages) |
-| **2** | `#[intercept(Layer::new(...))]` | Per-request, stackable | Add cross-cutting middleware (caching, custom auth, request shaping, tracing) |
+| **2** | `#[intercept(Layer)]` | Per-request, stackable | Add cross-cutting middleware (caching, custom auth, request shaping, tracing) |
 | **3** | `Plugin::build(app)` | Distribution wrapper around tier 1 + 2 | Ship a reusable integration as a crate (e.g. `autumn-aws-secrets-plugin`) |
 
 These compose: a tier-3 `Plugin` typically does its work by calling tier-1 or
@@ -76,16 +76,24 @@ run once per matching request and can stack arbitrarily.
 
 ```rust,no_run
 # use autumn_web::prelude::*;
-# struct CacheResponseLayer;
-# impl CacheResponseLayer { fn new(_: ()) -> Self { Self } }
-# let cache = ();
+# #[derive(Clone)]
+# struct CacheExpensive;
+# impl<S> tower::Layer<S> for CacheExpensive {
+#     type Service = S;
+#     fn layer(&self, inner: S) -> S { inner }
+# }
 
 #[get("/expensive")]
-#[intercept(CacheResponseLayer::new(cache.clone()))]
+#[intercept(CacheExpensive)]
 async fn expensive() -> &'static str {
     "computed once, served many"
 }
 ```
+
+> The attribute argument is parsed as a path and used as a value, so the layer
+> must be nameable as one — a unit struct, or a `const`/`static`. `Layer::new(..)`
+> does not parse and is currently dropped **silently**. See the
+> [middleware guide](./middleware.md) for the full constraint.
 
 ### When tier 2 is the right answer
 
@@ -96,7 +104,7 @@ async fn expensive() -> &'static str {
 
 ### Tier-2 examples
 
-- **Caching** — `#[intercept(CacheResponseLayer::new(my_cache))]` is the
+- **Caching** — a response-cache layer is the
   intentional path for response caching. The `Cache` trait isn't a tier-1
   install because there is no single "framework cache" — different routes
   benefit from different cache configurations.

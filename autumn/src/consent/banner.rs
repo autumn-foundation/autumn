@@ -222,6 +222,19 @@ pub async fn inject_consent_banner(
         return next.run(request).await;
     }
 
+    // An htmx request asks for a *fragment*, not a document. Such a response
+    // carries no `</body>`, so the splice below would append the banner to the
+    // end of the fragment — and htmx would then swap that copy into whatever
+    // element it targets, while the banner already injected into the enclosing
+    // page stays put. The visitor sees duplicate consent controls, and on a
+    // page whose fragments refresh (a live feed, a vote button) a new copy on
+    // every swap. A fragment is never the right place to prompt, so skip it
+    // entirely: the enclosing document already carries the banner, and the
+    // next full page load re-evaluates consent as usual.
+    if is_htmx_request(request.headers()) {
+        return next.run(request).await;
+    }
+
     let consent = Consent::from_headers(request.headers());
     let request_csrf_cookie = find_cookie(request.headers(), csrf_cookie_name);
 
@@ -269,6 +282,20 @@ pub async fn inject_consent_banner(
         extract_response_csrf_cookie(&response, csrf_cookie_name).or(request_csrf_cookie);
     let banner_html = consent_banner_markup(csrf_token.as_deref(), csrf_form_field).into_string();
     splice_into_response(response, &banner_html).await
+}
+
+/// Whether this request came from htmx, and therefore expects a fragment
+/// rather than a complete document.
+///
+/// htmx sets `HX-Request: true` on every request it issues. Matching the
+/// framework's other htmx-aware paths (`crate::htmx`, the tracked-job poll
+/// route), the header's presence is what matters — the value is not parsed
+/// beyond confirming it is not the literal `false` htmx never actually sends.
+fn is_htmx_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("hx-request")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -1215,6 +1242,86 @@ mod tests {
             !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
             "an oversized body is served as-is without the banner spliced in \
              (splicing would require buffering arbitrarily more)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_htmx_fragment_never_receives_a_banner() {
+        // A fragment carries no `</body>`, so the splice would APPEND the
+        // banner — and htmx would swap that copy into the page alongside the
+        // banner the enclosing document already has. An undecided visitor
+        // would see duplicate consent controls on every page that hydrates a
+        // fragment on load.
+        let app = Router::new()
+            .route(
+                "/_partials/nav-auth",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        // A real fragment: no <html>, no <body>.
+                        .body(Body::from("<div id=\"nav\">Log in</div>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+
+        // No consent cookie: this visitor definitely still needs prompting,
+        // so the only thing keeping the banner out is the htmx check.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_partials/nav-auth")
+                    .header("hx-request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            !rendered.contains("autumn-consent-banner"),
+            "an htmx fragment must never carry the banner; got: {rendered}"
+        );
+        assert_eq!(
+            rendered, "<div id=\"nav\">Log in</div>",
+            "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_document_still_receives_the_banner_without_the_htmx_header() {
+        // The guard above must not have turned the banner off in general.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from("<html><body><h1>Hi</h1></body></html>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "an ordinary page load must still be prompted"
         );
     }
 

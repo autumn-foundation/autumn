@@ -318,10 +318,21 @@ pub async fn show(
     // A paginated listing gets a SELF-referential canonical: page 2 is not a
     // duplicate of page 1, and pointing every page at page 1 asks a crawler to
     // drop the deeper pages from the index. See docs/guide/seo.md.
-    let canonical_path = if first_page {
-        __autumn_path_show(&sub.slug)
-    } else {
-        format!("{}?page={}", __autumn_path_show(&sub.slug), page.page)
+    //
+    // `size` belongs in it whenever it is not the default, for the same reason
+    // `page` does: the canonical must name a URL that renders THIS slice.
+    // `/r/x?page=2` under the default size of 20 is posts 21-40, which is not
+    // what `?page=2&size=5` just showed the visitor — pointing at it would
+    // declare materially different content canonical.
+    let canonical_path = {
+        let base = __autumn_path_show(&sub.slug);
+        let default_size = autumn_web::pagination::DEFAULT_PAGE_SIZE;
+        match (first_page, page.size == default_size) {
+            (true, true) => base,
+            (true, false) => format!("{base}?size={}", page.size),
+            (false, true) => format!("{base}?page={}", page.page),
+            (false, false) => format!("{base}?page={}&size={}", page.page, page.size),
+        }
     };
 
     let seo = crate::seo::with_canonical(
