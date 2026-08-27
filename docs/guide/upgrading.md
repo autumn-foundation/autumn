@@ -341,8 +341,9 @@ hatch.
 
 ### Inside a Cargo workspace
 
-If the project is a crate inside an enclosing workspace, the files that
-workspace owns at *its* root are out of scope here, and the report says so:
+If the project is a crate inside an enclosing workspace — meaning its own
+`Cargo.toml` has no `[workspace]` table of its own — the files that workspace
+owns at *its* root are out of scope here, and the report says so:
 
 - `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
   nearest ancestor of the crate being built, so a crate-local copy does not add
@@ -355,6 +356,12 @@ Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
 `build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
 usual. Reconcile the workspace-level files by running the command at the
 workspace root, if that root is itself an Autumn project.
+
+`autumn new` writes a bare `[workspace]` table into every generated
+`Cargo.toml`, so a scaffolded project is its own workspace root wherever you
+drop it, and nothing changes. This applies only once you adopt the app *into* a
+workspace by deleting that table — which is exactly when Cargo starts resolving
+its lint, format and toolchain config from the root instead.
 
 ### Gating CI on scaffold freshness
 

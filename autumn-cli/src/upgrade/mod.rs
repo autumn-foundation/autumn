@@ -1402,7 +1402,7 @@ fn reject_bad_combination(opts: &UpgradeOptions) -> Option<i32> {
 }
 
 /// Record framework-owned paths as the developer's own (issue #1593).
-fn accept_scaffold(root: &Path, paths: &[String]) -> i32 {
+fn accept_scaffold(root: &Path, paths: &[String], json: bool) -> i32 {
     if !scaffold::is_project(root) {
         eprintln!(
             "autumn upgrade: `{}` is not an Autumn project (no `autumn.toml`).",
@@ -1412,6 +1412,21 @@ fn accept_scaffold(root: &Path, paths: &[String]) -> i32 {
     }
     match scaffold::accept(root, paths) {
         Ok(manifest) => {
+            // `--json` is the machine-readable mode for the whole command, so
+            // this branch cannot be the one that prints prose onto a stdout a
+            // caller is parsing.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "accepted": paths,
+                        "pinned": manifest.pinned,
+                        "manifest": scaffold::MANIFEST_PATH,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_owned())
+                );
+                return 0;
+            }
             println!(
                 "Accepted as yours; `autumn upgrade` will leave {} alone:",
                 if paths.len() == 1 { "it" } else { "them" }
@@ -1424,7 +1439,6 @@ fn accept_scaffold(root: &Path, paths: &[String]) -> i32 {
                  under reconciliation.",
                 scaffold::MANIFEST_PATH
             );
-            let _ = manifest;
             0
         }
         Err(error) => {
@@ -1568,7 +1582,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     // against the `autumn-web` requirement, so a project whose manifest Cargo
     // cannot give a single floor for can still be gated on scaffold freshness.
     if !opts.accept.is_empty() {
-        return accept_scaffold(root, &opts.accept);
+        return accept_scaffold(root, &opts.accept, opts.json);
     }
 
     if opts.check {

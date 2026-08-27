@@ -518,6 +518,15 @@ fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
         "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
     )
     .unwrap();
+    // `autumn new` writes a bare `[workspace]` table so a generated project is
+    // its own root wherever it is dropped. Adopting one INTO a workspace means
+    // deleting that table — which is what makes this crate a member at all.
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace("[workspace]\n", ""),
+    )
+    .unwrap();
     for path in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
         fs::remove_file(root.join(path)).unwrap();
     }
@@ -584,4 +593,18 @@ fn a_removed_only_report_does_not_talk_about_conflicts_that_do_not_exist() {
     assert!(!out.contains("conflict(s) need review"), "{out}");
     // ...and `--check` never points at diffs it deliberately suppressed.
     assert!(!out.contains("diffs above"), "{out}");
+}
+
+#[test]
+fn accept_honours_json_mode() {
+    // `--json` is documented as the machine-readable mode; a caller that
+    // combines it with `--accept` gets prose on stdout and a parse error.
+    let (_tmp, root) = new_project("acceptjson", &[]);
+    fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+    let output = run(&root, &["--accept", "Dockerfile", "--json"]);
+    assert!(output.status.success(), "{}", report(&output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout_of(&output)).expect("stdout must be JSON");
+    assert_eq!(value["accepted"][0], "Dockerfile", "{value}");
 }

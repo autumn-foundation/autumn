@@ -220,6 +220,16 @@ impl Manifest {
     /// upgrading conservatively.
     #[must_use]
     pub fn load(root: &Path) -> Option<Self> {
+        // Refusing to *write* through a linked manifest was only half of it.
+        // Read through one and whoever controls the target supplies the
+        // digests — and a digest matching a project's current scaffold file
+        // turns that file into an `update`, so the next `--apply` overwrites
+        // something nobody vouched for. A manifest reachable only through a
+        // link is treated as absent, which is the same conservative answer a
+        // project that never had one gets.
+        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
+            return None;
+        }
         Self::parse(&std::fs::read_to_string(root.join(MANIFEST_PATH)).ok()?)
     }
 
@@ -475,17 +485,28 @@ const WORKSPACE_ROOT_OWNED: &[&str] = &[
 /// the same way.
 #[must_use]
 pub fn workspace_root_above(root: &Path) -> Option<PathBuf> {
+    // A manifest carrying `[workspace]` alongside its `[package]` is the
+    // standard way for a crate below another workspace to form its own — and a
+    // workspace root owns the toolchain, lint, formatting and CI files no
+    // matter what sits above it. Answering "member" here would take exactly
+    // those out of scope and let drift in them go unreported.
+    if declares_workspace(root) {
+        return None;
+    }
     let absolute = root.canonicalize().ok()?;
     absolute
         .ancestors()
         .skip(1)
-        .find(|ancestor| {
-            std::fs::read_to_string(ancestor.join("Cargo.toml"))
-                .ok()
-                .and_then(|text| text.parse::<toml::Table>().ok())
-                .is_some_and(|table| table.contains_key("workspace"))
-        })
+        .find(|ancestor| declares_workspace(ancestor))
         .map(Path::to_path_buf)
+}
+
+/// Whether the `Cargo.toml` in `directory` declares a workspace.
+fn declares_workspace(directory: &Path) -> bool {
+    std::fs::read_to_string(directory.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|table| table.contains_key("workspace"))
 }
 
 /// The current release's framework-owned files, rendered for the project at
@@ -2464,6 +2485,74 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "build.rs"),
             "a file the codemods rewrite is never a writable scaffold update"
+        );
+    }
+
+    #[test]
+    fn a_nested_workspace_root_is_a_root_not_a_member() {
+        // `[package]` and `[workspace]` in one manifest is the standard way for
+        // a crate below another workspace to form its own. It owns its
+        // toolchain, lint, formatting and CI files — treating it as a member
+        // drops exactly those out of scope, so drift in them goes unreported.
+        let outer = TempDir::new().unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        let root = outer.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[workspace]\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+
+        let report = plan(&root, "0.7.0");
+        assert!(
+            !report.workspace_member,
+            "its own `[workspace]` makes it a root"
+        );
+        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
+        for owned in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+            assert!(offered.contains(&owned), "{owned} missing from {offered:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_manifest_is_not_a_baseline_to_trust() {
+        // Refusing to WRITE through a linked manifest was only half of it: read
+        // through one, and whoever controls the target supplies the digests.
+        // A digest matching the project's current file turns it into an
+        // `update`, and the next `--apply` overwrites a file nobody vouched
+        // for.
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside-manifest.toml");
+        let real = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
+        fs::write(&outside, &real).unwrap();
+        fs::remove_file(tmp.path().join(MANIFEST_PATH)).unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join(MANIFEST_PATH)).unwrap();
+
+        assert!(
+            Manifest::load(tmp.path()).is_none(),
+            "a linked manifest vouches for nothing"
+        );
+
+        // A file it would otherwise have called `update` is a conflict instead.
+        let stale = "# older\n";
+        write(tmp.path(), "clippy.toml", stale);
+        let mut linked = Manifest::parse(&real).unwrap();
+        linked
+            .digests
+            .insert("clippy.toml".to_owned(), digest(stale));
+        fs::write(&outside, linked.render()).unwrap();
+
+        let entries = plan_in(tmp.path()).entries;
+        assert_eq!(
+            status_of(&entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::NoBaseline)
         );
     }
 }
