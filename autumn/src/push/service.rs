@@ -292,10 +292,17 @@ impl WebPush {
         message: &PushMessage,
     ) -> Result<PushDeliveryReport, PushError> {
         let principal = principal.into();
-        // Fail fast, before touching the store: a missing key or an oversize
-        // payload fails identically for every device, so discovering it
-        // per-device would just be N copies of the same error.
+        // Fail fast, before touching the store: a missing key, an unusable
+        // `sub`, or an oversize payload fails identically for every device, so
+        // discovering it per-device would just be N copies of the same error.
         let vapid = self.vapid.as_ref().ok_or(PushError::NotConfigured)?;
+        // Checked here, not in `new`: the constructor is infallible (and takes
+        // `impl Into<String>`), so a service built by
+        // `AppBuilder::with_web_push` — from a secrets manager, say — never
+        // passes through the boot-time `[push]` validation. Without this an
+        // invalid `sub` would sign every request and every push service would
+        // refuse it, showing up only as `report.failed` with no cause named.
+        self.validate_subject()?;
         let payload = Self::encode(message)?;
 
         let subscriptions = self
@@ -343,6 +350,23 @@ impl WebPush {
             report.merge(self.send(principal, message).await?);
         }
         Ok(report)
+    }
+
+    /// Check the `sub` claim against what RFC 8292 permits.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::InvalidConfig`] when the subject is neither a `mailto:`
+    /// nor an `https:` URI.
+    fn validate_subject(&self) -> Result<(), PushError> {
+        if super::config::is_valid_vapid_subject(&self.subject) {
+            return Ok(());
+        }
+        Err(PushError::InvalidConfig(format!(
+            "the VAPID `sub` claim must be a `mailto:` or `https:` URI (RFC 8292 §2.1), got \
+             `{}`. A push service may refuse every message signed with anything else.",
+            self.subject
+        )))
     }
 
     /// Serialize a message and check it against the payload ceiling.
@@ -1138,6 +1162,59 @@ mod tests {
             "the error must say how to fix it: {err}"
         );
         assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_subject_is_refused_before_any_dispatch() {
+        // `WebPush::new` is infallible and takes `impl Into<String>`, so a
+        // service registered through `AppBuilder::with_web_push` never passes
+        // through the boot-time `[push]` validation. Without this check an
+        // invalid `sub` would sign every request and every push service would
+        // refuse it, showing up only as `report.failed` with no cause named.
+        let transport = RecordingPushTransport::new();
+        let push = WebPush::new(
+            MemoryPushSubscriptionStore::new(),
+            VapidKey::generate(),
+            // A bare address, not a `mailto:` URI — the common mistake.
+            "ops@example.com",
+            transport.clone(),
+        );
+        push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+            .await
+            .expect("subscribe");
+
+        let err = push
+            .send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect_err("an unusable sub must be refused");
+        assert!(matches!(err, PushError::InvalidConfig(_)), "{err:?}");
+        assert!(
+            transport.requests().is_empty(),
+            "nothing may be dispatched with a sub every push service will refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_subject_still_sends() {
+        for subject in ["mailto:ops@example.com", "https://example.com/contact"] {
+            let transport = RecordingPushTransport::new();
+            let push = WebPush::new(
+                MemoryPushSubscriptionStore::new(),
+                VapidKey::generate(),
+                subject,
+                transport.clone(),
+            );
+            push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+                .await
+                .expect("subscribe");
+            assert_eq!(
+                push.send(7_i64, &PushMessage::new("Hi", "There"))
+                    .await
+                    .unwrap_or_else(|e| panic!("{subject} must send, got {e}"))
+                    .delivered,
+                1
+            );
+        }
     }
 
     #[tokio::test]

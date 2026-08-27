@@ -275,6 +275,15 @@ happily records subscriptions, and silently never delivers anything.
 - A `[push] private_key` that is present but unusable — a typo, an env var that
   failed to interpolate, an empty string — **fails the boot** with a named
   error. An app with no `[push]` block at all is unaffected.
+- A **blank** `AUTUMN_PUSH__PRIVATE_KEY` is treated as "this secret failed to
+  interpolate", not as "push disabled". Most `AUTUMN_*` overrides clear their
+  setting when set to an empty string; this one deliberately does not, because
+  clearing it would silently disable delivery — and would erase a good key from
+  `autumn.toml` besides.
+- `subject` is validated wherever it comes from. The `[push]` block is checked
+  at boot; a service built by hand and registered with
+  `AppBuilder::with_web_push` is checked on the first `send`, before anything
+  is dispatched, since it never passes through boot validation.
 - Declaring `public_key` is optional and exists purely as a safety check: a
   mismatched pair is caught at boot rather than surfacing as every send being
   rejected by the push service with no local symptom.

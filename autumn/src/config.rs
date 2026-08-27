@@ -4378,7 +4378,21 @@ impl AutumnConfig {
     /// every send failing `NotConfigured` and the public-key endpoint serving
     /// `503`, with the operator looking at a variable they did set.
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_option_secret(env, "AUTUMN_PUSH__PRIVATE_KEY", &mut self.push.private_key);
+        // NOT `parse_env_option_secret`. That helper treats a blank value as
+        // "clear this setting", which is right for a section where unsetting
+        // via env is meaningful — but wrong here, and dangerously so: the
+        // commonest way `AUTUMN_PUSH__PRIVATE_KEY` ends up blank is a secret
+        // that failed to interpolate, and clearing it would silently disable
+        // push, sail through `validate_push`, and surface much later as a
+        // `503` and `NotConfigured` on every send. Worse, it would erase a
+        // perfectly good key from `autumn.toml`.
+        //
+        // So a blank value is PRESERVED, precisely so `load_vapid_key` can
+        // reject it at boot with a message naming the environment variable —
+        // the fail-fast contract this whole subsystem is built on.
+        if let Ok(value) = env.var("AUTUMN_PUSH__PRIVATE_KEY") {
+            self.push.private_key = Some(secrecy::SecretString::from(value));
+        }
         parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
         parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
         parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);

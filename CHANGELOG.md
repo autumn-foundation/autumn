@@ -76,7 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host.
 
   `[push]` honors the usual environment overrides
-  (`AUTUMN_PUSH__PRIVATE_KEY` and friends), and `subject` is validated at boot
+  (`AUTUMN_PUSH__PRIVATE_KEY` and friends) — with one deliberate divergence: a
+  *blank* private-key override is preserved and refused at boot rather than
+  clearing the setting the way other `AUTUMN_*` overrides do, because the
+  commonest cause is a secret that failed to interpolate, and clearing it would
+  silently disable delivery (and erase a good key from `autumn.toml`). The
+  `subject` is validated at boot
   against what RFC 8292 permits — a bare email address instead of a `mailto:`
   URI otherwise boots cleanly and has every delivery refused remotely. Because
   Autumn's CSRF layer rejects an unaccompanied POST and its cookie is

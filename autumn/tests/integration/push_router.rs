@@ -509,6 +509,50 @@ fn push_settings_can_be_supplied_through_the_environment() {
     );
 }
 
+/// A blank `AUTUMN_PUSH__PRIVATE_KEY` must fail the boot, not disable push.
+///
+/// The shared env helpers treat a blank value as "clear this setting", which
+/// is right where unsetting via env is meaningful. It is wrong here: the
+/// commonest way this variable ends up blank is a secret that failed to
+/// interpolate, and clearing it would silently disable delivery, sail through
+/// `validate_push()`, and surface much later as `503`/`NotConfigured`.
+#[test]
+fn a_blank_push_key_override_fails_the_boot_rather_than_disabling_push() {
+    use autumn_web::config::AutumnConfig;
+
+    for blank in ["", "   ", "\n"] {
+        temp_env::with_var("AUTUMN_PUSH__PRIVATE_KEY", Some(blank), || {
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides();
+            let err = config
+                .validate_push()
+                .expect_err("a blank key must fail the boot");
+            assert!(
+                err.to_string().contains("AUTUMN_PUSH__PRIVATE_KEY"),
+                "the error must name the variable to look at: {err}"
+            );
+        });
+    }
+}
+
+/// …and it must not erase a good key that `autumn.toml` already supplied.
+#[test]
+fn a_blank_push_key_override_does_not_silently_erase_a_configured_key() {
+    use autumn_web::config::AutumnConfig;
+
+    let key = VapidKey::generate();
+    temp_env::with_var("AUTUMN_PUSH__PRIVATE_KEY", Some(""), || {
+        let mut config = AutumnConfig::default();
+        config.push.private_key = Some(key.private_key_base64url().into());
+        config.apply_env_overrides();
+        // Loudly refused — never quietly reverted to "no key configured".
+        assert!(
+            config.validate_push().is_err(),
+            "a blank override must not be mistaken for `push disabled`"
+        );
+    });
+}
+
 /// The public-key response carries the caller's CSRF token, because the
 /// subscribe snippet has no other way to get one: the CSRF cookie is
 /// `HttpOnly`, and the generated snippet runs on pages rendered by a

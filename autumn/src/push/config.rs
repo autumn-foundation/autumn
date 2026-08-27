@@ -76,7 +76,7 @@ pub struct PushConfig {
 /// RFC 8292 §2.1 requires a `mailto:` or `https:` URI — it is how a push
 /// service operator reaches you about your traffic, so a bare email address or
 /// a name is not enough.
-fn is_valid_vapid_subject(subject: &str) -> bool {
+pub(super) fn is_valid_vapid_subject(subject: &str) -> bool {
     let subject = subject.trim();
     if let Some(rest) = subject.strip_prefix("mailto:") {
         // `mailto:` with nothing after it names nobody.
@@ -122,8 +122,11 @@ impl PushConfig {
         // exact failure this whole path exists to prevent.
         if private.is_empty() {
             return Err(PushError::InvalidVapidKey(
-                "`[push] private_key` is empty. If it comes from an environment variable, \
-                 that variable is unset or blank in this environment."
+                "`[push] private_key` is empty. The commonest cause is \
+                 `AUTUMN_PUSH__PRIVATE_KEY` being set to a secret that failed to \
+                 interpolate in this environment — a blank value is refused rather than \
+                 treated as \"push disabled\", because silently disabling delivery is \
+                 exactly the failure this check exists to prevent."
                     .to_owned(),
             ));
         }
