@@ -307,7 +307,9 @@ async fn writes_are_attributed_even_when_the_role_check_is_disabled() {
     // disable actor attribution — otherwise admin-surface writes would land as
     // `SYSTEM_ACTOR`, and writes made while impersonating would lose the
     // operator entirely.
-    let sink = RecordingSink::default();
+    // The assertion reads the handler's response, not the sink, so a plain
+    // tracing sink is enough — impersonation only requires that *some* sink is
+    // installed.
     let client = TestApp::new()
         .routes(routes![login_admin, app_write])
         .plugin(
@@ -315,11 +317,10 @@ async fn writes_are_attributed_even_when_the_role_check_is_disabled() {
                 .require_role(None)
                 .with_impersonation(ImpersonationGate::custom(AllowAnyAuthenticated)),
         )
-        .state_initializer({
-            let sink = sink.clone();
-            move |state| {
-                state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink.clone())));
-            }
+        .state_initializer(|state| {
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
         })
         .build();
     client.post("/login-admin").send().await.assert_ok();
