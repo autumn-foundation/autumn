@@ -249,7 +249,7 @@ pub fn admin_router(
 
 /// Typed Extension carrying the admin URL prefix so handlers can build links.
 #[derive(Clone)]
-pub struct AdminPrefix(pub String);
+pub(crate) struct AdminPrefix(pub(crate) String);
 
 /// Typed Extension signalling whether the runtime config service is mounted.
 #[derive(Clone)]

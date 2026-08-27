@@ -448,22 +448,54 @@ pub const IMPERSONATION_BANNER_CSS: &str = "
 /// [`impersonation_banner_for`](crate::impersonation_banner_for) for the
 /// one-call version that reads both from the request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ImpersonationBanner {
     /// The user the session is currently acting as.
     pub effective_user_id: String,
     /// The real operator behind the session.
     pub impersonator_id: String,
     /// Prefix the admin plugin is mounted at; the revert form posts to
-    /// `{stop_path}/impersonate/stop`.
-    pub stop_path: String,
+    /// `{admin_prefix}/impersonate/stop`.
+    pub admin_prefix: String,
     /// CSRF token for that form. Empty when no `CsrfLayer` is installed, in
     /// which case the hidden field is omitted entirely.
     pub csrf_token: String,
     /// Configured CSRF form-field name (defaults to `_csrf` when empty).
     pub csrf_form_field: String,
+    /// Path the browser returns to after reverting. Empty means "the admin
+    /// panel"; the revert route re-validates it as a same-origin relative path
+    /// either way, so it can never become an open redirect.
+    pub return_to: String,
 }
 
 impl ImpersonationBanner {
+    /// Build the banner view-model for an active impersonation.
+    #[must_use]
+    pub fn new(
+        state: &autumn_web::auth::impersonation::ImpersonationState,
+        admin_prefix: &str,
+        csrf_token: &str,
+        csrf_form_field: &str,
+    ) -> Self {
+        Self {
+            effective_user_id: state.effective_user_id.clone(),
+            impersonator_id: state.impersonator_id.clone(),
+            admin_prefix: admin_prefix.to_owned(),
+            csrf_token: csrf_token.to_owned(),
+            csrf_form_field: csrf_form_field.to_owned(),
+            return_to: String::new(),
+        }
+    }
+
+    /// Return the operator to `path` after reverting, instead of to the admin
+    /// panel. Worth setting when the banner is embedded in the application's
+    /// own layout. Re-validated server-side on the revert route.
+    #[must_use]
+    pub fn returning_to(mut self, path: impl Into<String>) -> Self {
+        self.return_to = path.into();
+        self
+    }
+
     /// The CSRF field name to render, defaulting to Autumn's `_csrf`.
     fn csrf_field(&self) -> &str {
         if self.csrf_form_field.is_empty() {
@@ -497,7 +529,7 @@ impl ImpersonationBanner {
 pub fn impersonation_banner(banner: &ImpersonationBanner) -> Markup {
     let stop_action = format!(
         "{}/impersonate/stop",
-        banner.stop_path.trim_end_matches('/')
+        banner.admin_prefix.trim_end_matches('/')
     );
     html! {
         div class="autumn-impersonation-banner" role="status" aria-live="polite" {
@@ -510,6 +542,9 @@ pub fn impersonation_banner(banner: &ImpersonationBanner) -> Markup {
             form class="autumn-impersonation-banner__form" method="post" action=(stop_action) {
                 @if !banner.csrf_token.is_empty() {
                     input type="hidden" name=(banner.csrf_field()) value=(banner.csrf_token);
+                }
+                @if !banner.return_to.is_empty() {
+                    input type="hidden" name="return_to" value=(banner.return_to);
                 }
                 button type="submit" class="autumn-impersonation-banner__stop" {
                     "Stop impersonating"
@@ -4533,6 +4568,102 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         let s = format_timestamp(1_700_000_000);
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
+    }
+
+    // ── Impersonation banner (#1394) ─────────────────────────────────────
+
+    fn banner_state(target: &str, operator: &str) -> ImpersonationBanner {
+        ImpersonationBanner {
+            effective_user_id: target.to_owned(),
+            impersonator_id: operator.to_owned(),
+            admin_prefix: "/admin".to_owned(),
+            csrf_token: String::new(),
+            csrf_form_field: String::new(),
+            return_to: String::new(),
+        }
+    }
+
+    #[test]
+    fn banner_names_both_parties_and_offers_a_revert() {
+        let html = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(html.contains("Viewing as"), "{html}");
+        assert!(html.contains("user-9"), "{html}");
+        assert!(html.contains("admin-1"), "{html}");
+        assert!(html.contains("Stop impersonating"), "{html}");
+        assert!(
+            html.contains(r#"action="/admin/impersonate/stop""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"method="post""#), "{html}");
+    }
+
+    #[test]
+    fn banner_omits_the_csrf_field_when_no_token_is_available() {
+        // `CsrfLayer` is off outside the prod profile; rendering `name="" value=""`
+        // would be a broken field rather than an absent one.
+        let html = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+    }
+
+    #[test]
+    fn banner_renders_the_csrf_field_with_the_configured_name() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.csrf_token = "tok-123".to_owned();
+        banner.csrf_form_field = "authenticity_token".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="tok-123""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn banner_falls_back_to_the_default_csrf_field_name() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.csrf_token = "tok-123".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(html.contains(r#"name="_csrf" value="tok-123""#), "{html}");
+    }
+
+    #[test]
+    fn banner_action_survives_a_trailing_slash_on_the_prefix() {
+        let mut banner = banner_state("user-9", "admin-1");
+        banner.admin_prefix = "/back-office/".to_owned();
+        let html = impersonation_banner(&banner).into_string();
+        assert!(
+            html.contains(r#"action="/back-office/impersonate/stop""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn banner_carries_return_to_only_when_set() {
+        let plain = impersonation_banner(&banner_state("user-9", "admin-1")).into_string();
+        assert!(!plain.contains("return_to"), "{plain}");
+
+        let with_return =
+            impersonation_banner(&banner_state("user-9", "admin-1").returning_to("/dashboard"))
+                .into_string();
+        assert!(
+            with_return.contains(r#"name="return_to" value="/dashboard""#),
+            "{with_return}"
+        );
+    }
+
+    #[test]
+    fn banner_escapes_the_user_ids_it_renders() {
+        let html = impersonation_banner(&banner_state("<script>alert(1)</script>", "admin-1"))
+            .into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn the_admin_layout_ships_the_banner_styles() {
+        assert!(
+            IMPERSONATION_BANNER_CSS.contains(".autumn-impersonation-banner"),
+            "{IMPERSONATION_BANNER_CSS}"
+        );
     }
 
     // ── admin_layout nav (#1134) ─────────────────────────────────────────

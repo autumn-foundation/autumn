@@ -979,7 +979,7 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
-### Admin impersonation (0.7.0, issue #1394)
+### Admin impersonation (unreleased, issue #1394)
 
 "Log in as this user" without breaking the audit trail. Never hand-roll it
 with `session.insert("user_id", target)` — that makes every subsequent version
@@ -987,12 +987,14 @@ row and audit event claim the *customer* did it.
 
 `autumn_web::auth::impersonation::begin_impersonation(&state, &session, target)`
 swaps the session's **effective** user and records the real admin separately
-under a reserved `impersonator_id` key, so `#[secured]` / `Auth<T>` /
+under a reserved `impersonator_id` key, so `#[secured]` / `RequireAuth` /
 `PolicyContext` see the impersonated user while the ambient current actor
 (`Current::actor`, which seeds `#[repository(versioned)]` rows and audit
 events) stays the **real impersonator**. `end_impersonation(&state, &session)`
-reverts. `impersonator_id(&session)` is the separate accessor;
-`impersonation_state(&state, &session)` returns both ids.
+reverts. `impersonator_id(&state, &session)` is the separate accessor;
+`impersonation_state(&state, &session)` returns both ids, and the
+`Impersonation` extractor is the handler-side form. Register the gate with
+`AppBuilder::impersonation_gate(...)`.
 
 Default-deny: it needs an `ImpersonationGate` in `AppState` —
 `ImpersonationGate::allow_roles(["admin"])`, or `::custom(policy)` with an
@@ -1000,8 +1002,13 @@ Default-deny: it needs an `ImpersonationGate` in `AppState` —
 `target_role`, which resolves the impersonated session's role **server-side**;
 never accept a role from request input). Missing gate or a refusal is `403`.
 Both edges rotate the session id and write `auth.impersonation.begin` /
-`.end` audit events carrying `{impersonator_id, target_id}`; a begin whose
-audit write fails is refused. No nesting (`409`), no self-impersonation, and
+`.end` audit events carrying `{impersonator_id, target_id}`; a begin is refused
+when the audit write fails **or when no audit sink is installed at all** — wire
+`AppBuilder::with_audit_sink(...)` before enabling it. The operator's step-up
+claim is stashed and dropped for the duration (so a `#[step_up]` action cannot
+be run on the target's account on the operator's re-auth) and restored on
+revert; call `impersonation::clear(&session)` from any login flow so a
+forgotten impersonation cannot be inherited by the next user of that session. No nesting (`409`), no self-impersonation, and
 the admin's own step-up claim is preserved rather than refreshed.
 
 For the UI, `AdminPlugin::with_impersonation(gate)` mounts

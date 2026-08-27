@@ -69,30 +69,26 @@ use crate::templates::{ImpersonationBanner, impersonation_banner};
 /// Infallible: a request with no `SessionLayer` (or no active impersonation)
 /// simply yields `None`, so every admin page can take it unconditionally.
 #[derive(Debug, Clone, Default)]
-pub struct AdminImpersonation(Option<impersonation::ImpersonationState>);
+pub struct AdminImpersonation(impersonation::Impersonation);
 
 impl AdminImpersonation {
     /// The active impersonation, if any.
     #[must_use]
     pub const fn state(&self) -> Option<&impersonation::ImpersonationState> {
-        self.0.as_ref()
+        self.0.state()
     }
 
     /// Build the banner view-model for a page rendered under `prefix`.
     #[must_use]
     pub fn banner(
         &self,
-        prefix: &str,
+        admin_prefix: &str,
         csrf_token: &str,
         csrf_form_field: &str,
     ) -> Option<ImpersonationBanner> {
-        self.0.as_ref().map(|state| ImpersonationBanner {
-            effective_user_id: state.effective_user_id.clone(),
-            impersonator_id: state.impersonator_id.clone(),
-            stop_path: prefix.to_owned(),
-            csrf_token: csrf_token.to_owned(),
-            csrf_form_field: csrf_form_field.to_owned(),
-        })
+        self.0
+            .state()
+            .map(|state| ImpersonationBanner::new(state, admin_prefix, csrf_token, csrf_form_field))
     }
 }
 
@@ -103,12 +99,8 @@ impl FromRequestParts<AppState> for AdminImpersonation {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(session) = parts.extensions.get::<Session>().cloned() else {
-            return Ok(Self(None));
-        };
-        Ok(Self(
-            impersonation::impersonation_state(state, &session).await,
-        ))
+        let inner = impersonation::Impersonation::from_request_parts(parts, state).await?;
+        Ok(Self(inner))
     }
 }
 
@@ -128,13 +120,12 @@ pub async fn impersonation_banner_for(
     csrf_form_field: &str,
 ) -> Option<Markup> {
     let active = impersonation::impersonation_state(state, session).await?;
-    Some(impersonation_banner(&ImpersonationBanner {
-        effective_user_id: active.effective_user_id,
-        impersonator_id: active.impersonator_id,
-        stop_path: admin_prefix.to_owned(),
-        csrf_token: csrf_token.to_owned(),
-        csrf_form_field: csrf_form_field.to_owned(),
-    }))
+    Some(impersonation_banner(&ImpersonationBanner::new(
+        &active,
+        admin_prefix,
+        csrf_token,
+        csrf_form_field,
+    )))
 }
 
 /// Form body for `POST {prefix}/impersonate`.
@@ -145,7 +136,7 @@ pub async fn impersonation_banner_for(
 /// accepting it from the request would let an operator mint a session more
 /// privileged than the target really is.
 #[derive(Debug, Deserialize)]
-pub struct BeginForm {
+pub(crate) struct BeginForm {
     user_id: String,
     /// Where to send the browser afterwards. Validated as a same-origin
     /// relative path, so it can never become an open redirect.
@@ -159,7 +150,7 @@ pub struct BeginForm {
 /// enabled), then gated again by the app's
 /// [`ImpersonationGate`](autumn_web::auth::impersonation::ImpersonationGate):
 /// role membership alone is never sufficient.
-pub async fn impersonate_begin(
+pub(crate) async fn impersonate_begin(
     State(state): State<AppState>,
     session: Session,
     axum::extract::Form(form): axum::extract::Form<BeginForm>,
@@ -175,11 +166,28 @@ pub async fn impersonate_begin(
 /// session no longer carries the admin role, so a gated revert would trap the
 /// operator in the target's identity. It is self-gating — a session that is not
 /// impersonating gets a `400` and nothing changes.
-pub async fn impersonate_stop(
+pub(crate) async fn impersonate_stop(
     State(state): State<AppState>,
     session: Session,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    body: axum::body::Bytes,
 ) -> AutumnResult<Response> {
     impersonation::end_impersonation(&state, &session).await?;
-    Ok(Redirect::to(safe_redirect_target(&prefix)).into_response())
+    // The banner posts the page it was rendered on, so reverting from an
+    // application page returns there instead of dumping the operator into the
+    // admin panel. Parsed straight from the body rather than through `Form<T>`
+    // so a bare, body-less `POST` still reverts instead of being rejected for a
+    // missing content type — the revert must never be the thing that fails.
+    // Absent or unsafe values fall back to the admin prefix, and
+    // `safe_redirect_target` makes an open redirect impossible either way.
+    let return_to = form_urlencoded::parse(&body)
+        .find(|(key, _)| key == "return_to")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default();
+    let destination = if return_to.is_empty() {
+        safe_redirect_target(&prefix).to_owned()
+    } else {
+        safe_redirect_target(&return_to).to_owned()
+    };
+    Ok(Redirect::to(&destination).into_response())
 }

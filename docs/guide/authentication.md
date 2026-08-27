@@ -699,30 +699,76 @@ What the framework guarantees while impersonation is active:
 
 | Question | Answer |
 |---|---|
-| Who does `#[secured]` / `Auth<T>` / `PolicyContext` resolve? | the **impersonated** user |
+| Who do `#[secured]`, `RequireAuth` and `PolicyContext` resolve? | the **impersonated** user |
 | Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** |
-| Who does `impersonation::impersonator_id(&session)` return? | the **real impersonator** |
+| Who does `impersonation::impersonator_id(&state, &session)` return? | the **real impersonator** |
 | Session id | rotated on begin *and* end |
-| Audit | one event on begin, one on end, each `{impersonator_id, target_id}` |
+| Audit | one event on begin, one on end, each with `actor_id` = the impersonator and `target_resource_id` = the target |
+
+`Auth<T>` is not in that first row: it is populated by your own loader
+middleware from request extensions, so it follows the impersonated user only if
+that loader reads the auth session key. The same caveat applies to any identity
+key your app writes alongside `user_id` at login (a generated `{model}_id` /
+`{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
+key and nothing else, so map the rest yourself if your handlers read them.
+
+`RequireAuth` also publishes `RateLimitPrincipal` and the log context's
+`user_id` as the **effective** user, so rate-limit buckets and log lines follow
+the target while attribution follows the operator.
+
+Read the state with the `Impersonation` extractor when you just want to branch
+on it:
+
+```rust,ignore
+use autumn_web::auth::impersonation::Impersonation;
+
+#[get("/")]
+async fn home(impersonation: Impersonation) -> Markup {
+    match impersonation.state() {
+        Some(active) => /* show a banner naming active.impersonator_id */,
+        None => /* normal page */,
+    }
+}
+```
 
 And what it refuses:
 
 - **No nesting.** Starting a second hop while impersonating is a `409`, so it
   cannot be chained to escalate.
 - **No self-impersonation**, and no blank target.
-- **No unaudited swap.** If the audit write fails, `begin_impersonation` returns
-  `500` and the session is untouched. Ending is the opposite trade-off: a sink
-  failure is logged, but the revert still happens.
+- **No unaudited swap.** `begin_impersonation` returns `500` — leaving the
+  session untouched — if the audit write fails *or* if the app has no audit sink
+  installed at all (`audit::write_from_state` is a silent no-op without one, so
+  a missing sink would otherwise mean a swap with no record). Register one with
+  `AppBuilder::with_audit_sink(TracingAuditSink)` at minimum before enabling
+  impersonation. Ending is the opposite trade-off: a sink failure is logged, but
+  the revert still happens.
 - **No client-chosen role.** The impersonated session's role comes from
   `ImpersonationPolicy::target_role`, resolved server-side; it defaults to *no*
   role rather than inheriting the admin's.
-- **No laundering past step-up.** The admin's own `last_strong_auth_at` claim is
-  preserved, not refreshed, so `#[step_up]` still evaluates the real operator's
-  freshness.
+- **No laundering past step-up.** `last_strong_auth_at` is a bare timestamp with
+  no identity bound to it, so begin **stashes and drops** the operator's claim
+  rather than carrying it over — otherwise a `#[step_up]` route could run a
+  destructive action on the *target's* account on the strength of the operator's
+  re-authentication. Ending restores the operator's own claim. The practical
+  consequence: sensitive, step-up-gated actions cannot be performed while
+  impersonating.
 
-Tenancy is yours to enforce: implement `ImpersonationPolicy` instead of using
-`allow_roles`, and consult `ctx` (which carries the session and the DB pool) to
-confirm the target is in the caller's tenant.
+- **No inherited record.** The session records *which* user the impersonation
+  describes. If the effective user later changes — someone logs in on that
+  session after an operator walked away without reverting — the record is stale:
+  it is ignored for attribution and refused by the revert route, instead of
+  handing the new user the operator's identity and role. Call
+  `impersonation::clear(&session)` from your own login / magic-link / passkey
+  promotion so the record never outlives the session it belonged to.
+
+Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
+not look at the target at all, so it will happily impersonate any string
+including another admin or a user in a different tenant. For anything
+multi-tenant, implement `ImpersonationPolicy` and consult `ctx` (which carries
+the session and the DB pool) to confirm the target exists and is in the caller's
+tenant. `begin_impersonation` trims the target id **before** the policy sees it,
+so the id you authorize is exactly the id that lands in the session.
 
 ```rust,ignore
 use autumn_web::auth::impersonation::{ImpersonationPolicy, ImpersonationTarget};

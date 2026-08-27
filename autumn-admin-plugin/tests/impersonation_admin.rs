@@ -209,6 +209,11 @@ async fn admin_pages_render_the_banner_while_impersonating() {
                 .require_role("admin".to_owned())
                 .with_impersonation(ImpersonationGate::custom(ImpersonateAsAdmin)),
         )
+        .state_initializer(|state| {
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
         .build();
     client.post("/login-admin").send().await.assert_ok();
 

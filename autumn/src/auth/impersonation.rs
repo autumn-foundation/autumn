@@ -13,9 +13,11 @@
 //! [`begin_impersonation`] swaps the session's **effective** user to the target
 //! and records the real admin separately under [`IMPERSONATOR_SESSION_KEY`].
 //! Because the effective user lives in the ordinary auth session key,
-//! everything that resolves "the current user" — [`Auth`](super::Auth),
-//! `#[secured]`, [`PolicyContext`] — transparently sees the *impersonated*
-//! user, exactly as if they had logged in. Meanwhile the framework's ambient
+//! everything the framework resolves "the current user" from — `#[secured]`,
+//! [`RequireAuth`](super::RequireAuth), [`PolicyContext`] — transparently sees
+//! the *impersonated* user, exactly as if they had logged in. ([`Auth<T>`] is
+//! populated by the app's own loader middleware from request extensions, so it
+//! follows only if that loader reads the auth session key.) Meanwhile the ambient
 //! [current actor](crate::current::Current) — the value that seeds
 //! `#[repository(versioned)]` version rows and audit events — is published as
 //! the **real impersonator**, so writes made during the session stay honestly
@@ -32,13 +34,11 @@
 //! an app opts in explicitly:
 //!
 //! ```rust,no_run
-//! use autumn_web::AppBuilder;
+//! use autumn_web::app::AppBuilder;
 //! use autumn_web::auth::impersonation::ImpersonationGate;
 //!
 //! # fn wire(app: AppBuilder) -> AppBuilder {
-//! app.state_initializer(|state| {
-//!     state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
-//! })
+//! app.impersonation_gate(ImpersonationGate::allow_roles(["admin"]))
 //! # }
 //! ```
 //!
@@ -46,15 +46,44 @@
 //! which registers the gate *and* mounts the begin/revert routes plus the
 //! "Viewing as … — Stop impersonating" banner.
 //!
+//! # An audit sink is required
+//!
+//! [`begin_impersonation`] refuses with `500` unless the app has an
+//! [`AuditLogger`](crate::audit::AuditLogger) with at least one sink installed
+//! — `audit::write_from_state` is a silent no-op without one, and an
+//! unrecorded identity swap is exactly what this module exists to prevent.
+//! `AppBuilder::with_audit_sink(TracingAuditSink)` is the minimum; a durable
+//! sink (`JsonlFileAuditSink`, or your own) is what you actually want. Ending
+//! an impersonation is deliberately *not* subject to this: dropping privilege
+//! must always succeed.
+//!
 //! # Scope
 //!
 //! Session-based auth only: an API-token principal has no session to swap, so
 //! the token authentication path is untouched. Same-tenant only — the
 //! [`ImpersonationPolicy`] is the seam where an app enforces its tenancy
 //! boundary (it receives the full [`PolicyContext`], including the session and
-//! the DB pool). Step-up (`#[step_up]`) still evaluates the *real admin's*
-//! freshness claim, which `begin_impersonation` deliberately leaves untouched:
-//! impersonation never launders a sensitive action past step-up.
+//! the DB pool) — the framework itself enforces no tenancy, and
+//! [`ImpersonationGate::allow_roles`] in particular does not look at the target
+//! at all, so a multi-tenant app wants a real [`ImpersonationPolicy`].
+//!
+//! Step-up does **not** carry over: [`begin_impersonation`] stashes the
+//! operator's `last_strong_auth_at` claim and drops it from the impersonated
+//! session, so a `#[step_up]` route cannot run a sensitive action on the
+//! target's account on the strength of the *operator's* re-authentication.
+//! [`end_impersonation`] restores the operator's own claim.
+//!
+//! # Reserved session keys
+//!
+//! [`IMPERSONATOR_SESSION_KEY`], [`IMPERSONATED_SESSION_KEY`],
+//! [`IMPERSONATOR_ROLE_SESSION_KEY`] and [`IMPERSONATOR_STEP_UP_SESSION_KEY`]
+//! belong to the framework; do not configure `[auth].session_key` to collide
+//! with them, and do not write them by hand. Call [`clear`] from any flow that
+//! replaces the session's user outright (a login, a magic-link or passkey
+//! promotion) so a record left behind by an operator who never reverted is not
+//! inherited by whoever logs in next.
+//!
+//! [`Auth<T>`]: super::Auth
 //!
 //! [`AppState`]: crate::AppState
 //! [`PolicyContext`]: crate::authorization::PolicyContext
@@ -75,10 +104,28 @@ use crate::session::Session;
 /// [`impersonator_id`] instead.
 pub const IMPERSONATOR_SESSION_KEY: &str = "impersonator_id";
 
+/// Session key recording **which** user the impersonation record describes.
+///
+/// The record is only honored while this still matches the session's effective
+/// user. Without that binding, a stale record left behind by an operator who
+/// never reverted would be picked up by whoever logs in on that session next —
+/// handing them the admin's identity through the revert route, and
+/// misattributing their writes to the admin in the meantime. Reserved by the
+/// framework, like [`IMPERSONATOR_SESSION_KEY`].
+pub const IMPERSONATED_SESSION_KEY: &str = "impersonated_id";
+
 /// Session key stashing the real admin's role for the duration of the
 /// impersonation, so [`end_impersonation`] can restore it exactly. Reserved by
 /// the framework, like [`IMPERSONATOR_SESSION_KEY`].
 pub const IMPERSONATOR_ROLE_SESSION_KEY: &str = "impersonator_role";
+
+/// Session key stashing the real admin's step-up claim.
+///
+/// Holds [`step_up::STEP_UP_SESSION_KEY`](crate::step_up::STEP_UP_SESSION_KEY)
+/// for the duration of the impersonation, so the impersonated session cannot
+/// spend the operator's freshness. Reserved by the framework, like
+/// [`IMPERSONATOR_SESSION_KEY`].
+pub const IMPERSONATOR_STEP_UP_SESSION_KEY: &str = "impersonator_last_strong_auth_at";
 
 /// Session key holding the current role. Mirrors the key `#[secured("role")]`
 /// and the admin plugin's role middleware read.
@@ -135,6 +182,18 @@ impl ImpersonationTarget {
     #[must_use]
     pub fn role(&self) -> Option<&str> {
         self.role.as_deref()
+    }
+
+    /// The same target with its user id trimmed of surrounding whitespace.
+    ///
+    /// [`begin_impersonation`] applies this **before** the
+    /// [`ImpersonationPolicy`] ever sees the target, so the id the policy
+    /// authorizes, the id the audit event records, and the id written to the
+    /// session are always one and the same string.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.user_id = self.user_id.trim().to_owned();
+        self
     }
 }
 
@@ -285,6 +344,7 @@ impl std::fmt::Debug for ImpersonationGate {
 
 /// A snapshot of an active impersonation: who is really acting, and as whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImpersonationState {
     /// The **real** operator — the id audit and version writes are attributed
     /// to while the impersonation is active.
@@ -293,52 +353,216 @@ pub struct ImpersonationState {
     pub effective_user_id: String,
 }
 
+/// The raw impersonation record on the session, **unvalidated**.
+///
+/// Returns `(impersonator_id, impersonated_id)` when both reserved keys are
+/// present. Callers must confirm `impersonated_id` still matches the session's
+/// effective user before honoring it — see [`audit_actor_id`], which is the
+/// validating form every framework seam uses.
+async fn raw_record(session: &Session) -> Option<(String, String)> {
+    let impersonator = session.get(IMPERSONATOR_SESSION_KEY).await?;
+    let impersonated = session.get(IMPERSONATED_SESSION_KEY).await?;
+    Some((impersonator, impersonated))
+}
+
 /// The real operator behind the current session, or `None` when the session is
 /// not impersonating.
 ///
 /// The companion to ordinary current-user resolution: `session.get("user_id")`
 /// (and everything built on it) answers *"who does this request act as?"*, this
 /// answers *"who is really doing it?"*.
-pub async fn impersonator_id(session: &Session) -> Option<String> {
-    session.get(IMPERSONATOR_SESSION_KEY).await
+///
+/// Validated: a record whose recorded target no longer matches the session's
+/// effective user is stale — someone logged in on this session after an
+/// operator walked away without reverting — and is reported as "not
+/// impersonating" rather than silently attributing that person's work to the
+/// operator. Clear such a record with [`clear`].
+pub async fn impersonator_id(state: &AppState, session: &Session) -> Option<String> {
+    impersonation_state(state, session)
+        .await
+        .map(|active| active.impersonator_id)
 }
 
 /// Whether the session is currently impersonating someone.
-pub async fn is_impersonating(session: &Session) -> bool {
-    session.contains_key(IMPERSONATOR_SESSION_KEY).await
+///
+/// Validated the same way as [`impersonator_id`].
+pub async fn is_impersonating(state: &AppState, session: &Session) -> bool {
+    impersonation_state(state, session).await.is_some()
 }
 
 /// The full [`ImpersonationState`] for the session, or `None` when it is not
 /// impersonating. Reads the effective user through the app's configured auth
-/// session key.
+/// session key and verifies the record still describes that user.
 pub async fn impersonation_state(
     state: &AppState,
     session: &Session,
 ) -> Option<ImpersonationState> {
-    let impersonator_id = impersonator_id(session).await?;
-    let effective_user_id = session
-        .get(state.auth_session_key())
-        .await
-        .unwrap_or_default();
-    Some(ImpersonationState {
+    let effective_user_id = session.get(state.auth_session_key()).await?;
+    let (impersonator_id, impersonated_id) = raw_record(session).await?;
+    (impersonated_id == effective_user_id).then_some(ImpersonationState {
         impersonator_id,
         effective_user_id,
     })
 }
 
+/// Drop any impersonation record from the session.
+///
+/// Audits nothing and restores nothing.
+///
+/// This is **not** the revert — use [`end_impersonation`] for that. It exists
+/// for identity transitions that replace the session's user outright, where the
+/// old record no longer describes anyone: a login, a magic-link or passkey
+/// promotion, an account switch. Call it wherever your app writes the auth
+/// session key directly, so a record left behind by an operator who never
+/// reverted cannot be inherited by the next person to log in on that session.
+///
+/// ```rust,no_run
+/// # use autumn_web::session::Session;
+/// # use autumn_web::auth::impersonation;
+/// async fn establish_session(session: &Session, user_id: &str) {
+///     session.rotate_id().await;
+///     impersonation::clear(session).await;
+///     session.insert("user_id", user_id).await;
+/// }
+/// ```
+pub async fn clear(session: &Session) {
+    session.remove(IMPERSONATOR_SESSION_KEY).await;
+    session.remove(IMPERSONATED_SESSION_KEY).await;
+    session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await;
+    session.remove(IMPERSONATOR_STEP_UP_SESSION_KEY).await;
+}
+
 /// The id that audit and version writes made by this session should carry.
 ///
 /// Returns the real impersonator while impersonation is active, and
-/// `effective_user_id` otherwise. This is the single rule the framework's three
-/// session-based [`Current::set_actor`] seams apply, so `#[repository(versioned)]`
-/// writes and [`AuditEvent`]s stay attributed to the human responsible.
+/// `effective_user_id` otherwise. This is the single rule the framework's
+/// session-based [`Current::set_actor`] seams apply, so
+/// `#[repository(versioned)]` writes and [`AuditEvent`]s stay attributed to the
+/// human responsible.
+///
+/// Validating by construction: the caller supplies the effective user, so a
+/// stale record — one describing a *different* user than the session now
+/// resolves as — is ignored and the effective user is returned. That keeps a
+/// forgotten impersonation from misattributing the next person's writes to the
+/// operator.
 pub async fn audit_actor_id(session: &Session, effective_user_id: &str) -> String {
-    impersonator_id(session)
-        .await
-        .unwrap_or_else(|| effective_user_id.to_owned())
+    match raw_record(session).await {
+        Some((impersonator, impersonated)) if impersonated == effective_user_id => impersonator,
+        _ => effective_user_id.to_owned(),
+    }
+}
+
+// ── Extractor ────────────────────────────────────────────────────
+
+/// Request extractor resolving the session's active impersonation, if any.
+///
+/// Infallible — a request with no session, or one that is not impersonating,
+/// yields `Impersonation(None)` — so a handler can take it unconditionally and
+/// branch on it. The ergonomic form of [`impersonation_state`] for apps that use
+/// the core primitive without `autumn-admin-plugin`.
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::auth::impersonation::Impersonation;
+///
+/// #[autumn_web::get("/")]
+/// async fn home(impersonation: Impersonation) -> String {
+///     match impersonation.state() {
+///         Some(active) => format!("viewing as {}", active.effective_user_id),
+///         None => "your own account".to_owned(),
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Impersonation(Option<ImpersonationState>);
+
+impl Impersonation {
+    /// The active impersonation, or `None` when the session is not
+    /// impersonating (or there is no session).
+    #[must_use]
+    pub const fn state(&self) -> Option<&ImpersonationState> {
+        self.0.as_ref()
+    }
+
+    /// Consume the extractor, yielding the active impersonation.
+    #[must_use]
+    pub fn into_state(self) -> Option<ImpersonationState> {
+        self.0
+    }
+
+    /// Whether the request is running under an impersonation.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for Impersonation {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(session) = parts.extensions.get::<Session>().cloned() else {
+            return Ok(Self(None));
+        };
+        Ok(Self(impersonation_state(state, &session).await))
+    }
 }
 
 // ── Begin / end ──────────────────────────────────────────────────
+
+/// Move `session` from the operator's identity onto the target's.
+///
+/// Only the impersonation-relevant keys move; everything else in the session
+/// (flash, CSRF, wizard progress) is deliberately preserved. The operator's
+/// role and step-up claim are stashed rather than discarded, so
+/// [`end_impersonation`] can restore them exactly.
+async fn swap_identity(
+    session: &Session,
+    auth_key: &str,
+    real_id: &str,
+    target_id: &str,
+    target_role: Option<&str>,
+) {
+    session.insert(IMPERSONATOR_SESSION_KEY, real_id).await;
+    session.insert(IMPERSONATED_SESSION_KEY, target_id).await;
+    stash(session, ROLE_SESSION_KEY, IMPERSONATOR_ROLE_SESSION_KEY).await;
+    // `last_strong_auth_at` is a bare timestamp with no identity bound to it,
+    // so carrying it across the swap would let a `#[step_up]` route run a
+    // destructive action *on the target's account* on the strength of the
+    // operator's re-authentication — impersonation laundering a credential
+    // check. Every other identity transition in the framework drops this key
+    // for the same reason.
+    stash(
+        session,
+        crate::step_up::STEP_UP_SESSION_KEY,
+        IMPERSONATOR_STEP_UP_SESSION_KEY,
+    )
+    .await;
+
+    session.insert(auth_key, target_id).await;
+    set_or_remove(session, ROLE_SESSION_KEY, target_role).await;
+    // Privilege change ⇒ new session id (no fixation).
+    session.rotate_id().await;
+}
+
+/// Move `from` to `to`, leaving neither key set when `from` was absent.
+async fn stash(session: &Session, from: &str, to: &str) {
+    let value = session.remove(from).await;
+    set_or_remove(session, to, value.as_deref()).await;
+}
+
+/// Set `key` to `value`, or remove it entirely when `value` is `None`.
+async fn set_or_remove(session: &Session, key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => session.insert(key, value).await,
+        None => {
+            session.remove(key).await;
+        }
+    }
+}
 
 /// Begin impersonating `target` from the current admin session.
 ///
@@ -371,20 +595,21 @@ pub async fn audit_actor_id(session: &Session, effective_user_id: &str) -> Strin
 ///   refused. The refusal is itself audited as a failure.
 /// * `409` — the session is **already** impersonating. Impersonation does not
 ///   nest, so it cannot be chained to escalate.
-/// * `500` — the audit event could not be written. A privileged identity swap
-///   that cannot be recorded does not happen at all.
+/// * `500` — no audit sink is configured, or the audit event could not be
+///   written. A privileged identity swap that cannot be recorded does not
+///   happen at all, so an app must register an [`AuditSink`](crate::audit::AuditSink)
+///   before enabling impersonation.
 pub async fn begin_impersonation(
     state: &AppState,
     session: &Session,
     target: impl Into<ImpersonationTarget>,
 ) -> crate::AutumnResult<ImpersonationState> {
-    let target = target.into();
-    let target_id = target.user_id().trim();
-    if target_id.is_empty() {
-        return Err(crate::AutumnError::bad_request_msg(
-            "impersonation target is required",
-        ));
-    }
+    // Normalize ONCE, before anything sees the target. The policy, the audit
+    // event, and the session write must all reason about the same string: if the
+    // gate were handed a raw `" root "` while the session received `"root"`, a
+    // policy denying `"root"` would authorize an id it never approved.
+    let target = target.into().normalized();
+    let target_id = target.user_id();
 
     let auth_key = state.auth_session_key().to_owned();
     let Some(real_id) = session.get(&auth_key).await else {
@@ -393,15 +618,23 @@ pub async fn begin_impersonation(
         ));
     };
 
+    if target_id.is_empty() {
+        return Err(crate::AutumnError::bad_request_msg(
+            "impersonation target is required",
+        ));
+    }
+
     // No nesting: an already-impersonated session cannot start a second hop,
-    // so impersonation can never be chained into an escalation.
-    if is_impersonating(session).await {
+    // so impersonation can never be chained into an escalation. Uses the
+    // validated form, so a *stale* record (one describing a user this session
+    // no longer resolves as) does not permanently wedge the session at 409.
+    if is_impersonating(state, session).await {
         return Err(crate::AutumnError::conflict_msg(
             "already impersonating; stop the current impersonation first",
         ));
     }
 
-    if target_id == real_id {
+    if target_id == real_id.trim() {
         return Err(crate::AutumnError::bad_request_msg(
             "cannot impersonate yourself",
         ));
@@ -429,6 +662,25 @@ pub async fn begin_impersonation(
         .await;
         return Err(crate::AutumnError::forbidden_msg(
             "not permitted to impersonate",
+        ));
+    }
+
+    // Fail closed on a *missing* sink, not just a failing one.
+    // `audit::write_from_state` deliberately returns `Ok(())` when no
+    // `AuditLogger` is installed, so without this check an app that enabled
+    // impersonation but never configured a sink would swap identities with no
+    // record at all — precisely the outcome this module exists to prevent.
+    // Checked after the authorization gate so an unauthorized caller still gets
+    // a plain `403` and learns nothing about the app's audit configuration.
+    let audit_enabled = state
+        .extension::<crate::audit::AuditLogger>()
+        .is_some_and(|logger| logger.is_enabled());
+    if !audit_enabled {
+        return Err(crate::AutumnError::internal_server_error_msg(
+            "impersonation refused: no audit sink is configured. Register one \
+             (e.g. `AppBuilder::with_audit_sink(TracingAuditSink)`) before \
+             enabling impersonation — an unrecorded identity swap is exactly \
+             what this feature exists to prevent",
         ));
     }
 
@@ -464,26 +716,14 @@ pub async fn begin_impersonation(
         },
     };
 
-    // Swap the identity. Only these keys move: everything else in the session
-    // (flash, CSRF, the admin's own step-up claim) is deliberately preserved.
-    session
-        .insert(IMPERSONATOR_SESSION_KEY, real_id.clone())
-        .await;
-    match session.get(ROLE_SESSION_KEY).await {
-        Some(role) => session.insert(IMPERSONATOR_ROLE_SESSION_KEY, role).await,
-        None => {
-            session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await;
-        }
-    }
-    session.insert(&auth_key, target_id).await;
-    match target_role {
-        Some(role) => session.insert(ROLE_SESSION_KEY, role).await,
-        None => {
-            session.remove(ROLE_SESSION_KEY).await;
-        }
-    }
-    // Privilege change ⇒ new session id (no fixation).
-    session.rotate_id().await;
+    swap_identity(
+        session,
+        &auth_key,
+        &real_id,
+        target_id,
+        target_role.as_deref(),
+    )
+    .await;
 
     // The remainder of *this* request is the impersonator's work too.
     Current::set_actor(real_id.clone());
@@ -514,11 +754,18 @@ pub async fn end_impersonation(
     state: &AppState,
     session: &Session,
 ) -> crate::AutumnResult<ImpersonationState> {
-    let Some(real_id) = impersonator_id(session).await else {
+    let auth_key = state.auth_session_key().to_owned();
+    let Some(active) = impersonation_state(state, session).await else {
+        // Either there is no record, or there is a *stale* one describing a user
+        // this session no longer resolves as — an operator walked away without
+        // reverting and somebody else logged in on the same session. Honoring
+        // that record would hand the new user the operator's identity and role
+        // with no credential, so drop it instead of restoring it.
+        clear(session).await;
         return Err(crate::AutumnError::bad_request_msg("not impersonating"));
     };
-    let auth_key = state.auth_session_key().to_owned();
-    let effective_user_id = session.get(&auth_key).await.unwrap_or_default();
+    let real_id = active.impersonator_id;
+    let effective_user_id = active.effective_user_id;
 
     if let Err(error) = crate::audit::write_from_state(
         state,
@@ -543,12 +790,17 @@ pub async fn end_impersonation(
 
     session.insert(&auth_key, real_id.clone()).await;
     session.remove(IMPERSONATOR_SESSION_KEY).await;
-    match session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await {
-        Some(role) => session.insert(ROLE_SESSION_KEY, role).await,
-        None => {
-            session.remove(ROLE_SESSION_KEY).await;
-        }
-    }
+    session.remove(IMPERSONATED_SESSION_KEY).await;
+    stash(session, IMPERSONATOR_ROLE_SESSION_KEY, ROLE_SESSION_KEY).await;
+    // Put the operator's own step-up claim back exactly as it was, and discard
+    // anything the impersonated session accrued — that freshness belonged to
+    // the target's credential, not the operator's.
+    stash(
+        session,
+        IMPERSONATOR_STEP_UP_SESSION_KEY,
+        crate::step_up::STEP_UP_SESSION_KEY,
+    )
+    .await;
     session.rotate_id().await;
 
     Current::set_actor(real_id.clone());
@@ -573,27 +825,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn impersonator_accessors_read_the_reserved_key() {
-        let session = session_with(&[("user_id", "target"), (IMPERSONATOR_SESSION_KEY, "admin")]);
-        assert!(is_impersonating(&session).await);
-        assert_eq!(impersonator_id(&session).await, Some("admin".to_owned()));
-    }
-
-    #[tokio::test]
-    async fn a_plain_session_is_not_impersonating() {
-        let session = session_with(&[("user_id", "u1")]);
-        assert!(!is_impersonating(&session).await);
-        assert_eq!(impersonator_id(&session).await, None);
-    }
-
-    #[tokio::test]
     async fn audit_actor_prefers_the_impersonator_and_falls_back_to_the_user() {
-        let impersonating =
-            session_with(&[("user_id", "target"), (IMPERSONATOR_SESSION_KEY, "admin")]);
+        let impersonating = session_with(&[
+            ("user_id", "target"),
+            (IMPERSONATOR_SESSION_KEY, "admin"),
+            (IMPERSONATED_SESSION_KEY, "target"),
+        ]);
         assert_eq!(audit_actor_id(&impersonating, "target").await, "admin");
 
         let plain = session_with(&[("user_id", "u1")]);
         assert_eq!(audit_actor_id(&plain, "u1").await, "u1");
+    }
+
+    #[tokio::test]
+    async fn a_stale_record_is_ignored_rather_than_misattributed() {
+        // The record describes `target`, but the session now resolves as
+        // `carol` — somebody logged in after an operator walked away without
+        // reverting. Carol's writes are hers.
+        let stale = session_with(&[
+            ("user_id", "carol"),
+            (IMPERSONATOR_SESSION_KEY, "admin"),
+            (IMPERSONATED_SESSION_KEY, "target"),
+        ]);
+        assert_eq!(audit_actor_id(&stale, "carol").await, "carol");
+    }
+
+    #[tokio::test]
+    async fn a_half_written_record_is_ignored() {
+        // Only the framework writes both keys together, so a session carrying
+        // just one (an app poking at the reserved key by hand) is not a record.
+        let half = session_with(&[("user_id", "target"), (IMPERSONATOR_SESSION_KEY, "admin")]);
+        assert_eq!(audit_actor_id(&half, "target").await, "target");
+    }
+
+    #[tokio::test]
+    async fn clear_drops_every_reserved_key() {
+        let session = session_with(&[
+            ("user_id", "target"),
+            (IMPERSONATOR_SESSION_KEY, "admin"),
+            (IMPERSONATED_SESSION_KEY, "target"),
+            (IMPERSONATOR_ROLE_SESSION_KEY, "admin"),
+            (IMPERSONATOR_STEP_UP_SESSION_KEY, "123"),
+        ]);
+        clear(&session).await;
+        for key in [
+            IMPERSONATOR_SESSION_KEY,
+            IMPERSONATED_SESSION_KEY,
+            IMPERSONATOR_ROLE_SESSION_KEY,
+            IMPERSONATOR_STEP_UP_SESSION_KEY,
+        ] {
+            assert_eq!(session.get(key).await, None, "{key} must be cleared");
+        }
+        assert_eq!(
+            session.get("user_id").await,
+            Some("target".to_owned()),
+            "clear() drops the record, not the session"
+        );
+    }
+
+    #[test]
+    fn normalizing_a_target_trims_the_id() {
+        assert_eq!(
+            ImpersonationTarget::new("  root  ").normalized().user_id(),
+            "root"
+        );
+        assert_eq!(
+            ImpersonationTarget::new("u1")
+                .with_role("member")
+                .normalized()
+                .role(),
+            Some("member"),
+            "normalizing preserves the trusted role decision"
+        );
     }
 
     #[test]

@@ -1541,6 +1541,28 @@ impl AppBuilder {
         self
     }
 
+    /// Enable **user impersonation** for this app, gated by `gate`.
+    ///
+    /// Impersonation is default-deny: without this call (or
+    /// `AdminPlugin::with_impersonation`, which does it for you)
+    /// [`begin_impersonation`](crate::auth::impersonation::begin_impersonation)
+    /// refuses every attempt with `403`. It also requires an audit sink — see
+    /// [`with_audit_sink`](Self::with_audit_sink).
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::auth::impersonation::ImpersonationGate;
+    ///
+    /// # fn wire(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
+    /// app.impersonation_gate(ImpersonationGate::allow_roles(["admin"]))
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn impersonation_gate(self, gate: crate::auth::impersonation::ImpersonationGate) -> Self {
+        self.state_initializer(move |state| {
+            state.insert_extension(gate);
+        })
+    }
+
     /// Store or replace a typed builder extension.
     ///
     /// External crates use this to accumulate configuration across fluent

@@ -69,15 +69,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary), so an app can never acquire impersonation by accident. Both
   directions rotate the session id (no fixation) and write an audit event
   carrying `{impersonator_id, target_id}`; a *denied* attempt is audited as a
-  failure, and a begin whose audit write fails is refused outright rather than
-  taking effect unrecorded. Impersonation does not nest — starting a second hop
+  failure, and a begin is refused outright — rather than taking effect
+  unrecorded — both when the audit write fails and when the app has installed
+  no audit sink at all (`audit::write_from_state` is a silent no-op without
+  one, so impersonation requires a real sink before it will swap anything). Impersonation does not nest — starting a second hop
   is a `409`, so it cannot be chained to escalate — and the impersonated
   session's role is resolved **server-side** by
   `ImpersonationPolicy::target_role`, never taken from request input, so an
   operator cannot mint a session more privileged than the target really is. The
-  admin's own step-up (`last_strong_auth_at`) claim is deliberately preserved
-  rather than refreshed, so impersonation never launders a sensitive action past
-  `#[step_up]`.
+  operator's step-up (`last_strong_auth_at`) claim is a bare timestamp with no
+  identity bound to it, so begin stashes and drops it — otherwise a `#[step_up]`
+  route could run a destructive action on the *target's* account on the strength
+  of the operator's re-authentication — and end restores it. Impersonation also
+  does not survive a change of identity: the session records which user the
+  record describes, and a stale record (an operator walked away without
+  reverting and somebody else logged in) is ignored for attribution and refused
+  by the revert route rather than handing the newcomer the operator's identity
+  and role. `impersonation::clear` scrubs it from a login flow.
 
 - **`AdminPlugin::with_impersonation(gate)` — the impersonation UI (#1394):**
   opts an admin panel into the primitive above and mounts two routes:

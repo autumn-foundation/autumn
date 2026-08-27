@@ -242,6 +242,12 @@ impl AdminPlugin {
     /// layout with [`impersonation_banner_for`] so it is visible on the pages
     /// the operator is actually looking at.
     ///
+    /// **Requires an audit sink.** `begin_impersonation` refuses with `500`
+    /// unless the app has an [`AuditLogger`](autumn_web::audit::AuditLogger)
+    /// carrying at least one sink, because an unrecorded identity swap is the
+    /// exact failure this feature exists to prevent. The plugin logs an error at
+    /// startup when the sink is missing.
+    ///
     /// The gate is also where an app enforces its own boundaries — in
     /// particular tenancy, which the framework cannot infer: the policy
     /// receives the full [`PolicyContext`](autumn_web::authorization::PolicyContext),
@@ -293,6 +299,14 @@ impl Plugin for AdminPlugin {
             "autumn-admin: model slug 'config' conflicts with the mounted runtime-config \
              routes; rename the model or don't call with_runtime_config",
         );
+        // Same hazard the "config" guard above covers: `POST {prefix}/impersonate`
+        // is a literal route, so a model registered at that slug would silently
+        // lose its create endpoint to the impersonation handler.
+        assert!(
+            !(impersonation.is_some() && registry.get("impersonate").is_some()),
+            "autumn-admin: model slug 'impersonate' conflicts with the mounted \
+             impersonation routes; rename the model or don't call with_impersonation",
+        );
         let registry = Arc::new(registry);
         let router = routes::admin_router(
             Arc::clone(&registry),
@@ -335,6 +349,20 @@ impl Plugin for AdminPlugin {
             // is the single opt-in.
             Some(gate) => app.state_initializer(move |state| {
                 state.insert_extension(gate);
+                // Surface the audit requirement at startup rather than at the
+                // first impersonation attempt: `begin_impersonation` refuses
+                // with 500 without a sink, and a 500 in front of a support
+                // engineer is a worse place to learn this than a boot log.
+                let audited = state
+                    .extension::<autumn_web::audit::AuditLogger>()
+                    .is_some_and(|logger| logger.is_enabled());
+                if !audited {
+                    tracing::error!(
+                        "🍂 Autumn Admin: impersonation is enabled but no audit sink is \
+                         configured; every attempt will be refused. Register one with \
+                         `AppBuilder::with_audit_sink(...)`."
+                    );
+                }
             }),
             None => app,
         };
@@ -409,8 +437,9 @@ pub(crate) fn admin_route_infos(
         ("GET", format!("{prefix}{}", *routes::ADMIN_JS_PATH)),
     ]);
     // The revert route is intentionally ungated (see `routes::admin_router`),
-    // so it is declared separately with the plugin's *unclassified* posture
-    // rather than inheriting the admin role.
+    // so it is declared separately as `Public` rather than inheriting the admin
+    // role — declaring it `Gated` would make the route audit assert a guard
+    // that genuinely is not there.
     let ungated: Vec<(&str, String)> = if has_impersonation {
         vec![("POST", format!("{prefix}/impersonate/stop"))]
     } else {
