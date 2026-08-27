@@ -479,3 +479,51 @@ async fn sitemap_is_empty_without_a_database() {
         entries.len()
     );
 }
+
+/// `robots.txt` must not block a URL whose exclusion depends on a meta tag.
+///
+/// A `Disallow` line stops the fetch, so a crawler never reads that page's
+/// `noindex` — and the URL can still be indexed from an inbound link, as a
+/// bare result nobody can remove. The two are alternatives for one URL, not
+/// layers. This asserts the example's `autumn.toml` keeps them apart: the
+/// machine endpoints are blocked, and the two routes that declare `noindex`
+/// (`/submit` and `/u/{username}`) are left crawlable.
+#[test]
+fn robots_txt_never_blocks_a_url_that_relies_on_a_noindex_tag() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("autumn.toml");
+    let raw = std::fs::read_to_string(&manifest).expect("read autumn.toml");
+    let parsed: toml::Value = toml::from_str(&raw).expect("parse autumn.toml");
+
+    let rules: Vec<String> = parsed
+        .get("seo")
+        .and_then(|seo| seo.get("robots"))
+        .and_then(|robots| robots.get("additional_rules"))
+        .and_then(toml::Value::as_array)
+        .expect("[seo.robots] additional_rules")
+        .iter()
+        .map(|v| v.as_str().expect("rule is a string").to_owned())
+        .collect();
+
+    // The routes that declare `seo(robots = "noindex", ...)` must stay
+    // crawlable, or the directive can never be read.
+    for noindex_path in ["/submit", "/u/"] {
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.starts_with("Disallow:") && rule.contains(noindex_path)),
+            "{noindex_path} declares a noindex tag, so robots.txt must not Disallow it; \
+             rules: {rules:?}",
+        );
+    }
+
+    // The machine endpoints have no page worth indexing, so blocking the crawl
+    // is the right tool there. Keep that half of the contract asserted too.
+    for machine_path in ["/api/", "/actuator/", "/_partials/"] {
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule == &format!("Disallow: {machine_path}")),
+            "expected a Disallow for the machine endpoint {machine_path}; rules: {rules:?}",
+        );
+    }
+}

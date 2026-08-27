@@ -374,6 +374,28 @@ mod tests {
         );
     }
 
+    /// `noindex, follow` is the directive a thin-but-linking page wants: keep
+    /// this page out of the index, but let crawlers walk through to the pages
+    /// that belong in it. `routes::auth::profile` declares exactly this.
+    #[test]
+    fn layout_with_seo_renders_noindex_follow_for_a_profile_page() {
+        let seo = SeoMeta::new()
+            .title("u/ferris \u{2022} Autumn Reddit")
+            .robots("noindex, follow")
+            .og_type("profile");
+
+        let rendered = layout_with_seo(seo, None, None, html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"<meta name="robots" content="noindex, follow">"#),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("nofollow"),
+            "`follow` must not be rendered as `nofollow`; rendered: {rendered}"
+        );
+    }
+
     #[test]
     fn layout_with_seo_renders_a_noindex_directive() {
         let seo = SeoMeta::new()

@@ -251,6 +251,13 @@ Autumn reads `noindex` as a comma-separated directive, so `"noindex"`,
 `"noindex, nofollow"`, and `"nofollow, noindex"` all count. An unrelated value
 such as `"noarchive"` does not.
 
+Choose the second half of the directive on purpose. `noindex, follow` keeps the
+page out of the index but lets crawlers walk its links, which is what a thin
+profile page wants. `noindex, nofollow` stops both.
+
+Do not also add the URL to `robots.txt`. See
+[Do not use `Disallow` and `noindex` on the same URL](#do-not-use-disallow-and-noindex-on-the-same-url).
+
 ### The sitemap-exclusion rule
 
 The framework filters only the paths it derives on its own. Those are the
@@ -284,9 +291,10 @@ Override the default and add your own rules under `[seo.robots]`:
 allow_all = false
 
 # Extra lines. Autumn appends them after the User-agent block.
+# Machine endpoints only. Read the next section before you add a page here.
 additional_rules = [
-  "Disallow: /submit",
   "Disallow: /actuator/",
+  "Disallow: /api/",
   "Crawl-delay: 5",
 ]
 
@@ -294,13 +302,29 @@ additional_rules = [
 sitemap_url = "https://cdn.example.com/sitemap.xml"
 ```
 
-`robots.txt` and a `noindex` tag do different jobs. Use both:
+### Do not use `Disallow` and `noindex` on the same URL
+
+The two rules do different jobs, and they cancel each other out:
 
 - `robots.txt` stops the **crawl**.
 - `noindex` stops the **indexing**.
 
-A page that another site links to can enter the index without a crawl. Only the
-`noindex` tag keeps it out, and a crawler must fetch the page to read that tag.
+A crawler must fetch a page to read its `noindex` tag. A `Disallow` line stops
+that fetch, so the crawler never reads the tag. The damage goes further. A page
+that another site links to can still enter the index without a crawl. The URL
+then appears as a bare result, and you have no way to remove it.
+
+Pick one tool for each URL:
+
+| Goal | Use |
+|---|---|
+| Keep the URL out of the index | Allow the crawl. Serve `seo(robots = "noindex")`. |
+| Keep crawlers off a machine endpoint | `Disallow` it. Accept that URL-only indexing stays possible. |
+
+A `noindex` tag also has to be reachable. A page behind `#[secured]` answers an
+anonymous crawler with a redirect to the login form. The crawler never sees the
+tag on the page itself. Put the directive where a crawler can read it, or send
+an `X-Robots-Tag: noindex` header on the redirect.
 
 ---
 
@@ -371,9 +395,16 @@ let source = PostSitemapSource { pool };
 `examples/reddit-clone/src/seo.rs` does this. It lists the communities and the
 posts.
 
-Bound the query. It runs at boot, so a row count you did not choose must not
-decide how long it takes. Log a warning when the bound bites, so a partial
+Cap the number of entries, and log a warning when the cap bites, so a partial
 sitemap is never a silent one.
+
+Know what a `LIMIT` bounds. It bounds the size of the document. It does not
+bound the work: a database must read every candidate row before it can know
+which rows are newest. Boot time therefore grows with the table. That is
+acceptable while the table is small. Past that point, stop building the sitemap
+at boot and serve `/sitemap.xml` from your own route, as
+[The entries are a start-up snapshot](#the-entries-are-a-start-up-snapshot)
+describes.
 
 ### Give `lastmod` the page, not one column
 
@@ -569,7 +600,8 @@ fn post_page_declares_its_canonical_url() {
 2. Put `(seo.render())` in the `<head>` of your layout.
 3. Declare a `title` and a `description` on each public route.
 4. Add a canonical URL on each page that answers at more than one address.
-5. Mark each private page `robots = "noindex, nofollow"`.
+5. Mark each page you want out of the index `robots = "noindex"`, and leave
+   that URL out of `robots.txt`.
 6. Register a `SitemapSource` for the pages the framework cannot derive.
 7. Read `/robots.txt` and `/sitemap.xml` before you deploy.
 

@@ -38,14 +38,19 @@ base_url = "https://autumn-reddit.example.com"
 # allows every crawler. Set `allow_all = false` here to keep a staging
 # deployment out of search results even when it runs the `prod` profile.
 #
-# These rules are a second line of defence for the pages that must stay out of
-# the index. `robots.txt` stops the crawl; the `seo(robots = "noindex")`
-# argument on a route stops the indexing. Use both: a page that another site
-# links to can still be indexed without ever being crawled.
+# `Disallow` and `noindex` are ALTERNATIVES for one URL, not layers. A
+# `Disallow` line stops the fetch, so a crawler never reads the page's
+# `noindex` tag -- and the URL can still be indexed from an inbound link, as a
+# bare result nobody can remove. Pick one tool per URL:
+#
+#   * "I do not want this URL in the index"  -> allow the crawl, serve
+#     `seo(robots = "noindex")`. That is why `/submit` and `/u/` are NOT
+#     listed below even though both declare the directive.
+#   * "I do not want crawlers here at all"   -> `Disallow`, and accept that
+#     URL-only indexing stays possible. That is the right trade for the
+#     machine endpoints below: they serve JSON or HTML fragments, so there is
+#     no page anyone could usefully index anyway.
 additional_rules = [
-  "Disallow: /submit",
-  "Disallow: /login",
-  "Disallow: /register",
   "Disallow: /_partials/",
   "Disallow: /actuator/",
   "Disallow: /api/",

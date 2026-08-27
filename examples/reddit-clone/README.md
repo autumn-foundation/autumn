@@ -144,8 +144,9 @@ websocat ws://localhost:3000/ws/r/rustlang
 `[seo] base_url` in `autumn.toml` mounts `/robots.txt` and `/sitemap.xml`. The
 sitemap source in `src/seo.rs` reads the database at start-up and lists the
 front page, the community index, the communities, and the posts (capped at
-1,000 and 5,000 entries respectively — a bounded boot query, with a logged
-warning when a cap bites).
+1,000 and 5,000 entries respectively, with a logged warning when a cap bites).
+The caps bound the number of URLs, not the work the query does — see
+`src/seo.rs` for when to stop building the sitemap at boot.
 
 ```bash
 # The crawl rules. The dev profile disallows every crawler; prod allows them.

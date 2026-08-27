@@ -327,14 +327,22 @@ pub async fn front_page(
 
 /// The submit form.
 ///
-/// `robots = "noindex, nofollow"` keeps this page out of search results. The
-/// page is behind `#[secured]`, so a crawler only ever sees the login
-/// redirect, and an indexed "Submit a post" result would help nobody.
+/// `robots = "noindex, nofollow"` declares the intent, but note what actually
+/// reaches a crawler here: the page is behind `#[secured]`, so an anonymous
+/// request gets the login redirect, not this HTML. The directive is therefore
+/// belt-and-braces for signed-in states rather than the thing keeping the URL
+/// out of an index. `routes::auth::profile` is the route where the same
+/// directive genuinely does the work, on a page a crawler can fetch.
 ///
-/// The directive also has a second effect on `#[static_get]` routes: the
-/// framework drops such a route from `/sitemap.xml`, so the application never
-/// advertises a URL and asks crawlers to skip it at the same time. This route
-/// is a `#[get]` route, so no derived entry exists to drop.
+/// What the app must NOT do is also add `/submit` to `[seo.robots]
+/// additional_rules`. A `Disallow` line stops the fetch, so no crawler could
+/// ever read this tag — the two are alternatives for one URL, not layers.
+/// See the comment in `autumn.toml` and `docs/guide/seo.md`.
+///
+/// The directive has a second effect on `#[static_get]` routes: the framework
+/// drops such a route from `/sitemap.xml`, so the application never advertises
+/// a URL and asks crawlers to skip it at the same time. This route is a
+/// `#[get]` route, so no derived entry exists to drop.
 #[secured]
 #[get(
     "/submit",

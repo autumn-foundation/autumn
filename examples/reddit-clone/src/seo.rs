@@ -46,23 +46,33 @@ struct PostSitemapRow {
 /// The maximum number of posts in `/sitemap.xml`.
 ///
 /// The sitemap protocol permits 50,000 URLs in one file, and this example
-/// stops well below that. The cap is deliberate, not an oversight: the query
-/// below runs at boot, before the application serves anything, so it must be
-/// bounded by a number the author chose rather than by however many rows the
-/// table holds.
+/// stops well below that.
 ///
-/// The consequence is real and this example accepts it: past this many posts
-/// the sitemap is **partial**, and it drops the least recently changed posts
-/// first -- "changed" by the derived `<lastmod>`, so a busy comment thread
-/// keeps its place even when nobody has edited the post itself. `collect` logs a warning when it hits the cap, so the truncation is
-/// never silent. A site that outgrows one file needs a sitemap index served
-/// from its own `/sitemap.xml` route — see `docs/guide/seo.md`.
+/// **What this cap does and does not bound.** It bounds the number of URLs in
+/// the document. It does **not** bound the work the query does: `ORDER BY
+/// last_modified DESC LIMIT n` still makes Postgres join and aggregate every
+/// matching post and comment before it can know which `n` are newest, so
+/// boot-time cost grows with the table rather than with this constant. That
+/// is inherent to deriving the sort key at read time (see
+/// [`RedditSitemapSource::collect`]), and it is the right trade at this
+/// example's scale. It stops being the right trade well before 5,000 posts on
+/// a busy site: at that point move off the start-up snapshot entirely and
+/// serve `/sitemap.xml` from your own route, which `docs/guide/seo.md`
+/// describes.
+///
+/// Past this many posts the sitemap is **partial**, and it drops the least
+/// recently changed posts first -- "changed" by the derived `<lastmod>`, so a
+/// busy comment thread keeps its place even when nobody has edited the post
+/// itself. `collect` logs a warning when it hits the cap, so the truncation is
+/// never silent.
 const MAX_POST_ENTRIES: i64 = 5_000;
 
 /// The maximum number of communities in `/sitemap.xml`.
 ///
-/// Same contract as [`MAX_POST_ENTRIES`]: a bounded boot query, a logged
-/// warning at the cap, and a partial sitemap past it.
+/// Same contract as [`MAX_POST_ENTRIES`]: it bounds the number of URLs, not
+/// the work, with a logged warning at the cap and a partial sitemap past it.
+/// This is the cheap query of the two -- an indexed scan of a small table,
+/// with no join and no aggregate.
 const MAX_SUBREDDIT_ENTRIES: i64 = 1_000;
 
 /// The site base URL, without a trailing slash.
