@@ -93,7 +93,18 @@ pub enum ArtifactError {
         actual: String,
     },
     /// The artifact could not be read from or written to disk.
-    Io(String),
+    ///
+    /// The [`kind`](std::io::ErrorKind) is carried separately so a caller can
+    /// tell "this optional plugin is not installed" from "this plugin is
+    /// installed and unreadable" — one is a skip, the other is a boot failure.
+    Io {
+        /// The path that failed.
+        path: std::path::PathBuf,
+        /// What kind of I/O failure it was.
+        kind: std::io::ErrorKind,
+        /// The underlying message.
+        detail: String,
+    },
 }
 
 impl fmt::Display for ArtifactError {
@@ -139,7 +150,11 @@ impl fmt::Display for ArtifactError {
                 "sandboxed plugin module digest mismatch: the manifest declares {declared} but \
                  the module hashes to {actual}. The artifact was modified after it was reviewed"
             ),
-            Self::Io(detail) => write!(f, "sandboxed plugin artifact I/O failure: {detail}"),
+            Self::Io { path, detail, .. } => write!(
+                f,
+                "sandboxed plugin artifact I/O failure at {path}: {detail}",
+                path = path.display()
+            ),
         }
     }
 }
@@ -163,8 +178,12 @@ impl From<ManifestError> for ArtifactError {
 /// describes, proven to be the module it describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxArtifact {
-    /// The capability manifest, already parsed and validated.
-    pub manifest: SandboxManifest,
+    /// Private on purpose. The type's whole claim is that *this* manifest
+    /// describes *these* bytes and that both passed the gate; a caller that
+    /// could reach in and widen a prefix, raise a ceiling or add a route would
+    /// defeat every one of those checks after the fact, because nothing
+    /// re-validates on the way to the host.
+    manifest: SandboxManifest,
     module: Vec<u8>,
 }
 
@@ -202,6 +221,12 @@ impl SandboxArtifact {
         // one does.
         let manifest = SandboxManifest::parse(&manifest.to_toml()?)?;
         Ok(Self { manifest, module })
+    }
+
+    /// The capability manifest these bytes were verified against.
+    #[must_use]
+    pub const fn manifest(&self) -> &SandboxManifest {
+        &self.manifest
     }
 
     /// The wasm module these bytes describe.
@@ -308,8 +333,11 @@ impl SandboxArtifact {
     /// Returns [`ArtifactError::Io`] if the file cannot be read, or any
     /// [`read`](Self::read) error for its contents.
     pub fn read_file(path: &Path) -> Result<Self, ArtifactError> {
-        let bytes = std::fs::read(path)
-            .map_err(|err| ArtifactError::Io(format!("{}: {err}", path.display())))?;
+        let bytes = std::fs::read(path).map_err(|err| ArtifactError::Io {
+            path: path.to_path_buf(),
+            kind: err.kind(),
+            detail: err.to_string(),
+        })?;
         Self::read(&bytes)
     }
 
@@ -321,8 +349,20 @@ impl SandboxArtifact {
     /// [`to_bytes`](Self::to_bytes) error.
     pub fn write_file(&self, path: &Path) -> Result<(), ArtifactError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes)
-            .map_err(|err| ArtifactError::Io(format!("{}: {err}", path.display())))
+        // Write beside the target and rename, so a failure part-way through
+        // cannot leave a truncated artifact where a good one was. A rename is
+        // atomic on every platform this runs on.
+        let temporary = path.with_extension("autumn-plugin-tmp");
+        std::fs::write(&temporary, bytes).map_err(|err| ArtifactError::Io {
+            path: temporary.clone(),
+            kind: err.kind(),
+            detail: err.to_string(),
+        })?;
+        std::fs::rename(&temporary, path).map_err(|err| ArtifactError::Io {
+            path: path.to_path_buf(),
+            kind: err.kind(),
+            detail: err.to_string(),
+        })
     }
 }
 
@@ -408,7 +448,7 @@ path = "/hello/greet"
     fn seal_computes_the_digest_so_a_packer_cannot_forget_it() {
         let artifact = sealed();
         assert_eq!(
-            artifact.manifest.sha256,
+            artifact.manifest().sha256,
             SandboxArtifact::digest(EMPTY_MODULE)
         );
     }
@@ -504,12 +544,54 @@ path = "/hello/greet"
 
     #[test]
     fn a_manifest_that_does_not_validate_is_refused_on_read() {
-        let mut artifact = sealed();
-        artifact.manifest.prefix = "/".to_owned();
-        // `to_bytes` renders whatever it is handed; `read` is the gate.
-        let bytes = artifact.to_bytes().expect("packs");
+        // A hand-built container, which is the only way this can happen: the
+        // manifest is not a public field, so nothing can widen a prefix on a
+        // sealed artifact after the fact.
+        let manifest = manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE))
+            .replace(r#"prefix = "/hello""#, r#"prefix = "/""#);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SandboxArtifact::MAGIC);
+        bytes.extend_from_slice(&SandboxArtifact::FORMAT_VERSION.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(manifest.as_bytes());
+        bytes.extend_from_slice(EMPTY_MODULE);
         let err = SandboxArtifact::read(&bytes).expect_err("must be caught");
         assert!(matches!(err, ArtifactError::Manifest(_)), "{err}");
+    }
+
+    #[test]
+    fn a_missing_file_is_distinguishable_from_an_unreadable_one() {
+        // "this optional plugin is not installed" is a skip; "this plugin is
+        // installed and unreadable" is a boot failure. A caller cannot tell
+        // those apart from a stringified error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = SandboxArtifact::read_file(&dir.path().join("absent.autumn-plugin"))
+            .expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                ArtifactError::Io {
+                    kind: std::io::ErrorKind::NotFound,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_never_replaces_a_good_artifact_with_a_truncated_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hello.autumn-plugin");
+        sealed().write_file(&path).expect("writes");
+        // A second write lands atomically over the first.
+        sealed().write_file(&path).expect("rewrites");
+        assert!(SandboxArtifact::read_file(&path).is_ok());
+        assert!(
+            !path.with_extension("autumn-plugin-tmp").exists(),
+            "the staging file must not survive a successful write"
+        );
     }
 
     #[test]

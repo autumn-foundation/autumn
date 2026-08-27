@@ -70,6 +70,15 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Upper bound on a manifest's declared response ceiling (64 MiB).
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on the memory a plugin may hold across all in-flight requests
+/// (1 GiB).
+///
+/// `memory_bytes × max_concurrency` is the real host exposure, and bounding the
+/// factors separately does not bound the product: 1 GiB × 1024 is two valid
+/// factors and a terabyte. This is the number a reviewer should look at, so it
+/// is the number the validator checks.
+pub const MAX_FOOTPRINT_BYTES: u128 = 1024 * 1024 * 1024;
+
 /// Upper bound on a manifest's declared concurrency ceiling.
 ///
 /// Each in-flight request holds its own instance, and each instance may hold up
@@ -229,9 +238,14 @@ impl ResourceLimits {
                 return Err(ManifestError::LimitOutOfRange { field, value, max });
             }
         }
-        // `max_request_body_bytes` is exempt from the zero check above only in
-        // spirit — a plugin that accepts no body still needs a non-zero cap for
-        // the empty body itself, so it is validated with the rest.
+        let footprint = (self.memory_bytes as u128).saturating_mul(self.max_concurrency as u128);
+        if footprint > MAX_FOOTPRINT_BYTES {
+            return Err(ManifestError::LimitOutOfRange {
+                field: "memory_bytes × max_concurrency",
+                value: footprint,
+                max: MAX_FOOTPRINT_BYTES,
+            });
+        }
         Ok(())
     }
 }
@@ -288,6 +302,13 @@ pub enum ManifestError {
         path: String,
         /// The prefix it was measured against.
         prefix: String,
+    },
+    /// Two declared routes are one route as far as the router is concerned.
+    ConflictingRoutes {
+        /// The route declared first.
+        first: String,
+        /// The route that collided with it.
+        second: String,
     },
     /// The same `(method, path)` pair is declared twice.
     DuplicateRoute {
@@ -368,6 +389,11 @@ impl fmt::Display for ManifestError {
                 f,
                 "declared route `{method} {path}` is outside the declared prefix `{prefix}`; a \
                  sandboxed plugin may only mount under its own prefix"
+            ),
+            Self::ConflictingRoutes { first, second } => write!(
+                f,
+                "declared routes `{first}` and `{second}` are the same route to the router, so \
+                 mounting both is impossible; give them distinct paths"
             ),
             Self::DuplicateRoute { method, path } => {
                 write!(f, "declared route `{method} {path}` appears twice")
@@ -534,7 +560,15 @@ impl SandboxManifest {
             });
         }
         validate_name(&self.name)?;
-        if self.version.is_empty() || self.version.len() > MAX_NAME_LEN {
+        // `version` is rendered verbatim on the consent screen an operator reads
+        // before agreeing to run the artifact. A free-form field there can
+        // rewrite the lines above it with terminal escapes — hide a route, hide
+        // a capability, forge a verdict — so it gets the same treatment as the
+        // name: printable ASCII, no spaces, bounded.
+        let version_ok = !self.version.is_empty()
+            && self.version.len() <= MAX_NAME_LEN
+            && self.version.chars().all(|ch| ch.is_ascii_graphic());
+        if !version_ok {
             return Err(ManifestError::InvalidVersion(self.version.clone()));
         }
         validate_prefix(&self.prefix)?;
@@ -548,6 +582,12 @@ impl SandboxManifest {
             return Err(ManifestError::NoRoutes);
         }
         let mut seen: Vec<(&str, &str)> = Vec::with_capacity(self.routes.len());
+        // The same engine the mount will use, so "these two are one route" is
+        // decided here rather than discovered by a panic at boot. Two routes
+        // that differ only by method share one template legitimately, so a path
+        // already inserted is skipped instead of self-conflicting.
+        let mut shapes: matchit::Router<()> = matchit::Router::new();
+        let mut inserted: Vec<&str> = Vec::with_capacity(self.routes.len());
         for route in &self.routes {
             if !ALLOWED_METHODS.contains(&route.method.as_str()) {
                 return Err(ManifestError::InvalidMethod(route.method.clone()));
@@ -568,6 +608,18 @@ impl SandboxManifest {
                 });
             }
             seen.push(key);
+
+            if !inserted.contains(&route.path.as_str()) {
+                if let Err(matchit::InsertError::Conflict { with }) =
+                    shapes.insert(route.path.as_str(), ())
+                {
+                    return Err(ManifestError::ConflictingRoutes {
+                        first: with,
+                        second: route.path.clone(),
+                    });
+                }
+                inserted.push(route.path.as_str());
+            }
         }
         self.limits.validate()
     }
@@ -654,6 +706,14 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
 /// A declared route path may carry axum captures (`{id}`, `{*rest}`) — they are
 /// matched by the host's router, never by the guest — but must otherwise be a
 /// well-formed absolute path.
+///
+/// The capture syntax is checked by **inserting the path into a throwaway
+/// `matchit` router**, which is the same engine axum 0.8 routes through, rather
+/// than by a hand-written imitation of its rules. That matters more here than
+/// anywhere else in this module: `axum::Router::route` *panics* on a template it
+/// cannot insert, so a path this function waves through is a manifest that takes
+/// the whole application down at boot. A plugin that can do that has defeated
+/// the sandbox before it runs a single instruction.
 fn validate_route_path(path: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &'static str| {
         Err(ManifestError::InvalidRoutePath {
@@ -680,6 +740,39 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         if segment.chars().any(char::is_whitespace) {
             return refuse("a route path must not contain whitespace");
         }
+        // Not just whitespace: an ESC in a route path is printed verbatim on the
+        // consent screen, where it can rewrite what the operator reads.
+        if segment.chars().any(char::is_control) {
+            return refuse("a route path must not contain control characters");
+        }
+        // axum 0.8 spells captures `{name}` / `{*rest}` and *panics* on a
+        // segment starting with the 0.7 spelling, before matchit ever sees it.
+        // Naming the fix beats reporting matchit's message for a path it never
+        // received.
+        if segment.starts_with(':') {
+            return refuse("axum 0.8 spells a capture `{name}`, not `:name`");
+        }
+        if segment.starts_with('*') {
+            return refuse("axum 0.8 spells a catch-all `{*name}`, not `*name`");
+        }
+    }
+    let mut probe: matchit::Router<()> = matchit::Router::new();
+    if let Err(err) = probe.insert(path, ()) {
+        return Err(ManifestError::InvalidRoutePath {
+            path: path.to_owned(),
+            reason: match err {
+                matchit::InsertError::InvalidParam => {
+                    "a capture must be spelled `{name}` with a non-empty name"
+                }
+                matchit::InsertError::InvalidCatchAll => {
+                    "a catch-all `{*name}` is only allowed as the last segment"
+                }
+                matchit::InsertError::InvalidParamSegment => {
+                    "a path segment may hold one whole capture and nothing else"
+                }
+                _ => "the router cannot mount this path",
+            },
+        });
     }
     Ok(())
 }
@@ -821,6 +914,106 @@ max_concurrency = 8
                 "prefix {bad} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_route_path_the_router_would_refuse_is_refused_here() {
+        // Each of these makes `axum::Router::route` panic. A manifest that
+        // validates and then takes the app down at boot is the worst failure
+        // this lane could have, so the validator has to speak the router's
+        // language rather than a plausible imitation of it.
+        for bad in [
+            "/hello/:id",       // axum 0.7 capture syntax
+            "/hello/*rest",     // axum 0.7 wildcard syntax
+            "/hello/{id",       // unterminated capture
+            "/hello/{}",        // unnamed capture
+            "/hello/{*rest}/x", // catch-all that is not last
+            "/hello/a{b}c",     // two things in one segment
+        ] {
+            let src =
+                valid_toml().replace(r#"path = "/hello/greet""#, &format!(r#"path = "{bad}""#));
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::InvalidRoutePath { .. })
+                ),
+                "route path {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capture_route_is_accepted() {
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/{name}""#);
+        assert!(SandboxManifest::parse(&src).is_ok());
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/{*rest}""#);
+        assert!(SandboxManifest::parse(&src).is_ok());
+    }
+
+    #[test]
+    fn two_routes_that_collide_in_the_router_are_refused() {
+        // Distinct strings, one route as far as the router is concerned.
+        for (first, second) in [("/hello/{a}", "/hello/{b}"), ("/hello/{*a}", "/hello/{b}")] {
+            let src = format!(
+                "{base}\n[[routes]]\nmethod = \"POST\"\npath = \"{second}\"\n",
+                base = valid_toml()
+                    .replace(r#"path = "/hello/greet""#, &format!(r#"path = "{first}""#)),
+            );
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::ConflictingRoutes { .. })
+                ),
+                "{first} and {second} must be refused as a conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_path_under_two_methods_is_not_a_conflict() {
+        let src = format!(
+            "{base}\n[[routes]]\nmethod = \"POST\"\npath = \"/hello/{{name}}\"\n",
+            base = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/{name}""#),
+        );
+        assert!(SandboxManifest::parse(&src).is_ok());
+    }
+
+    #[test]
+    fn a_version_that_could_forge_a_consent_screen_is_refused() {
+        // `version` is the one free-form field on the screen an operator reads
+        // before agreeing to run the artifact.
+        for bad in [
+            "",
+            "0.1.0 \u{1b}[2K",
+            "0.1.0\u{7f}",
+            "has space",
+            &"9".repeat(200),
+        ] {
+            let src =
+                valid_toml().replace(r#"version = "0.1.0""#, &format!(r#"version = "{bad}""#));
+            assert!(
+                SandboxManifest::parse(&src).is_err(),
+                "version {bad:?} must be refused"
+            );
+        }
+        assert!(SandboxManifest::parse(&valid_toml()).is_ok());
+    }
+
+    #[test]
+    fn a_route_path_carrying_a_control_character_is_refused() {
+        // A TOML `\u001B` escape decodes to a real ESC byte in the path — one
+        // that would rewrite the consent screen an operator reads it from.
+        let src = valid_toml().replace(
+            r#"path = "/hello/greet""#,
+            r#"path = "/hello/\u001B[2Kgreet""#,
+        );
+        assert!(
+            matches!(
+                SandboxManifest::parse(&src),
+                Err(ManifestError::InvalidRoutePath { .. })
+            ),
+            "an escape sequence in a route path must be refused"
+        );
     }
 
     #[test]

@@ -105,6 +105,25 @@ const HOST_IO_CHUNK_BYTES: usize = 64 * 1024;
 /// Cap on accumulated guest stderr, in bytes (64 KiB).
 const STDERR_BUDGET_BYTES: usize = 64 * 1024;
 
+/// Largest `iovec` array the shim will walk in one call.
+///
+/// Real WASI callers pass a handful; an array of millions is a guest asking the
+/// host to do a million times the work of one call. Bounding the array bounds
+/// the per-call amplification factor, which the fuel charge below then prices.
+const MAX_IOVECS: i32 = 64;
+
+/// Bytes of host-side copying one unit of fuel buys.
+///
+/// wasmi meters the guest's own instructions, and a host call costs a handful
+/// of units no matter how much the host then copies on the guest's behalf.
+/// Without a charge here, a guest could buy gigabytes of `memcpy` for single
+/// digits of fuel — a spin *inside the host* rather than inside the
+/// interpreter, which the CPU ceiling would never see and no deadline exists to
+/// catch. The rate matches the order of wasmi's own pricing for bulk memory
+/// operations, so byte-work and instruction-work share one budget and the
+/// ceiling means what the manifest says it means.
+const BYTES_PER_FUEL: u64 = 64;
+
 /// Characters of stderr echoed into a failure detail.
 const STDERR_EXCERPT: usize = 512;
 
@@ -166,6 +185,7 @@ impl fmt::Display for DeniedCapability {
 /// sandbox that silently swallows a `path_open` and one that has a bug look
 /// exactly alike from outside.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CapabilityDenial {
     /// Which class of authority was refused.
     pub capability: DeniedCapability,
@@ -209,6 +229,9 @@ pub enum SandboxFailure {
     Exited(i32),
     /// The guest returned without answering.
     NoAnswer,
+    /// The guest wrote what may well be a complete frame but never ended the
+    /// line, so the host never saw one.
+    PartialFrame,
     /// The guest wrote something that is not a frame this version knows.
     MalformedFrame(String),
     /// The guest reported its own failure.
@@ -252,6 +275,11 @@ impl fmt::Display for SandboxFailure {
             Self::Trap(detail) => write!(f, "the plugin trapped: {detail}"),
             Self::Exited(code) => write!(f, "the plugin called proc_exit({code})"),
             Self::NoAnswer => write!(f, "the plugin returned without answering"),
+            Self::PartialFrame => write!(
+                f,
+                "the plugin wrote a partial frame with no terminating newline; a frame is one \
+                 NDJSON line, so it must end with `\\n` (use `println!`, not `print!`)"
+            ),
             Self::MalformedFrame(detail) => {
                 write!(f, "the plugin wrote a malformed frame: {detail}")
             }
@@ -314,6 +342,7 @@ impl std::error::Error for SandboxLoadError {}
 /// Everything one request produced: the answer or the failure, plus the
 /// evidence.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SandboxOutcome {
     /// The plugin's answer, or why there is none.
     pub result: Result<SandboxResponse, SandboxFailure>,
@@ -357,7 +386,7 @@ impl SandboxHost {
     /// Returns [`SandboxLoadError`] if the module does not compile, imports
     /// something the sandbox does not provide, or exports no `_start`.
     pub fn load(artifact: &SandboxArtifact) -> Result<Self, SandboxLoadError> {
-        Self::from_module(artifact.manifest.clone(), artifact.module())
+        Self::from_module(artifact.manifest().clone(), artifact.module())
     }
 
     /// Compile a module against an already-validated manifest.
@@ -402,6 +431,25 @@ impl SandboxHost {
         &self.manifest
     }
 
+    /// Every import a module declares, as `module::name`, without loading it.
+    ///
+    /// The review surface for an artifact the sandbox *refuses*: what it wanted
+    /// is the whole reason it was refused, so a consent screen must be able to
+    /// show it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxLoadError::Wasm`] if the bytes are not a module.
+    pub fn imports_of(wasm: &[u8]) -> Result<Vec<String>, SandboxLoadError> {
+        let engine = Engine::default();
+        let module =
+            Module::new(&engine, wasm).map_err(|err| SandboxLoadError::Wasm(err.to_string()))?;
+        Ok(module
+            .imports()
+            .map(|import| format!("{}::{}", import.module(), import.name()))
+            .collect())
+    }
+
     /// Every import the module declares, as `module::name`, for review.
     #[must_use]
     pub fn imports(&self) -> Vec<String> {
@@ -425,9 +473,8 @@ impl SandboxHost {
         let granted: Vec<SandboxCapability> = self.manifest.capabilities.clone();
         let frame = HostFrame::request(request, &granted);
 
-        let mut state = HostState::new(self.manifest.name.clone(), limits);
-        match to_line(&frame) {
-            Ok(line) => state.stdin.extend(line.as_bytes()),
+        let line = match to_line(&frame) {
+            Ok(line) => line,
             Err(err) => {
                 // The host could not encode its own request. Report it as a
                 // plugin-prefix failure rather than propagating: the rest of
@@ -440,12 +487,16 @@ impl SandboxHost {
                     stderr: String::new(),
                 };
             }
-        }
+        };
+        let mut state = HostState::new(self.manifest.name.clone(), limits, line.as_bytes());
+        state.stdin.extend(line.as_bytes());
 
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limiter);
-        // Set before instantiation: data-segment initialisation burns fuel too,
-        // so a module whose *start-up* is hostile is caught here.
+        // Set before instantiation, so the budget is in place the moment the
+        // first guest instruction runs. wasmi does not meter instantiation
+        // itself, which is why the module's data and element segments are
+        // bounded at load instead — by `MAX_MODULE_BYTES` on the container.
         if let Err(err) = store.set_fuel(limits.fuel) {
             return SandboxOutcome {
                 result: Err(SandboxFailure::Instantiation(err.to_string())),
@@ -483,15 +534,16 @@ impl SandboxHost {
         };
 
         let trap = start.call(&mut store, ()).err();
-        let answered = store.data().answer.is_some();
+        let partial = !store.data().stdout_line.is_empty();
         let result = match (store.data().answer.clone(), trap) {
             // A guest that answered and *then* trapped still answered: the
-            // first frame is the answer, and the trap is noise after the fact.
+            // first frame is the answer, and everything after it — including
+            // the host's own `AnswerComplete` unwind — is noise after the fact.
             (Some(answer), _) => answer,
             (None, Some(err)) => Err(guest_failure(&err, limits)),
+            (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        debug_assert!(answered || result.is_err());
         finish(store, limits, result)
     }
 }
@@ -527,13 +579,24 @@ fn finish(
                     "a sandboxed plugin may not set this response header",
                 );
             }
-            response
-                .validate()
-                .and_then(|()| response.check_size(limits.max_response_bytes))
-                .map_or_else(
-                    |err| Err(SandboxFailure::ResponseRefused(err.to_string())),
-                    |()| Ok(response),
-                )
+            if let Some(essence) = response.refused_content_type() {
+                let detail = format!(
+                    "a sandboxed plugin may not serve `{essence}`: a document or a script from \
+                     the host's own origin would carry the host's authority"
+                );
+                state.deny(DeniedCapability::ResponseHeader, "content-type", &detail);
+                Err(SandboxFailure::ResponseRefused(
+                    super::wire::WireError::UnsupportedContentType(essence).to_string(),
+                ))
+            } else {
+                response
+                    .validate()
+                    .and_then(|()| response.check_size(limits.max_response_bytes))
+                    .map_or_else(
+                        |err| Err(SandboxFailure::ResponseRefused(err.to_string())),
+                        |()| Ok(response),
+                    )
+            }
         }
         Err(failure) => Err(failure),
     };
@@ -595,6 +658,21 @@ fn forbidden_imports(module: &Module) -> Vec<CapabilityDenial> {
 /// causes can be told apart from any other trap.
 #[derive(Debug)]
 struct OutputBudgetExhausted;
+
+/// The guest answered, so there is nothing left for it to do. Carried as a host
+/// error to unwind the interpreter at the frame rather than letting a guest
+/// hold a permit and a blocking worker for its whole budget after the exchange
+/// is over.
+#[derive(Debug)]
+struct AnswerComplete;
+
+impl fmt::Display for AnswerComplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the plugin answered")
+    }
+}
+
+impl wasmi::core::HostError for AnswerComplete {}
 
 impl fmt::Display for OutputBudgetExhausted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -673,18 +751,38 @@ struct HostState {
     answer: Option<Result<SandboxResponse, SandboxFailure>>,
     /// Everything the guest reached for and did not get.
     denials: Vec<CapabilityDenial>,
-    /// Fixed-seed PRNG state, so `random_get` is not ambient entropy.
+    /// Request-seeded PRNG state, so `random_get` is deterministic without
+    /// being a published constant.
     random_state: u64,
     limiter: MemoryLimiter,
     limits: ResourceLimits,
 }
 
 impl HostState {
-    /// Arbitrary but fixed. The property that matters is that two runs of the
-    /// same artifact see the same bytes.
+    /// The starting point the request is mixed into. Arbitrary but fixed.
     const RANDOM_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
-    fn new(plugin: String, limits: ResourceLimits) -> Self {
+    /// Derive this request's PRNG seed from the request itself.
+    ///
+    /// A single fixed seed would make `random_get` a *constant* across every
+    /// request to every deployment of an artifact — anyone holding the same
+    /// bytes could predict every value a guest ever derived from it. Mixing the
+    /// request in keeps the property that actually matters (the same request
+    /// twice produces the same bytes, so an author can reproduce a bug from the
+    /// request alone) without publishing the stream.
+    ///
+    /// This is **not** cryptographic entropy, and the sandbox offers none: a
+    /// guest holds no capability that would make a secret useful to it.
+    fn seed_from(frame: &[u8]) -> u64 {
+        let mut seed = Self::RANDOM_SEED;
+        for byte in frame {
+            seed = seed.rotate_left(7) ^ u64::from(*byte);
+            seed = seed.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        seed
+    }
+
+    fn new(plugin: String, limits: ResourceLimits, frame: &[u8]) -> Self {
         Self {
             plugin,
             stdin: VecDeque::new(),
@@ -692,7 +790,7 @@ impl HostState {
             stderr: Vec::new(),
             answer: None,
             denials: Vec::new(),
-            random_state: Self::RANDOM_SEED,
+            random_state: Self::seed_from(frame),
             limiter: MemoryLimiter {
                 max: limits.memory_bytes,
                 peak: 0,
@@ -782,6 +880,11 @@ impl HostState {
         if let Some(kept) = bytes.get(..bytes.len().min(room)) {
             self.stderr.extend_from_slice(kept);
         }
+    }
+
+    /// Whether every further stderr byte would be discarded.
+    fn stderr_is_full(&self) -> bool {
+        self.stderr.len() >= STDERR_BUDGET_BYTES
     }
 
     fn stderr_excerpt(&self) -> String {
@@ -1054,6 +1157,24 @@ fn is_shim_function(name: &str) -> bool {
     SERVED_IMPORTS.contains(&name) || DENIED_IMPORTS.iter().any(|(known, ..)| *known == name)
 }
 
+/// Charge the guest's fuel budget for `bytes` of host-side work.
+///
+/// Returns the `OutOfFuel` trap when the budget cannot cover it, so a guest
+/// that tries to buy unbounded copying ends exactly as a guest that spins does:
+/// [`SandboxFailure::FuelExhausted`], and a 504 on its own prefix.
+fn charge_bytes(caller: &mut Caller<'_, HostState>, bytes: usize) -> Result<(), wasmi::Error> {
+    let units = u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .checked_div(BYTES_PER_FUEL)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let left = caller.get_fuel()?;
+    let remaining = left
+        .checked_sub(units)
+        .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
+    caller.set_fuel(remaining)
+}
+
 /// Register the guest-visible WASI surface.
 ///
 /// One registration per import, all in one place, because this list **is** the
@@ -1083,26 +1204,39 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                         "fd_read",
                         "a sandboxed plugin has no descriptors beyond the request dialogue",
                     );
-                    return errno::BADF;
+                    return Ok(errno::BADF);
                 }
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
+                if iovs_len > MAX_IOVECS {
+                    return Ok(errno::INVAL);
+                }
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
+                    // Bounds-check BEFORE consuming: `take_stdin` pops the bytes,
+                    // and a write that then fails would have destroyed part of
+                    // the request frame with no way for the guest to recover it.
+                    let in_bounds = pointer
+                        .checked_add(length)
+                        .is_some_and(|end| end <= memory.data_size(&caller));
+                    if !in_bounds {
+                        return Ok(errno::INVAL);
+                    }
+                    charge_bytes(&mut caller, length)?;
                     let chunk = caller.data_mut().take_stdin(length);
                     if memory.write(&mut caller, pointer, &chunk).is_err() {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     let Ok(read) = u32::try_from(chunk.len()) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     let Some(sum) = total.checked_add(read) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     total = sum;
                     if chunk.len() < length {
@@ -1111,12 +1245,12 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                 }
 
                 let Ok(at) = usize::try_from(nread) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 if write_u32(&mut caller, memory, at, total).is_none() {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(engine_error)?;
@@ -1142,6 +1276,9 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                 let Some(memory) = memory_of(&caller) else {
                     return Ok(errno::INVAL);
                 };
+                if iovs_len > MAX_IOVECS {
+                    return Ok(errno::INVAL);
+                }
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
@@ -1170,7 +1307,14 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                     // mirror it in one allocation.
                     let mut offset = 0usize;
                     while offset < length {
+                        // Stderr past its budget is discarded, so copying it is
+                        // pure host work with no output. Stop rather than
+                        // faithfully copying bytes into the bin.
+                        if fd == 2 && caller.data().stderr_is_full() {
+                            break;
+                        }
                         let take = HOST_IO_CHUNK_BYTES.min(length.saturating_sub(offset));
+                        charge_bytes(&mut caller, take)?;
                         let mut scratch = vec![0u8; take];
                         let at = pointer.saturating_add(offset);
                         if memory.read(&caller, at, &mut scratch).is_err() {
@@ -1182,6 +1326,13 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                                 // errno the guest can ignore and retry: trap so
                                 // the request ends here.
                                 return Err(wasmi::Error::host(OutputBudgetExhausted));
+                            }
+                            if caller.data().answer.is_some() {
+                                // The exchange is over. A guest that keeps
+                                // running would hold a permit and a blocking
+                                // worker for its whole budget and then serve the
+                                // answer it already had.
+                                return Err(wasmi::Error::host(AnswerComplete));
                             }
                         } else {
                             caller.data_mut().write_stderr(&scratch);
@@ -1309,22 +1460,23 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         .func_wrap(
             WASI,
             "random_get",
-            |mut caller: Caller<'_, HostState>, buf: i32, len: i32| {
+            |mut caller: Caller<'_, HostState>, buf: i32, len: i32| -> Result<i32, wasmi::Error> {
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 let (Ok(at), Ok(len)) = (usize::try_from(buf), usize::try_from(len)) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 let in_bounds = at
                     .checked_add(len)
                     .is_some_and(|end| end <= memory.data_size(&caller));
                 if !in_bounds {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
                 let mut written = 0usize;
                 while written < len {
                     let take = HOST_IO_CHUNK_BYTES.min(len.saturating_sub(written));
+                    charge_bytes(&mut caller, take)?;
                     let mut scratch = vec![0u8; take];
                     for slot in &mut scratch {
                         *slot = caller.data_mut().next_random_byte();
@@ -1333,11 +1485,11 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                         .write(&mut caller, at.saturating_add(written), &scratch)
                         .is_err()
                     {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     written = written.saturating_add(take);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(engine_error)?;
@@ -1657,6 +1809,158 @@ path = "/hello/greet"
     }
 
     // ── fault isolation ──────────────────────────────────────────────
+
+    #[test]
+    fn host_side_copying_is_charged_against_the_guest_s_fuel() {
+        // wasmi meters the guest's instructions, not what the host does on its
+        // behalf. Without a charge, a guest buys gigabytes of memcpy for single
+        // digits of fuel — a spin inside the host that the CPU ceiling never
+        // sees. This guest asks the host to copy 1 MiB in ~50 instructions.
+        const COPIED: u64 = 1024 * 1024;
+        let bulk = host(guests::STDOUT_BULK).run(&get("/hello/greet"));
+        assert!(
+            bulk.fuel_used >= COPIED / 64,
+            "1 MiB of host-side copying cost only {} fuel units",
+            bulk.fuel_used
+        );
+        // …and the loop itself is nothing, so the charge is the copy.
+        let honest = host(guests::HELLO).run(&get("/hello/greet"));
+        assert!(
+            honest.fuel_used < COPIED / 64,
+            "the baseline is not a baseline: {} units",
+            honest.fuel_used
+        );
+    }
+
+    #[test]
+    fn a_guest_that_floods_stderr_runs_out_of_fuel_rather_than_time() {
+        let limits = ResourceLimits {
+            fuel: 2_000_000,
+            ..ResourceLimits::default()
+        };
+        let outcome = try_host_with(guests::STDERR_FLOOD, limits)
+            .expect("loads")
+            .run(&get("/hello/greet"));
+        let failure = outcome.result.expect_err("must not answer");
+        assert!(
+            matches!(failure, SandboxFailure::FuelExhausted { .. }),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn a_guest_that_answers_and_then_spins_does_not_hold_its_whole_budget() {
+        // The exchange is over at the frame. A guest that keeps running would
+        // otherwise hold a permit and a blocking worker for its whole budget
+        // and then serve the answer it already had.
+        let limits = ResourceLimits {
+            fuel: 500_000_000,
+            ..ResourceLimits::default()
+        };
+        let outcome = try_host_with(guests::ANSWER_THEN_SPIN, limits)
+            .expect("loads")
+            .run(&get("/hello/greet"));
+        assert_eq!(outcome.result.expect("answers").status, 200);
+        assert!(
+            outcome.fuel_used < 1_000_000,
+            "the answer cost {} fuel; the guest was allowed to keep spinning",
+            outcome.fuel_used
+        );
+    }
+
+    #[test]
+    fn a_frame_without_its_newline_says_what_the_author_did() {
+        let outcome = host(guests::PARTIAL_FRAME).run(&get("/hello/greet"));
+        let failure = outcome.result.expect_err("must not answer");
+        assert!(matches!(failure, SandboxFailure::PartialFrame), "{failure}");
+        assert!(failure.to_string().contains("println!"), "{failure}");
+    }
+
+    #[test]
+    fn a_guest_may_not_forge_the_host_s_own_response_headers() {
+        let outcome = host(guests::FORGE_ATTRIBUTION).run(&get("/hello/greet"));
+        let denied = denied(&outcome, DeniedCapability::ResponseHeader);
+        assert!(
+            denied.contains(&"x-autumn-sandboxed".to_owned()),
+            "{denied:?}"
+        );
+        assert!(
+            denied.contains(&"x-content-type-options".to_owned()),
+            "{denied:?}"
+        );
+        let response = outcome.result.expect("answers");
+        assert!(
+            response
+                .headers
+                .iter()
+                .all(|(name, _)| name.starts_with("content-"))
+        );
+    }
+
+    #[test]
+    fn a_document_content_type_is_refused_rather_than_served_from_the_host_s_origin() {
+        for essence in [
+            "text/html",
+            "application/javascript",
+            "image/svg+xml",
+            "text/css",
+        ] {
+            let response = SandboxResponse {
+                status: 200,
+                headers: vec![("content-type".to_owned(), essence.to_owned())],
+                body: b"<script>".to_vec(),
+            };
+            assert_eq!(
+                response.refused_content_type().as_deref(),
+                Some(essence),
+                "{essence} must be refused"
+            );
+        }
+        for essence in ["text/plain; charset=utf-8", "application/json", "image/png"] {
+            let response = SandboxResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_owned(), essence.to_owned())],
+                body: vec![],
+            };
+            assert_eq!(
+                response.refused_content_type(),
+                None,
+                "{essence} must be served"
+            );
+        }
+    }
+
+    #[test]
+    fn entropy_is_deterministic_per_request_without_being_a_published_constant() {
+        // The guest folds an entropy byte into its status, so this only holds
+        // if the host's stream is a function of the request.
+        let host = host(guests::ENTROPY);
+        let first = host.run(&get("/hello/greet")).result.expect("answers");
+        let again = host.run(&get("/hello/greet")).result.expect("answers");
+        assert_eq!(first.status, again.status, "the same request must replay");
+
+        let other = host.run(&get("/hello/other")).result.expect("answers");
+        assert!(
+            (200..=207).contains(&other.status),
+            "unexpected status {}",
+            other.status
+        );
+        // Not asserted equal *or* unequal: one byte mod 8 collides one time in
+        // eight. What matters is that the seed is not a global constant, which
+        // the seed function's own test below pins.
+    }
+
+    #[test]
+    fn the_entropy_seed_is_a_function_of_the_request() {
+        assert_ne!(
+            HostState::seed_from(b"one request"),
+            HostState::seed_from(b"another request")
+        );
+        assert_eq!(
+            HostState::seed_from(b"one request"),
+            HostState::seed_from(b"one request")
+        );
+    }
 
     #[test]
     fn a_trap_is_an_error_value_not_a_dead_process() {

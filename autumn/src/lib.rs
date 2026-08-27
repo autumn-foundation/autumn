@@ -192,6 +192,14 @@ pub mod metrics;
 pub mod migrate;
 pub(crate) mod pg_conn_str;
 pub mod plugin;
+/// The refusal [`AppBuilder::plugin_route_infos`](app::AppBuilder::plugin_route_infos)
+/// and [`route_listing::collect_route_infos`] return.
+///
+/// Re-exported from the crate-private `router` module because both of those
+/// are public functions that hand it back: without this, a caller could not
+/// name the type, match its variants, or write the signature of a function
+/// that forwards it.
+pub use router::RouterBuildError;
 pub mod plugin_conformance;
 #[cfg(feature = "plugin-sandbox")]
 pub mod plugin_sandbox;

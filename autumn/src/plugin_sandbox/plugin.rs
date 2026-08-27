@@ -179,13 +179,31 @@ impl SandboxedPlugin {
         self.host.manifest()
     }
 
+    /// This plugin, mounted at the prefix its own manifest declares.
+    ///
+    /// The public door, for a test or an embedder that wants the routes without
+    /// an [`AppBuilder`]. It nests at `self.manifest().prefix` and nowhere else:
+    /// a caller that could choose the prefix could mount a plugin over a
+    /// namespace its manifest never named, and the prefix would stop being a
+    /// containment boundary.
+    ///
+    /// Generic over the router's state because the handlers use none — a
+    /// sandboxed plugin has no access to application state, which is the point.
+    ///
+    /// Prefer installing it as a [`Plugin`], which also logs the capability
+    /// grant and declares the routes for `autumn routes` and
+    /// `autumn plugin-check`.
+    #[must_use]
+    pub fn mounted_router<S>(&self) -> axum::Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        axum::Router::new().nest(&self.manifest().prefix.clone(), self.router())
+    }
+
     /// The router for this plugin's declared routes, with paths **relative to
     /// the declared prefix** — the shape [`AppBuilder::nest`] expects.
-    ///
-    /// Generic over the router's state because the handlers use none: a
-    /// sandboxed plugin has no access to application state, which is the whole
-    /// point.
-    pub fn router<S>(&self) -> axum::Router<S>
+    fn router<S>(&self) -> axum::Router<S>
     where
         S: Clone + Send + Sync + 'static,
     {
@@ -302,12 +320,11 @@ async fn serve(
             max_concurrency = limits.max_concurrency,
             "sandboxed plugin is at its concurrency ceiling; shedding the request"
         );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(http::header::RETRY_AFTER, "1")],
-            "the sandboxed plugin is at its concurrency ceiling\n",
-        )
-            .into_response();
+        let mut response = sandbox_error(&plugin, StatusCode::SERVICE_UNAVAILABLE);
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
     };
 
     let path_params: Vec<(String, String)> = params
@@ -345,11 +362,7 @@ async fn serve(
             max_request_body_bytes = limits.max_request_body_bytes,
             "request body over the sandboxed plugin's declared ceiling; refusing it"
         );
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "the request body is over this sandboxed plugin's declared ceiling\n",
-        )
-            .into_response();
+        return sandbox_error(&plugin, StatusCode::PAYLOAD_TOO_LARGE);
     };
     let body = body.to_vec();
 
@@ -367,8 +380,17 @@ async fn serve(
     // would block a worker for the whole fuel budget. `spawn_blocking` also
     // means a panic anywhere in the host shim surfaces as a `JoinError` here
     // instead of unwinding through the request task.
-    let outcome = tokio::task::spawn_blocking(move || host.run(&sandbox_request)).await;
-    drop(permit);
+    // The permit moves INTO the closure. A `spawn_blocking` task is never
+    // cancelled — dropping its handle detaches it — so a permit held by this
+    // future would be released the instant a client disconnects while the
+    // interpreter kept running. `max_concurrency` would then bound nothing: a
+    // client that connects and immediately resets, in a loop, would fill the
+    // shared blocking pool with interpreters nobody is waiting for.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        host.run(&sandbox_request)
+    })
+    .await;
 
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -425,21 +447,34 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
         // that can return a script.
         out = out.header(http::header::CONTENT_TYPE, "application/octet-stream");
     }
-    out = out.header(http::header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-
-    match attribution(plugin) {
-        Some(value) => out = out.header(SANDBOX_ATTRIBUTION_HEADER, value),
-        None => return sandbox_error(plugin, StatusCode::BAD_GATEWAY),
-    }
-
-    out.body(Body::from(response.body.clone())).map_or_else(
-        |_| sandbox_error(plugin, StatusCode::BAD_GATEWAY),
-        axum::response::IntoResponse::into_response,
-    )
+    let Ok(mut built) = out.body(Body::from(response.body.clone())) else {
+        return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
+    };
+    stamp_host_headers(&mut built, plugin);
+    built
 }
 
 fn attribution(plugin: &str) -> Option<HeaderValue> {
     HeaderValue::try_from(plugin).ok()
+}
+
+/// Stamp the headers the host owns, replacing anything of the same name.
+///
+/// `Response::builder().header(..)` *appends*, and `HeaderMap::get` returns the
+/// first value — so a guest that emitted `x-autumn-sandboxed` or
+/// `x-content-type-options` of its own would win the lookup against the host's.
+/// The response header allowlist already refuses both names; this is the second
+/// lock on the same door, and it is what makes "every response on this prefix
+/// is attributable" true of the 413 and 503 the guest never ran for.
+fn stamp_host_headers(response: &mut Response, plugin: &str) {
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(value) = attribution(plugin) {
+        headers.insert(HeaderName::from_static(SANDBOX_ATTRIBUTION_HEADER), value);
+    }
 }
 
 /// The error a sandboxed plugin's own prefix serves. Never leaks a guest's
@@ -451,11 +486,7 @@ fn sandbox_error(plugin: &str, status: StatusCode) -> Response {
         "the sandboxed plugin could not serve this request\n",
     )
         .into_response();
-    if let Some(value) = attribution(plugin) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(SANDBOX_ATTRIBUTION_HEADER), value);
-    }
+    stamp_host_headers(&mut response, plugin);
     response
 }
 
@@ -508,7 +539,7 @@ sha256 = "{digest}"
     fn app(plugin: &SandboxedPlugin) -> axum::Router {
         axum::Router::new()
             .route("/healthz", axum::routing::get(|| async { "ok" }))
-            .nest(&plugin.manifest().prefix.clone(), plugin.router())
+            .merge(plugin.mounted_router())
     }
 
     async fn send(app: axum::Router, method: &str, path: &str) -> (StatusCode, String) {

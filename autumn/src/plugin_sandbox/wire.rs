@@ -25,12 +25,14 @@
 //! cookie or bearer token reaching a plugin could only ever be a liability —
 //! and a plugin that echoed request headers would otherwise leak one.
 //!
-//! [`DENIED_RESPONSE_HEADERS`] are stripped from whatever the guest answers.
-//! `Set-Cookie` is the load-bearing one: a plugin that could set a cookie could
-//! forge a session in the host application's own origin, which is precisely the
-//! authority the sandbox exists to withhold. The rest are framing headers
-//! (`Content-Length`, `Transfer-Encoding`, hop-by-hop) that belong to the host's
-//! HTTP stack, not to a guest.
+//! On the way back, only [`ALLOWED_RESPONSE_HEADERS`] survive, and only the
+//! content types in [`ALLOWED_RESPONSE_CONTENT_TYPES`] are served at all. Both
+//! are allowlists for the same reason: the sandbox's whole job is to withhold
+//! the host application's origin, and a response is served *from* that origin.
+//! A `Set-Cookie` forges a session in it, a `Strict-Transport-Security`
+//! rewrites its TLS posture, and an `application/javascript` body executes in
+//! it. A deny-list would have to name each of those and the next one nobody has
+//! standardised yet.
 //!
 //! Header names and values are validated before they reach a response: a value
 //! carrying `\r\n` would otherwise let a guest inject headers of its own into
@@ -67,25 +69,98 @@ pub const SENSITIVE_REQUEST_HEADERS: &[&str] = &[
     "proxy-authorization",
     "www-authenticate",
     "proxy-authenticate",
+    // Not credentials in the RFC sense, but every one of them is a bearer
+    // token in practice. `x-csrf-token` is the load-bearing one: Autumn's own
+    // htmx integration attaches it to every same-origin request, so without
+    // this line a plugin route reached from an app page would be handed the
+    // caller's CSRF token — the exact thing that makes a forged same-origin
+    // POST possible.
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-api-key",
+    "x-auth-token",
+    "api-key",
 ];
 
-/// Response headers a sandboxed plugin may not set.
-pub const DENIED_RESPONSE_HEADERS: &[&str] = &[
-    // Authority the sandbox exists to withhold.
-    "set-cookie",
-    "set-cookie2",
-    // Framing and transport: the host's HTTP stack owns these.
-    "content-length",
-    "content-encoding",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "upgrade",
-    "te",
-    "trailer",
-    "proxy-authenticate",
-    "www-authenticate",
+/// Response headers a sandboxed plugin may set.
+///
+/// An **allowlist**, not a deny-list. A deny-list is a blocklist against a
+/// header registry that keeps growing: `Set-Cookie` forges a session,
+/// `Strict-Transport-Security` rewrites the whole origin's TLS posture,
+/// `Clear-Site-Data` destroys every user's session, and the next one has not
+/// been standardised yet. A plugin's legitimate response headers are few and
+/// predictable, so the boundary that does not rot is the one that names them.
+///
+/// Anything outside this list — including the host's own
+/// `x-autumn-sandboxed` and `x-content-type-options`, which a guest must not be
+/// able to forge — is stripped and recorded as a denial. `x-`-prefixed headers
+/// are allowed as a general escape hatch for a plugin's own metadata, except
+/// the host-owned names in [`RESERVED_RESPONSE_HEADERS`].
+pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "accept-ranges",
+    "age",
+    "cache-control",
+    "content-disposition",
+    "content-language",
+    "content-range",
+    "content-type",
+    "etag",
+    "expires",
+    "last-modified",
+    "location",
+    "retry-after",
+    "vary",
 ];
+
+/// `x-`-prefixed response headers a plugin may **not** set, because the host
+/// sets them and their meaning depends on who did.
+pub const RESERVED_RESPONSE_HEADERS: &[&str] = &[
+    "x-autumn-sandboxed",
+    "x-content-type-options",
+    "x-frame-options",
+    "x-xss-protection",
+    "x-permitted-cross-domain-policies",
+    "x-dns-prefetch-control",
+];
+
+/// Content types a sandboxed plugin's response may declare.
+///
+/// The sandbox withholds the host application's origin. A response served from
+/// the host's own origin gives it back, so the type matters as much as the
+/// bytes: `application/javascript` under `script-src 'self'` is script
+/// execution in the host's origin, and `text/html` is a document in it. Neither
+/// is a capability this slice grants, and neither can be made safe by a header
+/// the application's own security middleware is entitled to overwrite.
+///
+/// So the first slice serves data, not documents. Every entry here is a type a
+/// browser will neither execute nor render as a same-origin document —
+/// `image/svg+xml` is absent for exactly that reason, and so are HTML, CSS,
+/// JavaScript, XML and PDF. Widening this list is a later slice's job, and the
+/// honest way to do it is to serve a plugin's documents from an origin of their
+/// own.
+///
+/// Matching is on the type/subtype only; parameters (`; charset=utf-8`) are
+/// ignored.
+pub const ALLOWED_RESPONSE_CONTENT_TYPES: &[&str] = &[
+    "text/plain",
+    "text/csv",
+    "application/json",
+    "application/octet-stream",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+];
+
+/// Whether a plugin may set a response header of this (lower-cased) name.
+#[must_use]
+pub fn response_header_allowed(name: &str) -> bool {
+    if RESERVED_RESPONSE_HEADERS.contains(&name) {
+        return false;
+    }
+    ALLOWED_RESPONSE_HEADERS.contains(&name) || name.starts_with("x-")
+}
 
 /// Something that could not be parsed out of, or encoded onto, the wire.
 #[derive(Debug)]
@@ -102,6 +177,8 @@ pub enum WireError {
         /// Why it was refused.
         reason: &'static str,
     },
+    /// The response declared a content type this slice does not serve.
+    UnsupportedContentType(String),
     /// The response frame was larger than the plugin's declared ceiling.
     ResponseTooLarge {
         /// The response's size in bytes.
@@ -127,6 +204,13 @@ impl fmt::Display for WireError {
                     "the plugin answered with an invalid header {name:?}: {reason}"
                 )
             }
+            Self::UnsupportedContentType(essence) => write!(
+                f,
+                "the plugin answered with content type `{essence}`, which a sandboxed plugin may \
+                 not serve: a document or a script from the host's own origin would carry the \
+                 host's authority. Allowed: {allowed}",
+                allowed = ALLOWED_RESPONSE_CONTENT_TYPES.join(", ")
+            ),
             Self::ResponseTooLarge { found, max } => write!(
                 f,
                 "the plugin answered with {found} bytes, over its declared {max}-byte ceiling"
@@ -155,7 +239,7 @@ impl From<serde_json::Error> for WireError {
 /// # Errors
 ///
 /// Returns [`WireError::Json`] if the frame cannot be serialized.
-pub fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
+pub(crate) fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
     let mut line = serde_json::to_string(frame)?;
     line.push('\n');
     Ok(line)
@@ -168,7 +252,7 @@ pub fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
 /// Returns [`WireError::Json`] if the line is not a well-formed frame of the
 /// expected shape — including an `op` this version does not know, which is
 /// refused rather than ignored.
-pub fn from_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, WireError> {
+pub(crate) fn from_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, WireError> {
     Ok(serde_json::from_str(line)?)
 }
 
@@ -209,6 +293,7 @@ pub struct SandboxRequest {
 
 /// One HTTP response, as a plugin hands it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxResponse {
     /// HTTP status code.
     pub status: u16,
@@ -231,11 +316,11 @@ impl SandboxResponse {
         let mut denied = Vec::new();
         self.headers.retain(|(name, _)| {
             let lower = name.to_ascii_lowercase();
-            if DENIED_RESPONSE_HEADERS.contains(&lower.as_str()) {
+            if response_header_allowed(&lower) {
+                true
+            } else {
                 denied.push(lower);
                 false
-            } else {
-                true
             }
         });
         (self, denied)
@@ -250,7 +335,7 @@ impl SandboxResponse {
     /// a legal HTTP token, or carries a control character — a value containing
     /// `\r\n` would otherwise be response splitting.
     pub fn validate(&self) -> Result<(), WireError> {
-        if !(100..=599).contains(&self.status) {
+        if !(200..=599).contains(&self.status) {
             return Err(WireError::InvalidStatus(self.status));
         }
         for (name, value) in &self.headers {
@@ -269,6 +354,29 @@ impl SandboxResponse {
             }
         }
         Ok(())
+    }
+
+    /// The response's declared content type, if it is one this slice refuses.
+    ///
+    /// Returns the offending type so the caller can record a denial naming it.
+    #[must_use]
+    pub fn refused_content_type(&self) -> Option<String> {
+        let declared = self
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())?;
+        let essence = declared
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&essence.as_str()) {
+            None
+        } else {
+            Some(essence)
+        }
     }
 
     /// Refuse a response larger than the plugin's declared ceiling.
@@ -292,10 +400,16 @@ impl SandboxResponse {
 }
 
 /// A frame the host sends to the guest.
+///
+/// Crate-private: the framing is an implementation detail of
+/// [`SandboxHost::run`](super::host::SandboxHost::run) on the host side, and on
+/// the guest side it is a *protocol*, documented in this module and in
+/// `docs/guide/sandboxed-plugins.md`, that a guest implements from the prose —
+/// a `wasm32-wasip1` guest cannot link `autumn-web` at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
-pub enum HostFrame {
+pub(crate) enum HostFrame {
     /// One HTTP request to serve.
     Request {
         /// The protocol version this frame speaks.
@@ -345,7 +459,7 @@ impl HostFrame {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
-pub enum GuestFrame {
+pub(crate) enum GuestFrame {
     /// The plugin's answer.
     Response(SandboxResponse),
     /// The plugin reporting that it could not answer. The host turns this into
@@ -363,7 +477,7 @@ pub enum GuestFrame {
 /// what lets an author diff two runs of the same request and see only what
 /// changed.
 #[must_use]
-pub fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
@@ -481,6 +595,16 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_field_on_a_response_frame_is_refused() {
+        // The response is the one frame a guest controls, so it is the one that
+        // most needs to refuse what it does not understand: a v2 guest sending
+        // a field this version drops would be answered as if it had not.
+        let line = r#"{"op":"response","status":200,"headers":[],"body_b64":"","stream":true}"#;
+        let err = from_line::<GuestFrame>(line).expect_err("an unknown field must be refused");
+        assert!(err.to_string().contains("stream"), "{err}");
+    }
+
+    #[test]
     fn malformed_json_is_refused() {
         assert!(from_line::<GuestFrame>("not json").is_err());
         assert!(from_line::<GuestFrame>("").is_err());
@@ -494,7 +618,9 @@ mod tests {
 
     #[test]
     fn a_status_outside_http_range_is_refused() {
-        for status in [0u16, 99, 600, 1000] {
+        // 1xx is refused too: an informational response is the HTTP stack's to
+        // send, and hyper treats one coming back from a service as an error.
+        for status in [0u16, 99, 100, 101, 199, 600, 1000] {
             let response = SandboxResponse {
                 status,
                 headers: vec![],
@@ -505,7 +631,7 @@ mod tests {
                 "status {status} must be refused"
             );
         }
-        for status in [100u16, 200, 404, 500, 599] {
+        for status in [200u16, 204, 404, 500, 599] {
             let response = SandboxResponse {
                 status,
                 headers: vec![],

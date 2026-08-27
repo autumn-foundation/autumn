@@ -133,10 +133,15 @@ impl Report {
     /// Build the verdict for a verified artifact.
     #[must_use]
     pub fn of(artifact: &SandboxArtifact) -> Self {
-        let manifest = &artifact.manifest;
-        let (loads, load_error, imports) = match SandboxHost::load(artifact) {
-            Ok(host) => (true, None, host.imports()),
-            Err(err) => (false, Some(err.to_string()), Vec::new()),
+        let manifest = artifact.manifest();
+        // The import list is a property of the module, not of whether the
+        // sandbox will run it — and it is *most* interesting when the sandbox
+        // will not. Reporting "(none)" for a module that was refused for what
+        // it imports would make the consent screen contradict itself.
+        let imports = SandboxHost::imports_of(artifact.module()).unwrap_or_default();
+        let (loads, load_error) = match SandboxHost::load(artifact) {
+            Ok(_) => (true, None),
+            Err(err) => (false, Some(err.to_string())),
         };
         Self {
             name: manifest.name.clone(),
@@ -180,15 +185,20 @@ impl Report {
             out.push_str("    (none)\n");
         }
         for import in &self.imports {
+            // Import names are arbitrary UTF-8 lifted straight out of a module
+            // an operator has explicitly not audited. A terminal escape here
+            // could rewrite the lines above it — the routes, the grant, the
+            // verdict — which is an attack on the decision this screen exists
+            // to inform.
             out.push_str("    ");
-            out.push_str(import);
+            out.push_str(&import.escape_debug().to_string());
             out.push('\n');
         }
         out.push('\n');
         match &self.load_error {
             Some(error) => {
                 out.push_str("\u{2717} this artifact does not load in this build's sandbox:\n  ");
-                out.push_str(error);
+                out.push_str(&error.escape_debug().to_string());
                 out.push('\n');
             }
             None => out.push_str("\u{2713} loads into this build's sandbox\n"),
@@ -266,7 +276,7 @@ pub fn run_package(opts: &PackageOptions<'_>) {
     eprintln!("\u{1F342} autumn plugin package\n");
     match package(opts) {
         Ok(artifact) => {
-            print!("{}", artifact.manifest.consent_summary());
+            print!("{}", artifact.manifest().consent_summary());
             println!("\nWrote {}", opts.out.display());
         }
         Err(err) => {
@@ -376,8 +386,8 @@ path = "/hello/greet"
         let fixture = good_fixture();
         let artifact = pack(&fixture);
         let module = std::fs::read(&fixture.module).expect("reads");
-        assert_eq!(artifact.manifest.sha256, SandboxArtifact::digest(&module));
-        assert_ne!(artifact.manifest.sha256, "0".repeat(64));
+        assert_eq!(artifact.manifest().sha256, SandboxArtifact::digest(&module));
+        assert_ne!(artifact.manifest().sha256, "0".repeat(64));
     }
 
     #[test]
@@ -386,7 +396,7 @@ path = "/hello/greet"
         pack(&fixture);
         let bytes = std::fs::read(&fixture.out).expect("reads");
         let artifact = SandboxArtifact::read(&bytes).expect("reads back");
-        assert_eq!(artifact.manifest.name, "autumn-plugin-hello");
+        assert_eq!(artifact.manifest().name, "autumn-plugin-hello");
     }
 
     #[test]
@@ -448,7 +458,7 @@ path = "/hello/greet"
             "/hello",
             "http-request",
             "GET /hello/greet",
-            &artifact.manifest.sha256,
+            &artifact.manifest().sha256,
             "filesystem",
             "wasi_snapshot_preview1::fd_write",
         ] {
@@ -476,7 +486,7 @@ path = "/hello/greet"
         let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
         assert_eq!(value["name"], "autumn-plugin-hello");
         assert_eq!(value["prefix"], "/hello");
-        assert_eq!(value["sha256"], artifact.manifest.sha256.as_str());
+        assert_eq!(value["sha256"], artifact.manifest().sha256.as_str());
         assert_eq!(value["capabilities"][0], "http-request");
         assert_eq!(value["routes"][0]["path"], "/hello/greet");
         assert_eq!(value["loads"], true);

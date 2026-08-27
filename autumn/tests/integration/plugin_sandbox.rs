@@ -65,7 +65,7 @@ fn plugin(wat: &str, limits: ResourceLimits) -> SandboxedPlugin {
 fn app(plugin: &SandboxedPlugin) -> axum::Router {
     axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .nest(PREFIX, plugin.router())
+        .merge(plugin.mounted_router())
 }
 
 async fn get(app: axum::Router, path: &str) -> (StatusCode, String) {
@@ -122,13 +122,13 @@ async fn an_artifact_modified_after_review_is_refused_at_install() {
 #[test]
 fn the_capability_grant_is_reviewable_before_the_plugin_serves() {
     let artifact = pack(guests::HELLO, ResourceLimits::default());
-    let summary = artifact.manifest.consent_summary();
+    let summary = artifact.manifest().consent_summary();
     for expected in [
         PLUGIN_NAME,
         PREFIX,
         "http-request",
         "GET /hello/greet",
-        &artifact.manifest.sha256,
+        &artifact.manifest().sha256,
         "filesystem",
         "network",
         "environment",
@@ -156,6 +156,9 @@ fn a_sandboxed_plugin_passes_the_existing_conformance_checks() {
 enum Containment {
     /// Refused before the artifact ever runs.
     RefusedAtLoad,
+    /// Ran, misbehaved, and still answered — the misbehaviour cost it nothing
+    /// and gained it nothing.
+    Served,
     /// Ran, was denied the authority it reached for, and still answered.
     DeniedAndServed(DeniedCapability),
     /// Ran and was stopped without an answer; the prefix serves a 5xx.
@@ -267,6 +270,26 @@ const CORPUS: &[(&str, &str, Containment)] = &[
         guests::UNKNOWN_OP,
         Containment::StoppedWithFivehundred,
     ),
+    (
+        "forge the host's own attribution and sniffing headers",
+        guests::FORGE_ATTRIBUTION,
+        Containment::DeniedAndServed(DeniedCapability::ResponseHeader),
+    ),
+    (
+        "flood stderr, which the host copies and discards",
+        guests::STDERR_FLOOD,
+        Containment::StoppedWithFivehundred,
+    ),
+    (
+        "buy host-side copying that fuel does not price",
+        guests::STDOUT_BULK,
+        Containment::StoppedWithFivehundred,
+    ),
+    (
+        "answer and then keep spinning",
+        guests::ANSWER_THEN_SPIN,
+        Containment::Served,
+    ),
 ];
 
 /// Limits tight enough that a runaway guest is stopped in milliseconds, so the
@@ -291,15 +314,12 @@ async fn the_adversarial_corpus_is_contained_in_full() {
         let artifact = pack(wat, adversarial_limits());
         let loaded = SandboxedPlugin::from_artifact(&artifact);
 
-        match expected {
-            Containment::RefusedAtLoad => {
-                let err = loaded
-                    .err()
-                    .unwrap_or_else(|| panic!("{what}: must be refused at load"));
-                assert!(matches!(err, SandboxPluginError::Load(_)), "{what}: {err}");
-                continue;
-            }
-            _ => {}
+        if matches!(expected, Containment::RefusedAtLoad) {
+            let err = loaded
+                .err()
+                .unwrap_or_else(|| panic!("{what}: must be refused at load"));
+            assert!(matches!(err, SandboxPluginError::Load(_)), "{what}: {err}");
+            continue;
         }
 
         let plugin = loaded.unwrap_or_else(|err| panic!("{what}: should load — {err}"));
@@ -323,13 +343,17 @@ async fn the_adversarial_corpus_is_contained_in_full() {
                     outcome.denials
                 );
             }
+            Containment::Served => {
+                assert_eq!(status, StatusCode::OK, "{what}: the answer stands");
+            }
             Containment::StoppedWithFivehundred => {
                 assert!(
                     status.is_server_error(),
                     "{what}: expected 5xx, got {status}"
                 );
             }
-            Containment::RefusedAtLoad => unreachable!(),
+            // Handled above, before the plugin was ever built.
+            Containment::RefusedAtLoad => {}
         }
 
         // Whatever it did, the rest of the application is untouched — which is
@@ -352,7 +376,7 @@ fn sandbox_request() -> autumn_web::plugin_sandbox::SandboxRequest {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_runaway_plugin_does_not_stop_a_concurrent_request_to_another_route() {
     // The interpreter is synchronous; if it ran on the async runtime a single
     // spinning guest would stall every other in-flight request on that worker.
@@ -367,12 +391,55 @@ async fn a_runaway_plugin_does_not_stop_a_concurrent_request_to_another_route() 
         let plugin = Arc::clone(&plugin);
         async move { get(app(&plugin), "/hello/greet").await }
     });
-    let (status, body) = get(app(&plugin), "/healthz").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "ok");
+    // The spinning request is still burning its budget on a blocking worker.
+    // If the interpreter ran on the async runtime, this would not return until
+    // it finished — so the deadline is the assertion, not decoration.
+    let healthz = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        get(app(&plugin), "/healthz"),
+    )
+    .await
+    .expect("the app must keep serving while a plugin spins");
+    assert_eq!(healthz.0, StatusCode::OK);
+    assert_eq!(healthz.1, "ok");
 
     let (status, _) = spinning.await.expect("the spinning request completes");
     assert!(status.is_server_error(), "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoning_a_request_does_not_free_the_permit_the_interpreter_holds() {
+    // `spawn_blocking` never cancels: dropping the handle detaches the task.
+    // A permit held by the (cancellable) request future would therefore be
+    // released the instant a client disconnects, while the interpreter kept
+    // running — and `max_concurrency` would bound nothing.
+    let plugin = plugin(
+        guests::CPU_SPIN,
+        ResourceLimits {
+            // Long enough that the guest is provably still running 300 ms
+            // later in a debug build, short enough that the runtime's wait for
+            // the detached worker at test end stays in single-digit seconds.
+            fuel: 300_000_000,
+            max_concurrency: 1,
+            ..adversarial_limits()
+        },
+    );
+    let abandoned = tokio::spawn({
+        let app = app(&plugin);
+        async move { get(app, "/hello/greet").await }
+    });
+    // Let the request reach the interpreter, then walk away from it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    abandoned.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The one permit is still held by the interpreter that is still running.
+    let (status, _) = get(app(&plugin), "/hello/greet").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an abandoned request must not hand its permit back early"
+    );
 }
 
 // ── the success metric's latency half ────────────────────────────────────

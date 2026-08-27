@@ -1483,12 +1483,12 @@ impl AppBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`RouterBuildError::UnregisteredApiVersion`](crate::router::RouterBuildError::UnregisteredApiVersion)
+    /// Returns [`RouterBuildError::UnregisteredApiVersion`](crate::RouterBuildError::UnregisteredApiVersion)
     /// if a route names an API version this builder has not registered — the
     /// same refusal `autumn routes` reports.
     pub fn plugin_route_infos(
         &self,
-    ) -> Result<Vec<crate::route_listing::RouteInfo>, crate::router::RouterBuildError> {
+    ) -> Result<Vec<crate::route_listing::RouteInfo>, crate::RouterBuildError> {
         let mut infos = crate::route_listing::collect_route_infos(
             &self.routes,
             &self.route_sources,
