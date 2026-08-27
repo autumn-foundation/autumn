@@ -1,18 +1,23 @@
-//! `autumn upgrade` — apply each release's mechanical app-code migrations
-//! (issue #1629).
+//! `autumn upgrade` — bring an app up to a release: its own code, and its
+//! framework-owned project files (issues #1629 and #1593).
 //!
 //! Autumn ships every 2-4 weeks and, pre-1.0, most releases can break existing
-//! apps. Issue #1588 made a written migration guide a release gate, and #1593
-//! reconciles framework-owned scaffold files — but both leave the user's own
-//! Rust code out of bounds, so a purely mechanical rename like 0.6.0's
-//! `with_pool` -> `with_pool_untracked` still had to be hand-applied call site
-//! by call site from prose.
+//! apps. Issue #1588 made a written migration guide a release gate, but prose
+//! left both halves of the actual work by hand: a purely mechanical rename like
+//! 0.6.0's `with_pool` -> `with_pool_untracked` had to be applied call site by
+//! call site, and the project skeleton `autumn new` wrote — `Dockerfile`,
+//! `build.rs`, `autumn.toml`, the toolchain configs — stayed frozen at whatever
+//! release scaffolded it, because bumping `autumn-web` updates the library, not
+//! the project.
 //!
-//! This command closes that half. For each release between the app's recorded
+//! This command closes both. For each release between the app's recorded
 //! `autumn-web` version and the target, it applies that release's
 //! machine-applyable migrations (see [`migrations`]) to the app's own source,
 //! and reports everything it could not safely rewrite with `file:line` and a
-//! guide link rather than guessing.
+//! guide link rather than guessing. In the same run it reconciles the
+//! framework-owned project files against the current release's scaffold (see
+//! [`scaffold`]), which never touches `src/` and never overwrites a file the
+//! developer edited.
 //!
 //! # Safety posture
 //!
@@ -28,12 +33,14 @@
 //! - **Nothing silent.** A site the engine declines to rewrite (inside a macro
 //!   invocation or an attribute) is listed under `manual` with its location.
 //!
-//! `autumn upgrade` is also where #1593's scaffold reconciliation lands when it
-//! ships; this slice is the app-code step only.
+//! The same posture governs the scaffold half, one step further: a file whose
+//! bytes no longer match the digest [`crate::new`] recorded when it wrote them
+//! is a *conflict*, reported with its diff and never written.
 
 pub mod diff;
 pub mod engine;
 pub mod migrations;
+pub mod scaffold;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -41,6 +48,11 @@ use std::path::{Path, PathBuf};
 use migrations::{AppMigration, Version};
 
 /// Options for `autumn upgrade`.
+///
+/// One bool per flag, deliberately: they are independent switches the CLI layer
+/// passes straight through, and grouping them into modes would put the flag
+/// combinations' meaning somewhere other than where they are validated.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct UpgradeOptions {
     /// Override the detected `autumn-web` version the app is upgrading *from*.
@@ -54,6 +66,10 @@ pub struct UpgradeOptions {
     pub json: bool,
     /// List the registry and exit, without scanning any source.
     pub list: bool,
+    /// Report scaffold-file drift and exit nonzero if there is any, without
+    /// scanning app code and without writing. The CI gate for scaffold
+    /// freshness (issue #1593).
+    pub check: bool,
 }
 
 /// A site the user has to handle themselves, with where to read about it.
@@ -169,6 +185,14 @@ impl Report {
 /// work and at worst a corrupted dependency.
 /// Skipped only where a crate begins — a directory holding a `Cargo.toml`.
 /// Beneath that, these are ordinary module names.
+/// Exit code for `--check` when a project's framework-owned files have drifted
+/// from the current release's scaffold (issue #1593).
+///
+/// Its own code rather than the generic `1`: within this command one exit code
+/// means one thing, and `1` already means "the apply step died partway", which
+/// is a materially different thing for a CI job to react to.
+pub const DRIFT_EXIT_CODE: i32 = 3;
+
 const SKIPPED_DIRS: &[&str] = &["target", "vendor", "node_modules", "dist", "tmp"];
 
 /// Hidden directories that hold tool or VCS metadata rather than app code.
@@ -442,7 +466,20 @@ fn manual_json(entries: &[ManualEntry]) -> serde_json::Value {
 }
 
 /// Render the machine-readable report.
+///
+/// The scaffold section (issue #1593) is merged in by the caller, which is why
+/// [`json_value`] exists separately: `autumn upgrade --json` emits one document,
+/// and building it by re-parsing this function's own output would be a parser
+/// round trip over data the caller already has.
+#[must_use]
 pub fn render_json(report: &Report) -> String {
+    serde_json::to_string_pretty(&json_value(report)).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// The machine-readable report as a value, so a caller can extend it (the
+/// scaffold section) without re-parsing its own output.
+#[must_use]
+pub fn json_value(report: &Report) -> serde_json::Value {
     let files: Vec<serde_json::Value> = report
         .files
         .iter()
@@ -485,7 +522,7 @@ pub fn render_json(report: &Report) -> String {
             "reason": reason,
         })).collect::<Vec<_>>(),
     });
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
+    value
 }
 
 /// Read the `autumn-web` requirement recorded by the app at `root`.
@@ -1313,37 +1350,98 @@ mod write_guard_tests {
     }
 }
 
+/// Print one run's reports — app code, and the scaffold section when there is
+/// one.
+///
+/// A directory that is not an Autumn project produces byte-for-byte the report
+/// it always did: the scaffold section is an addition to this command, not a
+/// change to it.
+fn emit(report: &Report, scaffold_report: Option<&scaffold::ScaffoldReport>, json: bool) {
+    match (json, scaffold_report) {
+        (true, None) => println!("{}", render_json(report)),
+        (true, Some(scaffold_report)) => {
+            let mut value = json_value(report);
+            value["scaffold"] = scaffold::json(scaffold_report);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
+            );
+        }
+        (false, scaffold_report) => {
+            print!("{}", render_text(report));
+            if let Some(scaffold_report) = scaffold_report {
+                print!("{}", scaffold::render_text(scaffold_report));
+            }
+        }
+    }
+}
+
+fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
+    if !scaffold::is_project(root) {
+        eprintln!(
+            "autumn upgrade: `{}` is not an Autumn project (no `autumn.toml`).\n\
+             `--check` gates a project's framework-owned files against the current scaffold.",
+            root.display()
+        );
+        return 2;
+    }
+    let report = scaffold::plan(root, target);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scaffold::json(&report))
+                .unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else {
+        print!("{}", scaffold::render_text(&report));
+    }
+    if report.drifted() { DRIFT_EXIT_CODE } else { 0 }
+}
+
+/// Print the shipped codemod registry, for `--list-migrations`.
+fn list_migrations(json: bool) {
+    let all: Vec<&'static AppMigration> = migrations::app_migrations().iter().collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "migrations": migrations_json(&all) })
+            )
+            .unwrap_or_else(|_| "{}".to_owned())
+        );
+        return;
+    }
+    println!("Shipped app-code migrations ({}):", all.len());
+    for migration in &all {
+        println!(
+            "  {:<6}  {}  {}",
+            migration.confidence.label(),
+            migration.id,
+            migration.title
+        );
+        println!("          {}", migrations::guide_url(migration.guide));
+    }
+}
+
 /// Run `autumn upgrade` against `root`, returning the process exit code.
 ///
 /// `0` on any completed scan — including one that found sites only a human can
 /// take, or files it could not parse, both of which the report names. `1` when
 /// the apply step failed partway through, `2` for a bad argument or an
-/// unreadable scan root.
+/// unreadable scan root, and [`DRIFT_EXIT_CODE`] when `--check` found scaffold
+/// drift.
 #[must_use]
 pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
     if opts.list {
-        let all: Vec<&'static AppMigration> = migrations::app_migrations().iter().collect();
-        if opts.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({ "migrations": migrations_json(&all) })
-                )
-                .unwrap_or_else(|_| "{}".to_owned())
-            );
-        } else {
-            println!("Shipped app-code migrations ({}):", all.len());
-            for migration in &all {
-                println!(
-                    "  {:<6}  {}  {}",
-                    migration.confidence.label(),
-                    migration.id,
-                    migration.title
-                );
-                println!("          {}", migrations::guide_url(migration.guide));
-            }
-        }
+        list_migrations(opts.json);
         return 0;
+    }
+
+    if opts.check && opts.apply {
+        eprintln!(
+            "autumn upgrade: `--check` reports drift and writes nothing; it cannot be combined with `--apply`."
+        );
+        return 2;
     }
 
     let target = opts
@@ -1368,6 +1466,14 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         return 2;
     }
 
+    // The CI gate (issue #1593). Deliberately ahead of the version resolution:
+    // scaffold drift is measured against the recorded provenance manifest, not
+    // against the `autumn-web` requirement, so a project whose manifest Cargo
+    // cannot give a single floor for can still be gated on scaffold freshness.
+    if opts.check {
+        return check_scaffold(root, &target, opts.json);
+    }
+
     let recorded = opts.from.clone().or_else(|| recorded_version(root));
     let Some(recorded) = recorded else {
         eprintln!(
@@ -1386,6 +1492,7 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
 
     let mut report = plan(root, from, to);
     let mut failure = None;
+    let mut scaffold_failure = None;
     if opts.apply {
         match write_plan(&report) {
             Ok(()) => report.outcome = Outcome::Applied,
@@ -1403,16 +1510,44 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         }
     }
 
-    if opts.json {
-        println!("{}", render_json(&report));
-    } else {
-        print!("{}", render_text(&report));
+    // Framework-owned scaffold files are reconciled in the same run as the app
+    // code (issue #1593), so "bring me up to this release" is one command
+    // rather than two. Only in an actual Autumn project: `autumn upgrade` also
+    // runs over plain crates that merely depend on autumn-web, and offering to
+    // seed a Dockerfile into one of those would be nonsense.
+    //
+    // Planned *after* the app-code step, not alongside it: `build.rs` is both a
+    // framework-owned file and a `.rs` file the codemods scan, so a plan made
+    // before the rewrites could be a plan about bytes that no longer exist.
+    let mut scaffold_report = scaffold::is_project(root).then(|| scaffold::plan(root, &target));
+    // Only when the app-code step completed. A half-migrated tree is not a tree
+    // to start rewriting project files in.
+    if opts.apply
+        && failure.is_none()
+        && let Some(scaffold_report) = scaffold_report.as_mut()
+    {
+        scaffold_failure = scaffold::apply(scaffold_report).err();
     }
+
+    emit(&report, scaffold_report.as_ref(), opts.json);
 
     if let Some(WriteFailure { path, error, .. }) = failure {
         eprintln!(
             "autumn upgrade: failed while writing {path}: {error}\n\
              Files listed before it in the report above were already written; \
+             `git diff` shows exactly what changed."
+        );
+        return 1;
+    }
+    if let Some(scaffold::WriteFailure {
+        path,
+        error,
+        written,
+    }) = scaffold_failure
+    {
+        eprintln!(
+            "autumn upgrade: failed while writing the scaffold file {path}: {error}\n\
+             {written} scaffold file(s) were written before it; \
              `git diff` shows exactly what changed."
         );
         return 1;

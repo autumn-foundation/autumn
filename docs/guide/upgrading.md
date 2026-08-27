@@ -8,7 +8,18 @@ upgrade, a codemod you can run instead of hand-editing call sites out of prose.
 ```bash
 autumn upgrade            # preview: per-file diff, nothing written
 autumn upgrade --apply    # take the rewrites
+autumn upgrade --check    # CI gate: exit 3 if scaffold files have drifted
 ```
+
+One run covers both halves of an upgrade:
+
+1. **Your own Rust code** — each release's machine-applyable API migrations,
+   applied to `src/`, `tests/`, `examples/`, `benches/` and every workspace
+   member.
+2. **Your project's framework-owned files** — `Dockerfile`, `build.rs`,
+   `autumn.toml`, the toolchain and style configs, the CI workflow —
+   reconciled against the current release's scaffold. See
+   [Scaffold files](#scaffold-files) below.
 
 ## What it does
 
@@ -19,9 +30,9 @@ machine-applyable migrations to **your own Rust source** — `src/`, `tests/`,
 and vendored sources are never touched.
 
 It is deliberately narrow. Today the shipped rewrites are API **renames**:
-`0.6.0`'s `with_pool` → `with_pool_untracked`, for instance. Configuration
-files, dependency versions, and framework-owned scaffold files are out of
-scope — `autumn doctor` and the migration guides cover those.
+`0.6.0`'s `with_pool` → `with_pool_untracked`, for instance. Dependency
+versions are out of scope, and so is anything under `src/` that is not a call
+site a shipped codemod names.
 
 ## Preview first, always
 
@@ -114,6 +125,217 @@ not:
   call unconditionally; under the other configuration the same name may be an
   unrelated import. Calls to such a type are reported for a human.
 
+## Scaffold files
+
+`autumn new` writes about a dozen framework-owned files into every project, and
+those templates keep evolving: the widget CSS restructure, the `nav_bar`
+helper, the toolchain and style configs that did not exist before `0.5`.
+Bumping `autumn-web` in `Cargo.toml` updates the *library*; it does not touch
+your project skeleton. So an app scaffolded on `0.5` keeps `0.5`-vintage
+project files forever unless something reconciles them.
+
+That something is the second half of `autumn upgrade`. It renders the current
+release's scaffold in memory, compares it against what is on disk, and prints a
+per-file verdict:
+
+```text
+Scaffold files (0.5.0 -> 0.7.0)
+
+  3 file(s) differ:
+  conflict  Dockerfile           you changed this since it was scaffolded
+  add       clippy.toml          this release's scaffold has it; your project does not
+  add       rust-toolchain.toml  this release's scaffold has it; your project does not
+
+Dockerfile (conflict)
+@@ lines 65-66 @@
+-
+-# my own tweak
+
+clippy.toml (add)
+@@ line 1 @@
++msrv = "1.88.0"
+
+rust-toolchain.toml (add)
+@@ lines 1-3 @@
++[toolchain]
++channel = "1.88.0"
++components = ["rustfmt", "clippy"]
+
+2 file(s) would be written; 1 conflict(s) need review.
+Nothing was written. Re-run with `--apply` to take the writable ones, then
+review with `git diff` -- `git checkout -- <path>` puts any one file back.
+Conflicts are never overwritten. Compare each against this release's
+scaffold above, take what you want, and re-run to confirm.
+Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md
+```
+
+In every diff, `-` is what your project has now and `+` is what this release's
+scaffold writes. For a `conflict` that is a description of the difference, not
+of an impending write — a conflict is never applied.
+
+### Which files it owns
+
+| Owned — reconciled | Not owned — never touched |
+|---|---|
+| `autumn.toml` | `src/**` (all of your application code, including `src/bin/seed.rs`) |
+| `Dockerfile`, `.dockerignore` | `Cargo.toml` (your dependencies) |
+| `build.rs` | `README.md` (your prose) |
+| `.gitignore`, `.env.example` | `tests/**`, `migrations/**`, `i18n/**` |
+| `.github/workflows/ci.yml` | `config/credentials/**` (your secrets) |
+| `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml` | `static/js/**` (vendored — `autumn assets` owns these) |
+| `tailwind.config.js`, `static/css/input.css` (fullstack only) | |
+
+**Application source is out of bounds.** The command never reads, writes, or
+names a path under `src/`. API migration to your own code is the *first* half
+of `autumn upgrade` (above), and anything it cannot rewrite mechanically is
+your release's [migration guide](../migrations/README.md) to work through.
+
+### The five verdicts
+
+| Verdict | What it means | Written by `--apply`? |
+|---|---|---|
+| `current` | Identical to this release's scaffold. Not listed. | – |
+| `add` | This release's scaffold has the file and your project does not — including every file a release *after* yours introduced. | yes |
+| `update` | The template changed and your copy is provably untouched since Autumn wrote it. | yes |
+| `conflict` | The template changed and your copy may be yours now. | **no** |
+| `removed` | Autumn wrote this file once and you deleted it. | **no** |
+
+### How it knows you edited a file
+
+"May I overwrite this?" is really "did you touch it?", and neither the file's
+contents nor its timestamp can answer that. So `autumn new` records a digest of
+every framework-owned file as it writes it, in `.autumn/scaffold.toml`:
+
+```toml
+version = "0.7.0"
+flavor = "fullstack"
+i18n = false
+seed = false
+daemon = false
+bundled_pg = false
+
+[files]
+"clippy.toml" = "5e884898da280471…"
+```
+
+**Commit that file.** Its entire value is being the baseline a *later* checkout
+compares against. It holds a release, the flags the project was created with,
+and one digest per file — no paths outside the project, and nothing secret.
+`autumn upgrade --apply` refreshes it, and it moves its recorded `version`
+forward only once no conflicts are left, so a half-finished upgrade never reads
+as a finished one.
+
+Line endings are normalised before hashing, so a `core.autocrlf` checkout on
+Windows is not mistaken for you having personally rewritten all twelve files.
+
+### Projects older than this feature
+
+An app scaffolded before `.autumn/scaffold.toml` existed has no baseline, and
+that is **not** an error — it just means "untouched" cannot be proven. The
+upgrade is best effort:
+
+- files your project is missing entirely are still offered as `add` — there is
+  no content to lose;
+- every file that differs is a `conflict` for you to review, never an
+  overwrite.
+
+The report says so up front. Once you have run `--apply` once, the manifest
+exists and every later upgrade gets the sharper answer.
+
+Flavor is inferred the same way when there is no manifest: a project with no
+`static/` directory and no `tailwind.config.js` is treated as an `--api` app
+and is never offered Tailwind files; an `i18n/` directory means the project was
+made with `--with-i18n`.
+
+### Reverting
+
+`--apply` edits files in place, and your VCS is the undo:
+
+```bash
+git status                       # what changed
+git diff                         # exactly what changed, line by line
+git checkout -- rust-toolchain.toml   # put one file back
+git checkout -- .                # put everything back
+```
+
+Commit or stash before you apply, the same as for the codemods. The preview is
+the review step, `git diff` is the proof, and `git checkout --` is the escape
+hatch.
+
+### Gating CI on scaffold freshness
+
+```bash
+autumn upgrade --check
+```
+
+`--check` reconciles the scaffold files, writes nothing, and exits **3** when
+anything has drifted — so a CI job can fail the build on a stale skeleton:
+
+```yaml
+- name: Scaffold is current
+  run: autumn upgrade --check
+```
+
+It exits `0` on a clean project. A file you deliberately deleted is reported as
+`removed` but does **not** hold the gate red — deleting it was a decision, and
+a gate that can never go green again is a gate people delete.
+
+`--check` cannot be combined with `--apply`; that is a usage error (exit `2`).
+Run it outside an Autumn project — a directory with no `autumn.toml` — and it
+says so and exits `2` rather than reporting a spurious pass.
+
+`--json` works with `--check` too, and with a normal run the scaffold report is
+a `scaffold` key alongside the app-code report:
+
+```json
+{
+  "scaffold": {
+    "baseline": "0.5.0",
+    "target": "0.7.0",
+    "has_manifest": true,
+    "drift": true,
+    "written": 2,
+    "conflicts": 1,
+    "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md",
+    "files": [
+      { "path": "clippy.toml", "status": "add", "applied": true }
+    ]
+  }
+}
+```
+
+### A whole upgrade, end to end
+
+```bash
+# 1. Start clean, so `git diff` means something.
+git status
+
+# 2. Preview both halves: code rewrites and scaffold drift.
+autumn upgrade
+
+# 3. Take them.
+autumn upgrade --apply
+
+# 4. Read what it did.
+git diff
+
+# 5. Work the conflicts it refused to touch, one file at a time.
+#    Each one's diff is in the report above.
+
+# 6. Confirm the skeleton is current.
+autumn upgrade --check
+
+# 7. Now bump the library and build.
+#    (The codemods migrate FROM the version Cargo.toml records, so this is last.)
+cargo add autumn-web@0.7.0
+cargo check
+
+# 8. Read the release's migration guide for anything mechanical rewriting
+#    could not do — the link is at the bottom of every report.
+```
+
+Only step 3 writes anything, and step 4 shows you all of it.
+
 ## Flags
 
 | Flag | Effect |
@@ -124,6 +346,7 @@ not:
 | `--to VERSION` | Upgrade to this release instead of the CLI's own version. |
 | `--json` | Machine-readable report — the same content, for CI. |
 | `--list-migrations` | Print the shipped codemods and exit, without scanning. |
+| `--check` | Reconcile the scaffold files only, write nothing, and exit `3` if any have drifted. For CI. Cannot be combined with `--apply`. |
 
 ## Exit codes
 
@@ -131,7 +354,8 @@ not:
 |------|---------|
 | `0` | The scan completed. This includes a run that reported `manual` sites or skipped an unparsable file — both are in the report, and neither is a failure of the command. |
 | `1` | The apply step failed partway through. The report names the file it died on; the ones listed before it were already written. |
-| `2` | A bad argument, a `PATH` that is not a readable directory, or a version this command cannot parse. Nothing was scanned. |
+| `2` | A bad argument, a `PATH` that is not a readable directory, a version this command cannot parse, or `--check` outside an Autumn project. Nothing was scanned. |
+| `3` | `--check` found scaffold drift. Its own code rather than `1`, so a CI job can tell "your skeleton is stale" from "the apply step died partway". |
 
 There is no "found something" exit code: a preview that finds work is the
 command working. Gate on the `--json` report's `manual`, `skipped`, and site

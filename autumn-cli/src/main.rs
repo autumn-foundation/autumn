@@ -267,6 +267,7 @@ struct Cli {
 /// that a codegen difference between two rustc builds decides whether the
 /// argument-parsing tests overflow. An `Args` struct moves this command's share
 /// into `UpgradeArgs::augment_args`, which gets its own frame and pops.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args, Debug)]
 struct UpgradeArgs {
     /// Project directory to migrate (defaults to the current directory).
@@ -288,6 +289,10 @@ struct UpgradeArgs {
     /// List the shipped app-code migrations and exit without scanning.
     #[arg(long = "list-migrations")]
     list_migrations: bool,
+    /// Report framework-owned scaffold files that have drifted from this
+    /// release and exit 3 if any have. Writes nothing; for CI.
+    #[arg(long, conflicts_with = "apply")]
+    check: bool,
 }
 
 /// Available subcommands.
@@ -414,17 +419,23 @@ enum Commands {
         #[command(subcommand)]
         action: AssetsCommands,
     },
-    /// Apply a release's mechanical app-code migrations to your own source.
+    /// Bring an app up to a release: its own code, and its scaffold files.
     ///
     /// For each release between the `autumn-web` version this app records and
     /// the target, `autumn upgrade` applies that release's machine-applyable
-    /// migrations -- today, API renames -- to the app's own Rust code.
+    /// migrations -- today, API renames -- to the app's own Rust code. In the
+    /// same run it reconciles the project's framework-owned files (Dockerfile,
+    /// build.rs, autumn.toml, the toolchain/style configs, the CI workflow)
+    /// against the current release's scaffold. Application source under src/ is
+    /// out of bounds for that half.
     ///
     /// It writes nothing by default: a bare `autumn upgrade` prints a per-file
     /// diff plus a count of affected sites, and `--apply` is the explicit write
     /// step. Anything it cannot safely rewrite (a call site inside a macro
     /// invocation, or a change with no mechanical form) is listed with its
-    /// location and a link to the guide section, never guessed at.
+    /// location and a link to the guide section, never guessed at. A scaffold
+    /// file you have edited since it was generated is reported as a conflict
+    /// with its diff, never overwritten.
     ///
     /// Run it BEFORE bumping the `autumn-web` dependency: the release it
     /// migrates *from* is the one the project manifest records. If the bump
@@ -432,6 +443,7 @@ enum Commands {
     ///
     ///   autumn upgrade                     # preview
     ///   autumn upgrade --apply             # write the rewrites
+    ///   autumn upgrade --check             # CI gate: exit 3 on scaffold drift
     ///   autumn upgrade --list-migrations   # what ships today
     #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
@@ -3711,6 +3723,7 @@ fn run_command(command: Commands) {
             apply,
             json,
             list_migrations,
+            check,
         }) => {
             let code = upgrade::run_in(
                 std::path::Path::new(&path),
@@ -3720,6 +3733,7 @@ fn run_command(command: Commands) {
                     apply,
                     json,
                     list: list_migrations,
+                    check,
                 },
             );
             std::process::exit(code);

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`autumn upgrade` now reconciles framework-owned scaffold files, not just
+  app code (#1593):** `autumn new` writes about a dozen framework-owned files
+  into every project — `Dockerfile`, `.dockerignore`, `build.rs`, `autumn.toml`,
+  `tailwind.config.js`, `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`,
+  the CI workflow, `static/css/input.css` — and those templates keep evolving,
+  but bumping `autumn-web` in `Cargo.toml` updates the library, not the project
+  skeleton. An app scaffolded on 0.5 therefore kept 0.5-vintage project files
+  forever, and the only remedy was diffing a freshly generated throwaway project
+  by hand. `autumn upgrade` now renders the current release's scaffold in memory
+  and reports a per-file verdict alongside the existing codemod report: `add`
+  for a file a later release introduced (a pre-#1492 app is offered
+  `rust-toolchain.toml`), `update` for one whose template moved while your copy
+  stayed untouched, `conflict` for one you edited, and `removed` for one you
+  deleted on purpose. Preview stays the default; `--apply` writes the additions
+  and updates and never a conflict.
+
+  Knowing which files you edited needs a baseline, so `autumn new` now records
+  one: `.autumn/scaffold.toml` holds the release that scaffolded the project,
+  the flags it was created with, and a digest of every framework-owned file as
+  Autumn wrote it. Commit it — its value is being the baseline a later checkout
+  compares against. Projects created before this feature have no manifest and
+  are handled best-effort rather than refused: missing files are still offered,
+  and everything that differs is a conflict for review, because "untouched"
+  cannot be proven. Digests are taken over LF-normalised text, so a
+  `core.autocrlf` checkout on Windows is not mistaken for a rewrite of every
+  file.
+
+  Application source is out of bounds throughout: the command never reads,
+  writes, or names a path under `src/`, and `Cargo.toml`, `README.md`,
+  `tests/`, `migrations/`, `i18n/`, `config/credentials/` and the vendored
+  `static/js/` assets are not framework-owned either. `autumn new` and the
+  reconciler render from one shared function, so what the scaffold writes and
+  what the upgrade considers current cannot drift apart.
+
+  New: `autumn upgrade --check` reconciles the scaffold files, writes nothing,
+  and exits `3` when anything has drifted, so CI can gate on scaffold freshness
+  (`1` still means the apply step died partway, and a deliberately deleted file
+  does not hold the gate red forever). Every report ends with a link to that
+  release's migration guide, so file reconciliation and API migration are one
+  workflow. `--json` carries the whole thing under a `scaffold` key.
+  [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end
+  to end, including the `git diff` / `git checkout --` revert path.
+
 ### Fixed
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
