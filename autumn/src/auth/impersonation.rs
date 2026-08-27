@@ -763,8 +763,17 @@ pub async fn begin_impersonation(
     )
     .await;
 
-    // The remainder of *this* request is the impersonator's work too.
-    Current::set_actor(real_id.clone());
+    // The remainder of *this* request is the impersonator's work too — but only
+    // seed the actor if nothing stronger already resolved one, matching the
+    // "first/outermost resolver wins" rule the three session seams follow. On
+    // every session-authenticated path the actor is already this same
+    // `real_id` by now (the seam, or the `PolicyContext` built above, seeded
+    // it), so this changes nothing there; it matters when an API-token bearer
+    // or an explicit `with_actor(...)` scope resolved the principal first, and
+    // clobbering that would misattribute the rest of the handler's writes.
+    if Current::actor().is_none() {
+        Current::set_actor(real_id.clone());
+    }
 
     Ok(ImpersonationState {
         impersonator_id: real_id,
@@ -847,7 +856,10 @@ pub async fn end_impersonation(
     .await;
     session.rotate_id().await;
 
-    Current::set_actor(real_id.clone());
+    // Same rule as `begin_impersonation`: seed, never clobber.
+    if Current::actor().is_none() {
+        Current::set_actor(real_id.clone());
+    }
 
     Ok(ImpersonationState {
         impersonator_id: real_id,

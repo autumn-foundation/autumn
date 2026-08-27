@@ -712,6 +712,60 @@ async fn a_blank_target_is_rejected() {
         .assert_status(400);
 }
 
+// ── An already-resolved actor is never clobbered ──────────────
+
+/// Begins an impersonation inside an explicit `with_actor(...)` scope — the
+/// shape a background job or an API-token-authenticated route takes — and
+/// reports the ambient actor from inside that scope.
+#[autumn_web::post("/impersonate-in-actor-scope")]
+async fn begin_in_actor_scope(
+    State(state): State<AppState>,
+    session: Session,
+    Form(form): Form<TargetForm>,
+) -> AutumnResult<String> {
+    autumn_web::current::with_actor("outer-principal", async {
+        impersonation::begin_impersonation(&state, &session, form.user_id).await?;
+        Ok(Current::actor().unwrap_or_else(|| "-".to_owned()))
+    })
+    .await
+}
+
+#[tokio::test]
+async fn beginning_impersonation_does_not_clobber_a_stronger_actor() {
+    // The three session seams all seed the actor only when none is set, so an
+    // API-token bearer or an explicit `with_actor(...)` scope wins. Beginning
+    // an impersonation must follow the same rule, or the rest of the handler's
+    // writes would be misattributed to the session user.
+    let client = TestApp::new()
+        .routes(routes![login_admin, begin_in_actor_scope, stop, whoami])
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client.post("/login-admin").send().await.assert_ok();
+
+    let actor = client
+        .post("/impersonate-in-actor-scope")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .text();
+    assert_eq!(
+        actor, "outer-principal",
+        "the outermost resolved principal must survive the swap"
+    );
+
+    // The impersonation itself still took effect; only the attribution rule
+    // changed, and a fresh request resolves the impersonator as usual.
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=admin-1;actor=admin-1"
+    );
+}
+
 // ── A self-destructive auth session key is refused ────────────
 
 #[tokio::test]
