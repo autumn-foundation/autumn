@@ -342,7 +342,12 @@ async fn run_mirror(
     // full deadline on the primary wait — up to `2 * timeout_ms` holding a slot,
     // which at capacity keeps every later mirror dropped for twice as long as
     // the operator configured, against this module's stated guarantee.
-    let deadline = tokio::time::Instant::now() + ctx.settings.timeout;
+    let now = tokio::time::Instant::now();
+    // `checked_add`, not `+`: this module's panic gate denies arithmetic that
+    // can panic, and `Instant + Duration` does on overflow. An absurd
+    // `timeout_ms` therefore degrades to an immediate deadline — the mirror
+    // gives up rather than the request path panicking.
+    let deadline = now.checked_add(ctx.settings.timeout).unwrap_or(now);
 
     let shadow = match tokio::time::timeout_at(deadline, ctx.transport.send(request)).await {
         Err(_) | Ok(Err(ShadowError::Timeout)) => {

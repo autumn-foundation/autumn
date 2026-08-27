@@ -139,8 +139,10 @@ async fn spawn_candidate() -> (SocketAddr, Arc<CandidateLog>) {
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 fn mirroring_config(target: SocketAddr) -> AutumnConfig {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        ..AutumnConfig::default()
+    };
     config.security.csrf.enabled = false;
     config.actuator.sensitive = true;
     config.shadow = ShadowConfig {
@@ -363,8 +365,10 @@ async fn the_actuator_endpoint_reports_the_mirror_run() {
 
 #[tokio::test]
 async fn the_actuator_endpoint_reports_a_disabled_mirror_by_default() {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        ..AutumnConfig::default()
+    };
     config.security.csrf.enabled = false;
     config.actuator.sensitive = true;
 
@@ -600,8 +604,10 @@ async fn a_divergence_is_reported_as_a_labelled_metric() {
 async fn the_shadow_metric_families_are_absent_without_a_mirror() {
     // Nothing to say, nothing written: the families stay out of the scrape
     // until an operator turns mirroring on.
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".into());
+    let mut config = AutumnConfig {
+        profile: Some("test".into()),
+        ..AutumnConfig::default()
+    };
     config.security.csrf.enabled = false;
 
     let app = TestApp::new()
