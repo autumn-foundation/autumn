@@ -31,6 +31,7 @@ use super::store::{
 };
 use super::transport::{PushRequest, PushTransport};
 use super::vapid::VapidKey;
+use crate::state::AppState;
 
 /// Default `TTL` (RFC 8030 §5.2) on a dispatched message: how long the push
 /// service may hold it for a device that is currently offline.
@@ -302,6 +303,18 @@ impl WebPush {
             .boxed_list_for(principal.as_str().to_owned())
             .await?;
 
+        if subscriptions.is_empty() {
+            // Usually benign (the user never granted permission), but it is
+            // also what a principal-namespace mismatch looks like — the
+            // subscribe route recorded `user:42` while the send asked for
+            // `42`. Naming the id that was looked up is the quickest way to
+            // spot that, and there is no other symptom.
+            tracing::debug!(
+                principal = %principal,
+                "no push subscriptions for this principal; nothing dispatched"
+            );
+        }
+
         let mut report = PushDeliveryReport::default();
         for subscription in subscriptions {
             report.merge(self.deliver_one(vapid, &subscription, &payload).await?);
@@ -334,8 +347,8 @@ impl WebPush {
 
     /// Serialize a message and check it against the payload ceiling.
     fn encode(message: &PushMessage) -> Result<Vec<u8>, PushError> {
-        let payload = serde_json::to_vec(message)
-            .map_err(|e| PushError::Encryption(format!("payload serialization: {e}")))?;
+        let payload =
+            serde_json::to_vec(message).map_err(|e| PushError::Serialization(e.to_string()))?;
         if payload.len() > encryption::MAX_PLAINTEXT_LEN {
             return Err(PushError::PayloadTooLarge {
                 len: payload.len(),
@@ -360,7 +373,7 @@ impl WebPush {
                 // succeed, but it must not abort delivery to this principal's
                 // other devices either.
                 tracing::warn!(
-                    endpoint = %subscription.endpoint,
+                    endpoint.origin = %endpoint_origin(subscription.endpoint()),
                     error = %e,
                     "skipping a push subscription that could not be encoded"
                 );
@@ -375,7 +388,7 @@ impl WebPush {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!(
-                    endpoint = %subscription.endpoint,
+                    endpoint.origin = %endpoint_origin(subscription.endpoint()),
                     error = %e,
                     "push transport failed"
                 );
@@ -398,22 +411,46 @@ impl WebPush {
             }),
             404 | 410 => {
                 // Unscoped: the endpoint is dead for whoever owns it.
-                self.store
-                    .boxed_remove(subscription.endpoint.clone(), None)
-                    .await?;
-                tracing::debug!(
-                    endpoint = %subscription.endpoint,
-                    status,
-                    "pruned a stale push subscription"
-                );
-                Ok(PushDeliveryReport {
-                    pruned: vec![subscription.endpoint.clone()],
-                    ..Default::default()
-                })
+                //
+                // A store failure here is NOT propagated. The message has
+                // already been dispatched and answered; failing the whole send
+                // now would discard the deliveries that already succeeded to
+                // this principal's other devices and abort the ones still to
+                // come — the exact opposite of "a dead device never blocks a
+                // live one". The row simply survives to be pruned on the next
+                // send.
+                match self
+                    .store
+                    .boxed_remove(subscription.endpoint().to_owned(), None)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::debug!(
+                            endpoint.origin = %endpoint_origin(subscription.endpoint()),
+                            status,
+                            "pruned a stale push subscription"
+                        );
+                        Ok(PushDeliveryReport {
+                            pruned: vec![subscription.endpoint().to_owned()],
+                            ..Default::default()
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            endpoint.origin = %endpoint_origin(subscription.endpoint()),
+                            error = %e,
+                            "could not prune a stale push subscription; it will be retried"
+                        );
+                        Ok(PushDeliveryReport {
+                            failed: 1,
+                            ..Default::default()
+                        })
+                    }
+                }
             }
             other => {
                 tracing::warn!(
-                    endpoint = %subscription.endpoint,
+                    endpoint.origin = %endpoint_origin(subscription.endpoint()),
                     status = other,
                     "push service rejected a message; leaving the subscription in place"
                 );
@@ -432,12 +469,12 @@ impl WebPush {
         subscription: &StoredSubscription,
         payload: &[u8],
     ) -> Result<PushRequest, PushError> {
-        let body = encryption::encrypt(payload, &subscription.p256dh, &subscription.auth)?;
+        let body = encryption::encrypt(payload, subscription.p256dh(), subscription.auth())?;
         let issued_at = u64::try_from(self.clock.now().timestamp()).unwrap_or(0);
         let authorization =
-            vapid.authorization_header(&subscription.endpoint, &self.subject, issued_at)?;
+            vapid.authorization_header(subscription.endpoint(), &self.subject, issued_at)?;
         Ok(PushRequest {
-            endpoint: subscription.endpoint.clone(),
+            endpoint: subscription.endpoint().to_owned(),
             headers: vec![
                 ("authorization".to_owned(), authorization),
                 ("content-encoding".to_owned(), "aes128gcm".to_owned()),
@@ -450,6 +487,136 @@ impl WebPush {
             body,
         })
     }
+}
+
+// ── Extractor ───────────────────────────────────────────────────────────────
+
+impl WebPush {
+    /// The service an app that registered nothing gets.
+    ///
+    /// Resolution mirrors [`Notifications`](crate::notifications::Notifications):
+    /// the database-backed store when a pool is configured, the in-memory one
+    /// otherwise. The VAPID key and subject come from the validated `[push]`
+    /// config block.
+    fn default_for(state: &AppState) -> Self {
+        let config = state.config();
+        // Already validated at boot by `AppBuilder`, so a key that fails to
+        // load here means the config was replaced at runtime. Treating that as
+        // "unconfigured" is the safe reading: sends then fail loudly with
+        // `NotConfigured` rather than silently signing with a stale key.
+        let vapid = config.push.load_vapid_key().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "the `[push]` VAPID key failed to load; sends will fail");
+            None
+        });
+        let subject = config.push.subject_or_default();
+        let ttl_secs = config.push.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+
+        let transport = Self::default_transport(state);
+
+        #[cfg(feature = "db")]
+        let store: Arc<dyn BoxedPushSubscriptionStore> =
+            if let Some(pool) = crate::db::DbState::pool(state) {
+                Arc::new(super::store::DbPushSubscriptionStore::new(pool.clone()))
+            } else {
+                Arc::new(super::store::MemoryPushSubscriptionStore::new())
+            };
+        #[cfg(not(feature = "db"))]
+        let store: Arc<dyn BoxedPushSubscriptionStore> =
+            Arc::new(super::store::MemoryPushSubscriptionStore::new());
+
+        Self {
+            store,
+            vapid: vapid.map(Arc::new),
+            subject: subject.into(),
+            transport,
+            ttl_secs,
+            clock: state.clock_arc(),
+        }
+    }
+
+    /// [`default_for`](Self::default_for) with an explicitly registered store.
+    ///
+    /// Used by
+    /// [`AppBuilder::with_push_subscription_store`](crate::app::AppBuilder::with_push_subscription_store),
+    /// so a custom store still picks up the app's configured key, subject,
+    /// TTL, transport and clock.
+    pub(crate) fn from_state_with_store(
+        state: &AppState,
+        store: impl PushSubscriptionStore,
+    ) -> Self {
+        Self {
+            store: Arc::new(store),
+            ..Self::default_for(state)
+        }
+    }
+
+    /// The transport a resolved service uses: a real HTTP client when one can
+    /// be built, otherwise a transport that reports the failure rather than
+    /// pretending to deliver.
+    fn default_transport(state: &AppState) -> Arc<dyn PushTransport> {
+        #[cfg(feature = "http-client")]
+        {
+            Arc::new(super::transport::HttpPushTransport::new(
+                crate::http_client::Client::from_state(state),
+            ))
+        }
+        #[cfg(not(feature = "http-client"))]
+        {
+            let _ = state;
+            Arc::new(super::transport::UnavailablePushTransport)
+        }
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for WebPush {
+    // Resolution always succeeds (a store fallback always exists, and a
+    // missing key surfaces from `send`, not extraction) — the same contract
+    // `Notifications` and `Session` have.
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Fast path: a service registered by `AppBuilder::with_web_push` /
+        // `with_push_subscription_store`, or resolved by an earlier request.
+        if let Some(existing) = state.extension::<Self>() {
+            return Ok((*existing).clone());
+        }
+
+        // Resolve OUTSIDE `extension_or_insert_with`.
+        //
+        // That helper holds the extensions **write** lock while it calls its
+        // closure, and `default_for` reads other extensions off the same state
+        // (the shared outbound HTTP client, and the mock registry under test).
+        // A `std::sync::RwLock` is not reentrant, so resolving inside the
+        // closure takes a read lock on a lock this thread already holds for
+        // writing — and the request hangs forever. `Notifications` can resolve
+        // inline only because its closure touches nothing but the database
+        // pool.
+        //
+        // Building before the lock costs at most a redundant construction when
+        // two requests race; `extension_or_insert_with` re-checks under the
+        // lock, so exactly one is stored and the loser is dropped.
+        let resolved = Self::default_for(state);
+        // `extension_or_insert_with` keeps the resolved service (and thus the
+        // memory store's contents) stable across requests.
+        Ok((*state.extension_or_insert_with::<Self>(|| resolved)).clone())
+    }
+}
+
+/// The origin of an endpoint URL, for logging.
+///
+/// A full push endpoint URL is a **capability**: anyone holding one can send
+/// to that device. Logs are copied, shipped, and retained far more widely than
+/// the subscription table, so framework logs record only the origin — enough
+/// to tell FCM apart from Mozilla autopush when diagnosing a delivery problem,
+/// and useless to anyone who reads the log.
+fn endpoint_origin(endpoint: &str) -> String {
+    url::Url::parse(endpoint).map_or_else(
+        |_| "<unparseable>".to_owned(),
+        |parsed| parsed.origin().ascii_serialization(),
+    )
 }
 
 impl std::fmt::Debug for WebPush {
@@ -535,7 +702,7 @@ mod tests {
         plaintext
     }
 
-    async fn web_push_with(transport: RecordingPushTransport) -> (WebPush, VapidKey) {
+    fn web_push_with(transport: RecordingPushTransport) -> (WebPush, VapidKey) {
         let vapid = VapidKey::generate();
         let push = WebPush::new(
             MemoryPushSubscriptionStore::new(),
@@ -572,12 +739,12 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_records_the_subscription_for_the_principal() {
-        let (push, _) = web_push_with(RecordingPushTransport::new()).await;
+        let (push, _) = web_push_with(RecordingPushTransport::new());
         let stored = push
             .subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
             .await
             .expect("subscribe");
-        assert_eq!(stored.principal_id, "7");
+        assert_eq!(stored.principal_id(), "7");
         let report = push
             .send(7_i64, &PushMessage::new("Hi", "There"))
             .await
@@ -590,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_rejects_a_malformed_payload_rather_than_storing_it() {
-        let (push, _) = web_push_with(RecordingPushTransport::new()).await;
+        let (push, _) = web_push_with(RecordingPushTransport::new());
         let mut bad = browser_subscription("https://push.example.com/a");
         bad.keys.auth = URL_SAFE_NO_PAD.encode([0_u8; 4]);
         let err = push.subscribe(7_i64, &bad).await.expect_err("rejected");
@@ -602,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe_removes_only_the_callers_own_endpoint() {
-        let (push, _) = web_push_with(RecordingPushTransport::new()).await;
+        let (push, _) = web_push_with(RecordingPushTransport::new());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
             .await
             .expect("subscribe");
@@ -631,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribing_an_unknown_endpoint_reports_false_not_an_error() {
-        let (push, _) = web_push_with(RecordingPushTransport::new()).await;
+        let (push, _) = web_push_with(RecordingPushTransport::new());
         assert!(
             !push
                 .unsubscribe(7_i64, "https://push.example.com/never")
@@ -645,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn send_dispatches_to_the_recorded_endpoint() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/abc"))
             .await
             .expect("subscribe");
@@ -669,7 +836,7 @@ mod tests {
         use p256::ecdsa::signature::Verifier;
 
         let transport = RecordingPushTransport::new();
-        let (push, vapid) = web_push_with(transport.clone()).await;
+        let (push, vapid) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/abc"))
             .await
             .expect("subscribe");
@@ -713,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn dispatched_request_carries_the_aes128gcm_content_headers() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/abc"))
             .await
             .expect("subscribe");
@@ -739,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn dispatched_body_decrypts_to_the_message_in_the_browser() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/abc"))
             .await
             .expect("subscribe");
@@ -762,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn each_device_gets_its_own_request() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             7_i64,
             &browser_subscription("https://push.example.com/laptop"),
@@ -799,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn every_message_gets_fresh_encryption_material() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/abc"))
             .await
             .expect("subscribe");
@@ -822,7 +989,7 @@ mod tests {
     async fn a_410_gone_prunes_the_subscription() {
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/dead", 410);
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             7_i64,
             &browser_subscription("https://push.example.com/dead"),
@@ -858,7 +1025,7 @@ mod tests {
     async fn a_404_not_found_also_prunes() {
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/gone", 404);
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             7_i64,
             &browser_subscription("https://push.example.com/gone"),
@@ -882,7 +1049,7 @@ mod tests {
         // permission.
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/a", 503);
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
             .await
             .expect("subscribe");
@@ -910,7 +1077,7 @@ mod tests {
     async fn one_dead_device_does_not_stop_delivery_to_the_others() {
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/dead", 410);
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             7_i64,
             &browser_subscription("https://push.example.com/dead"),
@@ -935,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn sending_to_a_principal_with_no_subscriptions_is_a_no_op() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         let report = push
             .send(99_i64, &PushMessage::new("Hi", "There"))
             .await
@@ -970,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn vapid_public_key_is_the_browsers_application_server_key() {
-        let (push, vapid) = web_push_with(RecordingPushTransport::new()).await;
+        let (push, vapid) = web_push_with(RecordingPushTransport::new());
         assert_eq!(
             push.vapid_public_key().expect("configured"),
             vapid.public_key_base64url()
@@ -993,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversize_message_is_refused_before_any_dispatch() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
             .await
             .expect("subscribe");
@@ -1014,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn send_many_fans_out_across_principals() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(1_i64, &browser_subscription("https://push.example.com/one"))
             .await
             .expect("subscribe");
@@ -1040,7 +1207,7 @@ mod tests {
     async fn send_many_aggregates_pruning_across_principals() {
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/dead", 410);
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             1_i64,
             &browser_subscription("https://push.example.com/dead"),
@@ -1068,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn send_many_accepts_string_principals_too() {
         let transport = RecordingPushTransport::new();
-        let (push, _) = web_push_with(transport.clone()).await;
+        let (push, _) = web_push_with(transport.clone());
         push.subscribe(
             "service:ci",
             &browser_subscription("https://push.example.com/ci"),
@@ -1081,6 +1248,254 @@ mod tests {
                 .expect("send_many")
                 .delivered,
             1
+        );
+    }
+
+    // ── TTL and clock ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ttl_defaults_to_the_documented_value() {
+        // `ttl.parse().is_ok()` would pass for `0`, which means
+        // deliver-now-or-drop — a real behavioural difference for the offline
+        // device this feature exists to reach.
+        let transport = RecordingPushTransport::new();
+        let (push, _) = web_push_with(transport.clone());
+        push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+            .await
+            .expect("subscribe");
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+        assert_eq!(
+            transport.requests()[0].header("ttl"),
+            Some(DEFAULT_TTL_SECS.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_ttl_reaches_the_dispatched_header() {
+        let transport = RecordingPushTransport::new();
+        let (push, _) = web_push_with(transport.clone());
+        let push = push.with_ttl_secs(60);
+        push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+            .await
+            .expect("subscribe");
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+        assert_eq!(transport.requests()[0].header("ttl"), Some("60"));
+    }
+
+    #[tokio::test]
+    async fn the_jwt_exp_is_anchored_to_the_frameworks_clock() {
+        // A broken clock (or the `unwrap_or(0)` in `build_request` firing)
+        // would put `exp` in 1970 and make every real send be rejected by the
+        // push service — with signature verification still passing, so no
+        // other test would notice.
+        use chrono::{TimeZone as _, Utc};
+
+        let issued = Utc.timestamp_opt(1_800_000_000, 0).single().expect("time");
+        let transport = RecordingPushTransport::new();
+        let (push, _) = web_push_with(transport.clone());
+        let push = push.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(issued)));
+        push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+            .await
+            .expect("subscribe");
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+
+        let authorization = transport.requests()[0]
+            .header("authorization")
+            .expect("header")
+            .to_owned();
+        let jwt = authorization
+            .strip_prefix("vapid t=")
+            .and_then(|rest| rest.split_once(", k="))
+            .expect("vapid header")
+            .0
+            .to_owned();
+        let claims = URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(1).expect("claims"))
+            .expect("base64url");
+        let claims: serde_json::Value = serde_json::from_slice(&claims).expect("json");
+        assert_eq!(
+            claims["exp"].as_u64().expect("exp"),
+            1_800_000_000 + crate::push::vapid::VAPID_TOKEN_TTL_SECS,
+            "exp must be derived from the injected clock, not wall time or zero"
+        );
+    }
+
+    // ── Store failures ──────────────────────────────────────────────────────
+
+    /// A store whose every operation fails, for the paths
+    /// [`MemoryPushSubscriptionStore`] can never reach.
+    #[derive(Debug, Default)]
+    struct BrokenStore;
+
+    impl PushSubscriptionStore for BrokenStore {
+        async fn save(&self, _subscription: StoredSubscription) -> Result<(), PushError> {
+            Err(PushError::Store("save exploded".to_owned()))
+        }
+        async fn list_for(
+            &self,
+            _principal_id: &str,
+        ) -> Result<Vec<StoredSubscription>, PushError> {
+            Err(PushError::Store("list exploded".to_owned()))
+        }
+        async fn remove(
+            &self,
+            _endpoint: &str,
+            _principal_id: Option<&str>,
+        ) -> Result<u64, PushError> {
+            Err(PushError::Store("remove exploded".to_owned()))
+        }
+    }
+
+    /// A store that reads fine but cannot delete — the shape that makes a
+    /// prune fail after the message has already been dispatched.
+    #[derive(Debug)]
+    struct UnprunableStore(MemoryPushSubscriptionStore);
+
+    impl PushSubscriptionStore for UnprunableStore {
+        async fn save(&self, subscription: StoredSubscription) -> Result<(), PushError> {
+            self.0.save(subscription).await
+        }
+        async fn list_for(&self, principal_id: &str) -> Result<Vec<StoredSubscription>, PushError> {
+            self.0.list_for(principal_id).await
+        }
+        async fn remove(
+            &self,
+            _endpoint: &str,
+            _principal_id: Option<&str>,
+        ) -> Result<u64, PushError> {
+            Err(PushError::Store("remove exploded".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_on_read_surfaces_rather_than_reporting_zero_deliveries() {
+        let push = WebPush::new(
+            BrokenStore,
+            VapidKey::generate(),
+            "mailto:ops@example.com",
+            RecordingPushTransport::new(),
+        );
+        let err = push
+            .send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect_err("a broken store must not look like `no subscriptions`");
+        assert!(matches!(err, PushError::Store(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_prune_does_not_abort_delivery_to_the_other_devices() {
+        // The prune happens AFTER dispatch. Propagating a store failure there
+        // would discard the deliveries that already succeeded and skip the
+        // ones still to come — the opposite of "a dead device never blocks a
+        // live one".
+        let transport =
+            RecordingPushTransport::new().responding_with("https://push.example.com/dead", 410);
+        let push = WebPush::new(
+            UnprunableStore(MemoryPushSubscriptionStore::new()),
+            VapidKey::generate(),
+            "mailto:ops@example.com",
+            transport.clone(),
+        );
+        push.subscribe(
+            7_i64,
+            &browser_subscription("https://push.example.com/dead"),
+        )
+        .await
+        .expect("subscribe");
+        push.subscribe(
+            7_i64,
+            &browser_subscription("https://push.example.com/live"),
+        )
+        .await
+        .expect("subscribe");
+
+        let report = push
+            .send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("a prune failure must not fail the send");
+        assert_eq!(
+            report.delivered, 1,
+            "the live device must still be reported as delivered"
+        );
+        assert!(
+            report.pruned.is_empty(),
+            "nothing was actually pruned, so nothing may be reported as pruned"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(transport.requests().len(), 2, "both devices were attempted");
+    }
+
+    // ── Cross-origin fan-out ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn each_endpoint_gets_a_jwt_audienced_to_its_own_push_service() {
+        // Real deployments mix FCM, Mozilla autopush and WNS. A bug that
+        // computed `aud` once — or reused one Authorization header across
+        // devices — would pass every single-origin test and then be rejected
+        // by every push service but the first.
+        let transport = RecordingPushTransport::new();
+        let (push, _) = web_push_with(transport.clone());
+        for endpoint in [
+            "https://fcm.googleapis.com/fcm/send/abc",
+            "https://updates.push.services.mozilla.com/wpush/v2/xyz",
+        ] {
+            push.subscribe(7_i64, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+
+        for request in transport.requests() {
+            let authorization = request.header("authorization").expect("header");
+            let jwt = authorization
+                .strip_prefix("vapid t=")
+                .and_then(|rest| rest.split_once(", k="))
+                .expect("vapid header")
+                .0;
+            let claims = URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).expect("claims"))
+                .expect("base64url");
+            let claims: serde_json::Value = serde_json::from_slice(&claims).expect("json");
+            let expected = url::Url::parse(&request.endpoint)
+                .expect("endpoint parses")
+                .origin()
+                .ascii_serialization();
+            assert_eq!(
+                claims["aud"], expected,
+                "each request's aud must be ITS OWN endpoint's origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_device_gets_its_own_encryption_material() {
+        // One ephemeral key or salt reused across two subscriptions in the
+        // same send would be an actual cryptographic break.
+        let transport = RecordingPushTransport::new();
+        let (push, _) = web_push_with(transport.clone());
+        for endpoint in ["https://push.example.com/a", "https://push.example.com/b"] {
+            push.subscribe(7_i64, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+
+        let requests = transport.requests();
+        assert_ne!(requests[0].body[..16], requests[1].body[..16], "salt");
+        assert_ne!(
+            requests[0].body[21..86],
+            requests[1].body[21..86],
+            "ephemeral key"
         );
     }
 }

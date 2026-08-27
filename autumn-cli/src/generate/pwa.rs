@@ -12,12 +12,19 @@
 //!   - `tests/system/pwa_smoke.rs`     — Smoke test (manifest content-type + SW registration)
 //!   - `Cargo.toml`                    — `system-tests` feature added if absent
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
+use autumn_web::config::DatabaseBackend;
+use autumn_web::push::PUSH_SUBSCRIPTIONS_TABLE;
+
+use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
 use super::emit::Plan;
-use super::schema_edit::update_main_rs;
+use super::schema_edit::{
+    create_table_sql_with_metadata_and_id_for, drop_table_sql, update_main_rs,
+};
 use super::system_test::patch_cargo_toml as patch_system_test_cargo_toml;
-use super::{GenerateError, ensure_project_root};
+use super::{GenerateError, detect_backend, ensure_project_root, timestamp_now};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -70,6 +77,32 @@ fn plan_pwa_shared(project_root: &Path) -> Plan {
             "pwa_offline".to_owned(),
         ],
     });
+
+    // migrations/<ts>_create_push_subscriptions/{up,down}.sql — the table the
+    // framework's `DbPushSubscriptionStore` reads (issue #1392).
+    //
+    // Like the notifications feed, push subscriptions are a singleton scaffold:
+    // re-running (especially with `--force`) must not mint a SECOND
+    // `*_create_push_subscriptions` directory, since two `CREATE TABLE
+    // push_subscriptions` migrations would fail the next `autumn migrate` on
+    // the duplicate table and make destroy's suffix match ambiguous. So reuse
+    // an existing directory when one is present, minting a fresh timestamped
+    // one only on a clean project.
+    let backend = detect_backend(project_root);
+    let migration_dir = existing_push_migration_dir(project_root).unwrap_or_else(|| {
+        project_root.join("migrations").join(format!(
+            "{}_create_{PUSH_SUBSCRIPTIONS_TABLE}",
+            timestamp_now()
+        ))
+    });
+    plan.create(
+        migration_dir.join("up.sql"),
+        push_subscriptions_up_sql(backend),
+    );
+    plan.create(
+        migration_dir.join("down.sql"),
+        drop_table_sql(PUSH_SUBSCRIPTIONS_TABLE),
+    );
 
     // System test
     let system_test_path = project_root
@@ -124,6 +157,18 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
 
     // src/main.rs: inject PWA meta tags + route handlers (idempotent)
     let updated_main = inject_pwa_into_main(&main_existing);
+    // A silently unmounted router is the worst outcome here: the command exits
+    // 0, the client snippet ships, and every `fetch` it makes 404s with
+    // nothing pointing at the cause. Say so instead.
+    if !updated_main.contains("autumn_web::push::router()") {
+        plan.warn(
+            "could not find the app builder in src/main.rs, so the Web Push routes were not \
+             mounted. Add this line to your builder chain by hand:\n    \
+             .merge(autumn_web::push::router())\n  \
+             Without it the generated subscribe snippet will 404. See \
+             docs/guide/web-push.md.",
+        );
+    }
     if updated_main != main_existing {
         plan.modify(main_path, updated_main);
     }
@@ -156,6 +201,88 @@ pub fn plan_pwa_destroy_fallback(project_root: &Path) -> Result<Plan, GenerateEr
 }
 
 // ── Content renderers ─────────────────────────────────────────────────────────
+
+/// The existing `migrations/<ts>_create_push_subscriptions/` directory, if the
+/// project already has one — so a re-run reuses it in place rather than
+/// minting a second singleton migration. Matched by the same
+/// `_create_push_subscriptions` suffix destroy uses, so the two stay in
+/// agreement. If more than one somehow exists (a hand-added duplicate), the
+/// lexicographically-smallest is chosen deterministically.
+fn existing_push_migration_dir(project_root: &Path) -> Option<PathBuf> {
+    let suffix = format!("_create_{PUSH_SUBSCRIPTIONS_TABLE}");
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(project_root.join("migrations"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
+}
+
+/// The four non-`id` columns of the `push_subscriptions` table, expressed in
+/// the migration DSL so the DDL comes out of the same shared helper every
+/// other generator uses (`id` and `created_at` come from the helper itself).
+///
+/// The column types must match the framework store's diesel `table!` in
+/// `autumn_web::push::store` (`Text` throughout; `Timestamptz` on Postgres,
+/// `TimestamptzSqlite` — RFC 3339 `TEXT` — on SQLite): that store, not any
+/// generated model, is what reads this table. The two key columns hold the
+/// browser's own base64url strings rather than raw bytes, which keeps one
+/// `table!` definition working on both backends.
+fn push_subscription_fields() -> Vec<Field> {
+    let field = |name: &str, unique: bool| Field {
+        name: name.to_owned(),
+        kind: FieldKind::String,
+        nullable: false,
+        variants: Vec::new(),
+        unique,
+        constraints: FieldConstraints::default(),
+        state_machine: None,
+    };
+    vec![
+        field("principal_id", false),
+        // UNIQUE is load-bearing, not decoration: it is what makes the store's
+        // `ON CONFLICT (endpoint) DO UPDATE` upsert atomic rather than a racy
+        // select-then-insert, and what stops one browser accumulating a row
+        // per page load.
+        field("endpoint", true),
+        field("p256dh", false),
+        field("auth", false),
+    ]
+}
+
+/// Build the `push_subscriptions` `up.sql` for the target `backend`.
+///
+/// The shared helper's stock `created_at` is `TIMESTAMP`; the Postgres output
+/// rewrites that one column to `TIMESTAMPTZ` to stay in lockstep with the
+/// framework store's `Timestamptz` mapping — the same adjustment the
+/// notifications generator makes, for the same reason. The `SQLite` output
+/// already matches and is left exactly as the helper emits it.
+fn push_subscriptions_up_sql(backend: DatabaseBackend) -> String {
+    let indexes: BTreeSet<String> = std::iter::once("principal_id".to_owned()).collect();
+    let sql = create_table_sql_with_metadata_and_id_for(
+        backend,
+        PUSH_SUBSCRIPTIONS_TABLE,
+        &push_subscription_fields(),
+        &indexes,
+        &BTreeMap::new(),
+        IdType::BigSerial,
+    );
+    match backend {
+        DatabaseBackend::Postgres => sql.replace(
+            "created_at TIMESTAMP NOT NULL DEFAULT NOW()",
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ),
+        DatabaseBackend::Sqlite => sql,
+    }
+}
 
 fn render_manifest() -> String {
     concat!(
@@ -236,6 +363,67 @@ self.addEventListener('fetch', (event) => {
     );
   }
 });
+
+// ── Web Push ────────────────────────────────────────────────────────────────
+// Fired by the browser even when every tab of this site is closed. The payload
+// is what `autumn_web::push::PushMessage` serializes: {title, body, url?, icon?}.
+
+self.addEventListener('push', (event) => {
+  // A push can legitimately arrive with no payload, and a payload from any
+  // other sender need not be JSON. Throwing here makes the browser show a
+  // generic 'site updated in the background' notice instead, so always fall
+  // back to something readable.
+  let payload = {};
+  if (event.data) {
+    try {
+      payload = event.data.json();
+    } catch (e) {
+      payload = { body: event.data.text() };
+    }
+  }
+  const title = payload.title || 'Notification';
+  const options = {
+    body: payload.body || '',
+    icon: payload.icon || '/static/icons/icon.svg',
+    // Carried through to `notificationclick` below.
+    data: { url: payload.url || '/' },
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = new URL(
+    (event.notification.data && event.notification.data.url) || '/',
+    self.location.origin
+  );
+  // Cross-origin targets are dropped: the payload travels through a third-party
+  // push service, so a notification must never be able to navigate this app's
+  // users off-origin.
+  const url = target.origin === self.location.origin ? target.href : self.location.origin + '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
+      // Prefer focusing a tab that is already on the target rather than
+      // opening a duplicate one.
+      for (const client of windows) {
+        if (client.url === url && 'focus' in client) {
+          return client.focus();
+        }
+      }
+      if (windows.length > 0 && 'navigate' in windows[0] && 'focus' in windows[0]) {
+        // `navigate()` REJECTS for a client this service worker does not
+        // control — and `includeUncontrolled: true` above is exactly how such
+        // clients get into this list. An unhandled rejection inside
+        // `waitUntil` means the click does nothing at all, so fall back.
+        return windows[0]
+          .navigate(url)
+          .then((client) => (client ? client.focus() : undefined))
+          .catch(() => self.clients.openWindow(url));
+      }
+      return self.clients.openWindow(url);
+    })
+  );
+});
 "
     .to_owned()
 }
@@ -267,12 +455,130 @@ fn render_maskable_icon_svg() -> String {
 fn render_pwa_register_js() -> String {
     // Served as a same-origin script to avoid CSP `script-src 'self'` blocking
     // inline scripts that the default SecurityHeadersLayer enforces.
-    "if('serviceWorker'in navigator)\
-     navigator.serviceWorker\
-     .register('/service-worker.js',{scope:'/'})\
-     .then(()=>document.documentElement.dataset.swRegistered='true')\
-     .catch(console.error);\n"
-        .to_owned()
+    //
+    // Two halves: service-worker registration (unconditional), and Web Push
+    // opt-in (issue #1392), which is deliberately NOT run on load — a
+    // permission prompt fired without a user gesture is the fastest way to get
+    // permanently blocked, and both Chrome and Firefox penalise it. Instead the
+    // subscribe flow is exposed as `window.autumnPushSubscribe()` and wired to
+    // any element carrying `data-autumn-push-subscribe`, so an app gets an
+    // opt-in button with no JavaScript of its own:
+    //
+    //     <button data-autumn-push-subscribe>Enable notifications</button>
+    //
+    // The paths below come from `autumn_web::push::router`'s own constants, so
+    // the snippet and the mounted routes can never drift apart.
+    format!(
+        r"if ('serviceWorker' in navigator) {{
+  navigator.serviceWorker
+    .register('/service-worker.js', {{ scope: '/' }})
+    .then(() => {{ document.documentElement.dataset.swRegistered = 'true'; }})
+    .catch(console.error);
+}}
+
+// Autumn's CSRF layer rejects an unaccompanied mutating request, so read the
+// token the layout publishes and send it on both POSTs below. Without this the
+// subscribe/unsubscribe calls 403 the moment `[security.csrf] enabled = true`
+// — and the tempting workaround (exempting `/push/`) would strip CSRF from a
+// route whose entire body is client-chosen.
+function autumnPushHeaders() {{
+  const headers = {{ 'content-type': 'application/json' }};
+  // Unquoted attribute values (both are valid CSS identifiers) so this stays
+  // inside a Rust raw string that cannot contain a double quote.
+  const token = document.querySelector('meta[name=csrf-token]');
+  if (token && token.content) {{
+    const header = document.querySelector('meta[name=csrf-token-header]');
+    headers[(header && header.content) || 'X-CSRF-Token'] = token.content;
+  }}
+  return headers;
+}}
+
+// `applicationServerKey` takes a BufferSource, not the base64url string the
+// endpoint serves, and `atob` only understands standard base64 — so translate
+// base64url's `-` and `_` back to `+` and `/` and re-pad before decoding.
+function autumnDecodeVapidKey(base64url) {{
+  const padding = '='.repeat((4 - (base64url.length % 4)) % 4);
+  const base64 = (base64url + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) {{
+    bytes[i] = raw.charCodeAt(i);
+  }}
+  return bytes;
+}}
+
+// Opt the current visitor in to Web Push. Call it from a click handler — it
+// prompts for notification permission, so it needs a user gesture.
+// Resolves `true` once the subscription has been recorded server-side.
+window.autumnPushSubscribe = async function autumnPushSubscribe() {{
+  // Safari on older iOS has service workers but no Push API at all.
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+    return false;
+  }}
+  if ((await Notification.requestPermission()) !== 'granted') {{
+    return false;
+  }}
+  const response = await fetch('{key_path}');
+  if (!response.ok) {{
+    // 503 means the app has not configured `[push] private_key` yet.
+    console.error('web push is not configured on this server');
+    return false;
+  }}
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.subscribe({{
+    // Chrome refuses a subscription without this, and it is also the honest
+    // contract: every push this app sends raises a visible notification.
+    userVisibleOnly: true,
+    applicationServerKey: autumnDecodeVapidKey((await response.text()).trim()),
+  }});
+  const recorded = await fetch('{subscribe_path}', {{
+    method: 'POST',
+    headers: autumnPushHeaders(),
+    // Send the session cookie so the server knows whose subscription this is.
+    credentials: 'same-origin',
+    body: JSON.stringify(subscription),
+  }});
+  return recorded.ok;
+}};
+
+// Undo the above: forget this browser's subscription, server-side and locally.
+window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+    return false;
+  }}
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {{
+    return true;
+  }}
+  await fetch('{unsubscribe_path}', {{
+    method: 'POST',
+    headers: autumnPushHeaders(),
+    credentials: 'same-origin',
+    body: JSON.stringify({{ endpoint: subscription.endpoint }}),
+  }});
+  return subscription.unsubscribe();
+}};
+
+// Declarative opt-in: no application JavaScript required.
+document.addEventListener('click', (event) => {{
+  // A synthetic `document.dispatchEvent(new MouseEvent('click'))` — the common
+  // close-the-open-dropdown idiom — has `document` as its target, which has no
+  // `closest`. Guard rather than throw on every such click.
+  if (!(event.target instanceof Element)) {{
+    return;
+  }}
+  const trigger = event.target.closest('[data-autumn-push-subscribe]');
+  if (trigger) {{
+    event.preventDefault();
+    window.autumnPushSubscribe().catch(console.error);
+  }}
+}});
+",
+        key_path = autumn_web::push::router::VAPID_PUBLIC_KEY_PATH,
+        subscribe_path = autumn_web::push::router::SUBSCRIBE_PATH,
+        unsubscribe_path = autumn_web::push::router::UNSUBSCRIBE_PATH,
+    )
 }
 
 fn render_pwa_system_test() -> String {
@@ -396,13 +702,131 @@ fn render_pwa_system_test() -> String {
 pub fn inject_pwa_into_main(source: &str) -> String {
     let with_meta = inject_pwa_meta_into_head(source);
     let with_handlers = inject_pwa_handlers(&with_meta);
+    let with_push_router = inject_push_router(&with_handlers);
     let route_entries = vec![
         "pwa_manifest".to_owned(),
         "pwa_service_worker".to_owned(),
         "pwa_register_js".to_owned(),
         "pwa_offline".to_owned(),
     ];
-    update_main_rs(&with_handlers, &[], &route_entries)
+    update_main_rs(&with_push_router, &[], &route_entries)
+}
+
+/// The trailing marker on the mount line [`inject_push_router`] inserts.
+///
+/// Load-bearing for [`remove_push_router`]: destroy must remove only the line
+/// *this generator* wrote. Without a marker it would also delete a mount the
+/// developer had written themselves before ever running the generator — which
+/// `Plan::revert` documents it never does.
+const PUSH_ROUTER_MARKER: &str = "// added by `autumn generate pwa`";
+
+/// The line [`inject_push_router`] inserts, and [`remove_push_router`] removes.
+///
+/// Mounting the framework's built-in push routes is what makes the generated
+/// client snippet work: without it every `fetch` in `pwa-register.js` 404s.
+const PUSH_ROUTER_LINE: &str =
+    "        .merge(autumn_web::push::router()) // added by `autumn generate pwa`";
+
+/// Mount `autumn_web::push::router()` on the app builder in `main()`.
+///
+/// Anchored on the `autumn_web::app()` line that every scaffolded `main.rs`
+/// opens its builder chain with. Idempotent, and — like
+/// [`inject_pwa_meta_into_head`] — a **no-op** when no usable anchor is found,
+/// rather than a guess: an app whose `main.rs` has been restructured keeps
+/// compiling and mounts the router itself with the one line the guide shows.
+/// The caller reports that no-op as a warning; a silently unmounted router
+/// would look like success and 404 on every call from the generated snippet.
+///
+/// # Anchor selection
+///
+/// Matching `autumn_web::app()` by text alone is not safe: this project's own
+/// documentation (and `autumn_web::push::router`'s doc comment) shows a
+/// quick-start snippet containing that exact line, so a `main.rs` that pasted
+/// it into a comment would get the mount spliced **into the comment** —
+/// producing a file that does not compile *and* a `main()` that never mounts
+/// the router. So the scan walks lines with a byte cursor (never re-locating
+/// by text, which could land on an earlier occurrence), skips anything inside
+/// a comment, and only accepts an anchor at or after `async fn main`.
+fn inject_push_router(source: &str) -> String {
+    if source.contains("autumn_web::push::router()") {
+        return source.to_owned();
+    }
+    let Some(anchor_end) = push_router_anchor(source) else {
+        return source.to_owned();
+    };
+    let mut result = String::with_capacity(source.len() + PUSH_ROUTER_LINE.len() + 1);
+    result.push_str(&source[..anchor_end]);
+    result.push('\n');
+    result.push_str(PUSH_ROUTER_LINE);
+    result.push_str(&source[anchor_end..]);
+    result
+}
+
+/// Byte offset just past the builder-opening `autumn_web::app()` inside
+/// `main()`, or `None` when there is no unambiguous anchor.
+///
+/// See [`inject_push_router`]'s "Anchor selection" for why each rule is here.
+fn push_router_anchor(source: &str) -> Option<usize> {
+    let mut offset = 0_usize;
+    let mut in_block_comment = false;
+    let mut seen_main = false;
+
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let line_start = offset;
+        offset += line.len();
+
+        // Track block comments so a commented-out builder never anchors.
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        // `//`, `///`, `//!`, and continuation lines of a block comment.
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            continue;
+        }
+
+        if trimmed.contains("async fn main") {
+            seen_main = true;
+        }
+        // Only a line that ENDS with the builder opener is an anchor: a
+        // single-line chain (`autumn_web::app().routes(…).run().await;`) has
+        // no place to insert a `.merge(…)` line, so it is deliberately left
+        // alone and reported instead of being spliced mid-expression.
+        if seen_main && line.trim_end().ends_with("autumn_web::app()") {
+            return Some(line_start + line.trim_end().len());
+        }
+    }
+    None
+}
+
+/// Inverse of [`inject_push_router`]: remove exactly the line it inserted.
+///
+/// Matched on the [`PUSH_ROUTER_MARKER`] this generator writes, so a mount the
+/// developer added themselves is left untouched — `Plan::revert`'s contract is
+/// that it never removes content the plan did not itself add. A no-op when the
+/// marked line is absent (already destroyed, or hand-edited away).
+fn remove_push_router(existing: &str) -> String {
+    if !existing.contains(PUSH_ROUTER_MARKER) {
+        return existing.to_owned();
+    }
+    let mut out = String::with_capacity(existing.len());
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.contains("autumn_web::push::router()") && trimmed.ends_with(PUSH_ROUTER_MARKER) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Insert PWA `<link>` / `<meta>` tags into the `head {}` block of the
@@ -644,7 +1068,8 @@ fn indent_count(line: &str) -> usize {
 /// handler functions this generator injected. A no-op wherever its target
 /// isn't present (already destroyed, or hand-edited away).
 pub(super) fn remove_pwa_injection(existing: &str) -> String {
-    let without_handlers = remove_pwa_handlers(existing);
+    let without_router = remove_push_router(existing);
+    let without_handlers = remove_pwa_handlers(&without_router);
     remove_pwa_meta_from_head(&without_handlers)
 }
 
@@ -1520,5 +1945,400 @@ async fn main() {
         );
         let after = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert_eq!(original_main, after, "dry-run must not modify main.rs");
+    }
+
+    // ── Web Push (issue #1392) ──────────────────────────────────────────────
+
+    /// The text an emitted action would write.
+    fn action_contents(action: &crate::generate::emit::Action) -> String {
+        match action {
+            crate::generate::emit::Action::Create { contents, .. }
+            | crate::generate::emit::Action::Modify { contents, .. }
+            | crate::generate::emit::Action::CreateIfAbsent { contents, .. } => contents.clone(),
+            crate::generate::emit::Action::CreateBytes { bytes, .. } => {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
+    }
+
+    #[test]
+    fn service_worker_has_a_push_handler() {
+        let sw = render_service_worker();
+        assert!(
+            sw.contains("addEventListener('push'"),
+            "without a `push` handler the browser shows nothing when the tab is closed — \
+             the entire point of Web Push:\n{sw}"
+        );
+        assert!(
+            sw.contains("showNotification"),
+            "the push handler must actually raise a notification:\n{sw}"
+        );
+    }
+
+    #[test]
+    fn push_handler_reads_the_frameworks_json_payload() {
+        let sw = render_service_worker();
+        // The framework sends `{title, body, url?, icon?}` — the SW must read
+        // those exact keys or every notification renders blank.
+        for key in ["title", "body", "icon"] {
+            assert!(
+                sw.contains(key),
+                "the push handler must read `{key}` from the payload:\n{sw}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_handler_survives_a_payload_that_is_not_json() {
+        // A push with no payload (or a non-JSON one from another sender) must
+        // still show *something* rather than throwing inside the SW, which
+        // browsers surface as a generic "site updated in the background".
+        let sw = render_service_worker();
+        assert!(
+            sw.contains("catch"),
+            "the push handler must guard payload parsing:\n{sw}"
+        );
+    }
+
+    #[test]
+    fn service_worker_has_a_notificationclick_handler_that_focuses_or_opens() {
+        let sw = render_service_worker();
+        assert!(
+            sw.contains("addEventListener('notificationclick'"),
+            "clicking a notification must do something:\n{sw}"
+        );
+        assert!(
+            sw.contains("clients.matchAll"),
+            "clicking must FOCUS an already-open tab rather than always opening \
+             a duplicate one:\n{sw}"
+        );
+        assert!(
+            sw.contains("openWindow"),
+            "…and open a new window when none is focusable:\n{sw}"
+        );
+        assert!(
+            sw.contains("notification.close()"),
+            "the notification must be dismissed on click:\n{sw}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_subscribes_against_the_frameworks_public_key_endpoint() {
+        let js = render_pwa_register_js();
+        assert!(
+            js.contains(autumn_web::push::router::VAPID_PUBLIC_KEY_PATH),
+            "the snippet must fetch the key from the built-in endpoint so the two \
+             can never drift:\n{js}"
+        );
+        assert!(
+            js.contains(autumn_web::push::router::SUBSCRIBE_PATH),
+            "the snippet must POST the subscription to the built-in endpoint:\n{js}"
+        );
+        assert!(
+            js.contains("pushManager.subscribe"),
+            "the snippet must actually subscribe:\n{js}"
+        );
+        assert!(
+            js.contains("userVisibleOnly"),
+            "Chrome refuses a subscription without `userVisibleOnly: true`:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_converts_the_key_to_the_uint8array_the_api_requires() {
+        // `applicationServerKey` takes a BufferSource, not the base64url
+        // string the endpoint serves; passing the string fails at runtime.
+        let js = render_pwa_register_js();
+        assert!(
+            js.contains("Uint8Array"),
+            "the base64url key must be decoded to a Uint8Array:\n{js}"
+        );
+        assert!(js.contains("atob"), "…via base64 decoding:\n{js}");
+        assert!(
+            js.contains("replace"),
+            "…after translating base64url's -/_ back to +/ for atob:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_never_prompts_for_permission_on_page_load() {
+        // A permission prompt fired on load is the single fastest way to get
+        // permanently blocked, and Chrome/Firefox both penalise it. The
+        // snippet must expose an explicit opt-in instead.
+        //
+        // The check has to be positional, not a substring test: `contains`
+        // cannot tell a call INSIDE `autumnPushSubscribe` from one at top
+        // level, which is exactly the failure being guarded against. So find
+        // every `requestPermission` and require each to sit inside a function
+        // body — i.e. on an indented line.
+        let js = render_pwa_register_js();
+        let prompts: Vec<&str> = js
+            .lines()
+            .filter(|line| line.contains("requestPermission"))
+            .collect();
+        assert!(
+            !prompts.is_empty(),
+            "the snippet must request permission somewhere:\n{js}"
+        );
+        for line in prompts {
+            assert!(
+                line.starts_with(' '),
+                "`requestPermission` must be called inside the opt-in function, never at \
+                 top level where it would run on page load:\n{line}"
+            );
+        }
+        assert!(
+            js.contains("window.autumnPushSubscribe = "),
+            "the snippet must expose a callable opt-in entry point:\n{js}"
+        );
+        assert!(
+            js.contains("data-autumn-push-subscribe"),
+            "…and wire it to a declarative opt-in attribute so an app needs no JS \
+             of its own:\n{js}"
+        );
+    }
+
+    #[test]
+    fn client_snippet_skips_push_entirely_when_the_browser_lacks_support() {
+        let js = render_pwa_register_js();
+        assert!(
+            js.contains("PushManager"),
+            "the snippet must feature-detect before touching the Push API — Safari \
+             on older iOS has service workers but no PushManager:\n{js}"
+        );
+    }
+
+    #[test]
+    fn plan_creates_the_push_subscriptions_migration() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let plan = plan_pwa(tmp.path()).unwrap();
+        let up = plan
+            .actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .contains("create_push_subscriptions")
+                    && a.path().ends_with("up.sql")
+            })
+            .expect("the pwa generator must scaffold the push_subscriptions table");
+        let sql = action_contents(up);
+        assert!(sql.contains("CREATE TABLE"), "{sql}");
+        for column in ["principal_id", "endpoint", "p256dh", "auth"] {
+            assert!(
+                sql.contains(column),
+                "the DDL must match the framework store's columns; missing `{column}`:\n{sql}"
+            );
+        }
+        assert!(
+            sql.to_uppercase().contains("UNIQUE"),
+            "`endpoint` must be UNIQUE — it is what makes the store's upsert atomic \
+             rather than a racy select-then-insert:\n{sql}"
+        );
+    }
+
+    /// Pins the generated Postgres DDL against the exact schema the framework
+    /// store is tested on.
+    ///
+    /// The two live in different crates — `autumn-web`'s tests cannot depend
+    /// on `autumn-cli` — so this assertion and the `CREATE_PUSH_SUBSCRIPTIONS_SQL`
+    /// constant in `autumn/tests/integration/push_end_to_end.rs` are the only
+    /// thing binding them. A column renamed, retyped, or dropped on either
+    /// side fails here.
+    #[test]
+    fn generated_push_ddl_matches_the_ddl_the_framework_store_is_tested_against() {
+        let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
+
+        for column in [
+            "principal_id TEXT NOT NULL",
+            "endpoint TEXT NOT NULL",
+            "p256dh TEXT NOT NULL",
+            "auth TEXT NOT NULL",
+        ] {
+            assert!(
+                sql.contains(column),
+                "the store's diesel `table!` expects `{column}`:\n{sql}"
+            );
+        }
+        assert!(
+            sql.contains("id BIGSERIAL PRIMARY KEY"),
+            "the store selects `id` as BigInt:\n{sql}"
+        );
+        // The store maps `created_at` as `Timestamptz`. The shared helper emits
+        // a plain `TIMESTAMP`, so this generator rewrites that one column — if
+        // the helper's spacing ever changes, the rewrite silently no-ops and
+        // this is what catches it.
+        assert!(
+            sql.contains("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            "`created_at` must be TIMESTAMPTZ to match the store's mapping:\n{sql}"
+        );
+        assert!(
+            !sql.contains("created_at TIMESTAMP NOT NULL"),
+            "the TIMESTAMP → TIMESTAMPTZ rewrite did not apply:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn push_migration_makes_endpoint_unique_specifically() {
+        // `contains("UNIQUE")` alone would pass with the constraint on the
+        // wrong column — and `endpoint` being unique is what makes the store's
+        // `ON CONFLICT (endpoint) DO UPDATE` atomic rather than a racy
+        // select-then-insert.
+        let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
+        let unique_line = sql
+            .lines()
+            .find(|line| line.to_uppercase().contains("UNIQUE"))
+            .unwrap_or_else(|| panic!("no UNIQUE constraint in:\n{sql}"));
+        assert!(
+            unique_line.contains("(endpoint)"),
+            "UNIQUE must be on `endpoint`, not another column: {unique_line}"
+        );
+    }
+
+    #[test]
+    fn push_migration_indexes_principal_id_for_the_send_path() {
+        // Every send does `WHERE principal_id = …`; without the index that is
+        // a sequential scan of every subscription in the system.
+        let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
+        assert!(
+            sql.contains("(principal_id)"),
+            "`principal_id` must be indexed:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn push_migration_is_emitted_for_sqlite_too() {
+        let sql = push_subscriptions_up_sql(DatabaseBackend::Sqlite);
+        assert!(sql.contains("CREATE TABLE"), "{sql}");
+        assert!(
+            !sql.contains("BIGSERIAL"),
+            "SQLite has no BIGSERIAL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("TIMESTAMPTZ"),
+            "the SQLite lane stores RFC 3339 TEXT, matching TimestamptzSqlite:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn push_migration_has_a_matching_down() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let plan = plan_pwa(tmp.path()).unwrap();
+        let down = plan
+            .actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .contains("create_push_subscriptions")
+                    && a.path().ends_with("down.sql")
+            })
+            .expect("every migration needs a down");
+        let sql = action_contents(down);
+        assert!(sql.contains("DROP TABLE"), "{sql}");
+    }
+
+    #[test]
+    fn re_running_reuses_the_existing_push_migration_directory() {
+        // Two `*_create_push_subscriptions` directories would fail the next
+        // `autumn migrate` on the duplicate table — the same singleton rule
+        // the notifications generator follows.
+        let tmp = project_with_main(DEFAULT_MAIN);
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags {
+                force: true,
+                ..Flags::default()
+            })
+            .unwrap();
+
+        let dirs: Vec<_> = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_create_push_subscriptions")
+            })
+            .collect();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "re-running must reuse the existing migration directory, not mint a second"
+        );
+    }
+
+    #[test]
+    fn inject_mounts_the_built_in_push_router() {
+        let injected = inject_pwa_into_main(DEFAULT_MAIN);
+        assert!(
+            injected.contains("autumn_web::push::router()"),
+            "without the router mounted the generated client snippet 404s on every \
+             call:\n{injected}"
+        );
+    }
+
+    #[test]
+    fn inject_push_router_is_idempotent() {
+        let once = inject_pwa_into_main(DEFAULT_MAIN);
+        let twice = inject_pwa_into_main(&once);
+        assert_eq!(once, twice);
+        assert_eq!(
+            twice.matches("autumn_web::push::router()").count(),
+            1,
+            "a second run must not mount the router twice:\n{twice}"
+        );
+    }
+
+    #[test]
+    fn generate_then_destroy_removes_the_push_router_mount_too() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let main_path = tmp.path().join("src/main.rs");
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("autumn_web::push::router()")
+        );
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&main_path).unwrap(),
+            original_main,
+            "destroy must restore main.rs byte-for-byte, router mount included"
+        );
+    }
+
+    #[test]
+    fn dry_run_writes_no_push_files() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags {
+                dry_run: true,
+                ..Flags::default()
+            })
+            .unwrap();
+        assert!(
+            !tmp.path().join("migrations").exists(),
+            "--dry-run must write nothing"
+        );
+        assert!(
+            !fs::read_to_string(tmp.path().join("src/main.rs"))
+                .unwrap()
+                .contains("autumn_web::push::router()")
+        );
     }
 }

@@ -106,23 +106,50 @@ pub struct SubscriptionKeys {
 
 /// A subscription that has been validated and bound to a principal.
 ///
-/// Only [`BrowserSubscription::decode`] produces one, so every value of this
-/// type carries an https endpoint, a `p256dh` that is a real point on P-256,
-/// and a 16-byte `auth` secret.
+/// The fields are private and [`BrowserSubscription::decode`] is the only way
+/// to build one, so every value of this type is *known* to carry a validated,
+/// normalized https endpoint, a `p256dh` that is a real point on P-256, and a
+/// 16-byte `auth` secret. A custom [`PushSubscriptionStore`] therefore never
+/// has to re-validate what it is handed — and cannot be handed anything a
+/// hostile client shaped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSubscription {
     /// Who this subscription delivers to.
-    pub principal_id: String,
-    /// The push service URL. Unique across the store: an endpoint identifies
-    /// exactly one user agent installation.
-    pub endpoint: String,
+    principal_id: String,
+    /// The push service URL, normalized. Unique across the store: an endpoint
+    /// identifies exactly one user agent installation.
+    endpoint: String,
     /// The user agent's P-256 public key, raw (65 bytes, uncompressed).
-    pub p256dh: Vec<u8>,
+    p256dh: Vec<u8>,
     /// The user agent's authentication secret, raw (16 bytes).
-    pub auth: Vec<u8>,
+    auth: Vec<u8>,
 }
 
 impl StoredSubscription {
+    /// Who this subscription delivers to.
+    #[must_use]
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    /// The push service URL, in the normalized form the store keys on.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The user agent's P-256 public key, raw (65 bytes, uncompressed).
+    #[must_use]
+    pub fn p256dh(&self) -> &[u8] {
+        &self.p256dh
+    }
+
+    /// The user agent's authentication secret, raw (16 bytes).
+    #[must_use]
+    pub fn auth(&self) -> &[u8] {
+        &self.auth
+    }
+
     /// The `p256dh` key as the browser sent it.
     #[must_use]
     pub fn p256dh_base64url(&self) -> String {
@@ -204,53 +231,116 @@ impl BrowserSubscription {
 ///
 /// See [`BrowserSubscription::decode`]'s "Endpoint safety" section for why
 /// each rule is here.
+/// The longest endpoint URL that will be stored.
+///
+/// Real push service endpoints are a few hundred bytes. A generous ceiling
+/// stops a client filling the table — and every later `Vec<String>` of pruned
+/// endpoints — with maximum-size rows.
+pub(crate) const MAX_ENDPOINT_LEN: usize = 2048;
+
+/// Check an endpoint URL and return it in **normalized** form.
+///
+/// See [`BrowserSubscription::decode`]'s "Endpoint safety" section for why
+/// each rule is here.
+///
+/// Normalization is load-bearing, not cosmetic: `endpoint` is the store's
+/// unique identity, so returning the raw client string would let
+/// `https://x.example/p`, `https://x.example:443/p`, `https://X.example/p` and
+/// `https://u:p@x.example/p` become four rows that all dispatch to the same
+/// real endpoint — defeating both the upsert and the "re-subscribing never
+/// duplicates" guarantee. `Url`'s own serialization lowercases the host, drops
+/// the scheme's default port, and resolves dot segments; userinfo and fragment
+/// are stripped here because neither is part of the endpoint's identity and a
+/// push service never uses them.
 fn validate_endpoint(endpoint: &str) -> Result<String, PushError> {
     let endpoint = endpoint.trim();
-    let parsed = url::Url::parse(endpoint)
-        .map_err(|e| PushError::InvalidEndpoint(format!("{endpoint}: {e}")))?;
+    if endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(PushError::InvalidEndpoint(format!(
+            "push endpoints must be at most {MAX_ENDPOINT_LEN} bytes, got {}",
+            endpoint.len()
+        )));
+    }
+    // The submitted URL is deliberately NOT echoed in these messages: the
+    // built-in subscribe route surfaces them to the caller, and an endpoint
+    // URL is a capability — anyone holding one can push to that device.
+    let mut parsed = url::Url::parse(endpoint)
+        .map_err(|e| PushError::InvalidEndpoint(format!("not a valid URL: {e}")))?;
     if parsed.scheme() != "https" {
         return Err(PushError::InvalidEndpoint(format!(
-            "{endpoint}: push endpoints must use https, got `{}`",
+            "push endpoints must use https, got `{}`",
             parsed.scheme()
         )));
     }
     match parsed.host() {
         Some(url::Host::Domain(host)) => {
-            let host = host.to_ascii_lowercase();
-            if host == "localhost" || host.ends_with(".localhost") {
-                return Err(PushError::InvalidEndpoint(format!(
-                    "{endpoint}: refusing a loopback push endpoint"
-                )));
+            // `Url` lowercases the host but PRESERVES a trailing dot, and
+            // `localhost.` is the fully-qualified form every resolver maps to
+            // 127.0.0.1 — so the comparison has to strip it, or the loopback
+            // rule is one character away from being bypassed.
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+                return Err(PushError::InvalidEndpoint(
+                    "refusing a loopback push endpoint".to_owned(),
+                ));
             }
         }
         Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
-            return Err(PushError::InvalidEndpoint(format!(
-                "{endpoint}: push endpoints must name a host, not an IP literal"
-            )));
+            return Err(PushError::InvalidEndpoint(
+                "push endpoints must name a host, not an IP literal".to_owned(),
+            ));
         }
         None => {
-            return Err(PushError::InvalidEndpoint(format!("{endpoint}: no host")));
+            return Err(PushError::InvalidEndpoint("no host".to_owned()));
         }
     }
-    Ok(endpoint.to_owned())
+    // Credentials and fragments are not part of the endpoint's identity, and a
+    // push service never uses them; leaving them in would make one endpoint
+    // several rows.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
 }
 
 // ── Store trait ─────────────────────────────────────────────────────────────
 
+/// The most subscriptions one principal may hold.
+///
+/// Every device (and every browser profile) a user has is one subscription, so
+/// the ceiling is generous — but it must exist: without it any authenticated
+/// caller can register unbounded rows, and since a send dispatches to each in
+/// turn, that turns one account into an unbounded amount of work per
+/// notification.
+pub const MAX_SUBSCRIPTIONS_PER_PRINCIPAL: usize = 20;
+
 /// Pluggable storage for push subscriptions.
 ///
 /// Implement this to persist subscriptions somewhere other than the built-in
-/// backends. Two contracts every backend must honor:
+/// backends. Three contracts every backend must honor:
 ///
 /// - **`endpoint` is the primary identity.** [`save`](Self::save) upserts on
-///   it: re-saving an endpoint updates the existing row (including moving it
-///   to a different principal, which is what happens when a second user signs
-///   in on a shared device) and never creates a second row.
+///   it: re-saving an endpoint updates the existing row and never creates a
+///   second one.
+/// - **A cross-principal move requires proof of possession.** Re-saving an
+///   endpoint that currently belongs to a *different* principal is allowed
+///   only when the incoming `p256dh` matches the stored one; otherwise it is
+///   [`PushError::EndpointClaimed`]. This keeps the legitimate case working —
+///   a shared device where a second user signs in re-subscribes and the
+///   browser returns the *same* endpoint **and the same keys**, so the row
+///   moves — while refusing the attack it otherwise enables: an endpoint URL
+///   is only a capability to *send*, and without this rule anyone who obtained
+///   one could re-register it under their own account with their own keys,
+///   silently cutting the victim off and redirecting their notifications.
 /// - **Removal is idempotent.** [`remove`](Self::remove) returns how many rows
 ///   it deleted; a missing endpoint is `Ok(0)`, not an error.
 pub trait PushSubscriptionStore: Send + Sync + 'static {
     /// Persist a subscription, replacing any existing row for the same
     /// endpoint.
+    ///
+    /// Must return [`PushError::EndpointClaimed`] when the endpoint belongs to
+    /// a different principal and the incoming `p256dh` does not match the
+    /// stored one, and [`PushError::TooManySubscriptions`] when the principal
+    /// is already at [`MAX_SUBSCRIPTIONS_PER_PRINCIPAL`]. See the trait docs.
     fn save(
         &self,
         subscription: StoredSubscription,
@@ -335,9 +425,35 @@ impl MemoryPushSubscriptionStore {
 impl PushSubscriptionStore for MemoryPushSubscriptionStore {
     async fn save(&self, subscription: StoredSubscription) -> Result<(), PushError> {
         let mut rows = self.lock()?;
+
         // Endpoint identity, not (principal, endpoint): re-subscribing on a
         // shared device must MOVE the row, never leave the previous owner
-        // still receiving on it.
+        // still receiving on it. But a move across principals is only honored
+        // when the caller presents the SAME `p256dh` the stored row has —
+        // otherwise merely knowing an endpoint URL would be enough to take a
+        // victim's device over. See the trait docs.
+        if let Some(existing) = rows
+            .iter()
+            .find(|row| row.endpoint == subscription.endpoint)
+            && existing.principal_id != subscription.principal_id
+            && existing.p256dh != subscription.p256dh
+        {
+            return Err(PushError::EndpointClaimed);
+        }
+
+        let is_new = !rows.iter().any(|row| row.endpoint == subscription.endpoint);
+        if is_new
+            && rows
+                .iter()
+                .filter(|row| row.principal_id == subscription.principal_id)
+                .count()
+                >= MAX_SUBSCRIPTIONS_PER_PRINCIPAL
+        {
+            return Err(PushError::TooManySubscriptions {
+                max: MAX_SUBSCRIPTIONS_PER_PRINCIPAL,
+            });
+        }
+
         rows.retain(|row| row.endpoint != subscription.endpoint);
         rows.push(subscription);
         drop(rows);
@@ -497,32 +613,84 @@ mod db_store {
 
     impl PushSubscriptionStore for DbPushSubscriptionStore {
         async fn save(&self, subscription: StoredSubscription) -> Result<(), PushError> {
+            // `filter` on an `ON CONFLICT … DO UPDATE` (the proof-of-possession
+            // predicate below) comes from `FilterDsl`, which the prelude does
+            // not re-export for insert statements. Imported inside this fn
+            // rather than at module scope so it cannot shadow `QueryDsl::filter`
+            // on the ordinary selects in `list_for`/`remove`.
+            use diesel::query_dsl::methods::FilterDsl as _;
+            use push_subscriptions::dsl;
+
             let mut conn = self.conn().await?;
             let principal_id = subscription.principal_id.clone();
+            let endpoint = subscription.endpoint.clone();
             let p256dh = subscription.p256dh_base64url();
             let auth = subscription.auth_base64url();
-            diesel::insert_into(push_subscriptions::table)
+
+            // Cap the principal's device count. Checked before the insert
+            // rather than enforced in SQL because the ceiling is a per-owner
+            // count, not a constraint any single row can express; the upsert
+            // below is what stays atomic. A pre-existing endpoint is an
+            // update, so it is never blocked by the cap.
+            // Fully qualified: `FilterDsl` is imported above for the upsert's
+            // `DO UPDATE … WHERE`, which would otherwise make this ambiguous.
+            let counted = diesel::QueryDsl::filter(
+                diesel::QueryDsl::filter(
+                    dsl::push_subscriptions,
+                    dsl::principal_id.eq(&principal_id),
+                ),
+                dsl::endpoint.ne(&endpoint),
+            );
+            let existing: i64 = counted
+                .count()
+                .get_result(&mut conn)
+                .await
+                .map_err(|e| store_err(&e))?;
+            if usize::try_from(existing).unwrap_or(usize::MAX)
+                >= super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL
+            {
+                return Err(PushError::TooManySubscriptions {
+                    max: super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL,
+                });
+            }
+
+            let affected = diesel::insert_into(push_subscriptions::table)
                 .values(NewSubscriptionRow {
                     principal_id: principal_id.clone(),
-                    endpoint: subscription.endpoint.clone(),
+                    endpoint: endpoint.clone(),
                     p256dh: p256dh.clone(),
                     auth: auth.clone(),
                     created_at: Utc::now(),
                 })
-                // Endpoint identity: re-subscribing the same user agent MOVES
-                // the row to whoever is signed in now (a shared device where a
-                // second user signs in) instead of leaving the previous owner
-                // still receiving on it.
-                .on_conflict(push_subscriptions::endpoint)
+                // Endpoint identity: re-subscribing the same user agent
+                // updates its row in place rather than adding a second.
+                .on_conflict(dsl::endpoint)
                 .do_update()
                 .set((
-                    push_subscriptions::principal_id.eq(principal_id),
-                    push_subscriptions::p256dh.eq(p256dh),
-                    push_subscriptions::auth.eq(auth),
+                    dsl::principal_id.eq(&principal_id),
+                    dsl::p256dh.eq(&p256dh),
+                    dsl::auth.eq(&auth),
                 ))
+                // Proof of possession for a CROSS-principal move, enforced in
+                // the same statement so it cannot race a concurrent subscribe:
+                // the update only applies when the row already belongs to this
+                // principal (an ordinary re-subscribe or key rotation), or when
+                // the caller presents the stored `p256dh` (the shared-device
+                // case, where the browser returns the same endpoint AND the
+                // same keys). Anyone who merely learned the endpoint URL fails
+                // both and the statement touches zero rows.
+                .filter(
+                    dsl::principal_id
+                        .eq(principal_id.clone())
+                        .or(dsl::p256dh.eq(p256dh.clone())),
+                )
                 .execute(&mut conn)
                 .await
                 .map_err(|e| store_err(&e))?;
+
+            if affected == 0 {
+                return Err(PushError::EndpointClaimed);
+            }
             Ok(())
         }
 
@@ -576,6 +744,10 @@ mod tests {
     const P256DH: &str =
         "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
     const AUTH: &str = "BTBZMqHH6r4Tts7J_aSIgg";
+    /// A second, unrelated valid P-256 point — what an attacker (or a key
+    /// rotation) would present.
+    const OTHER_P256DH: &str =
+        "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8";
 
     fn browser_subscription(endpoint: &str) -> BrowserSubscription {
         BrowserSubscription {
@@ -621,18 +793,18 @@ mod tests {
     #[test]
     fn decode_turns_base64url_keys_into_raw_bytes() {
         let subscription = stored(1_i64, "https://push.example.com/a");
-        assert_eq!(subscription.principal_id, "1");
-        assert_eq!(subscription.endpoint, "https://push.example.com/a");
+        assert_eq!(subscription.principal_id(), "1");
+        assert_eq!(subscription.endpoint(), "https://push.example.com/a");
         assert_eq!(
-            subscription.p256dh,
+            subscription.p256dh(),
             URL_SAFE_NO_PAD.decode(P256DH).expect("decode")
         );
         assert_eq!(
-            subscription.auth,
+            subscription.auth(),
             URL_SAFE_NO_PAD.decode(AUTH).expect("decode")
         );
-        assert_eq!(subscription.p256dh.len(), 65);
-        assert_eq!(subscription.auth.len(), 16);
+        assert_eq!(subscription.p256dh().len(), 65);
+        assert_eq!(subscription.auth().len(), 16);
     }
 
     #[test]
@@ -780,7 +952,7 @@ mod tests {
             .expect("save");
         let rows = store.list_for("1").await.expect("list");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].endpoint, "https://push.example.com/a");
+        assert_eq!(rows[0].endpoint(), "https://push.example.com/a");
     }
 
     #[tokio::test]
@@ -852,5 +1024,183 @@ mod tests {
                 .expect("remove"),
             0
         );
+    }
+    // ── Endpoint hardening ──────────────────────────────────────────────────
+
+    #[test]
+    fn decode_rejects_a_trailing_dot_loopback_endpoint() {
+        // `localhost.` is the fully-qualified form every resolver maps to
+        // 127.0.0.1, and `Url` preserves the dot — so a check that compares
+        // against `localhost` alone is one character from being bypassed.
+        for endpoint in [
+            "https://localhost./push",
+            "https://LOCALHOST./push",
+            "https://foo.localhost./push",
+        ] {
+            let err = browser_subscription(endpoint)
+                .decode(&1_i64.into())
+                .expect_err(&format!("{endpoint} must be refused"));
+            assert!(
+                matches!(err, PushError::InvalidEndpoint(_)),
+                "{endpoint}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_normalizes_the_endpoint_so_variants_are_one_row() {
+        // `endpoint` is the store's unique identity. If these normalized to
+        // different strings, one browser would become several rows dispatching
+        // to the same real endpoint — several duplicate notifications, and the
+        // upsert defeated.
+        let canonical = stored(1_i64, "https://push.example.com/abc")
+            .endpoint()
+            .to_owned();
+        for variant in [
+            "https://push.example.com:443/abc",
+            "https://PUSH.example.com/abc",
+            "https://user:secret@push.example.com/abc",
+            "https://push.example.com/abc#fragment",
+            "  https://push.example.com/abc  ",
+        ] {
+            assert_eq!(
+                stored(1_i64, variant).endpoint(),
+                canonical,
+                "{variant} must normalize to the same endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_does_not_echo_the_submitted_url_in_its_error() {
+        // The built-in subscribe route surfaces these messages to the caller,
+        // and an endpoint URL is a capability: anyone holding one can push to
+        // that device.
+        let secret = "https://push.example.com/SECRET-DEVICE-TOKEN";
+        let mut sub = browser_subscription(secret);
+        sub.endpoint = secret.replace("https", "http");
+        let err = sub.decode(&1_i64.into()).expect_err("http is refused");
+        assert!(
+            !err.to_string().contains("SECRET-DEVICE-TOKEN"),
+            "the error must not reflect the endpoint back: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_an_absurdly_long_endpoint() {
+        let long = format!("https://push.example.com/{}", "x".repeat(MAX_ENDPOINT_LEN));
+        let err = browser_subscription(&long)
+            .decode(&1_i64.into())
+            .expect_err("oversize endpoints are refused");
+        assert!(matches!(err, PushError::InvalidEndpoint(_)), "{err:?}");
+    }
+
+    // ── Takeover and capacity ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_different_principal_cannot_claim_an_endpoint_with_its_own_keys() {
+        // Knowing an endpoint URL must not be enough to take a device over:
+        // that would silently cut the victim off AND redirect their
+        // notifications to the attacker, who supplied the keys.
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/a"))
+            .await
+            .expect("save");
+
+        let mut hostile = browser_subscription("https://push.example.com/a");
+        hostile.keys.p256dh = OTHER_P256DH.to_owned();
+        let hostile = hostile.decode(&2_i64.into()).expect("valid shape");
+
+        assert!(
+            matches!(store.save(hostile).await, Err(PushError::EndpointClaimed)),
+            "an endpoint URL alone must not transfer a subscription"
+        );
+        assert_eq!(
+            store.list_for("1").await.expect("list").len(),
+            1,
+            "the original owner keeps receiving"
+        );
+        assert!(store.list_for("2").await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_same_browser_re_subscribing_under_a_new_user_still_moves() {
+        // The legitimate shared-device case: `pushManager.subscribe()` on an
+        // unchanged registration returns the SAME endpoint and the SAME keys,
+        // so possession is proved and the row moves.
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/a"))
+            .await
+            .expect("save");
+        store
+            .save(stored(2_i64, "https://push.example.com/a"))
+            .await
+            .expect("a genuine re-subscribe is honored");
+        assert!(store.list_for("1").await.expect("list").is_empty());
+        assert_eq!(store.list_for("2").await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_principal_may_rotate_its_own_keys_freely() {
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/a"))
+            .await
+            .expect("save");
+        let mut rotated = browser_subscription("https://push.example.com/a");
+        rotated.keys.p256dh = OTHER_P256DH.to_owned();
+        store
+            .save(rotated.decode(&1_i64.into()).expect("valid"))
+            .await
+            .expect("the owner may rotate its own keys");
+        assert_eq!(store.list_for("1").await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_principal_cannot_register_unbounded_subscriptions() {
+        // Every send dispatches to each subscription in turn, so an uncapped
+        // principal turns one notification into unbounded work.
+        let store = MemoryPushSubscriptionStore::new();
+        for i in 0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL {
+            store
+                .save(stored(1_i64, &format!("https://push.example.com/d{i}")))
+                .await
+                .expect("save up to the cap");
+        }
+        assert!(
+            matches!(
+                store
+                    .save(stored(1_i64, "https://push.example.com/one-too-many"))
+                    .await,
+                Err(PushError::TooManySubscriptions { .. })
+            ),
+            "the cap must be enforced"
+        );
+        // An existing endpoint is an update, so it is never capped.
+        store
+            .save(stored(1_i64, "https://push.example.com/d0"))
+            .await
+            .expect("re-saving an existing endpoint is not capped");
+        assert_eq!(
+            store.list_for("1").await.expect("list").len(),
+            MAX_SUBSCRIPTIONS_PER_PRINCIPAL
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_per_principal_not_global() {
+        let store = MemoryPushSubscriptionStore::new();
+        for i in 0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL {
+            store
+                .save(stored(1_i64, &format!("https://push.example.com/d{i}")))
+                .await
+                .expect("save");
+        }
+        store
+            .save(stored(2_i64, "https://push.example.com/other-user"))
+            .await
+            .expect("one user at their cap must not block everyone else");
     }
 }

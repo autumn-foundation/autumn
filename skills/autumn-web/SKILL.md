@@ -1167,6 +1167,49 @@ async fn create_comment(notifications: Notifications) -> AutumnResult<&'static s
 - Guide: `docs/guide/notifications.md`. Out of scope by design: bell widget,
   email/SMS channels, preferences/digests, cross-recipient fan-out.
 
+### Web Push (tab closed)
+
+`autumn_web::push` delivers to a subscribed browser even when the app is
+closed — the leg neither the in-app feed nor `channels` can cover. The
+developer writes **zero** crypto: VAPID signing (RFC 8292) and payload
+encryption (RFC 8291) are the framework's.
+
+- **Setup is three steps:** `VapidKey::generate()` once (offline) → `[push]
+  private_key`/`subject` in `autumn.toml` → `autumn generate pwa` (which mounts
+  `autumn_web::push::router()`, emits the SW `push`/`notificationclick`
+  handlers and the client subscribe snippet, and scaffolds the
+  `push_subscriptions` migration). Then `push.send(user_id,
+  &PushMessage::new(title, body).url(target))`.
+- **`WebPush` is an extractor** (like `Session`/`Db`/`Notifications`):
+  `send`, `send_many`, `subscribe`, `unsubscribe`, `vapid_public_key`.
+- **`PushPrincipal` accepts both id shapes** — `i64` (as the notification feed
+  uses) and `&str`/`String` (as auth tokens carry) — so composing with #1148
+  needs no conversion.
+- **Storage resolution** mirrors the feed's: `with_push_subscription_store(...)`
+  → `DbPushSubscriptionStore` (the generated `push_subscriptions` table) →
+  `MemoryPushSubscriptionStore`. `endpoint` is UNIQUE and the identity: a
+  re-subscribe updates the row, and a re-subscribe under a different principal
+  MOVES it (shared device, second user signs in).
+- **Composing with #1148:** await the `notify(...)` write (durable record),
+  then `push.send(...)` best-effort and log a failure — the same posture
+  `notify_with_push` takes with its channel broadcast. Never let a push failure
+  fail the notification write.
+- **Never a silent no-op:** an unusable `[push] private_key` fails the BOOT;
+  `send` with no key is `PushError::NotConfigured` raised before dispatch;
+  `GET /push/vapid-public-key` answers 503 when unconfigured.
+- **Pruning:** 404/410 removes the subscription (`report.pruned`); 5xx/429/
+  transport errors are counted in `report.failed` and LEFT in place — pruning
+  on a transient failure would unsubscribe everyone during an outage.
+- **Subscribe is an SSRF boundary:** the endpoint is client-supplied and later
+  POSTed to, so it must be `https` with a non-loopback domain host (IP literals
+  refused). The built-in routes resolve the principal server-side and 401 when
+  they cannot; unsubscribe is scoped to the caller.
+- **Testing:** `RecordingPushTransport` captures requests (assert endpoint,
+  headers, encrypted body) and `.responding_with(endpoint, 410)` drives the
+  pruning path. Wire it with `TestApp::with_web_push(...)`.
+- Guide: `docs/guide/web-push.md`. Out of scope by design: native mobile push
+  (APNs/FCM), notification actions/images/badges, preferences/quiet hours.
+
 ## Background work
 
 Use built-in jobs and tasks before reaching for a workflow engine:

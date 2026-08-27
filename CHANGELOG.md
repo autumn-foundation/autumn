@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cargo test` on the workspace no longer aborts with a stack overflow:**
+  clap's derive macro expands the whole `autumn` CLI — every subcommand, every
+  argument — into a single `augment_args` function, and unoptimized that one
+  frame is larger than the 2 MiB stack libtest gives a test thread. The first
+  test to call `Cli::try_parse_from` therefore overflowed and took the process
+  down with `SIGABRT`, stopping the suite before ~5,600 other `autumn-cli`
+  tests ran. Release builds inline the frame away, which is why only `cargo
+  test` was affected. A workspace `.cargo/config.toml` now sets
+  `RUST_MIN_STACK`, so the fix travels with the code instead of living in a CI
+  environment variable — the suite cannot pass on one machine and abort on
+  another.
+
 - **TLS-enabled migrations no longer panic when applied from an app's own
   async `on_startup` hook:** the sync migration/wait-check path bridges to
   Postgres through diesel-async's `AsyncConnectionWrapper` whenever the
@@ -32,6 +44,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `multi_thread` tokio runtime, called directly from an async body.
 
 ### Added
+
+- **Web Push — notifications that reach a device with the tab closed
+  (#1392):** Autumn already generated an installable PWA (#1149) and stored an
+  in-app notification feed (#1148), but a notification could only ever arrive
+  while the user already had the app open. The new `autumn_web::push` module
+  closes that loop, and a developer writes **zero** lines of crypto: the
+  framework mints/loads the VAPID key pair, signs the ES256 identity JWT
+  (RFC 8292), performs the ECDH + HKDF + AES-128-GCM payload encryption
+  (RFC 8291), and dispatches to the push service. Configure `[push]
+  private_key`, mount `autumn_web::push::router()` (which `autumn generate pwa`
+  now does for you), and call `push.send(user_id, &PushMessage::new(title,
+  body).url(target))`.
+
+  `autumn generate pwa` now also emits a service worker with `push` and
+  `notificationclick` handlers, a client subscribe snippet wired to the
+  framework's own public-key endpoint, and a `push_subscriptions` migration —
+  all idempotent, `--dry-run`-honoring, and fully reversed by
+  `autumn destroy pwa`.
+
+  Subscription storage is hardened against the fact that an endpoint URL is a
+  *capability*: the subscribe boundary normalizes the endpoint (so one browser
+  can never become several rows), caps subscriptions per principal, and allows
+  an endpoint to move between accounts only when the request presents the
+  stored `p256dh` — which keeps the shared-device case working (the browser
+  returns the same endpoint **and** keys) while refusing a takeover by anyone
+  who merely learned the URL. The outbound transport resolves the endpoint host
+  and refuses any address on the framework's SSRF deny-list, pins the connection
+  to the checked address, and declines redirects, so neither a DNS record
+  pointing at `169.254.169.254` nor a `307` can steer the POST at an internal
+  host.
+
+  Failure posture is deliberate: a `[push] private_key` that is present but
+  unusable fails the **boot** rather than leaving push silently dead, and
+  sending with no key configured is an error raised before any dispatch, never
+  an `Ok` report of zero deliveries. A `404`/`410` from the push service prunes
+  the subscription so a dead endpoint is never re-sent to, while a `5xx` or
+  rate limit leaves it in place — pruning on a transient failure would silently
+  unsubscribe every user during an outage. Because the subscribe endpoint takes
+  a client-supplied URL the framework later POSTs to, it requires `https` and
+  refuses IP-literal and loopback hosts, closing the SSRF shape at the
+  boundary.
+
+  The encryption is pinned to RFC 8291 §5's own published test vector — fed the
+  RFC's inputs it must reproduce the RFC's output byte-for-byte — and the
+  end-to-end test decrypts a dispatched body back with the receiving user
+  agent's private key and verifies the VAPID signature, so what is asserted is
+  what a real browser would receive. Ships `RecordingPushTransport` so
+  applications can assert their own push behaviour the same way.
+
+  Adds **no new crate** to the dependency graph: `p256` was already resolved
+  for `jsonwebtoken`'s ES256 backend, and `aes-gcm`/`hmac`/`sha2`/`base64` were
+  already non-optional dependencies. All additions are additive — a new
+  `[push]` config block, a new `push_subscriptions` table, and new public API;
+  no existing `autumn-web` surface changed. Guide:
+  `docs/guide/web-push.md`. Out of scope by design: native mobile push
+  (APNs/FCM device tokens), notification actions/images/badges, and per-user
+  preferences or quiet hours.
 
 - **`#[query_budget(N)]` — a compile-time, per-route database query budget
   (#1667):** declare a handler's query ceiling and the build fails when any

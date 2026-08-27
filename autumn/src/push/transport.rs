@@ -166,13 +166,28 @@ impl PushTransport for RecordingPushTransport {
 
 /// The default [`PushTransport`]: a real `POST` to the push service.
 ///
-/// Uses the framework's outbound [`Client`](crate::http_client::Client), so
-/// push traffic inherits its tracing context propagation, timeouts, and — the
-/// reason it matters here — its SSRF address policy. The subscribe boundary
-/// already refuses IP-literal and loopback endpoints
-/// ([`BrowserSubscription::decode`](super::store::BrowserSubscription::decode));
-/// this covers the remaining case of a *hostname* that resolves to a private
-/// address.
+/// Uses the framework's outbound [`Client`](crate::http_client::Client) for
+/// tracing context propagation and timeouts, and adds the SSRF protection a
+/// push endpoint specifically needs.
+///
+/// # Why this does its own address validation
+///
+/// The endpoint is a URL the *client* chose, and this is the code that
+/// connects to it. [`BrowserSubscription::decode`](super::store::BrowserSubscription::decode)
+/// already refuses IP-literal and loopback endpoints at the subscribe
+/// boundary, but that check cannot see where a *hostname* resolves — an
+/// attacker who controls a DNS record can point `push.attacker.example` at
+/// `169.254.169.254` and pass it. `Client`'s own address deny-list only runs
+/// on the `get_ssrf_safe` path, which is GET-only, so this transport applies
+/// the equivalent to its `POST`:
+///
+/// 1. resolve the host and refuse the request unless **every** resolved
+///    address passes [`is_blocked_ip`](crate::http_client::is_blocked_ip);
+/// 2. pin the connection to the validated address, so the socket cannot be
+///    re-pointed between the check and the connect (DNS rebinding); and
+/// 3. refuse to follow redirects, so a real-looking public endpoint cannot
+///    `307` the body onto an internal address — reqwest's default policy
+///    would replay the POST with no re-validation of the new hop.
 #[cfg(feature = "http-client")]
 #[derive(Clone)]
 pub struct HttpPushTransport {
@@ -199,7 +214,16 @@ impl HttpPushTransport {
 impl PushTransport for HttpPushTransport {
     fn deliver<'a>(&'a self, request: &'a PushRequest) -> PushTransportFuture<'a> {
         Box::pin(async move {
-            let mut builder = self.client.post(&request.endpoint);
+            let pin = resolve_and_validate_endpoint(&request.endpoint).await?;
+
+            let mut builder = self
+                .client
+                .post(&request.endpoint)
+                // See the type docs: pin the checked address and refuse to
+                // follow a redirect, so neither DNS rebinding nor a `307` can
+                // steer this POST at an internal host.
+                .pin_to(pin)
+                .no_redirect();
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
@@ -211,5 +235,193 @@ impl PushTransport for HttpPushTransport {
                 Err(e) => Err(PushError::Transport(e.to_string())),
             }
         })
+    }
+}
+
+/// Resolve `endpoint`'s host and return one address that is safe to connect to.
+///
+/// Every resolved address must pass the outbound client's SSRF deny-list: a
+/// host that resolves to *any* blocked address is refused outright rather than
+/// filtered down to its public addresses, since a resolver returning both is
+/// exactly the shape a rebinding attack produces.
+#[cfg(feature = "http-client")]
+async fn resolve_and_validate_endpoint(endpoint: &str) -> Result<std::net::SocketAddr, PushError> {
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| PushError::InvalidEndpoint(format!("{endpoint}: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| PushError::InvalidEndpoint(format!("{endpoint}: no host")))?
+        .to_owned();
+    // `port_or_known_default` gives 443 for https, the only scheme
+    // `validate_endpoint` lets through.
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| PushError::Transport(format!("could not resolve the push endpoint: {e}")))?
+        .collect();
+
+    if let Some(blocked) = addrs
+        .iter()
+        .find(|addr| crate::http_client::is_blocked_ip(addr.ip()))
+    {
+        return Err(PushError::InvalidEndpoint(format!(
+            "the push endpoint host resolves to a blocked address ({}); refusing to connect",
+            blocked.ip()
+        )));
+    }
+    addrs.first().copied().ok_or_else(|| {
+        PushError::Transport("the push endpoint host resolved to no addresses".to_owned())
+    })
+}
+
+/// A transport for a build with no HTTP client compiled in.
+///
+/// Reports the failure instead of pretending to deliver: a push that cannot
+/// possibly go out must never look like it did.
+#[cfg(not(feature = "http-client"))]
+#[derive(Debug, Clone, Copy)]
+pub struct UnavailablePushTransport;
+
+#[cfg(not(feature = "http-client"))]
+impl PushTransport for UnavailablePushTransport {
+    fn deliver<'a>(&'a self, _request: &'a PushRequest) -> PushTransportFuture<'a> {
+        Box::pin(async {
+            Err(PushError::Transport(
+                "no outbound HTTP client is available: autumn-web was built without the \
+                 `http-client` feature. Enable it, or register your own transport."
+                    .to_owned(),
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(endpoint: &str) -> PushRequest {
+        PushRequest {
+            endpoint: endpoint.to_owned(),
+            headers: vec![
+                ("authorization".to_owned(), "vapid t=x, k=y".to_owned()),
+                ("content-encoding".to_owned(), "aes128gcm".to_owned()),
+            ],
+            body: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        // Header names are case-insensitive on the wire, and a test asserting
+        // on `Authorization` must not fail because the sender wrote it lower.
+        let request = request("https://push.example.com/a");
+        assert_eq!(request.header("Authorization"), Some("vapid t=x, k=y"));
+        assert_eq!(request.header("AUTHORIZATION"), Some("vapid t=x, k=y"));
+        assert_eq!(request.header("missing"), None);
+    }
+
+    #[tokio::test]
+    async fn recording_transport_defaults_to_created() {
+        // `201 Created` is what a push service returns on acceptance; a
+        // default that fell outside 2xx would make every unscripted test look
+        // like a failed delivery.
+        let transport = RecordingPushTransport::new();
+        assert_eq!(
+            transport
+                .deliver(&request("https://push.example.com/a"))
+                .await
+                .expect("deliver"),
+            201
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_transport_applies_a_scripted_status_by_endpoint() {
+        let transport = RecordingPushTransport::new()
+            .responding_with("https://push.example.com/dead", 410)
+            .responding_with("https://push.example.com/busy", 429);
+
+        for (endpoint, expected) in [
+            ("https://push.example.com/dead", 410),
+            ("https://push.example.com/busy", 429),
+            ("https://push.example.com/other", 201),
+        ] {
+            assert_eq!(
+                transport
+                    .deliver(&request(endpoint))
+                    .await
+                    .expect("deliver"),
+                expected,
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_transport_uses_the_first_matching_script() {
+        // Deterministic precedence: a test that scripts an endpoint twice must
+        // not get whichever entry the iteration order happened to reach.
+        let transport = RecordingPushTransport::new()
+            .responding_with("https://push.example.com/a", 410)
+            .responding_with("https://push.example.com/a", 500);
+        assert_eq!(
+            transport
+                .deliver(&request("https://push.example.com/a"))
+                .await
+                .expect("deliver"),
+            410
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_transport_records_in_dispatch_order_and_shares_across_clones() {
+        let transport = RecordingPushTransport::new();
+        let clone = transport.clone();
+        for endpoint in ["https://push.example.com/1", "https://push.example.com/2"] {
+            clone.deliver(&request(endpoint)).await.expect("deliver");
+        }
+        let recorded = transport.requests();
+        assert_eq!(recorded.len(), 2, "a clone must share the recording");
+        assert_eq!(recorded[0].endpoint, "https://push.example.com/1");
+        assert_eq!(recorded[1].endpoint, "https://push.example.com/2");
+        assert_eq!(recorded[0].body, vec![1, 2, 3]);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn the_http_transport_refuses_an_endpoint_resolving_to_a_blocked_address() {
+        // `localhost` is a hostname, so the subscribe-time IP-literal rule
+        // cannot catch it — this is the layer that must.
+        let err = resolve_and_validate_endpoint("https://localhost/push")
+            .await
+            .expect_err("a loopback-resolving host is refused");
+        assert!(matches!(err, PushError::InvalidEndpoint(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("blocked address"),
+            "the error must say why: {err}"
+        );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn the_http_transport_reports_an_unresolvable_host_as_a_transport_error() {
+        // `.invalid` is reserved by RFC 2606 and never resolves. A DNS failure
+        // is transient, not a reason to prune the subscription, so it must be
+        // a Transport error rather than an InvalidEndpoint one.
+        let err = resolve_and_validate_endpoint("https://nothing.invalid/push")
+            .await
+            .expect_err("an unresolvable host fails");
+        assert!(matches!(err, PushError::Transport(_)), "{err:?}");
+    }
+
+    #[cfg(not(feature = "http-client"))]
+    #[tokio::test]
+    async fn the_unavailable_transport_errors_rather_than_pretending_to_deliver() {
+        let err = UnavailablePushTransport
+            .deliver(&request("https://push.example.com/a"))
+            .await
+            .expect_err("a push that cannot go out must never look like it did");
+        assert!(matches!(err, PushError::Transport(_)), "{err:?}");
     }
 }

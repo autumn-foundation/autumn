@@ -1106,6 +1106,15 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub tenancy: TenancyConfig,
 
+    /// Web Push settings (`[push]` section, issue #1392).
+    ///
+    /// Absent by default. The VAPID key it names is loaded and validated once
+    /// at boot — a key that is present but unusable fails the boot rather than
+    /// leaving the app running with push silently dead. See
+    /// [`crate::push::PushConfig`] and `docs/guide/web-push.md`.
+    #[serde(default)]
+    pub push: crate::push::PushConfig,
+
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
@@ -3268,6 +3277,22 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
     // `crate::time_zone::TimeZoneConfig` — untagged Scalar|Table.
     ("time_zone", &["identifier", "sources"]),
 ];
+
+impl AutumnConfig {
+    /// Validate the `[push]` block, as `AppBuilder::run` does before binding.
+    ///
+    /// Factored out of the boot path so the rule it enforces — a VAPID key
+    /// that is present but unusable is a hard failure, never a quiet fallback
+    /// to "push disabled" — is reachable from a test. `run` calls exactly this
+    /// and exits on `Err`.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::push::PushConfig::load_vapid_key`].
+    pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
+        self.push.load_vapid_key().map(|_| ())
+    }
+}
 
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
