@@ -113,7 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones the import cannot set, and a model with an at-rest `#[encrypted]` column —
   which the export omits but the form requires — or with no CSV-settable column
   at all (every column an `Attachment`, a `Bytea`, or `--default`ed, so an
-  importer could only ever commit rows of defaults) refuses the surface outright
+  importer could only ever commit rows of defaults) — or a non-nullable `Bytea`
+  column, which the import must skip but the form requires — refuses the surface
+  outright
   with a warning naming the column.
   Additive: without the flag the scaffold's output is byte-identical, and
   `--import` on a variant that emits no `CsvSchema` (`--api`, `--live`,

@@ -734,7 +734,7 @@ fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
 fn a_bytea_column_is_not_importable() {
     let (_tmp, project, _) = scaffold_project(
         "import-bytea",
-        &["title:String", "blob:Bytea"],
+        &["title:String", "blob:Option<Bytea>"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
@@ -759,8 +759,11 @@ fn a_bytea_column_is_not_importable() {
     );
     // The export still writes the column — this is an import-side exclusion, not
     // a change to #1315's surface.
+    // (The nullable column exports through `map(|bytes| …)`, the non-nullable
+    // one through `&self.blob` — assert the parts common to both rather than
+    // one shape's exact expression.)
     assert!(
-        routes.contains("String::from_utf8_lossy(&self.blob)"),
+        routes.contains("self.blob") && routes.contains("String::from_utf8_lossy"),
         "the export must still carry the column:
 {routes}"
     );
@@ -775,7 +778,7 @@ fn a_bytea_column_is_not_importable() {
 fn an_unsettable_column_never_reaches_the_form_decoder() {
     let (_tmp, project, _) = scaffold_project(
         "import-bytea-decode",
-        &["title:String", "blob:Bytea"],
+        &["title:String", "blob:Option<Bytea>"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
@@ -788,9 +791,47 @@ fn an_unsettable_column_never_reaches_the_form_decoder() {
     // The premise the filter exists for: the form DOES still carry the column,
     // so without the filter its exported mojibake would decode and be written.
     assert!(
-        routes.contains("pub blob: String,")
-            && routes.contains("blob: form.blob.clone().into_bytes()"),
-        "the form still carries a Bytea column, which is why filtering matters:\n{routes}"
+        routes.contains("pub blob: Option<String>,"),
+        "the form still carries the Bytea column, which is why filtering matters:\n{routes}"
+    );
+}
+
+/// A NON-NULLABLE `Bytea` is refused outright. The import must filter the column
+/// out (it cannot round-trip), but the form declares it as a bare `String` with
+/// no default — so a filtered row fails "missing field" and the importer could
+/// never import anything. A nullable one is fine: the form declares
+/// `Option<String>`, so a filtered column decodes as `None`.
+///
+/// This is the general shape the `#[encrypted]` refusal is the other instance
+/// of: a column the import cannot set that the form nonetheless requires.
+#[test]
+fn a_required_unsettable_column_refuses_the_import() {
+    let (_tmp, project, output) = scaffold_project(
+        "import-bytea-required",
+        &["title:String", "blob:Bytea"],
+        &["--import"],
+    );
+    assert_no_import_anywhere(&project);
+    assert!(
+        output.contains("non-nullable Bytea column"),
+        "the warning must name the shape:\n{output}"
+    );
+    assert!(
+        output.contains("blob:Option<Bytea>"),
+        "the warning must name the way out:\n{output}"
+    );
+
+    // CONTROL: the nullable form of the same column keeps the surface, because
+    // a filtered-out `Option<String>` decodes as `None` rather than failing.
+    let (_tmp2, nullable, _) = scaffold_project(
+        "import-bytea-nullable",
+        &["title:String", "blob:Option<Bytea>"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(nullable.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains(r#"#[post("/posts/import")]"#),
+        "a nullable Bytea column must still get the import:\n{routes}"
     );
 }
 

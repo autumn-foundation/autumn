@@ -1825,9 +1825,24 @@ fn plan_scaffold_with_options_impl(
         .iter()
         .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
         .count();
+    // The general shape both this and the `#[encrypted]` refusal above are
+    // instances of: a column the import CANNOT set, which the form nonetheless
+    // REQUIRES. Filtering such a column out of the decoded row (which the import
+    // must do — see the `Bytea` reasoning at `form_carried`) then makes every
+    // row fail with "missing field", so the surface would exist and never
+    // import anything.
+    //
+    // A non-nullable `Bytea` is the case that reaches here: the form declares it
+    // as a bare `String`. A NULLABLE one is fine — the form declares
+    // `Option<String>`, so a filtered-out column simply decodes as `None`.
+    let unsatisfiable_form_column = form_fields
+        .iter()
+        .find(|f| f.kind == FieldKind::Bytea && !f.nullable)
+        .map(|f| f.name.clone());
     let import_enabled = options_with_key.import
         && export_enabled
         && encrypted_form_column.is_none()
+        && unsatisfiable_form_column.is_none()
         && settable_import_columns > 0;
     // A `--import` that lands on a gated-off variant would otherwise be silent:
     // no upload form, no route, no explanation. Say so at generation time with
@@ -1847,6 +1862,15 @@ fn plan_scaffold_with_options_impl(
              create rows of database defaults, and a file with any header at all \
              would decode into them. Add a column the form carries, or drop \
              --import."
+            } else if let Some(column) = unsatisfiable_form_column.as_deref() {
+                &format!(
+                    "`{column}` is a non-nullable Bytea column. The CSV export renders it \
+                 with `String::from_utf8_lossy`, so it cannot be imported back without \
+                 corrupting non-UTF-8 bytes — but the generated form requires it, so \
+                 skipping it would fail every row with \"missing field\". Make it \
+                 nullable (`{column}:Option<Bytea>`), drop the column, or import it \
+                 through a hand-written route."
+                )
             } else if let Some(column) = encrypted_form_column.as_deref() {
                 &format!(
                     "`{column}` is an at-rest #[encrypted] column, which the CSV export \
@@ -4041,6 +4065,11 @@ fn render_routes_file(
     let import_enabled = import
         && export_enabled
         && !fields.iter().any(Field::is_encrypted)
+        // A non-nullable `Bytea` is a column the import must filter out but the
+        // form requires, so every row would fail "missing field".
+        && !fields
+            .iter()
+            .any(|f| f.kind == FieldKind::Bytea && !f.nullable)
         && fields
             .iter()
             .any(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea);
