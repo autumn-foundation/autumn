@@ -114,3 +114,56 @@ fn the_apps_cached_read_declares_rather_than_guesses_its_dependencies() {
     assert_eq!(read.provenance, DependencyProvenance::Declared);
     assert!(read.acknowledged_stale.is_none());
 }
+
+/// The dump mode `autumn cache audit` drives, end to end against this app's own
+/// binary.
+///
+/// Everything above works on registrations read in-process. This is the other
+/// half of the contract: the CLI never links the app, it *runs* it — so the
+/// marker protocol, the JSON on the far side, and the promise that dump mode
+/// touches no database and binds no port all have to hold in a real child
+/// process, or the gate reports "no manifest" against a perfectly good app.
+#[test]
+fn the_app_emits_its_manifest_in_dump_mode_without_a_database() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_saas"))
+        .env("AUTUMN_DUMP_CACHE_COHERENCE", "1")
+        // No DATABASE_URL: dump mode must return before anything connects.
+        .env_remove("DATABASE_URL")
+        .output()
+        .expect("the app binary must run");
+
+    assert!(
+        output.status.success(),
+        "dump mode must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let manifest = coherence::parse_manifest_dump(&stdout)
+        .unwrap_or_else(|| panic!("no manifest on the marker line; stdout was:\n{stdout}"));
+
+    assert_eq!(manifest.schema_version, 1);
+    assert!(
+        manifest.violations.is_empty(),
+        "the shipped app must audit clean through the real dump path:\n{}",
+        coherence::format_diagnostic(&manifest.violations)
+    );
+    assert!(
+        manifest
+            .dimensions
+            .cached_reads
+            .entries
+            .iter()
+            .any(|e| e.id.ends_with("cached_project_count")),
+        "the app's cached read must survive the process boundary"
+    );
+    assert!(
+        manifest
+            .dimensions
+            .mutations
+            .entries
+            .iter()
+            .any(|e| e.name == "ProjectRepository::save"),
+        "so must its write surface"
+    );
+}

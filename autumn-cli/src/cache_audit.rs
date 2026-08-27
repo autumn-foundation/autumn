@@ -113,6 +113,18 @@ pub fn format_acknowledged_report(manifest: &CoherenceManifest) -> String {
     )
 }
 
+/// Write the manifest to `path` as the build artifact CI archives.
+///
+/// Trailing newline so the file is well-formed for `cat`, `diff` and every
+/// line-oriented tool a CI job is likely to point at it.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the file cannot be written.
+pub fn write_manifest(manifest: &CoherenceManifest, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(path, format!("{}\n", manifest.to_json()))
+}
+
 /// Run `autumn cache audit`.
 pub fn run(opts: &CacheAuditOptions<'_>) {
     eprintln!("\u{1F342} autumn cache audit\n");
@@ -159,7 +171,7 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
 
     let json = manifest.to_json();
     if let Some(path) = opts.manifest {
-        if let Err(e) = std::fs::write(path, format!("{json}\n")) {
+        if let Err(e) = write_manifest(&manifest, std::path::Path::new(path)) {
             eprintln!("\u{2717} Failed to write manifest to {path}: {e}");
             std::process::exit(1);
         }
@@ -332,6 +344,53 @@ mod tests {
         let report = format_report(&manifest, false);
         assert!(!report.contains("error:"), "{report}");
         assert!(manifest.violations.is_empty());
+    }
+
+    #[test]
+    fn the_manifest_is_written_as_a_reparseable_build_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-cache-audit-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache-coherence.json");
+
+        let manifest = CoherenceManifest::build(
+            &[read(
+                "blog::recent",
+                &["Post"],
+                DependencyProvenance::Declared,
+            )],
+            &[mutation("blog::models::Post")],
+        );
+        write_manifest(&manifest, &path).expect("manifest must be written");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.ends_with('\n'),
+            "a line-oriented CI tool should not choke on the last line"
+        );
+        // The artifact is the manifest, not a rendering of it: reading it back
+        // must yield the same document, violations included.
+        let reparsed: CoherenceManifest = serde_json::from_str(&written).unwrap();
+        assert_eq!(reparsed.summary(), manifest.summary());
+        assert_eq!(reparsed.violations, manifest.violations);
+        assert_eq!(reparsed.violations[0].read, "blog::recent");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writing_the_manifest_to_an_unwritable_path_is_an_error_not_a_panic() {
+        let manifest = CoherenceManifest::build(&[], &[]);
+        assert!(
+            write_manifest(
+                &manifest,
+                std::path::Path::new("/nonexistent-dir-autumn-1716/manifest.json")
+            )
+            .is_err()
+        );
     }
 
     #[test]
