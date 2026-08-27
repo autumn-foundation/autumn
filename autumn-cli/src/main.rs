@@ -3168,9 +3168,13 @@ enum GenerateCommands {
         /// writes when the submit explicitly confirms a commit, through the
         /// repository's transactional `save_many_skip_invalid`. Decodes rows
         /// against the same `CsvSchema` impl the CSV export emits, so it is
-        /// honoured wherever that export is (not `--api`, `--live`,
-        /// `--sharded`, or an owner-scoped `--live-validation` scaffold — the
-        /// generator warns and emits nothing there).
+        /// honoured wherever that export is: not for `--api`, `--live`,
+        /// `--sharded`, an owner-scoped `--live-validation` scaffold, or a model
+        /// with an at-rest `#[encrypted]` column (the export omits that column
+        /// but the form requires it) — the generator warns and emits nothing
+        /// there. Composes with `--i18n`, `--searchable`, `--soft-delete`,
+        /// `--belongs-to` and `--counter-cache`, and enables autumn-web's
+        /// `multipart` feature. Insert-only: every row becomes a NEW record.
         #[arg(long)]
         import: bool,
         /// Print the file plan and exit without writing anything.

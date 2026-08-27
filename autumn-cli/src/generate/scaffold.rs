@@ -1799,25 +1799,60 @@ fn plan_scaffold_with_options_impl(
     // `export_enabled` rather than on a matrix of its own: the import decodes
     // each row against the `CsvSchema` impl the export emits, so where there is
     // no export there is no column map to import against.
-    let import_enabled = options_with_key.import && export_enabled;
+    // An at-rest `#[encrypted]` column is OMITTED from the export (issue #1340 —
+    // the model holds plaintext, so exporting it would write the decrypted
+    // secret of every row into a downloadable file), but it IS a required field
+    // on `{Pascal}Form`. A file whose header is `csv_columns()` therefore cannot
+    // satisfy the form: every row would fail to decode with "missing field", and
+    // the upload page would be handing the operator the exact header guaranteed
+    // to fail. Refuse the surface instead of shipping one that cannot work.
+    // Derived from `form_fields` (the columns the form actually carries), so an
+    // encrypted column that is `--default`ed — and therefore absent from the
+    // form too — does not block the import.
+    let encrypted_form_column = form_fields
+        .iter()
+        .find(|f| f.is_encrypted())
+        .map(|f| f.name.clone());
+    let import_enabled =
+        options_with_key.import && export_enabled && encrypted_form_column.is_none();
     // A `--import` that lands on a gated-off variant would otherwise be silent:
     // no upload form, no route, no explanation. Say so at generation time with
     // the reason and the way out, exactly as `--soft-delete` does for a missing
     // Trash view. Only reached when the flag was actually passed, so an ordinary
     // scaffold prints nothing.
     if options_with_key.import && !import_enabled {
-        let reason = if options_with_key.api {
-            "an --api scaffold renders no HTML views, so there is no upload form to render"
-        } else if options_with_key.live || options_with_key.live_validation {
-            "the CSV schema the import decodes against is only emitted for a list \
-             view the export can reuse verbatim, and a --live index runs `repo.page` \
-             behind an SSE island"
+        // One arm per way `export_enabled` can be false, in the order the gate
+        // itself evaluates them — the import decodes against the export's
+        // `CsvSchema`, so every reason is really "no schema was emitted here".
+        // Each names what to drop, because "not supported" without a way out is
+        // the warning an author has to come and read the source to act on.
+        let reason = if let Some(column) = encrypted_form_column.as_deref() {
+            &format!(
+                "`{column}` is an at-rest #[encrypted] column, which the CSV export \
+                 omits (issue #1340 — the model holds plaintext) but the generated \
+                 form requires, so every imported row would fail to decode. Drop \
+                 #[encrypted] from `{column}`, or import that column through a \
+                 hand-written route"
+            )
+        } else if options_with_key.api {
+            "an --api scaffold renders no HTML views, so there is no upload form to \
+             render and no CsvSchema impl to decode rows against. Drop --api for an \
+             HTML resource"
         } else if options_with_key.model.sharded {
             "a sharded repository pins every write to the shard it is handed, so a \
-             bulk import would land wherever the request happened to route"
+             bulk import would land wherever the request happened to route. Drop \
+             --sharded"
+        } else if options_with_key.live {
+            "a --live index runs `repo.page` behind an SSE island rather than the \
+             `ListQuery` list the CSV schema is emitted for. Drop --live"
+        } else if owner_authorizes && options_with_key.live_validation {
+            "an owner-scoped --live-validation index runs a hand-written \
+             owner-filtered query rather than a scoped repository method, so no \
+             CsvSchema impl is emitted to decode rows against. Drop \
+             --live-validation, or drop the owner column"
         } else {
-            "the index is owner-scoped through a manual query rather than a scoped \
-             repository method, so no CsvSchema impl is emitted to import against"
+            "this resource's index is not a repository list the CSV schema is \
+             emitted for"
         };
         plan.warn(format!(
             "--import: no CSV import route generated for {plural} — {reason}. \
@@ -2356,31 +2391,44 @@ fn plan_scaffold_with_options_impl(
     // handler also needs is already enabled by the export block above — the
     // import is gated on that export existing — so only `multipart` is added
     // here. Without it the generated app would not compile.
-    if import_enabled {
+    //
+    // Claimed on the DESTROY path too, whether or not `--import` was repeated on
+    // that command line, for the same reason `main_route_entries` claims the two
+    // route entries unconditionally there: a revert that removed the routes
+    // module but left the feature pinned would leave the project carrying a
+    // dependency nothing uses. The revert is a no-op when the feature is not
+    // there, so claiming it is always safe. Unlike `csv` above, this gate turns
+    // on a FLAG the author must repeat — `export_enabled` is derived from the
+    // model's shape and survives a bare `destroy scaffold`; `--import` does not.
+    if import_enabled || for_revert {
         let cargo_path = project_root.join("Cargo.toml");
-        let base = plan
-            .actions
-            .iter()
-            .rev()
-            .find_map(|a| match a {
-                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| read_or_empty(&cargo_path));
-        let updated = ensure_autumn_web_feature(&base, "multipart");
-        if updated != base {
-            plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path.clone(), updated);
+        if import_enabled {
+            let base = plan
+                .actions
+                .iter()
+                .rev()
+                .find_map(|a| match a {
+                    Action::Modify { path, contents } if path == &cargo_path => {
+                        Some(contents.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| read_or_empty(&cargo_path));
+            let updated = ensure_autumn_web_feature(&base, "multipart");
+            if updated != base {
+                plan.actions.retain(|a| a.path() != cargo_path);
+                plan.modify(cargo_path.clone(), updated);
+            }
         }
         // `owner_dir: None` for the same reason the `csv` feature above uses it:
         // "some routes file still exists" is the wrong question, since only an
         // IMPORT-enabled resource (or an attachment scaffold, which enables the
-        // same feature) needs `multipart`. The
-        // `autumn_web::extract::Multipart` marker registered in
-        // `emit::autumn_web_feature_markers` is the precise test — it matches
-        // another scaffold's import or attachment handler AND any hand-written
-        // multipart code, and matches neither when the resource being destroyed
-        // was the only user.
+        // same feature) needs `multipart`. The bare `Multipart` marker
+        // registered in `emit::autumn_web_feature_markers` is the precise test —
+        // it matches another scaffold's import or attachment handler AND any
+        // hand-written multipart code (including one that names the type through
+        // the prelude), and matches none of them when the resource being
+        // destroyed was the only user.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "multipart".to_owned(),
@@ -3147,7 +3195,12 @@ const IMPORT_DATETIME_FORMAT_ARM: &str = r#"
         // an exported file re-imports on this column. Harmless for the browser
         // path, which never sends this shape.
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))"#;
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+        // A TZ-AWARE column's `Display` appends the zone name
+        // (`2026-08-26 12:00:00 UTC`). The zone is redundant on the way back in
+        // — the caller re-attaches UTC — but without this arm every row of an
+        // exported file fails on that column.
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f %Z"))"#;
 
 /// The generated pieces backing the changeset round-trip (issue #1124): the
 /// public, validating `{Pascal}Form` struct, its fallible conversion into
@@ -3932,7 +3985,16 @@ fn render_routes_file(
     // `import_enabled` gate in `plan_scaffold_with_options_impl` (which also
     // excludes `--api`, whose scaffold emits no HTML routes module at all), or
     // main.rs would mount routes this module never emitted.
-    let import_enabled = import && export_enabled;
+    // ...and never where a REQUIRED form column is absent from that schema. An
+    // at-rest `#[encrypted]` column is exactly that case: #1340 omits it from the
+    // export (the model holds plaintext, so exporting it would write the
+    // decrypted secret of every row to a file), but `{Pascal}Form` requires it,
+    // so every row of a file headed by `csv_columns()` would fail to decode.
+    // `fields` here is the FORM's column list, so an encrypted column that was
+    // `--default`ed out of the form does not block anything. Must agree exactly
+    // with the `import_enabled` gate in `plan_scaffold_with_options_impl`, which
+    // is where the warning naming the column is printed.
+    let import_enabled = import && export_enabled && !fields.iter().any(Field::is_encrypted);
     // Issue #1349: the export link's text, registered only where the export is
     // actually emitted so a non-exporting scaffold defines no unused key.
     // Issue #1349: strings the shared widgets supply by DEFAULT rather than the
@@ -6328,12 +6390,42 @@ mod attachment_read_back_tests {{
         } else {
             (String::new(), String::new())
         };
-        // The same predicate `render_csv_schema_impl` uses to decide whether to
-        // emit `csv_text_cell` at all: an at-rest encrypted column is excluded
-        // from the export entirely, so it cannot contribute a guarded cell.
-        let guards_text_cells = all_fields
+        // The same filter `render_csv_schema_impl` applies when it decides which
+        // cells go through `csv_text_cell`: an at-rest encrypted column is
+        // excluded from the export entirely, so it cannot contribute a guarded
+        // cell. `id` and `created_at` are typed, so they never appear here.
+        let text_columns: Vec<&str> = all_fields
             .iter()
-            .any(|f| !f.is_encrypted() && csv_kind_is_text(f.kind));
+            .filter(|f| !f.is_encrypted() && csv_kind_is_text(f.kind))
+            .map(|f| f.name.as_str())
+            .collect();
+        // Every boolean column the export writes, with "does a blank cell mean
+        // false" — true for a non-nullable column (an unchecked checkbox), false
+        // for a nullable one (a blank is NULL there, not `false`).
+        // Exported columns with no field on `{Pascal}Form`, so an import can never
+        // set them: `id` and `created_at` (the database assigns both), an
+        // `Attachment` (a storage key in a cell is not a file), and any column
+        // dropped from the form — a `--default`ed one, for instance. Computed as
+        // the difference rather than listed by kind, so it stays right whatever
+        // the form's own exclusions become.
+        let form_carried: BTreeSet<&str> = fields
+            .iter()
+            .filter(|f| !f.kind.is_attachment())
+            .map(|f| f.name.as_str())
+            .collect();
+        let mut ignored_columns: Vec<&str> = vec!["id"];
+        ignored_columns.extend(
+            all_fields
+                .iter()
+                .filter(|f| !f.is_encrypted() && !form_carried.contains(f.name.as_str()))
+                .map(|f| f.name.as_str()),
+        );
+        ignored_columns.push("created_at");
+        let bool_columns: Vec<(&str, bool)> = all_fields
+            .iter()
+            .filter(|f| f.kind == FieldKind::Bool && !f.is_encrypted())
+            .map(|f| (f.name.as_str(), !f.nullable))
+            .collect();
         render_csv_import_section(
             pascal_name,
             plural,
@@ -6343,7 +6435,9 @@ mod attachment_read_back_tests {{
             flash_arg,
             &authz_params,
             &authz_call,
-            guards_text_cells,
+            &text_columns,
+            &ignored_columns,
+            &bool_columns,
             labels,
         )
     } else {
@@ -10239,7 +10333,41 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
 /// [`CSV_IMPORT_TEMPLATE`] at `__UNGUARD_FN__` only when some exported column is
 /// text-backed — an unused `fn` would be a `dead_code` warning in the user's
 /// app, and the scaffold's contract is that generated code compiles clean.
-const CSV_UNGUARD_CELL_FN: &str = r"/// Undo the export's `csv_text_cell` formula guard.
+const CSV_BOOL_CELL_FN: &str = r#"__BOOL_COLUMNS_CONST__/// Normalize a boolean cell into what `serde` will accept for a `bool`.
+///
+/// The generated form declares a non-nullable `bool` as
+/// `#[serde(default)] pub flag: bool`, so on the BROWSER path an unchecked
+/// checkbox sends no key at all and defaults to `false`. A spreadsheet is not a
+/// checkbox: it always writes the column, and it writes it a dozen ways —
+/// `TRUE`/`FALSE` (what Excel exports), `1`/`0`, `yes`/`no`, or an empty cell
+/// for "no". serde's `bool` accepts only `true` and `false`, so without this
+/// every one of those spellings would fail the WHOLE ROW on a column the form
+/// itself treats as optional.
+///
+/// An unrecognised value is passed through untouched, so it fails with the
+/// form's own message naming the column rather than being coerced to something
+/// the operator did not write. A blank cell maps to `false` only for a
+/// NON-nullable column (that is what the unchecked checkbox means); for a
+/// nullable one it is left blank, which `decode_form` strips to `None`.
+fn csv_bool_cell<'a>(column: &str, value: &'a str) -> &'a str {
+    let Some((_, blank_is_false)) = CSV_BOOL_COLUMNS.iter().find(|(name, _)| *name == column)
+    else {
+        return value;
+    };
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return if *blank_is_false { "false" } else { value };
+    }
+    match normalized.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "1" | "on" => "true",
+        "false" | "f" | "no" | "n" | "0" | "off" => "false",
+        _ => value,
+    }
+}
+
+"#;
+
+const CSV_UNGUARD_CELL_FN: &str = r"__TEXT_COLUMNS_CONST__/// Undo the export's `csv_text_cell` formula guard.
 ///
 /// `to_csv_record` prefixes an apostrophe to a text value beginning `=`, `+`,
 /// `-`, `@`, TAB or CR so a spreadsheet displays it instead of executing it.
@@ -10256,7 +10384,16 @@ const CSV_UNGUARD_CELL_FN: &str = r"/// Undo the export's `csv_text_cell` formul
 /// value someone really typed as `'=x` and one the export guarded from `=x` are
 /// the same bytes in the file, and this resolves them to `=x`. Delete the call
 /// in the import handler if you would rather keep the apostrophe and store it.
-fn csv_unguard_cell(value: &str) -> &str {
+///
+/// Applied only to the columns the export routes through `csv_text_cell`
+/// (`CSV_TEXT_COLUMNS`). A numeric, boolean, UUID, timestamp or enum column is
+/// rendered from a typed value and can never have been guarded, so stripping an
+/// apostrophe there would make the import quietly MORE permissive than the form
+/// it claims to mirror — `'-5` would import as `-5` where the form rejects it.
+fn csv_unguard_cell<'a>(column: &str, value: &'a str) -> &'a str {
+    if !CSV_TEXT_COLUMNS.contains(&column) {
+        return value;
+    }
     let mut rest = value.chars();
     if rest.next() == Some('\'')
         && matches!(rest.next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'))
@@ -10301,6 +10438,32 @@ const CSV_IMPORT_TEMPLATE: &str = r#"
 /// files big enough that a request-time round trip is the wrong shape, move the
 /// parse into a background job instead of raising this.
 const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most data rows one upload will process.
+///
+/// `MAX_IMPORT_BYTES` bounds the file; this bounds what the file can make the
+/// server DO with it, which is not the same thing. A 2 MiB CSV of six-byte rows
+/// is ~350 000 rows, and each one costs a form decode, a validation pass, and —
+/// when it fails — a `CsvRowError` that is then rendered into the report page.
+/// That is a 2 MiB request amplified into tens of megabytes of server memory,
+/// on the DRY-RUN path, where the caller pays nothing. The cap is the same
+/// 10 000 the CSV export uses, for the same reason.
+///
+/// Rows past the cap are COUNTED and SKIPPED, never silently dropped: they land
+/// in `ImportReport::skipped`, so `total_rows()` still says how big the file
+/// really was, and the report leads with a warning naming the count. Split the
+/// file and import the rest, or raise this — and `MAX_IMPORT_BYTES` with it.
+const MAX_IMPORT_ROWS: u64 = 10_000;
+
+/// The most row errors the report page will RENDER.
+///
+/// A file can legitimately be wrong in ten thousand places (a shifted column,
+/// an export from another system), and nobody reads ten thousand table rows —
+/// but building them costs real memory, and a response over
+/// `security.submit_token`'s 10 MiB cacheable-body limit silently loses this
+/// route's double-submit protection. The count above the table is the whole
+/// truth; this only bounds the listing.
+const MAX_REPORT_ERRORS: usize = 200;
 
 /// Media types accepted for the uploaded CSV part.
 ///
@@ -10356,7 +10519,7 @@ fn is_csv_upload(file_name: Option<&str>, content_type: Option<&str>) -> bool {
     named_csv && declared_ok
 }
 
-__UNGUARD_FN__/// The CSV upload control: the expected column list, the file input, and the
+__IGNORED_COLUMNS_CONST____CELL_FNS__/// The CSV upload control: the expected column list, the file input, and the
 /// commit confirmation.
 ///
 /// Shared by `GET /__PLURAL__/import`, the 422 re-render when an upload is
@@ -10364,14 +10527,20 @@ __UNGUARD_FN__/// The CSV upload control: the expected column list, the file inp
 /// preview, tick the box, upload again" is always the same control.
 ///
 /// The CSRF and one-time submit-token inputs are rendered FIRST on purpose.
-/// Both layers scan only the first `security.csrf.token_scan_bytes` of a
-/// multipart body, so a token rendered after the file part would sit past the
-/// scan window on any real upload and the submit would be rejected. Keep them
-/// first if you rearrange this form.
+/// Both layers scan only a bounded PREFIX of a multipart body — CSRF the first
+/// `security.csrf.token_scan_bytes`, the submit-token layer its own fixed 2 MiB
+/// — so a token rendered after the file part sits past that window on any real
+/// upload. The two then fail differently, and the quiet one is the dangerous
+/// one: a CSRF token outside the window is a 403, but a submit token outside it
+/// is indistinguishable from no token at all, so the request passes through
+/// UNGUARDED and a double-click or Back→resubmit commits the file twice. Keep
+/// both fields first if you rearrange this form.
 ///
-/// `commit` pre-checks the confirmation box. The preview passes `true` (the
-/// next submit is the one that writes) and the committed result passes `false`
-/// (so the next upload previews again rather than silently importing twice).
+/// `commit` pre-checks the confirmation box. Every caller passes `false`, and
+/// that is deliberate: a preview page that armed the box would arm it for
+/// WHATEVER FILE IS CHOSEN NEXT, so an operator who reads a bad report and
+/// picks a different file to preview would commit it instead. "Unconfirmed
+/// means dry run" has to hold for every upload, not just the first.
 fn import_form_body(
     __LOCALE_REF_PARAM__csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
@@ -10387,8 +10556,13 @@ fn import_form_body(
         p {
             __L_COLUMNS__
             ": "
-            (<__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns().join(", "))
+            // Joined with a BARE comma, and marked up as code, so this line can
+            // be copied straight into a spreadsheet's first row. The CSV parser
+            // does not trim, so a `, `-separated copy would produce header keys
+            // like `" title"` and every column would silently fail to match.
+            code { (<__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns().join(",")) }
         }
+        p { __L_COLUMNS_NOTE__ }__IGNORED_COLUMNS_MARKUP__
         form method="post" action=(paths::import()) enctype="multipart/form-data" {
             (csrf_input(csrf, csrf_field))
             (submit_token_input(submit_token, submit_field))
@@ -10415,7 +10589,11 @@ fn import_form_body(
 ///
 /// `inserted + errors.len()` always equals `total_rows()`: no row is counted
 /// twice and none is dropped silently.
-fn import_report_view(__LOCALE_REF_PARAM__report: &autumn_web::data::csv::ImportReport, committed: bool) -> Markup {
+fn import_report_view(
+    __LOCALE_REF_PARAM__report: &autumn_web::data::csv::ImportReport,
+    committed: bool,
+    write_failure: Option<&str>,
+) -> Markup {
     html! {
         h2 {
             @if committed { __L_COMPLETE__ } @else { __L_PREVIEW__ }
@@ -10429,6 +10607,18 @@ fn import_report_view(__LOCALE_REF_PARAM__report: &autumn_web::data::csv::Import
             }
             li { __L_ROWS_FAILED__ ": " (report.errors.len()) }
         }
+        // A write that failed partway through. Loudest thing on the page: some
+        // rows may already be committed and the counts below cannot say which,
+        // so re-uploading the same file would duplicate them.
+        @if let Some(failure) = write_failure {
+            p role="alert" { __L_WRITE_FAILED__ ": " (failure) }
+        }
+        // Rows the cap left unprocessed. Loud, and above the error table: an
+        // import that quietly stopped two thirds of the way through a file is
+        // the one failure an operator must not have to infer from arithmetic.
+        @if report.skipped > 0 {
+            p role="alert" { __L_ROWS_SKIPPED__ ": " (report.skipped) }
+        }
         @if report.errors.is_empty() {
             p { __L_NO_ERRORS__ }
         } @else {
@@ -10441,17 +10631,26 @@ fn import_report_view(__LOCALE_REF_PARAM__report: &autumn_web::data::csv::Import
                     }
                 }
                 tbody {
-                    @for error in &report.errors {
+                    @for error in report.errors.iter().take(MAX_REPORT_ERRORS) {
                         tr {
                             // The 1-based line number in the uploaded file, so
                             // the operator can jump straight to the row in their
-                            // spreadsheet.
-                            td { (error.line) }
+                            // spreadsheet. A `0` means "no line" (a write failure
+                            // whose row could not be mapped back) — show the same
+                            // dash the column cell uses rather than a line number
+                            // that exists in no file.
+                            @if error.line == 0 { td { "-" } } @else { td { (error.line) } }
                             td { (error.column.as_deref().unwrap_or("-")) }
                             td { (error.message) }
                         }
                     }
                 }
+            }
+            // The count above the table is the whole truth; the listing is
+            // bounded. Say so rather than let a reader take the last rendered
+            // row for the last error.
+            @if report.errors.len() > MAX_REPORT_ERRORS {
+                p { __L_MORE_ERRORS__ ": " (report.errors.len() - MAX_REPORT_ERRORS) }
             }
         }
     }
@@ -10508,6 +10707,14 @@ pub async fn import_form(
 /// failure carries the index of the row that caused it, which maps back to the
 /// CSV line recorded during the parse — that is how a unique violation is
 /// reported against line 7 rather than as an opaque 500.
+///
+/// INSERT-ONLY, and this is the likeliest surprise: every row goes through
+/// `into_new` and is INSERTED. No row is ever matched against an existing
+/// record, and an `id` column in the file is ignored — so re-uploading a file
+/// this app exported DUPLICATES it rather than updating it in place.
+/// `ImportMode::Upsert { by }` exists for update-in-place; wiring it up means
+/// matching on the `by` columns here and calling the repository's update path
+/// for a hit, which is deliberately left to you rather than guessed at.
 ///
 /// ATOMICITY, precisely: `save_many_skip_invalid` owns the transaction, and
 /// this handler makes exactly one call to it. Rows that fail are skipped and
@@ -10569,7 +10776,13 @@ pub async fn import(
                 // The confirmation checkbox. An unchecked box submits NOTHING —
                 // absence is what keeps the default a dry run — and any value
                 // other than the ones below is treated as "not confirmed".
-                let value = String::from_utf8(field.bytes_limited().await?).unwrap_or_default();
+                //
+                // Capped hard: the longest value this accepts is four bytes, but
+                // an unnarrowed `bytes_limited()` would buffer up to the GLOBAL
+                // `security.upload.max_file_size_bytes` (16 MiB by default)
+                // before throwing it away.
+                let value = String::from_utf8(field.with_max_bytes(64).bytes_limited().await?)
+                    .unwrap_or_default();
                 commit = matches!(value.trim(), "1" | "on" | "true" | "yes");
             }
             _ => {}
@@ -10608,9 +10821,19 @@ pub async fn import(
     // and drops it.
     let mut pending_lines: Vec<u64> = Vec::new();
     let mut pending_rows: Vec<New__PASCAL__> = Vec::new();
+    let mut rows_seen: u64 = 0;
     let mut report = autumn_web::data::csv::import_csv(&uploaded[..], &options, |line, row, _mode| {
+        rows_seen += 1;
+        if rows_seen > MAX_IMPORT_ROWS {
+            // Past the cap. Count the row and move on WITHOUT decoding,
+            // validating, or allocating an error for it — those are exactly the
+            // costs `MAX_IMPORT_ROWS` exists to bound. `Skipped` keeps
+            // `total_rows()` honest, so the report still reports the file's real
+            // size and the banner above the table names what was left out.
+            return autumn_web::data::csv::ImportRowResult::Skipped;
+        }
         let encoded = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(row.iter().map(|(key, value)| (key.as_str(), __UNGUARD_CALL__)))
+                .extend_pairs(row.iter().map(|(key, value)| (key.as_str(), __CELL_CALL__)))
             .finish();
         let form = match decode_form(Bytes::from(encoded)) {
             Ok(form) => form,
@@ -10642,8 +10865,30 @@ pub async fn import(
         }
         autumn_web::data::csv::ImportRowResult::Inserted
     });
+    // Set when the write itself fails rather than a row failing: some earlier
+    // chunk may already be committed, so the page has to say so instead of
+    // 500ing on a half-finished import.
+    let mut write_failure: Option<String> = None;
     if commit {
-        let (saved, failures) = repo.save_many_skip_invalid(&pending_rows).await?;
+        // NOT `?`. `save_many_skip_invalid` isolates the row-level failures a
+        // constraint causes, but a chunk that fails for another reason — a
+        // statement timeout, a serialization failure, a dropped connection —
+        // aborts the whole call, DISCARDING the successes it had already
+        // accumulated while every earlier chunk stays committed. A bare 500 there
+        // would tell the operator nothing about what landed, and their only move
+        // (re-upload) would duplicate it, because this import is insert-only.
+        let (saved, failures) = match repo.save_many_skip_invalid(&pending_rows).await {
+            Ok(result) => result,
+            Err(err) => {
+                autumn_web::reexports::tracing::error!(
+                    error = %err,
+                    rows = pending_rows.len(),
+                    "__PLURAL__ CSV import failed partway through the write"
+                );
+                write_failure = Some(err.to_string());
+                (Vec::new(), Vec::new())
+            }
+        };
         // Take the inserted count from what the DATABASE returned rather than
         // from what the parse pass counted: a row that validated and then lost a
         // unique race is a failure, and `inserted + errors = rows read` has to
@@ -10653,11 +10898,16 @@ pub async fn import(
             let line = pending_lines.get(index).copied().unwrap_or_default();
             report.errors.push(autumn_web::data::csv::CsvRowError::row(line, failure.to_string()));
         }
+        // Back into file order. Validation errors were collected row by row, but
+        // the write failures above are appended after all of them, so unsorted
+        // the report would read 3, 7, 12, then 2, 5 — against a file the operator
+        // is reading top to bottom.
+        report.errors.sort_by_key(|error| error.line);
     }
     let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
         h1 { __L_HEADING__ }
-        (import_report_view(__LOCALE_ARG__&report, commit))
-        (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), !commit, None))
+        (import_report_view(__LOCALE_ARG__&report, commit, write_failure.as_deref()))
+        (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, None))
         (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))
     });
     Ok(page.into_response())
@@ -10688,12 +10938,27 @@ fn render_csv_import_section(
     flash_arg: &str,
     authz_params: &str,
     authz_call: &str,
-    // Whether the emitted `CsvSchema` routes any column through the export's
-    // `csv_text_cell` formula guard. When it does, the import has to undo that
-    // guard or a file this app exported would gain an apostrophe per round trip;
-    // when it does not, emitting the inverse would be an unused `fn` — a
-    // `dead_code` warning in the user's app.
-    guards_text_cells: bool,
+    // The exported column names the export's `csv_text_cell` formula guard
+    // applies to. The import has to undo that guard on exactly those columns or
+    // a file this app exported would gain an apostrophe per round trip — and on
+    // no others, or it would strip a leading apostrophe the export never added.
+    // Empty means no guarded column, and then no inverse is emitted at all: an
+    // unused `fn` is a `dead_code` warning in the user's app.
+    text_columns: &[&str],
+    // Columns the EXPORT writes but the form does not carry, so an import can
+    // never set them: `id` and `created_at` (the database assigns them), a
+    // `--default`ed column (dropped from the form, set by the SQL DEFAULT), a
+    // `position` column (assigned by the reorder triggers) and an `Attachment`
+    // (a storage key in a cell is not a file). They are silently ignored on the
+    // way in, so the upload page names them rather than letting an operator edit
+    // one and watch nothing happen.
+    ignored_columns: &[&str],
+    // The boolean columns, paired with whether a BLANK cell means `false` for
+    // them (true for a non-nullable column, false for a nullable one). A
+    // spreadsheet writes `TRUE`/`1`/`yes`/blank where serde's `bool` accepts
+    // only `true`/`false`, so without this every such spelling fails the whole
+    // row on a column the form itself treats as optional.
+    bool_columns: &[(&str, bool)],
     labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     // Issue #1349: the two view helpers take the locale by reference (they only
@@ -10719,14 +10984,98 @@ fn render_csv_import_section(
     // handler binds has one type either way.
     let not_csv_english = "That file is not a .csv - choose a CSV file and try again.";
     let no_file_english = "Choose a CSV file to import.";
-    let (unguard_fn, unguard_call) = if guards_text_cells {
-        (CSV_UNGUARD_CELL_FN, "csv_unguard_cell(value)")
+    // The two per-column cell rules, each emitted only when some column needs
+    // it: an unused `fn` is a `dead_code` warning in the user's app.
+    //
+    // `cell_call` composes whichever apply, innermost first, so a text column
+    // that is also boolean (there is no such column today, but the composition
+    // costs nothing) would go through both. With neither, the value is passed
+    // through exactly as it was before either helper existed.
+    // Named on the page, not just in a doc comment. These columns ARE in the
+    // header the export writes and in the list printed above it, but the form
+    // does not carry them — so without this line an operator could edit one in a
+    // spreadsheet, re-upload, and watch nothing happen, with no error and no row
+    // in the report to explain it.
+    let (ignored_columns_const, ignored_columns_markup) = if ignored_columns.is_empty() {
+        (String::new(), String::new())
     } else {
-        ("", "value.as_str()")
+        let names = ignored_columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            format!(
+                "/// Exported columns the import cannot set — the database assigns\n\
+                 /// them, or `{{Pascal}}Form` does not carry them. Named on the upload\n\
+                 /// page (they are column NAMES, not prose, so they are not\n\
+                 /// translated) rather than left for the operator to discover by\n\
+                 /// editing one and watching nothing happen.\n\
+                 const CSV_IGNORED_COLUMNS: &[&str] = &[{names}];\n\n"
+            ),
+            "\n        p {\n            __L_IGNORED_NOTE__\n            \": \"\n            code { (CSV_IGNORED_COLUMNS.join(\", \")) }\n        }"
+                .to_owned(),
+        )
     };
+    // Which cell rules this model needs, and the expression that applies them.
+    // Each helper is emitted only where some column needs it: an unused `fn` is
+    // a `dead_code` warning in the user's app, and the scaffold's contract is
+    // that generated code compiles clean.
+    let cell_call = match (!text_columns.is_empty(), !bool_columns.is_empty()) {
+        (true, true) => "csv_bool_cell(key, csv_unguard_cell(key, value))",
+        (true, false) => "csv_unguard_cell(key, value)",
+        (false, true) => "csv_bool_cell(key, value)",
+        (false, false) => "value.as_str()",
+    };
+    let mut cell_fns = String::new();
+    if !text_columns.is_empty() {
+        let names = text_columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        cell_fns.push_str(&CSV_UNGUARD_CELL_FN.replace(
+            "__TEXT_COLUMNS_CONST__",
+            &format!(
+                "/// The exported columns the export's `csv_text_cell` formula guard\n\
+                 /// applies to — the text-backed ones. Kept beside the inverse below so\n\
+                 /// the two halves of the guard are edited together: dropping a column\n\
+                 /// from `csv_text_cell` without dropping it here would strip an\n\
+                 /// apostrophe the export never added.\n\
+                 const CSV_TEXT_COLUMNS: &[&str] = &[{names}];\n\n"
+            ),
+        ));
+    }
+    if !bool_columns.is_empty() {
+        let entries = bool_columns
+            .iter()
+            .map(|(name, blank_is_false)| format!("(\"{name}\", {blank_is_false})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        cell_fns.push_str(&CSV_BOOL_CELL_FN.replace(
+            "__BOOL_COLUMNS_CONST__",
+            &format!(
+                "/// The boolean columns, and whether a BLANK cell means `false` for\n\
+                 /// each. A non-nullable `bool` takes `false` — that is what an\n\
+                 /// unchecked checkbox means, and the form's `#[serde(default)]`\n\
+                 /// already encodes it — while a nullable one keeps the blank, which\n\
+                 /// `decode_form` strips to `None`.\n\
+                 const CSV_BOOL_COLUMNS: &[(&str, bool)] = &[{entries}];\n\n"
+            ),
+        ));
+    }
     CSV_IMPORT_TEMPLATE
-        .replace("__UNGUARD_FN__", unguard_fn)
-        .replace("__UNGUARD_CALL__", unguard_call)
+        .replace("__IGNORED_COLUMNS_CONST__", &ignored_columns_const)
+        .replace("__IGNORED_COLUMNS_MARKUP__", &ignored_columns_markup)
+        .replace(
+            "__L_IGNORED_NOTE__",
+            &labels.markup(
+                "common.import.columns.ignored",
+                "Columns in the file that this import cannot set",
+            ),
+        )
+        .replace("__CELL_FNS__", &cell_fns)
+        .replace("__CELL_CALL__", cell_call)
         .replace("__LOCALE_REF_PARAM__", locale_ref_param)
         .replace("__LOCALE_PARAM__", locale_param)
         .replace("__LOCALE_ARG__", locale_arg)
@@ -10744,6 +11093,13 @@ fn render_csv_import_section(
         .replace(
             "__L_COLUMNS__",
             &labels.markup("common.import.columns", "Expected columns"),
+        )
+        .replace(
+            "__L_COLUMNS_NOTE__",
+            &labels.markup(
+                "common.import.columns.note",
+                "Copy this line as your file's first row. Columns the file adds beyond it are ignored. Every row is inserted as a NEW record — an existing record is never matched or updated, so re-uploading a file duplicates it.",
+            ),
         )
         .replace(
             "__L_FILE__",
@@ -10783,6 +11139,24 @@ fn render_csv_import_section(
         .replace(
             "__L_ROWS_FAILED__",
             &labels.markup("common.import.rows.failed", "Rows with errors"),
+        )
+        .replace(
+            "__L_WRITE_FAILED__",
+            &labels.markup(
+                "common.import.write.failed",
+                "The write failed partway through. Rows already committed are NOT                  listed below — check the list view before uploading this file again,                  or it will import them twice",
+            ),
+        )
+        .replace(
+            "__L_ROWS_SKIPPED__",
+            &labels.markup(
+                "common.import.rows.skipped",
+                "Rows not processed (the file is over this route's row cap)",
+            ),
+        )
+        .replace(
+            "__L_MORE_ERRORS__",
+            &labels.markup("common.import.rows.more", "Further errors not listed"),
         )
         .replace(
             "__L_NO_ERRORS__",

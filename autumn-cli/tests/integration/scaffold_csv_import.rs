@@ -92,7 +92,8 @@ fn handler_slice<'a>(routes: &'a str, name: &str) -> &'a str {
 /// Slice out a private `fn name(` helper: its signature through the line before
 /// the next top-level `fn`/handler.
 fn fn_slice<'a>(routes: &'a str, name: &str) -> &'a str {
-    let needle = format!("\nfn {name}(");
+    // No `(`: some helpers carry a lifetime parameter (`fn f<'a>(…)`).
+    let needle = format!("\nfn {name}");
     let start = routes
         .find(&needle)
         .unwrap_or_else(|| panic!("routes file must emit `fn {name}(`:\n{routes}"));
@@ -134,7 +135,10 @@ fn both_import_routes_are_mounted_in_main() {
     flags.extend_from_slice(&[] as &[&str]);
     let (_tmp, project, _) = scaffold_project("import-main", &default_cols(), &flags);
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
-    for entry in ["routes::posts::import_form", "routes::posts::import"] {
+    // `routes::posts::import` is a SUBSTRING of `routes::posts::import_form`, so
+    // each entry is matched with its own line terminator — otherwise mounting
+    // only the form would satisfy both assertions.
+    for entry in ["routes::posts::import_form,", "routes::posts::import,"] {
         assert!(
             main.contains(entry),
             "`{entry}` must be mounted in main.rs:\n{main}"
@@ -152,7 +156,8 @@ fn paths_module_exposes_the_import_helper() {
         .split_once("];")
         .expect("paths! block end")
         .0;
-    for helper in ["import_form", "import"] {
+    // Terminated, for the same substring reason as the `main.rs` mount above.
+    for helper in ["    import_form,", "    import,"] {
         assert!(
             paths.contains(helper),
             "the paths! block must expose `{helper}`:\n{paths}"
@@ -188,14 +193,44 @@ fn the_handler_previews_in_dry_run_mode_unless_the_submit_confirms() {
         import.contains("autumn_web::data::csv::import_csv("),
         "the handler must drive the shipped import engine:\n{import}"
     );
-    // The write call must be reachable only under the confirmation flag.
+    // The write must be the FIRST statement of the commit block. A looser
+    // "somewhere after an `if commit {`" check is vacuous: the handler already
+    // contains `mode: if commit {` and a second `if commit {` inside the row
+    // closure, both before the real gate, so deleting the gate entirely would
+    // still satisfy it. This is the single safety property of the whole feature.
     let (before_write, _) = import
-        .split_once("save_many_skip_invalid")
+        .split_once("repo.save_many_skip_invalid(")
         .expect("the commit path must call save_many_skip_invalid");
-    assert!(
-        before_write.contains("if commit {"),
-        "the write must sit behind the explicit commit confirmation:\n{import}"
+    let gate = before_write
+        .rfind("if commit {")
+        .expect("the write must sit inside an `if commit` block");
+    // Walk from just inside that `if commit {` to the write, tracking block
+    // depth. If the block CLOSES before the write is reached, the `if commit`
+    // found above is not the one guarding it — which is exactly what would
+    // happen if the real gate were deleted and `rfind` landed on the closure's
+    // own `if commit { pending_lines.push(..) }` instead.
+    let between = &before_write[gate + "if commit {".len()..];
+    let mut depth: i32 = 1;
+    for byte in between.bytes() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        assert!(
+            depth > 0,
+            "the `if commit` block closes before the write, so the write is not \
+             gated by it:\n{between}"
+        );
+    }
+    assert_eq!(
+        import.matches("repo.save_many_skip_invalid(").count(),
+        1,
+        "exactly one write call, so the gate above covers all of them:\n{import}"
     );
+    // `import_csv` hands the mode to the closure and never acts on it itself, so
+    // the mode alone does not make a dry run safe — say so here, where someone
+    // tempted to relax the gate above will read it.
 }
 
 #[test]
@@ -278,13 +313,20 @@ fn a_file_this_app_exported_round_trips_back_in() {
     //    value beginning `=`/`+`/`-`/`@`. Without the inverse, every round trip
     //    would store one more apostrophe.
     assert!(
-        routes.contains("fn csv_unguard_cell("),
+        routes.contains("fn csv_unguard_cell<'a>("),
         "the import must undo the export's formula guard:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
     assert!(
-        import.contains("csv_unguard_cell(value)"),
+        import.contains("csv_unguard_cell(key, value)"),
         "the row decoder must route each value through the inverse guard:\n{import}"
+    );
+    // ...and only on the columns the export actually guards. Stripping an
+    // apostrophe from a typed column would make the import quietly more
+    // permissive than the form it claims to mirror (`'-5` -> `-5`).
+    assert!(
+        routes.contains(r#"const CSV_TEXT_COLUMNS: &[&str] = &["title", "body"];"#),
+        "the inverse must be scoped to the guarded columns:\n{routes}"
     );
 }
 
@@ -342,6 +384,163 @@ fn the_datetime_parser_accepts_the_format_the_export_writes() {
     );
 }
 
+/// A spreadsheet does not write `true`/`false`. Excel writes `TRUE`/`FALSE`,
+/// people write `1`/`0` or `yes`, and "no" is very often an empty cell — while
+/// serde's `bool` accepts exactly two spellings. Without a normalizer every one
+/// of those fails the WHOLE ROW on a column the generated form itself treats as
+/// optional (`#[serde(default)] pub published: bool`).
+#[test]
+fn a_boolean_column_accepts_the_spellings_a_spreadsheet_writes() {
+    let (_tmp, routes) = import_routes("import-bools", &[]);
+    assert!(
+        routes.contains(r#"const CSV_BOOL_COLUMNS: &[(&str, bool)] = &[("published", true)];"#),
+        "the boolean columns must be listed with their blank-cell meaning:\n{routes}"
+    );
+    let cell = fn_slice(&routes, "csv_bool_cell");
+    for needle in [
+        r#""true" | "t" | "yes" | "y" | "1" | "on" => "true","#,
+        r#"=> "false","#,
+    ] {
+        assert!(
+            cell.contains(needle),
+            "the normalizer must accept `{needle}`:\n{cell}"
+        );
+    }
+    // A blank cell means `false` for a NON-nullable column (that is what an
+    // unchecked checkbox means) and stays blank for a nullable one, where
+    // `decode_form` strips it to `None`.
+    assert!(
+        cell.contains("return if *blank_is_false { \"false\" } else { value };"),
+        "a blank cell must respect the column's nullability:\n{cell}"
+    );
+    // An unrecognised value is NOT coerced — it fails with the form's own
+    // message, which names the column.
+    assert!(
+        cell.contains("_ => value,"),
+        "an unrecognised value must pass through untouched:\n{cell}"
+    );
+    let import = handler_slice(&routes, "import");
+    assert!(
+        import.contains("csv_bool_cell(key, csv_unguard_cell(key, value))"),
+        "the row decoder must apply both cell rules:\n{import}"
+    );
+
+    // A nullable bool keeps its blank.
+    let (_tmp2, project, _) = scaffold_project(
+        "import-bools-null",
+        &["title:String", "published:Option<bool>"],
+        &["--import"],
+    );
+    let nullable = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        nullable.contains(r#"&[("published", false)]"#),
+        "a nullable bool's blank cell is NULL, not false:\n{nullable}"
+    );
+}
+
+/// The export writes columns the form does not carry — `id` and `created_at`
+/// always, plus anything dropped from the form. They are ignored on the way in,
+/// so the upload page has to NAME them: otherwise an operator edits one in a
+/// spreadsheet, re-uploads, and watches nothing happen.
+#[test]
+fn the_upload_page_names_the_columns_it_cannot_set() {
+    let (_tmp, project, _) = scaffold_project(
+        "import-ignored",
+        &["title:String", "tag:String", "--default", "tag=general"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    let form = fn_slice(&routes, "import_form_body");
+    assert!(
+        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "tag", "created_at"];"#),
+        "the columns the import cannot set must be listed:\n{routes}"
+    );
+    assert!(
+        form.contains(r#"code { (CSV_IGNORED_COLUMNS.join(", ")) }"#),
+        "the ignored columns must be named on the upload page:\n{form}"
+    );
+    // ...and the expected header row is copy-pasteable: a bare comma, because
+    // the CSV parser does not trim and `", "` would make every column miss.
+    assert!(
+        form.contains(r#"csv_columns().join(",")"#),
+        "the expected header row must be copy-pasteable:\n{form}"
+    );
+}
+
+/// An at-rest `#[encrypted]` column is omitted from the export (#1340) but is a
+/// REQUIRED field on the generated form, so a file whose header is
+/// `csv_columns()` can never satisfy it: every row would fail with "missing
+/// field". Refuse the surface rather than ship one that cannot work.
+#[test]
+fn an_encrypted_column_refuses_the_import_and_says_why() {
+    let (_tmp, project, output) = scaffold_project(
+        "import-encrypted",
+        &["title:String", "api_token:String{encrypted}"],
+        &["--import"],
+    );
+    assert_no_import_anywhere(&project);
+    assert!(
+        output.contains("api_token") && output.contains("#[encrypted]"),
+        "the warning must name the column and the reason:\n{output}"
+    );
+}
+
+/// A write that fails for a reason `save_many_skip_invalid` cannot isolate (a
+/// timeout, a dropped connection) leaves earlier chunks COMMITTED. A bare 500
+/// would tell the operator nothing about what landed, and their only move —
+/// re-uploading — would duplicate it, because the import is insert-only.
+#[test]
+fn a_failed_write_reports_what_may_already_be_committed() {
+    let (_tmp, routes) = import_routes("import-writefail", &[]);
+    let import = handler_slice(&routes, "import");
+    assert!(
+        !import.contains("save_many_skip_invalid(&pending_rows).await?"),
+        "the write must not `?` away a partial commit:\n{import}"
+    );
+    assert!(
+        import.contains("write_failure = Some(err.to_string());"),
+        "a failed write must be carried into the report:\n{import}"
+    );
+    let view = fn_slice(&routes, "import_report_view");
+    assert!(
+        view.contains("@if let Some(failure) = write_failure {"),
+        "the report must lead with the write failure:\n{view}"
+    );
+}
+
+/// The row cap bounds what a 2 MiB upload can make the server DO with it — a
+/// file of six-byte rows is ~350 000 of them, each costing a decode, a
+/// validation pass and (when it fails) a rendered table row.
+#[test]
+fn the_import_is_capped_by_rows_as_well_as_by_bytes() {
+    let (_tmp, routes) = import_routes("import-rowcap", &[]);
+    assert!(
+        routes.contains("const MAX_IMPORT_ROWS: u64 = 10_000;"),
+        "the row count must be capped, not just the byte count:\n{routes}"
+    );
+    assert!(
+        routes.contains("const MAX_REPORT_ERRORS: usize = 200;"),
+        "the rendered error list must be bounded:\n{routes}"
+    );
+    let import = handler_slice(&routes, "import");
+    // Rows past the cap are COUNTED and SKIPPED, so `total_rows()` still reports
+    // the file's real size — never silently dropped.
+    assert!(
+        import.contains("if rows_seen > MAX_IMPORT_ROWS {")
+            && import.contains("return autumn_web::data::csv::ImportRowResult::Skipped;"),
+        "rows past the cap must be counted as skipped:\n{import}"
+    );
+    let view = fn_slice(&routes, "import_report_view");
+    assert!(
+        view.contains("@if report.skipped > 0 {"),
+        "a truncated import must say so:\n{view}"
+    );
+    assert!(
+        view.contains("report.errors.iter().take(MAX_REPORT_ERRORS)"),
+        "the error listing must be bounded:\n{view}"
+    );
+}
+
 // ── AC5: CSRF, size limit, and a content-type/extension check ─────────────────
 
 #[test]
@@ -381,6 +580,12 @@ fn the_upload_is_size_capped_and_checked_by_extension_and_content_type() {
     assert!(
         import.contains(".bytes_limited()"),
         "the upload must go through the framework's size-limited read:\n{import}"
+    );
+    // The sibling text part is capped too: without narrowing it, a four-byte
+    // checkbox value could be sent as the GLOBAL 16 MiB upload limit.
+    assert!(
+        import.contains("field.with_max_bytes(64).bytes_limited()"),
+        "the confirmation part must be capped to its own size:\n{import}"
     );
     assert!(
         routes.contains("const MAX_IMPORT_BYTES: usize"),
@@ -424,11 +629,21 @@ fn the_generated_smoke_test_previews_then_commits() {
             "the generated import test must exercise `{needle}`:\n{test}"
         );
     }
-    // Dry run: 1 insertable + 1 row error, and NOTHING persisted.
-    assert!(
-        test.contains("would insert 1"),
-        "the generated test must assert the dry-run insertable count:\n{test}"
-    );
+    // Dry run: 1 insertable + 1 row error ON THE RIGHT LINE, and NOTHING
+    // persisted. The line number is asserted here as well as in the emitted test
+    // because it is the property the CRLF fix in this same change exists for —
+    // without it the generated test could stop checking and nothing would say so.
+    for needle in [
+        "would insert 1",
+        "errors 1",
+        "first error line 3",
+        "assert_eq!(\n        after_commit, \"Keep me\"",
+    ] {
+        assert!(
+            test.contains(needle),
+            "the generated test must assert `{needle}`:\n{test}"
+        );
+    }
     assert!(
         test.contains("a dry run must not write"),
         "the generated test must assert the dry run persisted nothing:\n{test}"
@@ -514,6 +729,68 @@ fn assert_no_import_anywhere(project: &Path) {
         !main.contains("routes::posts::import"),
         "main.rs must not mount an import the module never emitted:\n{main}"
     );
+    // The Cargo feature and the generated test are two more places the surface
+    // could leak; greping only the routes module would miss both.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !cargo.contains("\"multipart\""),
+        "no import means no multipart feature:\n{cargo}"
+    );
+    let test = fs::read_to_string(project.join("tests/post.rs")).unwrap_or_default();
+    assert!(!test.contains("csv_import"), "{test}");
+}
+
+/// The strongest form of "additive": for a variant that cannot have the import,
+/// passing `--import` must change NOTHING. A grep only sees the strings it was
+/// told to look for; this compares the whole generated tree.
+fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
+    let mut flags = vec!["--import"];
+    flags.extend_from_slice(extra);
+    // The SAME project name for both, in their own tempdirs: `autumn new` stamps
+    // the name into `.env.example`, `Cargo.toml` and the README, so two names
+    // would differ for reasons that have nothing to do with the flag.
+    let with_flag = scaffold_project(name, &default_cols(), &flags);
+    let without = scaffold_project(name, &default_cols(), extra);
+    let files = |root: &Path| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("readable dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(body) = fs::read_to_string(&path) {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("under root")
+                        .display()
+                        .to_string();
+                    // Freshly generated secrets differ by construction; every
+                    // other file is the generator's own output.
+                    if rel.contains("master.key") || rel.contains("credentials.enc") {
+                        continue;
+                    }
+                    out.push((rel, body));
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    let a = files(&with_flag.1);
+    let b = files(&without.1);
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "--import must not add or remove files for a variant that cannot honour it"
+    );
+    for ((name_a, body_a), (name_b, body_b)) in a.iter().zip(b.iter()) {
+        assert_eq!(name_a, name_b, "same tree shape");
+        assert_eq!(
+            body_a, body_b,
+            "--import changed {name_a} for a variant that cannot honour it"
+        );
+    }
 }
 
 #[test]
@@ -522,19 +799,34 @@ fn live_scaffold_omits_the_import_and_says_why() {
         scaffold_project("import-live", &default_cols(), &["--import", "--live"]);
     assert_no_import_anywhere(&project);
     assert!(
-        output.contains("--import"),
+        output.contains("--import: no CSV import route generated"),
         "the generator must warn that --import was not honoured:\n{output}"
+    );
+    assert!(
+        output.contains("SSE island"),
+        "the warning must name the --live reason, not a neighbouring one:\n{output}"
     );
 }
 
 #[test]
 fn sharded_scaffold_omits_the_import() {
-    let (_tmp, project, _) = scaffold_project(
+    let (_tmp, project, output) = scaffold_project(
         "import-sharded",
         &default_cols(),
         &["--import", "--sharded"],
     );
     assert_no_import_anywhere(&project);
+    assert!(
+        output.contains("sharded repository pins every write"),
+        "the warning must name the sharding reason:\n{output}"
+    );
+}
+
+#[test]
+fn a_gated_off_variant_is_byte_identical_with_and_without_the_flag() {
+    assert_import_flag_changes_nothing("import-id-live", &["--live"]);
+    assert_import_flag_changes_nothing("import-id-sharded", &["--sharded"]);
+    assert_import_flag_changes_nothing("import-id-api", &["--api"]);
 }
 
 #[test]
@@ -543,6 +835,36 @@ fn api_scaffold_omits_the_import() {
         scaffold_project("import-api", &default_cols(), &["--import", "--api"]);
     assert!(!project.join("src/routes/posts.rs").exists());
     assert_no_import_anywhere(&project);
+}
+
+/// `destroy scaffold` takes the `multipart` feature back out — unless something
+/// else still needs it. The `csv` feature has the same pair of tests in
+/// `scaffold_csv_export.rs`; this is the import's half.
+#[test]
+fn destroy_takes_the_multipart_feature_back_out() {
+    let (_tmp, project, _) = scaffold_project("import-destroy-mp", &default_cols(), &["--import"]);
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !cargo.contains("\"multipart\""),
+        "the only multipart user is gone, so the feature must go too:\n{cargo}"
+    );
+}
+
+#[test]
+fn destroy_keeps_the_multipart_feature_while_hand_written_code_uses_it() {
+    let (_tmp, project, _) = scaffold_project("import-destroy-mp2", &default_cols(), &["--import"]);
+    fs::write(
+        project.join("src/uploads.rs"),
+        "use autumn_web::extract::Multipart;\npub async fn handle(_form: Multipart) {}\n",
+    )
+    .unwrap();
+    run_autumn_ok(&project, &["destroy", "scaffold", "Post", "--force"]);
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"multipart\""),
+        "a hand-written Multipart route still needs the feature:\n{cargo}"
+    );
 }
 
 // ── Owner-scoped scaffolds keep the index's posture ───────────────────────────

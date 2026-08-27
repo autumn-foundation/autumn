@@ -253,6 +253,31 @@ where
 
 // ── import_csv ────────────────────────────────────────────────────────────────
 
+/// Strip the `(line: N, byte: N)` fragment the CSV parser embeds in its own
+/// error text.
+///
+/// The parser's line number is the UNCALIBRATED one (see the calibration in
+/// [`import_csv`]), so on a CRLF file it disagrees with the `line` field of the
+/// [`CsvRowError`] the message is attached to — and a report that shows a reader
+/// two different line numbers for the same row is worse than one that shows
+/// none. The `line` field is the answer; this removes the contradicting copy.
+///
+/// A message without the fragment is returned unchanged, so this degrades to a
+/// no-op if the parser's wording ever changes.
+fn without_parser_position(message: &str) -> String {
+    const OPEN: &str = " (line: ";
+    let Some(start) = message.find(OPEN) else {
+        return message.to_owned();
+    };
+    let Some(len) = message[start..].find(')') else {
+        return message.to_owned();
+    };
+    let mut out = String::with_capacity(message.len());
+    out.push_str(&message[..start]);
+    out.push_str(&message[start + len + 1..]);
+    out
+}
+
 /// Parse CSV from `reader`, validate rows, and drive import via `handler`.
 ///
 /// The `handler` closure receives the **1-based CSV line number** and a
@@ -311,10 +336,15 @@ where
     // it share that number rather than climbing, which is the parser's limit,
     // not this offset's.
     //
-    // A header carrying an embedded newline inside a quoted field would
-    // mis-calibrate this by however many lines it spans; that is vanishingly
-    // rare, and the alternative (trusting a counter that disagrees with itself
-    // across dialects) is wrong on the common case instead of the exotic one.
+    // The shift is measured ONCE, so it assumes the file is internally
+    // consistent. Two inputs it cannot serve: a file that MIXES terminators (an
+    // editor that appended an LF row to a CRLF export, or two exports
+    // concatenated), where the rows after the switch drift by one; and a header
+    // carrying an embedded newline inside a quoted field, which mis-calibrates
+    // by however many lines it spans. Both are rare next to "the file came out
+    // of Excel", and the alternative — trusting a counter that disagrees with
+    // itself across dialects — is wrong on the common case instead of the
+    // exotic ones.
     let line_offset: i64 = 2 - i64::try_from(rdr.position().line()).unwrap_or(2);
     let absolute_line = move |raw: u64| -> u64 {
         let raw = i64::try_from(raw).unwrap_or(i64::MAX);
@@ -329,9 +359,13 @@ where
             }
             Err(e) => {
                 let pos = absolute_line(e.position().map_or(0, csv::Position::line));
-                report
-                    .errors
-                    .push(CsvRowError::row(pos, format!("CSV parse error: {e}")));
+                report.errors.push(CsvRowError::row(
+                    pos,
+                    format!(
+                        "CSV parse error: {}",
+                        without_parser_position(&e.to_string())
+                    ),
+                ));
                 continue;
             }
         };
@@ -588,6 +622,77 @@ mod tests {
         assert_eq!(crlf, lf, "line endings must not change the row numbers");
     }
 
+    /// The calibration has to reach the PARSE-ERROR branch too: a malformed row
+    /// is reported with the line it is on, and `docs/guide/generators.md`
+    /// promises the scaffolded importer surfaces it "against that row's line".
+    /// Pre-fix the CRLF fixture blamed line 2 for the row on line 3.
+    #[test]
+    fn import_csv_parse_error_line_numbers_match_across_dialects() {
+        let lines = |csv: &[u8]| -> u64 {
+            let report = import_csv(csv, &ImportOptions::default(), |_line, _row, _mode| {
+                ImportRowResult::Inserted
+            });
+            assert_eq!(report.errors.len(), 1, "one malformed row per fixture");
+            assert!(
+                report.errors[0].message.starts_with("CSV parse error"),
+                "expected a parse error, got {:?}",
+                report.errors[0].message
+            );
+            report.errors[0].line
+        };
+        // Row 2 carries a third field the two-column header cannot take.
+        assert_eq!(lines(b"title,note\na,b\nc,d,e\nf,g\n"), 3);
+        assert_eq!(lines(b"title,note\r\na,b\r\nc,d,e\r\nf,g\r\n"), 3);
+    }
+
+    /// The line number in the `line` FIELD and any line number inside the
+    /// `message` must never contradict each other. The parser's own Display
+    /// embeds its uncalibrated position, which on a CRLF file is one behind, so
+    /// the report would show a reader two different lines for one row.
+    #[test]
+    fn import_csv_parse_error_message_carries_no_second_line_number() {
+        for csv in [
+            &b"title,note\na,x\nBAD\nc,z\n"[..],
+            &b"title,note\r\na,x\r\nBAD\r\nc,z\r\n"[..],
+        ] {
+            let report = import_csv(csv, &ImportOptions::default(), |_line, _row, _mode| {
+                ImportRowResult::Inserted
+            });
+            assert_eq!(report.errors.len(), 1);
+            assert_eq!(report.errors[0].line, 3);
+            assert!(
+                !report.errors[0].message.contains("line:"),
+                "the parser's own line number must not travel in the message: {:?}",
+                report.errors[0].message
+            );
+            // The failure itself is still described.
+            assert!(
+                report.errors[0].message.contains("fields"),
+                "{:?}",
+                report.errors[0].message
+            );
+        }
+    }
+
+    /// A header that cannot be read at all aborts the import before any row
+    /// handler runs, and is reported against line 1 — the line the header is on.
+    #[test]
+    fn import_csv_header_error_is_reported_against_line_one_and_runs_no_rows() {
+        let report = import_csv(
+            &[0xff, 0xfe, b'a', b'\n'][..],
+            &ImportOptions::default(),
+            |_line, _row, _mode| unreachable!("no row handler may run for a bad header"),
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].line, 1);
+        assert!(
+            report.errors[0].message.starts_with("CSV header error"),
+            "{:?}",
+            report.errors[0].message
+        );
+        assert_eq!(report.total_rows(), 1);
+    }
+
     /// A quoted field carrying an embedded newline moves the rows after it down
     /// the file, and the reported numbers have to move with them — the operator
     /// counts lines in a text editor, not records.
@@ -694,6 +799,11 @@ mod tests {
         assert_eq!(report.errors.len(), 1, "exactly one error expected");
         assert!(!report.errors.is_empty());
         assert_eq!(report.errors[0].message, "value is BAD");
+        // The test's name promises an EXACT row; assert it, so this 27k-row
+        // fixture buys something the small ones above do not. The bad row is
+        // written at `i == target_line - 1`, which — with the header on line 1 —
+        // is file line 27143.
+        assert_eq!(report.errors[0].line, 27_143);
     }
 
     #[test]

@@ -329,7 +329,9 @@ fn views_look_up_every_user_facing_string_through_the_t_macro() {
 
 #[test]
 fn every_referenced_key_is_defined_in_the_generated_en_ftl() {
-    let (_tmp, project) = i18n_project(&[]);
+    // `--import` included: that surface alone adds ~20 keys, and this set
+    // difference is the only thing that would notice one going unwritten.
+    let (_tmp, project) = i18n_project(&["--import"]);
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     let ftl = fs::read_to_string(project.join("i18n/en.ftl")).unwrap();
 
