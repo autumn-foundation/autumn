@@ -521,7 +521,9 @@ container, another port, another machine) and point `target` at it.
   not an exponential storm. Your candidate build can read the same header to
   refuse writes.
 - **Actuator and probe paths are never mirrored**, so load-balancer health
-  checks do not drown the candidate.
+  checks do not drown the candidate. The exemption is derived from the actuator's
+  own mounted paths, so it holds for any `[actuator] prefix` — including `"/"`,
+  where the endpoints sit at the root.
 - **Requests the live build refuses are not mirrored.** A response of `429` or
   `503` — the statuses maintenance mode, load shedding, the request deadline,
   and the rate limiter produce — skips the mirror entirely (counted as
@@ -536,6 +538,12 @@ container, another port, another machine) and point `target` at it.
 - **Credentials never reach a proxy.** The mirroring client disables proxy
   autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
   a mirrored request (carrying the end user's cookie) to a third party.
+- **`Accept-Encoding` travels, and the candidate's answer is decoded.** A
+  handler can legitimately vary its body on that header, so stripping it would
+  have the two stacks answering different logical requests. The candidate's
+  response is `gzip`/`deflate`/`br`-decoded on arrival — under the same size
+  budget as the wire read, so a decompression bomb is refused rather than
+  buffered.
 - **Forwarding headers are not replayed.** `X-Forwarded-*`, `Forwarded`, and
   `X-Real-IP` are stripped: this layer runs before the primary's trusted-proxy
   policy, so forwarding them would hand the candidate a client-spoofed value

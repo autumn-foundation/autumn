@@ -154,6 +154,9 @@ impl MirrorSelector {
     ///
     /// `actuator_prefix` and `probe_paths` come from the same config the
     /// load-shed layer reads, so the two agree on what platform traffic is.
+    /// `probe_paths` should also carry the actuator's mounted endpoint paths:
+    /// with `prefix = "/"` the actuator mounts at the root, where no prefix
+    /// test can distinguish it from application routes.
     #[must_use]
     pub fn new(
         sample_rate: f64,
@@ -161,7 +164,14 @@ impl MirrorSelector {
         actuator_prefix: &str,
         probe_paths: &[String],
     ) -> Self {
-        let actuator_prefix = actuator_prefix.trim_end_matches('/').to_owned();
+        // The actuator's OWN normalizer, not a hand-rolled trim. `[actuator]
+        // prefix` accepts noncanonical forms — `"ops/"` mounts at `/ops`, `"/"`
+        // mounts at the root — and a trim that disagreed with the mount would
+        // leave the real endpoints unexempt, so operator polling of
+        // `/metrics`, `/prometheus`, `/shadow` would be mirrored: candidate
+        // load, plus permanent false divergences from payloads that are
+        // per-replica by construction.
+        let actuator_prefix = crate::actuator::normalize_actuator_prefix(actuator_prefix);
         Self {
             sample_rate,
             routes: std::sync::Arc::new(routes.iter().map(|r| RoutePattern::parse(r)).collect()),

@@ -3474,11 +3474,26 @@ fn build_shadow_layer(
             &config.log.unfilter_parameters,
         ));
 
+        // Exempt the actuator's ACTUAL mounted paths as well as its prefix.
+        // With `[actuator] prefix = "/"` the endpoints mount at the root, where
+        // no prefix test can tell them from application routes — and mirroring
+        // an operator's `/metrics` poll means candidate load plus permanent
+        // false divergences from a payload that is per-replica by
+        // construction. `actuator_endpoint_paths` is the same source the
+        // startup barrier seeds its allow-list from, so this cannot drift from
+        // what is mounted.
+        let mut exempt_paths = probe_bypass_paths(config);
+        exempt_paths.extend(crate::actuator::actuator_endpoint_paths(
+            &config.actuator.prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        ));
+
         let selector = crate::shadow::MirrorSelector::new(
             config.shadow.sample_rate,
             &config.shadow.routes,
             &config.actuator.prefix,
-            &probe_bypass_paths(config),
+            &exempt_paths,
         );
 
         tracing::info!(

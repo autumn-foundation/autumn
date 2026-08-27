@@ -49,11 +49,16 @@ use crate::shadow::sample::{SHADOW_HEADER, SHADOW_HEADER_VALUE};
 /// The hop-by-hop set (RFC 9110 §7.6.1) describes *this* connection, not the
 /// message, so forwarding it is meaningless at best. `host` is re-derived from
 /// the shadow target. `content-length`/`transfer-encoding` describe a body a
-/// `GET`/`HEAD` mirror does not carry. `accept-encoding` is dropped so the
-/// candidate answers uncompressed: the primary body is teed *inside* the
-/// compression layer, so an encoded shadow body would diff against a plain
-/// primary one and every route would look divergent.
-const STRIPPED_HEADERS: [&str; 17] = [
+/// `GET`/`HEAD` mirror does not carry.
+///
+/// `accept-encoding` is deliberately **not** in this list. The primary body is
+/// teed *inside* the compression layer, so it is the handler's plain bytes —
+/// but stripping the request header is not the way to make the candidate match:
+/// a handler or user layer may vary its body on `Accept-Encoding` (serving a
+/// precompressed representation), and then the two stacks would be answering
+/// different logical requests. The header travels, and the candidate's response
+/// is decoded on arrival instead — see `decode_body`.
+const STRIPPED_HEADERS: [&str; 16] = [
     // Hop-by-hop (RFC 9110 §7.6.1) plus `proxy-connection`.
     "connection",
     "proxy-connection",
@@ -66,9 +71,6 @@ const STRIPPED_HEADERS: [&str; 17] = [
     "upgrade",
     // Describes a body a GET/HEAD mirror does not carry.
     "content-length",
-    // Dropped so the candidate answers uncompressed — see the module note on
-    // why an encoded shadow body would diff against a plain primary one.
-    "accept-encoding",
     // The forwarding family. This layer runs OUTSIDE
     // `TrustedProxiesLayer`, so these still hold whatever the client put on
     // the wire: the primary is about to discard them (its peer is not a
@@ -245,6 +247,62 @@ pub fn shadow_url(target_base: &str, request_target: &str) -> String {
     }
 }
 
+/// Decode a candidate response body according to its `Content-Encoding`.
+///
+/// The mirrored request carries the client's own `Accept-Encoding` (see
+/// [`STRIPPED_HEADERS`]), so the candidate may legitimately answer encoded
+/// while the teed primary body is plain. Comparing those directly would report
+/// every compressible route as divergent.
+///
+/// The output is capped at `max_body_bytes` just as the wire read is: a
+/// decoder turns a small body into an arbitrarily large one, so bounding only
+/// the compressed bytes would leave a decompression bomb able to grow this
+/// process. An unknown encoding is passed through untouched — better a
+/// byte-comparison the operator can see than a guess.
+fn decode_body(
+    content_encoding: Option<&str>,
+    body: bytes::Bytes,
+    max_body_bytes: usize,
+) -> Result<bytes::Bytes, ShadowError> {
+    use std::io::Read as _;
+
+    let Some(encoding) = content_encoding else {
+        return Ok(body);
+    };
+    // `identity` means "not encoded"; anything unrecognised is left alone.
+    if matches!(encoding, "identity" | "") {
+        return Ok(body);
+    }
+
+    // One byte past the budget, so an over-budget body is detectable rather
+    // than silently truncated into a false divergence.
+    let limit = u64::try_from(max_body_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut decoded = Vec::new();
+    let read = match encoding {
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        "deflate" => flate2::read::ZlibDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        "br" => brotli::Decompressor::new(body.as_ref(), 4096)
+            .take(limit)
+            .read_to_end(&mut decoded),
+        _ => return Ok(body),
+    };
+    read.map_err(|error| {
+        ShadowError::Transport(format!(
+            "could not decode a {encoding} shadow body: {error}"
+        ))
+    })?;
+    if decoded.len() > max_body_bytes {
+        return Err(ShadowError::Oversize);
+    }
+    Ok(bytes::Bytes::from(decoded))
+}
+
 /// The real transport: one `reqwest` request, one deadline, no retries, no
 /// redirects, no circuit breaker.
 #[cfg(feature = "http-client")]
@@ -315,6 +373,11 @@ impl ShadowTransport for HttpShadowTransport {
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
+            let content_encoding = response
+                .headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_ascii_lowercase());
             // Streamed, not `.bytes()`: collecting the whole body first would
             // buffer an arbitrarily large candidate response into this
             // process's memory before anyone could check its size. A candidate
@@ -339,7 +402,16 @@ impl ShadowTransport for HttpShadowTransport {
                 collected.extend_from_slice(&chunk);
             }
 
-            Ok(ResponseFacts::new(status, content_type, collected.freeze()))
+            // The candidate saw the client's `Accept-Encoding`, so it may have
+            // answered encoded. Decode before comparing: the primary side was
+            // teed inside the compression layer and is plain.
+            let body = decode_body(
+                content_encoding.as_deref(),
+                collected.freeze(),
+                max_body_bytes,
+            )?;
+
+            Ok(ResponseFacts::new(status, content_type, body))
         })
     }
 }
@@ -422,9 +494,59 @@ mod tests {
     }
 
     #[test]
-    fn accept_encoding_is_stripped_so_both_sides_are_compared_uncompressed() {
+    fn accept_encoding_travels_so_both_stacks_answer_the_same_request() {
+        // A handler or user layer may vary its body on this header; stripping it
+        // would have the two stacks answering different logical requests. The
+        // candidate's response is decoded on arrival instead.
         let forwarded = forwarded_headers(&headers(&[("accept-encoding", "gzip, br")]), None);
-        assert!(!forwarded.contains_key("accept-encoding"));
+        assert_eq!(
+            forwarded
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip, br")
+        );
+    }
+
+    #[test]
+    fn an_encoded_candidate_body_is_decoded_before_comparison() {
+        use std::io::Write as _;
+        let plain = b"{\"ok\":true}";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(plain).expect("encode");
+        let gzipped = bytes::Bytes::from(encoder.finish().expect("finish"));
+        assert_ne!(
+            gzipped.as_ref(),
+            plain,
+            "the fixture must really be encoded"
+        );
+
+        let decoded = decode_body(Some("gzip"), gzipped, 4096).expect("decode");
+        assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn an_unencoded_or_unknown_body_passes_through() {
+        let body = bytes::Bytes::from_static(b"plain");
+        for encoding in [None, Some("identity"), Some("exotic-v2")] {
+            let out = decode_body(encoding, body.clone(), 4096).expect("pass through");
+            assert_eq!(out, body, "{encoding:?}");
+        }
+    }
+
+    #[test]
+    fn a_decompression_bomb_is_refused_by_the_output_budget() {
+        // The wire read is capped, but a decoder turns a small body into an
+        // arbitrarily large one — so the OUTPUT is capped too.
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![b'a'; 512 * 1024]).expect("encode");
+        let bomb = bytes::Bytes::from(encoder.finish().expect("finish"));
+        assert!(bomb.len() < 4096, "the fixture must be small on the wire");
+
+        assert_eq!(
+            decode_body(Some("gzip"), bomb, 4096),
+            Err(ShadowError::Oversize)
+        );
     }
 
     #[test]
