@@ -6440,12 +6440,21 @@ mod attachment_read_back_tests {{
                 .map(|f| f.name.as_str()),
         );
         ignored_columns.push("created_at");
+        // The exact complement of `ignored_columns` within `csv_columns()`: every
+        // exported column the form CAN set. Derived from the same `form_carried`
+        // set, so the two lists can never disagree about a column.
+        let required_columns: Vec<&str> = all_fields
+            .iter()
+            .filter(|f| !f.is_encrypted() && form_carried.contains(f.name.as_str()))
+            .map(|f| f.name.as_str())
+            .collect();
         let bool_columns: Vec<(&str, bool)> = all_fields
             .iter()
             .filter(|f| f.kind == FieldKind::Bool && !f.is_encrypted())
             .map(|f| (f.name.as_str(), !f.nullable))
             .collect();
         render_csv_import_section(
+            &required_columns,
             pascal_name,
             plural,
             snake_name,
@@ -10541,7 +10550,7 @@ fn is_csv_upload(file_name: Option<&str>, content_type: Option<&str>) -> bool {
     named_csv && declared_ok
 }
 
-__IGNORED_COLUMNS_CONST____DISCARDED_CONST____CELL_FNS__/// The CSV upload control: the expected column list, the file input, and the
+__REQUIRED_COLUMNS_CONST____IGNORED_COLUMNS_CONST____DISCARDED_CONST____CELL_FNS__/// The CSV upload control: the expected column list, the file input, and the
 /// commit confirmation.
 ///
 /// Shared by `GET /__PLURAL__/import`, the 422 re-render when an upload is
@@ -10853,7 +10862,7 @@ pub async fn import(
     // for every shape of file, and refusing outright beats importing a prefix:
     // a partially imported spreadsheet is exactly the trap this route exists to
     // avoid, and the operator can split the file and run it twice.
-    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > MAX_IMPORT_ROWS {
+__HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > MAX_IMPORT_ROWS {
         let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {
             h1 { __L_HEADING__ }
             (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&__L_TOO_MANY_ROWS__)))
@@ -10989,6 +10998,9 @@ pub async fn import(
               the template's placeholders and their values in different functions"
 )]
 fn render_csv_import_section(
+    // Issue #1393: every exported column `{Pascal}Form` can set — what an
+    // uploaded file's header is checked against before any row is decoded.
+    required_columns: &[&str],
     pascal_name: &str,
     plural: &str,
     snake_name: &str,
@@ -11071,6 +11083,58 @@ fn render_csv_import_section(
     // gain a leading underscore, because an unused binding is a warning in the
     // user's app and the scaffold's contract is that generated code compiles
     // clean.
+    // The columns an uploaded file MUST carry: every exported column the form can
+    // actually set. Without this check a file that shares no column names with
+    // the model still imports — `decode_form` ignores headers it does not know,
+    // and a form whose every field can be defaulted (an unchecked checkbox's
+    // `bool`, an optional column) then decodes an unrelated row into a blank
+    // record. `junk\nx` would preview as "1 row would insert" and commit a row of
+    // defaults. Comparing the header up front makes that one file-level refusal,
+    // which is what it is — the operator picked the wrong file.
+    let (required_columns_const, header_check) = if required_columns.is_empty() {
+        // Every exported column is one the form cannot set (a model whose columns
+        // are all `--default`ed). There is nothing a file could be missing, so
+        // emitting the const and the check would be dead code.
+        (String::new(), String::new())
+    } else {
+        let names = required_columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            format!(
+                "/// The columns an uploaded file must carry: every exported column\n\
+                 /// `{{Pascal}}Form` can actually set.\n\
+                 ///\n\
+                 /// Checked against the header BEFORE any row is decoded, because a\n\
+                 /// missing column is a property of the FILE, not of its rows. It also\n\
+                 /// catches the case row-level validation cannot: `decode_form` ignores\n\
+                 /// headers it does not know and defaults fields that are absent, so a\n\
+                 /// spreadsheet sharing no column names with this model would otherwise\n\
+                 /// decode into a run of blank records and report them as insertable.\n\
+                 const CSV_REQUIRED_COLUMNS: &[&str] = &[{names}];\n\n"
+            ),
+            [
+                "    let header = autumn_web::data::csv::read_header(&uploaded[..]);",
+                "    let missing: Vec<&str> = CSV_REQUIRED_COLUMNS",
+                "        .iter()",
+                "        .copied()",
+                "        .filter(|column| !header.iter().any(|found| found.trim() == *column))",
+                "        .collect();",
+                "    if !missing.is_empty() {",
+                "        let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {",
+                "            h1 { __L_HEADING__ }",
+                "            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&format!(\"{}: {}\", __L_MISSING_COLUMNS__, missing.join(\", \")))))",
+                "            (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))",
+                "        });",
+                "        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());",
+                "    }",
+                "",
+            ]
+            .join("\n"),
+        )
+    };
     let (discarded_mut, discarded_param) = if discarded_columns.is_empty() {
         ("", "_discarded_seen")
     } else {
@@ -11207,6 +11271,17 @@ fn render_csv_import_section(
         ));
     }
     CSV_IMPORT_TEMPLATE
+        .replace("__REQUIRED_COLUMNS_CONST__", &required_columns_const)
+        .replace("__HEADER_CHECK__", &header_check)
+        .replace(
+            "__L_MISSING_COLUMNS__",
+            &labels.expr(
+                "common.import.error.missing.columns",
+                "That file is missing columns this import needs",
+                "\"That file is missing columns this import needs\"",
+                &[],
+            ),
+        )
         .replace("__DISCARDED_MUT__", discarded_mut)
         .replace("__DISCARDED_PARAM__", discarded_param)
         .replace("__DISCARDED_CONST__", &discarded_const)

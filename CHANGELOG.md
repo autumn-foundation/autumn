@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn_web::data::csv::read_header`:** returns a CSV source's header column
+  names in file order (empty for a source with no readable header). It exists so
+  a caller can reject a file that is simply the WRONG FILE before importing any
+  of it: `import_csv` decodes rows by column name and a decoder may legitimately
+  default an absent field, so a spreadsheet sharing none of the expected names
+  can parse cleanly into a run of blank records. The scaffolded CSV import below
+  checks it against the columns the form can set.
+
 - **`autumn_web::data::csv::count_data_rows`:** counts the data rows in a CSV
   source without retaining any of them — the header excluded, a malformed row
   included. It exists for callers that must bound how much work an untrusted
@@ -79,7 +87,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped CSRF and one-time submit-token inputs first (so both land inside the
   multipart token-scan window), caps the upload at an emitted
   `MAX_IMPORT_BYTES` on top of `security.upload.max_file_size_bytes`, and checks
-  the file's extension and declared content type. Work is bounded by rows as
+  the file's extension and declared content type, and refuses a file whose
+  header is missing any column the form can set — the check that catches an
+  operator uploading the wrong spreadsheet, which row-level validation cannot
+  see because each decoded row is valid. Work is bounded by rows as
   well as bytes (`MAX_IMPORT_ROWS`, mirroring the export's cap), rows past the
   cap is refused whole rather than imported as a prefix, and a write that fails
   partway through says which rows may already be committed instead of 500ing.

@@ -285,6 +285,39 @@ where
     rdr.byte_records().count() as u64
 }
 
+/// The column names in a CSV source's header row, in file order.
+///
+/// Returns an empty `Vec` for an empty source or one whose header cannot be
+/// parsed — "no columns" and "a header we could not read" are the same thing to
+/// a caller deciding whether a file is the right shape.
+///
+/// This exists so a caller can reject a file that is simply the WRONG FILE
+/// before importing any of it. [`import_csv`] decodes each row by column name
+/// and a decoder can legitimately default an absent field (an unchecked
+/// checkbox's `bool`, an optional column), so a spreadsheet whose header shares
+/// none of the expected names can otherwise parse cleanly into a run of blank
+/// records. Comparing the header against the columns you require turns that
+/// into one file-level refusal — which is also what it actually is, rather than
+/// the same error repeated per row.
+///
+/// ```rust,no_run
+/// use autumn_web::data::csv::read_header;
+///
+/// let file = b"title,published\nHello,true\n";
+/// assert_eq!(read_header(file.as_ref()), vec!["title", "published"]);
+/// ```
+pub fn read_header<R>(reader: R) -> Vec<String>
+where
+    R: io::Read,
+{
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(reader);
+    rdr.headers()
+        .map(|header| header.iter().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
 /// Strip the `(line: N, byte: N)` fragment the CSV parser embeds in its own
 /// error text.
 ///
@@ -734,6 +767,28 @@ mod tests {
             report.errors[0].message
         );
         assert_eq!(report.total_rows(), 1);
+    }
+
+    /// The header a caller checks a file's shape against, before importing any
+    /// of it.
+    #[test]
+    fn read_header_returns_the_column_names_in_file_order() {
+        assert_eq!(
+            read_header(b"title,note\na,x\n".as_ref()),
+            vec!["title", "note"]
+        );
+        // CRLF, and a quoted header field carrying a comma and a newline.
+        assert_eq!(
+            read_header(b"title,note\r\na,x\r\n".as_ref()),
+            vec!["title", "note"]
+        );
+        assert_eq!(
+            read_header(b"\"a,b\",\"c\nd\"\nx,y\n".as_ref()),
+            vec!["a,b", "c\nd"]
+        );
+        // A header-only file still HAS a header; an empty one has none.
+        assert_eq!(read_header(b"title,note\n".as_ref()), vec!["title", "note"]);
+        assert!(read_header(b"".as_ref()).is_empty());
     }
 
     /// The counting pass a caller uses to bound work before importing has to

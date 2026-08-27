@@ -627,15 +627,18 @@ fn the_report_says_what_the_counts_cannot() {
 fn no_page_arms_a_commit_for_the_next_file_chosen() {
     let (_tmp, routes) = import_routes("import-rearm", &[]);
     let import = handler_slice(&routes, "import");
+    // Four renders: the file-type/empty refusal, the missing-columns refusal, the
+    // over-cap refusal, and the report. The count is asserted, not just the
+    // ratio — a fifth render added later should fail here and be looked at,
+    // which is how the missing-columns one was caught.
     assert_eq!(
         import.matches("import_form_body(").count(),
-        3,
-        "the handler renders the form on the refusal, the over-cap refusal and \
-         the report:\n{import}"
+        4,
+        "the handler renders the form on each refusal and on the report:\n{import}"
     );
     assert_eq!(
         import.matches("submit_field.as_ref(), false,").count(),
-        3,
+        4,
         "every re-render must leave the confirmation unchecked:\n{import}"
     );
     // ...and the GET form, which has no submit to carry over anyway.
@@ -643,6 +646,70 @@ fn no_page_arms_a_commit_for_the_next_file_chosen() {
     assert!(
         form.contains("submit_field.as_ref(), false, None)"),
         "the upload form starts unconfirmed:\n{form}"
+    );
+}
+
+/// A file that shares no column names with the model must be REFUSED, not
+/// imported as a run of blank records.
+///
+/// `decode_form` ignores headers it does not know and defaults fields that are
+/// absent, so for a model whose every form field can be defaulted — an unchecked
+/// checkbox's `bool`, an optional column — an unrelated spreadsheet decodes
+/// cleanly into defaults. Row-level validation cannot catch it: each row IS
+/// valid. Only the header can.
+#[test]
+fn a_file_missing_the_expected_columns_is_refused_whole() {
+    // Every field here is defaultable, which is what makes the check load-bearing
+    // rather than belt-and-braces.
+    let (_tmp, project, _) = scaffold_project(
+        "import-headers",
+        &["published:bool", "note:Option<String>"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains(r#"const CSV_REQUIRED_COLUMNS: &[&str] = &["published", "note"];"#),
+        "the form-carried columns must be named:\n{routes}"
+    );
+    let import = handler_slice(&routes, "import");
+    // The check precedes the import, because a missing column is a property of
+    // the FILE, not of its rows.
+    let (before_import, _) = import
+        .split_once("autumn_web::data::csv::import_csv(")
+        .expect("the handler must drive the import engine");
+    assert!(
+        before_import.contains("read_header(&uploaded[..])")
+            && before_import.contains("CSV_REQUIRED_COLUMNS"),
+        "the header must be checked before any row is decoded:\n{import}"
+    );
+    let (_, after_check) = before_import
+        .split_once("if !missing.is_empty() {")
+        .expect("the missing-columns branch");
+    assert!(
+        after_check.contains("UNPROCESSABLE_ENTITY"),
+        "a file missing expected columns must be refused:\n{import}"
+    );
+    // ...and the operator is told WHICH columns, not just that something is off.
+    assert!(
+        after_check.contains(r#"missing.join(", ")"#),
+        "the refusal must name the missing columns:\n{import}"
+    );
+}
+
+#[test]
+fn the_header_check_is_omitted_when_no_column_could_be_missing() {
+    // Every column is `--default`ed, so the form can set none of them and there
+    // is nothing a file could lack — emitting the const and the check would be
+    // dead code in the generated app.
+    let (_tmp, project, _) = scaffold_project(
+        "import-noheaders",
+        &["tag:String", "--default", "tag=general"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        !routes.contains("CSV_REQUIRED_COLUMNS"),
+        "no settable column means no header check to emit:\n{routes}"
     );
 }
 
