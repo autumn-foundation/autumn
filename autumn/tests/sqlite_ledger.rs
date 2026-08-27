@@ -885,9 +885,13 @@ async fn verify_detects_a_truncated_tail_against_the_live_row() {
     assert_eq!(broken.seq, 2, "reported at the surviving head");
 }
 
-/// The whole chain erased behind a row that still exists.
+/// A row with no chain at all is the documented state of every row that predates
+/// the day its model was ledgered, so it must not be reported as tampering — even
+/// though a wholly erased chain looks identical from inside the database. The
+/// emptiness is still visible on the report, and a pinned head covers the erasure
+/// case; see #2323.
 #[tokio::test]
-async fn verify_detects_a_wholly_erased_chain() {
+async fn a_row_with_no_chain_is_not_reported_as_tampering() {
     let pool = boot_pool("lg_erased").await;
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
@@ -901,17 +905,30 @@ async fn verify_detects_a_wholly_erased_chain() {
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
-        .expect("erase the chain");
+        .expect("leave the record with no chain");
     }
 
-    let broken = repo
-        .ledger_verify(id)
-        .await
-        .expect("verify")
-        .broken
-        .expect("a live record with no history must be detected");
-    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
-    assert_eq!(broken.seq, 0);
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(
+        report.revisions_checked, 0,
+        "the empty chain is what the caller inspects, not an accusation"
+    );
+
+    // A write after that point opens a fresh chain, exactly as it would for a
+    // row that predates ledgering — and that chain verifies.
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_cents: Patch::Set(42),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 1);
 }
 
 /// A correctly-hashed appended forgery is undetectable from inside the chain —

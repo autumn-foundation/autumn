@@ -490,10 +490,11 @@ pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerif
 ///   ([`LedgerBreak::LiveStateMismatch`]) — a truncated tail, a row erased out
 ///   of band, or a write that reached the table without appending a revision.
 ///
-/// With `live` [`NotChecked`](LedgerLiveState::NotChecked), an empty slice
-/// verifies as intact: a record with no revisions may simply never have been
-/// written. With a live row present it does not — a row that exists with no
-/// history is evidence its history was erased.
+/// An empty slice always verifies as intact, live row or not: a record may never
+/// have been written, or may predate the day its model was ledgered (the
+/// migration guide says ledgering is not retroactive). Distinguishing that from
+/// a wholly erased chain needs metadata outside the deletable rows — see #2323;
+/// a pinned head covers it meanwhile. `revisions_checked` reports the emptiness.
 #[must_use]
 pub fn verify_chain_against(
     record_id: i64,
@@ -523,10 +524,27 @@ fn live_state_break(
     revisions: &[LedgerRevision],
     live: LedgerLiveState,
 ) -> Option<LedgerBreakReport> {
-    match (live, revisions.last()) {
-        (LedgerLiveState::NotChecked | LedgerLiveState::Matches, _)
-        | (LedgerLiveState::Absent, None) => None,
-        (LedgerLiveState::Absent, Some(head)) => Some(LedgerBreakReport {
+    // An empty chain is never a break, whatever the live row says.
+    //
+    // A record may simply never have been written — or may predate the day its
+    // model was ledgered. Ledgering is non-destructive but not retroactive, so
+    // rows written before the marker went on legitimately have no chain until
+    // their first subsequent write: that is the documented, expected state of
+    // every existing row on the day a team adopts the feature, and accusing it
+    // would put a false positive in front of every such deployment, against the
+    // one metric this module is held to.
+    //
+    // The cost is that a *wholly* erased chain is indistinguishable from a
+    // pre-ledgering row from inside the database. Telling them apart needs
+    // per-record initialization metadata kept outside the deletable rows
+    // (tracked in #2323); a pinned head covers it meanwhile, naming a sequence
+    // the ledger no longer has. `revisions_checked == 0` on the report is what
+    // makes the empty case visible to a caller that cares.
+    let head = revisions.last()?;
+
+    match live {
+        LedgerLiveState::NotChecked | LedgerLiveState::Matches => None,
+        LedgerLiveState::Absent => Some(LedgerBreakReport {
             seq: head.seq,
             revision_id: Some(head.id),
             kind: LedgerBreak::LiveStateMismatch,
@@ -536,15 +554,7 @@ fn live_state_break(
                 head.seq
             ),
         }),
-        (LedgerLiveState::Diverged, None) => Some(LedgerBreakReport {
-            seq: 0,
-            revision_id: None,
-            kind: LedgerBreak::LiveStateMismatch,
-            detail: "the record exists but its ledger is empty; \
-                     every revision of its history was deleted"
-                .to_owned(),
-        }),
-        (LedgerLiveState::Diverged, Some(head)) => Some(LedgerBreakReport {
+        LedgerLiveState::Diverged => Some(LedgerBreakReport {
             seq: head.seq,
             revision_id: Some(head.id),
             kind: LedgerBreak::LiveStateMismatch,
@@ -1607,12 +1617,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_detects_a_wholly_erased_chain_behind_a_live_row() {
-        let broken = verify_chain_against(7, &[], LedgerLiveState::Diverged)
-            .broken
-            .expect("a live record with no history must be detected");
-        assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
-        assert_eq!(broken.seq, 0);
+    fn verify_does_not_accuse_a_row_that_predates_ledgering() {
+        // Every existing row on the day a team adopts `ledgered` is in exactly
+        // this state — live, with no chain yet — and the migration guide says so.
+        // Reporting it as tampering would be a false positive on an untouched
+        // deployment. `revisions_checked` is what tells a caller the chain is
+        // empty; see #2323 for telling this apart from a wholly erased chain.
+        let report = verify_chain_against(7, &[], LedgerLiveState::Diverged);
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 0);
+        assert_eq!(report.head_hash, None);
     }
 
     #[test]

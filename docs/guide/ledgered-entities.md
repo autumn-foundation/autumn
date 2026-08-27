@@ -193,6 +193,7 @@ Each revision embeds the hash of its predecessor, forming a per-record chain.
 | The chain no longer starts at seq 1 | `BrokenChainStart` / `MissingRevision` |
 | A sequence number is at `i64::MAX` and cannot be followed | `UnusableSeq` |
 | The newest revision does not describe the live row | `LiveStateMismatch` |
+| A live row with no chain at all | *Not* a break — see below |
 
 An intact report carries `head_hash`; a broken one carries none.
 
@@ -227,6 +228,14 @@ What it cannot see is a *consistent* rewrite. The hashing rule is open source, s
 an adversary with write access to the ledger table can re-derive a whole chain
 and adjust the row to match. Nothing stored inside the same database can prevent
 that.
+
+One state is deliberately **not** reported: a live row with no revisions at all.
+That is what every existing row looks like on the day you adopt `ledgered` —
+ledgering is not retroactive — so accusing it would put a false positive in front
+of every adopting deployment. The cost is that a *wholly* erased chain looks
+identical from inside the database; `revisions_checked == 0` on the report is
+what makes the empty case visible, and a pinned head (below) is what tells the
+two apart.
 
 There is also a narrower window worth knowing about. Deleting the newest
 revision and then letting a *normal* write land re-uses the deleted sequence
