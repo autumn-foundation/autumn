@@ -921,6 +921,31 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
+- **(unreleased, #1394)**: admin impersonation —
+  `autumn_web::auth::impersonation::{begin_impersonation, end_impersonation,
+  impersonator_id, is_impersonating, impersonation_state, audit_actor_id, clear,
+  Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationTarget,
+  ImpersonationState, IMPERSONATOR_SESSION_KEY, IMPERSONATED_SESSION_KEY}`, plus
+  `AppBuilder::impersonation_gate`. Default-deny behind an
+  `ImpersonationGate` registered in `AppState`, and refused outright without an
+  audit sink
+  (`allow_roles([..])` / `custom(policy)` / `deny_all()`); the session's
+  effective user becomes the target while `Current::actor` — and therefore
+  `#[repository(versioned)]` rows and audit events — stays the real
+  impersonator. Both edges rotate the session id and emit
+  `auth.impersonation.begin` / `.end` audit events carrying
+  `actor_id` = the impersonator and `target_resource_id` = the target. No
+  nesting (`409`); the impersonated role comes only from
+  `ImpersonationPolicy::target_role`, never request input; the operator's
+  step-up claim is stashed for the duration; a record whose recorded target no
+  longer matches the session's effective user is stale and is ignored; an
+  `auth.session_key` colliding with `RESERVED_SESSION_KEYS` is refused
+  (`is_reserved_session_key`).
+  Admin UI: `AdminPlugin::with_impersonation(gate)`,
+  `autumn_admin_plugin::{impersonation_banner_for, impersonation_banner,
+  ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes
+  `POST {prefix}/impersonate` (gated) and `POST {prefix}/impersonate/stop`
+  (ungated on purpose). Session-based auth only.
 
 ## Submit tokens (0.6.0, #1360)
 

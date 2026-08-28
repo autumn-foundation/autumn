@@ -48,4 +48,5 @@ mod serve;
 mod tauri_mobile_thin_client;
 mod test_command;
 mod upgrade_codemod;
+mod upgrade_scaffold;
 mod webhook_sim;

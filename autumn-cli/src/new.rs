@@ -2,13 +2,14 @@
 //!
 //! Generates a complete Autumn project directory from embedded templates.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
 use autumn_web::credentials::{MasterKey, encrypt};
 
-mod templates {
+pub mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
     /// JSON-first API flavor (`autumn new --api`): drops the HTML/CSS view
     /// stack (`maud`) and disables `autumn-web`'s default view features.
@@ -139,7 +140,7 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
 }
 
 /// Reject unsupported flag combinations before any files are written.
-fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+pub fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
     // The API flavor and the daemon flavors are different app shapes with
     // conflicting `autumn-web` feature sets: `--api` drops the view stack
     // (maud/htmx/tailwind) for a pure-JSON app, while `--daemon`/`--bundled-pg`
@@ -279,6 +280,79 @@ fn generate_inner(
     }
     fs::write(project_dir.join("src/main.rs"), main_rs)?;
 
+    // Every framework-owned file comes from one renderer, shared with `autumn
+    // upgrade`'s scaffold reconciliation (issue #1593). Writing them from a
+    // second, parallel code path here is how the two would silently disagree —
+    // and a byte of disagreement reads to the reconciler as a permanent
+    // conflict in every project ever generated.
+    let owned = framework_owned_files(&vars, opts);
+    for (relative, contents) in &owned {
+        fs::write(project_dir.join(relative), contents)?;
+    }
+    // Record what this release wrote, so a later `autumn upgrade` can tell a
+    // template that moved from a file the developer edited (issue #1593). Best
+    // effort by design: the manifest only ever *sharpens* a later upgrade, and
+    // failing a scaffold over bookkeeping would be a worse trade than losing
+    // conflict precision.
+    let _ = crate::upgrade::scaffold::Manifest::for_files(autumn_version, opts, &owned)
+        .save(&project_dir);
+    fs::write(project_dir.join("migrations/.gitkeep"), "")?;
+
+    // The API flavor serves no HTML, so it needs no vendored htmx/SSE JS or the
+    // static asset manifest — skip the whole `static/` vendoring step.
+    if !opts.with_api {
+        scaffold_vendor_assets(&project_dir)?;
+    }
+    scaffold_credentials(&project_dir, name)?;
+    fs::write(
+        project_dir.join("tests/integration_test.rs"),
+        render(templates::INTEGRATION_TEST),
+    )?;
+
+    write_optional_scaffold_files(&project_dir, name, opts, &render)?;
+
+    if !quiet {
+        print_scaffold_summary(name, opts);
+    }
+
+    Ok(())
+}
+
+/// Every framework-owned file `autumn new` writes outside the application's own
+/// source, rendered for `opts`.
+///
+/// This is the single definition of "what the current release's scaffold looks
+/// like". [`generate_inner`] writes these files, and `autumn upgrade`'s
+/// scaffold reconciliation (issue #1593) compares an existing project against
+/// exactly the same rendering — so the two cannot drift apart, which is the one
+/// bug that would make the reconciler report a conflict in every project on
+/// earth.
+///
+/// # What is *not* here
+///
+/// The set is an allowlist, not "everything `autumn new` writes", and two
+/// exclusions are load bearing:
+///
+/// - **`src/**`.** Application source is out of bounds for the reconciler
+///   (issue #1593); `src/main.rs` and the optional seed binary are the app's,
+///   not the framework's, the moment the project exists. Enforced by the
+///   assertion below, not just by convention.
+/// - **Files the framework generates but does not own thereafter**:
+///   `Cargo.toml` (the app's dependencies), `README.md` (the app's prose),
+///   `tests/`, `migrations/`, `i18n/`, `config/credentials/` (secrets), and the
+///   vendored `static/js/` assets, which `autumn assets` — not this — keeps
+///   current.
+///
+/// Keys are project-relative and always `/`-separated, so they are equally
+/// valid as `Path` joins and as the keys of the provenance manifest on every
+/// host.
+#[must_use]
+pub fn framework_owned_files(
+    vars: &TemplateVars<'_>,
+    opts: GenerateOptions,
+) -> BTreeMap<&'static str, String> {
+    let render = |template: &str| -> String { render_template(template, vars) };
+
     let mut autumn_toml = if opts.with_i18n {
         let mut s = render(templates::AUTUMN_TOML);
         s.push_str("\n[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\"]\n");
@@ -307,7 +381,7 @@ fn generate_inner(
              auto_migrate_in_production = true\n",
         );
     }
-    fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
+
     let dockerfile = if opts.with_api {
         // The `--api` Dockerfile carries i18n `COPY` anchors resolved by flag:
         // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
@@ -321,69 +395,42 @@ fn generate_inner(
         // still builds.
         inject_i18n_dockerfile(&render(templates::DOCKERFILE), opts.with_i18n)
     };
-    fs::write(project_dir.join("Dockerfile"), dockerfile)?;
-    fs::write(
-        project_dir.join(".dockerignore"),
-        render(templates::DOCKERIGNORE),
-    )?;
-    let build_rs_template = if opts.with_api {
-        templates::BUILD_API_RS
-    } else {
-        templates::BUILD_RS
-    };
-    fs::write(project_dir.join("build.rs"), render(build_rs_template))?;
-    // The API flavor has no Tailwind/CSS pipeline, so skip the CSS input and
-    // Tailwind config entirely (there is no `static/css` directory either).
-    if !opts.with_api {
-        fs::write(
-            project_dir.join("static/css/input.css"),
-            render(templates::INPUT_CSS),
-        )?;
-        fs::write(
-            project_dir.join("tailwind.config.js"),
-            render(templates::TAILWIND_CONFIG),
-        )?;
-    }
-    fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
-    fs::write(
-        project_dir.join(".env.example"),
-        render(templates::ENV_EXAMPLE),
-    )?;
-    fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
-    // The API flavor serves no HTML, so it needs no vendored htmx/SSE JS or the
-    // static asset manifest — skip the whole `static/` vendoring step.
-    if !opts.with_api {
-        scaffold_vendor_assets(&project_dir)?;
-    }
-    scaffold_credentials(&project_dir, name)?;
-    fs::write(
-        project_dir.join("tests/integration_test.rs"),
-        render(templates::INTEGRATION_TEST),
-    )?;
-    // Bind the path so the write fits on one line: a multi-line
-    // `fs::write(...)?` leaves the `?` error-propagation region on a bare
-    // `)?;` line that passing tests never hit, which llvm-cov reports as an
-    // uncovered line (as it does for the multi-line writes above).
-    let ci_workflow = project_dir.join(".github/workflows/ci.yml");
+    let build_rs = if opts.with_api {
+        render(templates::BUILD_API_RS)
+    } else {
+        render(templates::BUILD_RS)
+    };
+
     let ci_yml = if opts.with_api {
         strip_ci_tailwind_note(&render(templates::CI_WORKFLOW))
     } else {
         render(templates::CI_WORKFLOW)
     };
-    fs::write(ci_workflow, ci_yml)?;
-    let rust_toolchain = project_dir.join("rust-toolchain.toml");
-    fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
-    fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
-    fs::write(project_dir.join("clippy.toml"), render(templates::CLIPPY))?;
 
-    write_optional_scaffold_files(&project_dir, name, opts, &render)?;
-
-    if !quiet {
-        print_scaffold_summary(name, opts);
+    let mut files = BTreeMap::new();
+    files.insert("autumn.toml", autumn_toml);
+    files.insert("Dockerfile", dockerfile);
+    files.insert(".dockerignore", render(templates::DOCKERIGNORE));
+    files.insert("build.rs", build_rs);
+    files.insert(".gitignore", render(templates::GITIGNORE));
+    files.insert(".env.example", render(templates::ENV_EXAMPLE));
+    files.insert(".github/workflows/ci.yml", ci_yml);
+    files.insert("rust-toolchain.toml", render(templates::RUST_TOOLCHAIN));
+    files.insert("rustfmt.toml", render(templates::RUSTFMT));
+    files.insert("clippy.toml", render(templates::CLIPPY));
+    // The API flavor has no Tailwind/CSS pipeline, so it owns no CSS input and
+    // no Tailwind config (there is no `static/css` directory either).
+    if !opts.with_api {
+        files.insert("tailwind.config.js", render(templates::TAILWIND_CONFIG));
+        files.insert("static/css/input.css", render(templates::INPUT_CSS));
     }
 
-    Ok(())
+    debug_assert!(
+        files.keys().all(|path| !path.starts_with("src/")),
+        "application source is out of bounds for scaffold reconciliation"
+    );
+    files
 }
 
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
@@ -495,6 +542,10 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
     println!("  Created {name}/config/credentials/development.toml.enc");
+    // Named with its purpose attached: it is the only generated file whose
+    // value depends entirely on being committed, and the only one a developer
+    // would otherwise be tempted to gitignore as machine bookkeeping.
+    println!("  Created {name}/.autumn/scaffold.toml (commit it — `autumn upgrade` reads it)");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }
@@ -2641,5 +2692,223 @@ mod tests {
             !content.contains("/static/js/htmx.min.js"),
             "generated main.rs must not hardcode /static/js/htmx.min.js, got:\n{content}"
         );
+    }
+
+    // --- issue #1593: the framework-owned file set `autumn upgrade` reconciles ---
+
+    fn owned(opts: GenerateOptions) -> std::collections::BTreeMap<&'static str, String> {
+        let vars = TemplateVars {
+            project_name: "demo",
+            crate_name: "demo",
+            autumn_version: "0.7.0",
+            rust_version: "1.88.0",
+        };
+        framework_owned_files(&vars, opts)
+    }
+
+    #[test]
+    fn framework_owned_set_covers_the_fullstack_scaffold() {
+        let files = owned(GenerateOptions::default());
+        for expected in [
+            "autumn.toml",
+            "Dockerfile",
+            ".dockerignore",
+            "build.rs",
+            ".gitignore",
+            ".env.example",
+            ".github/workflows/ci.yml",
+            "rust-toolchain.toml",
+            "rustfmt.toml",
+            "clippy.toml",
+            "tailwind.config.js",
+            "static/css/input.css",
+        ] {
+            assert!(
+                files.contains_key(expected),
+                "missing {expected}: {:?}",
+                files.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn framework_owned_set_never_reaches_into_src() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+            GenerateOptions {
+                with_i18n: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            for path in owned(opts).keys() {
+                assert!(
+                    !path.starts_with("src/"),
+                    "application source is out of bounds, got {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn api_flavor_owns_no_css_or_tailwind() {
+        let files = owned(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            !files.contains_key("tailwind.config.js"),
+            "{:?}",
+            files.keys()
+        );
+        assert!(
+            !files.contains_key("static/css/input.css"),
+            "{:?}",
+            files.keys()
+        );
+        // ...but it still owns the common set.
+        assert!(files.contains_key("Dockerfile"));
+        assert!(files.contains_key("build.rs"));
+    }
+
+    #[test]
+    fn api_and_fullstack_render_different_dockerfiles_and_build_scripts() {
+        let full = owned(GenerateOptions::default());
+        let api = owned(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        assert_ne!(full["Dockerfile"], api["Dockerfile"]);
+        assert_ne!(full["build.rs"], api["build.rs"]);
+    }
+
+    #[test]
+    fn i18n_option_is_reflected_in_the_owned_autumn_toml_and_dockerfile() {
+        let plain = owned(GenerateOptions::default());
+        let i18n = owned(GenerateOptions {
+            with_i18n: true,
+            ..GenerateOptions::default()
+        });
+        assert!(!plain["autumn.toml"].contains("[i18n]"));
+        assert!(i18n["autumn.toml"].contains("[i18n]"));
+        assert_ne!(plain["Dockerfile"], i18n["Dockerfile"]);
+        // The unresolved anchors never survive into a generated file.
+        assert!(!i18n["Dockerfile"].contains("__AUTUMN_I18N_BUILDER_COPY__"));
+        assert!(!plain["Dockerfile"].contains("__AUTUMN_I18N_BUILDER_COPY__"));
+    }
+
+    #[test]
+    fn daemon_and_bundled_pg_options_reach_the_owned_autumn_toml() {
+        let daemon = owned(GenerateOptions {
+            with_daemon: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            daemon["autumn.toml"].contains("uses no database"),
+            "{}",
+            daemon["autumn.toml"]
+        );
+        let bundled = owned(GenerateOptions {
+            with_daemon: true,
+            with_bundled_pg: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            bundled["autumn.toml"].contains("auto_migrate_in_production = true"),
+            "{}",
+            bundled["autumn.toml"]
+        );
+    }
+
+    #[test]
+    fn generated_project_files_match_the_framework_owned_rendering() {
+        // The reconciler compares a project against `framework_owned_files`, so
+        // a byte that `autumn new` writes differently is a permanent phantom
+        // conflict. One renderer, one truth.
+        let tmp = TempDir::new().unwrap();
+        generate("owned-app", tmp.path()).unwrap();
+        let vars = TemplateVars {
+            project_name: "owned-app",
+            crate_name: "owned_app",
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        for (path, expected) in framework_owned_files(&vars, GenerateOptions::default()) {
+            let actual = fs::read_to_string(tmp.path().join("owned-app").join(path))
+                .unwrap_or_else(|e| panic!("{path} was not scaffolded: {e}"));
+            assert_eq!(actual, expected, "{path} drifted from its rendering");
+        }
+    }
+
+    #[test]
+    fn a_new_project_records_the_release_that_scaffolded_it() {
+        use crate::upgrade::scaffold::{MANIFEST_PATH, Manifest};
+
+        let tmp = TempDir::new().unwrap();
+        generate("provenance-app", tmp.path()).unwrap();
+        let root = tmp.path().join("provenance-app");
+
+        assert!(root.join(MANIFEST_PATH).is_file(), "no scaffold manifest");
+        let manifest = Manifest::load(&root).expect("manifest parses");
+        assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(manifest.options, GenerateOptions::default());
+        // Every framework-owned file it just wrote has a baseline digest.
+        for path in framework_owned_files(
+            &TemplateVars {
+                project_name: "provenance-app",
+                crate_name: "provenance_app",
+                autumn_version: env!("CARGO_PKG_VERSION"),
+                rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            },
+            GenerateOptions::default(),
+        )
+        .keys()
+        {
+            assert!(
+                manifest.digests.contains_key(*path),
+                "no baseline recorded for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recorded_manifest_records_the_options_the_project_was_made_with() {
+        use crate::upgrade::scaffold::Manifest;
+
+        let tmp = TempDir::new().unwrap();
+        let opts = GenerateOptions {
+            with_api: true,
+            with_i18n: true,
+            ..GenerateOptions::default()
+        };
+        generate_with("api-provenance", tmp.path(), opts).unwrap();
+        let manifest = Manifest::load(&tmp.path().join("api-provenance")).unwrap();
+        assert_eq!(manifest.options, opts);
+    }
+
+    #[test]
+    fn a_new_project_reports_no_scaffold_drift() {
+        // The tightest guarantee available: what `autumn new` writes today is
+        // exactly what `autumn upgrade` calls current.
+        use crate::upgrade::scaffold;
+
+        let tmp = TempDir::new().unwrap();
+        generate("fresh-app", tmp.path()).unwrap();
+        let report = scaffold::plan(&tmp.path().join("fresh-app"), env!("CARGO_PKG_VERSION"));
+        assert!(!report.drifted(), "{}", scaffold::render_text(&report));
+    }
+
+    #[test]
+    fn the_scaffold_manifest_is_committed_not_ignored() {
+        // A manifest that git ignores is a manifest that never reaches the
+        // next checkout, which is the only place it has any value.
+        let tmp = TempDir::new().unwrap();
+        generate("committed-app", tmp.path()).unwrap();
+        let gitignore = fs::read_to_string(tmp.path().join("committed-app/.gitignore")).unwrap();
+        assert!(!gitignore.contains(".autumn"), "{gitignore}");
     }
 }

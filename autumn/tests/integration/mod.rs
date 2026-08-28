@@ -118,6 +118,9 @@ mod htmx_serving;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 mod idempotency_middleware;
+mod impersonation;
+#[cfg(feature = "db")]
+mod impersonation_versioned_db;
 #[cfg(feature = "inbound-mail")]
 mod inbound_mail_integration;
 mod ingress_named_futures;

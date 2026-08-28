@@ -1,0 +1,451 @@
+//! Field-level serde / JSON-schema helpers shared by the `#[model]` macro and
+//! the `#[derive(OpenApiSchema)]` derive.
+//!
+//! These live in their own module (rather than inside [`crate::model`]) so the
+//! always-compiled `OpenApiSchema` derive does not drag the database-oriented
+//! `#[model]` codegen — which is gated behind the crate's `db` feature — into
+//! a no-database build. See `openapi_schema.rs` for the derive and `model.rs`
+//! for the macro; both go through the helpers here so a schema advertised by
+//! one matches the schema advertised by the other.
+
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::Field;
+
+/// Whether a field carries the named marker attribute (e.g. `#[id]`).
+pub fn has_attr(field: &Field, name: &str) -> bool {
+    field.attrs.iter().any(|a| a.path().is_ident(name))
+}
+
+/// Whether a field is declared `#[translatable]` (issue #1384): its column
+/// holds an `autumn_web::i18n::Translated` container — an independent value
+/// per locale tag — instead of a single monolingual string.
+pub fn field_is_translatable(field: &syn::Field) -> bool {
+    has_attr(field, "translatable")
+}
+
+/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
+/// to *serialization*, if any. Handles both the plain form and the split
+/// `rename_all(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side — that is what `Changeset::field_value` indexes by).
+///
+/// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
+/// list this parser can't fully walk simply yields no rule (the real serde
+/// derive still validates the attribute itself).
+pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut rule = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Ok(value) = meta.value() {
+                    // rename_all = "camelCase"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        rule = Some(s.value());
+                    }
+                } else {
+                    // rename_all(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            rule = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    rule
+}
+
+/// The field-level `#[serde(rename = "...")]` name that applies to
+/// *serialization*, if any. Handles both the plain form and the split
+/// `rename(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side). Field-level `rename` overrides a struct-level
+/// `rename_all`, mirroring serde's own precedence.
+pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
+    let mut renamed = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    // rename = "headline"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    // rename(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`snake_case`) field identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
+/// itself would reject (the `Serialize` derive on the emitted struct then
+/// reports the error — no point duplicating it here).
+pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
+    fn pascal(field: &str) -> String {
+        field
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect()
+    }
+    match rule {
+        // serde treats fields as already snake_case/lowercase.
+        "lowercase" | "snake_case" => Some(field.to_owned()),
+        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => Some(field.to_ascii_uppercase()),
+        "PascalCase" => Some(pascal(field)),
+        "camelCase" => {
+            let pascal = pascal(field);
+            let mut chars = pascal.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "kebab-case" => Some(field.replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
+/// The JSON-schema property name a field serializes to, honoring serde attrs.
+///
+/// Precedence mirrors serde: a field-level `#[serde(rename = "...")]` wins over
+/// a container `#[serde(rename_all = "...")]`, which in turn overrides the raw
+/// identifier. The raw-ident prefix (`r#`) is stripped first, so a field
+/// `r#type` advertises the property name `"type"` (what the handler actually
+/// deserializes), never the literal `"r#type"`.
+///
+/// KNOWN LIMITATION: this uses the *serialize* side of a split
+/// `#[serde(rename(serialize = ..., deserialize = ...))]` /
+/// `#[serde(rename_all(serialize = ..., deserialize = ...))]`. For the common
+/// symmetric `rename` / `rename_all` (which apply to both sides) this is exact;
+/// only the rare split-form input struct could differ between the advertised
+/// schema and the deserialized wire name. This is deliberate: it keeps the
+/// `#[derive(OpenApiSchema)]`, `#[model]`, and `FormModel` code paths in
+/// lockstep on the same serde helpers rather than duplicating a
+/// deserialize-side variant.
+pub fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -> Option<String> {
+    let ident = field.ident.as_ref()?;
+    let raw = ident.to_string();
+    let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+    Some(
+        field_serde_serialize_rename(field)
+            .or_else(|| rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, &raw)))
+            .unwrap_or(raw),
+    )
+}
+
+/// Check whether a type is `Option<...>`.
+pub fn is_option_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        tp.path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "Option")
+    } else {
+        false
+    }
+}
+
+/// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
+pub fn type_name_str(ty: &syn::Type) -> String {
+    crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Emit the JSON-Schema `TokenStream` for one model field.
+///
+/// Identical to [`emit_json_schema_tokens`] except that a `#[translatable]`
+/// field (issue #1384) is described inline as a locale-tag→string map, which is
+/// exactly what its lossless `Serialize` emits. Without that, the field would
+/// fall through to the `$ref` branch and `autumn openapi` would ship a spec
+/// referencing a component nothing registers.
+///
+/// Keyed on the **attribute**, never on the type's name: an application type
+/// that merely happens to be called `Translated` (`domain::Translated`) keeps
+/// its ordinary `$ref`, so the advertised contract cannot silently disagree
+/// with what that type actually serializes to.
+pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
+    if field_is_translatable(field) {
+        return quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "type": "object",
+                "description": "Per-locale content, keyed by locale tag (issue #1384).",
+                "additionalProperties": { "type": "string" }
+            })
+        };
+    }
+    emit_json_schema_tokens(&field.ty)
+}
+
+/// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
+/// representing the JSON Schema for the given Rust type.
+///
+/// Handles `Option<T>` (nullable), `Vec<T>` (array), primitives (`String`,
+/// `i64`, etc.), and everything else as a `$ref` to a component schema.
+pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
+    // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __inner = #inner_tokens;
+            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+        }};
+    }
+
+    // Vec<T> → {"type": "array", "items": <T-schema>}
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __items = #inner_tokens;
+            ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
+        }};
+    }
+
+    let name = type_name_str(ty);
+    crate::api_doc::primitive_json_type(&name).map_or_else(
+        || {
+            // Emit the `$ref` against the field type's FULL `type_name` identity
+            // (built at runtime), NOT its short last segment, so the finalize
+            // collision index can match this nested ref to the exact producing
+            // type and rewrite it to the same display key the top-level route
+            // refs use — even when two types share a last segment (issue #1972).
+            quote! {{
+                let __ref_path = ::std::format!(
+                    "#/components/schemas/{}",
+                    ::core::any::type_name::<#ty>()
+                );
+                ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
+            }}
+        },
+        |json_type| {
+            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
+        },
+    )
+}
+
+/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+///
+/// `all_optional` is `true` for `UpdateX` structs where every field is
+/// conceptually optional (backed by `Patch<T>`).
+pub fn emit_schema_fn_body(
+    fields: &[&&Field],
+    all_optional: bool,
+    rename_all_rule: Option<&str>,
+) -> TokenStream {
+    emit_schema_fn_body_ext(fields, all_optional, &[], rename_all_rule)
+}
+
+pub fn emit_schema_fn_body_ext(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    rename_all_rule: Option<&str>,
+) -> TokenStream {
+    // Resolve each field's advertised property name once — through the shared
+    // serde helpers so the schema honors `#[serde(rename)]` /
+    // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
+    // same resolved name for BOTH the property key and the `required` entry, so
+    // the two can never drift.
+    let insertions: Vec<TokenStream> = fields
+        .iter()
+        .chain(extra_required.iter())
+        .map(|f| {
+            let field_name = schema_property_name(f, rename_all_rule)
+                .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
+            let schema_expr = emit_json_schema_tokens_for_field(f);
+            quote! {
+                __props.insert(#field_name.to_owned(), #schema_expr);
+            }
+        })
+        .collect();
+
+    let mut required_names: Vec<String> = if all_optional {
+        Vec::new()
+    } else {
+        fields
+            .iter()
+            .filter(|f| !is_option_type(&f.ty))
+            .filter_map(|f| schema_property_name(f, rename_all_rule))
+            .collect()
+    };
+    for f in extra_required {
+        if let Some(name) = schema_property_name(f, rename_all_rule) {
+            required_names.push(name);
+        }
+    }
+
+    let required_tokens: Vec<TokenStream> = required_names
+        .iter()
+        .map(|name| {
+            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
+        })
+        .collect();
+
+    quote! {
+        let mut __props = ::autumn_web::reexports::serde_json::Map::new();
+        #(#insertions)*
+        let mut __schema = ::autumn_web::reexports::serde_json::Map::new();
+        __schema.insert(
+            "type".to_owned(),
+            ::autumn_web::reexports::serde_json::json!("object"),
+        );
+        __schema.insert(
+            "properties".to_owned(),
+            ::autumn_web::reexports::serde_json::Value::Object(__props),
+        );
+        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
+            ::std::vec![#(#required_tokens),*];
+        if !__required.is_empty() {
+            __schema.insert(
+                "required".to_owned(),
+                ::autumn_web::reexports::serde_json::Value::Array(__required),
+            );
+        }
+        ::autumn_web::reexports::serde_json::Value::Object(__schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+    use syn::parse::Parser as _;
+
+    use super::*;
+
+    #[test]
+    fn field_serde_serialize_rename_parses_plain_and_split_forms() {
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
+            .unwrap();
+        assert_eq!(
+            field_serde_serialize_rename(&field).as_deref(),
+            Some("headline")
+        );
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! {
+                #[serde(rename(serialize = "out", deserialize = "in"))]
+                pub title: String
+            })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field).as_deref(), Some("out"));
+
+        // Deserialize-only rename leaves the serialized key alone.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename(deserialize = "in"))] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(default)] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+    }
+
+    #[test]
+    fn schema_property_name_resolves_renames_and_strips_raw_idents() {
+        // field rename wins over rename_all.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "kind")] pub category: String })
+            .unwrap();
+        assert_eq!(
+            schema_property_name(&field, Some("camelCase")).as_deref(),
+            Some("kind")
+        );
+
+        // container rename_all applies when there is no field rename.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { pub word_count: i64 })
+            .unwrap();
+        assert_eq!(
+            schema_property_name(&field, Some("camelCase")).as_deref(),
+            Some("wordCount")
+        );
+
+        // raw-ident prefix is stripped (advertise the wire name).
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { pub r#type: String })
+            .unwrap();
+        assert_eq!(schema_property_name(&field, None).as_deref(), Some("type"));
+
+        // no rule, plain field → the identifier verbatim.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { pub title: String })
+            .unwrap();
+        assert_eq!(schema_property_name(&field, None).as_deref(), Some("title"));
+    }
+
+    #[test]
+    fn serde_rename_all_serialize_rule_parses_plain_and_split_forms() {
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[serde(rename_all = "camelCase")])];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("camelCase")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[serde(rename_all(serialize = "kebab-case", deserialize = "camelCase"))]
+        )];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("kebab-case")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[serde(deny_unknown_fields)])];
+        assert_eq!(serde_rename_all_serialize_rule(&attrs), None);
+    }
+
+    #[test]
+    fn apply_serde_rename_all_rule_mirrors_serde_field_casings() {
+        let cases = [
+            ("lowercase", "word_count", "word_count"),
+            ("snake_case", "word_count", "word_count"),
+            ("UPPERCASE", "word_count", "WORD_COUNT"),
+            ("SCREAMING_SNAKE_CASE", "word_count", "WORD_COUNT"),
+            ("PascalCase", "word_count", "WordCount"),
+            ("camelCase", "word_count", "wordCount"),
+            ("camelCase", "title", "title"),
+            ("kebab-case", "word_count", "word-count"),
+            ("SCREAMING-KEBAB-CASE", "word_count", "WORD-COUNT"),
+        ];
+        for (rule, field, expected) in cases {
+            assert_eq!(
+                apply_serde_rename_all_rule(rule, field).as_deref(),
+                Some(expected),
+                "rule {rule} on {field}"
+            );
+        }
+        // A rule serde itself rejects resolves to no rename here.
+        assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
+}
