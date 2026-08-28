@@ -527,9 +527,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiling them and throwing them away. Measured on a 4-core box, a debug build
   of `autumn-macros` drops from 31.1s to 2.7s (-91%) with `db` off; the crate sits
   on the serial critical path of a first build (nothing else starts until it
-  finishes), so that time comes straight off cold-start onboarding
-  (issue #2309). A DB-backed app enables `db` and is unaffected — same macros,
-  same expansions. The serde / JSON-schema field helpers shared with
+  finishes), so that time comes straight off cold-start onboarding. End to end,
+  `autumn dev-loop-bench --cold-start` — `autumn new` to the first HTTP 200 for
+  the no-DB starter — drops from 136.6s to 90.8s (-33%) on the same box. That
+  does not on its own bring the gate's p95 60s / max 90s budget green, so the
+  budget question issue #2309 raises stays open (issue #2309). A DB-backed app
+  enables `db` and is unaffected — same macros, same expansions. The serde /
+  JSON-schema field helpers shared with
   `#[derive(OpenApiSchema)]` moved out of `model.rs` into a new always-compiled
   `schema` module, so the derive keeps working (and keeps its tests) with `db`
   off. Direct dependants of `autumn-macros` see no change: `db` is on by default
