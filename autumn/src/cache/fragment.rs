@@ -601,7 +601,7 @@ mod tests {
         clear_global_cache();
 
         let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
-        set_global_cache(cache.clone());
+        set_global_cache(cache);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let render = |counter: Arc<AtomicUsize>| {
@@ -667,7 +667,7 @@ mod tests {
         clear_global_cache();
 
         let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
-        set_global_cache(cache.clone());
+        set_global_cache(cache);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let render = |counter: Arc<AtomicUsize>| {
@@ -706,7 +706,7 @@ mod tests {
         clear_global_cache();
 
         let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
-        set_global_cache(cache.clone());
+        set_global_cache(cache);
 
         let other = Arc::new(AtomicUsize::new(0));
         let render = |counter: Arc<AtomicUsize>| {
