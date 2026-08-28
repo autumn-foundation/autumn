@@ -102,7 +102,7 @@ const FOR_NO_KEY_UPDATE: &str = "";
 /// against a bound `BIGINT`.
 ///
 /// `i32` is admitted alongside `i64`: those ids widen losslessly, they parse,
-/// and PostgreSQL compares `INTEGER` to `BIGINT` without complaint, so an
+/// and `PostgreSQL` compares `INTEGER` to `BIGINT` without complaint, so an
 /// `i32`-keyed author model works today and must keep working.
 ///
 /// Sealed, because implementing it for a wider type would re-open exactly the

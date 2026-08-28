@@ -1024,6 +1024,7 @@ impl Client {
             redirect_mode: RedirectMode::Default,
             pin_addr: None,
             ssrf_safe: false,
+            discard_response_body: false,
         }
     }
 
@@ -1178,6 +1179,9 @@ pub struct RequestBuilder {
     /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
     /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
     ssrf_safe: bool,
+    /// When `true`, the response body is dropped unread. See
+    /// [`RequestBuilder::discard_response_body`].
+    discard_response_body: bool,
 }
 
 impl RequestBuilder {
@@ -1232,6 +1236,18 @@ impl RequestBuilder {
         self
     }
 
+    /// Set a raw byte body, without assuming any content type.
+    ///
+    /// Use this for binary payloads — [`text_body`](Self::text_body) takes a
+    /// `String` and so cannot carry bytes that are not valid UTF-8. Set the
+    /// content type yourself with [`header`](Self::header). The Web Push
+    /// transport uses this for RFC 8291-encrypted bodies.
+    #[must_use]
+    pub fn bytes_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
     /// Override the maximum retry count for this request.
     ///
     /// Also clears the idempotent-only flag so non-idempotent methods such as
@@ -1266,6 +1282,25 @@ impl RequestBuilder {
     #[must_use]
     pub fn no_redirect(mut self) -> Self {
         self.redirect_mode = RedirectMode::None;
+        self
+    }
+
+    /// Return the status and headers without reading the response body.
+    ///
+    /// Every other path collects the whole body into memory with no ceiling,
+    /// which is the right default for an API call whose payload the caller
+    /// wants. It is the wrong default when the *remote host* is untrusted and
+    /// the caller needs only the status: a server that streams indefinitely
+    /// then costs one unbounded allocation per request until the timeout
+    /// fires.
+    ///
+    /// Web Push is exactly that shape — the endpoint URL is chosen by the
+    /// client, and the transport only ever reads the status code — so it sets
+    /// this. [`Response::bytes`] then returns empty; dropping the underlying
+    /// response closes the connection without draining it.
+    #[must_use]
+    pub const fn discard_response_body(mut self) -> Self {
+        self.discard_response_body = true;
         self
     }
 
@@ -1540,10 +1575,14 @@ impl RequestBuilder {
                         continue;
                     }
 
-                    let body = resp
-                        .bytes()
-                        .await
-                        .map_err(|e| ClientError::Request(e.without_url()))?;
+                    let body = if self.discard_response_body {
+                        // Dropped unread — see `discard_response_body`.
+                        Bytes::new()
+                    } else {
+                        resp.bytes()
+                            .await
+                            .map_err(|e| ClientError::Request(e.without_url()))?
+                    };
                     let elapsed = start.elapsed();
                     log_request(
                         self.method.as_str(),
@@ -1667,6 +1706,7 @@ impl RequestBuilder {
             &self.extra_headers,
             self.body.as_ref(),
             &self.retry_policy,
+            self.discard_response_body,
         )
         .await
     }
@@ -1719,6 +1759,7 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                self.discard_response_body,
             )
             .await?;
 
@@ -1797,6 +1838,7 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                self.discard_response_body,
             )
             .await?;
 
@@ -1898,6 +1940,7 @@ async fn send_one(
     extra_headers: &HeaderMap,
     body: Option<&Bytes>,
     retry_policy: &RetryPolicy,
+    discard_response_body: bool,
 ) -> Result<Response, ClientError> {
     let start = Instant::now();
     let max_attempts = if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
@@ -1942,10 +1985,14 @@ async fn send_one(
                     continue;
                 }
 
-                let body = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| ClientError::Request(e.without_url()))?;
+                let body = if discard_response_body {
+                    // Dropped unread — see `RequestBuilder::discard_response_body`.
+                    Bytes::new()
+                } else {
+                    resp.bytes()
+                        .await
+                        .map_err(|e| ClientError::Request(e.without_url()))?
+                };
                 log_request(
                     method.as_str(),
                     &url_used,
