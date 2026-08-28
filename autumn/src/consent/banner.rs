@@ -884,7 +884,13 @@ fn is_attachment(response: &Response<Body>) -> bool {
 /// A document begins with a doctype or an `<html>` tag even when it omits its
 /// closing tags; a swap fragment begins with the element being swapped in.
 fn starts_like_a_document(body: &[u8]) -> bool {
-    let mut head = body;
+    // A UTF-8 BOM is an encoding artifact, not content — plenty of editors and
+    // template toolchains emit one — and a browser reads the document straight
+    // through it. It is three fixed bytes in exactly one position, so stripping
+    // it is normalization rather than another guess about HTML shape.
+    let mut head = body
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(body);
     // Skip whitespace and any leading comments: a generator's `<!-- built at
     // … -->` preamble ahead of the doctype is still a document, and treating
     // it as a fragment would silently cost that page its banner.
@@ -1185,6 +1191,22 @@ mod tests {
                 String::from_utf8_lossy(fragment)
             );
         }
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_make_a_document_look_like_a_fragment() {
+        for doc in [
+            &b"\xEF\xBB\xBF<!doctype html><html><body>hi</body></html>"[..],
+            &b"\xEF\xBB\xBF<html><body>hi</body></html>"[..],
+            &b"\xEF\xBB\xBF\n  <!-- built -->\n<!doctype html><html><body>hi</body></html>"[..],
+        ] {
+            let out = splice_before_body_close(doc, "<snip>")
+                .expect("a BOM is an encoding artifact, not a fragment marker");
+            assert!(String::from_utf8(out).unwrap().contains("<snip></body>"));
+        }
+
+        // The BOM must not become a way to smuggle a fragment past the gate.
+        assert!(splice_before_body_close(b"\xEF\xBB\xBF<div>row</div>", "<snip>").is_none());
     }
 
     #[test]
