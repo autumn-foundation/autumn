@@ -49,7 +49,10 @@ use autumn_web::form::ChangesetForm;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-#[derive(Deserialize, Serialize, Validate, Clone)]
+// `Default` is here for the blank-form constructor further down
+// (`ChangesetForm::blank(TodoForm::default(), ..)`): a form struct that a GET
+// route renders empty needs it, and every field type already has one.
+#[derive(Deserialize, Serialize, Validate, Clone, Default)]
 pub struct TodoForm {
     #[validate(length(min = 1, max = 255, message = "Title must be 1–255 characters"))]
     title: String,

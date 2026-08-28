@@ -179,9 +179,16 @@ autumn_web::app()
 ```
 
 Pass your configured names if you customized `security.csrf.cookie_name` or
-`security.csrf.form_field`. The middleware reads both cookies off the incoming
-request rather than from request extensions, so it does not care where
-`CsrfLayer` sits relative to it.
+`security.csrf.form_field`.
+
+**The injector must wrap CSRF issuance** — it has to sit *outside* `CsrfLayer`,
+which is where `AppBuilder::layer` puts it. A returning visitor's token arrives
+as a cookie on the request, but a first-time visitor has none: `CsrfLayer` mints
+one, puts it in request extensions, and appends the `Set-Cookie` on the way out.
+The injector recovers it from that `Set-Cookie` — which it can only see if
+`CsrfLayer` already ran, i.e. inside it. Stack them the other way and a
+first-time visitor gets a bannerless page, and after a key rotation the stale
+cookie can be embedded instead of the refreshed token.
 
 Style it through the framework stylesheet — link
 `autumn_web::ui::WIDGETS_CSS_PATH` and override the
