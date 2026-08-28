@@ -464,6 +464,14 @@ pub struct HttpEffect {
     /// Status the peer answered with. `0` when the call never got a response
     /// (see `error`).
     pub status: u16,
+    /// The URL the response ultimately came from, when redirects moved it.
+    ///
+    /// Absent when it is the request URL, which is the ordinary case. A handler
+    /// that inspects `Response::url()` — to decide whether it was redirected,
+    /// or to resolve a relative link against the final location — would
+    /// otherwise branch differently under replay than it did live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
     /// Response headers, already masked.
     #[serde(default)]
     pub response_headers: Vec<(String, String)>,
@@ -527,6 +535,7 @@ impl Default for HttpEffect {
             request_headers: Vec::new(),
             request_body: CapsuleBody::Absent,
             status: 0,
+            final_url: None,
             response_headers: Vec::new(),
             response_body: CapsuleBody::Absent,
             error: None,
@@ -550,6 +559,7 @@ impl HttpEffect {
             request_headers: Vec::new(),
             request_body: CapsuleBody::Absent,
             status: 0,
+            final_url: None,
             response_headers: Vec::new(),
             response_body: CapsuleBody::Absent,
             error: Some(PENDING_EFFECT.to_owned()),
@@ -573,6 +583,16 @@ pub struct JobEffect {
     /// enqueue.
     #[serde(default)]
     pub delay_secs: Option<i64>,
+    /// The absolute instant an `enqueue_at`-family call asked for.
+    ///
+    /// Recorded beside `delay_secs` rather than folded into it because the two
+    /// say different things. A relative enqueue states a delay and the deadline
+    /// follows from when it ran; an absolute one states the deadline itself,
+    /// and the delay recorded for it would differ between capture and replay
+    /// purely because time passed. Comparing an absolute enqueue on its own
+    /// terms is what lets a changed deadline be noticed at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The error the backend returned, when the enqueue **failed**.
     ///
     /// A handler whose recorded 500 was caused by `enqueue(..).await?` — the
@@ -581,6 +601,19 @@ pub struct JobEffect {
     /// down the success path the failing run never took.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl Default for JobEffect {
+    /// An enqueue with nothing recorded; see [`HttpEffect::default`].
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            payload: serde_json::Value::Null,
+            delay_secs: None,
+            due_at: None,
+            error: None,
+        }
+    }
 }
 
 impl JobEffect {
@@ -592,6 +625,7 @@ impl JobEffect {
             name: String::new(),
             payload: serde_json::Value::Null,
             delay_secs: None,
+            due_at: None,
             error: Some(PENDING_EFFECT.to_owned()),
         }
     }
@@ -972,6 +1006,7 @@ mod tests {
             request_headers: vec![("authorization".to_owned(), "[FILTERED]".to_owned())],
             request_body: CapsuleBody::Text("{\"amount\":10}".to_owned()),
             status: 502,
+            final_url: Some("https://payments.example/charge/final".to_owned()),
             response_headers: vec![("content-type".to_owned(), "application/json".to_owned())],
             response_body: CapsuleBody::Base64("AAEC".to_owned()),
             error: None,
@@ -981,6 +1016,7 @@ mod tests {
             name: "send_receipt".to_owned(),
             payload: serde_json::json!({"order": 7}),
             delay_secs: Some(30),
+            due_at: None,
             error: None,
         });
         capsule.effects.cache.push(CacheEffect::Get {

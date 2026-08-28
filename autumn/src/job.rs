@@ -2367,13 +2367,13 @@ async fn run_enqueue_interceptor(
 fn replayed_enqueue(
     name: &str,
     payload: &Value,
-    delay_secs: Option<i64>,
+    schedule: EnqueueSchedule,
 ) -> Option<AutumnResult<()>> {
     use crate::capsule::effects::EnqueueVerdict;
 
     let tape = crate::capsule::effects::current_tape()?;
     Some(
-        match tape.next_job(name, &capsule_job_payload(payload), delay_secs) {
+        match tape.next_job(name, &capsule_job_payload(payload), schedule) {
             EnqueueVerdict::Queued => Ok(()),
             // A recorded backend *rejection* is reproduced as one. A handler
             // whose 500 came from `enqueue(..).await?` — the queue was down,
@@ -2435,6 +2435,24 @@ const TRANSACTIONAL_ENQUEUE_NOTE: &str = "the run enqueued a job inside its own 
 /// Saturating rather than `as`: this module's panic gate denies
 /// `arithmetic_side_effects`, and a delay larger than `i64::MAX` seconds is a
 /// caller error, not something to wrap around on.
+/// What an enqueue call asked for, as the caller stated it.
+///
+/// Kept as three cases rather than one `Option<i64>` because a deadline and a
+/// delay are not interchangeable at the comparison: the delay recorded for an
+/// absolute enqueue is `deadline - now`, which differs between capture and
+/// replay purely because time passed, so comparing an absolute enqueue by its
+/// delay would either diverge on every faithful replay or — as it did — have
+/// to skip the comparison entirely and let a changed deadline through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueSchedule {
+    /// Run as soon as a worker takes it.
+    Immediate,
+    /// Run after a relative delay, in whole seconds.
+    After(i64),
+    /// Run at an absolute instant.
+    At(chrono::DateTime<chrono::Utc>),
+}
+
 fn delay_seconds(delay: std::time::Duration) -> i64 {
     i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
 }
@@ -2444,7 +2462,7 @@ fn delay_seconds(delay: std::time::Duration) -> i64 {
 const fn replayed_enqueue(
     _name: &str,
     _payload: &Value,
-    _delay_secs: Option<i64>,
+    _schedule: EnqueueSchedule,
 ) -> Option<AutumnResult<()>> {
     None
 }
@@ -2547,6 +2565,7 @@ fn fill_enqueue(
             // denies `arithmetic_side_effects`, and the subtraction operator on
             // `DateTime` is not total.
             delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
+            due_at,
             error: error.map(ToString::to_string),
         },
     );
@@ -2604,7 +2623,7 @@ pub fn clear_global_job_client() {
 /// `name` does not match a registered job, or when the active backend rejects
 /// the enqueue operation.
 pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -2704,7 +2723,9 @@ pub async fn enqueue_in(
     // due-at against *its* clock — the job would be years off B's timeline and
     // never become due. Same failure mode as the real-time bug this migration
     // fixed, arrived at from the other direction.
-    if let Some(answer) = replayed_enqueue(name, &payload, Some(delay_seconds(delay))) {
+    if let Some(answer) =
+        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
+    {
         return answer;
     }
     let client = require_job_client()?;
@@ -2728,7 +2749,7 @@ pub async fn enqueue_at(
     payload: Value,
     when: chrono::DateTime<chrono::Utc>,
 ) -> AutumnResult<()> {
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -2768,7 +2789,7 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -2804,7 +2825,9 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, Some(delay_seconds(delay))) {
+    if let Some(answer) =
+        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
+    {
         return answer;
     }
     let client = require_job_client()?;
@@ -2833,7 +2856,7 @@ pub async fn enqueue_at_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -2869,7 +2892,7 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -2901,7 +2924,9 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, Some(delay_seconds(delay))) {
+    if let Some(answer) =
+        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
+    {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -2932,7 +2957,7 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, None) {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
         return answer;
     }
     let Some(client) = global_job_client() else {
@@ -3150,7 +3175,11 @@ impl JobClient {
         // `JobClient` — the event bus's durable dispatch, or `enqueue_tracked`.
         // Guarding here too closes those without ever double-consuming the
         // tape: a free-function enqueue returned long before this line.
-        if let Some(answer) = replayed_enqueue(name, &payload, None) {
+        if let Some(answer) = replayed_enqueue(
+            name,
+            &payload,
+            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+        ) {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         // Reserve before the backend is asked and fill in after, so concurrent
@@ -3794,7 +3823,11 @@ impl JobClient {
         // it never funnels through `enqueue_with_outcome_due`, so without its
         // own seam an `enqueue_on_conn` would be missing from the capsule and
         // then report an unrecorded-effect divergence on replay.
-        if let Some(answer) = replayed_enqueue(name, &payload, None) {
+        if let Some(answer) = replayed_enqueue(
+            name,
+            &payload,
+            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+        ) {
             return answer;
         }
         // On the postgres backend this enqueue is *also* a row INSERT on the

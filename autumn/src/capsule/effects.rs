@@ -438,15 +438,15 @@ impl ReplayEffects {
     ///
     /// `true` means the enqueue is satisfied from the tape and must **not** be
     /// written to a queue; `false` means it diverged and the caller should fail
-    /// it. `delay_secs` is compared when the caller states one — a job that
-    /// used to run immediately and now runs in an hour is a behaviour change
-    /// the capsule can see — and ignored when it does not.
+    /// it. The schedule is compared on the same terms the caller stated it: a
+    /// job that used to run immediately and now runs in an hour, or one whose
+    /// absolute deadline moved, is a behaviour change the capsule can see.
     #[must_use]
     pub(crate) fn next_job(
         &self,
         name: &str,
         payload: &serde_json::Value,
-        delay_secs: Option<i64>,
+        schedule: crate::job::EnqueueSchedule,
     ) -> EnqueueVerdict {
         let Ok(mut seam) = self.jobs.lock() else {
             return EnqueueVerdict::Diverged;
@@ -468,12 +468,18 @@ impl ReplayEffects {
             });
             return EnqueueVerdict::Diverged;
         };
-        // The delay is compared only when the *caller* stated one. Not every
-        // enqueue entry point knows its delay in seconds at the point the guard
-        // runs — `enqueue_at` holds an absolute instant and no clock — and
-        // comparing a `None` the caller could not supply against a `Some` the
-        // recording computed would fail a faithful replay.
-        let delay_diverged = delay_secs.is_some_and(|delay| next.delay_secs != Some(delay));
+        // Each schedule is compared on its own terms. A relative enqueue is
+        // compared by delay; an absolute one by its deadline, because the delay
+        // recorded for it is `deadline - now` and would differ between capture
+        // and replay purely because time passed. `Immediate` states nothing
+        // about timing, so there is nothing to compare — an entry point that
+        // takes no schedule cannot have changed one.
+        let schedule_diverged = match schedule {
+            crate::job::EnqueueSchedule::Immediate => false,
+            crate::job::EnqueueSchedule::After(delay) => next.delay_secs != Some(delay),
+            crate::job::EnqueueSchedule::At(deadline) => next.due_at != Some(deadline),
+        };
+        let delay_diverged = schedule_diverged;
         if next.name != name || delay_diverged || !json_matches_redacted(&next.payload, payload) {
             let expected = describe_job(&next.name, &next.payload);
             drop(seam);
@@ -1257,6 +1263,7 @@ mod tests {
                 name: "notify".to_owned(),
                 payload: serde_json::json!({"to": "a@example.com", "token": "[FILTERED]"}),
                 delay_secs: None,
+                due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1274,7 +1281,7 @@ mod tests {
             tape.next_job(
                 "notify",
                 &serde_json::json!({"to": "a@example.com", "token": "real-token"}),
-                None
+                crate::job::EnqueueSchedule::Immediate
             ),
             EnqueueVerdict::Queued
         );
@@ -1306,6 +1313,7 @@ mod tests {
                 name: "notify".to_owned(),
                 payload: serde_json::json!({"token": "[FILTERED]"}),
                 delay_secs: None,
+                due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1315,7 +1323,7 @@ mod tests {
             tape.next_job(
                 "notify",
                 &serde_json::json!({"token": "real", "extra": 1}),
-                None
+                crate::job::EnqueueSchedule::Immediate
             ),
             EnqueueVerdict::Diverged
         );
@@ -1404,18 +1412,27 @@ mod tests {
                 name: "send_receipt".to_owned(),
                 payload: serde_json::json!({"order": 7}),
                 delay_secs: None,
+                due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
         });
         assert_eq!(
-            tape.next_job("send_receipt", &serde_json::json!({"order": 7}), None),
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({"order": 7}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
             EnqueueVerdict::Queued,
             "the recorded enqueue is satisfied from the tape"
         );
         assert!(tape.divergences().is_empty());
         assert_eq!(
-            tape.next_job("send_receipt", &serde_json::json!({"order": 8}), None),
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({"order": 8}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
             EnqueueVerdict::Diverged,
             "an enqueue the recording never made must not be satisfied"
         );
@@ -1431,12 +1448,17 @@ mod tests {
                 name: "send_receipt".to_owned(),
                 payload: serde_json::json!({}),
                 delay_secs: None,
+                due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
         });
         assert_eq!(
-            tape.next_job("send_receipt", &serde_json::json!({}), Some(3600)),
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::After(3600)
+            ),
             EnqueueVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
@@ -1858,6 +1880,47 @@ mod tests {
         );
     }
 
+    /// An absolute enqueue states its deadline, so it is compared on that.
+    /// Comparing it by delay would either diverge on every faithful replay —
+    /// the delay is `deadline - now`, and `now` moved — or, as it did, skip the
+    /// comparison and let a moved deadline through.
+    #[test]
+    fn a_moved_absolute_deadline_is_a_divergence() {
+        use crate::job::EnqueueSchedule;
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("parses")
+            .with_timezone(&chrono::Utc);
+        let recorded = JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({}),
+            delay_secs: Some(3600),
+            due_at: Some(deadline),
+            ..Default::default()
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded.clone(), recorded],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::At(deadline + chrono::Duration::hours(1))
+            ),
+            EnqueueVerdict::Diverged,
+            "a job rescheduled to a different instant is a behaviour change"
+        );
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::At(deadline)
+            ),
+            EnqueueVerdict::Queued,
+            "and the same instant still replays, whatever the clock now reads"
+        );
+    }
+
     #[test]
     fn a_recorded_enqueue_failure_is_reproduced_as_a_failure() {
         // A handler whose 500 came from `enqueue(..).await?` must meet the
@@ -1867,12 +1930,17 @@ mod tests {
                 name: "send_receipt".to_owned(),
                 payload: serde_json::json!({}),
                 delay_secs: None,
+                due_at: None,
                 error: Some("queue is down".to_owned()),
             }],
             ..CapsuleEffects::default()
         });
         assert_eq!(
-            tape.next_job("send_receipt", &serde_json::json!({}), None),
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
             EnqueueVerdict::Failed("queue is down".to_owned())
         );
         assert!(tape.divergences().is_empty());

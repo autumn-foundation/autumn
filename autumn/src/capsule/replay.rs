@@ -1130,6 +1130,33 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
              say which case this was; raise `max_body_bytes` and re-record if it was the cap."
         ));
     }
+    // Effect data the handler *consumes* cannot tolerate a placeholder the way
+    // compared data can. A response body and a cache hit are deserialized and
+    // branched on, so `[FILTERED]` reaches the code as a literal — a number
+    // field that no longer parses, a string that takes the wrong arm — and the
+    // verdict would describe a run that never happened. The masking is not
+    // reversible, so this is a refusal rather than a warning.
+    let masked_input: Vec<&str> = capsule
+        .request
+        .redacted_keys
+        .iter()
+        .filter(|key| {
+            key.starts_with("cache[")
+                || (key.starts_with("http[") && key.contains("].response_body"))
+        })
+        .map(String::as_str)
+        .collect();
+    if !masked_input.is_empty() {
+        return Some(format!(
+            "input the replayed run reads back was masked by `[log] filter_parameters` ({}). \
+             An outbound response body and a cache hit are handed to the code as data — parsed, \
+             deserialized, branched on — so unlike a compared field the `[FILTERED]` placeholder \
+             cannot stand in for what was really there, and the run would be graded on input \
+             production never returned. Redaction is not reversible: unfilter the field for this \
+             route, or debug it from the recorded outcome instead.",
+            masked_input.join(", ")
+        ));
+    }
     if capsule.job.is_some() {
         // The job payload is the *input* a job capsule replays on, and unlike
         // an effect it is handed to the handler verbatim: there is no wildcard
@@ -1689,6 +1716,36 @@ mod tests {
         // The same key on a *request* capsule is not this refusal: a request
         // body is compared, not parsed, so redaction is tolerated there.
         capsule.job = None;
+        assert!(refusal_reason(&capsule).is_none());
+    }
+
+    /// A compared field can read `[FILTERED]` as a wildcard. Data the handler
+    /// *consumes* cannot: it is deserialized and branched on, so the
+    /// placeholder reaches the code as a literal value production never
+    /// returned.
+    #[test]
+    fn a_capsule_whose_replayed_input_was_masked_is_refused() {
+        let mut capsule = fixture(status(500));
+        assert!(refusal_reason(&capsule).is_none());
+
+        capsule.request.redacted_keys = vec!["http[0].response_body.access_token".to_owned()];
+        let reason = refusal_reason(&capsule).expect("a masked response body is refused");
+        assert!(
+            reason.contains("response_body") && reason.contains("filter_parameters"),
+            "the refusal must name the field and the knob: {reason}"
+        );
+
+        capsule.request.redacted_keys = vec!["cache[0].user_id".to_owned()];
+        assert!(
+            refusal_reason(&capsule).is_some(),
+            "a masked cache hit is served as concrete input too"
+        );
+
+        // A masked *request* header is compared, not consumed, so it still
+        // replays: the placeholder stands for whatever was really there.
+        capsule.request.redacted_keys = vec!["header:authorization".to_owned()];
+        assert!(refusal_reason(&capsule).is_none());
+        capsule.request.redacted_keys = vec!["http[0].request_header.authorization".to_owned()];
         assert!(refusal_reason(&capsule).is_none());
     }
 

@@ -521,6 +521,23 @@ pub fn redact_effects(
         for recipient in &mut mail.to {
             *recipient = mask_echoes(recipient, values);
         }
+        // Every free-form field a caller can put a request value into, not just
+        // the obvious two: an address submitted in a form and reused as
+        // `Reply-To`, an unsubscribe link carrying a token, a filename built
+        // from user input. A value masked one field over must not sit in the
+        // clear here.
+        if let Some(reply_to) = mail.reply_to.as_mut() {
+            *reply_to = mask_echoes(reply_to, values);
+        }
+        if let Some(unsubscribe) = mail.list_unsubscribe.as_mut() {
+            *unsubscribe = mask_echoes(unsubscribe, values);
+        }
+        for (_, value) in &mut mail.extra_headers {
+            *value = mask_echoes(value, values);
+        }
+        for attachment in &mut mail.attachments {
+            attachment.filename = mask_echoes(&attachment.filename, values);
+        }
         if let Some(from) = mail.from.as_mut() {
             *from = mask_echoes(from, values);
         }
@@ -1718,6 +1735,7 @@ mod tests {
                     name: "notify".to_owned(),
                     payload: serde_json::json!({"api_key": "sk-live-42", "order": 7}),
                     delay_secs: None,
+                    due_at: None,
                     error: None,
                 }],
                 cache: vec![CacheEffect::Insert {
@@ -1772,6 +1790,7 @@ mod tests {
                     // `pw` is in no filter list.
                     payload: serde_json::json!({"pw": "hunter2secret"}),
                     delay_secs: None,
+                    due_at: None,
                     error: None,
                 }],
                 mail: vec![MailEffect {

@@ -89,6 +89,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capsule still has a generated test wired into the consolidated suite: it runs
   the corpus by name filter, so a deleted test would otherwise be skipped in
   silence while the corpus reported that it replays clean.
+  An `enqueue_at` deadline is compared as a deadline rather than as a delay
+  derived from it, so a job rescheduled to a different instant is noticed; a
+  capsule whose outbound *response body* or *cache hit* was masked is refused,
+  since that data reaches the handler as input rather than as something
+  compared; the mail redaction sweep covers reply-to, `List-Unsubscribe`,
+  caller-set header values and attachment filenames, so a value filtered
+  elsewhere cannot sit in the clear one field over; and a response's final
+  post-redirect URL is recorded and restored, for handlers that inspect
+  `Response::url()`.
 
 ### Fixed
 

@@ -275,7 +275,7 @@ effect because your handler reached it a different way:
 | Seam | Captured at | Replayed as |
 | --- | --- | --- |
 | Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. A recorded *failure* comes back as the same `ClientError` variant, so a `matches!(err, ClientError::CircuitBreakerOpen)` guard takes the branch it took in production. Outbound webhook deliveries are covered here too, they send through the same client |
-| Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording and returns `Ok(())`; **nothing is written to a queue and no job runs** |
+| Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording — including its schedule, compared on the terms the caller stated it (a relative delay by delay, an `enqueue_at` deadline by deadline) — and returns `Ok(())`; **nothing is written to a queue and no job runs** |
 | Cache | `cache::get_cached` / `insert_cached` | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write lands in the tape, so a read-back in the same run finds it |
 | Mail | `Mailer::send` | The send is asserted against everything a recipient would notice — recipients, subject, reply-to, both halves of a multipart body, `List-Unsubscribe`, caller-set headers, and each attachment by name, type, size and digest — and its sender, when the replayed run chose one; **nothing is delivered** |
 | Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration |
@@ -895,6 +895,14 @@ What capsules do not do, stated plainly:
   tape before any job client is reached, and it starts no job runtime to
   rebuild the statement with. Rather than report an unchanged request as
   `diverged`, the capsule notes the enqueue and marks itself incomplete.
+- **A capsule whose replayed *input* was redacted is refused.** An outbound
+  response body and a cache hit are handed to the code as data — parsed,
+  deserialized, branched on — so unlike a compared field the `[FILTERED]`
+  placeholder cannot stand in for what was really there: a numeric field stops
+  parsing, a string takes the wrong arm. Redaction is not reversible, so such a
+  capsule is refused by name rather than replayed against input production
+  never returned. Compared fields (request headers and bodies) are unaffected —
+  there the placeholder is a wildcard, which is exactly what it can be.
 - **A job capsule whose payload was redacted is refused.** A job handler is
   handed its payload *verbatim*, so unlike an effect there is no wildcard
   reading of `[FILTERED]` at that boundary: the handler would parse or branch

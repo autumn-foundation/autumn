@@ -735,7 +735,13 @@ fn replayed_response(
             .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
         headers,
         body: Bytes::from(crate::capsule::effects::body_bytes(&recorded.response_body)),
-        url: url::Url::parse(request.url).ok(),
+        // The recorded final location when redirects moved it, so a handler
+        // inspecting `Response::url()` sees what it saw live.
+        url: recorded
+            .final_url
+            .as_deref()
+            .or(Some(request.url))
+            .and_then(|url| url::Url::parse(url).ok()),
     })
 }
 
@@ -807,7 +813,7 @@ impl OutboundRecorder {
         let (Some(scope), Some(slot)) = (self.scope, self.slot) else {
             return;
         };
-        let (status, response_headers, response_body, error) = match result {
+        let (status, response_headers, response_body, error, final_url) = match result {
             Ok(response) => (
                 response.status.as_u16(),
                 response
@@ -822,12 +828,18 @@ impl OutboundRecorder {
                     .collect(),
                 encode_body(&response.body, self.max_body_bytes),
                 None,
+                response
+                    .url()
+                    .map(reqwest::Url::as_str)
+                    .filter(|final_url| *final_url != self.url)
+                    .map(ToOwned::to_owned),
             ),
             Err(error) => (
                 0,
                 Vec::new(),
                 crate::capsule::CapsuleBody::Absent,
                 Some((error.to_string(), http_error_kind(error))),
+                None,
             ),
         };
         let (error, error_kind) = match error {
@@ -843,6 +855,7 @@ impl OutboundRecorder {
                 request_body: self.request_body,
                 status,
                 response_headers,
+                final_url,
                 response_body,
                 error,
                 error_kind,
