@@ -772,6 +772,22 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
 /// `snippet` is always plain ASCII-safe markup, so splicing it in at an
 /// ASCII tag's byte offset can never straddle a multi-byte UTF-8 sequence.
 fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
+    // The opening is checked FIRST, and it gates both branches.
+    //
+    // Searching for `</body>` alone is not a document test: a fragment can
+    // contain those bytes without being one — inside a `<script>` string, or an
+    // HTML comment — and splicing at that offset would drop the banner inside
+    // the script or the comment, corrupting the fragment and rendering no
+    // usable controls. A real document both opens like one and (usually) closes
+    // its body; a fragment that merely mentions the tag does neither.
+    //
+    // This is a shape test, not a parser. It is deliberately fail-safe: an
+    // input it cannot recognise is left alone rather than spliced blind, so the
+    // failure mode is a missing banner, never mangled markup.
+    if !starts_like_a_document(body) {
+        return None;
+    }
+
     if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>") {
         let mut out = Vec::with_capacity(body.len() + snippet.len());
         out.extend_from_slice(&body[..index]);
@@ -782,18 +798,10 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
 
     // HTML5 permits omitting `</body>`, so a document can legitimately lack
     // one — `<!doctype html><main>…</main>` is a real page a browser renders,
-    // and it must still be prompted. Appending is correct there.
-    //
-    // A fragment must NOT be appended to: it would arrive beside the banner
-    // already on the page. Since no request header separates a fragment from a
-    // whole-document htmx swap, the body's own opening decides it.
-    if starts_like_a_document(body) {
-        let mut out = body.to_vec();
-        out.extend_from_slice(snippet.as_bytes());
-        return out.into();
-    }
-
-    None
+    // and it must still be prompted.
+    let mut out = body.to_vec();
+    out.extend_from_slice(snippet.as_bytes());
+    out.into()
 }
 
 /// Whether the body opens as a complete document rather than a fragment.
@@ -801,14 +809,38 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
 /// A document begins with a doctype or an `<html>` tag even when it omits its
 /// closing tags; a swap fragment begins with the element being swapped in.
 fn starts_like_a_document(body: &[u8]) -> bool {
-    let head = body
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .map_or(&[][..], |i| &body[i..]);
+    let mut head = body;
+    // Skip whitespace and any leading comments: a generator's `<!-- built at
+    // … -->` preamble ahead of the doctype is still a document, and treating
+    // it as a fragment would silently cost that page its banner.
+    loop {
+        let trimmed = head
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(&[][..], |i| &head[i..]);
+        let Some(rest) = trimmed.strip_prefix(b"<!--".as_slice()) else {
+            head = trimmed;
+            break;
+        };
+        let Some(end) = rfind_first(rest, b"-->") else {
+            // An unterminated comment is not something to guess about.
+            return false;
+        };
+        head = &rest[end + 3..];
+    }
+
     let starts_with = |prefix: &[u8]| {
         head.len() >= prefix.len() && head[..prefix.len()].eq_ignore_ascii_case(prefix)
     };
     starts_with(b"<!doctype") || starts_with(b"<html>") || starts_with(b"<html ")
+}
+
+/// Byte offset of the FIRST occurrence of `needle` in `haystack`.
+fn rfind_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// Byte offset of the last case-insensitive (ASCII-only) match of `needle`
@@ -943,6 +975,34 @@ mod tests {
                 String::from_utf8_lossy(fragment)
             );
         }
+    }
+
+    #[test]
+    fn a_fragment_that_merely_mentions_body_close_is_still_a_fragment() {
+        // Finding the bytes `</body>` is not a document test. Splicing at that
+        // offset would land the banner inside the script string or the comment
+        // — corrupting the fragment AND rendering no usable controls.
+        for fragment in [
+            &b"<div><script>var end = \"</body>\";</script></div>"[..],
+            &b"<li><!-- closes with </body> in the source --></li>"[..],
+            &b"<pre><code>&lt;/body&gt;</code></pre>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(fragment, "<snip>").is_none(),
+                "not a document: {}",
+                String::from_utf8_lossy(fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_behind_a_generator_comment_is_still_a_document() {
+        let out = splice_before_body_close(
+            b"<!-- built at 2026-01-01 -->\n<!doctype html><html><body>hi</body></html>",
+            "<snip>",
+        )
+        .expect("a comment preamble does not make it a fragment");
+        assert!(String::from_utf8(out).unwrap().contains("<snip></body>"));
     }
 
     #[test]
