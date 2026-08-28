@@ -1199,6 +1199,33 @@ impl TestApp {
         self
     }
 
+    /// Mirrors
+    /// [`crate::app::AppBuilder::with_push_subscription_store`].
+    #[must_use]
+    pub fn with_push_subscription_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::push::PushSubscriptionStore,
+    {
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(crate::push::WebPush::from_state_with_store(state, store));
+        }));
+        self
+    }
+
+    /// Register an explicit [`WebPush`](crate::push::WebPush) service,
+    /// overriding key, store and transport at once.
+    ///
+    /// The usual reason is a
+    /// [`RecordingPushTransport`](crate::push::RecordingPushTransport), so a
+    /// test can assert exactly what would have gone to the push service.
+    #[must_use]
+    pub fn with_web_push(mut self, push: crate::push::WebPush) -> Self {
+        self.state_initializers.push(Box::new(move |state| {
+            state.insert_extension(push);
+        }));
+        self
+    }
+
     /// Apply a plugin directly to the test app.
     #[must_use]
     pub fn plugin<P: crate::plugin::Plugin>(mut self, plugin: P) -> Self {

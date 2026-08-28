@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lives. The header's true span is measured (a quoted header field may carry
   embedded newlines) rather than assumed to be one line, so the correction fixes
   the CRLF case without disturbing rows under a multi-line header.
+- **`cargo test` on the workspace no longer aborts with a stack overflow:**
+  clap's derive macro expands the whole `autumn` CLI — every subcommand, every
+  argument — into a single `augment_args` function, and unoptimized that one
+  frame is larger than the 2 MiB stack libtest gives a test thread. The first
+  test to call `Cli::try_parse_from` therefore overflowed and took the process
+  down with `SIGABRT`, stopping the suite before ~5,600 other `autumn-cli`
+  tests ran. Release builds inline the frame away, which is why only `cargo
+  test` was affected. A workspace `.cargo/config.toml` now sets
+  `RUST_MIN_STACK`, so the fix travels with the code instead of living in a CI
+  environment variable — the suite cannot pass on one machine and abort on
+  another.
 
 - **TLS-enabled migrations no longer panic when applied from an app's own
   async `on_startup` hook:** the sync migration/wait-check path bridges to
@@ -119,6 +130,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `multi_thread` tokio runtime, called directly from an async body.
 
 ### Added
+
+- **Examples for the four flagship 0.7.0 subsystems that shipped a guide and
+  nothing runnable (#2320, T2):** the 0.7.0 docs audit found guide coverage at
+  91.1% and example coverage at 59.4% — the debt had moved wholesale from docs
+  to examples, and the release's four headline subsystems were the worst of it.
+  Each now has a runnable example, and each example carries assertions rather
+  than prose alone:
+  - **Deterministic simulation testing** — `examples/reddit-clone/tests/sim_hot_rank.rs`
+    is a seeded `#[sim_test]` over the app's `score / (age_hours + 2)^1.5`
+    hot-rank decay curve. It walks 48 virtual hours in checkpoints through the
+    ordinary `Clock` extractor, so it exercises the injected-clock seam rather
+    than bypassing it, and finishes in milliseconds with no sleeping. `always!`
+    carries the hard invariants (a rank never climbs as a post ages; a positive
+    score never decays to zero) and `sometimes!` the reachability targets, with
+    two deliberately-separated score bands so `assert_all_sometimes_satisfied()`
+    holds at every seed and a green run is provably non-vacuous. It doubles as a
+    regression test for the sim seams: a clock that stops reaching handler
+    extractors makes every checkpoint equal and fires the monotonicity
+    invariant.
+  - **Failure capsules** — `examples/reddit-clone` gains an `autumn-capsules.toml`
+    profile that arms `[failure_capture]` (kept out of the dev profile because
+    turning capture on is a deliberate decision, not a convenience), a committed
+    capsule recorded from `/dev/trigger-error` under `capsules/`, and a README
+    walkthrough of `autumn replay` including the four verdicts and their exit
+    codes. `tests/failure_capsule.rs` proves the profile really arms capture
+    while `dev`/`redis` leave it off, that one failing request leaves exactly one
+    capsule and a 404 leaves none, and that the committed fixture parses through
+    the same `Capsule::from_json` the replay CLI uses. The profile also widens
+    `[log] filter_parameters` to cover this app's `Stripe-Signature` intake
+    header — redaction matches names by equality after normalization, never by
+    prefix, so a prefixed secret header is recorded verbatim unless it is named.
+  - **Self-clustering substrate** — `examples/bookmarks-distributed` already ran
+    two web replicas behind nginx; they now form a two-node cluster with no
+    coordination service, sharing a member view and a cluster-wide bookmark
+    counter. `[cluster]` lives in `autumn-docker.toml` and the per-instance
+    identity (node id, advertise address, seed peer) in `docker-compose.yml`,
+    which also gains an explicitly addressed bridge network — `[cluster]` parses
+    socket addresses and does not resolve hostnames, so the compose service
+    names the rest of the stack uses are unusable as an advertise address. A new
+    `/cluster` route reports the local view and the counter; unit tests assert
+    the committed section passes the same `ClusterConfig::validate` that runs at
+    boot, and that compose gives each replica a distinct dialable identity.
+  - **App metrics facade** — `examples/bookmarks` records one domain counter
+    (`bookmarks_created_total{outcome}`, counting rejected submissions as their
+    own series rather than dropping them) and one timer
+    (`bookmark_stats_query_seconds`, scoped to the two grouped aggregates behind
+    `/bookmarks/stats` by resolving the guard with `stop()` before rendering),
+    described once at startup so the timer's bucket bounds are set before
+    registration freezes them. `src/metrics.rs`'s tests assert both instruments
+    on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
+    database, and the Chromium smoke asserts the timer end-to-end against the
+    real binary.
 
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
@@ -300,6 +363,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--import` on a variant that emits no `CsvSchema` (`--api`, `--live`,
   `--sharded`, an owner-scoped `--live-validation`) generates nothing and warns
   with the reason.
+- **Web Push — notifications that reach a device with the tab closed
+  (#1392):** Autumn already generated an installable PWA (#1149) and stored an
+  in-app notification feed (#1148), but a notification could only ever arrive
+  while the user already had the app open. The new `autumn_web::push` module
+  closes that loop, and a developer writes **zero** lines of crypto: the
+  framework mints/loads the VAPID key pair, signs the ES256 identity JWT
+  (RFC 8292), performs the ECDH + HKDF + AES-128-GCM payload encryption
+  (RFC 8291), and dispatches to the push service. Configure `[push]
+  private_key`, mount `autumn_web::push::router()` (which `autumn generate pwa`
+  now does for you), and call `push.send(user_id, &PushMessage::new(title,
+  body).url(target))`.
+
+  `autumn generate pwa` now also emits a service worker with `push` and
+  `notificationclick` handlers, a client subscribe snippet wired to the
+  framework's own public-key endpoint, and a `push_subscriptions` migration —
+  all idempotent, `--dry-run`-honoring, and fully reversed by
+  `autumn destroy pwa`.
+
+  Subscription storage is hardened against the fact that an endpoint URL is a
+  *capability*: the subscribe boundary normalizes the endpoint (so one browser
+  can never become several rows), caps subscriptions per principal, and allows
+  an endpoint to move between accounts only when the request presents the
+  stored `p256dh` — which keeps the shared-device case working (the browser
+  returns the same endpoint **and** keys) while refusing a takeover by anyone
+  who merely learned the URL. The outbound transport resolves the endpoint host
+  and refuses any address on the framework's SSRF deny-list, pins the connection
+  to the checked address, and declines redirects, so neither a DNS record
+  pointing at `169.254.169.254` nor a `307` can steer the POST at an internal
+  host.
+
+  `[push]` honors the usual environment overrides
+  (`AUTUMN_PUSH__PRIVATE_KEY` and friends) — with one deliberate divergence: a
+  *blank* private-key override is preserved and refused at boot rather than
+  clearing the setting the way other `AUTUMN_*` overrides do, because the
+  commonest cause is a secret that failed to interpolate, and clearing it would
+  silently disable delivery (and erase a good key from `autumn.toml`). The
+  `subject` is validated at boot
+  against what RFC 8292 permits — a bare email address instead of a `mailto:`
+  URI otherwise boots cleanly and has every delivery refused remotely. Because
+  Autumn's CSRF layer rejects an unaccompanied POST and its cookie is
+  `HttpOnly`, the public-key response carries the caller's CSRF token for the
+  generated snippet, which is what keeps push opt-in working under the
+  production defaults without exempting the push routes from CSRF.
+
+  Because every endpoint is client-chosen, the delivery path is written for a
+  hostile one: a principal's devices are dispatched to concurrently (bounded),
+  so a device that accepts a connection and never answers cannot hold up its
+  live siblings; the transport reads only the status code and discards the
+  response body unread, so a registered endpoint cannot stream unbounded memory
+  into the process; and the generated snippet unsubscribes on sign-out, so a
+  subscription never outlives the session that created it.
+
+  Failure posture is deliberate: a `[push] private_key` that is present but
+  unusable fails the **boot** rather than leaving push silently dead, and
+  sending with no key configured is an error raised before any dispatch, never
+  an `Ok` report of zero deliveries. A `404`/`410` from the push service prunes
+  the subscription so a dead endpoint is never re-sent to, while a `5xx` or
+  rate limit leaves it in place — pruning on a transient failure would silently
+  unsubscribe every user during an outage. Because the subscribe endpoint takes
+  a client-supplied URL the framework later POSTs to, it requires `https` and
+  refuses IP-literal and loopback hosts, closing the SSRF shape at the
+  boundary.
+
+  The encryption is pinned to RFC 8291 §5's own published test vector — fed the
+  RFC's inputs it must reproduce the RFC's output byte-for-byte — and the
+  end-to-end test decrypts a dispatched body back with the receiving user
+  agent's private key and verifies the VAPID signature, so what is asserted is
+  what a real browser would receive. Ships `RecordingPushTransport` so
+  applications can assert their own push behaviour the same way.
+
+  Adds **no new crate** to the dependency graph: `p256` was already resolved
+  for `jsonwebtoken`'s ES256 backend, and `aes-gcm`/`hmac`/`sha2`/`base64` were
+  already non-optional dependencies. All additions are additive — a new
+  `[push]` config block, a new `push_subscriptions` table, and new public API;
+  no existing `autumn-web` surface changed. Guide:
+  `docs/guide/web-push.md`. Out of scope by design: native mobile push
+  (APNs/FCM device tokens), notification actions/images/badges, and per-user
+  preferences or quiet hours.
 - **SEO guide and a runnable SEO example (#2320, T1 Gap 1):** `seo.rs` was
   rustdoc-only and `docs/guide/` had zero `sitemap`/`robots` mentions, even
   though the `seo(...)` route attribute shipped in 0.7.0. The new

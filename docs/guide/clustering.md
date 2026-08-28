@@ -296,6 +296,18 @@ your port with the wrong secret. Any `pushes_unsendable_total` at all means
 this node has stopped gossiping and its peer is about to evict it — the push is
 also the heartbeat, so that failure is otherwise invisible from the inside.
 
+## A worked example
+
+`examples/bookmarks-distributed` runs this for real: its two web replicas sit
+behind nginx and form a two-node cluster sharing a `bookmarks_created` counter.
+`autumn-docker.toml` holds the `[cluster]` section (the settings both nodes
+share), `docker-compose.yml` holds the per-instance identity — node id,
+advertise address, and the single seed peer — plus the explicitly addressed
+bridge network the advertise addresses need, since this section parses socket
+addresses and does not resolve hostnames. `src/routes/cluster.rs` is the
+application surface: a `/cluster` route reporting the local member view and the
+counter's current lower bound.
+
 ## How it works
 
 ### The wire format

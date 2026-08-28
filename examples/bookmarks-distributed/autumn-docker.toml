@@ -32,3 +32,30 @@ key_prefix = "bookmarks:session"
 # AUTUMN_SECURITY__SIGNING_SECRET environment variable — see docker-compose.yml.
 [security.signing_secret]
 # secret is read from AUTUMN_SECURITY__SIGNING_SECRET env var at runtime
+
+# ── 0.7.0 Feature: the self-clustering substrate ────────────────────────────
+#
+# The two web replicas in `docker-compose.yml` already sit behind nginx and
+# already share Redis for sessions and cache. `[cluster]` gives them something
+# they can share with **no** coordination service at all: a member view and a
+# cluster-wide counter, gossiped directly between the processes over an
+# authenticated (HMAC-SHA256) TCP link. See `docs/guide/clustering.md`.
+#
+# What is *not* here is per-node identity: `node_id`, `advertise_addr` and
+# `seed_peers` differ per replica, so they are supplied as environment
+# overrides in `docker-compose.yml`. The secret is supplied there too — it is
+# a `SecretString` that must never be committed.
+[cluster]
+enabled = true
+cluster_name = "bookmarks-distributed"
+# Bind the wildcard so the listener is reachable across the compose network.
+# A wildcard bind *requires* an explicit advertise_addr, because 0.0.0.0 is
+# not an address a peer can dial — compose supplies one per replica.
+bind_addr = "0.0.0.0:7946"
+# Both replicas must be dialable at the address they advertise: replies never
+# travel back over an accepted inbound socket, so a node its peer cannot dial
+# converges on a one-member view forever.
+push_interval_ms = 500
+# Must be at least 3x push_interval_ms, or one delayed push evicts a healthy
+# peer and the member view flaps.
+suspicion_timeout_ms = 2500
