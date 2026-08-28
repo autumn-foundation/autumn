@@ -162,7 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[cached]` also gained `key(a, b)` to build the cache key from named
   parameters only, which is what lets a cached read take the repository handle it
   reads through — the handle is `Clone` but not `Hash`, and was never part of the
-  value’s identity. What is proven and what is not is stated on the tin: the
+  value’s identity. A derived dependency resolves the model through the
+  repository’s own `__AUTUMN_MODEL_NAME` rather than string-stripping its type
+  name, so `#[repository(Comment)] trait ModerationRepository` yields `Comment`;
+  a repository reached only through its trait is recorded `undetermined`, since
+  the trait carries no such constant and a guessed model that names nothing
+  would turn a real violation into a clean audit.
+  What is proven and what is not is stated on the tin: the
   `invalidations` dimension carries a `runtime_caveat` saying the edge’s target
   is proven — rustc resolves it to the read’s own generated id constant — but
   its *invocation* on the write path is not, and the manifest’s `excluded` list

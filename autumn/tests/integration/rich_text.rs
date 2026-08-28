@@ -489,21 +489,38 @@ fn deeply_nested_blocks_render_in_linear_time() {
     // amplifier: two source bytes per nesting level.
     //
     // Before the nesting cap this was O(depth²) inside the HTML sanitizer's
-    // open-elements scope walk — 80 KB of input took ~111s. The assertion is a
-    // generous ceiling (a linear render of this input is milliseconds); it is
-    // sized to catch a return of quadratic behaviour, not to benchmark.
+    // open-elements scope walk — 80 KB of input took ~111s.
+    //
+    // The claim is about SHAPE, so the assertion measures shape: render two
+    // sizes and bound the ratio. An absolute wall-clock ceiling would instead
+    // measure the machine — a debug build on a loaded Windows runner spent
+    // ~8s on the 80 KB input while the same commit passed on Linux and macOS,
+    // which says nothing about super-linearity.
     use std::time::Instant;
 
-    let source = "> ".repeat(40_000);
-    let started = Instant::now();
-    let html = render_user_content_html(&source);
-    let elapsed = started.elapsed();
+    fn render_timed(levels: usize) -> (String, std::time::Duration) {
+        let source = "> ".repeat(levels);
+        let started = Instant::now();
+        let html = render_user_content_html(&source);
+        (html, started.elapsed())
+    }
 
+    // Warm up first: the first render pays one-time initialisation that would
+    // otherwise land entirely in the small sample and depress the ratio.
+    let _ = render_timed(1_000);
+
+    let (_, small) = render_timed(10_000);
+    let (html, large) = render_timed(40_000);
+
+    // 4x the input. Linear ⇒ ~4x the time; quadratic ⇒ ~16x. A ceiling of 8x
+    // separates them with room for scheduler noise, and holds on any machine.
+    // The +50ms floor keeps a sub-millisecond `small` from turning timer
+    // granularity into a spurious ratio.
+    let ceiling = small.as_secs_f64() * 8.0 + 0.050;
     assert!(
-        elapsed.as_secs() < 5,
-        "rendering {} bytes of nested blockquotes took {elapsed:?} — the renderer \
-         has regressed to super-linear behaviour",
-        source.len()
+        large.as_secs_f64() < ceiling,
+        "4x the input took {large:?} against {small:?} for the smaller — a ratio \
+         past 8x means the renderer has regressed to super-linear behaviour"
     );
     // Output stays bounded too: past the cap the nesting is flattened rather
     // than emitted, so a 80 KB input cannot inflate into megabytes of markup.

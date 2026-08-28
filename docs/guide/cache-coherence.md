@@ -143,23 +143,34 @@ The declaration is trusted; make it true.
 Omit `reads(...)` and the macro recovers what it can from the function's own
 signature and body:
 
-* a repository type anywhere in scope — `PgPostRepository`, `impl PostRepository`,
-  a parameter, a turbofish — names `Post`;
+* the **concrete** repository struct anywhere in scope — `PgPostRepository`, a
+  parameter, a turbofish — contributes the model *that repository declares*.
+  The macro emits `<PgPostRepository>::__AUTUMN_MODEL_NAME`, the constant
+  `#[repository]` puts on every generated struct, so rustc resolves the model
+  and `#[repository(Comment)] trait ModerationRepository` correctly yields
+  `Comment` rather than the `Moderation` its name suggests;
 * a reading associated call on a model type, from a **closed list** of verbs
   (`find_all`, `find_by_id`, `count`, `exists_by_id`, `list`, `page`, `all`,
   `load`, `first`) — `Post::find_all(db)` names `Post`, `Post::find_by_slug(…)`
   does not.
 
+A repository reached only through its **trait** — `repo: &impl PostRepository`
+— is the one case derivation cannot resolve: the constant lives on the concrete
+struct, and the trait's name is not evidence of anything. Such a read is
+recorded `undetermined`, so it is reported and never gates. Take the concrete
+`Pg*` type, or declare `reads(...)`.
+
 The manifest tags these `derived`, and that tag is doing real work — it is a
-weaker claim than `declared` in two directions:
+weaker claim than `declared`:
 
 * **Incomplete.** A dependency reached through a helper function the analysis
   cannot read is missed. That is why a read it recovers nothing from is recorded
   as `undetermined` rather than as having no dependencies.
-* **Approximate.** The model is recovered from the repository *type name* by the
-  `Pg{Model}Repository` convention the macro itself generates. A repository trait
-  deliberately named against that convention — `StatsRepository` over a `Stat`
-  model — yields `Stats`, which matches nothing.
+
+It is not, however, *wrong*: every model in a derived set comes either from a
+model type named outright or from a repository's own declaration, so a derived
+dependency naming a model that does not exist — which would make a real
+violation audit clean — cannot happen.
 
 Declare `reads(...)` wherever the answer matters.
 

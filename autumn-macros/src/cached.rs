@@ -184,8 +184,16 @@ const MODEL_READ_VERBS: &[&str] = &[
 
 /// Recover the model name from a repository type name.
 ///
-/// `PgPostRepository` and `PostRepository` both name the `Post` model — the
-/// concrete struct and the trait `#[repository(Post)]` generates.
+/// `PgPostRepository` and `PostRepository` both *look like* the `Post` model —
+/// the concrete struct and the trait `#[repository(Post)]` generates.
+///
+/// This is a guess about a NAME, and the name can lie: `#[repository(Comment)]
+/// trait ModerationRepository` is supported, and there the guess says
+/// `Moderation` while the repository really writes `Comment`. It is used only
+/// to *recognise* a repository type (#1716), never to state the model a read
+/// depends on — the concrete `Pg*` path carries
+/// `__AUTUMN_MODEL_NAME`, and that is what the descriptor emits, so rustc
+/// resolves the model rather than this heuristic guessing it.
 fn model_from_repository_ident(ident: &str) -> Option<String> {
     let base = ident.strip_suffix("Repository")?;
     let base = base.strip_prefix("Pg").unwrap_or(base);
@@ -196,15 +204,45 @@ fn model_from_repository_ident(ident: &str) -> Option<String> {
     Some(base.to_string())
 }
 
+/// Whether this ident is the CONCRETE repository struct, the one
+/// `#[repository]` hangs `__AUTUMN_MODEL_NAME` on.
+///
+/// The trait of the same family (`PostRepository`) does not carry the constant,
+/// so a read bounded on the trait cannot have its model resolved here.
+fn is_concrete_repository_ident(ident: &str) -> bool {
+    ident.starts_with("Pg") && model_from_repository_ident(ident).is_some()
+}
+
 /// Whether an ident looks like a model type: `Post`, `LineItem`.
 fn is_model_ident(ident: &str) -> bool {
     ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && !ident.contains('_')
 }
 
+/// What a function was found to read, and whether anything was left unresolved.
+#[derive(Default)]
+struct DerivedDependencies {
+    /// Concrete `Pg*Repository` paths. The model comes from the repository's
+    /// own `__AUTUMN_MODEL_NAME`, so an escape-hatch name like
+    /// `#[repository(Comment)] trait ModerationRepository` resolves to
+    /// `Comment` rather than to the `Moderation` its name suggests.
+    repositories: Vec<syn::Path>,
+    /// Model types named outright in the body (`Post::find_all(db)`).
+    models: BTreeSet<String>,
+    /// A repository reached only through its TRAIT (`&impl PostRepository`),
+    /// whose model this analysis cannot resolve: the constant lives on the
+    /// concrete struct. Guessing from the trait's name is what produced a
+    /// wrong dependency — and a wrong dependency makes a real violation audit
+    /// clean — so the read is recorded `Undetermined` instead.
+    unresolved_repository: bool,
+}
+
 /// Walks a function looking for evidence of which models it reads.
 #[derive(Default)]
 struct DependencyVisitor {
-    models: BTreeSet<String>,
+    found: DerivedDependencies,
+    /// Paths already recorded, so `&PgPostRepository` mentioned twice does not
+    /// register the model twice.
+    seen_repositories: BTreeSet<String>,
 }
 
 // `VisitMut` rather than `Visit`: the workspace enables syn's `visit-mut`
@@ -214,11 +252,33 @@ struct DependencyVisitor {
 impl VisitMut for DependencyVisitor {
     fn visit_path_mut(&mut self, path: &mut syn::Path) {
         // Any repository type mentioned anywhere — a parameter type, a turbofish,
-        // an `impl PostRepository` bound — names the model it is generated for.
-        for segment in &path.segments {
-            if let Some(model) = model_from_repository_ident(&segment.ident.to_string()) {
-                self.models.insert(model);
+        // an `impl PostRepository` bound — points at the model it was generated
+        // for. Which model that is comes from the repository itself, not from
+        // its name: only the concrete `Pg*` struct carries the constant that
+        // says so.
+        for (i, segment) in path.segments.iter().enumerate() {
+            let ident = segment.ident.to_string();
+            if model_from_repository_ident(&ident).is_none() {
+                continue;
             }
+            if is_concrete_repository_ident(&ident) {
+                let mut prefix = path.clone();
+                // Keep only the segments up to the repository itself, so
+                // `PgPostRepository::find_all` yields the type, not the call.
+                prefix.segments = path.segments.iter().take(i + 1).cloned().collect();
+                // A type path spells its generics without `::`.
+                if let Some(last) = prefix.segments.last_mut()
+                    && let syn::PathArguments::AngleBracketed(args) = &mut last.arguments
+                {
+                    args.colon2_token = None;
+                }
+                if self.seen_repositories.insert(quote!(#prefix).to_string()) {
+                    self.found.repositories.push(prefix);
+                }
+            } else {
+                self.found.unresolved_repository = true;
+            }
+            break;
         }
         syn::visit_mut::visit_path_mut(self, path);
     }
@@ -234,7 +294,7 @@ impl VisitMut for DependencyVisitor {
                     && is_model_ident(&owner)
                     && model_from_repository_ident(&owner).is_none()
                 {
-                    self.models.insert(owner);
+                    self.found.models.insert(owner);
                 }
             }
         }
@@ -251,13 +311,13 @@ impl VisitMut for DependencyVisitor {
 /// as `undetermined` rather than as an empty — and therefore trivially
 /// coherent — dependency set. Declare `reads(...)` to get the strong claim.
 ///
-/// Returns the model idents, sorted and deduplicated.
-fn derive_dependencies(func: &ItemFn) -> Vec<String> {
+/// Returns the repository paths and the directly-named model idents.
+fn derive_dependencies(func: &ItemFn) -> DerivedDependencies {
     let mut visitor = DependencyVisitor::default();
     let mut scratch = func.clone();
     visitor.visit_signature_mut(&mut scratch.sig);
     visitor.visit_block_mut(&mut scratch.block);
-    visitor.models.into_iter().collect()
+    visitor.found
 }
 
 /// Name of the generated constant carrying a cached read's identity.
@@ -316,16 +376,34 @@ fn generate_coherence_items(
     // the manifest can carry, so it is never diluted by the heuristic.
     let (read_exprs, provenance) = if attrs.reads.is_empty() {
         let derived = derive_dependencies(input_fn);
-        let provenance = if derived.is_empty() {
+
+        // A repository states its own model. `#[repository(Comment)] trait
+        // ModerationRepository` is supported, and inferring `Moderation` from
+        // the type's NAME would register a model that does not exist — a
+        // `Comment` write would then intersect nothing and the audit would
+        // report clean on a read that really can go stale (#1716/#2357). The
+        // mutation side already resolves this through the same constant; this
+        // is the read side matching it, so rustc decides the model.
+        let mut exprs: Vec<TokenStream> = derived
+            .repositories
+            .iter()
+            .map(|path| quote! { <#path>::__AUTUMN_MODEL_NAME })
+            .collect();
+        // A model named outright recovers a bare ident (`Post`), not a
+        // nameable type: the model type is often not in scope at the cached
+        // function at all. The checker matches on the last path segment for
+        // exactly this reason.
+        exprs.extend(derived.models.iter().map(|m| quote! { || #m }));
+
+        // Honest over useful: a repository reached only through its trait has
+        // no constant to resolve, so the dependency set is *unknown*, not
+        // empty and not guessable. `Undetermined` is reported and never gates,
+        // which is the right answer for something this analysis cannot see.
+        let provenance = if derived.unresolved_repository || exprs.is_empty() {
             quote! { Undetermined }
         } else {
             quote! { Derived }
         };
-        // Derivation recovers a bare ident (`Post`), not a nameable type: the
-        // model type is often not in scope at the cached function at all (a
-        // `PgPostRepository` parameter does not bring `Post` with it). The
-        // checker matches on the last path segment for exactly this reason.
-        let exprs: Vec<TokenStream> = derived.iter().map(|m| quote! { || #m }).collect();
         (exprs, provenance)
     } else {
         let exprs: Vec<TokenStream> = attrs
@@ -985,6 +1063,20 @@ mod tests {
         assert!(parse_cached_args(blank).is_err());
     }
 
+    /// The repository paths a derivation found, rendered for comparison.
+    fn derived_repositories(f: &ItemFn) -> Vec<String> {
+        derive_dependencies(f)
+            .repositories
+            .iter()
+            .map(|p| quote!(#p).to_string())
+            .collect()
+    }
+
+    /// The directly-named models a derivation found.
+    fn derived_models(f: &ItemFn) -> Vec<String> {
+        derive_dependencies(f).models.into_iter().collect()
+    }
+
     #[test]
     fn derives_dependencies_from_repository_types_in_the_signature() {
         let f: ItemFn = syn::parse_quote! {
@@ -992,15 +1084,76 @@ mod tests {
                 repo.find_all().await.unwrap_or_default()
             }
         };
-        assert_eq!(derive_dependencies(&f), vec!["Post".to_string()]);
+        // The repository is recorded as a PATH, not as a guessed model name:
+        // the model comes from the repository's own `__AUTUMN_MODEL_NAME`.
+        assert_eq!(derived_repositories(&f), vec!["PgPostRepository"]);
+        assert!(derived_models(&f).is_empty());
+        assert!(!derive_dependencies(&f).unresolved_repository);
     }
 
+    /// The bug this shape used to have: the model was guessed from the type's
+    /// NAME, and `#[repository(Comment)] trait ModerationRepository` is
+    /// supported, so the guess said `Moderation` — a model that does not
+    /// exist. A `Comment` write then intersected nothing and the audit
+    /// reported clean on a read that really could go stale (#2357).
     #[test]
-    fn derives_dependencies_from_bare_repository_trait_types() {
+    fn a_repository_whose_name_differs_from_its_model_is_not_guessed_from_the_name() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn recent_comments(repo: &PgModerationRepository) -> Vec<String> {
+                repo.find_all().await.unwrap_or_default()
+            }
+        };
+        let derived = derive_dependencies(&f);
+        assert_eq!(derived_repositories(&f), vec!["PgModerationRepository"]);
+        assert!(
+            !derived.models.contains("Moderation"),
+            "the name must not become a dependency — the repository states its own model"
+        );
+
+        // And the expansion resolves it through the constant, so rustc — not
+        // this heuristic — decides which model the read depends on.
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! {
+                async fn recent_comments(repo: &PgModerationRepository) -> Vec<String> {
+                    repo.find_all().await.unwrap_or_default()
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains("< PgModerationRepository > :: __AUTUMN_MODEL_NAME"),
+            "{out}"
+        );
+        assert!(!out.contains("|| \"Moderation\""), "{out}");
+    }
+
+    /// The trait carries no `__AUTUMN_MODEL_NAME` — only the concrete `Pg*`
+    /// struct does — so the model is genuinely unknown here. Unknown must be
+    /// `Undetermined` (reported, never gating), not a guess: a guess that is
+    /// wrong turns a real violation into a clean audit.
+    #[test]
+    fn a_repository_reached_only_through_its_trait_is_undetermined() {
         let f: ItemFn = syn::parse_quote! {
             async fn feed(repo: &impl CommentRepository) -> Vec<String> { Vec::new() }
         };
-        assert_eq!(derive_dependencies(&f), vec!["Comment".to_string()]);
+        let derived = derive_dependencies(&f);
+        assert!(derived.repositories.is_empty());
+        assert!(derived.models.is_empty());
+        assert!(derived.unresolved_repository);
+
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! {
+                async fn feed(repo: &impl CommentRepository) -> Vec<String> { Vec::new() }
+            },
+        )
+        .to_string();
+        assert!(
+            out.contains("DependencyProvenance :: Undetermined"),
+            "{out}"
+        );
+        assert!(!out.contains("|| \"Comment\""), "{out}");
     }
 
     #[test]
@@ -1011,7 +1164,8 @@ mod tests {
                 Vec::new()
             }
         };
-        assert_eq!(derive_dependencies(&f), vec!["Post".to_string()]);
+        assert_eq!(derived_models(&f), vec!["Post".to_string()]);
+        assert!(derived_repositories(&f).is_empty());
     }
 
     #[test]
@@ -1023,8 +1177,33 @@ mod tests {
             }
         };
         assert_eq!(
-            derive_dependencies(&f),
-            vec!["Comment".to_string(), "Post".to_string()]
+            derived_repositories(&f),
+            vec!["PgPostRepository", "PgCommentRepository"]
+        );
+        assert_eq!(derived_models(&f), vec!["Post".to_string()]);
+    }
+
+    /// One repository named twice must not register twice.
+    #[test]
+    fn a_repository_mentioned_twice_is_recorded_once() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn feed(a: &PgPostRepository, b: &PgPostRepository) -> u8 { 0 }
+        };
+        assert_eq!(derived_repositories(&f), vec!["PgPostRepository"]);
+    }
+
+    /// A qualified path must yield the repository TYPE, not the call.
+    #[test]
+    fn a_qualified_repository_path_keeps_only_the_type_segments() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn feed(db: &mut Db) -> u8 {
+                let _ = crate::repositories::PgPostRepository::find_all(db);
+                0
+            }
+        };
+        assert_eq!(
+            derived_repositories(&f),
+            vec!["crate :: repositories :: PgPostRepository"]
         );
     }
 
@@ -1033,7 +1212,10 @@ mod tests {
         let f: ItemFn = syn::parse_quote! {
             fn double(x: i32) -> i32 { x * 2 }
         };
-        assert!(derive_dependencies(&f).is_empty());
+        let derived = derive_dependencies(&f);
+        assert!(derived.repositories.is_empty());
+        assert!(derived.models.is_empty());
+        assert!(!derived.unresolved_repository);
     }
 
     #[test]
@@ -1041,7 +1223,10 @@ mod tests {
         let f: ItemFn = syn::parse_quote! {
             fn build(cfg: &HashMap<String, String>) -> String { String::new() }
         };
-        assert!(derive_dependencies(&f).is_empty());
+        let derived = derive_dependencies(&f);
+        assert!(derived.repositories.is_empty());
+        assert!(derived.models.is_empty());
+        assert!(!derived.unresolved_repository);
     }
 
     #[test]
@@ -1084,7 +1269,12 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("Derived"), "{out}");
-        assert!(out.contains("\"Post\""), "{out}");
+        // The model is the repository's own constant, not the literal "Post"
+        // guessed from its name (#2357).
+        assert!(
+            out.contains("< PgPostRepository > :: __AUTUMN_MODEL_NAME"),
+            "{out}"
+        );
     }
 
     #[test]

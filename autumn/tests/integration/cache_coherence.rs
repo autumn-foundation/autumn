@@ -84,6 +84,28 @@ pub async fn coherence_opaque(seed: i64) -> i64 {
 #[autumn_web::repository(CoherencePost, invalidates(coherence_recent_titles))]
 pub trait CoherencePostRepository {}
 
+// ── The escape-hatch name (#2357) ────────────────────────────────────
+//
+// A repository whose trait name says nothing about its model. Deriving the
+// model from the NAME would register `CoherenceModeration`, which does not
+// exist, and a `CoherenceTag` write would then intersect nothing — the audit
+// would report clean on a read that really can go stale. The repository states
+// its own model instead.
+
+#[autumn_web::repository(CoherenceTag)]
+pub trait CoherenceModerationRepository {}
+
+/// No `reads(...)`: the dependency set is DERIVED from the repository
+/// parameter, and must come out as `CoherenceTag`.
+#[autumn_web::cached(key(tenant))]
+pub async fn coherence_moderated_labels(
+    tenant: i64,
+    repo: &PgCoherenceModerationRepository,
+) -> Vec<String> {
+    let _ = (tenant, repo);
+    Vec::new()
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Only this module's registrations: the test binary links every other
@@ -110,6 +132,61 @@ fn read_named(id: &str) -> CachedRead {
 }
 
 // ── Wiring ───────────────────────────────────────────────────────────
+
+/// The escape-hatch case (#2357): a repository whose NAME differs from its
+/// model must still register the model it actually reads.
+///
+/// The old derivation string-stripped the type name, so this read registered
+/// `CoherenceModeration` — a model nothing writes and nothing can match. The
+/// gate then had nothing to intersect and reported clean while a `CoherenceTag`
+/// write could strand the value. The read side now resolves the model through
+/// the repository's own `__AUTUMN_MODEL_NAME`, exactly as the mutation side
+/// does, so rustc decides it.
+#[test]
+fn a_derived_dependency_comes_from_the_repositorys_model_not_its_name() {
+    let read = read_named("coherence_moderated_labels");
+    assert_eq!(read.provenance, DependencyProvenance::Derived);
+
+    let models: Vec<&str> = read.reads.iter().map(|m| model_key(m)).collect();
+    assert_eq!(
+        models,
+        vec!["CoherenceTag"],
+        "the model must come from the repository, not from its name"
+    );
+    assert!(
+        !models.iter().any(|m| m.contains("Moderation")),
+        "a name-derived model would be a dependency that does not exist: {models:?}"
+    );
+}
+
+/// And the gate must actually fire on it — a dependency set that is right but
+/// unreachable by `check` would be no better than the wrong one.
+#[test]
+fn the_gate_catches_a_write_to_an_escape_hatch_named_repositorys_model() {
+    let read = read_named("coherence_moderated_labels");
+    let mutations: Vec<Mutation> = coherence::registered_mutations()
+        .into_iter()
+        .filter(|m| m.repository == "CoherenceModerationRepository")
+        .collect();
+    assert!(
+        !mutations.is_empty(),
+        "the repository must register its writes"
+    );
+
+    let findings = coherence::check(std::slice::from_ref(&read), &mutations);
+    assert!(
+        !findings.is_empty(),
+        "a CoherenceTag write with no invalidation must be caught: {findings:?}"
+    );
+    // `model` is the fully-qualified `type_name`; `model_key` is what the
+    // checker itself compares on.
+    assert!(
+        findings
+            .iter()
+            .all(|f| model_key(&f.model) == "CoherenceTag"),
+        "every finding must be about the model the repository declares: {findings:?}"
+    );
+}
 
 #[test]
 fn cached_reads_register_their_declared_dependency_set() {
