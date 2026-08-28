@@ -9,7 +9,7 @@
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
 //!
-//! Four cases are deliberately **not** injected into, so "the layer is
+//! Five cases are deliberately **not** injected into, so "the layer is
 //! registered" is not the same as "every page prompts":
 //!
 //! 1. an htmx *fragment* response, which has no `</body>` to splice before and
@@ -20,17 +20,20 @@
 //!    decoding it first — see [`is_html_response`]. Whether this happens is
 //!    decided by layer order: injection sees plain HTML only if it runs
 //!    *inside* the compression layer;
-//! 4. a body over [`MAX_SPLICE_BODY_BYTES`].
+//! 4. a `206 Partial Content` body (or any response carrying `Content-Range`),
+//!    whose bytes are a slice of a larger representation that `Content-Range`
+//!    describes — splicing would corrupt the range;
+//! 5. a body over [`MAX_SPLICE_BODY_BYTES`].
 //!
-//! All four still get `Vary: Cookie`, because the representation depends on the
+//! All five still get `Vary: Cookie`, because the representation depends on the
 //! consent cookie whether or not anything was injected. Each is documented on
 //! [`inject_consent_banner`] and summarized for app authors in
 //! `docs/guide/cookie-consent.md`.
 
 use axum::body::{Body, Bytes};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, SET_COOKIE, VARY,
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
 };
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
@@ -299,14 +302,13 @@ pub async fn inject_consent_banner(
     // so its conditional requests could never return `304` again and it would
     // refetch full bodies forever.
     //
-    // A boosted (`hx-boost`) navigation is the exception `Accept` alone gets
-    // wrong: htmx issues it over XHR without setting `Accept`, so it arrives
-    // with the XHR default `*/*` — which this deliberately does not treat as
-    // HTML. But the guard above already (correctly) declines to skip a boosted
-    // request, so it IS a document this middleware will inject into. Leaving
-    // its validators intact would let an inner `EtagLayer` answer `304` with
-    // no body to inject, so a policy bump or a withdrawal could leave the
-    // visitor unprompted for as long as their cache stays fresh.
+    // htmx requests are the exception `Accept` alone gets wrong: they go over
+    // XHR without setting `Accept`, so they arrive with the XHR default `*/*`,
+    // which this deliberately does not treat as HTML. Any of them may still be
+    // a whole-document swap (see `could_render_a_banner`). Leaving their
+    // validators intact would let an inner `EtagLayer` answer `304` with no
+    // body to inject, so a policy bump or a withdrawal could leave the visitor
+    // unprompted for as long as their cache stays fresh.
     if needs_prompt && could_render_a_banner(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
@@ -315,6 +317,25 @@ pub async fn inject_consent_banner(
     let mut response = next.run(request).await;
 
     if !is_html_content_type(&response) {
+        return response;
+    }
+
+    // A `206 Partial Content` body is a byte slice of a larger representation,
+    // and `Content-Range` states which bytes. Splicing would insert markup into
+    // the middle of that range and rewrite `Content-Length` while leaving
+    // `Content-Range` describing the original — so a range cache or a resuming
+    // download would reassemble a corrupted document. The selected bytes can
+    // easily satisfy the document test too, since a first range of an HTML file
+    // begins exactly like one.
+    //
+    // Checked by header as well as status: a proxy or a handler can attach
+    // `Content-Range` without the canonical status.
+    if response.status() == axum::http::StatusCode::PARTIAL_CONTENT
+        || response.headers().contains_key(CONTENT_RANGE)
+    {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
         return response;
     }
 
@@ -2037,6 +2058,65 @@ mod tests {
         // `*/*` remains deliberately excluded: the XHR default must not count
         // as a browser navigation. See `a_plain_xhr_json_client_...`.
         assert!(!accept("*/*"));
+    }
+
+    /// A `206` body is a slice of a larger document, and `Content-Range` says
+    /// which bytes. Splicing would insert markup into that slice and rewrite
+    /// `Content-Length` while `Content-Range` still described the original, so
+    /// a range cache or a resumed download would reassemble something corrupt.
+    ///
+    /// The trap is that a first range of an HTML file passes the document test
+    /// perfectly well — it opens `<!doctype html>` — so nothing further down
+    /// would have caught it.
+    #[tokio::test]
+    async fn a_ranged_response_is_never_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/page.html",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::PARTIAL_CONTENT,
+                        [
+                            (CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (CONTENT_RANGE, "bytes 0-31/512"),
+                        ],
+                        "<!doctype html><html><body>part",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/page.html")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .header(axum::http::header::RANGE, "bytes=0-31")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .any(|v| v.as_bytes().eq_ignore_ascii_case(b"Cookie")),
+            "a ranged HTML response still varies on the consent cookie"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            rendered, "<!doctype html><html><body>part",
+            "the advertised byte range must be served byte-for-byte"
+        );
     }
 
     /// A pre-rendered `HEAD` hit arrives here already bodyless, and no Axum

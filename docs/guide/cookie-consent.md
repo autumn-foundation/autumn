@@ -114,7 +114,7 @@ response and, when the visitor needs prompting, inserts the banner right before
 `</body>` — with no per-handler wiring and no change to your `layout()`
 signature.
 
-**It deliberately does not inject in four cases**, so do not treat "the layer
+**It deliberately does not inject in five cases**, so do not treat "the layer
 is registered" as "every page prompts":
 
 | Case | Why | Consequence |
@@ -122,6 +122,7 @@ is registered" as "every page prompts":
 | A **fragment** response — one whose body neither contains `</body>` nor opens as a document (`<!doctype`/`<html`) | appending to it would swap a second banner in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
 | A **static cache hit** with CSRF enforced and no token available | on a pre-rendered `#[static_get]` page `CsrfLayer` never runs, so the banner's buttons would `403` | that visitor is unprompted on that page, and prompted on the first dynamic route they reach |
 | An **encoded** response (`Content-Encoding` present) | the body would have to be decompressed before it could be spliced | the page is served unmodified. See below — this one is under your control |
+| A **ranged** response — `206 Partial Content`, or any `Content-Range` | the body is a slice of a larger document; inserting markup would make it stop matching the range its headers advertise | the range is served unmodified, so caches and resumed downloads stay correct |
 | A response body over 2 MiB | splicing would mean buffering arbitrarily more | the page is served unmodified |
 
 Note that the fragment test is made on the **response body**, not on request

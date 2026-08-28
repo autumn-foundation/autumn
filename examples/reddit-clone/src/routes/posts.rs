@@ -381,16 +381,23 @@ pub async fn submit_form(
     seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let subs = all_subreddits(&mut db).await?;
 
     // A blank changeset: the same type the POST handler re-renders on failure,
-    // so `new` and `invalid` are one code path with one set of markup. The GET
-    // route has no submitted body to capture a token from, so it passes
-    // `csrf.token()` explicitly — see docs/guide/forms.md.
-    let blank = ChangesetForm::blank(SubmitPostForm::default(), csrf.token());
+    // so `new` and `invalid` are one code path with one set of markup.
+    //
+    // A GET route has no submitted body, so it must supply BOTH halves the
+    // extractor would otherwise have captured: the token, and the field name to
+    // put it under. `blank` hardcodes `_csrf`, while `CsrfLayer` scans for the
+    // CONFIGURED name — so without `with_csrf_field` this form 403s on its
+    // first submit in any app that set `security.csrf.form_field`. See
+    // docs/guide/forms.md.
+    let blank = ChangesetForm::blank(SubmitPostForm::default(), csrf.token())
+        .with_csrf_field(csrf_field.0.clone());
 
     Ok(layout_with_seo(
         seo,
@@ -407,6 +414,7 @@ pub async fn submit_to_sub_form(
     Path(slug): Path<String>,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -418,13 +426,15 @@ pub async fn submit_to_sub_form(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("r/{slug} not found")))?;
 
+    // `with_csrf_field` for the same reason as the global submit form above.
     let blank = ChangesetForm::blank(
         SubmitPostForm {
             subreddit_id: sub.id.to_string(),
             ..SubmitPostForm::default()
         },
         csrf.token(),
-    );
+    )
+    .with_csrf_field(csrf_field.0.clone());
 
     Ok(layout(
         &format!("Submit to r/{}", sub.name),
@@ -1202,6 +1212,7 @@ pub async fn edit_form(
     State(state): State<AppState>,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -1209,6 +1220,7 @@ pub async fn edit_form(
     let post =
         load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
+    // `with_csrf_field` for the same reason as the submit forms above.
     let existing = ChangesetForm::blank(
         EditPostForm {
             title: post.title.clone(),
@@ -1219,7 +1231,8 @@ pub async fn edit_form(
             body: post.body.clone(),
         },
         csrf.token(),
-    );
+    )
+    .with_csrf_field(csrf_field.0.clone());
 
     Ok(layout(
         &format!("Edit: {}", post.title),
