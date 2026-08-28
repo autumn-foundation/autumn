@@ -336,6 +336,30 @@ pub fn check(reads: &[CachedRead], mutations: &[Mutation]) -> Vec<StalenessFindi
     findings
 }
 
+/// Cache-read identities claimed by more than one registration.
+///
+/// An identity is `module_path!()::<fn name>`, which two `#[cached]` associated
+/// functions with the same name in two `impl` blocks in one module both
+/// produce — as do a `declare_cached_read!` id chosen to collide with one. The
+/// consequences are real: `invalidates(...)` cannot say which read it means,
+/// and the two share a namespace at runtime. Invalidation clears every store
+/// registered under the identity, so nothing is silently left stale, but the
+/// ambiguity still deserves a name.
+///
+/// Returns the offending ids, sorted and deduplicated.
+#[must_use]
+pub fn duplicate_read_ids(reads: &[CachedRead]) -> Vec<String> {
+    let mut ids: Vec<&str> = reads.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    let mut duplicates: Vec<String> = ids
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0].to_string())
+        .collect();
+    duplicates.dedup();
+    duplicates
+}
+
 /// Every cached read whose dependency set could not be established.
 ///
 /// These gate nothing by default — see the module docs — but a green audit that
@@ -558,6 +582,11 @@ pub struct CoherenceManifest {
     pub violations: Vec<StalenessFinding>,
     /// Reads whose dependency set could not be established.
     pub undetermined_reads: Vec<UndeterminedRead>,
+    /// Identities claimed by more than one cached read — see
+    /// [`duplicate_read_ids`]. An `invalidates(...)` edge cannot distinguish
+    /// them.
+    #[serde(default)]
+    pub duplicate_read_ids: Vec<String>,
     /// Dimensions deliberately not emitted, and why.
     pub excluded: Vec<ExcludedDimension>,
 }
@@ -575,6 +604,7 @@ impl CoherenceManifest {
             },
             violations: check(reads, mutations),
             undetermined_reads: undetermined_dimension(reads),
+            duplicate_read_ids: duplicate_read_ids(reads),
             excluded: excluded_dimensions(),
         }
     }
@@ -859,11 +889,12 @@ macro_rules! declare_cached_read {
         reads = [$first:path $(, $rest:path)* $(,)?],
         acknowledge_stale = $reason:literal $(,)?
     ) => {
-        // Same rule the attribute macros enforce: an escape hatch without a
-        // justification is the one nobody can review.
+        // Same rule the attribute macros enforce, and the same BLANK test:
+        // an escape hatch whose justification is three spaces is the one nobody
+        // can review.
         const _: () = assert!(
-            !$reason.is_empty(),
-            "acknowledge_stale requires a non-empty reason",
+            !$crate::cache::coherence::reason_is_blank($reason),
+            "acknowledge_stale requires a non-blank reason",
         );
         $crate::declare_cached_read!(
             id = $id,
@@ -893,31 +924,100 @@ macro_rules! declare_cached_read {
     };
 }
 
+/// Whether an acknowledged-stale reason is blank.
+///
+/// `str::trim` is not `const`, so this walks the bytes: `declare_cached_read!`
+/// needs the check in a `const _: () = assert!(…)`, and the rule has to be the
+/// same one `#[cached]` and `#[repository]` enforce at parse time, or the
+/// weakest of the three declaration forms silently becomes the way to get a
+/// free pass.
+#[must_use]
+pub const fn reason_is_blank(reason: &str) -> bool {
+    let bytes = reason.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_whitespace() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 // ── Namespace invalidation ───────────────────────────────────────────
 
-/// Per-function cache stores, keyed by the read's cache-key namespace.
+/// What one cache-key namespace owns: the dedicated stores registered under it,
+/// and the epoch that fences an in-flight fill.
+#[derive(Default)]
+struct Namespace {
+    /// Every store registered under this namespace.
+    ///
+    /// A `Vec`, not a single store: two `#[cached]` associated functions with
+    /// the same name in two `impl` blocks in one module produce the same
+    /// `module_path!()`-derived identity, and overwriting would leave one of
+    /// them stale while reporting success. Clearing all of them
+    /// over-invalidates, which is safe; the audit reports the shared identity
+    /// so the ambiguity gets a name (see [`duplicate_read_ids`]).
+    stores: Vec<std::sync::Arc<dyn super::Cache>>,
+    /// Bumped by every [`invalidate_namespace`]. A fill that started before the
+    /// bump and finishes after it must not write its now-stale value back.
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Per-namespace cache state, keyed by the read's cache-key namespace.
 ///
 /// A `#[cached]` function's dedicated Moka store holds **only** that function's
 /// entries, so clearing it *is* namespace invalidation — no key enumeration
 /// required. The store registers itself here the first time the function runs,
 /// which is what lets the generated `__autumn_cache_invalidate__<fn>()` reach a
 /// store that lives inside the function body.
-static NAMESPACE_STORES: std::sync::RwLock<
-    Option<std::collections::HashMap<&'static str, std::sync::Arc<dyn super::Cache>>>,
-> = std::sync::RwLock::new(None);
+static NAMESPACES: std::sync::RwLock<Option<std::collections::HashMap<&'static str, Namespace>>> =
+    std::sync::RwLock::new(None);
 
 /// Register a cached read's dedicated store so [`invalidate_namespace`] can
-/// reach it. Called from `#[cached]`-generated code on first use.
+/// reach it, and take the namespace's fill fence.
+///
+/// Returns the epoch counter the caller must sample **before** computing a value
+/// and re-check **before** inserting it. Without that fence a fill already in
+/// flight when the invalidation lands writes its stale value back afterwards,
+/// and the invalidator has already reported success. `#[cached]`-generated code
+/// does this automatically; a hand-written cache that registers here should do
+/// the same, or accept that window.
 ///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
-pub fn register_namespace_store(namespace: &'static str, store: std::sync::Arc<dyn super::Cache>) {
-    NAMESPACE_STORES
+pub fn register_namespace_store(
+    namespace: &'static str,
+    store: std::sync::Arc<dyn super::Cache>,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let mut guard = NAMESPACES
         .write()
-        .expect("cache namespace store lock poisoned")
+        .expect("cache namespace store lock poisoned");
+    let entry = guard
         .get_or_insert_with(std::collections::HashMap::new)
-        .insert(namespace, store);
+        .entry(namespace)
+        .or_default();
+    entry.stores.push(store);
+    let epoch = std::sync::Arc::clone(&entry.epoch);
+    // Explicit, so the process-wide write lock is never held across the return.
+    drop(guard);
+    epoch
+}
+
+/// Whether a value computed while the namespace was at `sampled` is still safe
+/// to insert.
+///
+/// `false` means an invalidation landed mid-fill, so the value in hand is
+/// already stale and inserting it would resurrect exactly what was just
+/// dropped.
+///
+/// # Panics
+///
+/// Panics if the internal `RwLock` is poisoned.
+#[must_use]
+pub fn fill_is_still_current(epoch: &std::sync::atomic::AtomicU64, sampled: u64) -> bool {
+    epoch.load(std::sync::atomic::Ordering::Acquire) == sampled
 }
 
 /// Drop every entry belonging to one cached read.
@@ -928,37 +1028,72 @@ pub fn register_namespace_store(namespace: &'static str, store: std::sync::Arc<d
 /// namespace too — which is where the value actually lives once one is
 /// configured.
 ///
-/// Returns whether the invalidation was **complete**. It is complete when there
-/// is no shared backend, or when the shared backend could drop the namespace
-/// ([`MokaCache`](super::MokaCache) by iteration, `RedisCache` by `SCAN
-/// MATCH`). A custom [`Cache`](super::Cache) implementation that cannot
-/// pattern-match its key space returns `false` from
-/// [`Cache::invalidate_namespace`](super::Cache::invalidate_namespace), and that
-/// `false` is reported here verbatim — the honest signal that a
-/// backend-specific mechanism is needed.
+/// Returns whether the invalidation was **complete**, which means exactly this:
+/// every entry the namespace held is gone, and no fill this process already had
+/// in flight can put a stale one back.
+///
+/// It is `false` when a registered process-level backend could not drop the
+/// namespace — a `RedisCache` whose `SCAN`/`DEL` errored, or a custom
+/// [`Cache`](super::Cache) that cannot pattern-match its key space and so
+/// returns `false` from
+/// [`Cache::invalidate_namespace`](super::Cache::invalidate_namespace). That
+/// `false` is reported here verbatim: the honest signal that stale entries may
+/// still be served.
+///
+/// # What it reaches, and what it does not
+///
+/// It clears every store registered for `namespace` via
+/// [`register_namespace_store`] — which `#[cached]` does for you on first call —
+/// and asks the process-level backend
+/// ([`set_global_cache`](super::set_global_cache)) to drop the namespace.
+///
+/// It cannot reach a cache nobody registered. A `declare_cached_read!` entry
+/// over a caller-owned store — `cache_fragment(Some(&my_cache), …)`,
+/// `get_or_compute(&my_cache, …)` — is invisible here, and this returns `true`
+/// having cleared nothing, because "no store registered" is indistinguishable
+/// from "the function has not run yet". Register such a store to close that
+/// gap.
+///
+/// The fill fence is **per process**. Another replica's in-flight fill, started
+/// before this invalidation and finishing after it, can still write a stale
+/// value into a shared backend; a `true` here does not speak for other
+/// replicas.
 ///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn invalidate_namespace(namespace: &str) -> bool {
-    // Clone the handle out and DROP the guard before calling into the backend.
+    // Bump the epoch FIRST, so a fill already computing is fenced out before
+    // anything is cleared — the other order leaves a window where a fill both
+    // passes the fence and lands after the clear.
+    //
+    // Clone the handles out and DROP the guard before calling into any backend.
     // `register_namespace_store` is public and `Cache` is user-implementable, so
     // a `clear()` that happens to call a `#[cached]` function would otherwise
     // re-enter this non-reentrant `RwLock` and deadlock.
-    let dedicated = NAMESPACE_STORES
-        .read()
-        .expect("cache namespace store lock poisoned")
-        .as_ref()
-        .and_then(|map| map.get(namespace).cloned());
-    if let Some(store) = dedicated {
+    let dedicated: Vec<std::sync::Arc<dyn super::Cache>> = {
+        let guard = NAMESPACES
+            .read()
+            .expect("cache namespace store lock poisoned");
+        guard
+            .as_ref()
+            .and_then(|map| map.get(namespace))
+            .map_or_else(Vec::new, |entry| {
+                entry
+                    .epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                entry.stores.clone()
+            })
+    };
+    for store in dedicated {
         store.clear();
     }
 
-    // The dedicated store is only half the story: once a process-level backend
+    // The dedicated stores are only half the story: once a process-level backend
     // is registered, that is where the value actually lives, and the per-
     // function store holds nothing. Ask the backend — `MokaCache` and
-    // `RedisCache` both drop the namespace; a backend that cannot says so, and
-    // that `false` is what the caller reports.
+    // `RedisCache` both drop the namespace; a backend that cannot, or one whose
+    // sweep failed, says so, and that `false` is what the caller reports.
     super::global_cache().is_none_or(|global| global.invalidate_namespace(namespace))
 }
 
@@ -1564,6 +1699,143 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::super::set_global_cache(std::sync::Arc::new(OpaqueBackend));
         assert!(!invalidate_namespace("tests::opaque_ns"));
+        super::super::clear_global_cache();
+    }
+
+    // ── Codex round 1 ────────────────────────────────────────────────
+
+    #[test]
+    fn a_blank_acknowledgement_reason_is_blank_by_the_same_rule_everywhere() {
+        // `declare_cached_read!` asserts on this in a const context, and it has
+        // to agree with the `trim().is_empty()` the attribute macros apply — or
+        // the weakest declaration form becomes the way to get a free pass.
+        assert!(reason_is_blank(""));
+        assert!(reason_is_blank("   "));
+        assert!(reason_is_blank("\t\n "));
+        assert!(!reason_is_blank("5s lag is fine"));
+        assert!(!reason_is_blank("  x  "));
+    }
+
+    #[test]
+    fn an_identity_claimed_twice_is_reported() {
+        let reads = vec![
+            read("app::Stats::count", &["Post"]),
+            read("app::Stats::count", &["Post"]),
+            read("app::views::feed", &["Post"]),
+        ];
+        assert_eq!(duplicate_read_ids(&reads), vec!["app::Stats::count"]);
+        assert!(
+            CoherenceManifest::build(&reads, &[])
+                .duplicate_read_ids
+                .contains(&"app::Stats::count".to_string())
+        );
+    }
+
+    #[test]
+    fn distinct_identities_are_not_reported_as_duplicates() {
+        let reads = vec![read("a", &["Post"]), read("b", &["Post"])];
+        assert!(duplicate_read_ids(&reads).is_empty());
+        assert!(
+            CoherenceManifest::build(&reads, &[])
+                .duplicate_read_ids
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn every_store_sharing_a_namespace_is_cleared() {
+        // Two `#[cached]` associated functions with the same name in one module
+        // register under the same identity. Overwriting the registration would
+        // leave one of them stale while reporting success.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+
+        let first = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        let second = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        register_namespace_store("tests::shared_identity", first.clone());
+        register_namespace_store("tests::shared_identity", second.clone());
+        super::super::insert(&*first, "tests::shared_identity:1", 1_i32);
+        super::super::insert(&*second, "tests::shared_identity:2", 2_i32);
+
+        assert!(invalidate_namespace("tests::shared_identity"));
+
+        assert_eq!(
+            super::super::get::<i32>(&*first, "tests::shared_identity:1"),
+            None
+        );
+        assert_eq!(
+            super::super::get::<i32>(&*second, "tests::shared_identity:2"),
+            None,
+            "the second registration must not be left stale"
+        );
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn an_invalidation_fences_a_fill_that_was_already_in_flight() {
+        // The race: a miss starts computing, a write commits and invalidates,
+        // then the in-flight fill lands and resurrects the value that was just
+        // dropped. The epoch is what makes the invalidator's `true` true.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+
+        let store = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        let epoch = register_namespace_store("tests::fenced_ns", store.clone());
+
+        // A fill samples the epoch before computing...
+        let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+        assert!(fill_is_still_current(&epoch, sampled));
+
+        // ...a write invalidates while it is still computing...
+        assert!(invalidate_namespace("tests::fenced_ns"));
+
+        // ...so the fill must not write its now-stale value back.
+        assert!(
+            !fill_is_still_current(&epoch, sampled),
+            "an in-flight fill must be fenced out by the invalidation"
+        );
+
+        // A fill that starts after the invalidation is fine again.
+        let after = epoch.load(std::sync::atomic::Ordering::Acquire);
+        assert!(fill_is_still_current(&epoch, after));
+    }
+
+    #[test]
+    fn a_backend_whose_sweep_failed_reports_an_incomplete_invalidation() {
+        // A `RedisCache` whose SCAN or DEL errored returns `false` rather than
+        // a silent "done"; the caller is using this bool to decide whether
+        // stale data may still be served.
+        struct FailingSweep;
+        impl super::super::Cache for FailingSweep {
+            fn get_value(
+                &self,
+                _key: &str,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                None
+            }
+            fn insert_value(
+                &self,
+                _key: &str,
+                _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            ) {
+            }
+            fn invalidate(&self, _key: &str) {}
+            fn clear(&self) {}
+            fn invalidate_namespace(&self, _namespace: &str) -> bool {
+                false
+            }
+        }
+
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(FailingSweep));
+        assert!(!invalidate_namespace("tests::failed_sweep_ns"));
         super::super::clear_global_cache();
     }
 

@@ -235,32 +235,49 @@ impl RedisCache {
     ///
     /// Shared by [`Cache::clear`] and [`Cache::invalidate_namespace`], which
     /// differ only in how many segments of the key they pin.
-    fn scan_and_delete(&self, pattern: &str) {
+    ///
+    /// Returns whether the whole sweep succeeded. A `SCAN` error used to
+    /// degrade into "cursor 0, no keys" — indistinguishable from a finished
+    /// sweep — and a `DEL` error was dropped on the floor. That was survivable
+    /// while the only caller returned `()`; it is not survivable for
+    /// [`Cache::invalidate_namespace`], whose `bool` tells a caller whether
+    /// stale data may still be served. An error stops the walk and reports
+    /// `false`: a partial sweep is not a complete one.
+    fn scan_and_delete(&self, pattern: &str) -> bool {
         let pattern = pattern.to_owned();
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut cursor: u64 = 0;
                 loop {
-                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    let scanned: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
                         .arg(cursor)
                         .arg("MATCH")
                         .arg(&pattern)
                         .arg("COUNT")
                         .arg(100u32)
                         .query_async(&mut conn)
-                        .await
-                        .unwrap_or((0, vec![]));
-                    if !keys.is_empty() {
-                        let _: Result<(), _> = conn.del(keys).await;
+                        .await;
+                    let (next_cursor, keys) = match scanned {
+                        Ok(page) => page,
+                        Err(e) => {
+                            debug!(pattern, error = %e, "RedisCache: SCAN failed");
+                            return false;
+                        }
+                    };
+                    if !keys.is_empty()
+                        && let Err(e) = conn.del::<_, ()>(keys).await
+                    {
+                        debug!(pattern, error = %e, "RedisCache: DEL failed");
+                        return false;
                     }
                     cursor = next_cursor;
                     if cursor == 0 {
-                        break;
+                        return true;
                     }
                 }
-            });
-        });
+            })
+        })
     }
 }
 
@@ -350,18 +367,32 @@ impl Cache for RedisCache {
         // `namespace` is escaped for the same reason `key_prefix` is: it comes
         // from `module_path!()`, but an unescaped `*` or `[` anywhere in a
         // MATCH pattern would widen the sweep beyond the namespace it names.
-        self.scan_and_delete(&format!(
+        //
+        // The sweep's success is the return value, not a side note: the caller
+        // uses it to decide whether stale data may still be served, so a Redis
+        // error must surface as `false` rather than as a silent "done".
+        let swept = self.scan_and_delete(&format!(
             "{}:{}:*",
             escape_redis_glob(&self.key_prefix),
             escape_redis_glob(namespace)
         ));
-        true
+        if !swept {
+            debug!(
+                namespace,
+                "RedisCache: namespace sweep failed, reporting incomplete"
+            );
+        }
+        swept
     }
 
     fn clear(&self) {
         // Use SCAN instead of KEYS to avoid blocking the Redis server on large
         // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
-        self.scan_and_delete(&format!("{}:*", escape_redis_glob(&self.key_prefix)));
+        //
+        // `clear` returns `()`, so a failure has nowhere to go and is logged by
+        // the sweep rather than reported — unchanged from before namespace
+        // invalidation existed.
+        let _ = self.scan_and_delete(&format!("{}:*", escape_redis_glob(&self.key_prefix)));
     }
 
     /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are

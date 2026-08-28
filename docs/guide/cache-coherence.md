@@ -260,6 +260,25 @@ A call site that does **not** declare itself is invisible to the gate. A clean
 audit says nothing about it, which is why `undeclared_cache_call_sites` is named
 in the manifest's `excluded` list.
 
+**Declaring a read does not make it invalidatable.** `#[cached]` registers its
+own store, so `invalidate_namespace` reaches it. A manually declared read over a
+cache *you* own — `cache_fragment(Some(&my_cache), …)`,
+`get_or_compute(&my_cache, …)` — is not registered anywhere, so
+`invalidate_namespace(id)` clears nothing and still returns `true`: "no store
+registered" is indistinguishable from "the function has not run yet". Register
+it once, at startup, to close that:
+
+```rust
+autumn_web::cache::coherence::register_namespace_store(
+    "blog::routes::sidebar_fragment",
+    my_cache.clone(),
+);
+```
+
+It returns the namespace's fill epoch. Sample it before computing a value and
+re-check it before inserting — `#[cached]` does this for you — or a fill already
+in flight when an invalidation lands will write its stale value back afterwards.
+
 Because a manual declaration has no `#[cached]` function to hang an identity
 constant on, `invalidates(...)` cannot name it; today such a read is covered by
 `acknowledge_stale`, or by keeping it out of the mutated model's blast radius.
@@ -396,13 +415,17 @@ tell "we checked and it was fine" from "we never looked".
   called on the write path is the `invalidations` dimension's `runtime_caveat`;
   wiring it automatically through repository commit hooks is the next slice.
 * **Complete invalidation under an opaque backend.** Namespace invalidation
-  clears the read's own per-function store *and* asks the registered backend to
-  drop the namespace — `MokaCache` by iteration, `RedisCache` by a `SCAN MATCH`
-  one segment narrower than its `clear`. A custom `Cache` implementation that
-  cannot pattern-match its key space returns `false` from
+  clears every store registered for the read *and* asks the registered backend
+  to drop the namespace — `MokaCache` by iteration, `RedisCache` by a `SCAN
+  MATCH` one segment narrower than its `clear`. A backend that cannot
+  pattern-match its key space, or whose sweep errored, returns `false` from
   `Cache::invalidate_namespace`, and `invalidate_declared_caches()` reports that
   `false` verbatim rather than letting you believe the value is gone. It is
   `#[must_use]` for exactly that reason.
+* **A fill in flight on another replica.** The epoch fence stops a fill *this
+  process* started before an invalidation from writing its stale value back
+  after it. It cannot speak for another replica's in-flight fill into a shared
+  backend, so a `true` is a claim about this process, not the fleet.
 * **Which writes exist.** Only `#[repository]` write methods are in the mutated
   set. A hand-rolled repository, a raw diesel `update`/`insert`/`delete`, a
   migration, or a job that writes directly is invisible to the gate — so a

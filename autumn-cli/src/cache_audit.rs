@@ -52,11 +52,42 @@ pub fn format_report(manifest: &CoherenceManifest, strict: bool) -> String {
             strict,
         ));
     }
+    if !manifest.duplicate_read_ids.is_empty() {
+        out.push('\n');
+        out.push_str(&format_duplicate_diagnostic(&manifest.duplicate_read_ids));
+    }
     let acknowledged = format_acknowledged_report(manifest);
     if !acknowledged.is_empty() {
         out.push('\n');
         out.push_str(&acknowledged);
     }
+    out
+}
+
+/// Diagnostic for identities claimed by more than one cached read.
+///
+/// A warning, not a failure: invalidation clears every store registered under
+/// the identity, so nothing is silently left stale. But an `invalidates(...)`
+/// edge cannot say which of them it means, so the ambiguity gets named.
+#[must_use]
+pub fn format_duplicate_diagnostic(ids: &[String]) -> String {
+    let mut out = format!(
+        "warning: {} cache-read {} claimed by more than one registration\n",
+        ids.len(),
+        if ids.len() == 1 {
+            "identity is"
+        } else {
+            "identities are"
+        },
+    );
+    for id in ids {
+        out.push_str(&format!("  {id}\n"));
+    }
+    out.push_str(
+        "  an invalidates(...) edge cannot distinguish them, and they share a runtime \
+         namespace.\n  fix: rename one of the cached functions, or give the \
+         declare_cached_read! entry its own id.\n",
+    );
     out
 }
 

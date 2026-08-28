@@ -497,22 +497,32 @@ fn generate_cache_body(
         // per-function static, but a clone is handed to the coherence registry
         // on first use so the generated invalidator can reach — and clear — a
         // store that lives inside this function body.
-        static __AUTUMN_CACHE: ::std::sync::OnceLock<
-            ::std::sync::Arc<::autumn_web::cache::MokaCache>
-        > = ::std::sync::OnceLock::new();
+        static __AUTUMN_CACHE: ::std::sync::OnceLock<(
+            ::std::sync::Arc<::autumn_web::cache::MokaCache>,
+            ::std::sync::Arc<::std::sync::atomic::AtomicU64>,
+        )> = ::std::sync::OnceLock::new();
         // Evaluate TTL once; Duration is Copy so it can be used for both
         // the Moka initializer and the Redis insert call.
         let __autumn_ttl: ::std::option::Option<::std::time::Duration> = #ttl_expr;
-        let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
+        let (__autumn_moka, __autumn_epoch_cell) = __AUTUMN_CACHE.get_or_init(|| {
             let __autumn_store = ::std::sync::Arc::new(
                 ::autumn_web::cache::MokaCache::new(#max_expr, __autumn_ttl)
             );
-            ::autumn_web::cache::coherence::register_namespace_store(
+            let __autumn_epoch = ::autumn_web::cache::coherence::register_namespace_store(
                 #id_expr,
                 ::std::clone::Clone::clone(&__autumn_store) as ::std::sync::Arc<dyn ::autumn_web::cache::Cache>,
             );
-            __autumn_store
+            (__autumn_store, __autumn_epoch)
         });
+        // Sampled BEFORE the lookup, so it covers the whole miss-and-fill
+        // window: an invalidation landing while this call computes bumps the
+        // epoch, and the insert below is skipped rather than resurrecting the
+        // value that was just dropped.
+        let __autumn_epoch_at_entry =
+            ::std::sync::atomic::AtomicU64::load(
+                __autumn_epoch_cell,
+                ::std::sync::atomic::Ordering::Acquire,
+            );
         // Use the process-level shared backend when registered, otherwise fall
         // back to the per-function Moka store so zero-config local dev still works.
         let __autumn_global = ::autumn_web::cache::global_cache();
@@ -532,7 +542,11 @@ fn generate_cache_body(
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl);
+                    if ::autumn_web::cache::coherence::fill_is_still_current(
+                        __autumn_epoch_cell, __autumn_epoch_at_entry,
+                    ) {
+                        ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl);
+                    }
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -545,7 +559,11 @@ fn generate_cache_body(
                 return __autumn_cached;
             }
             let __autumn_result = #compute;
-            ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl);
+            if ::autumn_web::cache::coherence::fill_is_still_current(
+                __autumn_epoch_cell, __autumn_epoch_at_entry,
+            ) {
+                ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl);
+            }
             __autumn_result
         }
     }
@@ -849,6 +867,38 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("(a , b) . clone ()"), "{out}");
+    }
+
+    #[test]
+    fn the_expansion_fences_a_fill_against_a_concurrent_invalidation() {
+        // The epoch is sampled before the lookup and re-checked before the
+        // insert, so a miss that computes across an invalidation cannot
+        // resurrect the value that was just dropped.
+        let out =
+            cached_macro(TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }).to_string();
+        assert!(out.contains("__autumn_epoch_at_entry"), "{out}");
+        assert!(
+            out.contains("fill_is_still_current (__autumn_epoch_cell , __autumn_epoch_at_entry ,)"),
+            "the insert must be gated on the fence: {out}"
+        );
+        // Sampled before the hit path, so it covers the whole miss-and-fill
+        // window rather than only the compute.
+        let sample = out.find("__autumn_epoch_at_entry =").expect("sampled");
+        let lookup = out.find("get_cached").expect("lookup");
+        assert!(
+            sample < lookup,
+            "the epoch must be sampled before the lookup"
+        );
+    }
+
+    #[test]
+    fn result_mode_fences_its_insert_too() {
+        let out = cached_macro(
+            quote! { result },
+            quote! { async fn recent() -> Result<u8, Error> { Ok(0) } },
+        )
+        .to_string();
+        assert!(out.contains("fill_is_still_current"), "{out}");
     }
 
     // ── #1716: cache-coherence dependency declaration ────────────────

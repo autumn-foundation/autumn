@@ -18,7 +18,7 @@ use autumn_web::cache::coherence::{self, DependencyProvenance, model_key};
 
 // Linking the app crate is what puts its `#[cached]` and `#[repository]`
 // registrations into this test binary.
-use saas as _;
+use {{crate_name}} as _;
 
 #[test]
 fn the_app_is_provably_cache_coherent() {
@@ -125,7 +125,7 @@ fn the_apps_cached_read_declares_rather_than_guesses_its_dependencies() {
 /// process, or the gate reports "no manifest" against a perfectly good app.
 #[test]
 fn the_app_emits_its_manifest_in_dump_mode_without_a_database() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_saas"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_{{crate_name}}"))
         .env("AUTUMN_DUMP_CACHE_COHERENCE", "1")
         // No DATABASE_URL: dump mode must return before anything connects.
         .env_remove("DATABASE_URL")

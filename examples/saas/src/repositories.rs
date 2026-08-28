@@ -17,8 +17,9 @@
 //! write paths to call.
 //!
 //! Delete that one clause and `autumn cache audit` fails the build, naming the
-//! read, the write and the `Project` model they share. See
-//! `docs/guide/cache-coherence.md` and `tests/cache_coherence.rs`.
+//! read, the write and the `Project` model they share. `tests/cache_coherence.rs`
+//! proves both halves. See the Cache Coherence guide:
+//! <https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/cache-coherence.md>
 
 use crate::models::{
     NewPasswordResetToken, NewProject, PasswordResetToken, Project, UpdatePasswordResetToken,
