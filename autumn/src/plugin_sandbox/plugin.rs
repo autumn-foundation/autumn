@@ -348,7 +348,7 @@ async fn serve(
 
     let request = match read_request(&plugin, limits, pattern, &params, request).await {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // `wasmi` is a synchronous interpreter: running it on the async runtime
@@ -397,13 +397,17 @@ async fn serve(
 
 /// Turn an axum request into the frame the guest will see, or the response the
 /// caller gets instead.
+///
+/// The error side is boxed: a `Response` is large enough that returning one by
+/// value makes every `Ok` of this function carry its footprint too, on the path
+/// every sandboxed request takes.
 async fn read_request(
     plugin: &str,
     limits: super::manifest::ResourceLimits,
     pattern: String,
     params: &axum::extract::RawPathParams,
     request: axum::extract::Request,
-) -> Result<SandboxRequest, Response> {
+) -> Result<SandboxRequest, Box<Response>> {
     let path_params: Vec<(String, String)> = params
         .iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -453,7 +457,10 @@ async fn read_request(
                 max_request_body_bytes = limits.max_request_body_bytes,
                 "request body over the sandboxed plugin's declared ceiling; refusing it"
             );
-            return Err(sandbox_error(plugin, StatusCode::PAYLOAD_TOO_LARGE));
+            return Err(Box::new(sandbox_error(
+                plugin,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            )));
         }
         Err(_) => {
             tracing::warn!(
@@ -461,7 +468,7 @@ async fn read_request(
                 request_body_timeout_ms = limits.request_body_timeout_ms,
                 "request body did not arrive within the plugin's deadline; releasing its permit"
             );
-            return Err(sandbox_error(plugin, StatusCode::REQUEST_TIMEOUT));
+            return Err(Box::new(sandbox_error(plugin, StatusCode::REQUEST_TIMEOUT)));
         }
     };
 
