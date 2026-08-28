@@ -179,7 +179,10 @@ generalized to arbitrary objects, sequences, and depths.
 use autumn_web::prelude::*;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+// `Default` is not optional here: `#[serde(default)] filter: Filter` below
+// makes the generated deserializer call `Filter::default()` when the key is
+// absent, so deriving only `Deserialize` fails to compile.
+#[derive(Deserialize, Default)]
 struct Filter {
     status: Option<String>,
     min_score: Option<i64>,

@@ -159,12 +159,20 @@ arbitrary offset — for sort-key-only cursors (timestamps + ids) this is not a
 security concern.  If your cursor encodes **sensitive data** (tenant ids, access
 scopes) use the signed cursor API:
 
-```rust
-// Encoding
-let token = Cursor::encode_signed(&my_value, signing_key);
+```rust,ignore
+// Encoding returns a `Result`: the value has to serialize before it can be
+// signed.
+let token: String = Cursor::encode_signed(&my_value, signing_key)?;
 
-// Decoding in a handler
-let value = cursor_req.decode_signed::<MyValue>(signing_key);
+// Verifying that token directly. `None` means the signature did not match or
+// the token was malformed — the two are deliberately indistinguishable, and
+// the comparison is constant-time.
+let value: Option<MyValue> = Cursor::decode_signed(&token, signing_key);
+
+// In a handler you do not pass the token: it arrived on the request, so the
+// extractor already holds it and you supply only the key. `None` here also
+// covers "no `?cursor` at all", i.e. the first page.
+let value: Option<MyValue> = cursor_req.decode_signed::<MyValue>(signing_key);
 ```
 
 See the [`pagination`](https://docs.rs/autumn-web/latest/autumn_web/pagination/index.html)
