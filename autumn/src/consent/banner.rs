@@ -114,7 +114,7 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 ///             req,
 ///             next,
 ///             CONSENT_POLICY_VERSION,
-///             autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+///             Some(autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME),
 ///             autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
 ///         ).await
 ///     }));
@@ -211,7 +211,7 @@ pub async fn inject_consent_banner(
     mut request: Request<Body>,
     next: Next,
     policy_version: u32,
-    csrf_cookie_name: &str,
+    csrf_cookie_name: Option<&str>,
     csrf_form_field: &str,
 ) -> Response<Body> {
     if request
@@ -236,10 +236,25 @@ pub async fn inject_consent_banner(
     }
 
     let consent = Consent::from_headers(request.headers());
-    let request_csrf_cookie = find_cookie(request.headers(), csrf_cookie_name);
+    let request_csrf_cookie =
+        csrf_cookie_name.and_then(|name| find_cookie(request.headers(), name));
 
     let needs_prompt = consent.needs_prompt(policy_version);
-    if needs_prompt {
+    // Strip the conditional validators only for a client that could actually
+    // be shown a banner. The reason to strip them is that an inner `EtagLayer`
+    // could otherwise answer `304` with no body, replaying a browser-cached,
+    // banner-less page and skipping a prompt that is now due.
+    //
+    // That reasoning applies only to HTML documents, and the check has to
+    // happen here — before `next` runs — where the response's content type is
+    // not yet known. `Accept` is what distinguishes the two cases: a browser
+    // navigation always offers `text/html`, while an API client asks for JSON
+    // (or anything else). Stripping unconditionally would mean every request
+    // from a consent-less client loses `If-None-Match` / `If-Modified-Since`
+    // — and an API client never acquires a consent cookie, so its conditional
+    // requests could never return `304` again and it would refetch full bodies
+    // forever.
+    if needs_prompt && accepts_html(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
@@ -278,10 +293,51 @@ pub async fn inject_consent_banner(
         return response;
     }
 
-    let csrf_token =
-        extract_response_csrf_cookie(&response, csrf_cookie_name).or(request_csrf_cookie);
+    let csrf_token = csrf_cookie_name
+        .and_then(|name| extract_response_csrf_cookie(&response, name))
+        .or(request_csrf_cookie);
+
+    // With CSRF enforced but no token obtainable, the banner's buttons would
+    // POST to a CSRF-protected route without the hidden field and get a `403`.
+    // Rendering controls that cannot work is worse than rendering none: the
+    // visitor is invited to decide and then silently refused.
+    //
+    // This is reachable in a built (SSG/ISG) deployment. User `.layer()`
+    // middleware is applied OUTSIDE the static-first layer precisely so it can
+    // process pre-rendered responses — which means that on a static cache hit
+    // `CsrfLayer` never runs, sets no cookie, and there is nothing to embed.
+    // Skipping leaves the visitor unprompted on that page; the next dynamic
+    // page prompts them normally, and no non-essential cookie was set in the
+    // meantime because the gate stays closed while undecided.
+    if csrf_cookie_name.is_some() && csrf_token.is_none() {
+        tracing::debug!(
+            "consent banner skipped: CSRF is enforced but no token was available \
+             (typically a pre-rendered static page, where CsrfLayer never runs)"
+        );
+        return response;
+    }
+
     let banner_html = consent_banner_markup(csrf_token.as_deref(), csrf_form_field).into_string();
     splice_into_response(response, &banner_html).await
+}
+
+/// Whether the client offered to accept an HTML document.
+///
+/// Only such a request can be answered with a page carrying the banner, so
+/// only such a request has a reason to lose its conditional validators (see
+/// [`inject_consent_banner`]). A missing `Accept` header is treated as
+/// accepting HTML: the header is optional, and defaulting the other way would
+/// silently skip the prompt for a client that does render pages.
+///
+/// A bare `*/*` — what `curl` and many API clients send — is deliberately NOT
+/// treated as accepting HTML: those callers do not render a banner, and
+/// keeping their validators is what preserves their `304`s.
+fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
+    headers.get(axum::http::header::ACCEPT).is_none_or(|value| {
+        value
+            .to_str()
+            .is_ok_and(|accept| accept.to_ascii_lowercase().contains("text/html"))
+    })
 }
 
 /// Whether this request came from htmx, and therefore expects a fragment
@@ -776,11 +832,16 @@ mod tests {
             .unwrap()
     }
 
+    /// A bare router with no `CsrfLayer`, so `None` (CSRF disabled) is the
+    /// honest posture: there is no token to embed and none is wanted. Tests
+    /// that need the *enforced* posture pass `Some(..)` and arrange for a
+    /// token, or assert the skip — see
+    /// `enforced_csrf_without_a_token_skips_the_banner_rather_than_render_it_broken`.
     fn app_with_policy_version(version: u32) -> Router {
         Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, version, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, version, None, "_csrf").await
             }))
     }
 
@@ -811,7 +872,7 @@ mod tests {
             Router::new()
                 .route("/", get(handler))
                 .layer(axum::middleware::from_fn(move |req, next| async move {
-                    inject_consent_banner(req, next, POLICY_VERSION, "autumn-csrf", "_csrf").await
+                    inject_consent_banner(req, next, POLICY_VERSION, None, "_csrf").await
                 }))
                 .layer(SessionLayer::new(
                     MemoryStore::new(),
@@ -956,7 +1017,7 @@ mod tests {
                 get(|| async { ([(CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#) }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
@@ -983,7 +1044,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1224,7 +1285,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1242,6 +1303,159 @@ mod tests {
             !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
             "an oversized body is served as-is without the banner spliced in \
              (splicing would require buffering arbitrarily more)"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_csrf_without_a_token_skips_the_banner_rather_than_render_it_broken() {
+        // The static-page case: user `.layer()` middleware runs OUTSIDE the
+        // static-first layer (so it can process pre-rendered responses), which
+        // means `CsrfLayer` never ran and set no cookie. Rendering the banner
+        // here would give the visitor two buttons that both POST without the
+        // hidden `_csrf` field and get a 403 — inviting a decision and then
+        // silently refusing it.
+        let app = Router::new()
+            .route("/about", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                // `Some(..)` = the app enforces CSRF, but nothing in this stack
+                // ever issues the cookie.
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            !rendered.contains("autumn-consent-banner"),
+            "a banner that cannot submit must not be rendered at all; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<body>"),
+            "the page itself must still be served intact; got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_csrf_free_app_still_gets_its_banner() {
+        // `None` = the app disabled CSRF entirely, so an absent token is
+        // expected rather than a symptom, and the banner works without one.
+        // This is what keeps the skip above from silently disabling the
+        // feature for such an app.
+        let app = app_with_policy_version(1);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "an app with CSRF disabled must still prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_client_keeps_its_conditional_validators() {
+        // An API client never acquires a consent cookie, so it always "needs
+        // prompting" — if that stripped its validators, its conditional
+        // requests could never answer 304 again and it would refetch full
+        // bodies forever.
+        let app = Router::new()
+            .route(
+                "/api/posts",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!("{{\"saw_if_none_match\":{seen}}}")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/posts")
+                    .header(axum::http::header::ACCEPT, "application/json")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "{\"saw_if_none_match\":true}",
+            "a non-HTML client must keep If-None-Match so its ETag path still 304s"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_navigation_still_loses_its_validators_while_prompting() {
+        // The guard above must not have disabled the protection it narrows:
+        // a browser navigation still has to bypass a cached 304, or the
+        // banner-less page replays and the prompt is skipped.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{seen}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        axum::http::header::ACCEPT,
+                        "text/html,application/xhtml+xml",
+                    )
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("false"),
+            "an HTML navigation being prompted must have If-None-Match stripped; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "and it must still be prompted; got: {rendered}"
         );
     }
 
@@ -1264,7 +1478,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         // No consent cookie: this visitor definitely still needs prompting,
@@ -1308,7 +1522,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
 
         let response = app
@@ -1349,7 +1563,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1381,7 +1595,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1417,7 +1631,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1460,7 +1674,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1542,7 +1756,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "my-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("my-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1583,7 +1797,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "authenticity_token").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "authenticity_token").await
             }));
 
         let request = Request::builder()
@@ -1623,7 +1837,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let response = app
@@ -1664,7 +1878,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let cookie = super::super::accept_all_cookie(&["analytics"], 1);
@@ -1712,7 +1926,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let request = Request::builder()

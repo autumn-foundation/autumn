@@ -242,7 +242,7 @@ async fn main() {
                     req,
                     next,
                     routes::consent::CONSENT_POLICY_VERSION,
-                    autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+                    Some(autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME),
                     autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
                 )
                 .await
