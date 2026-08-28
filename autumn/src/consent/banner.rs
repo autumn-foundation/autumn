@@ -9,7 +9,7 @@
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
 //!
-//! Five cases are deliberately **not** injected into, so "the layer is
+//! Six cases are deliberately **not** injected into, so "the layer is
 //! registered" is not the same as "every page prompts":
 //!
 //! 1. an htmx *fragment* response, which has no `</body>` to splice before and
@@ -23,17 +23,20 @@
 //! 4. a `206 Partial Content` body (or any response carrying `Content-Range`),
 //!    whose bytes are a slice of a larger representation that `Content-Range`
 //!    describes — splicing would corrupt the range;
-//! 5. a body over [`MAX_SPLICE_BODY_BYTES`].
+//! 5. a **download** (`Content-Disposition: attachment`), whose bytes become a
+//!    file on disk rather than a page — splicing would edit the export and
+//!    write the visitor's live CSRF token into it;
+//! 6. a body over [`MAX_SPLICE_BODY_BYTES`].
 //!
-//! All five still get `Vary: Cookie`, because the representation depends on the
+//! All six still get `Vary: Cookie`, because the representation depends on the
 //! consent cookie whether or not anything was injected. Each is documented on
 //! [`inject_consent_banner`] and summarized for app authors in
 //! `docs/guide/cookie-consent.md`.
 
 use axum::body::{Body, Bytes};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_TYPE, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
 };
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
@@ -330,7 +333,13 @@ pub async fn inject_consent_banner(
     //
     // Checked by header as well as status: a proxy or a handler can attach
     // `Content-Range` without the canonical status.
-    if response.status() == axum::http::StatusCode::PARTIAL_CONTENT
+    // `Content-Disposition: attachment` means these bytes become a file on the
+    // visitor's disk, not a page in their browser. Splicing would edit the
+    // export they asked for and write their live CSRF token into it — a token
+    // that then sits in a saved file, possibly shared. An exported document is
+    // also never where a consent prompt belongs.
+    if is_attachment(&response)
+        || response.status() == axum::http::StatusCode::PARTIAL_CONTENT
         || response.headers().contains_key(CONTENT_RANGE)
     {
         response
@@ -804,6 +813,24 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
     out.into()
 }
 
+/// Whether the response is served as a download rather than rendered in place.
+///
+/// Only the disposition **type** is inspected: `attachment` is a download,
+/// `inline` and anything unrecognised are not. A `filename` parameter is
+/// irrelevant here and may itself contain the word.
+fn is_attachment(response: &Response<Body>) -> bool {
+    response
+        .headers()
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
+        })
+}
+
 /// Whether the body opens as a complete document rather than a fragment.
 ///
 /// A document begins with a doctype or an `<html>` tag even when it omits its
@@ -832,7 +859,18 @@ fn starts_like_a_document(body: &[u8]) -> bool {
     let starts_with = |prefix: &[u8]| {
         head.len() >= prefix.len() && head[..prefix.len()].eq_ignore_ascii_case(prefix)
     };
-    starts_with(b"<!doctype") || starts_with(b"<html>") || starts_with(b"<html ")
+    if starts_with(b"<!doctype") {
+        return true;
+    }
+    // `<html` must be followed by a tag terminator or ANY ASCII whitespace.
+    // Spelling out `<html>` and `<html ` missed `<html\nlang="en">` and the tab
+    // and carriage-return forms, all of which are ordinary formatting — and a
+    // doctype-less document that wraps its opening tag would have been read as
+    // a fragment and gone unprompted.
+    starts_with(b"<html")
+        && head
+            .get(b"<html".len())
+            .is_some_and(|b| *b == b'>' || b.is_ascii_whitespace())
 }
 
 /// Byte offset of the FIRST occurrence of `needle` in `haystack`.
@@ -975,6 +1013,70 @@ mod tests {
                 String::from_utf8_lossy(fragment)
             );
         }
+    }
+
+    #[test]
+    fn any_html_whitespace_may_follow_the_opening_tag() {
+        // `<html>` and `<html ` were spelled out literally; a document that
+        // wraps its attributes onto the next line is just as valid and was
+        // being read as a fragment.
+        for doc in [
+            &b"<html>\n<body>hi</body></html>"[..],
+            &b"<html lang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\nlang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\tlang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\r\nlang=\"en\"><body>hi</body></html>"[..],
+            &b"<HTML\nLANG=\"en\"><BODY>hi</BODY></HTML>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(doc, "<snip>").is_some(),
+                "a doctype-less document must still be recognised: {}",
+                String::from_utf8_lossy(doc)
+            );
+        }
+
+        // But the tag name must actually end there — `<htmlfoo>` is not one.
+        assert!(splice_before_body_close(b"<htmlfoo><body>x</body>", "<snip>").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_download_is_never_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/export.html",
+                axum::routing::get(|| async {
+                    (
+                        [
+                            (CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (CONTENT_DISPOSITION, "attachment; filename=\"export.html\""),
+                        ],
+                        "<!doctype html><html><body>rows</body></html>",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/export.html")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "<!doctype html><html><body>rows</body></html>",
+            "an exported file must reach the disk exactly as the handler wrote it"
+        );
     }
 
     #[test]
