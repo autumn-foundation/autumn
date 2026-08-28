@@ -127,6 +127,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Admin user impersonation with an audit trail and a revert banner (#1394):**
+  every support team eventually needs to "log in as this user" to reproduce a
+  bug or verify a permission, and until now that meant hand-rolling a session
+  swap — `session.set("user_id", target)` — which silently destroys the audit
+  trail: from that moment on every version row and audit event claims the
+  *customer* did it. A new additive API, `autumn_web::auth::impersonation`,
+  makes the secure version the easy one. `begin_impersonation` swaps the
+  session's effective user to the target and records the real admin separately
+  under a reserved `impersonator_id` key, so the resolution the *framework* owns
+  (`#[secured]`, `RequireAuth`, `PolicyContext`) transparently sees the
+  **impersonated** user — `Auth<T>` is populated by the app's own loader
+  middleware from request extensions, so it follows only if that loader reads the
+  auth session key — while the framework's ambient current actor (#1383) — the
+  value that seeds `#[repository(versioned)]` version rows and `AuditEvent`s — is
+  published as the **real impersonator**. `end_impersonation` reverses it.
+  Beginning is default-deny: it requires an `ImpersonationGate` in `AppState`
+  (`ImpersonationGate::allow_roles(["admin"])` for the common case, or a custom
+  `ImpersonationPolicy` — the seam where an app enforces its own tenancy
+  boundary), so an app can never acquire impersonation by accident. Both
+  directions rotate the session id (no fixation) and write an audit event
+  carrying `{impersonator_id, target_id}`; a *denied* attempt is audited as a
+  failure, and a begin is refused outright — rather than taking effect
+  unrecorded — both when the audit write fails and when the app has installed
+  no audit sink at all (`audit::write_from_state` is a silent no-op without
+  one, so impersonation requires a real sink before it will swap anything). Impersonation does not nest — starting a second hop
+  is a `409`, so it cannot be chained to escalate — and the impersonated
+  session's role is resolved **server-side** by
+  `ImpersonationPolicy::target_role`, never taken from request input, so an
+  operator cannot mint a session more privileged than the target really is. The
+  operator's step-up (`last_strong_auth_at`) claim is a bare timestamp with no
+  identity bound to it, so begin stashes and drops it — otherwise a `#[step_up]`
+  route could run a destructive action on the *target's* account on the strength
+  of the operator's re-authentication — and end restores it. Impersonation also
+  does not survive a change of identity: the record is bound both to the user it
+  describes and to the session generation that created it, so either a different
+  effective user or a session-id rotation (which every login performs) retires
+  it — it stops counting for attribution and the revert route refuses it, rather
+  than handing whoever comes next the operator's identity and role. The
+  generation binding covers the case an id check alone misses: the impersonated
+  customer signing in as themselves on the same browser.
+  `impersonation::clear` scrubs it from a login flow outright. An `auth.session_key`
+  configured as one of the reserved keys would make the swap clobber its own
+  record, so both directions refuse it and registering the gate logs it at
+  startup (`impersonation::is_reserved_session_key` /
+  `RESERVED_SESSION_KEYS` expose the check).
+
+- **`AdminPlugin::with_impersonation(gate)` — the impersonation UI (#1394):**
+  opts an admin panel into the primitive above and mounts two routes:
+  `POST {prefix}/impersonate` (behind the admin role gate, the step-up guard
+  when enabled, *and* the `ImpersonationGate`) and `POST
+  {prefix}/impersonate/stop`, deliberately mounted **outside** the role gate —
+  while impersonating, the session carries the target's role, so a gated revert
+  would trap the operator in the target's identity with no way back. The admin
+  router also publishes the request's current actor unconditionally —
+  attribution must not depend on the *optional* role check — so admin-surface
+  writes are attributed at all (previously `SYSTEM_ACTOR`) and correctly while
+  impersonating; runtime-config changes are recorded against the operator rather
+  than the customer for the same reason. Every admin page then renders a
+  persistent "Viewing as … — Stop impersonating" banner with one-click revert. The same banner goes in an application's own layout — the
+  surface an operator actually looks at while impersonating a non-admin — via
+  `autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
+  csrf_token, csrf_form_field)` plus the exported
+  `IMPERSONATION_BANNER_CSS`. Without `with_impersonation` neither route is
+  mounted at all.
 - **Examples for the four flagship 0.7.0 subsystems that shipped a guide and
   nothing runnable (#2320, T2):** the 0.7.0 docs audit found guide coverage at
   91.1% and example coverage at 59.4% — the debt had moved wholesale from docs

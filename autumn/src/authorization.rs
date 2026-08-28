@@ -162,10 +162,16 @@ impl PolicyContext {
         // so this stays panic-safe for non-request callers (e.g. hand-rolled
         // policy unit tests), and it never publishes for an anonymous session
         // (guarded on `Some`).
+        //
+        // Impersonation (#1394): when the session carries an impersonator, that
+        // operator — not the user the request resolves as — is the principal
+        // responsible for the writes this policy check gates.
         if crate::current::Current::actor().is_none()
             && let Some(user_id) = &user_id
         {
-            crate::current::Current::set_actor(user_id.clone());
+            crate::current::Current::set_actor(
+                crate::auth::impersonation::audit_actor_id(session, user_id).await,
+            );
         }
 
         let role = session.get("role").await;

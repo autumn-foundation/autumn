@@ -305,10 +305,15 @@ pub async fn __check_step_up_with_config(
             .map_or(DEFAULT_MAX_AGE_SECS, |c| c.default_max_age_secs)
     });
 
-    let actor_id = session
-        .get(state.auth_session_key())
-        .await
-        .unwrap_or_else(|| "anonymous".to_owned());
+    // Attribute through the same rule the three `Current::set_actor` seams use:
+    // while the session is impersonating (#1394), the operator — not the user
+    // the request resolves as — is who performed the sensitive action, and a
+    // step-up event naming the target would be exactly the misattribution
+    // impersonation exists to prevent.
+    let actor_id = match session.get(state.auth_session_key()).await {
+        Some(effective) => crate::auth::impersonation::audit_actor_id(session, &effective).await,
+        None => "anonymous".to_owned(),
+    };
 
     match check_step_up(session, max_age).await {
         Ok(()) => {
