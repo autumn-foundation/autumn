@@ -819,11 +819,25 @@ pub async fn submit(
                 &sse_post.render_fragment(),
             );
 
+            // `AfterBegin`, not `BeforeEnd`: the community listing orders by
+            // `(hot_rank DESC, id DESC)`, and a brand-new post has the default
+            // `hot_rank` of 0.0 with the highest id — so among the un-ranked
+            // posts it sorts FIRST. Appending it to the bottom put it where a
+            // reload would not.
+            //
+            // Known limitation, and the reason the listing wires this stream on
+            // page 1 only: a live insert cannot maintain an exact page slice.
+            // The list transiently shows `size + 1` rows until the next load,
+            // and the row pushed past the boundary also appears on page 2. That
+            // is offset pagination's inherent instability under concurrent
+            // inserts (see docs/guide/pagination.md), which a live feed makes
+            // visible rather than causes — a feed that must stay exact wants
+            // cursor pagination, not a paginated ranked slice.
             let _ = sse_state.broadcast().publish_oob(
                 &format!("posts:r/{}", sse_sub_slug),
                 &sse_post.dom_id(),
                 &autumn_web::htmx::OobSwap::Target(
-                    autumn_web::htmx::OobMethod::BeforeEnd,
+                    autumn_web::htmx::OobMethod::AfterBegin,
                     "#posts-list".to_string(),
                 ),
                 &sse_post.render_fragment(),

@@ -111,8 +111,23 @@ guidance for a consent-decision cookie.
 
 `inject_consent_banner` is a response-body-splice middleware: it detects an HTML
 response and, when the visitor needs prompting, inserts the banner right before
-`</body>`. Every HTML page gets it with no per-handler wiring and no change to
-your `layout()` signature.
+`</body>` — with no per-handler wiring and no change to your `layout()`
+signature.
+
+**It deliberately does not inject in three cases**, so do not treat "the layer
+is registered" as "every page prompts":
+
+| Case | Why | Consequence |
+|---|---|---|
+| An htmx **fragment** response (`HX-Request` without `HX-Boosted`) | a fragment has no `</body>`, so the banner would be appended and swapped in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
+| A **static cache hit** with CSRF enforced and no token available | on a pre-rendered `#[static_get]` page `CsrfLayer` never runs, so the banner's buttons would `403` | that visitor is unprompted on that page, and prompted on the first dynamic route they reach |
+| A response body over 2 MiB | splicing would mean buffering arbitrarily more | the page is served unmodified |
+
+The static case is the one to plan for: if your landing page is pre-rendered, a
+first-time visitor's *first* page will not carry the banner. That is safe —
+`Consent::allows` still returns `false`, so nothing non-essential runs — but if
+you need the prompt on that exact page, make it dynamic rather than assuming the
+layer covered it.
 
 ```rust,ignore
 const CONSENT_POLICY_VERSION: u32 = 1;
