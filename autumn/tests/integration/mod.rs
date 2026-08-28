@@ -210,6 +210,8 @@ mod process_role_worker_gating;
 // here is never picked up by that bare `--ignored` run.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox;
+mod push_end_to_end;
+mod push_router;
 mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]
