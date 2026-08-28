@@ -18,7 +18,8 @@ use std::fmt::Write as _;
 use std::process::Command;
 
 use autumn_web::cache::coherence::{
-    CoherenceManifest, UndeterminedRead, format_diagnostic, gate_failed, parse_manifest_dump,
+    CoherenceManifest, UndeterminedRead, audit_exit_code, format_diagnostic, gate_failed,
+    parse_manifest_dump,
 };
 
 use crate::routes;
@@ -219,12 +220,9 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
         eprintln!("\u{2713} No cached read can be left stale by a repository write.");
     }
 
-    // The gate fails on a proven violation always, and on an undetermined
-    // dependency set only under `--strict` — the default never fails on what it
-    // merely could not read.
-    let failed =
-        !manifest.violations.is_empty() || (opts.strict && !manifest.undetermined_reads.is_empty());
-    std::process::exit(i32::from(failed));
+    // The rule lives in `audit_exit_code`, not in a second copy here: the CLI
+    // and the framework must never be able to disagree about what fails.
+    std::process::exit(audit_exit_code(&manifest, opts.strict));
 }
 
 #[cfg(test)]
@@ -288,6 +286,23 @@ mod tests {
         assert!(summary.contains("1 derived"), "{summary}");
         assert!(summary.contains("1 undetermined"), "{summary}");
         assert!(summary.contains("1 repository mutations"), "{summary}");
+    }
+
+    /// `--strict` must not fail a read the author already opted out of. The
+    /// exit code and the printed report have to agree about that, since the
+    /// report is what a reviewer reads to decide whether the green is real.
+    #[test]
+    fn an_acknowledged_undetermined_read_stays_green_under_strict() {
+        let mut r = read("blog::ticker", &[], DependencyProvenance::Undetermined);
+        r.acknowledged_stale = Some("5s lag is fine on the ticker".to_string());
+        let manifest = CoherenceManifest::build(std::slice::from_ref(&r), &[]);
+
+        assert!(manifest.undetermined_reads.is_empty());
+        assert_eq!(audit_exit_code(&manifest, true), 0);
+
+        let report = format_report(&manifest, true);
+        assert!(!report.contains("error:"), "{report}");
+        assert!(report.contains("5s lag is fine on the ticker"), "{report}");
     }
 
     #[test]

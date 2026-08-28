@@ -542,11 +542,14 @@ fn generate_cache_body(
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    if ::autumn_web::cache::coherence::fill_is_still_current(
+                    // The epoch check and the insert are one indivisible step:
+                    // checking first and inserting after leaves a window where
+                    // an invalidation bumps and clears in between, and this
+                    // pre-invalidation value lands after the clear.
+                    ::autumn_web::cache::coherence::with_fill_fence(
                         __autumn_epoch_cell, __autumn_epoch_at_entry,
-                    ) {
-                        ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl);
-                    }
+                        || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl),
+                    );
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -559,11 +562,14 @@ fn generate_cache_body(
                 return __autumn_cached;
             }
             let __autumn_result = #compute;
-            if ::autumn_web::cache::coherence::fill_is_still_current(
+            // The epoch check and the insert are one indivisible step: checking
+            // first and inserting after leaves a window where an invalidation
+            // bumps and clears in between, and this pre-invalidation value
+            // lands after the clear.
+            ::autumn_web::cache::coherence::with_fill_fence(
                 __autumn_epoch_cell, __autumn_epoch_at_entry,
-            ) {
-                ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl);
-            }
+                || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl),
+            );
             __autumn_result
         }
     }
@@ -878,7 +884,7 @@ mod tests {
             cached_macro(TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }).to_string();
         assert!(out.contains("__autumn_epoch_at_entry"), "{out}");
         assert!(
-            out.contains("fill_is_still_current (__autumn_epoch_cell , __autumn_epoch_at_entry ,)"),
+            out.contains("with_fill_fence (__autumn_epoch_cell , __autumn_epoch_at_entry ,"),
             "the insert must be gated on the fence: {out}"
         );
         // Sampled before the hit path, so it covers the whole miss-and-fill
@@ -898,7 +904,44 @@ mod tests {
             quote! { async fn recent() -> Result<u8, Error> { Ok(0) } },
         )
         .to_string();
-        assert!(out.contains("fill_is_still_current"), "{out}");
+        assert!(out.contains("with_fill_fence"), "{out}");
+    }
+
+    /// The check and the insert must be *one* step, not two adjacent ones.
+    ///
+    /// A bare `if fill_is_still_current(..) { insert_cached(..) }` reads as
+    /// fenced and is not: an invalidation can bump the epoch and clear the
+    /// namespace between the `true` and the insert, and the pre-invalidation
+    /// value then lands after the clear and sits there until its TTL — or
+    /// forever, when the read has none. Pin the shape that closes it: every
+    /// `insert_cached` in the expansion is an argument to `with_fill_fence`,
+    /// and no `if`-gated `fill_is_still_current` guards one.
+    #[test]
+    fn the_insert_happens_inside_the_fence_not_merely_after_a_check() {
+        for (attr, item) in [
+            (TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }),
+            (
+                quote! { result },
+                quote! { async fn recent() -> Result<u8, Error> { Ok(0) } },
+            ),
+        ] {
+            let out = cached_macro(attr, item).to_string();
+            assert!(
+                !out.contains("if :: autumn_web :: cache :: coherence :: fill_is_still_current"),
+                "the check must not merely precede the insert: {out}"
+            );
+            let fence = out.find("with_fill_fence").expect("fenced");
+            let insert = out.find("insert_cached").expect("inserts");
+            assert!(
+                fence < insert,
+                "insert_cached must sit inside the with_fill_fence call: {out}"
+            );
+            assert_eq!(
+                out.matches("insert_cached").count(),
+                out.matches("with_fill_fence").count(),
+                "every insert must be fenced: {out}"
+            );
+        }
     }
 
     // ── #1716: cache-coherence dependency declaration ────────────────

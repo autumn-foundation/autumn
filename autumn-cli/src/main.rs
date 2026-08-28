@@ -103,7 +103,7 @@ pub enum RoutesSubcommands {
 /// Arguments for [`CacheSubcommands::Audit`].
 ///
 /// A separate `Args` struct rather than inline variant fields, for the same
-/// reason as [`UpgradeArgs`]: clap's derive builds every inline field of every
+/// reason as `UpgradeArgs`: clap's derive builds every inline field of every
 /// variant inside one `Commands::augment_subcommands` frame, and that frame is
 /// already within a kilobyte of libtest's 2 MiB thread stack. Five more inline
 /// fields is exactly the kind of increment that decides whether the

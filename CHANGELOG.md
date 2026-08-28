@@ -144,7 +144,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a new `Cache::invalidate_namespace` that `MokaCache` implements by iteration and
   `RedisCache` by a `SCAN MATCH` one segment narrower than its existing `clear`; a
   custom backend that cannot pattern-match its key space returns `false`, and the
-  caller is told so rather than left believing the value is gone.
+  caller is told so rather than left believing the value is gone. A fill already
+  in flight when an invalidation lands cannot write its stale value back
+  afterwards: `#[cached]` samples the namespace’s epoch before the lookup and
+  inserts through `with_fill_fence`, which re-checks it and inserts as one step
+  that cannot interleave with the invalidation’s bump.
   Deliberately conservative in the direction
   that keeps the gate alive: a read whose dependency set could not be
   established is `undetermined` — reported in the manifest and the summary, never
@@ -155,9 +159,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameters only, which is what lets a cached read take the repository handle it
   reads through — the handle is `Clone` but not `Hash`, and was never part of the
   value’s identity. What is proven and what is not is stated on the tin: the
-  `invalidations` dimension is tagged `declared`, not `provable`, with a
-  `runtime_caveat` saying the edge’s target is proven but its *invocation* is
-  not, and the manifest’s `excluded` list names row/column granularity,
+  `invalidations` dimension carries a `runtime_caveat` saying the edge’s target
+  is proven — rustc resolves it to the read’s own generated id constant — but
+  its *invocation* on the write path is not, and the manifest’s `excluded` list
+  names row/column granularity,
   cross-service coherence and TTL semantics as out of this slice. `examples/saas`
   demonstrates both halves — the app audits clean, and deleting the one
   `invalidates(...)` clause turns the build red. See

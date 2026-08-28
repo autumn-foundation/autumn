@@ -365,11 +365,19 @@ pub fn duplicate_read_ids(reads: &[CachedRead]) -> Vec<String> {
 /// These gate nothing by default — see the module docs — but a green audit that
 /// is mostly `undetermined` proves very little, so they are always reported and
 /// `--strict` turns them into a failure.
+///
+/// A read carrying `acknowledge_stale` is excluded: that attribute is the
+/// documented opt-out from the coherence gate, and a read the author has
+/// already signed off as knowingly-stale must not fail `--strict` through the
+/// undetermined door. Those reads are still reported, under their own
+/// acknowledged heading, so the opt-out stays visible rather than silent.
 #[must_use]
 pub fn undetermined_reads(reads: &[CachedRead]) -> Vec<&CachedRead> {
     reads
         .iter()
-        .filter(|r| r.provenance == DependencyProvenance::Undetermined)
+        .filter(|r| {
+            r.provenance == DependencyProvenance::Undetermined && r.acknowledged_stale.is_none()
+        })
         .collect()
 }
 
@@ -929,22 +937,60 @@ macro_rules! declare_cached_read {
     };
 }
 
+/// Decode the UTF-8 code point starting at `i`, returning it and its width.
+///
+/// A hand-rolled decoder because `str::chars` is not `const`. The input is a
+/// `&str`, so it is valid UTF-8 by construction and every continuation byte is
+/// in range.
+const fn decode_utf8(bytes: &[u8], i: usize) -> (u32, usize) {
+    let first = bytes[i];
+    if first < 0x80 {
+        (first as u32, 1)
+    } else if first < 0xE0 {
+        (
+            (((first as u32) & 0x1F) << 6) | ((bytes[i + 1] as u32) & 0x3F),
+            2,
+        )
+    } else if first < 0xF0 {
+        (
+            (((first as u32) & 0x0F) << 12)
+                | (((bytes[i + 1] as u32) & 0x3F) << 6)
+                | ((bytes[i + 2] as u32) & 0x3F),
+            3,
+        )
+    } else {
+        (
+            (((first as u32) & 0x07) << 18)
+                | (((bytes[i + 1] as u32) & 0x3F) << 12)
+                | (((bytes[i + 2] as u32) & 0x3F) << 6)
+                | ((bytes[i + 3] as u32) & 0x3F),
+            4,
+        )
+    }
+}
+
 /// Whether an acknowledged-stale reason is blank.
 ///
-/// `str::trim` is not `const`, so this walks the bytes: `declare_cached_read!`
-/// needs the check in a `const _: () = assert!(…)`, and the rule has to be the
-/// same one `#[cached]` and `#[repository]` enforce at parse time, or the
-/// weakest of the three declaration forms silently becomes the way to get a
-/// free pass.
+/// Blank means what `str::trim().is_empty()` means — **Unicode** whitespace, not
+/// just ASCII. An EM SPACE (`U+2003`) is a blank reason, and a check that only
+/// knew about ASCII would leave `declare_cached_read!` as a way to silence every
+/// coherence finding with a justification nobody can see.
+///
+/// `str::trim` is not `const` and neither is `str::chars`, so this decodes the
+/// bytes itself and defers to `char::is_whitespace`, which is. The rule has to
+/// be the same one `#[cached]` and `#[repository]` enforce at parse time, or the
+/// weakest of the three declaration forms becomes the free pass.
 #[must_use]
 pub const fn reason_is_blank(reason: &str) -> bool {
     let bytes = reason.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if !bytes[i].is_ascii_whitespace() {
-            return false;
+        let (code_point, width) = decode_utf8(bytes, i);
+        match char::from_u32(code_point) {
+            Some(c) if c.is_whitespace() => {}
+            _ => return false,
         }
-        i += 1;
+        i += width;
     }
     true
 }
@@ -1017,12 +1063,66 @@ pub fn register_namespace_store(
 /// already stale and inserting it would resurrect exactly what was just
 /// dropped.
 ///
-/// # Panics
-///
-/// Panics if the internal `RwLock` is poisoned.
+/// This is the bare comparison, and on its own it is **not** enough: between
+/// the `true` it returns and the insert it guards, an invalidation can bump the
+/// epoch and clear the namespace, and the insert then lands after the clear.
+/// Use [`with_fill_fence`], which performs the same comparison and the insert
+/// as one step that cannot interleave with an invalidation. This stays public
+/// for callers that only want to *observe* the fence — a test, a metric, a
+/// decision not to bother inserting — and for reading the epoch outside any
+/// critical section.
 #[must_use]
 pub fn fill_is_still_current(epoch: &std::sync::atomic::AtomicU64, sampled: u64) -> bool {
     epoch.load(std::sync::atomic::Ordering::Acquire) == sampled
+}
+
+/// Serializes cache fills against namespace invalidation.
+///
+/// Held shared by every in-flight fill's check-and-insert (fills never block
+/// each other) and exclusively by [`invalidate_namespace`] for the epoch bump
+/// alone. The data is `()`: the lock carries no state, only the mutual
+/// exclusion that makes the epoch check and the insert it guards indivisible.
+static FILL_FENCE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Insert a freshly computed cache value **iff** no invalidation has landed
+/// since `sampled`, with the check and the insert indivisible.
+///
+/// [`fill_is_still_current`] alone leaves a window: it can return `true`, an
+/// invalidation can then bump the epoch and clear the namespace, and the
+/// caller's insert lands afterwards — writing a pre-invalidation value into a
+/// namespace that was just emptied, where it can sit until its TTL, or forever
+/// when there is none. This closes that window. `insert` runs while the fence
+/// is held shared and [`invalidate_namespace`] bumps the epoch while holding it
+/// exclusively, so only two orderings exist:
+///
+/// * this call completes first — the invalidation's clear, which follows its
+///   bump, removes what was just inserted; or
+/// * the bump completes first — this call observes it and skips the insert.
+///
+/// Returns `Some(insert(...))` when the value was written, `None` when the fill
+/// was fenced out.
+///
+/// # Cost
+///
+/// `insert` runs under a shared lock, so a slow backend write delays
+/// *invalidators*, not other fills. Keep it to the insert itself, and never call
+/// [`invalidate_namespace`] from inside it — `std`'s `RwLock` is not reentrant
+/// and that self-deadlocks.
+pub fn with_fill_fence<R>(
+    epoch: &std::sync::atomic::AtomicU64,
+    sampled: u64,
+    insert: impl FnOnce() -> R,
+) -> Option<R> {
+    // A poisoned fence means some other fill's insert panicked. The lock guards
+    // no data — `()` cannot be left inconsistent — so recovering is right, and
+    // propagating would turn one unrelated panic into a permanently broken
+    // cache path.
+    let guard = FILL_FENCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let result = fill_is_still_current(epoch, sampled).then(insert);
+    drop(guard);
+    result
 }
 
 /// Drop every entry belonging to one cached read.
@@ -1072,15 +1172,29 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // anything is cleared — the other order leaves a window where a fill both
     // passes the fence and lands after the clear.
     //
-    // Clone the handles out and DROP the guard before calling into any backend.
-    // `register_namespace_store` is public and `Cache` is user-implementable, so
-    // a `clear()` that happens to call a `#[cached]` function would otherwise
-    // re-enter this non-reentrant `RwLock` and deadlock.
+    // The bump happens under the fill fence held EXCLUSIVELY, which is what
+    // makes it atomic with respect to a concurrent `with_fill_fence`: that fill
+    // either completes its check-and-insert before this bump (and the clear
+    // below removes what it wrote) or observes the bump and skips its insert.
+    // Comparing epochs without this mutual exclusion leaves the window where a
+    // fill passes the check, this invalidation bumps and clears, and the fill's
+    // insert lands afterwards.
+    //
+    // Only the bump is exclusive. Clone the handles out and DROP both guards
+    // before calling into any backend: `clear()` can be a network round-trip,
+    // and `register_namespace_store` is public with `Cache` user-implementable,
+    // so a `clear()` that happens to call a `#[cached]` function would otherwise
+    // re-enter these non-reentrant `RwLock`s and deadlock. Releasing early is
+    // safe — the ordering argument needs only the bump to be indivisible, and
+    // every clear follows it.
     let dedicated: Vec<std::sync::Arc<dyn super::Cache>> = {
+        let fence = FILL_FENCE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let guard = NAMESPACES
             .read()
             .expect("cache namespace store lock poisoned");
-        guard
+        let stores = guard
             .as_ref()
             .and_then(|map| map.get(namespace))
             .map_or_else(Vec::new, |entry| {
@@ -1088,7 +1202,10 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
                     .epoch
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 entry.stores.clone()
-            })
+            });
+        drop(guard);
+        drop(fence);
+        stores
     };
     for store in dedicated {
         store.clear();
@@ -1273,6 +1390,32 @@ mod tests {
         let undetermined = undetermined_reads(&all);
         assert_eq!(undetermined.len(), 1);
         assert_eq!(undetermined[0].id, "blog::views::mystery");
+    }
+
+    /// `acknowledge_stale` is documented as the opt-out from the gate, so it
+    /// has to hold on the undetermined path too — otherwise a read the author
+    /// signed off on fails `--strict` through a second door, and the only way
+    /// to get green is to delete the acknowledgement that made the opt-out
+    /// explicit.
+    #[test]
+    fn an_acknowledged_read_is_not_a_strict_undetermined_failure() {
+        let mut r = read("blog::views::mystery", &[]);
+        r.provenance = DependencyProvenance::Undetermined;
+        r.acknowledged_stale = Some("ttl of 5s is short enough".to_string());
+        assert!(
+            undetermined_reads(std::slice::from_ref(&r)).is_empty(),
+            "an acknowledged read must not be reported as undetermined"
+        );
+        let manifest = CoherenceManifest::build(std::slice::from_ref(&r), &[]);
+        assert!(!gate_failed(&manifest, true), "--strict must stay green");
+        // Still visible: opting out is loud, not silent.
+        assert_eq!(
+            manifest.dimensions.cached_reads.entries[0]
+                .acknowledged_stale
+                .as_deref(),
+            Some("ttl of 5s is short enough")
+        );
+        assert!(manifest.summary().contains("1 acknowledged-stale"));
     }
 
     #[test]
@@ -1721,6 +1864,29 @@ mod tests {
         assert!(!reason_is_blank("  x  "));
     }
 
+    /// "Blank" has to mean the same thing on both sides, and `str::trim` — what
+    /// the attribute macros apply — is Unicode-aware. An ASCII-only const check
+    /// would let `acknowledge_stale = "\u{2003}"` through `declare_cached_read!`
+    /// while `#[cached]` rejected it: the same reason accepted or refused
+    /// depending on which form you wrote it in, with the weaker form the way to
+    /// buy a free pass.
+    #[test]
+    fn unicode_whitespace_is_a_blank_reason_too() {
+        for blank in ["\u{2003}", "\u{00a0}", "\u{3000}", "\u{2028}", " \u{2003}\t"] {
+            assert!(
+                reason_is_blank(blank),
+                "{blank:?} is whitespace to `trim`, so it must be blank here too"
+            );
+            assert!(blank.trim().is_empty(), "the premise: {blank:?}");
+        }
+        // A multi-byte non-space is still a reason: the decoder must not
+        // mistake every wide character for whitespace.
+        for reason in ["\u{2003}ok", "日本語", "→ stale is fine"] {
+            assert!(!reason_is_blank(reason), "{reason:?}");
+            assert!(!reason.trim().is_empty(), "the premise: {reason:?}");
+        }
+    }
+
     #[test]
     fn an_identity_claimed_twice_is_reported() {
         let reads = vec![
@@ -1808,6 +1974,64 @@ mod tests {
         // A fill that starts after the invalidation is fine again.
         let after = epoch.load(std::sync::atomic::Ordering::Acquire);
         assert!(fill_is_still_current(&epoch, after));
+    }
+
+    #[test]
+    fn the_fill_fence_inserts_when_current_and_skips_when_invalidated() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            with_fill_fence(&epoch, sampled, || "inserted"),
+            Some("inserted")
+        );
+
+        epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert_eq!(
+            with_fill_fence(&epoch, sampled, || "inserted"),
+            None,
+            "a fill whose epoch moved must not run its insert at all"
+        );
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn an_invalidation_cannot_land_between_the_fence_check_and_the_insert() {
+        // The window the epoch comparison alone leaves open: the check returns
+        // `true`, an invalidation bumps and clears, and the insert lands after
+        // the clear — writing a pre-invalidation value into a namespace that
+        // was just emptied, where it sits until its TTL, or forever without
+        // one. `with_fill_fence` closes it by making the check and the insert
+        // indivisible, which is observable here as an invalidation being unable
+        // to bump the epoch while a fill's insert is running.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+
+        let store = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        let epoch = register_namespace_store("tests::atomic_fill_ns", store);
+        let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+
+        let inserted = with_fill_fence(&epoch, sampled, || {
+            // An invalidation racing this insert must block until it finishes,
+            // not slip in between the check above and the write below.
+            let racer = std::thread::spawn(|| invalidate_namespace("tests::atomic_fill_ns"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let observed = epoch.load(std::sync::atomic::Ordering::Acquire);
+            (racer, observed)
+        });
+
+        let (racer, observed) = inserted.expect("the fill was current, so it must have run");
+        assert_eq!(
+            observed, sampled,
+            "the epoch moved while the insert was running: the check and the \
+             insert are not atomic, so this value would land after the clear"
+        );
+        assert!(racer.join().expect("invalidator thread panicked"));
+        assert!(
+            !fill_is_still_current(&epoch, sampled),
+            "the invalidation must land once the fill releases the fence"
+        );
     }
 
     #[test]

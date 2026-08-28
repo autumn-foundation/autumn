@@ -172,6 +172,12 @@ It is reported in the manifest and in the audit's own output, and
 `autumn cache audit --strict` turns it into a failure for apps that want the
 stronger posture.
 
+An `undetermined` read that also carries `acknowledge_stale` is exempt from
+that, `--strict` included: the acknowledgement is *the* opt-out from this gate,
+and a read whose staleness the author has already signed off on must not fail
+through a second door. It stays visible — under the acknowledged heading, with
+its reason — rather than disappearing.
+
 Read the summary line before you trust a green build:
 
 ```
@@ -230,8 +236,12 @@ pub trait SeedPostRepository {}
 ```
 
 The reason is **mandatory and must be non-blank** — an empty one is a compile
-error. Every acknowledgement is an entry in the manifest, so an escape hatch is
-always visible in review.
+error, and "non-blank" is Unicode-aware, so a lone `U+2003 EM SPACE` does not
+sneak past it. Every acknowledgement is an entry in the manifest, so an escape
+hatch is always visible in review.
+
+An acknowledged read is out of the gate entirely: it is never a violation, and
+never a `--strict` undetermined failure either.
 
 ## Reads the macros cannot see
 
@@ -275,9 +285,24 @@ autumn_web::cache::coherence::register_namespace_store(
 );
 ```
 
-It returns the namespace's fill epoch. Sample it before computing a value and
-re-check it before inserting — `#[cached]` does this for you — or a fill already
-in flight when an invalidation lands will write its stale value back afterwards.
+It returns the namespace's fill epoch. Sample it before computing a value, then
+insert through `with_fill_fence` — `#[cached]` does this for you — or a fill
+already in flight when an invalidation lands will write its stale value back
+afterwards:
+
+```rust
+let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+let value = expensive();
+autumn_web::cache::coherence::with_fill_fence(&epoch, sampled, || {
+    my_cache.insert(&key, &value, ttl);
+});
+```
+
+`with_fill_fence` re-checks the epoch and runs the insert as one indivisible
+step, and `invalidate_namespace` bumps the epoch under the same fence. Checking
+the epoch yourself and inserting afterwards is not equivalent: an invalidation
+can bump and clear between the check and the insert, and the value then lands
+*after* the clear — stale until its TTL, or forever without one.
 
 Because a manual declaration has no `#[cached]` function to hang an identity
 constant on, `invalidates(...)` cannot name it; today such a read is covered by
