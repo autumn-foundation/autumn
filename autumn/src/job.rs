@@ -3813,6 +3813,11 @@ impl JobClient {
     /// failure-capsule seam. Takes the reference instant for the same reason
     /// [`enqueue_with_outcome_due_inner`](Self::enqueue_with_outcome_due_inner)
     /// does.
+    ///
+    /// Carries its wrapper's `db` gate: the body names `AsyncPgConnection`,
+    /// `pg_pool` and the postgres enqueue helpers, none of which exist without
+    /// it.
+    #[cfg(feature = "db")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_on_conn_due_inner(
         &self,
