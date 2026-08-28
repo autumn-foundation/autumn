@@ -298,6 +298,12 @@ const ACTIVITY_WINDOW_DAYS: i64 = 30;
 // `bucket`, `filter_range`) issue nothing, so the ceiling is 2 (#1667).
 #[query_budget(2)]
 pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
+    // Time the two aggregates with the metrics facade. The guard records on
+    // drop, so a `?` on either query below is covered too; it is bound to a
+    // named variable because `let _ = ...` would drop it immediately and
+    // record a duration of roughly zero. See `docs/guide/metrics.md`.
+    let stats_timing = crate::metrics::time_stats_query();
+
     // Top tags by bookmark count, largest first: `COUNT(*) GROUP BY tag`
     // ordered on the aggregate and capped — the whole top-N runs in the DB.
     let by_tag: Vec<(String, i64)> = repo
@@ -319,6 +325,11 @@ pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
         .await?;
     // The database groups in no defined order; sort into a chronological series.
     per_day.sort_by_key(|(day, _)| *day);
+
+    // Resolve the guard here rather than letting it drop at the end of the
+    // handler, so the histogram measures the aggregate queries and not the
+    // markup rendering that follows.
+    stats_timing.stop();
 
     Ok(layout(
         "Stats",
@@ -493,6 +504,11 @@ pub async fn create(
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let changeset = form.into_changeset();
     if !changeset.is_valid() {
+        // App-metrics facade (#1378): one line at the call site, no type to
+        // define and nothing registered with `AppBuilder`. Both outcomes are
+        // counted so `rate(bookmarks_created_total{outcome="rejected"}[5m])`
+        // can alert on a form that suddenly stops validating.
+        crate::metrics::record_created(crate::metrics::outcome::REJECTED);
         return Ok((
             StatusCode::UNPROCESSABLE_ENTITY,
             new_bookmark_form(&changeset),
@@ -506,6 +522,7 @@ pub async fn create(
         tag: data.tag,
     };
     repo.save(&new).await?;
+    crate::metrics::record_created(crate::metrics::outcome::CREATED);
     Ok(Redirect::to("/bookmarks").into_response())
 }
 

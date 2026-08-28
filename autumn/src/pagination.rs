@@ -764,11 +764,12 @@ const BASE64URL_ALPHABET: &[u8; 64] =
 // an MSRV the project may want to hold. Not a trade worth making for an
 // incidental cleanup; revisit when the MSRV moves past 1.88.
 //
-// `unknown_lints` is allowed alongside it because the lint has since been
-// renamed away on current stable clippy, where a bare `allow` of a name it no
-// longer knows is itself an error under `-D warnings`. Keeping both means the
-// intent above holds on the MSRV toolchain that still has the lint AND on a
-// newer one that does not, without pinning either.
+// `unknown_lints` is allowed alongside it because the lint below does not exist
+// on every toolchain the workspace is built with, in *either* direction: it was
+// added in 1.98 (the MSRV lane is 1.88) and has since been renamed away on
+// current stable. On any toolchain that does not know the name, a bare `allow`
+// of it is itself a `-D warnings` failure, so the allow has to be forward- and
+// backward-compatible to be useful.
 #[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn base64url_encode(input: &[u8]) -> String {

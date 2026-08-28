@@ -93,7 +93,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer adding operational features to an existing Autumn app |
 | **Journey** | Profiles/tasks: generated CRUD API, actuator endpoints, profile-based config, hourly scheduled task |
-| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering |
+| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering, app-metrics facade (`autumn_web::metrics` counter + timer on `/actuator/prometheus`) |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p bookmarks` |
 | **Success proof** | `curl http://localhost:3000/actuator/health` returns `{"status":"UP"}` |
@@ -107,11 +107,11 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer deploying an Autumn app at production scale with read replicas |
-| **Journey** | Distributed deployment: primary/replica Postgres, Redis-optional, multi-replica web tier behind nginx, one-shot migrator |
-| **Key capabilities** | Explicit repository seam, partitioned `#[scheduled]` with advisory locks, `autumn-{profile}.toml` layering, Docker Compose topology |
+| **Journey** | Distributed deployment: primary/replica Postgres, Redis-optional, multi-replica web tier behind nginx, one-shot migrator, and a two-node cluster the replicas form between themselves |
+| **Key capabilities** | Explicit repository seam, partitioned `#[scheduled]` with advisory locks, `autumn-{profile}.toml` layering, Docker Compose topology, self-clustering substrate (`[cluster]`, `ClusterHandle`, cluster-wide counter, `cluster:membership` health) |
 | **Prerequisites** | Docker and Docker Compose |
 | **Run command** | `docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --build` |
-| **Success proof** | `curl http://localhost:3000/api/bookmarks` returns `[]` after the stack is healthy |
+| **Success proof** | `curl http://localhost:3000/api/bookmarks` returns `[]` after the stack is healthy; `curl http://localhost:3000/cluster` reports a two-member view whose `node` alternates between `web-1` and `web-2` |
 
 ---
 
@@ -153,7 +153,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
 | **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, cookie consent, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), and cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow) |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve) |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML *and* the cookie-consent banner; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts; `curl 'http://localhost:3000/r/rust?page=2'` returns page 2 with a `<nav aria-label="Pagination">` of plain links |
@@ -295,12 +295,12 @@ can pick the closest starting point without overlap.
 | WASM island | `flock` | Server-rendered maud page that mounts a Yew CSR "literary boids" wasm widget on `GET /` |
 | CRUD + MCP | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, bearer-token API, and MCP tool projection |
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
-| Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
-| Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
+| Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task, app-metrics counter + timer |
+| Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, a two-node self-clustering substrate with no coordination service, Docker Compose |
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
-| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination — the complete feature showcase |
+| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |

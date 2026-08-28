@@ -185,6 +185,15 @@ where
             }
         }
 
+        // Web Push (#1392) distinguishes client-fault failures (a malformed
+        // browser subscription, an endpoint already claimed) from server-fault
+        // ones, so an app calling `push.subscribe(…).await?` from its own
+        // handler gets the same status the built-in push router would return
+        // rather than a blanket 500.
+        if let Some(push_err) = any_err.downcast_ref::<crate::push::PushError>() {
+            status = push_err.status();
+        }
+
         if matches!(
             any_err.downcast_ref::<crate::lock::LockError>(),
             Some(
