@@ -27,7 +27,7 @@
 //! |---|---|---|
 //! | [`with_mail_interceptor`](crate::app::AppBuilder::with_mail_interceptor) | [`MailInterceptor`] | every outgoing [`Mail`](crate::mail::Mail) delivery |
 //! | [`with_job_interceptor`](crate::app::AppBuilder::with_job_interceptor) | [`JobInterceptor`] | every job enqueue **and** every job execution |
-//! | [`with_db_interceptor`](crate::app::AppBuilder::with_db_interceptor) | [`DbConnectionInterceptor`] | every pooled connection checkout |
+//! | [`with_db_interceptor`](crate::app::AppBuilder::with_db_interceptor) | [`DbConnectionInterceptor`] | checkouts through `Db::checkout` — **not** the scheduler's or job runtime's; see [`DbConnectionInterceptor`] |
 //! | [`with_channels_interceptor`](crate::app::AppBuilder::with_channels_interceptor) | [`ChannelsInterceptor`] | every channel publish |
 //! | [`with_http_interceptor`](crate::app::AppBuilder::with_http_interceptor) | [`HttpInterceptor`] | outbound requests through `auth::HttpClient` (the `oauth2` path) — **not** every outbound request; see [`HttpInterceptor`] |
 //!
@@ -159,7 +159,15 @@ pub struct DbCheckoutContext {
     pub pool_name: String,
 }
 
-/// Wraps every pooled database connection checkout.
+/// Wraps connection checkouts made through the [`Db`](crate::db::Db) extractor
+/// and the shard-routed paths — that is, `Db::checkout`.
+///
+/// **Not every pooled checkout.** `Db::checkout` is the only caller that runs
+/// this chain, so background subsystems that take a connection straight from
+/// the pool — the scheduler, the job runtime — do not pass through it. Use it
+/// for request-path latency, budgets, or fault injection; do not rely on it as
+/// a complete audit of pool usage, because the work that runs outside a request
+/// is exactly what it cannot see.
 ///
 /// This is the hook the test harness uses to implement transactional test
 /// isolation: it hands every checkout the *same* connection, already inside a

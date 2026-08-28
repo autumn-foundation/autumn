@@ -12,7 +12,24 @@ problem is most of the work:
 | **Validation** | deciding whether a value is acceptable, and saying why | `#[validate(...)]`, `Valid<T>` |
 | **Normalization** | making an acceptable value *canonical* before it is stored | `#[normalize(...)]` |
 
-They compose in that order on every write: normalize, then validate, then save.
+Those three layers run in two distinct places, and conflating them is the
+single easiest way to write a validator that rejects input you meant to accept:
+
+- **The form layer validates first, on raw input.** `ChangesetForm` extraction
+  calls `IntoChangeset`, which runs `validator::Validate` on the value exactly
+  as it was decoded from the body — before any handler code, and before any
+  repository sees it.
+- **The repository layer then normalizes, validates, and saves**, in that order.
+  This is the pipeline `#[normalize(...)]` belongs to.
+
+So `normalize, then validate, then save` is true of the **model write path**,
+not of the form. A form-level `#[validate(email)]` sees `" Alice@example.com "`
+with its spaces intact and rejects it, even though the model carries
+`#[normalize(trim)]` and would have canonicalized it a moment later.
+
+Design around it: keep form-level validators tolerant of what a human actually
+types (shape and length, not exact canonical form), and put the rules that
+assume a canonical value on the model, where normalization has already run.
 
 ---
 

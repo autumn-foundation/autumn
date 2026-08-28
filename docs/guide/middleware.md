@@ -142,9 +142,17 @@ each has its own interceptor trait installed on the builder:
 |---|---|---|
 | `with_mail_interceptor` | `MailInterceptor` | every outgoing `Mail` delivery |
 | `with_job_interceptor` | `JobInterceptor` | every job enqueue **and** every job execution |
-| `with_db_interceptor` | `DbConnectionInterceptor` | every pooled connection checkout |
+| `with_db_interceptor` | `DbConnectionInterceptor` | checkouts through `Db::checkout` — see the caveat below |
 | `with_channels_interceptor` | `ChannelsInterceptor` | every channel publish |
 | `with_http_interceptor` | `HttpInterceptor` | outbound requests sent through `auth::HttpClient` — see the caveat below |
+
+Two of these do not mean *every*, and both gaps are in the same direction —
+work that happens outside a request is what escapes.
+
+`DbConnectionInterceptor` sees only checkouts made through `Db::checkout` (the
+`Db` extractor and the shard-routed paths). The scheduler and the job runtime
+take connections straight from the pool, so a hook used for auditing or fault
+injection will not observe them. It is a request-path tool.
 
 `HttpInterceptor` is the one to read the fine print on. Only
 `auth::HttpRequestBuilder::send` consults the interceptor list, and that type

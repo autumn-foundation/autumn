@@ -742,7 +742,12 @@ pub async fn submit(
     // Ensure unique slug within this subreddit by appending a suffix
     let slug = unique_slug(&base_slug, subreddit_id, &mut db).await?;
 
-    let body = valid.body.trim().to_string();
+    // NOT trimmed, unlike the title. The body is Markdown source, and leading
+    // whitespace is syntax: four spaces make a CommonMark code block, and
+    // trailing spaces make a hard line break. Trimming it silently reformats
+    // what the author wrote — and this app stores the source and renders at
+    // display time precisely so the author's original survives editing.
+    let body = valid.body.clone();
     let subreddit_slug = sub.slug.clone();
 
     let new_post = crate::models::NewPost {
@@ -1328,7 +1333,9 @@ pub async fn update(
     let changes = crate::models::UpdatePost {
         title: Patch::Set(title),
         slug: Patch::Set(new_slug.clone()),
-        body: Patch::Set(valid.body.trim().to_string()),
+        // Not trimmed, for the same reason as the create path: this is
+        // Markdown source, where leading and trailing whitespace carry meaning.
+        body: Patch::Set(valid.body.clone()),
         ..Default::default()
     };
     let sub: Subreddit = subreddits::table
@@ -1754,6 +1761,30 @@ mod tests {
     }
 
     // ── Rich text (#1255) ──────────────────────────────────────────
+
+    /// Leading whitespace in a Markdown body is syntax, not padding — which is
+    /// why neither write path trims the body the way both trim the title. Four
+    /// spaces make a CommonMark code block; trimming the source turns the
+    /// author's code sample into a paragraph, silently and permanently, since
+    /// this app stores the source rather than the rendered HTML.
+    #[test]
+    fn leading_indentation_is_markdown_syntax_and_must_survive_storage() {
+        let authored = "    let x = 1;";
+
+        let kept = autumn_web::markdown::render_user_content(authored).into_string();
+        assert!(
+            kept.contains("<code>"),
+            "four-space indentation must still render as a code block: {kept}"
+        );
+
+        // What a `.trim()` on the stored body would have produced instead.
+        let trimmed = autumn_web::markdown::render_user_content(authored.trim()).into_string();
+        assert!(
+            !trimmed.contains("<code>"),
+            "this is the regression being guarded against — if trimming stops \
+             changing the output, this test no longer proves anything: {trimmed}"
+        );
+    }
 
     #[test]
     fn a_post_body_is_rendered_as_sanitized_markdown() {
