@@ -112,6 +112,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration;` the generated tests were never built and `cargo test capsule_`
   matched nothing — which `autumn capsule verify` now reports as unusable
   rather than as a clean corpus.
+  Replay also dispatches a recorded job through the application's
+  `JobInterceptor` when one is registered, since that is part of how the
+  recorded run executed; an `enqueue_after_commit` is recorded where the
+  handler registers it, because the deferred callback runs on a task that does
+  not inherit the capture scope and the enqueue would otherwise be missing from
+  the capsule and diverge on every faithful replay; the generated support
+  module names Axum through `autumn_web::reexports::axum`, which is the only
+  path that resolves in an application that does not depend on Axum directly;
+  and a non-UTF-8 outbound response header is preserved lossily rather than
+  recorded as empty.
 
 ### Fixed
 

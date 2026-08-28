@@ -820,9 +820,18 @@ impl OutboundRecorder {
                     .headers
                     .iter()
                     .map(|(name, value)| {
+                        // A header value is bytes, not text. Replacing an
+                        // opaque non-UTF-8 value with an empty string would
+                        // hand replay a header the peer never sent, and code
+                        // reading it through `as_bytes()` would branch on
+                        // nothing; the lossy form at least preserves its shape
+                        // and length rather than deleting it.
                         (
                             name.as_str().to_owned(),
-                            value.to_str().unwrap_or_default().to_owned(),
+                            value.to_str().map_or_else(
+                                |_| String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                ToOwned::to_owned,
+                            ),
                         )
                     })
                     .collect(),

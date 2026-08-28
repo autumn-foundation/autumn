@@ -688,7 +688,14 @@ pub async fn execute_job(
     let payload = job.payload.clone();
     let run = crate::capsule::effects::with_effect_tape(
         fixtures.effects(),
-        crate::capsule::clock::with_replay_request_scope(async move { dispatch(payload).await }),
+        crate::capsule::clock::with_replay_request_scope(async move {
+            // The marker that says the recorded clock and entropy were actually
+            // served is otherwise set only by `ReportingLayer`, which a direct
+            // job dispatch never traverses — so without this every faithful job
+            // replay warns that fixtures it *did* serve went unused.
+            let _ = crate::capsule::effects::tape_active();
+            dispatch(payload).await
+        }),
     );
     let actual = match AssertUnwindSafe(run).catch_unwind().await {
         Ok(Ok(())) => CapsuleOutcome::Status {

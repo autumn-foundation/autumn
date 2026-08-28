@@ -2430,6 +2430,80 @@ const TRANSACTIONAL_ENQUEUE_NOTE: &str = "the run enqueued a job inside its own 
      records both as an enqueue and as the job-row INSERT on the database tape; replay can \
      serve the first but never issue the second, so the recording is not replayable";
 
+/// Run one job handler with the application's `JobInterceptor` applied, if it
+/// registered one.
+///
+/// The interceptor is part of how a job *executes*: an application can use it
+/// to reject, wrap, time or short-circuit a run, so a capsule recorded with one
+/// installed describes an execution that went through it. Replay dispatches a
+/// recorded job directly rather than through a worker, and so needs this to
+/// take the same path — otherwise a capsule whose failure came from the
+/// interceptor replays without it and reports a mismatch against code nobody
+/// changed.
+///
+/// The interceptor is read from the state's extensions, which is the same place
+/// [`run_job_handler_inner`] reads it, so the two cannot disagree about which
+/// interceptor is in force.
+pub(crate) async fn run_handler_with_interceptor(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+) -> AutumnResult<()> {
+    let interceptor = state
+        .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+        .map(|arc| (*arc).clone());
+    let payload_for_handler = payload.clone();
+    let next = Box::pin(async move { (handler)(state, payload_for_handler).await });
+    match interceptor {
+        Some(interceptor) => interceptor.intercept_execute(name, &payload, next).await,
+        None => next.await,
+    }
+}
+
+/// Record an after-commit enqueue at the moment the handler *registers* it.
+///
+/// The deferred callback runs from `tokio::task::spawn`, which does not inherit
+/// task-locals, so the capture scope is gone by the time the enqueue actually
+/// reaches a backend and nothing would be recorded at all. Replay, meanwhile,
+/// answers from the tape here at the registration point — so without this every
+/// faithful `enqueue_after_commit` would find an empty tape and diverge.
+///
+/// Recording at registration is also the more honest of the two: what the
+/// capsule is describing is the handler's behaviour, and "this handler asks for
+/// a job once its transaction commits" is exactly that. The backend outcome is
+/// not knowable here (it happens after the response), so the entry carries no
+/// error, and a transaction that rolls back leaves a recorded enqueue that
+/// never reached a queue — the same thing the handler asked for either way.
+#[cfg(feature = "reporting")]
+fn record_after_commit_enqueue(name: &str, payload: &Value, schedule: EnqueueSchedule) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    let Some(index) = scope.reserve_job_enqueue() else {
+        return;
+    };
+    let (delay_secs, due_at) = match schedule {
+        EnqueueSchedule::Immediate => (None, None),
+        EnqueueSchedule::After(delay) => (Some(delay), None),
+        EnqueueSchedule::At(deadline) => (None, Some(deadline)),
+    };
+    scope.fill_job_enqueue(
+        index,
+        crate::capsule::JobEffect {
+            name: name.to_owned(),
+            payload: capsule_job_payload(payload),
+            delay_secs,
+            due_at,
+            error: None,
+        },
+    );
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_after_commit_enqueue(_name: &str, _payload: &Value, _schedule: EnqueueSchedule) {}
+
 /// A relative delay in whole seconds, for the capsule's enqueue comparison.
 ///
 /// Saturating rather than `as`: this module's panic gate denies
@@ -2895,6 +2969,9 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
     if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
         return answer;
     }
+    // Recorded here, where replay also answers: the deferred callback
+    // runs without this task's capture scope, so nothing else would.
+    record_after_commit_enqueue(name, &payload, EnqueueSchedule::Immediate);
     let Some(client) = global_job_client() else {
         return Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime is not initialized; register jobs with AppBuilder::jobs()",
@@ -2929,6 +3006,9 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
     {
         return answer;
     }
+    // Recorded here, where replay also answers: the deferred callback
+    // runs without this task's capture scope, so nothing else would.
+    record_after_commit_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)));
     let Some(client) = global_job_client() else {
         return Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime is not initialized; register jobs with AppBuilder::jobs()",
@@ -2960,6 +3040,9 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
     if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
         return answer;
     }
+    // Recorded here, where replay also answers: the deferred callback
+    // runs without this task's capture scope, so nothing else would.
+    record_after_commit_enqueue(name, &payload, EnqueueSchedule::At(when));
     let Some(client) = global_job_client() else {
         return Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime is not initialized; register jobs with AppBuilder::jobs()",

@@ -6300,8 +6300,11 @@ impl AppBuilder {
             // *job-entry* capsule can dispatch the recorded job's handler
             // (#1634). No job runtime, scheduler or backend is started: the
             // handler is called directly, exactly once, with the recorded
-            // payload.
+            // payload — through the application's `JobInterceptor` when it
+            // registered one, since that is part of how the recorded run
+            // executed and dropping it would replay a different path.
             jobs,
+            job_interceptor,
             // F15: deliberately *not* destructured. A store installed with
             // `with_session_store(...)` outranks `config.session.backend` in
             // `apply_session_layer`, so forwarding it would let a replay dial —
@@ -6510,8 +6513,16 @@ impl AppBuilder {
             };
             let handler = info.handler;
             let job_state = router_state.clone();
-            let dispatch: crate::capsule::JobDispatch =
-                Box::new(move |payload| Box::pin(async move { handler(job_state, payload).await }));
+            if let Some(interceptor) = job_interceptor {
+                job_state.insert_extension(interceptor);
+            }
+            let job_name = job.name.clone();
+            let dispatch: crate::capsule::JobDispatch = Box::new(move |payload| {
+                Box::pin(async move {
+                    crate::job::run_handler_with_interceptor(&job_name, handler, job_state, payload)
+                        .await
+                })
+            });
             crate::capsule::execute_job(dispatch, &capsule, divergences, &fixtures).await
         } else {
             crate::capsule::execute(router, &capsule, divergences, &fixtures).await

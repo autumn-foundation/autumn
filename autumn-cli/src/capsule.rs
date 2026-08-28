@@ -376,7 +376,7 @@ use autumn_web::capsule::regression::RegressionContext;
 use autumn_web::test::TestApp;
 
 /// Build the application router a capsule replays against.
-pub fn router(ctx: &RegressionContext<'_>) -> axum::Router {
+pub fn router(ctx: &RegressionContext<'_>) -> autumn_web::reexports::axum::Router {
     TestApp::new()
         // TODO: add the routes your capsules exercise, e.g.
         //   .routes(autumn_web::routes![checkout, charge])
