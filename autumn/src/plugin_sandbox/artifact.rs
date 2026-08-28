@@ -32,6 +32,14 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Distinguishes concurrent `write_file` calls within one process.
+///
+/// The pid separates processes; this separates threads and repeat calls, so two
+/// packagings racing on the same output directory cannot collide on the
+/// temporary name and turn each other's `create_new` into an error.
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 use sha2::{Digest as _, Sha256};
 
@@ -374,21 +382,53 @@ impl SandboxArtifact {
     /// Returns [`ArtifactError::Io`] if the file cannot be written, or a
     /// [`to_bytes`](Self::to_bytes) error.
     pub fn write_file(&self, path: &Path) -> Result<(), ArtifactError> {
+        use std::io::Write as _;
+
         let bytes = self.to_bytes()?;
         // Write beside the target and rename, so a failure part-way through
         // cannot leave a truncated artifact where a good one was. A rename is
         // atomic on every platform this runs on.
-        let temporary = path.with_extension("autumn-plugin-tmp");
-        std::fs::write(&temporary, bytes).map_err(|err| ArtifactError::Io {
-            path: temporary.clone(),
-            kind: err.kind(),
-            detail: err.to_string(),
-        })?;
-        std::fs::rename(&temporary, path).map_err(|err| ArtifactError::Io {
+        //
+        // The temporary name is unique *and* the file is created with
+        // `create_new`, which is the half that matters: a predictable sibling
+        // that `std::fs::write` opens is a file it will truncate and a symlink
+        // it will follow, so packaging in a checkout the author did not write
+        // became a write primitive aimed at anything the user can write.
+        // `create_new` fails on anything already there — a symlink included —
+        // rather than resolving it.
+        let unique = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!(
+            "autumn-plugin-tmp-{pid}-{unique}",
+            pid = std::process::id()
+        ));
+
+        let io = |path: &Path, err: &std::io::Error| ArtifactError::Io {
             path: path.to_path_buf(),
             kind: err.kind(),
             detail: err.to_string(),
-        })
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|err| io(&temporary, &err))?;
+
+        // From here the temporary exists, so every failure has to remove it —
+        // leaving debris beside the artifact would make the next run's
+        // `create_new` the thing that fails.
+        if let Err(err) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(io(&temporary, &err));
+        }
+        drop(file);
+
+        if let Err(err) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(io(path, &err));
+        }
+        Ok(())
     }
 }
 
@@ -668,6 +708,31 @@ path = "/hello/greet"
                 }
             ),
             "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_never_follows_something_already_sitting_at_the_temporary_path() {
+        // The temporary sibling had a name anyone could predict, and
+        // `std::fs::write` truncates through a symlink. In a checkout the
+        // author did not write, that turns `autumn plugin package` into a
+        // write primitive aimed at any file the user can write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("precious");
+        std::fs::write(&victim, b"do not clobber me").expect("victim written");
+
+        let path = dir.path().join("hello.autumn-plugin");
+        let predictable = path.with_extension("autumn-plugin-tmp");
+        std::os::unix::fs::symlink(&victim, &predictable).expect("symlink");
+
+        // Packaging may succeed or refuse, but it must not write through the
+        // link: the victim's contents are what this is about.
+        let _ = sealed().write_file(&path);
+        assert_eq!(
+            std::fs::read(&victim).expect("victim still readable"),
+            b"do not clobber me",
+            "packaging wrote through a symlink at the temporary path"
         );
     }
 

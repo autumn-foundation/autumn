@@ -329,8 +329,7 @@ request pins outside it, counted at their simultaneous peak:
 | `memory_bytes` | the guest instance's linear memory |
 | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded into the NDJSON line that becomes the guest's stdin — all live at once |
 | table storage | the instance's tables, bounded to 16,384 references |
-| `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
-| `max_response_bytes` | the decoded response, once the frame parses |
+| `5 × max_response_bytes` | the response side peaks while the answer is *parsed*, not after: the raw NDJSON line the guest wrote is still live (up to `2 ×`), the base64 field may be copied out of it, and the decoded body is allocated while both are held |
 
 A manifest with a tiny `memory_bytes` and 64 MiB body/response ceilings would
 pass a memory-only check and still allocate hundreds of gigabytes, so the

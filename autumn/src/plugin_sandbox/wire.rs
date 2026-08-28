@@ -270,8 +270,15 @@ mod body_b64 {
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        let raw = String::deserialize(de)?;
-        BASE64.decode(&raw).map_err(serde::de::Error::custom)
+        // `Cow`, not `String`: base64's alphabet contains nothing JSON escapes,
+        // so an honest frame borrows straight out of the line the guest wrote
+        // and the decode is the only allocation. A guest that writes `\u0041`
+        // forces the owned copy — which is why the footprint still budgets for
+        // it — but it cannot make that the ordinary case.
+        let raw = std::borrow::Cow::<'de, str>::deserialize(de)?;
+        BASE64
+            .decode(raw.as_ref())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -365,21 +372,45 @@ impl SandboxResponse {
     /// Returns the offending type so the caller can record a denial naming it.
     #[must_use]
     pub fn refused_content_type(&self) -> Option<String> {
-        let declared = self
+        // *Every* declared type, not the first. Header values are appended to
+        // the response, so a second `content-type` reaches the client too, and
+        // a proxy or client that takes the last one sees whatever it says. A
+        // check that read only the first would enforce the allowlist against
+        // the value a guest least wanted to smuggle anything through.
+        let mut declared = self
             .headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value.clone())?;
-        let essence = declared
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&essence.as_str()) {
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            });
+
+        let first = declared.next()?;
+
+        // Two content-types is not a response any client agrees on the meaning
+        // of, so it is refused whether or not both are allowed: "the allowlist
+        // passed one of them" is not a property worth having. The refused type
+        // reported is whichever one is actually off the list, so the denial
+        // names the interesting header rather than the first one.
+        if let Some(extra) = declared.next() {
+            return Some(
+                if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&extra.as_str()) {
+                    first
+                } else {
+                    extra
+                },
+            );
+        }
+
+        if ALLOWED_RESPONSE_CONTENT_TYPES.contains(&first.as_str()) {
             None
         } else {
-            Some(essence)
+            Some(first)
         }
     }
 
@@ -730,6 +761,46 @@ mod tests {
         let HostFrame::Request { headers, .. } =
             HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
         assert_eq!(headers.len(), 6, "{headers:?}");
+    }
+
+    #[test]
+    fn a_second_content_type_cannot_smuggle_a_document_past_the_allowlist() {
+        // The allowlist exists because a response is served from the host's
+        // own origin, so this slice serves data and not documents. Checking
+        // only the *first* content-type does not enforce that: header values
+        // are appended, so both reach the client, and a proxy or client that
+        // takes the last one sees the document.
+        let response = SandboxResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".to_owned(), "text/plain".to_owned()),
+                ("content-type".to_owned(), "text/html".to_owned()),
+            ],
+            body: b"<script>alert(1)</script>".to_vec(),
+        };
+        assert!(
+            response.refused_content_type().is_some(),
+            "a second content-type crossed the boundary unchecked"
+        );
+
+        // And the reverse order, so this is not passing by luck of ordering.
+        let response = SandboxResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".to_owned(), "text/html".to_owned()),
+                ("content-type".to_owned(), "text/plain".to_owned()),
+            ],
+            body: Vec::new(),
+        };
+        assert!(response.refused_content_type().is_some());
+
+        // One allowed type is still allowed.
+        let response = SandboxResponse {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+            body: Vec::new(),
+        };
+        assert_eq!(response.refused_content_type(), None);
     }
 
     #[test]

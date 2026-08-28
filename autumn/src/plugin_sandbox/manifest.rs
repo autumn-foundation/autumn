@@ -231,8 +231,7 @@ impl ResourceLimits {
     /// | --- | --- |
     /// | `memory_bytes` | the guest instance's linear memory |
     /// | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded (≈4/3) into the NDJSON line that becomes the guest's stdin — all live at once |
-    /// | `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
-    /// | `max_response_bytes` | the decoded response, once the frame parses |
+    /// | `5 × max_response_bytes` | the response side peaks while the answer is *parsed*, not after: the raw NDJSON line is still live (up to `2 ×`), the base64 field may be copied out of it (`~1.34 ×`, when a guest escapes it), and the decoded body is allocated while both are held |
     /// | table storage | bounded per instance by `MAX_TABLE_ELEMENTS`, at 16 bytes a reference |
     ///
     /// The request terms are deliberately counted at their *simultaneous* peak
@@ -246,7 +245,7 @@ impl ResourceLimits {
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
-            .saturating_add((self.max_response_bytes as u128).saturating_mul(3))
+            .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
             // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
             // generous 16 bytes a reference. Small, but per-instance storage
             // the footprint would otherwise not know about at all.
@@ -1215,7 +1214,28 @@ max_concurrency = 8
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 4 * 100_000 + 3 * 10_000 + tables + 4096
+            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + 4096
+        );
+    }
+
+    #[test]
+    fn the_footprint_counts_the_peak_while_a_response_is_being_decoded() {
+        // Parsing the guest's answer is where the response side actually
+        // peaks: the raw NDJSON line is still live (up to 2x the ceiling), the
+        // base64 field may be copied out of it, and the decoded body is
+        // allocated while both are held. A term that counted only "the line
+        // plus the decoded response" described a moment that never happens.
+        let limits = ResourceLimits {
+            memory_bytes: 0,
+            max_request_body_bytes: 0,
+            max_response_bytes: 1_000_000,
+            ..ResourceLimits::default()
+        };
+        let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
+        assert_eq!(
+            limits.request_footprint_bytes(),
+            5 * 1_000_000 + tables + 4096,
+            "the response term must cover the line, the base64 copy and the decode at once"
         );
     }
 
