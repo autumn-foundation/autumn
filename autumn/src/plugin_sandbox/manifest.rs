@@ -82,6 +82,9 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// of gigabytes. See [`ResourceLimits::request_footprint_bytes`].
 pub const MAX_FOOTPRINT_BYTES: u128 = 1024 * 1024 * 1024;
 
+/// Upper bound on a manifest's declared request-body deadline (60 s).
+pub const MAX_REQUEST_BODY_TIMEOUT_MS: u64 = 60_000;
+
 /// Upper bound on a manifest's declared concurrency ceiling.
 ///
 /// Each in-flight request holds its own instance, and each instance may hold up
@@ -191,6 +194,16 @@ pub struct ResourceLimits {
     pub max_response_bytes: usize,
     /// Largest number of requests this plugin may execute concurrently.
     pub max_concurrency: usize,
+    /// How long the host will wait for a request body before giving up, in
+    /// milliseconds.
+    ///
+    /// A request holds its concurrency permit from the moment it is admitted —
+    /// that is what makes the footprint below a bound on the whole request and
+    /// not just on the part a guest is running. Without a deadline, a client
+    /// that dribbles a body could hold a permit indefinitely without ever
+    /// starting a guest, and `max_concurrency` such clients would shut the
+    /// plugin's prefix with 503s while no sandbox was executing anything.
+    pub request_body_timeout_ms: u64,
 }
 
 impl Default for ResourceLimits {
@@ -204,6 +217,7 @@ impl Default for ResourceLimits {
             max_request_body_bytes: 1024 * 1024,
             max_response_bytes: 4 * 1024 * 1024,
             max_concurrency: 8,
+            request_body_timeout_ms: 5_000,
         }
     }
 }
@@ -219,6 +233,7 @@ impl ResourceLimits {
     /// | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded (≈4/3) into the NDJSON line that becomes the guest's stdin — all live at once |
     /// | `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
     /// | `max_response_bytes` | the decoded response, once the frame parses |
+    /// | table storage | bounded per instance by `MAX_TABLE_ELEMENTS`, at 16 bytes a reference |
     ///
     /// The request terms are deliberately counted at their *simultaneous* peak
     /// rather than at what any one of them costs: a ceiling that assumed the
@@ -232,11 +247,15 @@ impl ResourceLimits {
         (self.memory_bytes as u128)
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(3))
+            // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
+            // generous 16 bytes a reference. Small, but per-instance storage
+            // the footprint would otherwise not know about at all.
+            .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
             .saturating_add(4096)
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
-        let checks: [(&str, u128, u128); 5] = [
+        let checks: [(&str, u128, u128); 6] = [
             ("fuel", u128::from(self.fuel), u128::from(MAX_FUEL)),
             (
                 "memory_bytes",
@@ -257,6 +276,11 @@ impl ResourceLimits {
                 "max_concurrency",
                 self.max_concurrency as u128,
                 MAX_CONCURRENCY as u128,
+            ),
+            (
+                "request_body_timeout_ms",
+                u128::from(self.request_body_timeout_ms),
+                u128::from(MAX_REQUEST_BODY_TIMEOUT_MS),
             ),
         ];
         for (field, value, max) in checks {
@@ -596,12 +620,14 @@ impl SandboxManifest {
         out.push_str("  resource ceilings per request:\n");
         let _ = writeln!(
             out,
-            "    cpu {fuel} fuel units, memory {memory} bytes, request body {body} bytes,\n    \
-             response {response} bytes, at most {concurrency} concurrent requests",
+            "    cpu {fuel} fuel units, memory {memory} bytes, request body {body} bytes\n    \
+             (read within {body_ms} ms), response {response} bytes, at most {concurrency} \
+             concurrent requests",
             fuel = self.limits.fuel,
             memory = self.limits.memory_bytes,
             body = self.limits.max_request_body_bytes,
             response = self.limits.max_response_bytes,
+            body_ms = self.limits.request_body_timeout_ms,
             concurrency = self.limits.max_concurrency,
         );
         out
@@ -1178,16 +1204,18 @@ max_concurrency = 8
     fn the_footprint_counts_every_buffer_a_request_holds_at_once() {
         // The request body is buffered, cloned into the frame, and
         // base64-expanded into the NDJSON line that becomes the guest's stdin —
-        // three live copies of an expanding thing, not one.
+        // three live copies of an expanding thing, not one — and the instance's
+        // tables are per-instance host storage too.
         let limits = ResourceLimits {
             memory_bytes: 1_000_000,
             max_request_body_bytes: 100_000,
             max_response_bytes: 10_000,
             ..ResourceLimits::default()
         };
+        let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 4 * 100_000 + 3 * 10_000 + 4096
+            1_000_000 + 4 * 100_000 + 3 * 10_000 + tables + 4096
         );
     }
 

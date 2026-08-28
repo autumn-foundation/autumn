@@ -346,59 +346,16 @@ async fn serve(
         return response;
     };
 
-    let path_params: Vec<(String, String)> = params
-        .iter()
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect();
-
-    let (parts, body) = request.into_parts();
-    // The nested router rewrote the URI, so the concrete path the caller asked
-    // for comes from the original.
-    let path = parts
-        .extensions
-        .get::<axum::extract::OriginalUri>()
-        .map_or_else(
-            || parts.uri.path().to_owned(),
-            |original| original.0.path().to_owned(),
-        );
-    let query = parts.uri.query().unwrap_or_default().to_owned();
-    let headers: Vec<(String, String)> = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
-
-    // The ceiling is applied while reading, so an oversized body is refused
-    // without ever being buffered in full.
-    let Ok(body) = axum::body::to_bytes(body, limits.max_request_body_bytes).await else {
-        tracing::warn!(
-            plugin,
-            max_request_body_bytes = limits.max_request_body_bytes,
-            "request body over the sandboxed plugin's declared ceiling; refusing it"
-        );
-        return sandbox_error(&plugin, StatusCode::PAYLOAD_TOO_LARGE);
-    };
-    let body = body.to_vec();
-
-    let sandbox_request = SandboxRequest {
-        method: parts.method.as_str().to_owned(),
-        route: pattern,
-        path,
-        query,
-        path_params,
-        headers,
-        body,
+    let request = match read_request(&plugin, limits, pattern, &params, request).await {
+        Ok(request) => request,
+        Err(response) => return response,
     };
 
     // `wasmi` is a synchronous interpreter: running it on the async runtime
     // would block a worker for the whole fuel budget. `spawn_blocking` also
     // means a panic anywhere in the host shim surfaces as a `JoinError` here
     // instead of unwinding through the request task.
+    //
     // The permit moves INTO the closure. A `spawn_blocking` task is never
     // cancelled — dropping its handle detaches it — so a permit held by this
     // future would be released the instant a client disconnects while the
@@ -407,7 +364,7 @@ async fn serve(
     // shared blocking pool with interpreters nobody is waiting for.
     let outcome = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        host.run(&sandbox_request)
+        host.run(&request)
     })
     .await;
 
@@ -436,6 +393,87 @@ async fn serve(
             sandbox_error(&plugin, failure.status())
         }
     }
+}
+
+/// Turn an axum request into the frame the guest will see, or the response the
+/// caller gets instead.
+async fn read_request(
+    plugin: &str,
+    limits: super::manifest::ResourceLimits,
+    pattern: String,
+    params: &axum::extract::RawPathParams,
+    request: axum::extract::Request,
+) -> Result<SandboxRequest, Response> {
+    let path_params: Vec<(String, String)> = params
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+
+    let (parts, body) = request.into_parts();
+    // The nested router rewrote the URI, so the concrete path the caller asked
+    // for comes from the original.
+    let path = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(
+            || parts.uri.path().to_owned(),
+            |original| original.0.path().to_owned(),
+        );
+    let query = parts.uri.query().unwrap_or_default().to_owned();
+    let headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+
+    // The ceiling is applied while reading, so an oversized body is refused
+    // without ever being buffered in full — and the *wait* is bounded too. The
+    // permit is already held at this point, deliberately: that is what makes the
+    // declared footprint a bound on the whole request rather than on the part a
+    // guest is running. The cost of that choice is that a client dribbling a
+    // body could otherwise hold a permit forever without starting a guest, so
+    // the read gets a deadline. Unlike the interpreter, an async body read is
+    // genuinely cancellable, so this is a real bound rather than a hopeful one.
+    let deadline = std::time::Duration::from_millis(limits.request_body_timeout_ms);
+    let read = tokio::time::timeout(
+        deadline,
+        axum::body::to_bytes(body, limits.max_request_body_bytes),
+    )
+    .await;
+    let body = match read {
+        Ok(Ok(body)) => body.to_vec(),
+        Ok(Err(_)) => {
+            tracing::warn!(
+                plugin,
+                max_request_body_bytes = limits.max_request_body_bytes,
+                "request body over the sandboxed plugin's declared ceiling; refusing it"
+            );
+            return Err(sandbox_error(plugin, StatusCode::PAYLOAD_TOO_LARGE));
+        }
+        Err(_) => {
+            tracing::warn!(
+                plugin,
+                request_body_timeout_ms = limits.request_body_timeout_ms,
+                "request body did not arrive within the plugin's deadline; releasing its permit"
+            );
+            return Err(sandbox_error(plugin, StatusCode::REQUEST_TIMEOUT));
+        }
+    };
+
+    Ok(SandboxRequest {
+        method: parts.method.as_str().to_owned(),
+        route: pattern,
+        path,
+        query,
+        path_params,
+        headers,
+        body,
+    })
 }
 
 /// Turn a sanitized guest answer into an HTTP response.
@@ -753,6 +791,35 @@ sha256 = "{digest}"
         drop(held);
         let (status, _) = send(app(&plugin), "GET", "/hello/greet").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_never_arrives_does_not_pin_a_permit_forever() {
+        // The permit is held from admission, which is what makes the declared
+        // footprint a bound on the whole request. The cost of that is a client
+        // dribbling a body, so the read has a deadline — and unlike the
+        // interpreter, an async body read is genuinely cancellable.
+        let plugin = plugin_from(
+            guests::HELLO,
+            "[[routes]]\nmethod = \"POST\"\npath = \"/hello/greet\"\n",
+            ResourceLimits {
+                max_concurrency: 1,
+                request_body_timeout_ms: 250,
+                ..ResourceLimits::default()
+            },
+        );
+        let stalled = Body::from_stream(futures::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let (status, _) = send_with_body(app(&plugin), "POST", "/hello/greet", stalled).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+
+        // …and the permit came back: the next request reaches the guest, which
+        // answers 405 because this fixture only handles GET. Any guest-produced
+        // answer proves the point — a pinned permit would have been a 503.
+        let (status, _) =
+            send_with_body(app(&plugin), "POST", "/hello/greet", Body::from("hi")).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[test]

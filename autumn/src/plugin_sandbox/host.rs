@@ -86,6 +86,9 @@ mod errno {
     pub(super) const NOTCAPABLE: i32 = 76;
 }
 
+/// Bytes in one WebAssembly page.
+const WASM_PAGE_BYTES: u64 = 64 * 1024;
+
 /// The size of one WASI `iovec` (two `u32`s: pointer and length).
 const IOVEC_SIZE: usize = 8;
 
@@ -111,6 +114,18 @@ const STDERR_BUDGET_BYTES: usize = 64 * 1024;
 /// host to do a million times the work of one call. Bounding the array bounds
 /// the per-call amplification factor, which the fuel charge below then prices.
 const MAX_IOVECS: i32 = 64;
+
+/// The largest number of table elements one instance may hold, across all of
+/// its tables.
+///
+/// A table holds function references, not bytes, but it is still per-instance
+/// host storage: at four tables of 65,536 entries each it would be megabytes an
+/// instance, multiplied by `max_concurrency`, that
+/// [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::ResourceLimits::request_footprint_bytes)
+/// never counted. Bounded here to a number small enough that the footprint can
+/// carry it as a constant, and generous enough for any real guest's
+/// indirect-call table.
+pub const MAX_TABLE_ELEMENTS: u32 = 16_384;
 
 /// The largest total data + element section a module may carry (16 MiB).
 ///
@@ -335,6 +350,16 @@ pub enum SandboxLoadError {
     },
     /// The module exports no `_start` of type `() -> ()`.
     MissingStart,
+    /// The module exports no linear memory named `memory`.
+    MissingMemory,
+    /// The module's *initial* linear memory is already over the manifest's
+    /// ceiling, so no request could ever instantiate it.
+    MemoryTooLarge {
+        /// The module's initial memory, in bytes.
+        found: u64,
+        /// The manifest's ceiling.
+        max: usize,
+    },
     /// The engine could not be configured.
     Engine(String),
 }
@@ -364,6 +389,16 @@ impl fmt::Display for SandboxLoadError {
                 f,
                 "the plugin exports no `_start` of type `() -> ()`; it must be built as a \
                  wasm32-wasip1 *command*"
+            ),
+            Self::MissingMemory => write!(
+                f,
+                "the plugin exports no linear memory named `memory`; every host function reads \
+                 and writes through it, so a plugin without one can never answer"
+            ),
+            Self::MemoryTooLarge { found, max } => write!(
+                f,
+                "the plugin's initial linear memory is {found} bytes, over the manifest's \
+                 {max}-byte ceiling; no request could instantiate it"
             ),
             Self::Engine(detail) => write!(f, "the sandbox engine could not be built: {detail}"),
         }
@@ -482,6 +517,28 @@ impl SandboxHost {
         });
         if !start_is_callable {
             return Err(SandboxLoadError::MissingStart);
+        }
+
+        // Every shim function reads and writes through an export named
+        // `memory`; without one they all answer `EINVAL` and the plugin can
+        // never serve a request. And a module whose *initial* memory is already
+        // over the manifest's ceiling is refused by the limiter at
+        // instantiation — per request, as a gateway error, when it could have
+        // been said once here.
+        let memory = module
+            .exports()
+            .find(|export| export.name() == "memory")
+            .and_then(|export| export.ty().memory().copied());
+        let Some(memory) = memory else {
+            return Err(SandboxLoadError::MissingMemory);
+        };
+        let initial_bytes =
+            u64::from(u32::from(memory.initial_pages())).saturating_mul(WASM_PAGE_BYTES);
+        if initial_bytes > manifest.limits.memory_bytes as u64 {
+            return Err(SandboxLoadError::MemoryTooLarge {
+                found: initial_bytes,
+                max: manifest.limits.memory_bytes,
+            });
         }
 
         Ok(Self {
@@ -882,6 +939,9 @@ struct MemoryLimiter {
     max: usize,
     peak: usize,
     refusals: usize,
+    /// Elements held across every table of this instance, so the ceiling is on
+    /// the instance rather than on each table separately.
+    table_elements: u32,
 }
 
 impl wasmi::ResourceLimiter for MemoryLimiter {
@@ -905,14 +965,23 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
 
     fn table_growing(
         &mut self,
-        _current: u32,
+        current: u32,
         desired: u32,
         _maximum: Option<u32>,
     ) -> Result<bool, wasmi::errors::TableError> {
-        // Tables hold function references, not bytes; a small ceiling is plenty
-        // for a plugin and keeps an indirect-call table from being a second,
-        // unmetered allocation channel.
-        Ok(desired <= 65_536)
+        // Across the instance, not per table: four tables each under a per-table
+        // ceiling would still be four times that ceiling of host storage, which
+        // is exactly the accounting hole this closes.
+        let total = self
+            .table_elements
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if total > MAX_TABLE_ELEMENTS {
+            self.refusals = self.refusals.saturating_add(1);
+            return Ok(false);
+        }
+        self.table_elements = total;
+        Ok(true)
     }
 
     fn instances(&self) -> usize {
@@ -987,6 +1056,7 @@ impl HostState {
                 max: limits.memory_bytes,
                 peak: 0,
                 refusals: 0,
+                table_elements: 0,
             },
             limits,
         }
@@ -1053,8 +1123,20 @@ impl HostState {
         for byte in bytes {
             if *byte == b'\n' {
                 let line = std::mem::take(&mut self.stdout_line);
-                let line = String::from_utf8_lossy(&line).into_owned();
-                self.on_guest_line(&line);
+                // Strictly, not lossily. `from_utf8_lossy` turns each invalid
+                // byte into a three-byte replacement character while the
+                // original is still alive, so a guest that filled its whole
+                // stdout budget with invalid bytes would make the host hold
+                // four times that budget — memory no manifest accounted for.
+                // A frame is JSON, so it is UTF-8 or it is not a frame.
+                match String::from_utf8(line) {
+                    Ok(line) => self.on_guest_line(&line),
+                    Err(_) => {
+                        self.answer = Some(Err(SandboxFailure::MalformedFrame(
+                            "the frame is not valid UTF-8".to_owned(),
+                        )));
+                    }
+                }
             } else {
                 if self.stdout_line.len() >= budget {
                     return false;
@@ -2105,6 +2187,66 @@ path = "/hello/greet"
             "instantiation cost {} of a {charged}-unit module",
             outcome.fuel_used
         );
+    }
+
+    #[test]
+    fn a_frame_that_is_not_utf8_is_refused_rather_than_expanded() {
+        // `from_utf8_lossy` turns each invalid byte into a three-byte
+        // replacement while the original is still alive, so a guest filling its
+        // whole stdout budget with invalid bytes would make the host hold four
+        // times that budget — memory no manifest accounted for.
+        let outcome = host(guests::INVALID_UTF8).run(&get("/hello/greet"));
+        let failure = outcome.result.expect_err("must not answer");
+        assert!(
+            matches!(failure, SandboxFailure::MalformedFrame(ref detail) if detail.contains("UTF-8")),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn a_module_without_the_memory_the_shim_needs_is_refused_at_load() {
+        // Every host function reads and writes through an export named
+        // `memory`. Without one they all answer EINVAL, so the plugin loads and
+        // then fails every request — which packaging exists to prevent.
+        let wat = r#"(module (func (export "_start") (nop)))"#;
+        assert!(matches!(
+            try_host(wat),
+            Err(SandboxLoadError::MissingMemory)
+        ));
+    }
+
+    #[test]
+    fn a_module_whose_initial_memory_exceeds_the_ceiling_is_refused_at_load() {
+        // 32 pages = 2 MiB of *initial* memory against a 1 MiB ceiling: the
+        // limiter would refuse it at instantiation, per request, as a gateway
+        // error — when it can be said once, here.
+        let wat = r#"(module (memory (export "memory") 32) (func (export "_start") (nop)))"#;
+        let limits = ResourceLimits {
+            memory_bytes: 1024 * 1024,
+            ..ResourceLimits::default()
+        };
+        let err = try_host_with(wat, limits).expect_err("must be refused");
+        assert!(
+            matches!(err, SandboxLoadError::MemoryTooLarge { found, .. } if found == 2 * 1024 * 1024),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn table_storage_is_bounded_across_the_whole_instance() {
+        // Four tables each under a per-table ceiling would still be four times
+        // that ceiling of per-instance host storage the footprint never counted.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..4 {
+            let _ = writeln!(wat, "  (table {MAX_TABLE_ELEMENTS} funcref)");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        // Refused by the limiter at instantiation: the instance's total is four
+        // times the ceiling, so the plugin's prefix 5xxs and the host is fine.
+        let outcome = host(&wat).run(&get("/hello/greet"));
+        assert!(outcome.result.is_err(), "{:?}", outcome.result);
     }
 
     #[test]

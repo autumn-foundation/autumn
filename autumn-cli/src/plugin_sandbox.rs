@@ -22,7 +22,10 @@
 
 use std::path::Path;
 
-use autumn_web::plugin_sandbox::{SandboxArtifact, SandboxHost, SandboxManifest};
+use autumn_web::plugin_sandbox::{
+    MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact, SandboxHost, SandboxManifest,
+    read_bounded,
+};
 use serde::Serialize;
 
 use crate::plugin_check::{self, ConformanceReport, ReportFormat};
@@ -51,11 +54,17 @@ pub struct PackageOptions<'a> {
 /// manifest does not validate, the payload is not a WebAssembly module, or the
 /// module imports something the sandbox does not provide.
 pub fn package(opts: &PackageOptions<'_>) -> Result<SandboxArtifact, String> {
-    let manifest_src = std::fs::read_to_string(opts.manifest)
-        .map_err(|err| format!("could not read {}: {err}", opts.manifest.display()))?;
+    // Bounded reads, for the same reason the loader's are: a ceiling applied
+    // after `fs::read` returns is a decision made after the damage. Packaging
+    // takes both of its inputs from whoever ran the command, and a
+    // multi-gigabyte one should be an error message rather than an OOM.
+    let manifest_bytes = read_bounded(opts.manifest, MAX_MANIFEST_BYTES)
+        .map_err(|err| format!("{}: {err}", opts.manifest.display()))?;
+    let manifest_src = String::from_utf8(manifest_bytes)
+        .map_err(|_| format!("{} is not valid UTF-8", opts.manifest.display()))?;
     let manifest = SandboxManifest::parse(&manifest_src).map_err(|err| err.to_string())?;
-    let module = std::fs::read(opts.module)
-        .map_err(|err| format!("could not read {}: {err}", opts.module.display()))?;
+    let module = read_bounded(opts.module, MAX_MODULE_BYTES)
+        .map_err(|err| format!("{}: {err}", opts.module.display()))?;
 
     let artifact = SandboxArtifact::seal(manifest, module).map_err(|err| err.to_string())?;
     // Load it before writing it. Refusing here costs the author a second;
@@ -410,6 +419,38 @@ path = "/hello/greet"
         .expect_err("must refuse");
         assert!(err.contains("WebAssembly"), "{err}");
         assert!(!fixture.out.exists(), "nothing may be written on refusal");
+    }
+
+    #[test]
+    fn packaging_refuses_an_oversized_input_before_reading_it() {
+        // `fs::read` sizes its buffer from the file, so a ceiling applied after
+        // it returns is a decision made after the damage. Sparse files, so the
+        // test does not allocate what it is proving is refused.
+        for oversize_manifest in [true, false] {
+            let fixture = good_fixture();
+            let target = if oversize_manifest {
+                &fixture.manifest
+            } else {
+                &fixture.module
+            };
+            let file = std::fs::File::create(target).expect("creates");
+            file.set_len(128 * 1024 * 1024).expect("sets len");
+            drop(file);
+
+            let err = package(&PackageOptions {
+                manifest: &fixture.manifest,
+                module: &fixture.module,
+                out: &fixture.out,
+            })
+            .expect_err("must refuse");
+            assert!(
+                err.contains("ceiling"),
+                "expected a size refusal, got a {}-byte message starting {:?}",
+                err.len(),
+                err.chars().take(120).collect::<String>()
+            );
+            assert!(!fixture.out.exists(), "nothing may be written on refusal");
+        }
     }
 
     #[test]

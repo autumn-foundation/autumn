@@ -364,40 +364,7 @@ impl SandboxArtifact {
     /// Returns [`ArtifactError::Io`] if the file cannot be read, or any
     /// [`read`](Self::read) error for its contents.
     pub fn read_file(path: &Path) -> Result<Self, ArtifactError> {
-        use std::io::Read as _;
-
-        let io = |err: &std::io::Error| ArtifactError::Io {
-            path: path.to_path_buf(),
-            kind: err.kind(),
-            detail: err.to_string(),
-        };
-        let mut file = std::fs::File::open(path).map_err(|err| io(&err))?;
-        let length = file.metadata().map_err(|err| io(&err))?.len();
-        if length > MAX_ARTIFACT_BYTES as u64 {
-            return Err(ArtifactError::ArtifactTooLarge {
-                found: length,
-                max: MAX_ARTIFACT_BYTES,
-            });
-        }
-
-        // Read through a bounded reader as well as checking the metadata: the
-        // length can be a lie (a growing file, a pipe, a racing writer), and the
-        // ceiling has to hold against the bytes, not against what the
-        // filesystem said about them.
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(length).unwrap_or(0).min(MAX_ARTIFACT_BYTES));
-        let read = file
-            .by_ref()
-            .take(MAX_ARTIFACT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|err| io(&err))?;
-        if read > MAX_ARTIFACT_BYTES {
-            return Err(ArtifactError::ArtifactTooLarge {
-                found: read as u64,
-                max: MAX_ARTIFACT_BYTES,
-            });
-        }
-        Self::read(&bytes)
+        Self::read(&read_bounded(path, MAX_ARTIFACT_BYTES)?)
     }
 
     /// Write the artifact to disk.
@@ -423,6 +390,50 @@ impl SandboxArtifact {
             detail: err.to_string(),
         })
     }
+}
+
+/// Read a file, refusing anything over `max` **before** allocating for it.
+///
+/// `std::fs::read` sizes its buffer from the file, so a ceiling applied after it
+/// returns is a decision made after the damage: a crafted multi-gigabyte input
+/// exhausts the process that was trying to refuse it. Every path that reads a
+/// caller-supplied file — the loader and `autumn plugin package` both — goes
+/// through here.
+///
+/// The metadata length is checked first (cheap) and the read is *also* bounded
+/// (correct): a length can be a lie, from a growing file, a pipe, or a racing
+/// writer, so the ceiling has to hold against the bytes rather than against what
+/// the filesystem said about them.
+///
+/// # Errors
+///
+/// Returns [`ArtifactError::ArtifactTooLarge`] over the ceiling, and
+/// [`ArtifactError::Io`] if the file cannot be opened or read.
+pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, ArtifactError> {
+    use std::io::Read as _;
+
+    let io = |err: &std::io::Error| ArtifactError::Io {
+        path: path.to_path_buf(),
+        kind: err.kind(),
+        detail: err.to_string(),
+    };
+    let too_large = |found: u64| ArtifactError::ArtifactTooLarge { found, max };
+
+    let mut file = std::fs::File::open(path).map_err(|err| io(&err))?;
+    let length = file.metadata().map_err(|err| io(&err))?.len();
+    if length > max as u64 {
+        return Err(too_large(length));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0).min(max));
+    let read = file
+        .by_ref()
+        .take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| io(&err))?;
+    if read > max {
+        return Err(too_large(u64::try_from(read).unwrap_or(u64::MAX)));
+    }
+    Ok(bytes)
 }
 
 fn read_u32(header: &[u8], at: usize) -> Result<u32, ArtifactError> {

@@ -2080,6 +2080,7 @@ memory_bytes = 33_554_432 # per-request instance; footprint × concurrency ≤ 1
 max_request_body_bytes = 1_048_576
 max_response_bytes = 4_194_304
 max_concurrency = 8       # requests shed with 503, never queued
+request_body_timeout_ms = 5_000  # a dribbled body cannot pin a permit (408)
 ```
 
 ```bash
@@ -2121,8 +2122,9 @@ rest of the app.
   unless the manifest declares HEAD itself, in which case that route mounts
   alone (two overlapping method routes on one path is an axum panic at boot).
 - Load refuses a module whose WASI import *signatures* disagree with the shim,
-  whose `_start` is not `() -> ()`, or which carries >4096 / >16 MiB of data and
-  element segments (every request re-instantiates it).
+  whose `_start` is not `() -> ()`, which exports no `memory` (or one already
+  over the ceiling), or which carries >4096 / >16 MiB of data and element
+  segments (every request re-instantiates it).
 - Response **content types** are an allowlist too: `text/plain`, `text/csv`,
   `application/json`, `application/octet-stream`, and raster images. HTML,
   SVG, JavaScript and CSS are refused — a document or script from your own

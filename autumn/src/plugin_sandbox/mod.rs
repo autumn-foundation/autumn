@@ -56,15 +56,16 @@ pub mod test_guests;
 
 pub use artifact::{
     ArtifactError, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, MAX_MODULE_BYTES, SandboxArtifact,
+    read_bounded,
 };
 pub use host::{
-    CapabilityDenial, DeniedCapability, SandboxFailure, SandboxHost, SandboxLoadError,
-    SandboxOutcome,
+    CapabilityDenial, DeniedCapability, MAX_INIT_SECTION_BYTES, MAX_INIT_SEGMENTS,
+    MAX_TABLE_ELEMENTS, SandboxFailure, SandboxHost, SandboxLoadError, SandboxOutcome,
 };
 pub use manifest::{
     DeclaredRoute, MAX_CONCURRENCY, MAX_FOOTPRINT_BYTES, MAX_FUEL, MAX_MEMORY_BYTES,
-    MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BYTES, ManifestError, ResourceLimits, SandboxCapability,
-    SandboxManifest, WIRE_VERSION,
+    MAX_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_TIMEOUT_MS, MAX_RESPONSE_BYTES, ManifestError,
+    ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
 pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
 pub use wire::{

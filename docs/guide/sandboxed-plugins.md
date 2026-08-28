@@ -173,6 +173,7 @@ memory_bytes = 33_554_432   # linear-memory ceiling for one request's instance
 max_request_body_bytes = 1_048_576
 max_response_bytes = 4_194_304
 max_concurrency = 8         # requests this plugin may execute at once
+request_body_timeout_ms = 5_000  # how long the host waits for a body
 ```
 
 Then bind the two together:
@@ -206,6 +207,7 @@ Every one of these is a hard error, not a warning:
 | a route path the router would refuse — `:id`, `*rest`, `{id`, `{*rest}/more` | `axum::Router::route` *panics* on one, so a manifest that passed would take the app down at boot |
 | a module importing an allowlisted WASI name with the wrong signature, or exporting a `_start` that is not `() -> ()` | it would load and then fail on every request, as a gateway error nobody can explain from outside |
 | a module with more than 4096 data + element segments, or more than 16 MiB of them | every request re-instantiates the module, and that copying happens before the first guest instruction — so it is bounded at load rather than discovered per request |
+| a module that exports no linear memory named `memory`, or whose *initial* memory is already over the manifest's ceiling | every host function reads and writes through that export, so without it the plugin loads and then fails every request |
 | two routes that are one route to the router (`/{a}` and `/{b}`) | same |
 | a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
@@ -311,6 +313,7 @@ would the GET and the host discards the body for you.
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
+| `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
 
 The number worth reviewing is `max_concurrency × the per-request footprint`,
 where the footprint is the guest's linear memory **plus** every host buffer a
@@ -320,12 +323,20 @@ request pins outside it, counted at their simultaneous peak:
 |---|---|
 | `memory_bytes` | the guest instance's linear memory |
 | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded into the NDJSON line that becomes the guest's stdin — all live at once |
+| table storage | the instance's tables, bounded to 16,384 references |
 | `2 × max_response_bytes + 4096` | the pending stdout line the guest is writing |
 | `max_response_bytes` | the decoded response, once the frame parses |
 
 A manifest with a tiny `memory_bytes` and 64 MiB body/response ceilings would
 pass a memory-only check and still allocate hundreds of gigabytes, so the
 validator checks the whole footprint against a 1 GiB ceiling.
+
+The permit is held from the moment a request is admitted, *before* its body is
+read — that is what makes the footprint a bound on the whole request rather than
+on the part a guest is running. The cost of that choice is that a client
+dribbling a body could otherwise hold a permit without ever starting a guest, so
+the read has its own deadline. Unlike the interpreter, an async body read is
+genuinely cancellable, so that is a real bound rather than a hopeful one.
 
 Each request gets a **fresh instance**, so no state survives a request and one
 request's misbehaviour cannot reach the next.
