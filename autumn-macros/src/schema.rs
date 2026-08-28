@@ -153,10 +153,7 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
 /// `#[derive(OpenApiSchema)]`, `#[model]`, and `FormModel` code paths in
 /// lockstep on the same serde helpers rather than duplicating a
 /// deserialize-side variant.
-pub fn schema_property_name(
-    field: &syn::Field,
-    rename_all_rule: Option<&str>,
-) -> Option<String> {
+pub fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -> Option<String> {
     let ident = field.ident.as_ref()?;
     let raw = ident.to_string();
     let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
