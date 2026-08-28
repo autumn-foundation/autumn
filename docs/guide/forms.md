@@ -123,9 +123,46 @@ Where the *result* goes is what differs.
 
 ### `ChangesetForm<T>` — for pages a human is looking at
 
-Invalid input is **data**, not an error. The extractor always succeeds, the
-handler decides what to render, and the user gets their input back. This is the
-right choice for every server-rendered HTML form.
+Invalid input is **data**, not an error: the extractor does not fail on a
+validation error, the handler decides what to render, and the user gets their
+input back. This is the right choice for every server-rendered HTML form.
+
+**It can still reject a body it cannot decode.** `decode_form_body` returns 415
+for the wrong `Content-Type` and 400 when a field will not deserialize into its
+declared type — before the handler runs, so there is nothing to re-render with.
+The round-trip covers *invalid* values, not *unparseable* ones.
+
+That distinction has a practical consequence: **type a form field as the string
+the browser actually submits, and convert after validation.** A field typed
+`i64` turns "abc" — or an empty select — into a hard 400 that discards the whole
+submission, title and body included. A `String` field with a validator that
+parses it turns the same input into an inline message next to the offending
+field:
+
+```rust,ignore
+#[derive(Deserialize, Serialize, Validate, Clone, Default)]
+struct SubmitPostForm {
+    // Not `i64`: a form field's job is to round-trip whatever the browser
+    // sent, so the page can be re-rendered with it. The conversion happens
+    // after validation proves it parses.
+    #[validate(custom(function = "validate_subreddit_choice"))]
+    subreddit_id: String,
+    #[validate(length(min = 1, max = 300))]
+    title: String,
+}
+
+fn validate_subreddit_choice(value: &str) -> Result<(), ValidationError> {
+    match value.trim().parse::<i64>() {
+        Ok(id) if id > 0 => Ok(()),
+        _ => Err(ValidationError::new("subreddit_id")
+            .with_message("Choose a community".into())),
+    }
+}
+```
+
+Reserve non-string field types for values a browser cannot get wrong, or for
+endpoints where a 400 is the right answer. `examples/reddit-clone`'s submit form
+is built this way, for exactly this reason.
 
 ### `Valid<T>` — for endpoints a program is calling
 
@@ -164,7 +201,7 @@ implement `DerefMut`, so it cannot be mutated back into an invalid state.
 
 | The caller is… | Use | Failure looks like |
 |---|---|---|
-| a browser rendering HTML | `ChangesetForm<T>` | the same page, 422, errors inline |
+| a browser rendering HTML | `ChangesetForm<T>` | the same page, 422, errors inline (a body that will not *decode* is still 400/415) |
 | an API client, an MCP tool, htmx expecting JSON | `Valid<T>` | 422 Problem Details with a field map |
 | not a request at all | `.validate()` → `Validated<T>` | an `AutumnError` you handle |
 
