@@ -16,6 +16,7 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+#[cfg(feature = "db")]
 mod commentable;
 mod edge;
 mod edge_routes_macro;
@@ -33,6 +34,7 @@ mod mail_previews_macro;
 mod mailer;
 mod mailer_preview;
 mod main_macro;
+#[cfg(feature = "db")]
 mod model;
 mod oauth2_callback;
 mod one_off_task;
@@ -43,10 +45,12 @@ mod parse;
 mod paths_macro;
 mod public;
 mod query_budget;
+#[cfg(feature = "db")]
 mod repository;
 mod route;
 mod routes_macro;
 mod scheduled;
+mod schema;
 mod secured;
 mod service;
 mod sim_test;
@@ -646,6 +650,7 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// `react()` acquires its **own** pooled connection and does not join an
 /// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
 /// connection pool.
+#[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
@@ -712,6 +717,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// #[repository(LedgerEntry, primary_reads)]
 /// trait LedgerEntryRepository {}
 /// ```
+#[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
     repository::repository_macro(attr.into(), item.into()).into()

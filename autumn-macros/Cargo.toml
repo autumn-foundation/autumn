@@ -14,6 +14,18 @@ categories = ["web-programming", "web-programming::http-server"]
 [lib]
 proc-macro = true
 
+[features]
+# `db` is on by default so a direct dependant (and `cargo test -p
+# autumn-macros`) keeps the full macro surface. `autumn-web` takes this crate
+# with `default-features = false` and forwards its own `db` feature, so a
+# no-database app never compiles the database codegen at all.
+default = ["db"]
+# Database-layer codegen: the `#[model]` and `#[repository]` attribute macros.
+# These two modules are ~40k of the crate's ~60k lines and dominate its compile
+# time, yet a no-database app can reach neither macro — `autumn-web` already
+# gates both re-exports on its own `db` feature (issue #2309).
+db = []
+
 [dependencies]
 syn.workspace = true
 quote.workspace = true
