@@ -360,6 +360,9 @@ server.tls.handshake_timeout_secs
 server.tls.key_path
 server.tls.reload_interval_secs
 server.unix_socket
+server.upgrade
+server.upgrade.enabled
+server.upgrade.ready_timeout_secs
 session
 session.allow_memory_in_production
 session.backend
