@@ -36,6 +36,13 @@ pub struct CacheAuditOptions<'a> {
     pub json: bool,
     /// Also fail when any cached read's dependency set is undetermined.
     pub strict: bool,
+    /// Cargo feature selection the audited binary is built under.
+    ///
+    /// The manifest describes the binary that produced it. Auditing the default
+    /// feature set says nothing about a deployment that enables others: a read
+    /// or a repository behind a non-default feature is simply not compiled in,
+    /// so it cannot appear in the manifest and cannot be found incoherent.
+    pub features: routes::CargoFeatures,
 }
 
 /// Render the human report for a manifest.
@@ -82,7 +89,7 @@ pub fn format_duplicate_diagnostic(ids: &[String]) -> String {
         },
     );
     for id in ids {
-        out.push_str(&format!("  {id}\n"));
+        let _ = writeln!(out, "  {id}");
     }
     out.push_str(
         "  an invalidates(...) edge cannot distinguish them, and they share a runtime \
@@ -160,7 +167,13 @@ pub fn write_manifest(manifest: &CoherenceManifest, path: &std::path::Path) -> s
 /// Run `autumn cache audit`.
 pub fn run(opts: &CacheAuditOptions<'_>) {
     eprintln!("\u{1F342} autumn cache audit\n");
-    routes::compile_binary(opts.package, opts.bin);
+    // Say which build is being audited whenever it is not the default one, so
+    // a manifest is never mistaken for a claim about a feature set it was not
+    // built under.
+    if !opts.features.is_default() {
+        eprintln!("Building with {}\n", opts.features.to_args().join(" "));
+    }
+    routes::compile_binary_with(opts.package, opts.bin, &opts.features);
     let binary = routes::find_binary(opts.package, opts.bin);
 
     let output = Command::new(&binary)
@@ -450,11 +463,13 @@ mod tests {
             &[mutation("Post")],
         );
         let mut dump = String::from("some unrelated startup logging\n");
-        dump.push_str(&format!(
-            "{}{}\n",
+        writeln!(
+            dump,
+            "{}{}",
             autumn_web::cache::coherence::COHERENCE_MANIFEST_MARKER,
             serde_json::to_string(&manifest).unwrap()
-        ));
+        )
+        .expect("writing to a String never fails");
         let parsed = parse_manifest_dump(&dump).expect("marker line must be found");
         assert_eq!(parsed.violations.len(), 1);
         assert_eq!(parsed.violations[0].read, "blog::recent");

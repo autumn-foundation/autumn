@@ -394,6 +394,55 @@ fn resolve_binary_from_metadata(
 // ── Also compile the binary before running ─────────────────────────────────
 
 pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
+    compile_binary_with(package, bin, &CargoFeatures::default());
+}
+
+/// The Cargo feature selection an audited build should be made under.
+///
+/// A manifest read out of a binary describes *that* binary. Build the default
+/// feature set and the manifest omits every `#[cached]` read and `#[repository]`
+/// write that is gated behind a non-default feature — so an audit can exit green
+/// while the deployed configuration, which does compile them, is incoherent.
+/// These are the same flags `cargo build` takes, forwarded verbatim, so the
+/// audited binary can be the one that ships.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CargoFeatures {
+    /// Each entry is passed as its own `--features` argument; Cargo accepts a
+    /// space- or comma-separated list inside one, so both spellings work.
+    pub features: Vec<String>,
+    /// `--all-features`.
+    pub all: bool,
+    /// `--no-default-features`.
+    pub no_default: bool,
+}
+
+impl CargoFeatures {
+    /// Whether this selects anything other than Cargo's defaults.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        self.features.is_empty() && !self.all && !self.no_default
+    }
+
+    /// The selection as the `cargo build` flags it forwards, for reporting.
+    #[must_use]
+    pub fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.no_default {
+            args.push("--no-default-features".to_string());
+        }
+        if self.all {
+            args.push("--all-features".to_string());
+        }
+        for f in &self.features {
+            args.push("--features".to_string());
+            args.push(f.clone());
+        }
+        args
+    }
+}
+
+/// Compile the app under an explicit Cargo feature selection.
+pub fn compile_binary_with(package: Option<&str>, bin: Option<&str>, features: &CargoFeatures) {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if let Some(pkg) = package {
@@ -402,6 +451,7 @@ pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
     if let Some(b) = bin {
         cargo.args(["--bin", b]);
     }
+    cargo.args(features.to_args());
 
     let status = cargo.status().expect("failed to run cargo build");
     if !status.success() {
@@ -879,5 +929,44 @@ mod tests {
             err.contains("server"),
             "should list available binaries, got: {err}"
         );
+    }
+
+    // ── Cargo feature selection for audited builds (#1716) ─────────────────
+
+    #[test]
+    fn a_default_feature_selection_adds_no_cargo_flags() {
+        let f = CargoFeatures::default();
+        assert!(f.is_default());
+        assert!(f.to_args().is_empty());
+    }
+
+    /// Each flag has to reach `cargo build` in a form Cargo accepts, and each
+    /// `--features` value needs its own flag — a manifest built under the wrong
+    /// feature set is a green audit of a binary nobody deploys.
+    #[test]
+    fn a_feature_selection_forwards_every_flag_cargo_needs() {
+        let f = CargoFeatures {
+            features: vec!["db,cache-moka".to_string(), "redis".to_string()],
+            all: false,
+            no_default: true,
+        };
+        assert!(!f.is_default());
+        assert_eq!(
+            f.to_args(),
+            vec![
+                "--no-default-features",
+                "--features",
+                "db,cache-moka",
+                "--features",
+                "redis",
+            ]
+        );
+
+        let all = CargoFeatures {
+            all: true,
+            ..CargoFeatures::default()
+        };
+        assert!(!all.is_default());
+        assert_eq!(all.to_args(), vec!["--all-features"]);
     }
 }

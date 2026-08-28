@@ -527,5 +527,16 @@ the coherence registration is placed inside the function body precisely so an
 | `--manifest PATH` | write the JSON manifest to a file |
 | `--json` | emit the manifest to stdout instead of the human report |
 | `--strict` | also fail on `undetermined` reads |
+| `--features F` | Cargo features to build the audited binary with (repeatable) |
+| `--all-features` | build the audited binary with every feature |
+| `--no-default-features` | build the audited binary without default features |
+
+**Audit the feature set you deploy.** The manifest describes the binary that
+produced it. A `#[cached]` read or a `#[repository]` write behind a feature the
+build does not enable is not compiled in at all, so it cannot appear in the
+manifest and cannot be found incoherent — a default-feature audit exits green
+on a configuration it never looked at. Pass the same feature flags your release
+build uses; the audit echoes them when they are not Cargo's defaults, so the
+report says which build it is talking about.
 
 Exit code is `0` when nothing can be left stale, `1` otherwise.

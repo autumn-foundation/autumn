@@ -1872,7 +1872,13 @@ mod tests {
     /// buy a free pass.
     #[test]
     fn unicode_whitespace_is_a_blank_reason_too() {
-        for blank in ["\u{2003}", "\u{00a0}", "\u{3000}", "\u{2028}", " \u{2003}\t"] {
+        for blank in [
+            "\u{2003}",
+            "\u{00a0}",
+            "\u{3000}",
+            "\u{2028}",
+            " \u{2003}\t",
+        ] {
             assert!(
                 reason_is_blank(blank),
                 "{blank:?} is whitespace to `trim`, so it must be blank here too"
@@ -1956,7 +1962,7 @@ mod tests {
         super::super::clear_global_cache();
 
         let store = std::sync::Arc::new(super::super::MokaCache::new(16, None));
-        let epoch = register_namespace_store("tests::fenced_ns", store.clone());
+        let epoch = register_namespace_store("tests::fenced_ns", store);
 
         // A fill samples the epoch before computing...
         let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
