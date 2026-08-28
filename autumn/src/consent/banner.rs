@@ -178,18 +178,26 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// `Content-Length` before emptying the body for `HEAD`, so the `HEAD`
 /// response's metadata always matches the equivalent `GET`'s.
 ///
-/// # Known limitation: `#[static_get]` pages and CSRF
+/// # `#[static_get]` pages: the banner is skipped, not broken
 ///
 /// A first-time visitor whose very first hit lands on a pre-rendered
-/// `#[static_get]` page is served that page by the static-first middleware
-/// before the dynamic router (and therefore `CsrfLayer`) ever runs, so no
-/// CSRF cookie exists yet. This middleware then has no token to embed in the
-/// banner's hidden field, and the resulting `/consent/accept` /
-/// `/consent/reject` submission is rejected by `CsrfLayer` with a `403`. This
-/// does not affect the default `autumn new` scaffold (which has no
-/// `#[static_get]` routes); an app that adds one should exempt its consent
-/// routes' path prefix, or route visitors through a dynamic page at least
-/// once before relying on the static-served banner's buttons.
+/// `#[static_get]` page is served that page by the static-first middleware.
+/// User `.layer()` middleware — including this one — is applied *outside* that
+/// layer so it can process pre-rendered responses, but `CsrfLayer` runs inside
+/// the dynamic router and therefore never runs at all on a static cache hit,
+/// so no CSRF cookie exists yet.
+///
+/// When `csrf_cookie_name` is `Some(..)` and no token can be found, this
+/// middleware **skips injection** rather than emitting a banner whose
+/// `/consent/accept` / `/consent/reject` submission `CsrfLayer` would reject
+/// with a `403`. The visitor is simply not prompted on that page; the first
+/// dynamic page they reach issues a token and prompts them normally, and the
+/// gate stays closed in the meantime, so no non-essential cookie is set while
+/// they are undecided.
+///
+/// Do **not** exempt the consent routes from CSRF to work around this. Those
+/// are the state-changing `POST`s the protection exists for, and the skip
+/// above already removes the failure that made exemption tempting.
 ///
 /// # Known limitation: no true streaming for an undecided visitor
 ///
@@ -222,16 +230,23 @@ pub async fn inject_consent_banner(
         return next.run(request).await;
     }
 
-    // An htmx request asks for a *fragment*, not a document. Such a response
-    // carries no `</body>`, so the splice below would append the banner to the
-    // end of the fragment — and htmx would then swap that copy into whatever
-    // element it targets, while the banner already injected into the enclosing
-    // page stays put. The visitor sees duplicate consent controls, and on a
-    // page whose fragments refresh (a live feed, a vote button) a new copy on
-    // every swap. A fragment is never the right place to prompt, so skip it
-    // entirely: the enclosing document already carries the banner, and the
-    // next full page load re-evaluates consent as usual.
-    if is_htmx_request(request.headers()) {
+    // An htmx *fragment* request asks for a piece of a page, not a document.
+    // Such a response carries no `</body>`, so the splice below would append
+    // the banner to the end of the fragment — and htmx would then swap that
+    // copy into whatever element it targets, while the banner already injected
+    // into the enclosing page stays put. The visitor sees duplicate consent
+    // controls, and on a page whose fragments refresh (a live feed, a vote
+    // button) a new copy on every swap. A fragment is never the right place to
+    // prompt, so skip it: the enclosing document already carries the banner,
+    // and the next full page load re-evaluates consent as usual.
+    //
+    // A *boosted* navigation (`hx-boost`) is deliberately NOT skipped. It also
+    // carries `HX-Request`, but the response is a complete document whose body
+    // replaces the current one — so skipping it would both omit the banner
+    // from the new page and destroy the one on the old page in the same swap,
+    // leaving an undecided visitor silently unprompted until they made a
+    // non-htmx navigation.
+    if is_htmx_fragment_request(request.headers()) {
         return next.run(request).await;
     }
 
@@ -343,15 +358,24 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
 /// Whether this request came from htmx, and therefore expects a fragment
 /// rather than a complete document.
 ///
-/// htmx sets `HX-Request: true` on every request it issues. Matching the
-/// framework's other htmx-aware paths (`crate::htmx`, the tracked-job poll
-/// route), the header's presence is what matters — the value is not parsed
-/// beyond confirming it is not the literal `false` htmx never actually sends.
-fn is_htmx_request(headers: &axum::http::HeaderMap) -> bool {
-    headers
-        .get("hx-request")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+/// htmx sets `HX-Request: true` on every request it issues, and additionally
+/// `HX-Boosted: true` when the request came from an `hx-boost`ed link or form.
+/// A boosted request is a full-page navigation — the response is a complete
+/// document that replaces the current body — so only a request that is htmx
+/// *and not* boosted is a fragment request.
+///
+/// Matching the framework's other htmx-aware paths (`crate::htmx`, the
+/// tracked-job poll route), a header's presence is what matters — the value is
+/// not parsed beyond confirming it is not the literal `false` htmx never
+/// actually sends.
+fn is_htmx_fragment_request(headers: &axum::http::HeaderMap) -> bool {
+    let header_is_true = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+    };
+    header_is_true("hx-request") && !header_is_true("hx-boosted")
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -1505,6 +1529,40 @@ mod tests {
         assert_eq!(
             rendered, "<div id=\"nav\">Log in</div>",
             "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boosted_navigation_is_a_document_and_still_gets_the_banner() {
+        // `hx-boost` sends BOTH `HX-Request` and `HX-Boosted`, but the response
+        // is a complete page that replaces the current body. Treating it as a
+        // fragment would omit the banner from the new page AND destroy the one
+        // on the old page in the same swap — leaving an undecided visitor
+        // silently unprompted until a non-htmx navigation.
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-boosted", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "a boosted navigation is a full document and must still be prompted"
         );
     }
 

@@ -18,9 +18,15 @@ async fn index(
 
 If an extractor cannot be built, the handler never runs and the framework
 returns the extractor's own error — a 400 for a malformed query string or an
-unparseable path segment, a 401 for a missing session, a 422 for a body that
-fails validation. You do not write that branch. (404 is for a route or record
-that does not exist, which is a handler's decision, not an extractor's.)
+unparseable path segment, a 422 for a body that fails validation, a 401 from
+`Auth` or `#[secured]` when a signed-in user is required. You do not write that
+branch.
+
+Two extractors that deliberately do *not* fail: `Session` is infallible — a
+visitor with no session cookie gets a fresh anonymous one, so `Session` alone
+never rejects a request and authentication is `Auth` / `#[secured]`'s job. And
+404 is for a route or record that does not exist, which is a handler's
+decision, not an extractor's.
 
 This guide covers the extractor catalog, the two rules that govern ordering,
 how to decode structured query strings, and how to write your own.
