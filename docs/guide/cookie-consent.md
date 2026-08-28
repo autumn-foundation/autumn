@@ -124,7 +124,11 @@ autumn_web::app()
             req,
             next,
             CONSENT_POLICY_VERSION,
-            autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+            // `Some(..)` = this app enforces CSRF. Pass `None` only if you
+            // have disabled CSRF entirely: the distinction decides what an
+            // absent token means, and with `Some` the banner is skipped
+            // rather than rendered with buttons that would 403.
+            Some(autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME),
             autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
         )
         .await
