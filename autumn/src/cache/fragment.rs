@@ -164,6 +164,14 @@ pub fn cache_fragment_in(
         return render();
     };
 
+    // Sampled BEFORE the lookup, so the fence covers the whole miss-and-render
+    // window. Being namespaced is exactly what exposes this helper to the race
+    // `cache_fragment` cannot have: an invalidation can now clear these entries
+    // mid-render, and an unfenced insert would put the pre-write markup back
+    // after the clear — stale until its TTL, or forever without one.
+    let epoch = super::coherence::namespace_epoch(namespace);
+    let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+
     // Same length-prefixed identity as `cache_fragment`, behind the namespace
     // that `invalidate_namespace` scans for: `{namespace}:` is exactly the
     // prefix `MokaCache` matches on and `RedisCache` builds its `SCAN MATCH`
@@ -179,7 +187,12 @@ pub fn cache_fragment_in(
     }
 
     let markup = render();
-    insert_cached(cache, &key, markup.0.clone(), ttl);
+    // Check and insert as one step, the same way `#[cached]` does — see
+    // `with_fill_fence`. A fenced-out fill still returns its markup to *this*
+    // caller; it just does not publish it.
+    super::coherence::with_fill_fence(&epoch, sampled, || {
+        insert_cached(cache, &key, markup.0.clone(), ttl);
+    });
     markup
 }
 
@@ -644,6 +657,54 @@ mod tests {
             counter.load(Ordering::SeqCst),
             2,
             "the invalidation must have dropped the entry"
+        );
+
+        clear_global_cache();
+    }
+
+    /// A render that spans an invalidation must not publish its stale markup.
+    ///
+    /// Being namespaced is what creates this race: `cache_fragment` has no
+    /// namespace, so nothing can clear it mid-render, but `cache_fragment_in`
+    /// entries are exactly what `invalidate_namespace` drops. Without the fence
+    /// the insert lands after the clear and the pre-write markup sits there
+    /// until its TTL — forever, with none.
+    ///
+    /// The invalidation is fired from inside the render closure, which is
+    /// precisely the window: the epoch was sampled before the lookup, and the
+    /// insert happens after this returns.
+    #[test]
+    fn a_render_that_spans_an_invalidation_does_not_publish_stale_markup() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache);
+
+        let markup = cache_fragment_global_in("blog::racing", "post:1", "v1", None, || {
+            // A repository write commits and invalidates while this renders.
+            assert!(crate::cache::coherence::invalidate_namespace(
+                "blog::racing"
+            ));
+            html! { p { "stale" } }
+        });
+        // The caller still gets what it rendered — the fence withholds the
+        // publish, it does not fail the call.
+        assert!(markup.into_string().contains("stale"));
+
+        // The next call must be a MISS: nothing stale was left behind.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let tally = renders.clone();
+        cache_fragment_global_in("blog::racing", "post:1", "v1", None, move || {
+            tally.fetch_add(1, Ordering::SeqCst);
+            html! { p { "fresh" } }
+        });
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "the fill that raced the invalidation must not have been published"
         );
 
         clear_global_cache();

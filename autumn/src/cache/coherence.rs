@@ -1049,7 +1049,7 @@ struct Namespace {
 /// required. The store registers itself here the first time the function runs,
 /// which is what lets the generated `__autumn_cache_invalidate__<fn>()` reach a
 /// store that lives inside the function body.
-static NAMESPACES: std::sync::RwLock<Option<std::collections::HashMap<&'static str, Namespace>>> =
+static NAMESPACES: std::sync::RwLock<Option<std::collections::HashMap<String, Namespace>>> =
     std::sync::RwLock::new(None);
 
 /// Register a cached read's dedicated store so [`invalidate_namespace`] can
@@ -1074,11 +1074,54 @@ pub fn register_namespace_store(
         .expect("cache namespace store lock poisoned");
     let entry = guard
         .get_or_insert_with(std::collections::HashMap::new)
-        .entry(namespace)
+        .entry(namespace.to_string())
         .or_default();
     entry.stores.push(store);
     let epoch = std::sync::Arc::clone(&entry.epoch);
     // Explicit, so the process-wide write lock is never held across the return.
+    drop(guard);
+    epoch
+}
+
+/// The fill epoch for `namespace`, without registering a store against it.
+///
+/// [`register_namespace_store`] is for a cache that *owns* the namespace and
+/// wants [`invalidate_namespace`] to clear it. This is for the other case: a
+/// call site writing into a store somebody else already registered — or into
+/// the process-global backend — that still needs the fence, because its insert
+/// races the same invalidation. `cache_fragment_in` uses it.
+///
+/// Sample the returned counter **before** the lookup, and insert through
+/// [`with_fill_fence`].
+///
+/// # Panics
+///
+/// Panics if the internal `RwLock` is poisoned.
+#[must_use]
+pub fn namespace_epoch(namespace: &str) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    // Read first: after the namespace's first use this is the only path taken,
+    // and a fragment render must not queue behind a process-wide write lock.
+    {
+        let guard = NAMESPACES
+            .read()
+            .expect("cache namespace store lock poisoned");
+        if let Some(epoch) = guard
+            .as_ref()
+            .and_then(|map| map.get(namespace))
+            .map(|entry| std::sync::Arc::clone(&entry.epoch))
+        {
+            return epoch;
+        }
+    }
+
+    let mut guard = NAMESPACES
+        .write()
+        .expect("cache namespace store lock poisoned");
+    let entry = guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(namespace.to_string())
+        .or_default();
+    let epoch = std::sync::Arc::clone(&entry.epoch);
     drop(guard);
     epoch
 }

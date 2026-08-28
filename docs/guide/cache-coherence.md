@@ -319,6 +319,10 @@ autumn_web::cache::coherence::with_fill_fence(&epoch, sampled, || {
 });
 ```
 
+`namespace_epoch(id)` gets that counter for a namespace you did not register a
+store against — a call site writing into the process-global backend, which is
+what `cache_fragment_in` does internally.
+
 `with_fill_fence` re-checks the epoch and runs the insert as one indivisible
 step, and `invalidate_namespace` bumps the epoch under the same fence. Checking
 the epoch yourself and inserting afterwards is not equivalent: an invalidation
