@@ -1057,6 +1057,9 @@ fn body_matches_redacted(recorded: &CapsuleBody, actual: &CapsuleBody) -> bool {
 /// Both absent matches; one present and one absent is a change; two present
 /// compare through [`matches_redacted`], so a masked value still stands for
 /// whatever was really there.
+///
+/// Gated with its callers: every one of them is in the mail comparison.
+#[cfg(any(test, feature = "mail"))]
 fn optional_matches_redacted(recorded: Option<&str>, actual: Option<&str>) -> bool {
     match (recorded, actual) {
         (None, None) => true,
