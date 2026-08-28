@@ -9,13 +9,22 @@
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
 //!
-//! Three cases are deliberately **not** injected into, so "the layer is
-//! registered" is not the same as "every page prompts": an htmx *fragment*
-//! response (which has no `</body>` to splice before, and whose swap would put
-//! a second banner on the page), a *static cache hit* where CSRF is enforced
-//! but no token is obtainable (the banner's buttons would `403`), and a body
-//! over [`MAX_SPLICE_BODY_BYTES`]. Each is documented on
-//! [`inject_consent_banner`], and all three are summarized for app authors in
+//! Four cases are deliberately **not** injected into, so "the layer is
+//! registered" is not the same as "every page prompts":
+//!
+//! 1. an htmx *fragment* response, which has no `</body>` to splice before and
+//!    whose swap would put a second banner on the page;
+//! 2. a *static cache hit* where CSRF is enforced but no token is obtainable,
+//!    since the banner's buttons would `403`;
+//! 3. an **encoded** body (`Content-Encoding`), which cannot be spliced without
+//!    decoding it first — see [`is_html_response`]. Whether this happens is
+//!    decided by layer order: injection sees plain HTML only if it runs
+//!    *inside* the compression layer;
+//! 4. a body over [`MAX_SPLICE_BODY_BYTES`].
+//!
+//! All four still get `Vary: Cookie`, because the representation depends on the
+//! consent cookie whether or not anything was injected. Each is documented on
+//! [`inject_consent_banner`] and summarized for app authors in
 //! `docs/guide/cookie-consent.md`.
 
 use axum::body::{Body, Bytes};

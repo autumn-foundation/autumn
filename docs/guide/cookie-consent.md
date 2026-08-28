@@ -114,14 +114,33 @@ response and, when the visitor needs prompting, inserts the banner right before
 `</body>` — with no per-handler wiring and no change to your `layout()`
 signature.
 
-**It deliberately does not inject in three cases**, so do not treat "the layer
+**It deliberately does not inject in four cases**, so do not treat "the layer
 is registered" as "every page prompts":
 
 | Case | Why | Consequence |
 |---|---|---|
 | An htmx **fragment** response — `HX-Request` without `HX-Boosted` or `HX-History-Restore-Request` | a fragment has no `</body>`, so the banner would be appended and swapped in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
 | A **static cache hit** with CSRF enforced and no token available | on a pre-rendered `#[static_get]` page `CsrfLayer` never runs, so the banner's buttons would `403` | that visitor is unprompted on that page, and prompted on the first dynamic route they reach |
+| An **encoded** response (`Content-Encoding` present) | the body would have to be decompressed before it could be spliced | the page is served unmodified. See below — this one is under your control |
 | A response body over 2 MiB | splicing would mean buffering arbitrarily more | the page is served unmodified |
+
+The encoded case is the one most likely to catch a real deployment, and unlike
+the others it is a consequence of how *you* stack your layers. Splicing needs
+plain HTML, so the banner middleware has to see the response **before** anything
+compresses it; if an inner layer (or the handler itself, returning a
+precompressed asset) has already set `Content-Encoding`, the page is passed
+through untouched. Get that order wrong on a compressed site and every HTML page
+is served without a banner, with nothing in the logs to say so.
+
+Autumn's own `[compression]` is **off by default**, so this does not bite a
+stock app. If you turn it on — or add your own `CompressionLayer` — do not
+reason about the ordering, assert it:
+
+```rust,ignore
+// Fails loudly if compression ever ends up inside the injector.
+let res = app.get("/").header("accept-encoding", "gzip").send().await;
+res.assert_body_contains("autumn-consent-banner");
+```
 
 The static case is the one to plan for: if your landing page is pre-rendered, a
 first-time visitor's *first* page will not carry the banner. That is safe —
