@@ -66,6 +66,14 @@ how to decode structured query strings, and how to write your own.
 | `SeoMeta` | the route's `seo(...)` declaration, as a builder |
 | `Negotiate` | the client's preferred response format |
 
+Most of these are infallible: `Session`, `Consent`, `Flash`, and `CurrentPath`
+cannot reject a request, so taking one is never a way to turn a caller away.
+The exception is `CsrfToken`, and its failure is a **misconfiguration** rather
+than a bad request — it returns 500 when `CsrfLayer` is not enabled, because a
+handler asking for a token in an app that mints none is a setup bug, not
+something a client did. Take `Option<CsrfToken>` (infallible) on a route that
+must still render when CSRF is off.
+
 ### Client identity behind a proxy
 
 Never read `X-Forwarded-*` yourself. These three resolve it once per request
