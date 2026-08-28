@@ -1,6 +1,6 @@
 //! Standardized pagination primitives.
 //!
-//! See the [pagination guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/pagination.md)
+//! See the [pagination guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/pagination.md)
 //! for the offset-versus-cursor decision, [`ListQuery`] sorting and filtering,
 //! and the cost pitfalls.
 //!

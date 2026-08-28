@@ -1,6 +1,6 @@
 //! Autumn's request extractors.
 //!
-//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/extractors.md)
+//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/extractors.md)
 //! for the full catalog, the ordering rules, and how to write your own.
 //!
 //! Most are thin wrappers over the Axum extractor of the same name, provided so

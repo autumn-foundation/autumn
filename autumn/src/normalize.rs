@@ -1,6 +1,6 @@
 //! Field normalization primitives (issue #1379).
 //!
-//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/forms.md)
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/forms.md)
 //! for where normalization sits relative to validation and hooks.
 //!
 //! Canonicalizes `#[model]` `String` columns declared with the

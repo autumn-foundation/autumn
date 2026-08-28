@@ -18,7 +18,7 @@
 //! allowlist sanitizer — see [`render_user_content_html`](crate::markdown::render_user_content_html) and
 //! [`docs/guide/rich-text.md`] for the exact guarantee.
 //!
-//! [`docs/guide/rich-text.md`]: https://github.com/autumn-foundation/autumn/blob/main/docs/guide/rich-text.md
+//! [`docs/guide/rich-text.md`]: https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/rich-text.md
 //!
 //! ## Quick start
 //!

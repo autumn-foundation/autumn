@@ -29,7 +29,7 @@
 //! | [`with_job_interceptor`](crate::app::AppBuilder::with_job_interceptor) | [`JobInterceptor`] | every job enqueue **and** every job execution |
 //! | [`with_db_interceptor`](crate::app::AppBuilder::with_db_interceptor) | [`DbConnectionInterceptor`] | every pooled connection checkout |
 //! | [`with_channels_interceptor`](crate::app::AppBuilder::with_channels_interceptor) | [`ChannelsInterceptor`] | every channel publish |
-//! | [`with_http_interceptor`](crate::app::AppBuilder::with_http_interceptor) | [`HttpInterceptor`] | every outbound HTTP request |
+//! | [`with_http_interceptor`](crate::app::AppBuilder::with_http_interceptor) | [`HttpInterceptor`] | outbound requests through `auth::HttpClient` (the `oauth2` path) — **not** every outbound request; see [`HttpInterceptor`] |
 //!
 //! # Last one wins
 //!
@@ -228,13 +228,25 @@ pub type HttpInterceptorFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'a>,
 >;
 
-/// Wraps every outbound HTTP request the framework's client makes.
+/// Wraps outbound HTTP requests sent through [`auth::HttpClient`] — the
+/// `oauth2`-gated client the OAuth flows use.
 ///
-/// Use it to stamp a header on every call, to record timings, or to return a
-/// canned response in tests without reaching the network. Unlike the other
-/// interceptors this one is resolved from a task-local list
-/// ([`ACTIVE_HTTP_INTERCEPTORS`]), so it follows the async task rather than the
-/// application state.
+/// **It does not cover every outbound request.** [`HttpRequestBuilder::send`]
+/// is the only caller that reads [`ACTIVE_HTTP_INTERCEPTORS`], so a call made
+/// through the SSRF-guarded [`Client`](crate::http_client::Client) extractor,
+/// or through a `reqwest::Client` your own code built, never reaches this
+/// trait. Do not rely on it as an audit or test-stubbing chokepoint for
+/// arbitrary outbound traffic; for that, route the traffic through a named
+/// client and see the [outbound HTTP guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/outbound-http.md).
+///
+/// Within that scope, use it to stamp a header on every call, to record
+/// timings, or to return a canned response in tests without reaching the
+/// network. Unlike the other interceptors this one is resolved from a
+/// task-local list ([`ACTIVE_HTTP_INTERCEPTORS`]), so it follows the async task
+/// rather than the application state.
+///
+/// [`auth::HttpClient`]: crate::auth::HttpClient
+/// [`HttpRequestBuilder::send`]: crate::auth::HttpRequestBuilder::send
 #[cfg(feature = "oauth2")]
 pub trait HttpInterceptor: Send + Sync + 'static {
     /// Run around one outbound request.

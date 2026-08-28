@@ -261,6 +261,14 @@ app.get("/").header("cookie", cookie).send().await
    .assert_no_selector(".autumn-consent-banner");
 ```
 
+The empty `form("")` works because `TestApp::new()` disables CSRF by default,
+the way Spring Security's test support does — so the POST reaches
+`consent_reject` and comes back with the consent cookie. If you re-enable CSRF
+in a test (`config.security.csrf.enabled = true`), that same POST is rejected
+with a `403` *before* the handler runs, and the rejection carries no consent
+cookie, so the `set-cookie` lookup fails rather than the assertion. Fetch a page
+first, read the token out of it, and submit it in the configured form field.
+
 The assertion worth writing is the *negative* one: that the analytics snippet
 is absent for a rejecting visitor. The banner being present is easy to get
 right; the gate being honored is the thing that regresses.

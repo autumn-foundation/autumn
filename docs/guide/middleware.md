@@ -144,10 +144,19 @@ each has its own interceptor trait installed on the builder:
 | `with_job_interceptor` | `JobInterceptor` | every job enqueue **and** every job execution |
 | `with_db_interceptor` | `DbConnectionInterceptor` | every pooled connection checkout |
 | `with_channels_interceptor` | `ChannelsInterceptor` | every channel publish |
-| `with_http_interceptor` | `HttpInterceptor` | every outbound HTTP request |
+| `with_http_interceptor` | `HttpInterceptor` | outbound requests sent through `auth::HttpClient` — see the caveat below |
 
-They share one shape: you receive the operation plus a `next` future, and you
-decide whether, when, and how to call it — the same "around" contract as a
+`HttpInterceptor` is the one to read the fine print on. Only
+`auth::HttpRequestBuilder::send` consults the interceptor list, and that type
+lives behind the `oauth2` feature — so a request made through the SSRF-guarded
+`Client` extractor, or through a `reqwest::Client` your own code built, does not
+run it. It is a hook on the OAuth path, not a chokepoint for arbitrary outbound
+traffic; if you need every call audited, that has to come from routing calls
+through a named client (see the [outbound HTTP guide](./outbound-http.md)), not
+from registering this.
+
+The rest share one shape: you receive the operation plus a `next` future, and
+you decide whether, when, and how to call it — the same "around" contract as a
 tower layer, on a non-HTTP pipeline. Note that this is an *observe* hook, not a
 rewrite hook: the operation is borrowed and `next` already captured it, so an
 interceptor can wrap, time, refuse, or log a job — but it cannot edit the

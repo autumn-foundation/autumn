@@ -1,6 +1,6 @@
 //! Cookie-consent tracking and gating (ePrivacy / GDPR Art. 7).
 //!
-//! See the [cookie-consent guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/cookie-consent.md)
+//! See the [cookie-consent guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/cookie-consent.md)
 //! for the end-to-end flow, including the withdraw path.
 //!
 //! Provides the [`Consent`] extractor plus a first-party cookie codec, so an

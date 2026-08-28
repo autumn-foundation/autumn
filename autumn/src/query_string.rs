@@ -1,7 +1,7 @@
 //! Structured query-string decoding for [`Query<T>`](crate::extract::Query)
 //! (issue #1972).
 //!
-//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/main/docs/guide/extractors.md)
+//! See the [extractors guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/extractors.md)
 //! for the narrative version, with worked examples.
 //!
 //! # Why this exists
