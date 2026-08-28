@@ -160,6 +160,85 @@ const BYTES_PER_FUEL: u64 = 64;
 /// Characters of stderr echoed into a failure detail.
 const STDERR_EXCERPT: usize = 512;
 
+/// Characters of a guest-influenced string kept for a log line or an error.
+///
+/// Every `String` a [`SandboxFailure`] carries came, directly or by way of an
+/// interpreter message quoting one, from an artifact nobody audited. It is
+/// evidence, so it has to survive; it is also attacker-controlled text on its
+/// way into a log the operator trusts, so it cannot survive intact.
+const DETAIL_EXCERPT: usize = 512;
+
+/// Bound and neutralise a string the guest influenced.
+///
+/// Two hazards, and the fix for one is not the fix for the other. *Length*: a
+/// detail can be as large as the stdout budget — megabytes at the maximum
+/// response ceiling — and a plugin that fails in a loop writes one per request,
+/// which is a log-storage exhaustion with no guest instruction spent on it.
+/// *Content*: a newline ends the host's record and starts one the operator did
+/// not write, and an ANSI escape repaints records already on screen; either
+/// turns "the log says" into something a plugin controls.
+///
+/// Control characters are escaped rather than dropped, so a detail that was
+/// trying to forge a line reads as one that tried. Everything printable —
+/// including non-ASCII — is kept: an author debugging a plugin that writes
+/// error text in their own language should be able to read it.
+fn guest_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(DETAIL_EXCERPT));
+    for (kept, ch) in text.chars().enumerate() {
+        if kept == DETAIL_EXCERPT {
+            out.push_str(" … (truncated)");
+            break;
+        }
+        if ch.is_control() {
+            out.extend(ch.escape_debug());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// What encoding one request's frame costs, in fuel.
+///
+/// Priced off the request's own bytes at [`BYTES_PER_FUEL`], the rate every
+/// other host-side copy pays, multiplied by the number of times those bytes are
+/// walked on the way to the guest's stdin: cloned into the frame, base64
+/// expanded, and serialised into JSON around it. That is the same factor the
+/// manifest's footprint check counts those buffers at, so one number describes
+/// both the memory and the CPU a request costs before it starts.
+fn encoding_fuel(request: &SandboxRequest) -> u64 {
+    /// Times the request's bytes are walked building the frame.
+    const PASSES: u64 = 4;
+
+    let bytes = request
+        .body
+        .len()
+        .saturating_add(request.path.len())
+        .saturating_add(request.query.len())
+        .saturating_add(request.route.len())
+        .saturating_add(
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            request
+                .path_params
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        );
+
+    u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(PASSES)
+        .checked_div(BYTES_PER_FUEL)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
 /// Largest number of distinct denials recorded for one request.
 ///
 /// The ledger is a diagnostic, and a guest that calls a denied import in a
@@ -334,6 +413,9 @@ impl std::error::Error for SandboxFailure {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SandboxLoadError {
+    /// The manifest handed to [`SandboxHost::from_module`] does not satisfy the
+    /// rules parsing enforces — it was built or mutated rather than parsed.
+    InvalidManifest(String),
     /// The bytes are not a WebAssembly module this engine can compile.
     Wasm(String),
     /// The module imports something no host function defines.
@@ -367,6 +449,9 @@ pub enum SandboxLoadError {
 impl fmt::Display for SandboxLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidManifest(detail) => {
+                write!(f, "the manifest is not one this host will serve: {detail}")
+            }
             Self::Wasm(detail) => write!(f, "the plugin module could not be loaded: {detail}"),
             Self::ForbiddenImports(denials) => write!(
                 f,
@@ -463,15 +548,30 @@ impl SandboxHost {
         Self::from_module(artifact.manifest().clone(), artifact.module())
     }
 
-    /// Compile a module against an already-validated manifest.
+    /// Compile a module against a manifest.
     ///
     /// Prefer [`load`](Self::load), which also proves the manifest describes
     /// *these* bytes.
     ///
+    /// The manifest is re-validated here rather than trusted. Parsing is where
+    /// a manifest's rules are enforced, but [`SandboxManifest`]'s fields are
+    /// public and this constructor is too, so "it was parsed once" is an
+    /// invariant a caller can step around by building or editing one. The
+    /// values that matter are the ones something downstream would *panic* on
+    /// rather than merely misbehave over — a `max_concurrency` past the
+    /// semaphore's ceiling, a route path axum refuses to build — and this crate
+    /// does not panic on plugin input.
+    ///
     /// # Errors
     ///
-    /// See [`load`](Self::load).
+    /// See [`load`](Self::load), plus
+    /// [`InvalidManifest`](SandboxLoadError::InvalidManifest) if the manifest
+    /// does not satisfy the rules parsing enforces.
     pub fn from_module(manifest: SandboxManifest, wasm: &[u8]) -> Result<Self, SandboxLoadError> {
+        manifest
+            .validate()
+            .map_err(|err| SandboxLoadError::InvalidManifest(err.to_string()))?;
+
         let mut config = Config::default();
         // Fuel metering is what turns "a plugin might loop forever" into "a
         // plugin gets a bounded number of instructions". It must be on before
@@ -603,6 +703,31 @@ impl SandboxHost {
     #[must_use]
     pub fn run(&self, request: &SandboxRequest) -> SandboxOutcome {
         let limits = self.manifest.limits;
+
+        // Building the guest's stdin is host work proportional to the request:
+        // the body is cloned into the frame and base64-expanded into the NDJSON
+        // line, all of it before a single guest instruction runs. Unpriced,
+        // that is megabytes of host CPU per request for a manifest that
+        // declares a large body ceiling and almost no fuel — and a client can
+        // repeat it for as long as it likes.
+        //
+        // So it is charged at the same rate as every other host-side copy, and
+        // charged *before* the copies happen: a budget that cannot cover the
+        // encoding refuses without doing it. The guest then starts on what is
+        // left, which is the same arrangement instantiation already has.
+        let encoding = encoding_fuel(request);
+        let Some(after_encoding) = limits.fuel.checked_sub(encoding) else {
+            return SandboxOutcome {
+                result: Err(SandboxFailure::FuelExhausted {
+                    budget: limits.fuel,
+                }),
+                denials: Vec::new(),
+                fuel_used: limits.fuel,
+                peak_memory_bytes: 0,
+                stderr: String::new(),
+            };
+        };
+
         let granted: Vec<SandboxCapability> = self.manifest.capabilities.clone();
         let frame = HostFrame::request(request, &granted);
 
@@ -613,7 +738,7 @@ impl SandboxHost {
                 // plugin-prefix failure rather than propagating: the rest of
                 // the application is unaffected either way.
                 return SandboxOutcome {
-                    result: Err(SandboxFailure::Instantiation(err.to_string())),
+                    result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
                     denials: Vec::new(),
                     fuel_used: 0,
                     peak_memory_bytes: 0,
@@ -633,9 +758,9 @@ impl SandboxHost {
         store.limiter(|state| &mut state.limiter);
         // Set before instantiation, so the budget is in place the moment the
         // first guest instruction runs.
-        if let Err(err) = store.set_fuel(limits.fuel) {
+        if let Err(err) = store.set_fuel(after_encoding) {
             return SandboxOutcome {
-                result: Err(SandboxFailure::Instantiation(err.to_string())),
+                result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
                 denials: Vec::new(),
                 fuel_used: 0,
                 peak_memory_bytes: 0,
@@ -650,11 +775,11 @@ impl SandboxHost {
         // charge cannot stop work that has already been admitted. The *price* is
         // here, so the work that is admitted still comes out of the budget the
         // manifest declared rather than being free.
-        match limits.fuel.checked_sub(self.instantiation_fuel) {
+        match after_encoding.checked_sub(self.instantiation_fuel) {
             Some(left) => {
                 if let Err(err) = store.set_fuel(left) {
                     return SandboxOutcome {
-                        result: Err(SandboxFailure::Instantiation(err.to_string())),
+                        result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
                         denials: Vec::new(),
                         fuel_used: 0,
                         peak_memory_bytes: 0,
@@ -676,7 +801,7 @@ impl SandboxHost {
         let mut linker = <Linker<HostState>>::new(&self.engine);
         if let Err(err) = define_wasi_shim(&mut linker) {
             return SandboxOutcome {
-                result: Err(SandboxFailure::Instantiation(err.to_string())),
+                result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
                 denials: Vec::new(),
                 fuel_used: 0,
                 peak_memory_bytes: 0,
@@ -751,7 +876,11 @@ fn finish(
                         .validate()
                         .and_then(|()| response.check_size(limits.max_response_bytes))
                         .map_or_else(
-                            |err| Err(SandboxFailure::ResponseRefused(err.to_string())),
+                            |err| {
+                                Err(SandboxFailure::ResponseRefused(guest_text(
+                                    &err.to_string(),
+                                )))
+                            },
                             |()| Ok(response.clone()),
                         )
                 },
@@ -786,7 +915,7 @@ fn instantiation_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxF
             budget: limits.fuel,
         }
     } else {
-        SandboxFailure::Instantiation(err.to_string())
+        SandboxFailure::Instantiation(guest_text(&err.to_string()))
     }
 }
 
@@ -804,7 +933,7 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
             max: limits.max_response_bytes,
         };
     }
-    SandboxFailure::Trap(err.to_string())
+    SandboxFailure::Trap(guest_text(&err.to_string()))
 }
 
 /// What one instantiation of this module will cost: how many data and element
@@ -1100,8 +1229,10 @@ impl HostState {
         }
         self.answer = Some(match from_line::<GuestFrame>(line) {
             Ok(GuestFrame::Response(response)) => Ok(response),
-            Ok(GuestFrame::Error { detail }) => Err(SandboxFailure::GuestError(detail)),
-            Err(err) => Err(SandboxFailure::MalformedFrame(err.to_string())),
+            Ok(GuestFrame::Error { detail }) => {
+                Err(SandboxFailure::GuestError(guest_text(&detail)))
+            }
+            Err(err) => Err(SandboxFailure::MalformedFrame(guest_text(&err.to_string()))),
         });
     }
 
@@ -1162,12 +1293,15 @@ impl HostState {
     }
 
     fn stderr_excerpt(&self) -> String {
+        // Bounded *and* neutralised: truncation stops a flood, but a forged
+        // record fits comfortably inside 512 characters.
         let text = String::from_utf8_lossy(&self.stderr);
         let trimmed = text.trim();
-        match trimmed.char_indices().nth(STDERR_EXCERPT) {
-            Some((index, _)) => trimmed.get(..index).unwrap_or_default().to_owned(),
-            None => trimmed.to_owned(),
-        }
+        let kept = match trimmed.char_indices().nth(STDERR_EXCERPT) {
+            Some((index, _)) => trimmed.get(..index).unwrap_or_default(),
+            None => trimmed,
+        };
+        guest_text(kept)
     }
 
     /// `SplitMix64`: tiny, deterministic, and good enough for a shim whose
@@ -2686,6 +2820,109 @@ path = "/hello/greet"
             matches!(outcome.result, Err(SandboxFailure::ResponseRefused(_))),
             "{:?}",
             outcome.result
+        );
+    }
+
+    #[test]
+    fn a_guest_error_detail_can_neither_flood_nor_forge_a_log_line() {
+        // A guest's `detail` is attacker-controlled text on its way to a log
+        // the operator trusts. Two separate hazards: its *length* (a line can
+        // be as large as the stdout budget, and a plugin that fails in a loop
+        // writes one per request) and its *content* (a newline starts a record
+        // the operator did not write; an ANSI escape repaints one they did).
+        let outcome = host(guests::FORGE_LOG).run(&get("/hello/greet"));
+        let Err(failure) = outcome.result else {
+            panic!("the guest reported a failure");
+        };
+        let rendered = failure.to_string();
+        assert!(
+            rendered.len() < 4096,
+            "a 2 KiB detail reached the log intact: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\r'),
+            "the detail can start a log record of its own: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "the detail can repaint the operator's terminal: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("forged"),
+            "the detail is still legible enough to debug with: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn stderr_is_escaped_as_well_as_bounded() {
+        // Same hazard, same answer: stderr was truncated but not neutralised,
+        // so a guest could forge a record inside its 512-character excerpt.
+        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        state.write_stderr(b"panicked\n2026-01-01  INFO forged\x1b[2K");
+        let excerpt = state.stderr_excerpt();
+        assert!(
+            !excerpt.contains('\n') && !excerpt.contains('\u{1b}'),
+            "{excerpt:?}"
+        );
+        assert!(excerpt.contains("panicked"), "{excerpt:?}");
+    }
+
+    #[test]
+    fn a_manifest_mutated_after_validation_is_refused_rather_than_trusted() {
+        // `SandboxManifest`'s fields are public and `from_module` is public, so
+        // "the manifest was validated when it was parsed" is an invariant a
+        // caller can step around without meaning to. The values that matter
+        // here are the ones that panic something downstream rather than merely
+        // misbehaving: a concurrency past the semaphore's ceiling, and a route
+        // path axum refuses to build.
+        let wasm = wat::parse_str(guests::HELLO).expect("the fixture is valid WAT");
+
+        let mut manifest = manifest_with(ResourceLimits::default());
+        manifest.limits.max_concurrency = usize::MAX;
+        let err = SandboxHost::from_module(manifest, &wasm)
+            .expect_err("an invalid manifest must not produce a host");
+        assert!(matches!(err, SandboxLoadError::InvalidManifest(_)), "{err}");
+
+        let mut manifest = manifest_with(ResourceLimits::default());
+        manifest.routes[0].path = "/{".to_owned();
+        let err = SandboxHost::from_module(manifest, &wasm)
+            .expect_err("an unbuildable route must not produce a host");
+        assert!(matches!(err, SandboxLoadError::InvalidManifest(_)), "{err}");
+    }
+
+    #[test]
+    fn encoding_the_request_frame_is_priced_before_it_is_performed() {
+        // The body is cloned into the frame and base64-expanded into the NDJSON
+        // line before a single guest instruction runs. With a large body
+        // ceiling and a small fuel budget that is megabytes of host CPU outside
+        // the declared ceiling, repeatable for as long as a client keeps
+        // sending.
+        let host = host(guests::HELLO);
+        let mut request = get("/hello/greet");
+        request.body = vec![b'x'; 200_000];
+
+        let starved = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                fuel: 16,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect("the fixture loads");
+        let outcome = starved.run(&request);
+        assert!(
+            matches!(outcome.result, Err(SandboxFailure::FuelExhausted { .. })),
+            "{:?}",
+            outcome.result
+        );
+
+        // And an honest request pays for it rather than getting it free.
+        let outcome = host.run(&request);
+        assert!(
+            outcome.fuel_used >= 200_000 / BYTES_PER_FUEL,
+            "the encoding was not charged: {} units",
+            outcome.fuel_used
         );
     }
 

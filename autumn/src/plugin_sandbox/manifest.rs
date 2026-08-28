@@ -633,7 +633,7 @@ impl SandboxManifest {
         out
     }
 
-    fn validate(&self) -> Result<(), ManifestError> {
+    pub(crate) fn validate(&self) -> Result<(), ManifestError> {
         if self.wire_version != WIRE_VERSION {
             return Err(ManifestError::UnsupportedWireVersion {
                 found: self.wire_version,

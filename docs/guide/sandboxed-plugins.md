@@ -212,6 +212,11 @@ Every one of these is a hard error, not a warning:
 | a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
 
+These rules are enforced when a manifest is parsed *and* again when a host is
+built from one, because `SandboxManifest`'s fields are public: a manifest that
+was constructed or edited in Rust rather than parsed gets the same answer as one
+read off disk.
+
 ---
 
 ## Installing
@@ -308,7 +313,7 @@ would the GET and the host discards the body for you.
 
 | Ceiling | What it bounds | What happens at the edge |
 |---|---|---|
-| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — including the module's own data and element segments, which every request re-instantiates — at 64 bytes per unit | 504 on the plugin's prefix |
+| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
@@ -337,6 +342,13 @@ on the part a guest is running. The cost of that choice is that a client
 dribbling a body could otherwise hold a permit without ever starting a guest, so
 the read has its own deadline. Unlike the interpreter, an async body read is
 genuinely cancellable, so that is a real bound rather than a hopeful one.
+
+Both of the host-side costs a request pays before the guest runs — instantiating
+the module and encoding the request frame — are charged against `fuel` *before*
+they are performed, so a manifest that declares a large body ceiling and almost
+no budget is refused rather than served for free. A price is not a ceiling,
+though, and the structurally expensive cases have one of their own at load: see
+the segment limits above.
 
 Each request gets a **fresh instance**, so no state survives a request and one
 request's misbehaviour cannot reach the next.
@@ -419,6 +431,13 @@ Denials are deduplicated per request, so a guest calling `path_open` in a loop
 produces one line, not a flood. A Rust guest's `std` touches `environ_sizes_get`
 during start-up, so an `environment` denial per request is normal for one and
 means exactly what it says: it asked, and it did not get.
+
+The log is a surface the plugin can write to, so it is bounded like every other
+one. Anything a guest influenced — its own error `detail`, its stderr, the
+interpreter's account of a trap — is truncated to 512 characters and has its
+control characters escaped before it is logged. A plugin that fails on every
+request cannot fill a disk with one, and a `detail` containing a newline or an
+ANSI escape reads as text that tried to forge a record rather than as one.
 
 ---
 

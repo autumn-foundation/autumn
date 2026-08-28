@@ -142,9 +142,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary: `wasmi` is a pure-Rust interpreter, so there is no daemon, no
   subprocess and no native codegen backend. Purely additive — the native
   `Plugin` trait and every existing plugin are untouched, and the feature is not
-  in `autumn-web`'s default set. First slice: request handling under the declared prefix is the
-  only capability that exists, so no manifest can ask for a database, a session
-  or an outbound call. See `docs/guide/sandboxed-plugins.md`.
+  in `autumn-web`'s default set. The declared budgets bound the host's own
+  work as well as the guest's: instantiating the module and encoding the request
+  frame are both charged against `fuel` before they are performed, and anything
+  the guest influenced — its error detail, its stderr, the interpreter's account
+  of a trap — is truncated and control-escaped before it is logged, so a plugin
+  cannot flood an operator's log or forge a record in it. First slice: request
+  handling under the declared prefix is the only capability that exists, so no
+  manifest can ask for a database, a session or an outbound call. See
+  `docs/guide/sandboxed-plugins.md`.
 
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
