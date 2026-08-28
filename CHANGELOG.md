@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sandboxed plugin can no longer abort the application at boot:** the
+  duplicate-route preflight skips `nest` mounts because axum exposes no way to
+  enumerate a nested router — but a sandboxed plugin's manifest *is* its route
+  table, and `Router::nest` panics with `Overlapping method route` when a
+  declared path is one the host already serves. An untrusted artifact declaring
+  a plausible prefix (`/admin`, `/status`, `/api`) could therefore take down
+  every route in the application, not just its own — containment failing open
+  for exactly the input class the sandbox lane exists to distrust. Routes
+  declared via `AppBuilder::declare_plugin_routes` are now checked against the
+  application's own routes through the same `matchit` oracle axum routes
+  through, so a collision — exact path, shape clash (`/hello/{id}` against a
+  declared `/hello/{slug}`), or catch-all — is a `RouterBuildError` naming the
+  plugin and the contested path, raised before anything mounts. Paths that axum
+  accepts (disjoint siblings under a shared prefix, a route *at* the prefix, a
+  GET and its implied HEAD) are unaffected. `TestApp` carries these
+  declarations too, so a colliding plugin fails in tests rather than only in
+  production.
+
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every
   `CsvRowError`, but the underlying CSV parser's own counter runs exactly one

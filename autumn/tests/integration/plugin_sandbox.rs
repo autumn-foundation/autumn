@@ -149,6 +149,64 @@ fn a_sandboxed_plugin_passes_the_existing_conformance_checks() {
     assert!(report.passed(), "{}", report.to_text_report());
 }
 
+/// A host route on exactly the path the `HELLO` manifest declares. The plugin
+/// is not special here — any application that already serves the path a
+/// third-party artifact names would hit this.
+#[autumn_web::get("/hello/greet")]
+async fn host_greet() -> &'static str {
+    "the host already serves this"
+}
+
+/// An untrusted artifact must not be able to abort the application at boot.
+///
+/// The manifest is the mount, and `axum::Router::nest` panics with "Overlapping
+/// method route" if a declared path is one the host already serves. That is a
+/// denial of service against the WHOLE app — every route, not just the
+/// plugin's prefix — reachable from an artifact the operator was told the
+/// sandbox contains, and it is the likely case rather than an exotic one: a
+/// third-party plugin picks a plausible prefix, which is exactly where
+/// collisions live.
+///
+/// The declared manifest is fed to the duplicate-route preflight, so this
+/// surfaces as the structured refusal naming the offending plugin instead.
+#[test]
+fn a_plugin_declaring_a_route_the_app_already_serves_is_refused_not_a_boot_panic() {
+    let outcome = std::panic::catch_unwind(|| {
+        // `TestClient` is not `Debug`, so discard it rather than unwrapping.
+        let _ = autumn_web::test::TestApp::new()
+            .routes(autumn_web::routes![host_greet])
+            .plugin(plugin(guests::HELLO, ResourceLimits::default()))
+            .build();
+    });
+    let failure = outcome.expect_err("mounting a colliding plugin must not succeed");
+    let message = failure
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| failure.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+
+    // The typed refusal, raised by the duplicate-route preflight BEFORE
+    // anything mounts — not axum's `Router::nest` blowing up mid-assembly.
+    assert!(
+        message.contains("DuplicateUserRoute"),
+        "expected the structured refusal; got: {message}"
+    );
+    assert!(
+        !message.contains("Overlapping method route"),
+        "the axum mount panic escaped the preflight; got: {message}"
+    );
+    // The operator has to learn WHICH artifact to stop installing, and which
+    // of their own routes it collided with.
+    assert!(
+        message.contains("sandbox:autumn-plugin-hello") && message.contains("host_greet"),
+        "the refusal must name both the plugin and the host route; got: {message}"
+    );
+    assert!(
+        message.contains("/hello/greet"),
+        "the refusal must name the contested path; got: {message}"
+    );
+}
+
 // ── AC-3, AC-4, AC-5: the adversarial corpus ─────────────────────────────
 
 /// What containment a given escape attempt is expected to produce.

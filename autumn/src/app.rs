@@ -475,8 +475,14 @@ pub struct AppBuilder {
     story_gallery: Option<crate::stories::StoryGallery>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
-    /// the underlying Axum router is not enumerable.
-    declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// the underlying Axum router is not enumerable, and handed to the router
+    /// build so the duplicate-route preflight can see inside those otherwise
+    /// opaque mounts.
+    ///
+    /// `pub(crate)` so [`TestApp`](crate::test::TestApp) can carry them too — a
+    /// harness that dropped them would mount a colliding plugin cleanly in
+    /// tests and panic at boot in production.
+    pub(crate) declared_routes: Vec<crate::route_listing::RouteInfo>,
     /// Whether `.idempotent()` was called on this builder. Applied to the
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
@@ -3213,7 +3219,7 @@ impl AppBuilder {
             mail_previews,
             #[cfg(feature = "maud")]
             story_gallery,
-            declared_routes: _,
+            declared_routes,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -3884,6 +3890,11 @@ impl AppBuilder {
                     scoped_groups,
                     merge_routers,
                     nest_routers,
+                    // The sandboxed-plugin manifests (and any other declared plugin
+                    // routes) this builder collected. Handing them to the router build is
+                    // what lets the duplicate-route preflight see inside an otherwise
+                    // opaque `nest` mount and refuse a collision instead of panicking.
+                    declared_routes,
                     custom_layers,
                     static_gate_layers,
                     #[cfg(feature = "maud")]
@@ -5216,6 +5227,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -6500,6 +6512,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -13165,6 +13178,7 @@ mod tests {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]
@@ -13242,6 +13256,7 @@ mod tests {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]

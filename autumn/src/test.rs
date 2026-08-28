@@ -716,6 +716,12 @@ pub struct TestApp {
     scoped_groups: Vec<crate::app::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    /// Routes declared for opaque `nest` mounts, mirroring
+    /// [`AppBuilder::declare_plugin_routes`]. Carried so a `TestApp` runs the
+    /// same duplicate-route preflight production does — without this, a plugin
+    /// whose manifest collides with a host route would mount cleanly in tests
+    /// and panic at boot in production.
+    declared_routes: Vec<crate::route_listing::RouteInfo>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
@@ -808,6 +814,7 @@ impl TestApp {
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             config,
@@ -1253,6 +1260,7 @@ impl TestApp {
         self.scoped_groups.extend(app_builder.scoped_groups);
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
+        self.declared_routes.extend(app_builder.declared_routes);
         self.custom_layers.extend(app_builder.custom_layers);
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
@@ -2187,6 +2195,7 @@ impl TestApp {
                 scoped_groups: self.scoped_groups,
                 merge_routers,
                 nest_routers: self.nest_routers,
+                declared_routes: self.declared_routes,
                 custom_layers: self.custom_layers,
                 static_gate_layers: self.static_gate_layers,
                 #[cfg(feature = "maud")]
