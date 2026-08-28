@@ -804,7 +804,21 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>") {
+    // Splice before `</body>` ONLY when it is the document's actual ending —
+    // that is, when nothing but `</html>` and whitespace follows it.
+    //
+    // A raw reverse search cannot tell a real closing tag from the same bytes
+    // sitting in a `<script>` string or an HTML comment, and this middleware
+    // has no HTML parser. So instead of trying to identify the tag, it checks
+    // the one thing that distinguishes the real one: a document ends
+    // `…</body></html>`, while a script literal or a trailing comment has other
+    // content after it. When the tail does not look like an ending, the banner
+    // is appended instead — which is already the correct, tested behaviour for
+    // a document that omits `</body>` entirely, and cannot corrupt markup the
+    // way splicing into a script string would.
+    if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>")
+        && tail_is_document_end(&body[index + b"</body>".len()..])
+    {
         let mut out = Vec::with_capacity(body.len() + snippet.len());
         out.extend_from_slice(&body[..index]);
         out.extend_from_slice(snippet.as_bytes());
@@ -818,6 +832,33 @@ fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
     let mut out = body.to_vec();
     out.extend_from_slice(snippet.as_bytes());
     out.into()
+}
+
+/// Whether everything after a `</body>` is just the document closing out:
+/// optional whitespace, an optional `</html>`, optional whitespace.
+///
+/// This is what separates the real closing tag from the same bytes inside a
+/// `<script>` string or a trailing comment, without parsing the document.
+fn tail_is_document_end(tail: &[u8]) -> bool {
+    let rest = trim_ascii_whitespace(tail);
+    let rest = if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"</html>") {
+        trim_ascii_whitespace(&rest[7..])
+    } else {
+        rest
+    };
+    rest.is_empty()
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
 }
 
 /// Whether the response is served as a download rather than rendered in place.
@@ -1084,6 +1125,48 @@ mod tests {
             "<!doctype html><html><body>rows</body></html>",
             "an exported file must reach the disk exactly as the handler wrote it"
         );
+    }
+
+    #[test]
+    fn a_body_close_that_is_not_the_document_ending_is_appended_past_not_spliced_into() {
+        // A complete document whose only `</body>` bytes live in a script
+        // string, or whose real closing tag is followed by a comment carrying
+        // the same text. Splicing at the raw match would drop the banner into
+        // JavaScript or a comment: corrupt markup AND no usable prompt.
+        for doc in [
+            &b"<!doctype html><script>const marker = \"</body>\";</script>"[..],
+            &b"<!doctype html><html><body>hi</body></html><!-- </body> -->"[..],
+        ] {
+            let out = splice_before_body_close(doc, "<snip>").expect("still a document");
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                rendered.ends_with("<snip>"),
+                "must append past the false boundary, not splice into it: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<snip>\";</script>") && !rendered.contains("<snip> -->"),
+                "the banner must not land inside the script or the comment: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_document_ending_is_still_spliced_before() {
+        for doc in [
+            &b"<html><body>hi</body></html>"[..],
+            &b"<html><body>hi</body></html>\n"[..],
+            &b"<html><body>hi</body>\n</html>\n\n"[..],
+            &b"<html><body>hi</body>"[..],
+            &b"<HTML><BODY>hi</BODY></HTML>"[..],
+        ] {
+            let rendered =
+                String::from_utf8(splice_before_body_close(doc, "<snip>").expect("document"))
+                    .unwrap();
+            assert!(
+                rendered.to_ascii_lowercase().contains("<snip></body>"),
+                "a genuine ending must still be spliced before: {rendered}"
+            );
+        }
     }
 
     #[test]
