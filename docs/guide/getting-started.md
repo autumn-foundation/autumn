@@ -148,6 +148,8 @@ my-app/
   rust-toolchain.toml
   rustfmt.toml
   clippy.toml
+  tailwind.config.js        # Tailwind content globs
+  .autumn/scaffold.toml     # which release scaffolded this — commit it
   src/
     main.rs                 # your application entry point
   static/
@@ -163,6 +165,11 @@ my-app/
     credentials/development.toml.enc
   .github/workflows/ci.yml  # fmt, clippy, test, and a11y checks
 ```
+
+`.autumn/scaffold.toml` is bookkeeping, but commit it: it records which
+release's scaffold produced the framework-owned files above, so a later
+[`autumn upgrade`](upgrading.md#scaffold-files) can tell a template that moved
+from a file you edited, and never overwrite your work.
 
 The files that matter right now:
 

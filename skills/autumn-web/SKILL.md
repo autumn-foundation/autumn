@@ -2158,8 +2158,10 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
-autumn upgrade                   # preview each release's mechanical app-code migrations (renames) as a per-file diff; writes nothing
-autumn upgrade --apply           # take them; --from/--to override the range, --list-migrations shows what ships (#1629)
+autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
+autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
+autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)
+autumn upgrade --accept <PATH>   # record a framework-owned file as the developer's own: never offered or written again, and not drift (#1593)
 autumn deploy check              # SSH/secret/DB/migrate-safety preflight per configured host; `doctor --online` runs the same graders
 autumn deploy plan               # dry-run: representative unit + ordered steps (+ fleet rollout order when `[deploy] hosts` is set)
 autumn deploy up                 # real deploy over SSH; with `[deploy] hosts` a serial rolling deploy across the fleet (#1621)
@@ -2169,13 +2171,25 @@ autumn deploy status --json --strict          # read-only per-host state + versi
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 ```
 
-### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629)
+### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
 
-**Reach for this before hand-editing call sites out of a migration guide.**
-For each release between the `autumn-web` version the app's `Cargo.toml`
-records and the target, it applies that release's *mechanical* migrations —
-API renames — to the app's own Rust source. First shipped: 0.6.0's
-`with_pool` → `with_pool_untracked`.
+**Reach for this before hand-editing call sites out of a migration guide, or
+hand-diffing a throwaway `autumn new` project.** One run covers both halves of
+an upgrade:
+
+1. **The app's own Rust source.** For each release between the `autumn-web`
+   version `Cargo.toml` records and the target, it applies that release's
+   *mechanical* migrations — API renames — to `src/`, `tests/`, `examples/`,
+   `benches/` and every workspace member. First shipped: 0.6.0's `with_pool`
+   → `with_pool_untracked`.
+2. **The project's framework-owned files.** `Dockerfile`, `.dockerignore`,
+   `build.rs`, `autumn.toml`, `.gitignore`, `.env.example`,
+   `.github/workflows/ci.yml`, `rust-toolchain.toml`, `rustfmt.toml`,
+   `clippy.toml`, and (fullstack only) `tailwind.config.js` +
+   `static/css/input.css`, reconciled against this release's scaffold.
+   Bumping `autumn-web` updates the library, not the project skeleton, so
+   without this an app scaffolded on 0.5 keeps 0.5-vintage project files
+   forever.
 
 Three things to get right when advising on it:
 
@@ -2196,6 +2210,40 @@ Three things to get right when advising on it:
 Every breaking change in `docs/migrations/*.md` carries an `**Automation:**`
 label — `auto` (the codemod does it), `review` (it rewrites, and flags each
 site), or `manual` (read the guide section). See `docs/guide/upgrading.md`.
+
+For the scaffold half, five more things (issue #1593):
+
+- **`src/` is out of bounds.** The set is a fixed allowlist with no `src/`
+  entry, and `Cargo.toml`, `README.md`, `tests/`, `migrations/`, `i18n/`,
+  `config/credentials/` and the vendored `static/js/` assets are not
+  framework-owned either. Application code is the *first* half's business.
+- **`.autumn/scaffold.toml` is the baseline, and must be committed.**
+  `autumn new` records the scaffolding release, the flags the project was made
+  with, and a digest of every framework-owned file as Autumn wrote it. That
+  digest is the only thing that can distinguish "the template moved" from "the
+  developer edited this". Verdicts: `add` (this release's scaffold has it and
+  the project does not — including files a later release introduced),
+  `update` (template moved, the copy is provably untouched), `conflict`
+  (never written), `removed` (deleted on purpose, never restored), `pinned`
+  (accepted as the developer's).
+- **A project with no manifest still upgrades, best-effort.** Every app
+  predating this feature is in that state: missing files are still offered,
+  and everything that differs is a conflict, because "untouched" cannot be
+  proven. Never an error.
+- **A conflict has to be able to conclude.** Where a file is deliberately the
+  team's — a `Dockerfile` with their own base image — `autumn upgrade --accept
+  <path>` records it in the manifest's `pinned` list so `--check` can go green
+  again. Removing a line from that list brings the file back.
+- **Inside a Cargo workspace, member crates are not offered `clippy.toml`,
+  `rustfmt.toml`, `rust-toolchain.toml` or a CI workflow.** Those resolve from
+  the nearest ancestor, so a crate-local copy *shadows* the workspace's rather
+  than adding to it, and GitHub never runs a workflow from a subdirectory.
+
+`--to` selects which codemods run; the scaffold half always reconciles to the
+release the CLI itself ships templates for — downgrades and historical
+scaffolds are out of scope. `--json` carries the scaffold report under a
+`scaffold` key in both modes, splitting `writable` (the plan) from `written`
+(what reached disk).
 
 `autumn console` is Autumn's `rails console` equivalent. Rust has no stable
 `eval`, so it follows loco.rs's edit-and-run model instead of shipping a REPL:
