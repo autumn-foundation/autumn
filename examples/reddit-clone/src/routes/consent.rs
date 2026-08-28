@@ -22,7 +22,9 @@ use autumn_web::prelude::*;
 use autumn_web::reexports::http::HeaderMap;
 use autumn_web::reexports::http::header::{CACHE_CONTROL, REFERER, SET_COOKIE, VARY};
 
-use super::layout::layout;
+use autumn_web::seo::SeoMeta;
+
+use super::layout::layout_with_seo;
 
 /// The version of this app's cookie policy.
 ///
@@ -80,6 +82,14 @@ pub async fn withdraw(flash: Flash, headers: HeaderMap) -> impl IntoResponse {
     )
 )]
 pub async fn manage(
+    // The `seo(...)` above is only a declaration: something has to carry it
+    // into the `<head>`. `SeoMeta` is the extractor that receives the route's
+    // declared metadata, and `layout_with_seo` is what renders it. Reaching for
+    // the plain `layout` here silently dropped `robots = "noindex, nofollow"`,
+    // because `layout` builds its own title-only `SeoMeta` — leaving a page
+    // that embeds a live CSRF token and a visitor's cookie choice indexable
+    // despite declaring otherwise.
+    seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
     consent: Consent,
@@ -96,8 +106,8 @@ pub async fn manage(
         "Only strictly-necessary cookies are running."
     };
 
-    let markup = layout(
-        "Cookie preferences",
+    let markup = layout_with_seo(
+        seo,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
@@ -150,6 +160,8 @@ autumn_web::paths![accept, reject, withdraw, manage];
 #[cfg(test)]
 mod tests {
     use autumn_web::consent::Consent;
+    use autumn_web::prelude::*;
+    use autumn_web::seo::SeoMeta;
 
     use super::{CATEGORIES, CONSENT_POLICY_VERSION};
 
@@ -162,6 +174,47 @@ mod tests {
         // its session/CSRF call sites through the same check if it wants one
         // code path.
         assert!(consent.allows("necessary", CONSENT_POLICY_VERSION));
+    }
+
+    /// The preferences page declares `robots = "noindex, nofollow"`, and a
+    /// declaration is only worth as much as the rendering that carries it.
+    /// `manage` originally called the plain `layout`, which builds its own
+    /// title-only `SeoMeta`, so the robots directive never reached the
+    /// `<head>` — leaving a page that embeds a live CSRF token and the
+    /// visitor's cookie choice indexable.
+    ///
+    /// `manage` takes five extractors, so unlike `about` it cannot be called
+    /// directly here. The guard is a chain of two halves instead:
+    ///
+    /// 1. `manage`'s first parameter is the route's `SeoMeta` (checked at
+    ///    compile time below), and an unused binding would fail the `-D
+    ///    warnings` gate — so it is not merely accepted, it is used.
+    /// 2. `layout_with_seo`, the only thing it can be used for here, really
+    ///    does render the directive.
+    ///
+    /// Neither half alone would have caught the original bug: the old code
+    /// passed this second assertion while dropping the tag.
+    #[test]
+    fn the_preferences_page_really_renders_its_noindex_directive() {
+        // Half 1 — compile-time: `manage` still receives the declared metadata.
+        fn takes_route_seo<F, Fut>(_handler: F)
+        where
+            F: Fn(SeoMeta, Session, CsrfToken, Consent, Flash) -> Fut,
+        {
+        }
+        takes_route_seo(super::manage);
+
+        // Half 2 — the renderer it hands that metadata to emits the directive.
+        let seo = SeoMeta::new()
+            .title("Cookie preferences \u{2022} Autumn Reddit")
+            .robots("noindex, nofollow");
+
+        let rendered = super::layout_with_seo(seo, None, Some("tok"), maud::html! {}).into_string();
+
+        assert!(
+            rendered.contains(r#"content="noindex, nofollow""#),
+            "the declared robots directive must reach the rendered head: {rendered}"
+        );
     }
 
     #[test]
