@@ -319,17 +319,18 @@ pub async fn inject_consent_banner(
         return response;
     }
 
-    // No `HEAD`-specific handling is needed here, even though this can
-    // splice a banner into the body below: Axum's own per-route wrapper
-    // (added by `.layer()`, wrapping this entire middleware) is what
-    // actually converts a `GET` handler's response into a `HEAD` one — it
-    // computes `Content-Length` from *this* middleware's returned body and
-    // *then* empties it for `HEAD`, strictly after this function returns.
-    // So by the time this code runs, `response` still carries the real,
-    // full body (and no `Content-Length` yet) regardless of request method;
-    // splicing into it here and letting `Content-Length` reflect the
-    // spliced body is exactly the metadata Axum will carry through to the
-    // final `HEAD` response once it empties the body.
+    // On a route Axum wraps, `HEAD` needs no special handling here: Axum's
+    // per-route wrapper computes `Content-Length` from *this* middleware's
+    // returned body and empties it strictly afterwards, so splicing here is
+    // what makes the `HEAD` metadata match the equivalent `GET`. The test
+    // `undecided_visitors_head_request_matches_the_spliced_gets_content_length_and_cache_control`
+    // pins that.
+    //
+    // The pre-rendered path is the exception, and it is caught below by the
+    // empty-body check rather than by the method: with a `dist` manifest the
+    // static-first middleware answers a `HEAD` hit itself with `Body::empty()`
+    // and this layer is reapplied *outside* it, so no wrapper will fix up what
+    // we return.
     // A fragment never carries the banner, but it may well carry markup the
     // handler gated on `Consent::allows` — an analytics snippet, a
     // personalised control. Without `Vary: Cookie` a shared cache could store
@@ -440,10 +441,37 @@ fn htmx_header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
 /// Whether the client offered to accept an HTML document.
 fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
     headers.get(axum::http::header::ACCEPT).is_none_or(|value| {
-        value
-            .to_str()
-            .is_ok_and(|accept| accept.to_ascii_lowercase().contains("text/html"))
+        value.to_str().is_ok_and(|accept| {
+            accept.split(',').any(|range| {
+                let mut parts = range.split(';').map(str::trim);
+                let Some(media) = parts.next() else {
+                    return false;
+                };
+                if !media.eq_ignore_ascii_case("text/html") {
+                    return false;
+                }
+                // `text/html;q=0` is an explicit refusal, not an offer. A
+                // substring check reads it as acceptance and then strips the
+                // client's conditional validators on every request — so an API
+                // client that names HTML only to reject it would never get a
+                // `304` again. Anything that is not a zero quality (including a
+                // malformed one) is treated as accepted, matching the lenient
+                // spirit of the rest of this predicate.
+                !parts.any(|param| {
+                    param
+                        .split_once('=')
+                        .is_some_and(|(k, v)| k.eq_ignore_ascii_case("q") && is_zero_quality(v))
+                })
+            })
+        })
     })
+}
+
+/// Whether an RFC 9110 quality value is exactly zero (`0`, `0.`, `0.000`).
+fn is_zero_quality(v: &str) -> bool {
+    let v = v.trim();
+    let (int, frac) = v.split_once('.').unwrap_or((v, ""));
+    int == "0" && frac.chars().all(|c| c == '0')
 }
 
 /// Whether this request came from htmx, and therefore expects a fragment
@@ -623,6 +651,29 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             // `RENDERED_BANNER_MARKER`'s doc for why the whole opening tag,
             // not just the bare class name) rather than assuming any
             // particular route.
+
+            // An already-empty HTML body is not a page to prompt in, and
+            // appending a bare banner to one produces a document that is
+            // nothing but a banner. The case that makes this reachable is a
+            // `HEAD` hit on a pre-rendered page: with a `dist` manifest the
+            // static-first middleware answers it directly with `Body::empty()`
+            // and `Content-Type: text/html`, and user layers — this one
+            // included — are reapplied *outside* that middleware, so no Axum
+            // per-route wrapper will fix up what we return. Splicing there
+            // would give a `HEAD` response a body and a `Content-Length` of the
+            // banner rather than of the equivalent `GET`.
+            //
+            // Deliberately keyed on the empty body rather than on the method:
+            // on a route Axum *does* wrap, a `HEAD` still carries the full body
+            // here and must be spliced, so that its `Content-Length` matches
+            // the `GET`.
+            if bytes.is_empty() {
+                parts
+                    .headers
+                    .append(VARY, HeaderValue::from_static("Cookie"));
+                return Response::from_parts(parts, Body::from(bytes));
+            }
+
             if contains_ascii_case_insensitive(&bytes, RENDERED_BANNER_MARKER.as_bytes()) {
                 // The handler's own rendering already carries a live,
                 // per-visitor CSRF token (see `consent_banner_markup`) —
@@ -1926,6 +1977,76 @@ mod tests {
         assert!(
             rendered.contains("autumn-consent-banner"),
             "and must still be prompted; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_quality_is_a_refusal_of_html() {
+        let accept = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_str(v).unwrap(),
+            );
+            accepts_html(&h)
+        };
+
+        // The finding: named, but refused.
+        assert!(!accept("application/json, text/html;q=0"));
+        assert!(!accept("text/html;q=0.0"));
+        assert!(!accept("text/html; q=0.000"));
+
+        // Still accepted — a zero check must not become a q-ranking.
+        assert!(accept("text/html"));
+        assert!(accept("text/html;q=0.1"));
+        assert!(accept("text/html;q=0.9, application/json"));
+        assert!(accept("application/json, text/html"));
+        // `*/*` remains deliberately excluded: the XHR default must not count
+        // as a browser navigation. See `a_plain_xhr_json_client_...`.
+        assert!(!accept("*/*"));
+    }
+
+    /// A pre-rendered `HEAD` hit arrives here already bodyless, and no Axum
+    /// per-route wrapper is left to fix up what we return — so splicing would
+    /// hand a `HEAD` a body and a `Content-Length` of the banner rather than of
+    /// the equivalent `GET`.
+    #[tokio::test]
+    async fn an_already_empty_html_response_is_not_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/",
+                // Stands in for the static-first middleware's `is_head` branch:
+                // `text/html`, empty body, produced without Axum wrapping a
+                // handler whose body it will later empty.
+                axum::routing::get(|| async {
+                    ([(CONTENT_TYPE, "text/html; charset=utf-8")], Body::empty())
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .any(|v| v.as_bytes().eq_ignore_ascii_case(b"Cookie")),
+            "it is still a consent-dependent representation"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "an empty HTML response must stay empty; got {} bytes",
+            body.len()
         );
     }
 

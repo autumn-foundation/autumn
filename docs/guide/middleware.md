@@ -381,12 +381,22 @@ short-circuit above it — session-store outages, and in production startup
 outermost **fallback** `AccessLog`, which logs them with the wire status (and
 without a request id, since `RequestIdLayer` never ran for them).
 
-The ordering guarantee that matters most: **user layers run inside
-`RequestIdLayer` on ingress**, so every `.layer()` you register can read the
-generated `RequestId` from the request extensions. Exception filters,
-metrics, and error-page rendering all sit *outside* your layers, which means
-errors you produce (and errors you let bubble up from handlers) are still
-caught by Autumn's error pipeline.
+The ordering guarantee that matters most: **in a fully dynamic build, user
+layers run inside `RequestIdLayer` on ingress**, so every `.layer()` you
+register can read the generated `RequestId` from the request extensions.
+Exception filters, metrics, and error-page rendering all sit *outside* your
+layers, which means errors you produce (and errors you let bubble up from
+handlers) are still caught by Autumn's error pipeline.
+
+> **This inverts when a `dist` manifest is active (SSG/ISR).** To let your
+> layers see pre-rendered responses — to compress them, for instance —
+> `try_build_router_with_static_inner` drains the registered layers and
+> reapplies them **outside** the static-first middleware, which puts them
+> outside `RequestIdLayer` and the session layer too. In that mode a layer
+> reading `RequestId` finds nothing, on cached hits *and* on dynamic misses.
+> Read it as `Option` and degrade, rather than unwrapping. The same
+> repositioning is why `request_timeout_ms` does not bound those layers in
+> static builds — a limitation `router.rs` documents at the same site.
 
 Multiple `.layer()` calls stack in registration order, mirroring
 [`tower::ServiceBuilder`]: the first `.layer(A)` call becomes the outermost
