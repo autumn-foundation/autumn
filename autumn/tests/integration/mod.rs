@@ -205,6 +205,8 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+mod push_end_to_end;
+mod push_router;
 mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]

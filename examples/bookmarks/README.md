@@ -26,6 +26,7 @@ tasks, embedded migrations, htmx, and actuator endpoints.
 | **Scheduled tasks** | `src/tasks.rs` | `#[scheduled(every = "1h")]` link health checker |
 | **Embedded migrations** | `src/main.rs` | Runs Diesel migrations at startup |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
+| **App metrics facade** | `src/metrics.rs`, `src/routes/bookmarks.rs` | One domain counter and one timer recorded at the call site with `autumn_web::metrics` — no type to define, nothing registered with `AppBuilder` — landing on the same `/actuator/prometheus` scrape as the built-in `autumn_http_*` families |
 
 ## Prerequisites
 
@@ -82,10 +83,67 @@ These routes are generated from `#[autumn_web::repository(Bookmark, api = "/api/
 |--------|--------------------------|------------------------|
 | GET    | `/actuator/health`       | Health + profile info  |
 | GET    | `/actuator/info`         | Build & runtime info   |
-| GET    | `/actuator/metrics`      | Request and pool stats |
+| GET    | `/actuator/metrics`      | Request and pool stats, plus this app's own metrics under `app` |
+| GET    | `/actuator/prometheus`   | Prometheus scrape, built-in and app families together |
 | GET    | `/health`                | Health check           |
 | GET    | `/static/js/htmx.min.js` | Bundled htmx          |
 | GET    | `/static/css/autumn.css` | Compiled Tailwind CSS  |
+
+## App metrics
+
+`/actuator/prometheus` already exposed the framework's own `autumn_http_*`
+families. `autumn_web::metrics` lets **this app** add its own instruments at the
+point where the interesting thing happens — one line at the call site, no trait
+to implement, no type to define, nothing to register with `AppBuilder`. See
+[`docs/guide/metrics.md`](../../docs/guide/metrics.md).
+
+`src/metrics.rs` is the one place that names an instrument, so the call sites
+stay one line each:
+
+| Instrument | Kind | Recorded where | Answers |
+|---|---|---|---|
+| `bookmarks_created_total{outcome}` | counter | `routes::bookmarks::create` | *how many submissions did the form accept, and how many did it reject?* |
+| `bookmark_stats_query_seconds` | timer (histogram) | `routes::bookmarks::stats` | *how long do the two grouped aggregates behind `/bookmarks/stats` take?* |
+
+```bash
+curl -s localhost:3000/actuator/prometheus | grep -E 'bookmark(s_created|_stats)'
+```
+
+```text
+# HELP bookmarks_created_total Bookmarks submitted through the create form, by outcome
+# TYPE bookmarks_created_total counter
+bookmarks_created_total{outcome="created"} 3
+# TYPE bookmark_stats_query_seconds histogram
+bookmark_stats_query_seconds_bucket{le="0.025"} 2
+...
+bookmark_stats_query_seconds_count 2
+```
+
+Three details worth copying into your own app:
+
+- **The counter counts both outcomes.** A rejected submission is its own
+  series, not a lost sample, so
+  `rate(bookmarks_created_total{outcome="rejected"}[5m])` can alert on a form
+  that suddenly stops validating.
+- **The timer's guard records on drop**, so every exit path is covered
+  including an early `?`. `stats` resolves it explicitly with `stop()` after the
+  last query, so the histogram measures the database work rather than the markup
+  rendering that follows. Bind the guard to a named variable — `let _ = …` drops
+  it immediately and records roughly zero.
+- **`describe()` runs once in `main`**, before the server starts, because
+  bucket bounds are frozen at registration and cannot move under a running
+  scrape target. Describing does not register, so the two calls may come in
+  either order.
+
+Labels must come from a small, closed set the code controls — `outcome` here is
+two values. Never label with user input, a tag, or a bookmark id: every distinct
+combination is a separate series that lives for the life of the process.
+
+The assertions live in `src/metrics.rs`'s own test module and need no database:
+
+```bash
+cargo test -p bookmarks --bin bookmarks
+```
 
 ## Seeding fake data
 

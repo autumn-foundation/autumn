@@ -321,8 +321,8 @@ inline secrets and memory replay. See `docs/guide/signed-webhooks.md`.
 ## Distributed bookmarks - plugin and topology pattern
 
 `examples/bookmarks-distributed` shows primary/replica pools, explicit
-production database roles, Postgres-coordinated scheduled work, and the Redis
-cache plugin:
+production database roles, Postgres-coordinated scheduled work, the Redis
+cache plugin, and a two-node `[cluster]` between its web replicas:
 
 ```rust
 use autumn_cache_redis::RedisCachePlugin;
@@ -341,6 +341,7 @@ async fn main() {
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
             routes::bookmarks::create,
+            routes::cluster::status,
             repositories::bookmark_api_count,
             repositories::bookmark_api_list,
             repositories::bookmark_api_get,
@@ -456,6 +457,53 @@ async fn watch(
 Under the hood the response goes through `autumn_web::range` (single-range
 parsing, multi-range single-range collapse, `If-Range`) and the blob slice is
 read via `BlobStore::get_range` (the local backend seeks + takes off disk).
+
+## Where the flagship 0.7.0 subsystems are exemplified
+
+Each of these has a full guide and, as of #2320, a runnable example. Read the
+example when you need working code rather than prose — the wiring details below
+are the ones that are easy to get wrong.
+
+| Subsystem | Guide | Working code |
+| --- | --- | --- |
+| Deterministic simulation testing | `docs/guide/simulation-testing.md` | `examples/reddit-clone/tests/sim_hot_rank.rs` |
+| Failure capsules | `docs/guide/failure-capsules.md` | `examples/reddit-clone/autumn-capsules.toml`, `capsules/`, `tests/failure_capsule.rs` |
+| Self-clustering substrate | `docs/guide/clustering.md` | `examples/bookmarks-distributed` (`autumn-docker.toml`, `docker-compose.yml`, `src/routes/cluster.rs`) |
+| App metrics facade | `docs/guide/metrics.md` | `examples/bookmarks/src/metrics.rs` |
+
+**`#[sim_test]`** — mount the app on the sim's paused runtime and read time
+through the ordinary `Clock` extractor; a handler that computes its own `now`
+is not being tested by the sim at all. `always!` for invariants (it panics and
+prints the `AUTUMN_SIM_SEED=…` replay line), `sometimes!` for reachability. A
+single run does **not** fail on an unsatisfied `sometimes!` — if you want that,
+arrange the workload so every label is reachable at any seed and call
+`assert_all_sometimes_satisfied()` explicitly. `Sim::build` injects the clock
+but **not** entropy: pass `.with_entropy(SeededEntropy::new(sim.seed))` or a
+later `Rng` draw silently stops replaying from the seed.
+
+**Failure capsules** — put `[failure_capture] enabled = true` in its own
+profile, not the dev one: a capsule is production data and database result rows
+are raw wire bytes that are never masked. Redaction matches parameter names by
+**equality after normalization**, never by prefix, so a prefixed secret header
+(`x-api-key`, `stripe-signature`) is recorded verbatim unless the app names it
+in `[log] filter_parameters`. A custom profile does not auto-apply migrations —
+set `auto_migrate = true` if the profile is meant to behave like dev.
+
+**`[cluster]`** — the settings both nodes share belong in the profile; the node
+id, advertise address and seed peers differ per instance and belong in the
+deployment (compose/env). A wildcard `bind_addr` **requires** an explicit
+`advertise_addr`, and the config parses socket addresses without resolving
+hostnames — so container/service DNS names do not work there and each node needs
+a fixed address. Reach the handle with `state.extension::<ClusterHandle>()`; it
+is `None` when the section is disabled, so a read path should degrade rather
+than 500.
+
+**App metrics** — call sites need no registration, but `describe_*` and
+`set_histogram_buckets` must run before first use, since bucket bounds freeze at
+registration; do it once at startup. A timer guard records on drop, so bind it
+to a named variable and use `stop()` when you want the measurement to end before
+the rest of the handler. Label values must come from a small closed set the code
+owns.
 
 ## Testing helpers
 

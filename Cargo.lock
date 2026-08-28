@@ -665,6 +665,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "p256 0.13.2",
  "percent-encoding",
  "pin-project-lite",
  "postgresql_embedded",

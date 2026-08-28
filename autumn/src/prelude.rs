@@ -267,6 +267,10 @@ pub use crate::log::context::with_log_field;
 /// In-app notifications service/extractor (persistent per-recipient feed
 /// with read/unread state). See [`crate::notifications`] for the full surface.
 pub use crate::notifications::Notifications;
+/// Web Push service/extractor (deliver a notification to a subscribed browser
+/// even when the app's tab is closed). See [`crate::push`] for the full
+/// surface.
+pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.

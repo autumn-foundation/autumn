@@ -452,6 +452,12 @@ pub mod pdf;
 /// [`preload::Preloadable`] trait that generated code implements.
 pub mod preload;
 pub mod prelude;
+// Declared bare, like `notifications`: the module carries its own `//!` docs,
+// and an outer doc comment here would make rustdoc resolve that whole
+// combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
+// friends are not in scope, breaking every intra-doc link in the module and
+// failing the `-D rustdoc::broken_intra_doc_links` docs gate.
+pub mod push;
 /// Compile-time per-route database query budgets (#1667).
 ///
 /// See [`query_budget::StaticQueryBudget`] and the
