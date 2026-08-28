@@ -1913,7 +1913,22 @@ fn reject_declared_framework_collisions(
         }
         let is_get = declared.method.eq_ignore_ascii_case("GET")
             || declared.method.eq_ignore_ascii_case("WS");
-        if is_get && framework_get_paths.contains(&declared.path) {
+        // Compare through matchit, not by string equality: a framework path
+        // that carries a capture conflicts with a DIFFERENTLY-NAMED capture at
+        // the same position, and axum refuses that shape regardless of method.
+        // `/_stories/{slug}` is the live example — a manifest declaring
+        // `/_stories/{id}` is an exact-string miss and a startup panic. The
+        // configurable paths (probes, actuator prefix, dev inspector, job
+        // status) can carry captures too, since an operator sets them.
+        let collision = is_get
+            .then(|| {
+                framework_get_paths.iter().find(|framework_path| {
+                    *framework_path == &declared.path
+                        || paths_conflict_under_matchit(framework_path, &declared.path)
+                })
+            })
+            .flatten();
+        if let Some(framework_path) = collision {
             // `FrameworkRouteOverlap` would read better, but its `existing` and
             // `incoming` are `&'static str` and a plugin's handler name is
             // built at runtime; widening them is a breaking change to a public
@@ -1923,7 +1938,10 @@ fn reject_declared_framework_collisions(
             return Err(RouterBuildError::DuplicateUserRoute {
                 method: "GET".to_owned(),
                 path: declared.path.clone(),
-                existing: "autumn framework route".to_owned(),
+                // Name the framework template, not just the label: when the
+                // clash is a shape conflict the two paths are not the same
+                // string, and the operator needs to see what it collided with.
+                existing: format!("autumn framework route {framework_path}"),
                 incoming: declared.handler.clone(),
             });
         }
@@ -9928,10 +9946,38 @@ enabled = true
                 ..
             } => {
                 assert_eq!(path, &config.health.path);
-                assert_eq!(existing, "autumn framework route");
+                assert!(
+                    existing.starts_with("autumn framework route")
+                        && existing.contains(&config.health.path),
+                    "the refusal must name the framework route it clashed with; got: {existing}"
+                );
                 assert_eq!(incoming, "sandbox:evil-plugin");
             }
             other => panic!("expected the framework-path refusal, got {other:?}"),
+        }
+    }
+
+    /// A framework path that carries a capture conflicts with a differently
+    /// NAMED capture at the same position — axum refuses that shape whatever
+    /// the method — so the framework comparison has to go through matchit, not
+    /// string equality. `/_stories/{slug}` is the live example; the
+    /// operator-configurable paths (probes, actuator prefix, dev inspector,
+    /// job status) can carry captures for the same reason.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_that_shape_clashes_with_a_framework_path()
+     {
+        let mut config = AutumnConfig::default();
+        config.health.path = "/probe/{id}".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", "/probe/{slug}", "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a shape clash with a framework path must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute { ref existing, .. } => assert!(
+                existing.contains("/probe/{id}"),
+                "the refusal must name the framework template it clashed with; got: {existing}"
+            ),
+            other => panic!("expected the framework shape refusal, got {other:?}"),
         }
     }
 

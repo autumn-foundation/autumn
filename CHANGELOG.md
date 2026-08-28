@@ -41,7 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/static/app.js` would serve script from the host's own origin. Matching is
   on segment boundaries, so `/staticky` is unaffected. Probe paths are claimed
   only when `health.enabled`, matching the mount, so a plugin is never refused
-  over a collision that cannot happen.
+  over a collision that cannot happen. Framework paths are compared through the
+  same matchit oracle as user routes, not by string equality, so a framework
+  template carrying a capture (`/_stories/{slug}`, or an operator-configured
+  probe or actuator path) is not an exact-string miss and a startup panic.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every
