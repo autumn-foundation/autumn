@@ -256,12 +256,33 @@ autumn_web::declare_cached_read! {
 }
 ```
 
-`id` is the read's identity in the manifest, and — for a read-through entry —
-the key prefix to invalidate by. It is **not** derived from the call site:
-`cache_fragment` builds its own key (`fragment:{len}:{identity}:{version}`) and
-`get_or_compute` takes a whole key, so keeping the two in step is on you.
-Namespace the id like a module path so it cannot collide with a `#[cached]`
-function's. `kind` is `Cached`, `Fragment` or `ReadThrough`; each model is a
+`id` is the read's identity in the manifest **and** the key prefix an
+invalidation sweeps for. It is not derived from the call site, so the call site
+has to key under it:
+
+```rust
+// Fragment: the `_in` variants take the namespace.
+autumn_web::cache::cache_fragment_global_in(
+    "blog::routes::sidebar_fragment",
+    format_args!("post:{}", post.id),
+    post.updated_at.timestamp(),
+    None,
+    || html! { … },
+);
+
+// Read-through: build the key with the id as its namespace.
+let key = autumn_web::cache::make_cache_key("blog::routes::sidebar_fragment", &(post.id,));
+autumn_web::cache::get_or_compute(&my_cache, &key, None, || expensive());
+```
+
+The plain `cache_fragment` / `cache_fragment_global` build their own key
+(`fragment:{len}:{identity}:{version}`). That prefix carries no per-read
+identity — every fragment in the app shares it — so a sweep for
+`blog::routes::sidebar_fragment` matches none of them, and the declared edge
+clears nothing while reporting success. Use the `_in` variants for any fragment
+you want a repository write to invalidate; the version token keeps working
+exactly as before, and the namespace is the *additional* handle. Namespace the
+id like a module path so it cannot collide with a `#[cached]` function's. `kind` is `Cached`, `Fragment` or `ReadThrough`; each model is a
 path (not an arbitrary type — `Vec<Post>` is rejected, because a wrapper's name
 is not a model's); a trailing `acknowledge_stale = "…"` opts the read out, with
 the same non-empty-reason rule the attributes enforce.

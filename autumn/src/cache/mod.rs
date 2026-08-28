@@ -42,7 +42,9 @@ mod moka_impl;
 mod read_through;
 
 #[cfg(feature = "maud")]
-pub use fragment::{cache_fragment, cache_fragment_global};
+pub use fragment::{
+    cache_fragment, cache_fragment_global, cache_fragment_global_in, cache_fragment_in,
+};
 pub use layer::{CacheResponseLayer, CacheResponseService};
 #[cfg(feature = "cache-moka")]
 pub use moka_impl::MokaCache;

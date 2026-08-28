@@ -813,7 +813,12 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
             reason: "`cache_fragment` and `get_or_compute` are plain function calls with a \
                      runtime key — there is no annotated item for a macro to find, so a call \
                      site that does not opt in with `declare_cached_read!` is not in this \
-                     manifest at all. A clean audit says nothing about it"
+                     manifest at all. A clean audit says nothing about it. Opting in is also \
+                     not enough on its own: the call site must key its entries under the \
+                     declared id, or `invalidate_namespace` matches nothing and reports \
+                     success. `cache_fragment_in` and `make_cache_key` are the namespaced \
+                     forms; the bare `cache_fragment` keys under `fragment:` and is not \
+                     reachable by a namespace sweep"
                 .to_string(),
         },
         ExcludedDimension {
@@ -876,6 +881,28 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
 ///     reads = [crate::models::Post, crate::models::Tag],
 /// }
 /// ```
+///
+/// # Keying the call site under the declared `id`
+///
+/// A declaration alone does not make the read *invalidatable* — the entry has
+/// to live under `id` in the cache's key space, because that is the only thing
+/// [`invalidate_namespace`] can match on. The plain helpers do not do this:
+///
+/// * [`cache_fragment`](super::cache_fragment) keys entries as
+///   `fragment:{len}:{identity}:{version}`. That prefix carries no per-read
+///   identity, so a sweep for `blog::sidebar_fragment` matches none of them.
+///   Use [`cache_fragment_in`](super::cache_fragment_in) or
+///   [`cache_fragment_global_in`](super::cache_fragment_global_in), which take
+///   the namespace and put it where the sweep looks.
+/// * [`get_or_compute`](super::get_or_compute) keys by whatever you pass it, so
+///   build that key with [`make_cache_key`](super::make_cache_key) and this
+///   `id` as its namespace.
+///
+/// A declared read whose call site keys under something else is still audited
+/// — the gate will still demand an edge for it — but the edge's
+/// `invalidate_namespace` will clear nothing and report success. Either key it
+/// under the `id`, or declare it with `acknowledge_stale` so the gap is stated
+/// rather than implied.
 ///
 /// An acknowledged-stale opt-out takes a trailing `acknowledge_stale = "…"`.
 #[macro_export]

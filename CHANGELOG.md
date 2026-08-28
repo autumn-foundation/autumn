@@ -154,7 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   established is `undetermined` — reported in the manifest and the summary, never
   failed, unless `--strict` — because a checker that fails on what it merely
   could not read is a checker that gets deleted from CI. Reads the macros cannot
-  see (fragment, read-through) declare themselves with `declare_cached_read!`.
+  see (fragment, read-through) declare themselves with `declare_cached_read!`,
+  and `cache_fragment_in` / `cache_fragment_global_in` key a fragment under that
+  declared id so the invalidation edge actually reaches it — the plain
+  `cache_fragment` keys under a bare `fragment:` prefix that every fragment
+  shares, which no per-read namespace sweep can match.
   `#[cached]` also gained `key(a, b)` to build the cache key from named
   parameters only, which is what lets a cached read take the repository handle it
   reads through — the handle is `Clone` but not `Hash`, and was never part of the

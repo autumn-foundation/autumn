@@ -83,10 +83,12 @@ pub async fn index(mut db: Db) -> AutumnResult<Markup> {
 }
 ```
 
-## The two helpers
+## The helpers
 
 ```rust
 use autumn_web::cache::{cache_fragment, cache_fragment_global};
+// Namespaced variants, for fragments a repository write should invalidate:
+use autumn_web::cache::{cache_fragment_in, cache_fragment_global_in};
 ```
 
 ### `cache_fragment_global`
@@ -119,6 +121,29 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
     })
 }
 ```
+
+### `cache_fragment_in` / `cache_fragment_global_in`
+
+The same two helpers with a leading `namespace`, which is prefixed onto the
+cache key. Reach for these when the fragment is declared with
+`declare_cached_read!` and a `#[repository]` write is expected to invalidate it:
+the plain helpers key entries under a bare `fragment:` prefix that carries no
+per-read identity, so a namespace sweep for one fragment read matches none of
+them and silently clears nothing.
+
+```rust
+cache_fragment_global_in(
+    "blog::routes::sidebar_fragment",   // the same string the declaration uses as `id`
+    format_args!("post_card:{}", post.id),
+    post.updated_at.and_utc().timestamp_micros(),
+    None,
+    || render_post_card(post),
+)
+```
+
+Version-token invalidation is unchanged — the namespace is an *additional*
+handle, not a replacement. See
+[the cache-coherence guide](cache-coherence.md) for the gate that uses it.
 
 ## Choosing the identity and version
 
