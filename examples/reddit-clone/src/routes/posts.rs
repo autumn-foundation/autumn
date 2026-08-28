@@ -501,12 +501,30 @@ fn submit_form_markup(
                             .label_class(label_class)
                             .class(input_class)
                             .required()
-                            .options(subs.iter().map(|sub| {
-                                autumn_web::a11y::SelectOption::new(
-                                    sub.id.to_string(),
-                                    format!("r/{}", sub.name),
+                            // The empty, disabled placeholder is load-bearing,
+                            // not decoration. Without it the browser
+                            // auto-selects the first real option, `required`
+                            // is satisfied without the author choosing
+                            // anything, and the post lands silently in
+                            // whichever community sorts first. An empty value
+                            // is also what makes `required` fire client-side,
+                            // and `validate_subreddit_choice` rejects it
+                            // server-side for a client that ignores both.
+                            .options(
+                                std::iter::once(
+                                    autumn_web::a11y::SelectOption::new(
+                                        "",
+                                        "Choose a community\u{2026}",
+                                    )
+                                    .disabled(),
                                 )
-                            }))
+                                .chain(subs.iter().map(|sub| {
+                                    autumn_web::a11y::SelectOption::new(
+                                        sub.id.to_string(),
+                                        format!("r/{}", sub.name),
+                                    )
+                                })),
+                            )
                             .selected_value(form.field_value("subreddit_id").unwrap_or_default())
                             .aria_invalid(!form.errors_for("subreddit_id").is_empty())
                             .described_by("subreddit_id-error"))
@@ -1590,6 +1608,34 @@ mod tests {
                 "field `{field}` must have an associated <label>; rendered: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn the_community_picker_does_not_preselect_a_real_community() {
+        // Without an empty placeholder the browser auto-selects the first
+        // option, `required` is satisfied without the author choosing, and the
+        // post lands silently in whichever community sorts first.
+        let subs = vec![Subreddit {
+            id: 7,
+            name: "aardvarks".to_owned(),
+            slug: "aardvarks".to_owned(),
+            description: String::new(),
+            creator_id: 1,
+            subscriber_count: 0,
+            comment_count: 0,
+            created_at: chrono::NaiveDateTime::default(),
+        }];
+        let rendered = submit_form_markup(&blank_submit_form(), &subs, None).into_string();
+
+        assert!(
+            rendered.contains(r#"<option value="" disabled"#)
+                || rendered.contains(r#"<option value="" selected disabled"#),
+            "the picker needs an empty disabled placeholder; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"<option value="7" selected"#),
+            "a real community must not be preselected on a blank form; rendered: {rendered}"
+        );
     }
 
     #[test]

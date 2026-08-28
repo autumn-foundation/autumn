@@ -260,16 +260,25 @@ pub async fn inject_consent_banner(
     // could otherwise answer `304` with no body, replaying a browser-cached,
     // banner-less page and skipping a prompt that is now due.
     //
-    // That reasoning applies only to HTML documents, and the check has to
-    // happen here — before `next` runs — where the response's content type is
-    // not yet known. `Accept` is what distinguishes the two cases: a browser
-    // navigation always offers `text/html`, while an API client asks for JSON
-    // (or anything else). Stripping unconditionally would mean every request
-    // from a consent-less client loses `If-None-Match` / `If-Modified-Since`
-    // — and an API client never acquires a consent cookie, so its conditional
-    // requests could never return `304` again and it would refetch full bodies
-    // forever.
-    if needs_prompt && accepts_html(request.headers()) {
+    // That reasoning applies only to responses this middleware could inject
+    // into, and the check has to happen here — before `next` runs — where the
+    // response's content type is not yet known. `Accept` normally
+    // distinguishes the two cases: a browser navigation offers `text/html`,
+    // while an API client asks for JSON. Stripping unconditionally would mean
+    // every request from a consent-less client loses `If-None-Match` /
+    // `If-Modified-Since` — and an API client never acquires a consent cookie,
+    // so its conditional requests could never return `304` again and it would
+    // refetch full bodies forever.
+    //
+    // A boosted (`hx-boost`) navigation is the exception `Accept` alone gets
+    // wrong: htmx issues it over XHR without setting `Accept`, so it arrives
+    // with the XHR default `*/*` — which this deliberately does not treat as
+    // HTML. But the guard above already (correctly) declines to skip a boosted
+    // request, so it IS a document this middleware will inject into. Leaving
+    // its validators intact would let an inner `EtagLayer` answer `304` with
+    // no body to inject, so a policy bump or a withdrawal could leave the
+    // visitor unprompted for as long as their cache stays fresh.
+    if needs_prompt && could_render_a_banner(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
@@ -347,6 +356,19 @@ pub async fn inject_consent_banner(
 /// A bare `*/*` — what `curl` and many API clients send — is deliberately NOT
 /// treated as accepting HTML: those callers do not render a banner, and
 /// keeping their validators is what preserves their `304`s.
+fn could_render_a_banner(headers: &axum::http::HeaderMap) -> bool {
+    accepts_html(headers) || htmx_header_is_true(headers, "hx-boosted")
+}
+
+/// An htmx boolean header: present and not the literal `false` htmx never sends.
+fn htmx_header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+}
+
+/// Whether the client offered to accept an HTML document.
 fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
     headers.get(axum::http::header::ACCEPT).is_none_or(|value| {
         value
@@ -369,13 +391,7 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
 /// not parsed beyond confirming it is not the literal `false` htmx never
 /// actually sends.
 fn is_htmx_fragment_request(headers: &axum::http::HeaderMap) -> bool {
-    let header_is_true = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
-    };
-    header_is_true("hx-request") && !header_is_true("hx-boosted")
+    htmx_header_is_true(headers, "hx-request") && !htmx_header_is_true(headers, "hx-boosted")
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -1529,6 +1545,102 @@ mod tests {
         assert_eq!(
             rendered, "<div id=\"nav\">Log in</div>",
             "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boosted_navigation_loses_its_validators_despite_the_xhr_accept_default() {
+        // htmx issues a boosted navigation over XHR without setting `Accept`,
+        // so it arrives as `*/*` — which `accepts_html` deliberately rejects to
+        // protect API clients' 304s. But a boosted request IS a document this
+        // middleware injects into, so leaving its validators intact would let
+        // an inner EtagLayer answer 304 with no body to inject, and a policy
+        // bump could go unprompted for as long as the cache stays fresh.
+        //
+        // Note the previous test does not cover this: it sends no `Accept` at
+        // all, and a missing `Accept` is already treated as HTML.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{seen}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-boosted", "true")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("false"),
+            "a boosted navigation must have If-None-Match stripped; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "and must still be prompted; got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_xhr_json_client_still_keeps_its_validators() {
+        // The boosted carve-out must not extend to an ordinary `*/*` XHR that
+        // is not a boosted navigation — that is the API client whose 304s the
+        // Accept check exists to protect.
+        let app = Router::new()
+            .route(
+                "/api/posts",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!("{{\"saw\":{seen}}}")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/posts")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "{\"saw\":true}",
+            "a bare */* XHR that is not boosted must keep its validators"
         );
     }
 
