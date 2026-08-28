@@ -1248,6 +1248,27 @@ mod tests {
         }
     }
 
+    /// A message with every delivery-relevant part spelled out, for the tests
+    /// that are about those parts rather than about the envelope.
+    fn sent_full<'a>(
+        to: &'a [String],
+        body: &'a CapsuleBody,
+        alternate_body: &'a CapsuleBody,
+        attachments: &'a [crate::capsule::schema::MailAttachmentEffect],
+    ) -> SentMail<'a> {
+        SentMail {
+            to,
+            from: Some("billing@shop.example"),
+            subject: "Receipt",
+            body,
+            alternate_body,
+            reply_to: None,
+            list_unsubscribe: None,
+            extra_headers: &[],
+            attachments,
+        }
+    }
+
     #[test]
     fn a_redacted_recording_still_matches_the_call_the_handler_makes() {
         // The capsule holds the *masked* spelling; the replayed handler
@@ -1796,50 +1817,30 @@ mod tests {
         });
         let to = ["a@example.com".to_owned()];
         let body = CapsuleBody::Text("you paid $10".to_owned());
-        let base =
-            |alternate: &'static CapsuleBody,
-             attachments: &'static [crate::capsule::schema::MailAttachmentEffect]| {
-                SentMail {
-                    to: &to,
-                    from: Some("billing@shop.example"),
-                    subject: "Receipt",
-                    body: &body,
-                    alternate_body: alternate,
-                    reply_to: None,
-                    list_unsubscribe: None,
-                    extra_headers: &[],
-                    attachments,
-                }
-            };
+        let same_html = CapsuleBody::Text("<p>you paid $10</p>".to_owned());
+        let new_html = CapsuleBody::Text("<p>you paid $10000</p>".to_owned());
+        let invoice = [crate::capsule::schema::MailAttachmentEffect {
+            filename: "invoice.pdf".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            len: 12,
+            sha256: "cd".repeat(32),
+        }];
 
         // The invoice was dropped.
-        static SAME_HTML: std::sync::LazyLock<CapsuleBody> =
-            std::sync::LazyLock::new(|| CapsuleBody::Text("<p>you paid $10</p>".to_owned()));
         assert_eq!(
-            tape.next_mail(&base(&SAME_HTML, &[])),
+            tape.next_mail(&sent_full(&to, &body, &same_html, &[])),
             MailVerdict::Diverged,
             "an attachment the run stopped sending is a different email"
         );
         // The HTML half was rewritten while the text fallback stood still.
-        static NEW_HTML: std::sync::LazyLock<CapsuleBody> =
-            std::sync::LazyLock::new(|| CapsuleBody::Text("<p>you paid $10000</p>".to_owned()));
-        static INVOICE: std::sync::LazyLock<Vec<crate::capsule::schema::MailAttachmentEffect>> =
-            std::sync::LazyLock::new(|| {
-                vec![crate::capsule::schema::MailAttachmentEffect {
-                    filename: "invoice.pdf".to_owned(),
-                    content_type: "application/pdf".to_owned(),
-                    len: 12,
-                    sha256: "cd".repeat(32),
-                }]
-            });
         assert_eq!(
-            tape.next_mail(&base(&NEW_HTML, &INVOICE)),
+            tape.next_mail(&sent_full(&to, &body, &new_html, &invoice)),
             MailVerdict::Diverged,
             "a rewritten HTML half must not ride along under an unchanged text fallback"
         );
         // Everything matching still replays.
         assert_eq!(
-            tape.next_mail(&base(&SAME_HTML, &INVOICE)),
+            tape.next_mail(&sent_full(&to, &body, &same_html, &invoice)),
             MailVerdict::Sent
         );
         let divergences = tape.divergences();

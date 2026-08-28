@@ -1780,8 +1780,10 @@ mod tests {
     /// contents could change freely and still replay `reproduced`.
     #[test]
     fn a_mail_body_too_large_to_record_marks_the_capsule_incomplete() {
-        let mut settings = CaptureSettings::default();
-        settings.max_body_bytes = 8;
+        let settings = CaptureSettings {
+            max_body_bytes: 8,
+            ..CaptureSettings::default()
+        };
         let scope = CaptureScope::new(
             "mail".to_owned(),
             Arc::new(settings),
