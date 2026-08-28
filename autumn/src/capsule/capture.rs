@@ -805,8 +805,16 @@ impl CaptureScope {
     /// empty body the recording never gave it.
     pub fn fill_http(&self, index: usize, mut effect: HttpEffect) {
         let cap = self.settings.max_body_bytes;
-        let request_over = body_weight(&effect.request_body) > cap;
-        let response_over = body_weight(&effect.response_body) > cap;
+        // An already-`Skipped` body counts. `http_client::encode_body` drops an
+        // oversized body *before* it reaches here — deliberately, so a 50 MB
+        // download is never copied just to be thrown away — and
+        // `body_weight(Skipped)` is zero, so a weight comparison alone would
+        // never see the one case this check exists for.
+        let skipped = |body: &CapsuleBody| {
+            matches!(body, CapsuleBody::Skipped { .. }) || body_weight(body) > cap
+        };
+        let request_over = skipped(&effect.request_body);
+        let response_over = skipped(&effect.response_body);
         effect.request_body = clamp_body(effect.request_body, cap);
         effect.response_body = clamp_body(effect.response_body, cap);
         if request_over || response_over {
@@ -1789,6 +1797,45 @@ mod tests {
     /// A lock poisoned by a panic mid-record means the capsule is missing
     /// whatever was being written. Returning the degraded value alone would
     /// make that indistinguishable from "the request did none of this".
+    /// `http_client::encode_body` skips an oversized body before `fill_http`
+    /// ever sees it, and a skipped body weighs nothing — so a check written
+    /// only against the weight would miss precisely the case it exists for.
+    #[test]
+    fn a_body_skipped_before_it_reached_the_recorder_still_truncates() {
+        let scope = CaptureScope::new(
+            "pre".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_http().expect("a slot is available");
+        scope.fill_http(
+            slot,
+            HttpEffect {
+                method: "POST".to_owned(),
+                url: "https://api.example/upload".to_owned(),
+                // What the outbound client hands over for a body past the cap.
+                request_body: CapsuleBody::Skipped {
+                    declared_len: Some(50_000_000),
+                },
+                status: 200,
+                ..Default::default()
+            },
+        );
+        let _ = scope.effects_snapshot();
+        assert!(
+            scope.is_truncated(),
+            "a capsule that cannot compare its own outbound body must say so"
+        );
+        assert!(
+            scope
+                .notes()
+                .iter()
+                .any(|note| note == HTTP_BODY_SKIPPED_NOTE),
+            "{:?}",
+            scope.notes()
+        );
+    }
+
     /// The replay comparison treats a skipped body as matching anything, so a
     /// capsule holding one must not present as complete — otherwise the mail
     /// contents could change freely and still replay `reproduced`.
