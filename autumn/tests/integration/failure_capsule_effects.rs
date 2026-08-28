@@ -493,7 +493,9 @@ async fn a_job_that_panics_before_its_final_attempt_still_leaves_a_capsule() {
             payload.contains("receipt 12 exploded"),
             "the panic payload must be recorded: {payload}"
         ),
-        other => panic!("expected a panic outcome, got {other:?}"),
+        other @ CapsuleOutcome::Status { .. } => {
+            panic!("expected a panic outcome, got {other:?}")
+        }
     }
     assert_eq!(
         PANIC_RUNS.load(Ordering::SeqCst),

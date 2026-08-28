@@ -63,7 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an outbound call or a mail send is served from the tape only when its
   *contents* match too — same endpoint but a different amount, or the same
   recipients but a different letter, is a divergence rather than a clean
-  reproduction; a job capsule whose payload `[log] filter_parameters` masked is
+  reproduction (a mail *sender* counts only when the replayed run chose one,
+  since a message that names no `from` inherits `[mail] from` at send time and
+  a replay boots without mail configuration); a job capsule whose payload `[log] filter_parameters` masked is
   refused, because a handler is handed its payload verbatim and would parse the
   `[FILTERED]` placeholder; an effect whose future was cancelled before it
   finished (a losing `tokio::select!` branch) marks the capsule incomplete

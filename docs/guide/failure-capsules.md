@@ -277,7 +277,7 @@ effect because your handler reached it a different way:
 | Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. Outbound webhook deliveries are covered here too, they send through the same client |
 | Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording and returns `Ok(())`; **nothing is written to a queue and no job runs** |
 | Cache | `cache::get_cached` / `insert_cached` | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write lands in the tape, so a read-back in the same run finds it |
-| Mail | `Mailer::send` | The send is asserted against the recorded recipients, subject, sender and body; **nothing is delivered** |
+| Mail | `Mailer::send` | The send is asserted against the recorded recipients, subject and body — and its sender, when the replayed run chose one; **nothing is delivered** |
 | Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration |
 | Randomness | `state.entropy()` | Every draw replays byte-for-byte, so the session id, CSRF token, request id or job id the failing request minted reappears |
 
@@ -867,6 +867,12 @@ What capsules do not do, stated plainly:
   outbound call from a spawned task there reaches the network. Mail handed to
   `Mailer::deliver_later` is spawned for the same reason and behaves the same
   way. Keep the effects a capsule needs on the awaited path.
+- **A mail sender is only compared when the replayed run chose one.** A
+  message that names no `from` inherits `[mail] from` at send time, so the
+  recorded address is deployment configuration rather than something the
+  handler decided — and a replay boots without mail configuration on purpose.
+  An unset sender on replay is therefore not read as a change; a sender the
+  run *did* choose, and chose differently, still diverges.
 - **A transactional enqueue makes a capsule unreplayable.** `enqueue_on_conn`
   (and its delayed and absolute variants) is two recorded effects for one
   action on the `postgres` backend: the enqueue itself, and the job-row INSERT

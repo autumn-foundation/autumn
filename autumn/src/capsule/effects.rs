@@ -672,11 +672,18 @@ impl ReplayEffects {
         // Same envelope, different letter. Consuming the send here would hand
         // back the recorded success for a message whose contents — or whose
         // sender — the code now gets wrong, and the run would grade clean.
-        let sender_match = match (next.from.as_deref(), sent.from) {
-            (None, None) => true,
-            (Some(recorded), Some(actual)) => matches_redacted(recorded, actual),
-            _ => false,
-        };
+        // The sender is compared only when the replayed run produced one. A
+        // message that sets no `from` inherits `[mail] from` at send time, so
+        // the recorded address is deployment *configuration* rather than
+        // handler behaviour — and a replay deliberately boots without mail
+        // config. Reading that absence as "the code changed its sender" is the
+        // same false signal as reporting a subsystem replay never booted. A
+        // sender the run did choose, and chose differently, is a real change.
+        let sender_match = sent.from.is_none_or(|actual| {
+            next.from
+                .as_deref()
+                .is_some_and(|recorded| matches_redacted(recorded, actual))
+        });
         if !sender_match || !body_matches_redacted(&next.body, sent.body) {
             let expected = describe_mail(&next.to, &next.subject);
             let changed = if sender_match {
@@ -1617,16 +1624,45 @@ mod tests {
                 body: &right_body,
             }),
             MailVerdict::Diverged,
-            "and mail sent from the wrong address is a change too"
+            "and mail sent from a different address is a change too"
         );
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 2);
         assert!(
             divergences[0].detail.contains("its body")
                 && divergences[1].detail.contains("its sender"),
-            "each report names what changed: {:?}",
-            divergences
+            "each report names what changed: {divergences:?}"
         );
+    }
+
+    /// An unset sender is the replay *environment*, not the code: a message
+    /// that names no `from` inherits `[mail] from` at send time, and a replay
+    /// boots without mail configuration on purpose. Reading that as a changed
+    /// sender would diverge every capsule from an app that configures one.
+    #[test]
+    fn a_sender_the_replay_never_configured_is_not_a_changed_sender() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                from: Some("noreply@shop.example".to_owned()),
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("thanks".to_owned()),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        });
+        let to = ["a@example.com".to_owned()];
+        let body = CapsuleBody::Text("thanks".to_owned());
+        assert_eq!(
+            tape.next_mail(&SentMail {
+                to: &to,
+                from: None,
+                subject: "Receipt",
+                body: &body,
+            }),
+            MailVerdict::Sent
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
     #[test]

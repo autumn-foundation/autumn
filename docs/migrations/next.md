@@ -164,8 +164,10 @@ instead of failing closed. A call the capsule never recorded is still refused,
 and is reported as an effect divergence rather than silently dialling. The
 recording answers a call only when its method, URL, caller-set headers *and*
 body match — the same endpoint with a different payload is a divergence — and
-a mail send is compared against its recorded sender and body as well as its
-recipients and subject.
+a mail send is compared against its recorded body as well as its recipients
+and subject — and against its sender when the replayed run chose one, since a
+message that sets no `from` inherits `[mail] from` at send time and a replay
+boots without mail configuration.
 
 Three situations now produce a refusal or an incomplete capsule where an
 earlier build would have graded the run. A **job capsule whose payload was
