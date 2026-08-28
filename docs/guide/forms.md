@@ -256,9 +256,19 @@ rejected with the same 422 field-error map an insert produces.
 
 A plain generated repository with no hooks and no knob takes the **blind
 update path**: it emits no merged-model check at all, deliberately, to avoid an
-unconditional extra `SELECT` on every update. Field-level rules on the columns
-actually being written still apply; cross-field invariants do not. If you are
-relying on a cross-field rule to hold on updates, turn the knob on — do not
+unconditional extra `SELECT` on every update.
+
+**On that path the repository validates nothing at all** — not cross-field
+rules, and not the field-level rules on the columns being written. The blind
+branch goes straight from `changes.__to_changeset()` to the `UPDATE`. So a
+direct `repo.update(id, &UpdateUser { email: Patch::Set("nope".into()), .. })`
+persists a value your `#[validate(email)]` would have rejected.
+
+Validation on an update comes from the *caller*, not the repository: a generated
+`--api` handler validates the patch before calling it, and a `ChangesetForm`
+handler validates the submitted form struct. If you call the repository directly
+and want the model's rules enforced, give it hooks, turn on
+`validate_on_update = fetch`, or validate before building the patch — do not
 assume it.
 
 Turning it on changes what is *validated*, not what is *stored*: only the hooked
@@ -340,7 +350,7 @@ written, and those are not the same question:
 
 | Repository | Merged model built? | Validation sees | Persisted |
 |---|---|---|---|
-| No hooks, no knob (**blind**) | no — no `from_patch` at all | the raw patch, field rules only | **raw patch** |
+| No hooks, no knob (**blind**) | no — no `from_patch` at all | **nothing** — the repository runs no validation | **raw patch** |
 | `validate_on_update = fetch` | yes, and it is normalized | the normalized merged model | **raw patch** |
 | Has hooks | yes | the normalized draft | **normalized draft** |
 
