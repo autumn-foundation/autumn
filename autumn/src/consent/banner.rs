@@ -208,6 +208,15 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// are the state-changing `POST`s the protection exists for, and the skip
 /// above already removes the failure that made exemption tempting.
 ///
+/// One residual edge remains, and it is not specific to consent: on a static
+/// hit the request's own CSRF cookie is used as the fallback token, and
+/// `CsrfLayer` never ran to validate or refresh it. A cookie that is stale
+/// (signing key rotated) or tampered is therefore embedded as-is, and the
+/// accept/reject `POST` will `403`. This middleware cannot tell the difference
+/// — it is given a cookie *name*, not the signing key — and the same stale
+/// cookie would fail on any other cached form page in the app. The visitor
+/// recovers on their first dynamic page, which reissues a valid token.
+///
 /// # Known limitation: no true streaming for an undecided visitor
 ///
 /// Deliberately mirroring `crate::middleware::dev::inject_live_reload`'s

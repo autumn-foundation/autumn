@@ -7,9 +7,21 @@
 //! its own interceptor trait here.
 //!
 //! Every trait in this module shares one shape: you receive the operation plus
-//! a `next` future (or closure), and you decide whether, when, and how to call
-//! it. That is the same "around" contract as a tower layer, on a non-HTTP
-//! pipeline.
+//! a `next`, and you decide whether, when, and how to invoke it. That is the
+//! same "around" contract as a tower layer, on a non-HTTP pipeline.
+//!
+//! # `next` comes in two forms, and the difference decides what you can build
+//!
+//! | `next` is | Traits | You can |
+//! |---|---|---|
+//! | an owned `Pin<Box<dyn Future>>` | [`MailInterceptor`], [`JobInterceptor`], [`DbConnectionInterceptor`] | await it **once**, or drop it to suppress the operation |
+//! | a callable `&dyn Fn(..)` | [`ChannelsInterceptor`], [`HttpInterceptor`] | invoke it zero, one, or **many** times |
+//!
+//! Awaiting an owned future consumes it, and there is no factory to build
+//! another — so **retry is not implementable** on the first three. Wrap, time,
+//! log, or refuse; to retry a mail send or a job, use the subsystem's own retry
+//! policy rather than the interceptor. The callable form is what makes a
+//! retrying outbound-HTTP or channel-publish interceptor possible.
 //!
 //! | Builder method | Trait | Wraps |
 //! |---|---|---|
@@ -66,10 +78,16 @@ use std::sync::Arc;
 
 /// Wraps every outgoing mail delivery.
 ///
-/// Call `next` to send, skip it to swallow the mail (a staging-environment
-/// mail trap), or wrap it to retry, rate-limit, or record. The
-/// [`Mail`](crate::mail::Mail) is borrowed, so an implementation can inspect
-/// the recipient and subject without taking ownership.
+/// Await `next` to send, or drop it to swallow the mail (a staging-environment
+/// mail trap). The [`Mail`](crate::mail::Mail) is borrowed, so an
+/// implementation can inspect the recipient and subject without taking
+/// ownership.
+///
+/// `next` is an owned single-shot future, so this hook **cannot retry** a
+/// failed delivery — awaiting it consumes the only attempt and nothing here can
+/// start another. Use it to rate-limit, record, redirect, or refuse; leave
+/// retries to the mail subsystem's own policy. See the two `next` forms in the
+/// [module documentation](self).
 #[cfg(feature = "mail")]
 pub trait MailInterceptor: Send + Sync + 'static {
     /// Run around one delivery attempt.
