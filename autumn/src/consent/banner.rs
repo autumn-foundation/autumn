@@ -485,7 +485,14 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
                 let Some(media) = parts.next() else {
                     return false;
                 };
-                if !media.eq_ignore_ascii_case("text/html") {
+                // `text/*` is a valid range that includes HTML, and a client
+                // sending it is a document client. `*/*` stays excluded
+                // deliberately — it is the XHR default, so treating it as a
+                // document offer would strip every API client's conditional
+                // validators. That carve-out is about `*/*` specifically, not
+                // about wildcards in general, which is what this missed.
+                if !media.eq_ignore_ascii_case("text/html") && !media.eq_ignore_ascii_case("text/*")
+                {
                     return false;
                 }
                 // `text/html;q=0` is an explicit refusal, not an offer. A
@@ -2206,6 +2213,15 @@ mod tests {
             );
             accepts_html(&h)
         };
+
+        // `text/*` is a range that includes HTML — a document client.
+        assert!(accept("text/*"));
+        assert!(accept("application/json, text/*;q=0.8"));
+        // ...and the same refusal rule applies to it.
+        assert!(!accept("text/*;q=0"));
+        // `*/*` stays excluded: that carve-out is about the XHR default
+        // specifically, not about wildcards generally.
+        assert!(!accept("*/*"));
 
         // The finding: named, but refused.
         assert!(!accept("application/json, text/html;q=0"));

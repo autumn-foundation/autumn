@@ -170,12 +170,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Rich text** — post bodies are user-submitted Markdown rendered through
     `markdown::render_user_content` at display time, so the stored source stays
     editable and a later allowlist change protects posts already written.
-  - **Cookie consent** — `inject_consent_banner` on spliceable HTML pages (it
-    deliberately skips four cases: htmx fragments, a tokenless static cache hit,
-    an encoded body, and bodies over 2 MiB — all four still get `Vary: Cookie`),
-    `POST` accept/reject/withdraw routes, a `GET /consent/manage` preferences
-    page reusing the framework banner widget, a footer link on every page, and
-    the app's one non-essential category gated at its single call site.
+  - **Cookie consent** — `inject_consent_banner` on spliceable HTML pages
+    (registering the layer is not the same as "every page prompts": several
+    response shapes are deliberately passed through untouched, all of them
+    still receiving `Vary: Cookie` — `docs/guide/cookie-consent.md` enumerates
+    them, and is the one place that list is maintained), `POST`
+    accept/reject/withdraw routes, a `GET /consent/manage` preferences page
+    reusing the framework banner widget, a footer link on every page, and the
+    app's one non-essential category gated at its single call site.
   - **Pagination** — the community listing is offset-paginated with
     `PageRequest` + `Page` + `pagination_nav`, with page links that are plain
     `<a href>`, a self-referential canonical on deeper pages, and the live SSE
