@@ -14,14 +14,18 @@
 //!
 //! | `next` is | Traits | You can |
 //! |---|---|---|
-//! | an owned `Pin<Box<dyn Future>>` | [`MailInterceptor`], [`JobInterceptor`], [`DbConnectionInterceptor`] | await it **once**, or drop it to suppress the operation |
-//! | a callable `&dyn Fn(..)` | [`ChannelsInterceptor`], [`HttpInterceptor`] | invoke it zero, one, or **many** times |
+//! | an owned `Pin<Box<dyn Future>>` | [`MailInterceptor`], [`JobInterceptor`], [`DbConnectionInterceptor`] | await it **once**, or drop it to suppress the operation — the operation itself is already fixed |
+//! | a callable `&dyn Fn(..)` | [`ChannelsInterceptor`], [`HttpInterceptor`] | invoke it zero, one, or **many** times, **and choose what to pass** |
 //!
-//! Awaiting an owned future consumes it, and there is no factory to build
-//! another — so **retry is not implementable** on the first three. Wrap, time,
-//! log, or refuse; to retry a mail send or a job, use the subsystem's own retry
-//! policy rather than the interceptor. The callable form is what makes a
-//! retrying outbound-HTTP or channel-publish interceptor possible.
+//! That second column is the whole distinction, and it decides more than retry.
+//! An owned future has already captured its operation — the mail to send, the
+//! job payload, the checkout — so the first three traits can neither **retry**
+//! (nothing here builds a second attempt) nor **rewrite** (nothing here reaches
+//! inside the captured value). They observe, delay, and refuse. The callable
+//! form takes the operation as arguments, so those two traits can do both.
+//!
+//! To retry a mail send or a job, use the subsystem's own retry policy rather
+//! than the interceptor.
 //!
 //! | Builder method | Trait | Wraps |
 //! |---|---|---|
@@ -76,18 +80,33 @@
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 
-/// Wraps every outgoing mail delivery.
+/// Wraps deliveries made through the app's configured [`Mailer`].
 ///
-/// Await `next` to send, or drop it to swallow the mail (a staging-environment
-/// mail trap). The [`Mail`](crate::mail::Mail) is borrowed, so an
-/// implementation can inspect the recipient and subject without taking
-/// ownership.
+/// It is installed by wrapping that mailer's transport, so every send through
+/// it passes here — but a `Mailer` your own code constructs is not wrapped.
 ///
-/// `next` is an owned single-shot future, so this hook **cannot retry** a
-/// failed delivery — awaiting it consumes the only attempt and nothing here can
-/// start another. Use it to rate-limit, record, redirect, or refuse; leave
-/// retries to the mail subsystem's own policy. See the two `next` forms in the
-/// [module documentation](self).
+/// Await `next` to send, or drop it to swallow the mail. The
+/// [`Mail`](crate::mail::Mail) is borrowed, so an implementation can inspect
+/// the recipient and subject without taking ownership.
+///
+/// `next` is an owned single-shot future built from a **clone of this `Mail` that
+/// was captured before the interceptor ran** (`InterceptedMailTransport::send`).
+/// Two things follow, and both are limits rather than conventions:
+///
+/// - **It cannot retry.** Awaiting `next` consumes the only attempt, and there
+///   is no factory here to build another. Leave retries to the mail subsystem's
+///   own policy.
+/// - **It cannot redirect.** The `Mail` is borrowed immutably and the message
+///   `next` will send is already fixed, so an implementation can neither
+///   rewrite the recipient nor start a replacement delivery. Sending somewhere
+///   else means constructing that mail through a `Mailer` you hold yourself,
+///   which is a different operation, not this one.
+///
+/// What it is for: rate-limiting, recording, and refusing — dropping `next` is
+/// how a staging-environment mail trap is built. See the two `next` forms in
+/// the [module documentation](self).
+///
+/// [`Mailer`]: crate::mail::Mailer
 #[cfg(feature = "mail")]
 pub trait MailInterceptor: Send + Sync + 'static {
     /// Run around one delivery attempt.
