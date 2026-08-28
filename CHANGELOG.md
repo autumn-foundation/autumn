@@ -33,7 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes it over, but silently handing an unaudited artifact the endpoint
   orchestrators read to decide whether the process is alive is worse than a
   loud refusal. Only `GET` is refused there, because only `GET` clashes; a
-  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly.
+  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly. The
+  framework namespaces `/static` and `/_autumn` are reserved wholesale, for
+  every method: paths under them are not enumerable route-by-route (`ServeDir`
+  serves whatever is on disk), and a declared sub-path there does not even
+  panic — it mounts and *shadows* the framework, so an artifact declaring
+  `/static/app.js` would serve script from the host's own origin. Matching is
+  on segment boundaries, so `/staticky` is unaffected. Probe paths are claimed
+  only when `health.enabled`, matching the mount, so a plugin is never refused
+  over a collision that cannot happen.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every

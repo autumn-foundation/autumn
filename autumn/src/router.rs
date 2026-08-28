@@ -1279,6 +1279,34 @@ fn collect_user_get_paths(
     owned
 }
 
+/// Path namespaces the framework owns wholesale, rather than as individual
+/// routes.
+///
+/// `/static` is always mounted — as `nest_service` over `ServeDir`, or as
+/// `GET /static/{*path}` under `embed-assets` — and `/_autumn` holds the
+/// inspector, job status, mail previews and the unsubscribe endpoint.
+///
+/// These need namespace treatment rather than an exact-path claim because the
+/// paths under them are not enumerable route-by-route: `ServeDir` serves
+/// whatever is on disk. A plugin nested here is not only a startup panic (a
+/// declared route AT the prefix, or a catch-all, makes `Router::nest` refuse
+/// the overlap) — a declared SUB-path mounts cleanly and then **shadows** the
+/// framework, so an artifact declaring `/static/app.js` would serve script
+/// from the host's own origin. That is the outcome this lane's response
+/// content-type allowlist exists to prevent, arriving by a different door.
+const fn framework_namespaces() -> &'static [&'static str] {
+    &["/static", "/_autumn"]
+}
+
+/// Whether `path` is inside `namespace` — the namespace itself, or anything
+/// below it on a segment boundary. `/staticfoo` is NOT inside `/static`.
+fn path_is_under_namespace(path: &str, namespace: &str) -> bool {
+    path == namespace
+        || path
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Every path a framework-mounted `GET` handler owns: probes, actuator, htmx
 /// assets, framework CSS, dev live-reload and inspector, mail previews and
 /// unsubscribe, the story gallery, and the tracked-job status route.
@@ -1289,11 +1317,16 @@ fn collect_user_get_paths(
 /// startup panic the other never sees.
 fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashSet<String> {
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Framework-mounted GETs.
-    claimed.insert(config.health.path.clone());
-    claimed.insert(config.health.live_path.clone());
-    claimed.insert(config.health.ready_path.clone());
-    claimed.insert(config.health.startup_path.clone());
+    // Framework-mounted GETs. The probes are behind the same `health.enabled`
+    // off-switch `mount_probe_endpoints` checks (#1971): claiming them while
+    // nothing mounts them would refuse a plugin — or an OpenAPI/MCP mount path
+    // — over a collision that cannot happen.
+    if config.health.enabled {
+        claimed.insert(config.health.path.clone());
+        claimed.insert(config.health.live_path.clone());
+        claimed.insert(config.health.ready_path.clone());
+        claimed.insert(config.health.startup_path.clone());
+    }
     for path in crate::actuator::actuator_endpoint_paths(
         &config.actuator.prefix,
         config.actuator.sensitive,
@@ -1803,40 +1836,7 @@ fn reject_duplicate_user_routes(
         record(&method, declared.path.clone(), &declared.handler)?;
     }
 
-    // The framework's own GETs (probes, actuator, htmx assets, mail previews,
-    // …) are mounted separately and are NOT in `route_list`, so `record` above
-    // cannot see them — a manifest declaring `GET /health` sailed past the
-    // check and still panicked at `Router::nest`. Verified against axum 0.8.9
-    // which methods actually clash there: only GET does. A declared HEAD or
-    // POST at a framework GET path merges cleanly into the same
-    // `MethodRouter`, so refusing those would reject mounts axum accepts.
-    //
-    // Refuse rather than let the framework yield. A user route at a probe path
-    // legitimately takes it over (issue #1971) — the developer owns their app.
-    // An artifact the operator was told is sandboxed is a different principal:
-    // silently handing it `/health`, which orchestrators read to decide whether
-    // the process is alive, would be a worse outcome than a loud refusal. Any
-    // path a user route already owns is caught by `record` above (the framework
-    // has yielded it), so this only fires where the framework really mounts.
-    let framework_get_paths = collect_framework_get_paths(config);
-    for declared in declared_routes {
-        let is_get = declared.method.eq_ignore_ascii_case("GET")
-            || declared.method.eq_ignore_ascii_case("WS");
-        if is_get && framework_get_paths.contains(&declared.path) {
-            // `FrameworkRouteOverlap` would read better, but its `existing` and
-            // `incoming` are `&'static str` and a plugin's handler name is
-            // built at runtime; widening them is a breaking change to a public
-            // enum. `DuplicateUserRoute` carries `String`s and still names the
-            // method, the path and both sides, which is what an operator needs
-            // to act.
-            return Err(RouterBuildError::DuplicateUserRoute {
-                method: "GET".to_owned(),
-                path: declared.path.clone(),
-                existing: "autumn framework route".to_owned(),
-                incoming: declared.handler.clone(),
-            });
-        }
-    }
+    reject_declared_framework_collisions(declared_routes, config)?;
 
     // Raw merged / nested routers are opaque — axum does not expose their
     // route tables. Warn so operators know the check does not cover those
@@ -1864,6 +1864,70 @@ fn reject_duplicate_user_routes(
         );
     }
 
+    Ok(())
+}
+
+/// Refuse a declared plugin route that lands on something the framework
+/// mounts.
+///
+/// Split out of [`reject_duplicate_user_routes`] because the framework's own
+/// mounts are not in `route_list` — they are installed separately — so the
+/// `record` oracle there cannot see them at all.
+fn reject_declared_framework_collisions(
+    declared_routes: &[crate::route_listing::RouteInfo],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    // The framework's own GETs (probes, actuator, htmx assets, mail previews,
+    // …) are mounted separately and are NOT in `route_list`, so the `record`
+    // oracle in `reject_duplicate_user_routes` cannot see them — a manifest
+    // declaring `GET /health` sailed past that check and still panicked at
+    // `Router::nest`. Verified against axum 0.8.9
+    // which methods actually clash there: only GET does. A declared HEAD or
+    // POST at a framework GET path merges cleanly into the same
+    // `MethodRouter`, so refusing those would reject mounts axum accepts.
+    //
+    // Refuse rather than let the framework yield. A user route at a probe path
+    // legitimately takes it over (issue #1971) — the developer owns their app.
+    // An artifact the operator was told is sandboxed is a different principal:
+    // silently handing it `/health`, which orchestrators read to decide whether
+    // the process is alive, would be a worse outcome than a loud refusal. Any
+    // path a user route already owns is caught by the caller's `record` pass
+    // (the framework has yielded it), so this only fires where the framework
+    // really mounts.
+    let framework_get_paths = collect_framework_get_paths(config);
+    for declared in declared_routes {
+        // Namespaces first, and for EVERY method: `/static` and `/_autumn` are
+        // owned wholesale, so a declared route anywhere beneath them is refused
+        // whether it would panic (at the prefix, or a catch-all) or mount
+        // quietly and shadow what the framework serves there.
+        if let Some(namespace) = framework_namespaces()
+            .iter()
+            .find(|namespace| path_is_under_namespace(&declared.path, namespace))
+        {
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method: declared.method.clone(),
+                path: declared.path.clone(),
+                existing: format!("autumn framework namespace {namespace}"),
+                incoming: declared.handler.clone(),
+            });
+        }
+        let is_get = declared.method.eq_ignore_ascii_case("GET")
+            || declared.method.eq_ignore_ascii_case("WS");
+        if is_get && framework_get_paths.contains(&declared.path) {
+            // `FrameworkRouteOverlap` would read better, but its `existing` and
+            // `incoming` are `&'static str` and a plugin's handler name is
+            // built at runtime; widening them is a breaking change to a public
+            // enum. `DuplicateUserRoute` carries `String`s and still names the
+            // method, the path and both sides, which is what an operator needs
+            // to act.
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method: "GET".to_owned(),
+                path: declared.path.clone(),
+                existing: "autumn framework route".to_owned(),
+                incoming: declared.handler.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -9885,6 +9949,68 @@ enabled = true
         ];
         let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect("non-GET declarations at a framework path must mount");
+    }
+
+    /// `/static` and `/_autumn` are framework namespaces, not enumerable
+    /// routes: `ServeDir` serves whatever is on disk, so no exact-path claim
+    /// can cover them. A plugin declaring a sub-path there does not even panic
+    /// — it mounts and SHADOWS the framework, which for `/static/app.js` means
+    /// an unaudited artifact serving script from the host's own origin.
+    /// Refused for every method, at the namespace root and below.
+    #[tokio::test]
+    async fn try_build_router_rejects_declared_plugin_routes_inside_framework_namespaces() {
+        for (method, path) in [
+            ("GET", "/static/app.js"),
+            ("GET", "/static"),
+            ("POST", "/_autumn/unsubscribe"),
+            ("GET", "/_autumn/jobs/abc"),
+        ] {
+            let config = AutumnConfig::default();
+            let mut ctx = duplicate_test_ctx();
+            ctx.declared_routes = vec![declared_route(method, path, "evil-plugin")];
+            let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect_err("a plugin route inside a framework namespace must be refused");
+            match err {
+                RouterBuildError::DuplicateUserRoute {
+                    path: ref got,
+                    ref existing,
+                    ..
+                } => {
+                    assert_eq!(got, path);
+                    assert!(
+                        existing.contains("framework namespace"),
+                        "the refusal must name the namespace; got: {existing}"
+                    );
+                }
+                other => {
+                    panic!("expected the namespace refusal for {method} {path}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The namespace check matches on segment boundaries, not string prefixes:
+    /// `/staticky` is an ordinary path a plugin may legitimately serve.
+    #[tokio::test]
+    async fn try_build_router_allows_a_plugin_path_that_merely_starts_like_a_namespace() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", "/staticky/thing", "good-plugin")];
+        let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("/staticky must not be read as /static");
+    }
+
+    /// `mount_probe_endpoints` mounts nothing when `health.enabled = false`, so
+    /// claiming the probe paths anyway would refuse a plugin over a collision
+    /// that cannot happen — turning a working install into a startup failure.
+    #[tokio::test]
+    async fn try_build_router_allows_a_declared_probe_path_when_probes_are_disabled() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", &config.health.path, "good-plugin")];
+        let _router = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("a disabled probe path must not be claimed");
     }
 
     /// The same protection has to cover a *shape* clash, not just an exact
