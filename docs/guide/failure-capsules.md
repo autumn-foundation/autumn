@@ -274,10 +274,10 @@ effect because your handler reached it a different way:
 
 | Seam | Captured at | Replayed as |
 | --- | --- | --- |
-| Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. Outbound webhook deliveries are covered here too, they send through the same client |
+| Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. A recorded *failure* comes back as the same `ClientError` variant, so a `matches!(err, ClientError::CircuitBreakerOpen)` guard takes the branch it took in production. Outbound webhook deliveries are covered here too, they send through the same client |
 | Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording and returns `Ok(())`; **nothing is written to a queue and no job runs** |
 | Cache | `cache::get_cached` / `insert_cached` | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write lands in the tape, so a read-back in the same run finds it |
-| Mail | `Mailer::send` | The send is asserted against the recorded recipients, subject and body — and its sender, when the replayed run chose one; **nothing is delivered** |
+| Mail | `Mailer::send` | The send is asserted against everything a recipient would notice — recipients, subject, reply-to, both halves of a multipart body, `List-Unsubscribe`, caller-set headers, and each attachment by name, type, size and digest — and its sender, when the replayed run chose one; **nothing is delivered** |
 | Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration |
 | Randomness | `state.entropy()` | Every draw replays byte-for-byte, so the session id, CSRF token, request id or job id the failing request minted reappears |
 
@@ -873,6 +873,20 @@ What capsules do not do, stated plainly:
   handler decided — and a replay boots without mail configuration on purpose.
   An unset sender on replay is therefore not read as a change; a sender the
   run *did* choose, and chose differently, still diverges.
+- **Attachments are recorded by digest, never by content.** An attachment is
+  routinely megabytes, and it is exactly the kind of payload — an invoice, an
+  export — a capsule has no business copying to disk. Its filename, content
+  type, length and SHA-256 are recorded instead: enough to notice a different
+  file is being sent, and nothing to leak if the capsule is shared.
+- **A recorded failure keeps its identity, not just its text.** Replay rebuilds
+  the error variant a handler branches on, and its `Display` output is the
+  recorded text *exactly* — no "replayed from the capsule" marker. A marker
+  would change the message a propagating handler puts in its response, and the
+  replay verdict compares outcome text verbatim, so an unchanged failure would
+  be reported as a mismatch. Errors wrapping a foreign type with no public
+  constructor (`reqwest::Error`, `lettre`'s SMTP error) come back as
+  `ClientError::ReplayedRequestFailure` / `MailError::ReplayedFailure`, which
+  print the recorded text and nothing else.
 - **A transactional enqueue makes a capsule unreplayable.** `enqueue_on_conn`
   (and its delayed and absolute variants) is two recorded effects for one
   action on the `postgres` backend: the enqueue itself, and the job-row INSERT

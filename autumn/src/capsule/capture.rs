@@ -448,6 +448,14 @@ const BODY_OVERFLOW_NOTE: &str =
 const HTTP_BODY_SKIPPED_NOTE: &str = "an outbound HTTP body exceeded `[failure_capture] max_body_bytes` and was not captured; \
      replaying would drive the handler with an empty body";
 
+/// Note recorded when a mail body was too large to keep.
+///
+/// Same reasoning as [`HTTP_BODY_SKIPPED_NOTE`]: the replay comparison treats a
+/// skipped body as matching anything, so a capsule carrying one can only be
+/// honest by declaring itself incomplete.
+const MAIL_BODY_SKIPPED_NOTE: &str = "a mail body exceeded `[failure_capture] max_body_bytes` and was not captured; replay \
+     cannot tell whether the message contents still match";
+
 /// Note recorded when an effect was reserved but never completed.
 ///
 /// A seam reserves its tape position when the effect *starts* and fills it in
@@ -844,7 +852,18 @@ impl CaptureScope {
 
     /// Complete a reserved mail slot.
     pub fn fill_mail(&self, index: usize, mut effect: MailEffect) {
-        effect.body = clamp_body(effect.body, self.settings.max_body_bytes);
+        let cap = self.settings.max_body_bytes;
+        let over = body_weight(&effect.body) > cap;
+        effect.body = clamp_body(effect.body, cap);
+        // A skipped body is a wildcard to the replay comparison — it has to be,
+        // there being nothing recorded to compare against — so a capsule
+        // holding one must not present as complete. Otherwise the message
+        // contents could change freely and still replay `reproduced`, which is
+        // the outcome comparing the body at all was meant to prevent.
+        if over {
+            self.note(MAIL_BODY_SKIPPED_NOTE);
+            self.mark_truncated();
+        }
         let weight = effect
             .subject
             .len()
@@ -1756,6 +1775,48 @@ mod tests {
     /// A lock poisoned by a panic mid-record means the capsule is missing
     /// whatever was being written. Returning the degraded value alone would
     /// make that indistinguishable from "the request did none of this".
+    /// The replay comparison treats a skipped body as matching anything, so a
+    /// capsule holding one must not present as complete — otherwise the mail
+    /// contents could change freely and still replay `reproduced`.
+    #[test]
+    fn a_mail_body_too_large_to_record_marks_the_capsule_incomplete() {
+        let mut settings = CaptureSettings::default();
+        settings.max_body_bytes = 8;
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("a body well past the cap".to_owned()),
+                ..Default::default()
+            },
+        );
+        let effects = scope.effects_snapshot();
+        assert!(
+            matches!(effects.mail[0].body, CapsuleBody::Skipped { .. }),
+            "the oversized body is not kept: {:?}",
+            effects.mail[0].body
+        );
+        assert!(
+            scope.is_truncated(),
+            "and the capsule says so rather than replaying any body clean"
+        );
+        assert!(
+            scope
+                .notes()
+                .iter()
+                .any(|note| note == MAIL_BODY_SKIPPED_NOTE),
+            "{:?}",
+            scope.notes()
+        );
+    }
+
     /// A seam reserves its tape position when the effect starts and fills it
     /// when the effect finishes. A cancelled future — the losing branch of a
     /// `tokio::select!`, a timeout — never fills it, and persisting the
@@ -1781,6 +1842,7 @@ mod tests {
                 response_headers: Vec::new(),
                 response_body: CapsuleBody::Absent,
                 error: None,
+                ..Default::default()
             },
         );
         // `cancelled` is deliberately never filled — its future was dropped.
@@ -1822,6 +1884,7 @@ mod tests {
                 response_headers: Vec::new(),
                 response_body: CapsuleBody::Absent,
                 error: None,
+                ..Default::default()
             },
         );
         let _ = scope.effects_snapshot();

@@ -472,8 +472,67 @@ pub struct HttpEffect {
     pub response_body: CapsuleBody,
     /// Transport-level failure text, when the call produced no response at
     /// all. Replay reproduces the failure rather than a status.
+    ///
+    /// This is the failure's *exact* `Display` output, because replay hands it
+    /// back verbatim: a handler that propagates the error puts this text in the
+    /// capsule's outcome, and comparing outcomes is a string comparison.
     #[serde(default)]
     pub error: Option<String>,
+    /// Which [`ClientError`](crate::http_client::ClientError) the failure was.
+    ///
+    /// The text alone is not enough: code that branches on the variant — a
+    /// `matches!(err, ClientError::CircuitBreakerOpen)` retry guard — takes a
+    /// different path if replay hands back a catch-all, and the capsule would
+    /// grade a run that never happened. Absent on capsules recorded before the
+    /// kind was tracked, which replay treats as [`HttpErrorKind::Transport`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<HttpErrorKind>,
+}
+
+/// Which outbound-HTTP failure a capsule recorded.
+///
+/// Named rather than structural so replay can rebuild the *observable* error,
+/// including for variants whose payload cannot be reconstructed from the
+/// display text alone. [`Transport`](Self::Transport) is the honest fallback:
+/// a `reqwest::Error` has no public constructor, so the recorded text is all
+/// there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpErrorKind {
+    /// An underlying transport error; only its text survives.
+    Transport,
+    /// JSON (de)serialisation failed; only its text survives.
+    Json,
+    /// No mock matched the outgoing request.
+    NoMock,
+    /// The outbound circuit breaker was open.
+    CircuitBreakerOpen,
+    /// The SSRF policy blocked the address.
+    SsrfBlocked,
+    /// A redirect chain exceeded the hop limit.
+    TooManyRedirects,
+    /// A redirect target was rejected by the validator.
+    RedirectRejected,
+    /// A URL could not be parsed or resolved.
+    InvalidUrl,
+}
+
+impl Default for HttpEffect {
+    /// An exchange with nothing recorded, for tests and fixtures to fill in the
+    /// one or two fields they are about.
+    fn default() -> Self {
+        Self {
+            method: String::new(),
+            url: String::new(),
+            request_headers: Vec::new(),
+            request_body: CapsuleBody::Absent,
+            status: 0,
+            response_headers: Vec::new(),
+            response_body: CapsuleBody::Absent,
+            error: None,
+            error_kind: None,
+        }
+    }
 }
 
 impl HttpEffect {
@@ -494,6 +553,7 @@ impl HttpEffect {
             response_headers: Vec::new(),
             response_body: CapsuleBody::Absent,
             error: Some(PENDING_EFFECT.to_owned()),
+            error_kind: None,
         }
     }
 }
@@ -599,12 +659,103 @@ pub struct MailEffect {
     pub from: Option<String>,
     /// Subject line, masked like any other recorded text.
     pub subject: String,
-    /// The (redacted) body.
+    /// The (redacted) body a capsule compares on: plain text when the message
+    /// had one, HTML otherwise.
     #[serde(default = "absent_body")]
     pub body: CapsuleBody,
+    /// The *other* alternative of a multipart message, when it had one.
+    ///
+    /// Recorded separately because a message can change in one alternative
+    /// alone — a rewritten HTML template with an untouched text fallback is a
+    /// materially different email — and comparing only the preferred body
+    /// would serve the recorded success to a run that now sends something
+    /// else.
+    #[serde(default = "absent_body")]
+    pub alternate_body: CapsuleBody,
+    /// `Reply-To`, when the message set one.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// `List-Unsubscribe`, when the message set one.
+    #[serde(default)]
+    pub list_unsubscribe: Option<String>,
+    /// Caller-set headers beyond the ones above, already masked.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    /// What the message carried, by name and digest — never the bytes.
+    #[serde(default)]
+    pub attachments: Vec<MailAttachmentEffect>,
     /// The delivery error the recorded send produced, when it failed.
+    ///
+    /// Its exact `Display` output, for the same reason
+    /// [`HttpEffect::error`] is.
     #[serde(default)]
     pub error: Option<String>,
+    /// Which [`MailError`](crate::mail::MailError) the failure was, so replay
+    /// can reproduce the variant a handler branches on and not only its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<MailErrorKind>,
+}
+
+/// One attachment a recorded message carried.
+///
+/// The bytes themselves are *not* recorded: an attachment is routinely
+/// megabytes, and it is exactly the kind of payload — an invoice, an export —
+/// a capsule has no business copying onto disk. A digest settles the only
+/// question replay needs to answer, which is whether the same file is still
+/// being sent, and leaks nothing if the capsule is shared.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailAttachmentEffect {
+    /// The filename the recipient would see.
+    pub filename: String,
+    /// The declared content type.
+    pub content_type: String,
+    /// Length of the attachment in bytes.
+    pub len: usize,
+    /// Lowercase hex SHA-256 of the attachment's bytes.
+    pub sha256: String,
+}
+
+/// Which mail failure a capsule recorded. See [`HttpErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailErrorKind {
+    /// The message itself was rejected as invalid.
+    InvalidMessage,
+    /// The mail runtime was unavailable.
+    RuntimeUnavailable,
+    /// A recipient or sender address failed to parse.
+    InvalidAddress,
+    /// The message failed to build.
+    Build,
+    /// The SMTP transport refused the send.
+    Smtp,
+    /// A file-transport write failed.
+    Io,
+    /// Every recipient was on the suppression list.
+    AllRecipientsSuppressed,
+    /// CSS inlining failed.
+    CssInline,
+    /// Anything else; only the recorded text survives.
+    Other,
+}
+
+impl Default for MailEffect {
+    /// A send with nothing recorded; see [`HttpEffect::default`].
+    fn default() -> Self {
+        Self {
+            to: Vec::new(),
+            from: None,
+            subject: String::new(),
+            body: CapsuleBody::Absent,
+            alternate_body: CapsuleBody::Absent,
+            reply_to: None,
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: Vec::new(),
+            error: None,
+            error_kind: None,
+        }
+    }
 }
 
 impl MailEffect {
@@ -617,7 +768,13 @@ impl MailEffect {
             from: None,
             subject: String::new(),
             body: CapsuleBody::Absent,
+            alternate_body: CapsuleBody::Absent,
+            reply_to: None,
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: Vec::new(),
             error: Some(PENDING_EFFECT.to_owned()),
+            error_kind: None,
         }
     }
 }
@@ -818,6 +975,7 @@ mod tests {
             response_headers: vec![("content-type".to_owned(), "application/json".to_owned())],
             response_body: CapsuleBody::Base64("AAEC".to_owned()),
             error: None,
+            error_kind: Some(HttpErrorKind::CircuitBreakerOpen),
         });
         capsule.effects.jobs.push(JobEffect {
             name: "send_receipt".to_owned(),
@@ -838,7 +996,18 @@ mod tests {
             from: Some("noreply@example.com".to_owned()),
             subject: "Receipt".to_owned(),
             body: CapsuleBody::Text("thanks".to_owned()),
+            alternate_body: CapsuleBody::Text("<p>thanks</p>".to_owned()),
+            reply_to: Some("support@example.com".to_owned()),
+            list_unsubscribe: Some("<https://example.com/u>".to_owned()),
+            extra_headers: vec![("x-campaign".to_owned(), "receipts".to_owned())],
+            attachments: vec![MailAttachmentEffect {
+                filename: "invoice.pdf".to_owned(),
+                content_type: "application/pdf".to_owned(),
+                len: 4,
+                sha256: "ab".repeat(32),
+            }],
             error: None,
+            error_kind: Some(MailErrorKind::AllRecipientsSuppressed),
         });
         capsule.effects.tenant = Some(TenantEffect {
             id: Some("acme".to_owned()),

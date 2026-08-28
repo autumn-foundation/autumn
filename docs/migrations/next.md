@@ -181,6 +181,14 @@ finished — a losing `tokio::select!` branch, a timeout — does the same rathe
 than persist an outcome the run never had. Each case previously produced a
 verdict; each now says why it cannot.
 
+Two API changes come with the sharper failure reproduction. `ClientError` gains
+`ReplayedRequestFailure` and `MailError` gains `ReplayedFailure`, both of which
+print their recorded text and nothing else; a `match` on either enum without a
+`_` arm needs the new variant. Recorded failures are otherwise rebuilt as the
+variant production produced, so code branching on
+`ClientError::CircuitBreakerOpen` or `MailError::AllRecipientsSuppressed`
+behaves during replay as it did live.
+
 A **panicking job** now leaves a capsule on whatever attempt it panicked on.
 All three backends dead-letter a panic immediately regardless of remaining
 attempts, so a job configured with `max_attempts = 25` that panics on its

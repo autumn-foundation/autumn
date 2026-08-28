@@ -80,8 +80,14 @@ pub enum ClientError {
     /// A recorded transport error cannot be rebuilt as a `reqwest::Error` — it
     /// has no public constructor — but it must not be downgraded to a status
     /// either: a handler whose bug is "we do not handle a connection reset"
-    /// has to meet the reset again. The recorded text is carried verbatim.
-    #[error("outbound HTTP request failed (replayed from the capsule): {0}")]
+    /// has to meet the reset again.
+    ///
+    /// Its `Display` is the recorded text *exactly*, with no replay marker of
+    /// its own. A handler that propagates this error puts the text into the
+    /// capsule's outcome, and the replay verdict compares outcome messages
+    /// verbatim — so a marker here would report an unchanged failure as a
+    /// mismatch, which is the one thing the comparison exists to get right.
+    #[error("{0}")]
     ReplayedRequestFailure(String),
     /// Outbound HTTP is blocked because this process is replaying a failure
     /// capsule (see the crate-internal `block_outbound_for_replay`).
@@ -627,6 +633,76 @@ fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
 
 /// Serve one outbound call from a capsule's effect tape.
 ///
+/// Which [`HttpErrorKind`] a failure is, so replay can rebuild the variant and
+/// not merely quote the text.
+#[cfg(feature = "reporting")]
+const fn http_error_kind(error: &ClientError) -> crate::capsule::schema::HttpErrorKind {
+    use crate::capsule::schema::HttpErrorKind as Kind;
+    match error {
+        ClientError::Json(_) => Kind::Json,
+        ClientError::NoMock(..) => Kind::NoMock,
+        ClientError::CircuitBreakerOpen => Kind::CircuitBreakerOpen,
+        ClientError::SsrfBlocked(_) => Kind::SsrfBlocked,
+        ClientError::TooManyRedirects(_) => Kind::TooManyRedirects,
+        ClientError::RedirectRejected(_) => Kind::RedirectRejected,
+        ClientError::InvalidUrl(_) => Kind::InvalidUrl,
+        // Everything else — a `reqwest` transport error, and the replay-only
+        // variants a recorded run cannot have produced — keeps its text alone.
+        _ => Kind::Transport,
+    }
+}
+
+/// Rebuild the error a recorded call produced, as the handler observed it.
+///
+/// Variants whose payload survives in the recording are rebuilt exactly, so
+/// code that branches on them takes the branch it took in production. The rest
+/// come back as [`ClientError::ReplayedRequestFailure`], whose `Display` is the
+/// recorded text verbatim — the closest an unreconstructible foreign error can
+/// be brought.
+#[cfg(feature = "reporting")]
+fn rebuild_client_error(
+    kind: Option<crate::capsule::schema::HttpErrorKind>,
+    text: String,
+) -> ClientError {
+    use crate::capsule::schema::HttpErrorKind as Kind;
+    match kind {
+        Some(Kind::CircuitBreakerOpen) => ClientError::CircuitBreakerOpen,
+        Some(Kind::SsrfBlocked) => {
+            ClientError::SsrfBlocked(strip_prefix_payload(&text, "SSRF policy blocked address: "))
+        }
+        Some(Kind::RedirectRejected) => {
+            ClientError::RedirectRejected(strip_prefix_payload(&text, "redirect rejected: "))
+        }
+        Some(Kind::InvalidUrl) => {
+            ClientError::InvalidUrl(strip_prefix_payload(&text, "invalid or unresolvable URL: "))
+        }
+        Some(Kind::TooManyRedirects) => text
+            .trim_end_matches(')')
+            .rsplit_once("(max ")
+            .and_then(|(_, hops)| hops.parse().ok())
+            .map_or_else(
+                || ClientError::ReplayedRequestFailure(text.clone()),
+                ClientError::TooManyRedirects,
+            ),
+        // `NoMock` carries the method and URL, which the effect already holds;
+        // it is a test-harness error a recorded production run cannot produce,
+        // so it is not worth rebuilding structurally.
+        Some(Kind::Json | Kind::NoMock | Kind::Transport) | None => {
+            ClientError::ReplayedRequestFailure(text)
+        }
+    }
+}
+
+/// The payload of a single-field error, recovered from its recorded `Display`.
+///
+/// The prefixes are this module's own `#[error(...)]` strings, so they cannot
+/// drift without this file changing; a recording that does not carry one is
+/// handed back whole rather than silently truncated.
+#[cfg(feature = "reporting")]
+fn strip_prefix_payload(text: &str, prefix: &str) -> String {
+    text.strip_prefix(prefix).unwrap_or(text).to_owned()
+}
+
 /// A recorded transport failure is reproduced as one, not as a status: a
 /// handler whose bug is "we do not handle a connection reset" must meet the
 /// reset again.
@@ -643,7 +719,7 @@ fn replayed_response(
         ));
     };
     if let Some(error) = recorded.error {
-        return Err(ClientError::ReplayedRequestFailure(error));
+        return Err(rebuild_client_error(recorded.error_kind, error));
     }
     let mut headers = HeaderMap::new();
     for (name, value) in &recorded.response_headers {
@@ -751,8 +827,12 @@ impl OutboundRecorder {
                 0,
                 Vec::new(),
                 crate::capsule::CapsuleBody::Absent,
-                Some(error.to_string()),
+                Some((error.to_string(), http_error_kind(error))),
             ),
+        };
+        let (error, error_kind) = match error {
+            Some((text, kind)) => (Some(text), Some(kind)),
+            None => (None, None),
         };
         scope.fill_http(
             slot,
@@ -765,6 +845,7 @@ impl OutboundRecorder {
                 response_headers,
                 response_body,
                 error,
+                error_kind,
             },
         );
     }

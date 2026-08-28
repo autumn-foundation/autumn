@@ -344,7 +344,10 @@ pub struct VerifyOptions<'a> {
 ///
 /// Two halves, in order. First the corpus-level checks `cargo test` cannot
 /// make: that the directory exists, that it is **not empty** (an empty corpus
-/// is reported as a failure, never as a vacuous pass), and that every capsule
+/// is reported as a failure, never as a vacuous pass), that every committed
+/// capsule still has a generated test wired into the consolidated suite (a
+/// deleted one would otherwise be skipped in silence by the name filter), and
+/// that every capsule
 /// in it is still readable and replayable by *this* build — exactly the
 /// question an Autumn upgrade raises. Then `cargo test capsule_`, which runs
 /// the generated tests themselves.
@@ -381,6 +384,42 @@ pub fn verify(opts: &VerifyOptions<'_>) {
     }
 }
 
+/// Why one committed capsule would not be executed by the filtered `cargo
+/// test`, or `None` when its test is present and wired in.
+///
+/// `verify` runs the corpus by *name filter*, so a generated test file that was
+/// deleted — or whose `mod` declaration was dropped from the consolidated
+/// `mod.rs` — simply does not run. Cargo reports success for the tests that
+/// remain, and the corpus announces that it replays clean while a committed
+/// capsule was never replayed at all. That is the vacuous pass an empty corpus
+/// is already refused for, arriving by a different door.
+fn unregistered_reason(fixture: &Path, suite: Option<&Path>, declarations: &str) -> Option<String> {
+    let slug = fixture.file_stem()?.to_str()?;
+    let module = format!("capsule_{slug}");
+    let suite = suite?;
+    let test_path = suite.join(format!("{module}.rs"));
+    if !test_path.exists() {
+        return Some(format!(
+            "its generated test {} is missing, so `cargo test {TEST_NAME_PREFIX}` would skip \
+             this capsule silently; regenerate it with `autumn capsule test {}`",
+            test_path.display(),
+            fixture.display()
+        ));
+    }
+    // Through `declares`, so `pub mod` counts and `mod capsule_foo_bar;`
+    // cannot satisfy the check for `capsule_foo` — the same matching the
+    // writer half uses when it registers a module.
+    if !declares(declarations, &module) {
+        return Some(format!(
+            "{} exists but is not declared in {}, so it is never compiled or run; add \
+             `mod {module};`",
+            test_path.display(),
+            suite.join("mod.rs").display()
+        ));
+    }
+    None
+}
+
 /// The name prefix every generated regression test carries, which is also the
 /// filter `verify` runs them with.
 const TEST_NAME_PREFIX: &str = "capsule_";
@@ -410,6 +449,15 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
         ));
     }
 
+    // The generated tests live beside the fixtures, under the same `tests/`
+    // root; `cargo test capsule_` can only run the ones that are still wired
+    // in, so this is where their absence has to be caught.
+    let suite = dir.parent().map(|tests| tests.join(TEST_SUBDIR));
+    let declarations = suite
+        .as_ref()
+        .and_then(|suite| std::fs::read_to_string(suite.join("mod.rs")).ok())
+        .unwrap_or_default();
+
     let mut text = String::new();
     let mut unusable = 0_usize;
     for path in &paths {
@@ -418,6 +466,15 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
                 if let Some(reason) = autumn_web::capsule::refusal_reason(case.capsule()) {
                     unusable = unusable.saturating_add(1);
                     let _ = writeln!(text, "REFUSED     {}\n  {reason}", path.display());
+                } else if let Some(reason) =
+                    unregistered_reason(path, suite.as_deref(), &declarations)
+                {
+                    // A readable capsule whose test is gone is the most
+                    // dangerous state in the corpus: the filtered `cargo test`
+                    // below would skip it in silence and still report that the
+                    // corpus replays clean.
+                    unusable = unusable.saturating_add(1);
+                    let _ = writeln!(text, "UNREGISTERED {}\n  {reason}", path.display());
                 } else {
                     let _ = writeln!(text, "ok          {}", path.display());
                 }
@@ -687,6 +744,17 @@ mod tests {
         let corpus = dir.path().join("capsules");
         std::fs::create_dir_all(&corpus).expect("mkdir");
         std::fs::write(corpus.join("good.json"), fixture_capsule("req-9")).expect("write");
+        // The generated tests live beside the fixtures; without them `verify`
+        // would (correctly) report the corpus as unregistered rather than ok.
+        let suite = dir.path().join("integration");
+        std::fs::create_dir_all(&suite).expect("mkdir");
+        std::fs::write(suite.join("capsule_good.rs"), "").expect("write");
+        std::fs::write(suite.join("capsule_stale.rs"), "").expect("write");
+        std::fs::write(
+            suite.join("mod.rs"),
+            "mod capsule_good;\nmod capsule_stale;\n",
+        )
+        .expect("write");
         std::fs::write(corpus.join("stale.json"), {
             let mut value: serde_json::Value =
                 serde_json::from_str(&fixture_capsule("req-10")).expect("parses");
@@ -703,6 +771,46 @@ mod tests {
         );
         assert!(report.text.contains("UNREADABLE"), "{}", report.text);
         assert!(report.text.contains("ok  "), "{}", report.text);
+    }
+
+    /// `verify` runs the corpus by *name filter*, so a generated test that was
+    /// deleted simply does not run and Cargo still reports success. That is the
+    /// vacuous pass an empty corpus is already refused for, arriving by a
+    /// different door.
+    #[test]
+    fn a_capsule_whose_generated_test_is_gone_is_not_a_silent_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = dir.path().join("capsules");
+        let suite = dir.path().join("integration");
+        std::fs::create_dir_all(&corpus).expect("mkdir");
+        std::fs::create_dir_all(&suite).expect("mkdir");
+        std::fs::write(corpus.join("orphan.json"), fixture_capsule("req-11")).expect("write");
+
+        // The test file was deleted outright.
+        std::fs::write(suite.join("mod.rs"), "mod capsule_orphan;\n").expect("write");
+        let report = verify_inner(&corpus).expect("a non-empty corpus reports");
+        assert_eq!(report.unusable, 1, "{}", report.text);
+        assert!(
+            report.text.contains("UNREGISTERED") && report.text.contains("is missing"),
+            "{}",
+            report.text
+        );
+
+        // The file is back, but nothing declares it, so it is never compiled.
+        std::fs::write(suite.join("capsule_orphan.rs"), "").expect("write");
+        std::fs::write(suite.join("mod.rs"), "mod capsule_something_else;\n").expect("write");
+        let report = verify_inner(&corpus).expect("a non-empty corpus reports");
+        assert_eq!(report.unusable, 1, "{}", report.text);
+        assert!(
+            report.text.contains("not declared"),
+            "the report must say which half is missing: {}",
+            report.text
+        );
+
+        // Both present: the capsule counts as runnable.
+        std::fs::write(suite.join("mod.rs"), "mod capsule_orphan;\n").expect("write");
+        let report = verify_inner(&corpus).expect("a non-empty corpus reports");
+        assert_eq!(report.unusable, 0, "{}", report.text);
     }
 
     #[test]

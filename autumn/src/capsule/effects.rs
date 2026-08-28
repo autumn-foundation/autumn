@@ -166,7 +166,10 @@ pub(crate) enum MailVerdict {
     /// Matched a recorded successful send; nothing is delivered.
     Sent,
     /// Matched a recorded send that *failed*; the caller reproduces the error.
-    Failed(String),
+    ///
+    /// Carries the recorded kind alongside the text so the caller can rebuild
+    /// the variant a handler branches on, not only what it prints.
+    Failed(String, Option<crate::capsule::schema::MailErrorKind>),
     /// Did not match the recording. A divergence has been logged.
     Diverged,
 }
@@ -684,13 +687,33 @@ impl ReplayEffects {
                 .as_deref()
                 .is_some_and(|recorded| matches_redacted(recorded, actual))
         });
-        if !sender_match || !body_matches_redacted(&next.body, sent.body) {
+        // Everything a recipient would notice, not only what addresses the
+        // envelope: an invoice removed, an HTML template rewritten under an
+        // untouched text fallback, an unsubscribe header dropped. Each is a
+        // materially different email, and serving the recorded success for one
+        // would leave the final audit nothing to catch.
+        let changed = if !sender_match {
+            Some("its sender")
+        } else if !body_matches_redacted(&next.body, sent.body) {
+            Some("its body")
+        } else if !body_matches_redacted(&next.alternate_body, sent.alternate_body) {
+            Some("the other half of its multipart body")
+        } else if !optional_matches_redacted(next.reply_to.as_deref(), sent.reply_to) {
+            Some("its reply-to")
+        } else if !optional_matches_redacted(
+            next.list_unsubscribe.as_deref(),
+            sent.list_unsubscribe,
+        ) {
+            Some("its list-unsubscribe header")
+        } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
+            Some("its headers")
+        } else if next.attachments != sent.attachments {
+            Some("its attachments")
+        } else {
+            None
+        };
+        if let Some(changed) = changed {
             let expected = describe_mail(&next.to, &next.subject);
-            let changed = if sender_match {
-                "its body"
-            } else {
-                "its sender"
-            };
             drop(seam);
             let actual = describe_mail(to, subject);
             self.diverge(EffectDivergence {
@@ -706,11 +729,16 @@ impl ReplayEffects {
             });
             return MailVerdict::Diverged;
         }
-        let error = seam.pending.pop_front().and_then(|recorded| recorded.error);
+        let error = seam
+            .pending
+            .pop_front()
+            .and_then(|recorded| recorded.error.map(|text| (text, recorded.error_kind)));
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
         self.served.fetch_add(1, Ordering::SeqCst);
-        error.map_or(MailVerdict::Sent, MailVerdict::Failed)
+        error.map_or(MailVerdict::Sent, |(text, kind)| {
+            MailVerdict::Failed(text, kind)
+        })
     }
 
     /// The tenant the recording resolved, when it resolved one.
@@ -988,6 +1016,16 @@ pub(crate) struct SentMail<'a> {
     /// The body, preferring plain text over HTML — the same preference the
     /// recorder applies.
     pub body: &'a CapsuleBody,
+    /// The other alternative of a multipart message.
+    pub alternate_body: &'a CapsuleBody,
+    /// `Reply-To`, when set.
+    pub reply_to: Option<&'a str>,
+    /// `List-Unsubscribe`, when set.
+    pub list_unsubscribe: Option<&'a str>,
+    /// Caller-set headers beyond the named ones.
+    pub extra_headers: &'a [(String, String)],
+    /// What the message carries, by name and digest.
+    pub attachments: &'a [crate::capsule::schema::MailAttachmentEffect],
 }
 
 /// Whether a recorded body matches what the replayed run produced.
@@ -1014,6 +1052,19 @@ fn body_matches_redacted(recorded: &CapsuleBody, actual: &CapsuleBody) -> bool {
 /// Order and count are compared exactly — a header the code stopped sending is
 /// a change — while a masked value matches whatever stood in its place, for the
 /// same reason [`matches_redacted`] exists.
+/// Whether an optional recorded field matches what the replayed run set.
+///
+/// Both absent matches; one present and one absent is a change; two present
+/// compare through [`matches_redacted`], so a masked value still stands for
+/// whatever was really there.
+fn optional_matches_redacted(recorded: Option<&str>, actual: Option<&str>) -> bool {
+    match (recorded, actual) {
+        (None, None) => true,
+        (Some(recorded), Some(actual)) => matches_redacted(recorded, actual),
+        _ => false,
+    }
+}
+
 fn headers_match_redacted(recorded: &[(String, String)], actual: &[(String, String)]) -> bool {
     recorded.len() == actual.len()
         && recorded.iter().zip(actual.iter()).all(
@@ -1134,6 +1185,13 @@ mod tests {
         CachedValue, EffectDivergenceKind, EffectSeam, EnqueueVerdict, FILTERED, MailVerdict,
         OutboundRequest, ReplayEffects, SentMail,
     };
+
+    /// An absent body to point at when a fixture has no alternative half.
+    ///
+    /// A `static` rather than a `const` so `&NO_BODY` borrows for `'static`:
+    /// `CapsuleBody` owns a `String`, so a const would only ever yield a
+    /// temporary that cannot outlive the `SentMail` borrowing it.
+    static NO_BODY: CapsuleBody = CapsuleBody::Absent;
     use crate::capsule::schema::{
         CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect, TenantEffect,
     };
@@ -1148,6 +1206,7 @@ mod tests {
             response_headers: Vec::new(),
             response_body: CapsuleBody::Text("{}".to_owned()),
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1172,6 +1231,11 @@ mod tests {
             from: None,
             subject,
             body,
+            alternate_body: &NO_BODY,
+            reply_to: None,
+            list_unsubscribe: None,
+            extra_headers: &[],
+            attachments: &[],
         }
     }
 
@@ -1486,6 +1550,7 @@ mod tests {
                 subject: "Receipt".to_owned(),
                 body: CapsuleBody::Text("thanks".to_owned()),
                 error: None,
+                ..Default::default()
             }],
             ..CapsuleEffects::default()
         });
@@ -1598,6 +1663,7 @@ mod tests {
             subject: "Receipt".to_owned(),
             body: CapsuleBody::Text("you paid $10".to_owned()),
             error: None,
+            ..Default::default()
         };
         let tape = ReplayEffects::new(CapsuleEffects {
             mail: vec![recorded.clone(), recorded],
@@ -1611,6 +1677,11 @@ mod tests {
                 from: Some("billing@shop.example"),
                 subject: "Receipt",
                 body: &wrong_body,
+                alternate_body: &NO_BODY,
+                reply_to: None,
+                list_unsubscribe: None,
+                extra_headers: &[],
+                attachments: &[],
             }),
             MailVerdict::Diverged,
             "same envelope, different letter — the recorded success must not be served"
@@ -1622,6 +1693,11 @@ mod tests {
                 from: Some("noreply@shop.example"),
                 subject: "Receipt",
                 body: &right_body,
+                alternate_body: &NO_BODY,
+                reply_to: None,
+                list_unsubscribe: None,
+                extra_headers: &[],
+                attachments: &[],
             }),
             MailVerdict::Diverged,
             "and mail sent from a different address is a change too"
@@ -1648,6 +1724,7 @@ mod tests {
                 subject: "Receipt".to_owned(),
                 body: CapsuleBody::Text("thanks".to_owned()),
                 error: None,
+                ..Default::default()
             }],
             ..CapsuleEffects::default()
         });
@@ -1659,10 +1736,123 @@ mod tests {
                 from: None,
                 subject: "Receipt",
                 body: &body,
+                alternate_body: &NO_BODY,
+                reply_to: None,
+                list_unsubscribe: None,
+                extra_headers: &[],
+                attachments: &[],
             }),
             MailVerdict::Sent
         );
         assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+    }
+
+    #[test]
+    fn a_changed_mail_attachment_or_alternate_body_diverges() {
+        // The envelope, subject, sender and preferred body all match; only the
+        // parts a recipient would still plainly notice have changed.
+        let recorded = MailEffect {
+            to: vec!["a@example.com".to_owned()],
+            from: Some("billing@shop.example".to_owned()),
+            subject: "Receipt".to_owned(),
+            body: CapsuleBody::Text("you paid $10".to_owned()),
+            alternate_body: CapsuleBody::Text("<p>you paid $10</p>".to_owned()),
+            attachments: vec![crate::capsule::schema::MailAttachmentEffect {
+                filename: "invoice.pdf".to_owned(),
+                content_type: "application/pdf".to_owned(),
+                len: 12,
+                sha256: "cd".repeat(32),
+            }],
+            ..Default::default()
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![recorded.clone(), recorded.clone(), recorded],
+            ..CapsuleEffects::default()
+        });
+        let to = ["a@example.com".to_owned()];
+        let body = CapsuleBody::Text("you paid $10".to_owned());
+        let base =
+            |alternate: &'static CapsuleBody,
+             attachments: &'static [crate::capsule::schema::MailAttachmentEffect]| {
+                SentMail {
+                    to: &to,
+                    from: Some("billing@shop.example"),
+                    subject: "Receipt",
+                    body: &body,
+                    alternate_body: alternate,
+                    reply_to: None,
+                    list_unsubscribe: None,
+                    extra_headers: &[],
+                    attachments,
+                }
+            };
+
+        // The invoice was dropped.
+        static SAME_HTML: std::sync::LazyLock<CapsuleBody> =
+            std::sync::LazyLock::new(|| CapsuleBody::Text("<p>you paid $10</p>".to_owned()));
+        assert_eq!(
+            tape.next_mail(&base(&SAME_HTML, &[])),
+            MailVerdict::Diverged,
+            "an attachment the run stopped sending is a different email"
+        );
+        // The HTML half was rewritten while the text fallback stood still.
+        static NEW_HTML: std::sync::LazyLock<CapsuleBody> =
+            std::sync::LazyLock::new(|| CapsuleBody::Text("<p>you paid $10000</p>".to_owned()));
+        static INVOICE: std::sync::LazyLock<Vec<crate::capsule::schema::MailAttachmentEffect>> =
+            std::sync::LazyLock::new(|| {
+                vec![crate::capsule::schema::MailAttachmentEffect {
+                    filename: "invoice.pdf".to_owned(),
+                    content_type: "application/pdf".to_owned(),
+                    len: 12,
+                    sha256: "cd".repeat(32),
+                }]
+            });
+        assert_eq!(
+            tape.next_mail(&base(&NEW_HTML, &INVOICE)),
+            MailVerdict::Diverged,
+            "a rewritten HTML half must not ride along under an unchanged text fallback"
+        );
+        // Everything matching still replays.
+        assert_eq!(
+            tape.next_mail(&base(&SAME_HTML, &INVOICE)),
+            MailVerdict::Sent
+        );
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 2);
+        assert!(
+            divergences[0].detail.contains("its attachments")
+                && divergences[1].detail.contains("multipart"),
+            "each report names what changed: {divergences:?}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_mail_failure_replays_as_its_own_variant() {
+        use crate::capsule::schema::MailErrorKind;
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("thanks".to_owned()),
+                error: Some(
+                    "all recipients are on the mail suppression list; nothing was sent".to_owned(),
+                ),
+                error_kind: Some(MailErrorKind::AllRecipientsSuppressed),
+                ..Default::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        let to = ["a@example.com".to_owned()];
+        let body = CapsuleBody::Text("thanks".to_owned());
+        // The kind travels with the text, so the caller can rebuild the very
+        // variant a handler branches on rather than a catch-all.
+        assert_eq!(
+            tape.next_mail(&sent(&to, "Receipt", &body)),
+            MailVerdict::Failed(
+                "all recipients are on the mail suppression list; nothing was sent".to_owned(),
+                Some(MailErrorKind::AllRecipientsSuppressed)
+            )
+        );
     }
 
     #[test]

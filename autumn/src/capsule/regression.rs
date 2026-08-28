@@ -385,6 +385,7 @@ mod tests {
                 response_headers: Vec::new(),
                 response_body: crate::capsule::CapsuleBody::Absent,
                 error: None,
+                ..Default::default()
             }],
             ..CapsuleEffects::default()
         };

@@ -455,6 +455,23 @@ pub fn redact_effects(
     }
 
     for (index, mail) in effects.mail.iter_mut().enumerate() {
+        mail.alternate_body = redact_effect_body(
+            &mail.alternate_body,
+            // An alternate body is the HTML half of a multipart message
+            // whenever there is one to record.
+            "text/html",
+            filter,
+            values,
+            keys,
+            &format!("mail[{index}].alternate_body"),
+        );
+        redact_effect_headers(
+            &mut mail.extra_headers,
+            filter,
+            values,
+            keys,
+            &format!("mail[{index}].header"),
+        );
         mail.body = redact_effect_body(
             &mail.body,
             "text/plain",
@@ -496,6 +513,7 @@ pub fn redact_effects(
     for mail in &mut effects.mail {
         mail.subject = mask_echoes(&mail.subject, values);
         mask_body_echoes(&mut mail.body, values);
+        mask_body_echoes(&mut mail.alternate_body, values);
         // Recipients are the PII on this seam: an operator who filters
         // `email` must not find the address sitting in the clear one field
         // over, which is exactly the "filter defeated through a side door"
@@ -1607,6 +1625,7 @@ mod tests {
                 )],
                 response_body: CapsuleBody::Text(r#"{"api_key":"sk-live-42"}"#.to_owned()),
                 error: None,
+                ..Default::default()
             }
         }
 
@@ -1761,6 +1780,7 @@ mod tests {
                     subject: "hunter2secret".to_owned(),
                     body: CapsuleBody::Text("your key is hunter2secret".to_owned()),
                     error: None,
+                    ..Default::default()
                 }],
                 tenant: Some(TenantEffect {
                     id: Some("hunter2secret".to_owned()),

@@ -76,6 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt number: all three backends dead-letter a panic immediately, so its
   first attempt is also its last, and gating capture on the final attempt meant
   the job failure most worth a capsule never produced one.
+  Two further rules keep a verdict honest. A recorded **failure** is rebuilt
+  with its own error variant and its exact recorded text — no replay marker —
+  so a handler that branches on `ClientError::CircuitBreakerOpen` or
+  `MailError::AllRecipientsSuppressed` takes the branch it took in production,
+  and one that propagates the error produces the same outcome message rather
+  than a spurious mismatch. And a **mail send** is compared on everything a
+  recipient would notice: both halves of a multipart body, reply-to,
+  `List-Unsubscribe`, caller-set headers, and each attachment by name, type,
+  size and SHA-256 (never its bytes — an invoice has no business being copied
+  into a capsule). `autumn capsule verify` now also checks that every committed
+  capsule still has a generated test wired into the consolidated suite: it runs
+  the corpus by name filter, so a deleted test would otherwise be skipped in
+  silence while the corpus reported that it replays clean.
 
 ### Fixed
 

@@ -2379,8 +2379,13 @@ fn replayed_enqueue(
             // whose 500 came from `enqueue(..).await?` — the queue was down,
             // the channel closed — must meet that error again, not be handed
             // the success it never got.
+            // The recorded message verbatim, with no replay marker: a handler
+            // that propagates `enqueue(..).await?` puts this text into the
+            // capsule's outcome, and the replay verdict compares outcome text
+            // exactly — so a prefix here would report an unchanged
+            // queue-failure capsule as a mismatch.
             EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
-                std::io::Error::other(format!("replayed from the capsule: {error}")),
+                std::io::Error::other(error),
             )),
             // `next_job` already logged the divergence; the enqueue fails
             // closed so the handler sees an error rather than a silent success
