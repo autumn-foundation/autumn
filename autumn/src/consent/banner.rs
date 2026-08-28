@@ -381,6 +381,16 @@ pub async fn inject_consent_banner(
             "consent banner skipped: CSRF is enforced but no token was available \
              (typically a pre-rendered static page, where CsrfLayer never runs)"
         );
+        // `Vary: Cookie` for the same reason as every other HTML pass-through:
+        // this response is bannerless *because this visitor had no CSRF
+        // cookie*. Cached without the header, a CDN could replay it to a
+        // visitor who does have one — and who could therefore have been
+        // prompted — suppressing the banner for as long as the entry stays
+        // fresh. The response varies on the cookie jar whether or not anything
+        // was injected.
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
         return response;
     }
 
@@ -1605,6 +1615,90 @@ mod tests {
             rendered, "<div id=\"nav\">Log in</div>",
             "the fragment must be passed through byte-for-byte"
         );
+    }
+
+    /// Every HTML response this middleware passes through must carry
+    /// `Vary: Cookie`, whether or not a banner was injected — its
+    /// representation depends on the consent cookie either way.
+    ///
+    /// Written as a table rather than one test per branch on purpose: the three
+    /// `Vary` bugs found in review (fragments, `Content-Encoding` bodies, and
+    /// the no-CSRF-token skip) were each a *new* pass-through added without
+    /// revisiting the others. A case added here fails until its branch appends
+    /// the header.
+    #[tokio::test]
+    async fn every_html_pass_through_varies_on_cookie() {
+        struct Case {
+            name: &'static str,
+            csrf_cookie_name: Option<&'static str>,
+            request: fn(axum::http::request::Builder) -> axum::http::request::Builder,
+            encoded: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "htmx fragment",
+                csrf_cookie_name: None,
+                request: |b| b.header("hx-request", "true"),
+                encoded: false,
+            },
+            Case {
+                name: "compressed HTML",
+                csrf_cookie_name: None,
+                request: |b| b,
+                encoded: true,
+            },
+            Case {
+                name: "CSRF enforced but no token obtainable (static hit)",
+                csrf_cookie_name: Some("autumn-csrf"),
+                request: |b| b,
+                encoded: false,
+            },
+        ];
+
+        for case in cases {
+            let encoded = case.encoded;
+            let name = case.csrf_cookie_name;
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        let mut builder = Response::builder()
+                            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                            .header(CACHE_CONTROL, "public, max-age=60");
+                        if encoded {
+                            builder = builder.header(CONTENT_ENCODING, "gzip");
+                        }
+                        builder
+                            .body(Body::from("<html><body>hi</body></html>"))
+                            .unwrap()
+                    }),
+                )
+                .layer(axum::middleware::from_fn(move |req, next| async move {
+                    inject_consent_banner(req, next, 1, name, "_csrf").await
+                }));
+
+            let response = app
+                .oneshot(
+                    (case.request)(Request::builder().uri("/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let vary: Vec<_> = response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            assert!(
+                vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+                "{} must vary on Cookie; got: {vary:?}",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
