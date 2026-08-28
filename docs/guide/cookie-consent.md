@@ -119,7 +119,7 @@ is registered" as "every page prompts":
 
 | Case | Why | Consequence |
 |---|---|---|
-| An htmx **fragment** response (`HX-Request` without `HX-Boosted`) | a fragment has no `</body>`, so the banner would be appended and swapped in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
+| An htmx **fragment** response — `HX-Request` without `HX-Boosted` or `HX-History-Restore-Request` | a fragment has no `</body>`, so the banner would be appended and swapped in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
 | A **static cache hit** with CSRF enforced and no token available | on a pre-rendered `#[static_get]` page `CsrfLayer` never runs, so the banner's buttons would `403` | that visitor is unprompted on that page, and prompted on the first dynamic route they reach |
 | A response body over 2 MiB | splicing would mean buffering arbitrarily more | the page is served unmodified |
 

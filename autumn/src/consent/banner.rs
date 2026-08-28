@@ -410,7 +410,14 @@ pub async fn inject_consent_banner(
 /// treated as accepting HTML: those callers do not render a banner, and
 /// keeping their validators is what preserves their `304`s.
 fn could_render_a_banner(headers: &axum::http::HeaderMap) -> bool {
-    accepts_html(headers) || htmx_header_is_true(headers, "hx-boosted")
+    // htmx issues both whole-document requests from an XHR whose default
+    // `Accept` is `*/*`, so `accepts_html` says no for exactly the requests
+    // that most need the prompt. Same list as the fragment guard, for the same
+    // reason: whichever of the two forgets an entry, a visitor goes unprompted.
+    accepts_html(headers)
+        || HTMX_WHOLE_DOCUMENT_HEADERS
+            .iter()
+            .any(|name| htmx_header_is_true(headers, name))
 }
 
 /// An htmx boolean header: present and not the literal `false` htmx never sends.
@@ -443,8 +450,36 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
 /// tracked-job poll route), a header's presence is what matters — the value is
 /// not parsed beyond confirming it is not the literal `false` htmx never
 /// actually sends.
+/// Every htmx request whose response is a **whole document** rather than a
+/// fragment to swap. Kept as an explicit list because getting it wrong is
+/// silent: a document misread as a fragment goes unbannered, and a fragment
+/// misread as a document gets a banner appended into the middle of the page.
+///
+/// Both entries are headers [`crate::htmx::HxRequest`] already models — the
+/// framework knew about them before this predicate did, which is exactly how
+/// each one came to be missing here.
+const HTMX_WHOLE_DOCUMENT_HEADERS: [&str; 2] = [
+    // `hx-boost` navigations: htmx issues the ordinary link/form request and
+    // swaps the returned document's body.
+    "hx-boosted",
+    // A history-cache miss (htmx 2.0.4 `Gt()`): htmx re-fetches the page with
+    // `HX-Request: true` and NO `HX-Boosted`, parses the response as a full
+    // document, and replaces `[hx-history-elt]` — normally the body — from it.
+    // Reading this as a fragment leaves a visitor unprompted after the swap.
+    "hx-history-restore-request",
+];
+
+/// True when htmx will swap this response into an existing page as a fragment.
+///
+/// A fragment has no `</body>`, so `splice_before_body_close` would *append*
+/// the banner and htmx would swap a second copy in beside the one already
+/// rendered — hence the guard. The document cases above are excluded because
+/// their responses really are complete pages.
 fn is_htmx_fragment_request(headers: &axum::http::HeaderMap) -> bool {
-    htmx_header_is_true(headers, "hx-request") && !htmx_header_is_true(headers, "hx-boosted")
+    htmx_header_is_true(headers, "hx-request")
+        && !HTMX_WHOLE_DOCUMENT_HEADERS
+            .iter()
+            .any(|name| htmx_header_is_true(headers, name))
 }
 
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
@@ -1883,6 +1918,108 @@ mod tests {
             rendered.contains("autumn-consent-banner"),
             "and must still be prompted; got: {rendered}"
         );
+    }
+
+    /// Names `hx-history-restore-request` as a literal, deliberately.
+    ///
+    /// The table-driven test below iterates `HTMX_WHOLE_DOCUMENT_HEADERS`, so
+    /// it proves every entry is handled by both guards but cannot prove the
+    /// list is *complete* — deleting an entry just shrinks its loop and it
+    /// still passes. (Confirmed by trying exactly that.) This test fails if the
+    /// header is dropped from the list, which is the regression that shipped.
+    ///
+    /// htmx 2.0.4 sends it on a history-cache miss with `HX-Request: true` and
+    /// no `HX-Boosted`, then parses the reply as a full document and replaces
+    /// `[hx-history-elt]` — normally the body — from it.
+    #[tokio::test]
+    async fn an_htmx_history_restore_is_a_document_and_is_prompted() {
+        let app = Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    axum::response::Html("<html><body>hi</body></html>")
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-history-restore-request", "true")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "a history restore replaces the body from a full document, so the \
+             visitor must still be prompted; got: {rendered}"
+        );
+    }
+
+    /// Both entries of `HTMX_WHOLE_DOCUMENT_HEADERS`, through both guards, in
+    /// one place — because the bug this replaces was a header handled by one
+    /// guard and forgotten by the other. A third document header added to the
+    /// list without a test here will fail this immediately.
+    #[tokio::test]
+    async fn every_whole_document_htmx_request_is_prompted_and_loses_its_validators() {
+        for header in HTMX_WHOLE_DOCUMENT_HEADERS {
+            let app = Router::new()
+                .route(
+                    "/",
+                    axum::routing::get(|req: axum::extract::Request| async move {
+                        let had_validator = req.headers().contains_key(IF_NONE_MATCH);
+                        axum::response::Html(format!(
+                            "<html><body>had_validator={had_validator}</body></html>"
+                        ))
+                    }),
+                )
+                .layer(axum::middleware::from_fn(move |req, next| async move {
+                    inject_consent_banner(req, next, 1, None, "_csrf").await
+                }));
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("hx-request", "true")
+                        .header(header, "true")
+                        // htmx sends these from an XHR, whose default `Accept`
+                        // is `*/*` — not `text/html`.
+                        .header(axum::http::header::ACCEPT, "*/*")
+                        .header(IF_NONE_MATCH, "\"abc\"")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rendered = String::from_utf8_lossy(&body);
+
+            assert!(
+                rendered.contains("had_validator=false"),
+                "`{header}` is a whole-document request, so its conditional \
+                 validators must be stripped while a prompt is due; got: {rendered}"
+            );
+            assert!(
+                rendered.contains("autumn-consent-banner"),
+                "`{header}` returns a complete document and must be prompted; \
+                 got: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]
