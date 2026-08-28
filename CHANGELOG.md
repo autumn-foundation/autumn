@@ -516,6 +516,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **a no-database app no longer compiles the framework's database codegen:**
+  `autumn-macros` had no `[features]` section at all, so `model.rs` and
+  `repository.rs` — together ~40k of the crate's ~60k lines, and the bulk of its
+  compile time — were built in full for every consuming app, including one that
+  can reach neither macro (`autumn-web` already gates both re-exports on its own
+  `db` feature). `autumn-macros` now has a default-on `db` feature covering that
+  codegen, and `autumn-web` takes the crate with `default-features = false` and
+  forwards its own `db` to it, so a DB-free app skips the modules instead of
+  compiling them and throwing them away. Measured on a 4-core box, a debug build
+  of `autumn-macros` drops from 31.1s to 2.7s (-91%) with `db` off; the crate sits
+  on the serial critical path of a first build (nothing else starts until it
+  finishes), so that time comes straight off cold-start onboarding
+  (issue #2309). A DB-backed app enables `db` and is unaffected — same macros,
+  same expansions. The serde / JSON-schema field helpers shared with
+  `#[derive(OpenApiSchema)]` moved out of `model.rs` into a new always-compiled
+  `schema` module, so the derive keeps working (and keeps its tests) with `db`
+  off. Direct dependants of `autumn-macros` see no change: `db` is on by default
+  there.
+
 - **`autumn-search`'s Postgres backend now batches a document write into one
   statement instead of one per document:** `PostgresSearchStore::write_documents`
   — the single write path behind both `SearchBackend::index` and

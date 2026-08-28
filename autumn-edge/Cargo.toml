@@ -20,7 +20,10 @@ categories = ["web-programming", "wasm"]
 # crate declares the same 0.8 release line on its own with
 # `default-features = false`. Cargo still resolves both to one `axum 0.8.x` in
 # `Cargo.lock`; only the per-target feature set differs.
-autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
+# Only the `#[edge]` / `edge_routes!` codegen is needed here, so the macro
+# crate's database codegen stays off (issue #2309). Leaving it on would also
+# feature-unify `autumn-macros/db` back on for every app that enables `edge`.
+autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 # Not pinned in `[workspace.dependencies]`; matches the `base64 = "0.22"` line
 # already used by `autumn`, `autumn-cli`, and `examples/todo-app`.
