@@ -119,10 +119,18 @@ is registered" as "every page prompts":
 
 | Case | Why | Consequence |
 |---|---|---|
-| An htmx **fragment** response — `HX-Request` without `HX-Boosted` or `HX-History-Restore-Request` | a fragment has no `</body>`, so the banner would be appended and swapped in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
+| A **fragment** response — one whose body neither contains `</body>` nor opens as a document (`<!doctype`/`<html`) | appending to it would swap a second banner in beside the one already on the page | the enclosing page prompts; the fragment does not. `Vary: Cookie` is still applied |
 | A **static cache hit** with CSRF enforced and no token available | on a pre-rendered `#[static_get]` page `CsrfLayer` never runs, so the banner's buttons would `403` | that visitor is unprompted on that page, and prompted on the first dynamic route they reach |
 | An **encoded** response (`Content-Encoding` present) | the body would have to be decompressed before it could be spliced | the page is served unmodified. See below — this one is under your control |
 | A response body over 2 MiB | splicing would mean buffering arbitrarily more | the page is served unmodified |
+
+Note that the fragment test is made on the **response body**, not on request
+headers. That matters because no header reliably separates an htmx fragment from
+an htmx whole-document swap: `hx-boost` and a history-cache miss each set one,
+but an ordinary `hx-get` with `hx-target="body"` replaces the document while
+sending nothing but `HX-Request` (htmx omits `HX-Target` when the target has no
+id). `examples/todo-app` paginates exactly that way. Deciding from the body
+covers all three without a list to keep up to date.
 
 The encoded case is the one most likely to catch a real deployment, and unlike
 the others it is a consequence of how *you* stack your layers. Splicing needs

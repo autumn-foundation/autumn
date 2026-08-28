@@ -278,7 +278,6 @@ pub async fn inject_consent_banner(
     // below: skipping injection is about where a prompt belongs, not about
     // cache correctness, and a fragment handler may itself render
     // consent-dependent markup via `Consent::allows`.
-    let is_fragment = is_htmx_fragment_request(request.headers());
 
     let consent = Consent::from_headers(request.headers());
     let request_csrf_cookie =
@@ -308,7 +307,7 @@ pub async fn inject_consent_banner(
     // its validators intact would let an inner `EtagLayer` answer `304` with
     // no body to inject, so a policy bump or a withdrawal could leave the
     // visitor unprompted for as long as their cache stays fresh.
-    if needs_prompt && !is_fragment && could_render_a_banner(request.headers()) {
+    if needs_prompt && could_render_a_banner(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
@@ -341,12 +340,14 @@ pub async fn inject_consent_banner(
     // depend on the consent cookie whether or not this middleware injects
     // anything. Two cases get the cache variance and nothing else:
     //
-    //   * a fragment (see above) — no banner, but the handler may have gated
-    //     markup on `Consent::allows`;
     //   * a `Content-Encoding` body — HTML we cannot splice into without
     //     decoding it, but HTML all the same. Since we already know the media
     //     type is HTML, `!is_html_response` here means exactly "encoded".
-    if is_fragment || !is_html_response(&response) {
+    //
+    // A fragment is no longer detected here: it is recognised further down by
+    // having no `</body>`, which is the property that actually matters and the
+    // only one that does not depend on guessing from request headers.
+    if !is_html_response(&response) {
         response
             .headers_mut()
             .append(VARY, HeaderValue::from_static("Cookie"));
@@ -420,14 +421,21 @@ pub async fn inject_consent_banner(
 /// treated as accepting HTML: those callers do not render a banner, and
 /// keeping their validators is what preserves their `304`s.
 fn could_render_a_banner(headers: &axum::http::HeaderMap) -> bool {
-    // htmx issues both whole-document requests from an XHR whose default
-    // `Accept` is `*/*`, so `accepts_html` says no for exactly the requests
-    // that most need the prompt. Same list as the fragment guard, for the same
-    // reason: whichever of the two forgets an entry, a visitor goes unprompted.
-    accepts_html(headers)
-        || HTMX_WHOLE_DOCUMENT_HEADERS
-            .iter()
-            .any(|name| htmx_header_is_true(headers, name))
+    // Any htmx request counts, deliberately, because no header distinguishes a
+    // fragment swap from a whole-document one. `hx-boost` and a history-cache
+    // miss have their own headers; an ordinary `hx-get` with `hx-target="body"`
+    // has none (htmx sends `HX-Target` only when the target has an id, and the
+    // body usually has none) yet replaces the document just the same. Three
+    // attempts at enumerating the document cases from headers each missed one.
+    //
+    // htmx also issues these over XHR, whose default `Accept` is `*/*`, so
+    // `accepts_html` says no for precisely the requests that most need a
+    // prompt. The cost of being generous here is bounded and falls only on
+    // htmx clients: one full response instead of a `304`, while a prompt is
+    // due. An API client sends neither `text/html` nor `HX-Request` and keeps
+    // its conditional requests — which is the property this predicate exists
+    // to protect.
+    accepts_html(headers) || htmx_header_is_true(headers, "hx-request")
 }
 
 /// An htmx boolean header: present and not the literal `false` htmx never sends.
@@ -487,38 +495,6 @@ fn is_zero_quality(v: &str) -> bool {
 /// tracked-job poll route), a header's presence is what matters — the value is
 /// not parsed beyond confirming it is not the literal `false` htmx never
 /// actually sends.
-/// Every htmx request whose response is a **whole document** rather than a
-/// fragment to swap. Kept as an explicit list because getting it wrong is
-/// silent: a document misread as a fragment goes unbannered, and a fragment
-/// misread as a document gets a banner appended into the middle of the page.
-///
-/// Both entries are headers [`crate::htmx::HxRequest`] already models — the
-/// framework knew about them before this predicate did, which is exactly how
-/// each one came to be missing here.
-const HTMX_WHOLE_DOCUMENT_HEADERS: [&str; 2] = [
-    // `hx-boost` navigations: htmx issues the ordinary link/form request and
-    // swaps the returned document's body.
-    "hx-boosted",
-    // A history-cache miss (htmx 2.0.4 `Gt()`): htmx re-fetches the page with
-    // `HX-Request: true` and NO `HX-Boosted`, parses the response as a full
-    // document, and replaces `[hx-history-elt]` — normally the body — from it.
-    // Reading this as a fragment leaves a visitor unprompted after the swap.
-    "hx-history-restore-request",
-];
-
-/// True when htmx will swap this response into an existing page as a fragment.
-///
-/// A fragment has no `</body>`, so `splice_before_body_close` would *append*
-/// the banner and htmx would swap a second copy in beside the one already
-/// rendered — hence the guard. The document cases above are excluded because
-/// their responses really are complete pages.
-fn is_htmx_fragment_request(headers: &axum::http::HeaderMap) -> bool {
-    htmx_header_is_true(headers, "hx-request")
-        && !HTMX_WHOLE_DOCUMENT_HEADERS
-            .iter()
-            .any(|name| htmx_header_is_true(headers, name))
-}
-
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
 /// set (e.g. the very first request from a visitor, before any CSRF cookie
 /// existed on the way in).
@@ -689,10 +665,18 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
                 return Response::from_parts(parts, Body::from(bytes));
             }
 
-            let updated = splice_before_body_close(&bytes, snippet);
-            if updated == bytes.as_ref() {
+            // The presence of `</body>` *is* the fragment test. An htmx swap
+            // that replaces the whole document has one; a fragment does not.
+            // Deciding here rather than from request headers is what makes this
+            // correct for `hx-boost`, a history-cache miss, and an ordinary
+            // `hx-get` with `hx-target="body"` alike — the last of which sends
+            // no header distinguishing it from a fragment at all.
+            let Some(updated) = splice_before_body_close(&bytes, snippet) else {
+                parts
+                    .headers
+                    .append(VARY, HeaderValue::from_static("Cookie"));
                 return Response::from_parts(parts, Body::from(bytes));
-            }
+            };
 
             parts
                 .headers
@@ -766,18 +750,44 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
 /// HTML as lowercase), which a byte-for-byte comparison must do explicitly.
 /// `snippet` is always plain ASCII-safe markup, so splicing it in at an
 /// ASCII tag's byte offset can never straddle a multi-byte UTF-8 sequence.
-fn splice_before_body_close(body: &[u8], snippet: &str) -> Vec<u8> {
+fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
     if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>") {
         let mut out = Vec::with_capacity(body.len() + snippet.len());
         out.extend_from_slice(&body[..index]);
         out.extend_from_slice(snippet.as_bytes());
         out.extend_from_slice(&body[index..]);
-        return out;
+        return out.into();
     }
 
-    let mut out = body.to_vec();
-    out.extend_from_slice(snippet.as_bytes());
-    out
+    // HTML5 permits omitting `</body>`, so a document can legitimately lack
+    // one — `<!doctype html><main>…</main>` is a real page a browser renders,
+    // and it must still be prompted. Appending is correct there.
+    //
+    // A fragment must NOT be appended to: it would arrive beside the banner
+    // already on the page. Since no request header separates a fragment from a
+    // whole-document htmx swap, the body's own opening decides it.
+    if starts_like_a_document(body) {
+        let mut out = body.to_vec();
+        out.extend_from_slice(snippet.as_bytes());
+        return out.into();
+    }
+
+    None
+}
+
+/// Whether the body opens as a complete document rather than a fragment.
+///
+/// A document begins with a doctype or an `<html>` tag even when it omits its
+/// closing tags; a swap fragment begins with the element being swapped in.
+fn starts_like_a_document(body: &[u8]) -> bool {
+    let head = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(&[][..], |i| &body[i..]);
+    let starts_with = |prefix: &[u8]| {
+        head.len() >= prefix.len() && head[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    starts_with(b"<!doctype") || starts_with(b"<html>") || starts_with(b"<html ")
 }
 
 /// Byte offset of the last case-insensitive (ASCII-only) match of `needle`
@@ -868,14 +878,16 @@ mod tests {
 
     #[test]
     fn splice_inserts_before_last_body_close_tag() {
-        let out = splice_before_body_close(b"<html><body><main>ok</main></body></html>", "<snip>");
+        let out = splice_before_body_close(b"<html><body><main>ok</main></body></html>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("<snip></body>"));
     }
 
     #[test]
     fn splice_appends_when_no_body_tag_but_html_shell_present() {
-        let out = splice_before_body_close(b"<html><main>ok</main></html>", "<snip>");
+        let out = splice_before_body_close(b"<html><main>ok</main></html>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"));
     }
@@ -888,14 +900,34 @@ mod tests {
         // valid HTML5 tag omission, e.g. `<!doctype html><main>...</main>`
         // -- is still a real page a browser renders; it must still get the
         // banner appended rather than being silently skipped.
-        let out = splice_before_body_close(b"<!doctype html><main>ok</main>", "<snip>");
+        let out = splice_before_body_close(b"<!doctype html><main>ok</main>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"), "{s}");
     }
 
     #[test]
+    fn splice_refuses_a_fragment_rather_than_appending_to_it() {
+        // The round-one bug: appending to a fragment put a second banner on the
+        // page when htmx swapped it in. A fragment is now recognised by its own
+        // opening — no request header separates it from a whole-document swap.
+        for fragment in [
+            &b"<div id=\"nav-auth\">hi</div>"[..],
+            &b"<li>a row</li>"[..],
+            &b"  <span>leading whitespace</span>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(fragment, "<snip>").is_none(),
+                "a fragment must be left alone: {}",
+                String::from_utf8_lossy(fragment)
+            );
+        }
+    }
+
+    #[test]
     fn splice_matches_uppercase_and_mixed_case_tags() {
-        let out = splice_before_body_close(b"<HTML><BODY><main>ok</main></BODY></HTML>", "<snip>");
+        let out = splice_before_body_close(b"<HTML><BODY><main>ok</main></BODY></HTML>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(
             s.contains("<snip></BODY>"),
@@ -905,7 +937,8 @@ mod tests {
 
     #[test]
     fn splice_appends_when_only_uppercase_html_shell_present() {
-        let out = splice_before_body_close(b"<HTML><main>ok</main></HTML>", "<snip>");
+        let out = splice_before_body_close(b"<HTML><main>ok</main></HTML>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"), "{s}");
     }
@@ -919,7 +952,7 @@ mod tests {
         // spliced around, never decoded.
         let mut body = b"<html><body>caf\xE9".to_vec();
         body.extend_from_slice(b"</body></html>");
-        let out = splice_before_body_close(&body, "<snip>");
+        let out = splice_before_body_close(&body, "<snip>").expect("a document must be spliceable");
         let out_str = String::from_utf8_lossy(&out);
         assert!(
             out.windows(4).any(|w| w == b"caf\xE9"),
@@ -2050,15 +2083,7 @@ mod tests {
         );
     }
 
-    /// Names `hx-history-restore-request` as a literal, deliberately.
-    ///
-    /// The table-driven test below iterates `HTMX_WHOLE_DOCUMENT_HEADERS`, so
-    /// it proves every entry is handled by both guards but cannot prove the
-    /// list is *complete* — deleting an entry just shrinks its loop and it
-    /// still passes. (Confirmed by trying exactly that.) This test fails if the
-    /// header is dropped from the list, which is the regression that shipped.
-    ///
-    /// htmx 2.0.4 sends it on a history-cache miss with `HX-Request: true` and
+    /// htmx 2.0.4 sends this on a history-cache miss with `HX-Request: true` and
     /// no `HX-Boosted`, then parses the reply as a full document and replaces
     /// `[hx-history-elt]` — normally the body — from it.
     #[tokio::test]
@@ -2098,13 +2123,22 @@ mod tests {
         );
     }
 
-    /// Both entries of `HTMX_WHOLE_DOCUMENT_HEADERS`, through both guards, in
-    /// one place — because the bug this replaces was a header handled by one
-    /// guard and forgotten by the other. A third document header added to the
-    /// list without a test here will fail this immediately.
+    /// The three shapes an htmx whole-document swap takes, each named as a
+    /// literal. The third — an ordinary `hx-get` with `hx-target="body"` — is
+    /// why this is no longer decided from request headers: htmx sends
+    /// `HX-Request` and nothing else for it (`HX-Target` is omitted when the
+    /// target has no id), so it is indistinguishable from a fragment on the
+    /// request side. `examples/todo-app` paginates exactly this way.
+    ///
+    /// All three are recognised by their response carrying `</body>`, and all
+    /// three must lose their conditional validators while a prompt is due.
     #[tokio::test]
-    async fn every_whole_document_htmx_request_is_prompted_and_loses_its_validators() {
-        for header in HTMX_WHOLE_DOCUMENT_HEADERS {
+    async fn every_whole_document_htmx_swap_is_prompted_and_loses_its_validators() {
+        for extra in [
+            Some("hx-boosted"),
+            Some("hx-history-restore-request"),
+            None, // plain `hx-get` with `hx-target="body"` — no marker header
+        ] {
             let app = Router::new()
                 .route(
                     "/",
@@ -2119,34 +2153,34 @@ mod tests {
                     inject_consent_banner(req, next, 1, None, "_csrf").await
                 }));
 
+            let mut builder = Request::builder()
+                .uri("/")
+                .header("hx-request", "true")
+                // htmx swaps run over XHR, whose default `Accept` is `*/*`.
+                .header(axum::http::header::ACCEPT, "*/*")
+                .header(IF_NONE_MATCH, "\"abc\"");
+            if let Some(name) = extra {
+                builder = builder.header(name, "true");
+            }
+
             let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri("/")
-                        .header("hx-request", "true")
-                        .header(header, "true")
-                        // htmx sends these from an XHR, whose default `Accept`
-                        // is `*/*` — not `text/html`.
-                        .header(axum::http::header::ACCEPT, "*/*")
-                        .header(IF_NONE_MATCH, "\"abc\"")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(builder.body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let rendered = String::from_utf8_lossy(&body);
+            let label = extra.unwrap_or("hx-target=body (no marker header)");
 
             assert!(
                 rendered.contains("had_validator=false"),
-                "`{header}` is a whole-document request, so its conditional \
-                 validators must be stripped while a prompt is due; got: {rendered}"
+                "`{label}` may replace the document, so its validators must be \
+                 stripped while a prompt is due; got: {rendered}"
             );
             assert!(
                 rendered.contains("autumn-consent-banner"),
-                "`{header}` returns a complete document and must be prompted; \
+                "`{label}` returned a complete document and must be prompted; \
                  got: {rendered}"
             );
         }

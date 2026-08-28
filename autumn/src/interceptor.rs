@@ -32,7 +32,7 @@
 //! | [`with_mail_interceptor`](crate::app::AppBuilder::with_mail_interceptor) | [`MailInterceptor`] | every outgoing [`Mail`](crate::mail::Mail) delivery |
 //! | [`with_job_interceptor`](crate::app::AppBuilder::with_job_interceptor) | [`JobInterceptor`] | every job enqueue **and** every job execution |
 //! | [`with_db_interceptor`](crate::app::AppBuilder::with_db_interceptor) | [`DbConnectionInterceptor`] | checkouts through `Db::checkout` — **not** the scheduler's or job runtime's; see [`DbConnectionInterceptor`] |
-//! | [`with_channels_interceptor`](crate::app::AppBuilder::with_channels_interceptor) | [`ChannelsInterceptor`] | every channel publish |
+//! | [`with_channels_interceptor`](crate::app::AppBuilder::with_channels_interceptor) | [`ChannelsInterceptor`] | publishes through the app's `Channels` registry — not a separately constructed one |
 //! | [`with_http_interceptor`](crate::app::AppBuilder::with_http_interceptor) | [`HttpInterceptor`] | outbound requests through `auth::HttpClient` (the `oauth2` path) — **not** every outbound request; see [`HttpInterceptor`] |
 //!
 //! # Last one wins
@@ -227,11 +227,19 @@ pub trait DbConnectionInterceptor: Send + Sync + 'static {
     }
 }
 
-/// Wraps every channel publish.
+/// Wraps publishes through the app's configured [`Channels`] registry.
+///
+/// `with_channels_interceptor` replaces `state.channels` with an intercepted
+/// backend, so every publish through `AppState`'s registry passes here — but a
+/// `Channels` your own code or a plugin constructs with `Channels::new` or
+/// `with_backend` has its own backend and does not. Same shape as the mail and
+/// HTTP hooks: it covers the registry, not the type.
 ///
 /// Synchronous, unlike the other interceptors, because publishing to a channel
 /// is itself synchronous — it hands the message to the configured bus and
 /// returns the number of local subscribers reached.
+///
+/// [`Channels`]: crate::channels::Channels
 #[cfg(feature = "ws")]
 pub trait ChannelsInterceptor: Send + Sync + 'static {
     /// Intercepts a channel message publication.

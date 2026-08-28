@@ -143,11 +143,16 @@ each has its own interceptor trait installed on the builder:
 | `with_mail_interceptor` | `MailInterceptor` | every outgoing `Mail` delivery |
 | `with_job_interceptor` | `JobInterceptor` | every job enqueue **and** every job execution |
 | `with_db_interceptor` | `DbConnectionInterceptor` | checkouts through `Db::checkout` — see the caveat below |
-| `with_channels_interceptor` | `ChannelsInterceptor` | every channel publish |
+| `with_channels_interceptor` | `ChannelsInterceptor` | publishes through the app's `Channels` registry |
 | `with_http_interceptor` | `HttpInterceptor` | outbound requests sent through `auth::HttpClient` — see the caveat below |
 
-Two of these do not mean *every*, and both gaps are in the same direction —
-work that happens outside a request is what escapes.
+None of these means *every* without qualification, and the gaps share a shape:
+each hook is installed on the thing the framework hands you, so anything
+constructed outside that registry — or running outside a request — escapes it.
+`with_mail_interceptor` wraps the configured `Mailer`'s transport,
+`with_channels_interceptor` the `AppState` `Channels` registry; a `Mailer` or
+`Channels` your own code builds is untouched by either. The two worth spelling
+out:
 
 `DbConnectionInterceptor` sees only checkouts made through `Db::checkout` (the
 `Db` extractor and the shard-routed paths). The scheduler and the job runtime
