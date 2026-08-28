@@ -261,6 +261,11 @@ actually being written still apply; cross-field invariants do not. If you are
 relying on a cross-field rule to hold on updates, turn the knob on — do not
 assume it.
 
+Turning it on changes what is *validated*, not what is *stored*: only the hooked
+path persists normalized values. See [Updates are not the same as
+inserts](#updates-are-not-the-same-as-inserts) for the three paths side by
+side.
+
 > Even with the knob, that check is point-in-time against a non-locked
 > snapshot. It reliably rejects a single request that is invalid once merged,
 > but two concurrent partial writes to different fields can still interleave
@@ -329,21 +334,37 @@ which is almost always what you wanted.
 
 ### Updates are not the same as inserts
 
-The insert path above stores the canonical value. **The blind update path does
-not.** On a repository with no hooks and no `validate_on_update` knob, an
-`update` normalizes only a temporary merged model used for validation, then
-persists the patch you handed it — raw. So this stores the untrimmed, uncased
-string, even on a `#[normalize(trim, downcase)]` column:
+The insert path above stores the canonical value. **Two of the three update
+paths do not.** They differ in what validation *sees* and in what actually gets
+written, and those are not the same question:
+
+| Repository | Merged model built? | Validation sees | Persisted |
+|---|---|---|---|
+| No hooks, no knob (**blind**) | no — no `from_patch` at all | the raw patch, field rules only | **raw patch** |
+| `validate_on_update = fetch` | yes, and it is normalized | the normalized merged model | **raw patch** |
+| Has hooks | yes | the normalized draft | **normalized draft** |
+
+So on either of the first two, this stores the untrimmed, uncased string even on
+a `#[normalize(trim, downcase)]` column:
 
 ```rust,ignore
 repo.update(id, &UpdateUser { email: Patch::Set("  FOO@X.com ".into()), ..Default::default() }).await?;
 // stored: "  FOO@X.com "   — not "foo@x.com"
 ```
 
-That is a deliberate, documented asymmetry in the generated code, and it is a
-trap worth knowing about, because the stored value then no longer matches the
-normalized finders below: `find_by_email("foo@x.com")` will not find that row,
-and a uniqueness assumption built on the canonical form is broken.
+The middle row is the surprising one, and it is deliberate: `from_patch`
+normalizes the merged model *in order to validate it*, but that draft is
+side-effect-only — the generated code keeps its 422 and throws the value away,
+persisting `changes.__to_changeset()` unchanged. A value that passes validation
+only because normalization cleaned it up is therefore stored dirty.
+`autumn-macros/src/repository.rs` calls this the "normalize-vs-persist
+asymmetry" at the site that causes it.
+
+It is a trap worth knowing about, because the stored value then no longer
+matches the normalized finders below: `find_by_email("foo@x.com")` will not find
+that row, and a uniqueness assumption built on the canonical form is broken. If
+you need updates to store canonical values, the hooked path is the one that
+does it.
 
 The hooked update path persists the normalized draft and does not have this
 problem. So: if a normalized column is ever written through `update`, give the

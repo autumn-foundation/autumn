@@ -31,15 +31,21 @@
 //! **Insert** (`save` / `save_many`) normalizes the `New*` input, so validators
 //! *and the database* observe the canonical value.
 //!
-//! **Update is not symmetric with insert, and the difference is easy to miss.**
-//! `UpdateDraft::from_patch` normalizes the merged model it builds, so
-//! validators see the canonical value — but on the **blind update path** (a
-//! repository with no hooks and no `validate_on_update` knob) that draft is
-//! used for validation only, and the repository then persists the raw
-//! `changes.__to_changeset()`. So an `update` that sets a `#[normalize(trim,
-//! downcase)]` column to `"  FOO@X.com "` stores it verbatim, and
-//! [`normalize_lookup_value`]-based finders will not match that row. The hooked
-//! path persists the normalized draft and does not have this asymmetry.
+//! **Update is not symmetric with insert, and there are three cases, not two.**
+//!
+//! | Repository | Merged draft | Persisted |
+//! |---|---|---|
+//! | no hooks, no knob (**blind**) | none built — `from_patch` is not emitted | raw patch |
+//! | `validate_on_update = fetch` | built and normalized, **validation only** | raw patch |
+//! | has hooks | built and normalized | the normalized draft |
+//!
+//! The middle row is the one that surprises: `from_patch` normalizes the merged
+//! model so validators see the canonical value, but the generated code keeps
+//! only its 422 and persists `changes.__to_changeset()` unchanged. So on either
+//! of the first two, an `update` that sets a `#[normalize(trim, downcase)]`
+//! column to `"  FOO@X.com "` stores it verbatim, and
+//! [`normalize_lookup_value`]-based finders will not match that row. Only the
+//! hooked path writes the canonical value.
 //!
 //! If a normalized column is ever written through `update`, give the repository
 //! hooks or normalize before building the patch — and consider a `CITEXT`
