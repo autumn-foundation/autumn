@@ -297,7 +297,7 @@ pub async fn inject_consent_banner(
 
     let mut response = next.run(request).await;
 
-    if !is_html_response(&response) {
+    if !is_html_content_type(&response) {
         return response;
     }
 
@@ -318,7 +318,16 @@ pub async fn inject_consent_banner(
     // one visitor's fragment and replay it to a visitor whose consent differs,
     // serving gated markup to someone who rejected it. Skipping the banner is
     // correct; skipping the cache variance is not.
-    if is_fragment {
+    // Everything below here is an HTML response, so its representation can
+    // depend on the consent cookie whether or not this middleware injects
+    // anything. Two cases get the cache variance and nothing else:
+    //
+    //   * a fragment (see above) — no banner, but the handler may have gated
+    //     markup on `Consent::allows`;
+    //   * a `Content-Encoding` body — HTML we cannot splice into without
+    //     decoding it, but HTML all the same. Since we already know the media
+    //     type is HTML, `!is_html_response` here means exactly "encoded".
+    if is_fragment || !is_html_response(&response) {
         response
             .headers_mut()
             .append(VARY, HeaderValue::from_static("Cookie"));
@@ -441,9 +450,25 @@ fn extract_response_csrf_cookie(
 }
 
 fn is_html_response(response: &Response<Body>) -> bool {
+    // A `Content-Encoding` body is HTML we cannot splice into without decoding
+    // it first, so it is not injectable — but it is still HTML, and still
+    // varies on the consent cookie. See `is_html_content_type`.
     if response.headers().contains_key(CONTENT_ENCODING) {
         return false;
     }
+    is_html_content_type(response)
+}
+
+/// Whether the response's media type is `text/html`, **regardless of whether it
+/// is encoded**.
+///
+/// [`is_html_response`] answers "can this be spliced into"; this answers "is
+/// this a page whose representation depends on the consent cookie". The two
+/// differ for a compressed response, and conflating them meant a
+/// `Content-Encoding` HTML response skipped `Vary: Cookie` entirely — so a
+/// shared cache could serve one visitor's consent-dependent markup to a visitor
+/// who chose differently.
+fn is_html_content_type(response: &Response<Body>) -> bool {
     response
         .headers()
         .get(CONTENT_TYPE)
@@ -1570,6 +1595,85 @@ mod tests {
         assert_eq!(
             rendered, "<div id=\"nav\">Log in</div>",
             "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compressed_html_page_still_varies_on_cookie() {
+        // `is_html_response` returns false for any `Content-Encoding` body,
+        // because it cannot be spliced into without decoding. But it is still
+        // HTML whose representation depends on the consent cookie — a handler
+        // can gate markup on `Consent::allows` and compress the result — so
+        // treating "cannot splice" as "not HTML" dropped `Vary: Cookie` and let
+        // a shared cache serve one visitor's choice to another.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(CONTENT_ENCODING, "gzip")
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .body(Body::from("<html><body>compressed</body></html>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+            "compressed HTML must still vary on Cookie; got: {vary:?}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "<html><body>compressed</body></html>",
+            "and must be passed through unspliced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_response_does_not_gain_a_cookie_vary() {
+        // The widened HTML check must not start stamping `Vary` on every
+        // response — a JSON API's cacheability is not this middleware's business.
+        let app = Router::new()
+            .route(
+                "/api",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().get_all(VARY).iter().next().is_none(),
+            "a JSON response must be left alone"
         );
     }
 

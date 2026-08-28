@@ -462,11 +462,26 @@ screen-reader user hears the error when focus lands on the field. The
 ## Uploads
 
 `Multipart` applies the app's `security.upload` policy — MIME allowlist and
-per-file size caps — before your handler sees a byte. `ChangesetForm` also
-decodes `multipart/form-data` bodies when the `multipart` feature is on; it
-skips file fields and decodes only the text ones, so a form with both a file
-input and validated text fields works without a second extractor. See
+per-file size caps — before your handler sees a byte. See
 [storage](./storage.md) for where the bytes then go.
+
+**`ChangesetForm` and file uploads do not compose.** It does decode
+`multipart/form-data` bodies when the `multipart` feature is on, but
+`decode_multipart` **skips file fields while consuming the stream** — so the
+upload is silently discarded, and a second `Multipart` extractor cannot recover
+it, because the body is already gone. A handler taking `ChangesetForm<T>` on a
+form that contains a file input validates the text fields correctly and loses
+the file with no error at all.
+
+So pick one per route:
+
+| The route needs | Use |
+|---|---|
+| validated text fields, re-rendered on failure | `ChangesetForm<T>` — and no file inputs on that form |
+| a file upload | `Multipart`, validating the text fields yourself |
+
+If you need both, split them: take the upload on its own route or its own
+request, and keep the changeset form for the fields that have to round-trip.
 
 ---
 
