@@ -2255,6 +2255,77 @@ impl AppBuilder {
         })
     }
 
+    /// Register a push subscription store, overriding the default resolution
+    /// used by the [`WebPush`] extractor.
+    ///
+    /// Without this call the extractor resolves its store automatically: the
+    /// database-backed
+    /// [`DbPushSubscriptionStore`](crate::push::DbPushSubscriptionStore) when a
+    /// pool is configured (the `push_subscriptions` table is scaffolded by
+    /// `autumn generate pwa`), the process-local
+    /// [`MemoryPushSubscriptionStore`](crate::push::MemoryPushSubscriptionStore)
+    /// otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::push::MemoryPushSubscriptionStore;
+    ///
+    /// autumn_web::app()
+    ///     .with_push_subscription_store(MemoryPushSubscriptionStore::new())
+    ///     .merge(autumn_web::push::router())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`WebPush`]: crate::push::WebPush
+    #[must_use]
+    pub fn with_push_subscription_store<S>(self, store: S) -> Self
+    where
+        S: crate::push::PushSubscriptionStore,
+    {
+        self.state_initializer(move |state| {
+            state.insert_extension(crate::push::WebPush::from_state_with_store(state, store));
+        })
+    }
+
+    /// Register a fully-built [`WebPush`] service, overriding key, store,
+    /// transport, TTL and clock at once.
+    ///
+    /// This is the registration path for a **custom
+    /// [`PushTransport`]** — routing push traffic through your own HTTP stack
+    /// or a queue rather than the built-in one — and for supplying a VAPID key
+    /// from somewhere `[push] private_key` cannot reach, such as a secrets
+    /// manager fetched at boot.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::push::{MemoryPushSubscriptionStore, VapidKey, WebPush};
+    ///
+    /// let push = WebPush::new(
+    ///     MemoryPushSubscriptionStore::new(),
+    ///     VapidKey::from_base64url(&fetch_key_from_vault().await?)?,
+    ///     "mailto:ops@example.com",
+    ///     MyQueueTransport::new(),
+    /// );
+    ///
+    /// autumn_web::app()
+    ///     .with_web_push(push)
+    ///     .merge(autumn_web::push::router())
+    ///     .run()
+    ///     .await;
+    /// ```
+    ///
+    /// [`WebPush`]: crate::push::WebPush
+    /// [`PushTransport`]: crate::push::PushTransport
+    #[must_use]
+    pub fn with_web_push(self, push: crate::push::WebPush) -> Self {
+        self.state_initializer(move |state| {
+            state.insert_extension(push);
+        })
+    }
+
     /// Register an experiment store with a custom [`ExposureSink`].
     ///
     /// Use when you want to forward exposure events to an analytics pipeline
@@ -3829,6 +3900,20 @@ impl AppBuilder {
         // `unix_socket_cleanup` is the socket to unlink on clean exit (axum does
         // not remove it for us), as `(path, dev, inode)` so cleanup can confirm
         // the file is still the one *this* process bound before removing it.
+        // Load the `[push]` VAPID key once, before binding. A key that is
+        // present but unusable (a typo, an env var that failed to interpolate,
+        // a public/private pair that does not match) is a hard boot failure
+        // rather than a quiet fallback to "push disabled": the failure this
+        // guards against is an app that starts cleanly, records subscriptions,
+        // and silently never delivers anything (issue #1392). An app with no
+        // `[push]` block at all is unaffected.
+        if let Err(e) = config.validate_push() {
+            tracing::error!("Invalid [push] configuration: {e}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         // Validate `[server.tls]` wiring before we bind anything, so a
         // misconfiguration is a clear pre-bind failure. Two cases fail fast:
         // (1) the section is present but this binary was built without the

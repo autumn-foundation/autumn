@@ -230,6 +230,11 @@ observability.server_timing
 openapi
 openapi.enabled
 openapi.path
+push
+push.private_key
+push.public_key
+push.subject
+push.ttl_secs
 reporting
 reporting.enabled
 reporting.sample_rate

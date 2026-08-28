@@ -292,6 +292,18 @@ immediate 0ms retry). See
 
 ---
 
+## A worked example in an app
+
+`examples/reddit-clone/tests/sim_hot_rank.rs` is the smallest complete shape of
+an application `#[sim_test]`: it mounts a route on the sim's paused runtime,
+walks 48 virtual hours in checkpoints, and asserts the app's hot-rank decay
+curve through the ordinary [`Clock`] extractor rather than around it. It uses
+`always!` for the hard invariants and `sometimes!` for reachability, and it
+arranges two deliberately-separated input bands so that
+[`assert_all_sometimes_satisfied`](autumn_web::sim::assert_all_sometimes_satisfied)
+holds at every seed — the pattern to copy when you want a single-run
+non-vacuity check rather than a sweep.
+
 ## What's virtualized (and what isn't)
 
 | Source | Sim treatment |

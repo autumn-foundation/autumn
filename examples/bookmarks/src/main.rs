@@ -1,3 +1,4 @@
+mod metrics;
 mod models;
 mod repositories;
 mod routes;
@@ -18,6 +19,11 @@ async fn home() -> Redirect {
 
 #[autumn_web::main]
 async fn main() {
+    // Attach `# HELP` text and bucket bounds to this example's own
+    // instruments before anything records into them. Recording itself needs
+    // no registration at all — see `src/metrics.rs`.
+    metrics::describe();
+
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes![
