@@ -191,6 +191,24 @@ The injector recovers it from that `Set-Cookie` — which it can only see if
 first-time visitor gets a bannerless page, and after a key rotation the stale
 cookie can be embedded instead of the refreshed token.
 
+**Consent-varying routes must not sit behind `CacheResponseLayer`.** Every
+response this middleware touches gets `Vary: Cookie`, and every injected one
+also gets `Cache-Control: private, no-store` — but those headers only instruct
+*HTTP* caches: the browser, a CDN, a reverse proxy. Autumn's own
+`CacheResponseLayer` is not one of those. It lives inside the app, above the
+handler, and keys its entries on the request URI and nothing else — no `Vary`,
+no `Cache-Control`, no cookies. Neither stacking order is safe:
+
+| `CacheResponseLayer` sits… | what gets stored | what leaks |
+|---|---|---|
+| **inside** the injector | the handler's body, before injection | a visitor who *allowed* a category fills the entry with `consent.allows(..)`-gated markup; a visitor who *refused* gets it on the hit, and the injector adds nothing for them because they have already decided — so nothing corrects it |
+| **outside** the injector | the injected body | one visitor's live CSRF token, replayed to everyone until the entry expires |
+
+So keep pages that read consent out of that layer, or give the cache a key that
+includes the decision. The same applies to anything else that varies per
+visitor behind it — a session, a signed-in user — this is just where consent
+runs into it.
+
 Style it through the framework stylesheet — link
 `autumn_web::ui::WIDGETS_CSS_PATH` and override the
 `.autumn-consent-banner*` classes if you want your own look.
@@ -328,6 +346,9 @@ right; the gate being honored is the thing that regresses.
 - [ ] A withdraw link is reachable from every page.
 - [ ] `CONSENT_POLICY_VERSION` is bumped when the policy changes.
 - [ ] Pages that embed the banner are not publicly cacheable.
+- [ ] No route that reads consent sits behind `CacheResponseLayer` — its
+      key is the URI alone, so it ignores the `Vary: Cookie` this
+      middleware sets.
 
 ---
 

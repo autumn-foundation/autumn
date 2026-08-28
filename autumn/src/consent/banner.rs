@@ -187,6 +187,20 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// one. `Cache-Control` is left alone in that case, since nothing per-visitor
 /// was freshly embedded and the app's own caching choice should stand.
 ///
+/// Both headers are instructions to *HTTP* caches — the browser, a CDN, a
+/// reverse proxy. They do not reach a cache living inside the application:
+/// [`CacheResponseLayer`](crate::cache::CacheResponseLayer) keys its entries
+/// on the request URI alone and reads neither header, so a consent-varying
+/// route registered behind it is unsafe in either stacking order. Inside
+/// this middleware, the layer stores the handler's pre-injection body, and a
+/// visitor who allowed a category populates it with
+/// `consent.allows(..)`-gated markup that a visitor who refused then gets on
+/// a cache hit — this middleware injects nothing for them, because they have
+/// decided, so nothing corrects it. Outside this middleware, it stores the
+/// *injected* body, CSRF token and all, and replays that. Keep
+/// consent-varying routes out of `CacheResponseLayer`, or give it a key that
+/// includes the consent decision.
+///
 /// If the response already contains the banner's own marker class (e.g. a
 /// "manage cookie preferences" handler rendered [`consent_banner_markup`]
 /// itself so an already-decided visitor can change their choice), this
