@@ -23,13 +23,28 @@
 //!
 //! # Ordering (write path)
 //!
-//! `#[model]` runs normalization at the head of the repository save flow —
-//! `save`/`save_many` (insert) normalize the `New*` input, and `update`
-//! normalizes through `UpdateDraft::from_patch` — **before** the
-//! `before_create` / `before_update` hooks (where `#[validate(...)]` and other
-//! user rejection logic run) and before the row is written, so validators and
-//! the database observe the canonical value. Normalizers apply left-to-right in
-//! the order written in the attribute.
+//! `#[model]` runs normalization at the head of the repository save flow, before
+//! the hooks (where `#[validate(...)]` and other user rejection logic run) and
+//! before the row is written. Normalizers apply left-to-right in the order
+//! written in the attribute.
+//!
+//! **Insert** (`save` / `save_many`) normalizes the `New*` input, so validators
+//! *and the database* observe the canonical value.
+//!
+//! **Update is not symmetric with insert, and the difference is easy to miss.**
+//! `UpdateDraft::from_patch` normalizes the merged model it builds, so
+//! validators see the canonical value — but on the **blind update path** (a
+//! repository with no hooks and no `validate_on_update` knob) that draft is
+//! used for validation only, and the repository then persists the raw
+//! `changes.__to_changeset()`. So an `update` that sets a `#[normalize(trim,
+//! downcase)]` column to `"  FOO@X.com "` stores it verbatim, and
+//! [`normalize_lookup_value`]-based finders will not match that row. The hooked
+//! path persists the normalized draft and does not have this asymmetry.
+//!
+//! If a normalized column is ever written through `update`, give the repository
+//! hooks or normalize before building the patch — and consider a `CITEXT`
+//! column or a functional unique index as the durable backstop. See
+//! `docs/guide/forms.md`.
 
 /// Strip leading and trailing whitespace.
 #[must_use]

@@ -9,7 +9,7 @@
 //! rolling cookie parsing and a bespoke "have they agreed" check.
 //!
 //! `autumn new` scaffolds a banner (offering "Accept all" / "Reject
-//! non-essential") wired automatically into every HTML page via
+//! non-essential") wired automatically into HTML pages via
 //! [`inject_consent_banner`], plus `POST /consent/accept` and
 //! `POST /consent/reject` routes that call [`accept_all_cookie`] and
 //! [`reject_non_essential_cookie`] to record the choice.

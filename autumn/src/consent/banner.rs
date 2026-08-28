@@ -5,9 +5,18 @@
 //! (re-)prompting, inserts the banner markup right before `</body>`. This
 //! mirrors [`crate::middleware::dev::inject_live_reload`]'s proven
 //! detect-HTML / splice-before-`</body>` / fix-`Content-Length` pattern, so
-//! every HTML page in the app shows the banner automatically — no per-handler
+//! HTML pages in the app show the banner automatically — no per-handler
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
+//!
+//! Three cases are deliberately **not** injected into, so "the layer is
+//! registered" is not the same as "every page prompts": an htmx *fragment*
+//! response (which has no `</body>` to splice before, and whose swap would put
+//! a second banner on the page), a *static cache hit* where CSRF is enforced
+//! but no token is obtainable (the banner's buttons would `403`), and a body
+//! over [`MAX_SPLICE_BODY_BYTES`]. Each is documented on
+//! [`inject_consent_banner`], and all three are summarized for app authors in
+//! `docs/guide/cookie-consent.md`.
 
 use axum::body::{Body, Bytes};
 use axum::http::header::{
