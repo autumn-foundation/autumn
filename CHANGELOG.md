@@ -25,7 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts (disjoint siblings under a shared prefix, a route *at* the prefix, a
   GET and its implied HEAD) are unaffected. `TestApp` carries these
   declarations too, so a colliding plugin fails in tests rather than only in
-  production.
+  production. Framework-mounted paths (probes, actuator, htmx assets, mail
+  previews, the story gallery, the tracked-job status route) are covered as
+  well: they are mounted outside the user route list, so a manifest declaring
+  `GET /health` would otherwise still have panicked. A framework path is
+  *refused* rather than yielded — a user route at a probe path legitimately
+  takes it over, but silently handing an unaudited artifact the endpoint
+  orchestrators read to decide whether the process is alive is worse than a
+  loud refusal. Only `GET` is refused there, because only `GET` clashes; a
+  declared `HEAD` or `POST` merges into the same `MethodRouter` cleanly.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every
