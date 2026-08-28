@@ -240,15 +240,18 @@ pub async fn inject_consent_banner(
     // prompt, so skip it: the enclosing document already carries the banner,
     // and the next full page load re-evaluates consent as usual.
     //
-    // A *boosted* navigation (`hx-boost`) is deliberately NOT skipped. It also
-    // carries `HX-Request`, but the response is a complete document whose body
-    // replaces the current one — so skipping it would both omit the banner
-    // from the new page and destroy the one on the old page in the same swap,
-    // leaving an undecided visitor silently unprompted until they made a
-    // non-htmx navigation.
-    if is_htmx_fragment_request(request.headers()) {
-        return next.run(request).await;
-    }
+    // A *boosted* navigation (`hx-boost`) is deliberately NOT treated as a
+    // fragment. It also carries `HX-Request`, but the response is a complete
+    // document whose body replaces the current one — so skipping it would both
+    // omit the banner from the new page and destroy the one on the old page in
+    // the same swap, leaving an undecided visitor silently unprompted until
+    // they made a non-htmx navigation.
+    //
+    // Note this only skips the *banner*. A fragment still gets `Vary: Cookie`
+    // below: skipping injection is about where a prompt belongs, not about
+    // cache correctness, and a fragment handler may itself render
+    // consent-dependent markup via `Consent::allows`.
+    let is_fragment = is_htmx_fragment_request(request.headers());
 
     let consent = Consent::from_headers(request.headers());
     let request_csrf_cookie =
@@ -278,7 +281,7 @@ pub async fn inject_consent_banner(
     // its validators intact would let an inner `EtagLayer` answer `304` with
     // no body to inject, so a policy bump or a withdrawal could leave the
     // visitor unprompted for as long as their cache stays fresh.
-    if needs_prompt && could_render_a_banner(request.headers()) {
+    if needs_prompt && !is_fragment && could_render_a_banner(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
@@ -300,6 +303,19 @@ pub async fn inject_consent_banner(
     // splicing into it here and letting `Content-Length` reflect the
     // spliced body is exactly the metadata Axum will carry through to the
     // final `HEAD` response once it empties the body.
+    // A fragment never carries the banner, but it may well carry markup the
+    // handler gated on `Consent::allows` — an analytics snippet, a
+    // personalised control. Without `Vary: Cookie` a shared cache could store
+    // one visitor's fragment and replay it to a visitor whose consent differs,
+    // serving gated markup to someone who rejected it. Skipping the banner is
+    // correct; skipping the cache variance is not.
+    if is_fragment {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        return response;
+    }
+
     if !needs_prompt {
         // A handler can still render differently based on the visitor's
         // Consent cookie even when this middleware injects nothing (e.g.
@@ -1545,6 +1561,57 @@ mod tests {
         assert_eq!(
             rendered, "<div id=\"nav\">Log in</div>",
             "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_htmx_fragment_still_varies_on_cookie() {
+        // No banner, but the handler may have gated markup on
+        // `Consent::allows`. Without `Vary: Cookie` a shared cache could store
+        // a consenting visitor's fragment and replay it to one who rejected.
+        let app = Router::new()
+            .route(
+                "/_partials/nav-auth",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .body(Body::from("<div>Log in</div>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_partials/nav-auth")
+                    .header("hx-request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+            "a fragment must still vary on Cookie; got: {vary:?}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "and must still carry no banner"
         );
     }
 

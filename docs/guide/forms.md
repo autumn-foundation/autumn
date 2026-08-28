@@ -187,13 +187,28 @@ pub struct User {
 }
 ```
 
-The generated repository runs these rules on **insert** (before the
-`before_create` hook) and on **update** — where they run against the *merged*
-model, the existing row with the patch applied, not the patch alone. That
-matters for cross-field rules: a `must_match` or a `#[validate(custom = ...)]`
-comparing two columns sees real values on both sides, and a partial update that
-would break the invariant is rejected with the same 422 field-error map an
-insert produces.
+The generated repository runs these rules on **insert**, before the
+`before_create` hook, always.
+
+**On update, merged-model validation is opt-in.** A repository with hooks, or
+one declared `#[repository(Post, validate_on_update = fetch)]`, loads the
+existing row, applies the patch, and validates the *merged* model — so a
+`must_match` or a `#[validate(custom = ...)]` comparing two columns sees real
+values on both sides, and a partial update that would break the invariant is
+rejected with the same 422 field-error map an insert produces.
+
+A plain generated repository with no hooks and no knob takes the **blind
+update path**: it emits no merged-model check at all, deliberately, to avoid an
+unconditional extra `SELECT` on every update. Field-level rules on the columns
+actually being written still apply; cross-field invariants do not. If you are
+relying on a cross-field rule to hold on updates, turn the knob on — do not
+assume it.
+
+> Even with the knob, that check is point-in-time against a non-locked
+> snapshot. It reliably rejects a single request that is invalid once merged,
+> but two concurrent partial writes to different fields can still interleave
+> into an invalid row. A cross-field invariant you cannot afford to lose wants
+> a database `CHECK` constraint underneath it.
 
 **Model rules and form rules are not redundant.** Put the invariant on the
 model, and put anything the *form* alone knows about on the form struct:
@@ -239,9 +254,8 @@ on lookups and still agree.
 ### Where it runs
 
 Normalization happens at the head of the repository save flow: `save` /
-`save_many` normalize the `New*` insert struct, and `update` normalizes through
-`UpdateDraft::from_patch`. That is **before** validation and before the
-`before_create` / `before_update` hooks, so:
+`save_many` normalize the `New*` insert struct, **before** validation and
+before the `before_create` hook, so:
 
 ```text
 submitted value
@@ -255,6 +269,30 @@ A validator that would have rejected the raw value for its whitespace never
 sees the whitespace. That is the intent: `#[normalize(trim)]` on a
 `#[validate(length(min = 1))]` field means "a title of only spaces is blank",
 which is almost always what you wanted.
+
+### Updates are not the same as inserts
+
+The insert path above stores the canonical value. **The blind update path does
+not.** On a repository with no hooks and no `validate_on_update` knob, an
+`update` normalizes only a temporary merged model used for validation, then
+persists the patch you handed it — raw. So this stores the untrimmed, uncased
+string, even on a `#[normalize(trim, downcase)]` column:
+
+```rust,ignore
+repo.update(id, &UpdateUser { email: Patch::Set("  FOO@X.com ".into()), ..Default::default() }).await?;
+// stored: "  FOO@X.com "   — not "foo@x.com"
+```
+
+That is a deliberate, documented asymmetry in the generated code, and it is a
+trap worth knowing about, because the stored value then no longer matches the
+normalized finders below: `find_by_email("foo@x.com")` will not find that row,
+and a uniqueness assumption built on the canonical form is broken.
+
+The hooked update path persists the normalized draft and does not have this
+problem. So: if a normalized column is ever written through `update`, give the
+repository hooks (or normalize the value yourself before building the patch)
+rather than assuming the attribute covers it. A `CITEXT` column or a functional
+unique index is the durable backstop.
 
 ### Lookups normalize too
 
