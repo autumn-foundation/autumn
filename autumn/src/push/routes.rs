@@ -232,9 +232,11 @@ impl RequestPrincipal {
         // 2. The signed-in user on the session, for an app whose push routes
         //    are not themselves behind an auth layer.
         let session_key = state.config().auth.session_key.clone();
-        if let Ok(session) = crate::session::Session::from_request_parts(&mut self.0, state).await
-            && let Some(user_id) = session.get(&session_key).await
-        {
+        // `Session`'s extractor rejection is `Infallible`, so this binding is
+        // irrefutable — leading it with `if let Ok(..)` in a let chain is a
+        // `-D warnings` failure (`irrefutable_let_patterns`).
+        let Ok(session) = crate::session::Session::from_request_parts(&mut self.0, state).await;
+        if let Some(user_id) = session.get(&session_key).await {
             return Ok(user_id);
         }
 

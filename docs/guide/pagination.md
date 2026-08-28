@@ -356,13 +356,16 @@ half cannot drift:
 ```rust,ignore
 use autumn_web::widgets::{Column, DataTableConfig, data_table};
 
-data_table(&page.content, &columns, &DataTableConfig {
-    caption: Some("Posts"),
-    empty_message: "No posts yet.",
-    base_path: "/posts",
-    query: &raw_query,      // the current request's query string
-    ..Default::default()
-})
+data_table(
+    &page.content,
+    &columns,
+    // `DataTableConfig` has no `Default`: `empty_message` is required, so the
+    // only way in is `new`, and the rest are `const` builder methods.
+    &DataTableConfig::new("No posts yet.")
+        .caption("Posts")
+        .base_path("/posts")
+        .query(&raw_query),     // the current request's query string
+)
 ```
 
 ---
