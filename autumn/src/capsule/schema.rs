@@ -667,6 +667,13 @@ pub enum CacheEffect {
         key: String,
         /// base64 of the JSON bytes written.
         value: String,
+        /// Time-to-live the write asked for, in seconds, when it set one.
+        ///
+        /// Part of the effect, not decoration: a five-second entry and a
+        /// permanent one are different cache mutations, and without this a
+        /// change of expiry consumes the same tape entry and replays clean.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_secs: Option<u64>,
     },
 }
 
@@ -1026,6 +1033,7 @@ mod tests {
         capsule.effects.cache.push(CacheEffect::Insert {
             key: "user:7".to_owned(),
             value: "eyJhIjoxfQ==".to_owned(),
+            ttl_secs: None,
         });
         capsule.effects.mail.push(MailEffect {
             to: vec!["a@example.com".to_owned()],

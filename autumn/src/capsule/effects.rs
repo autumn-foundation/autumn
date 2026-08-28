@@ -236,6 +236,8 @@ struct CacheWrite {
     /// `None` when the recorded value was not decodable; the key still has to
     /// match.
     value: Option<Vec<u8>>,
+    /// The expiry the recorded write asked for, in seconds.
+    ttl_secs: Option<u64>,
 }
 
 /// One cache key's recorded value and whether the run has read it.
@@ -281,9 +283,14 @@ impl ReplayEffects {
             .cache
             .iter()
             .filter_map(|entry| match entry {
-                CacheEffect::Insert { key, value } => Some(CacheWrite {
+                CacheEffect::Insert {
+                    key,
+                    value,
+                    ttl_secs,
+                } => Some(CacheWrite {
                     key: key.clone(),
                     value: decode(value),
+                    ttl_secs: *ttl_secs,
                 }),
                 CacheEffect::Get { .. } => None,
             })
@@ -567,7 +574,7 @@ impl ReplayEffects {
     /// code dropped, added, or changed the value of is a behaviour change, and
     /// without this it could ride along under an unchanged response and still
     /// report `Reproduced`. Nothing is ever sent to a live backend.
-    pub(crate) fn cache_insert(&self, key: &str, value: &[u8]) {
+    pub(crate) fn cache_insert(&self, key: &str, value: &[u8], ttl_secs: Option<u64>) {
         if let Ok(mut cache) = self.cache.lock() {
             cache
                 .entry(key.to_owned())
@@ -606,7 +613,9 @@ impl ReplayEffects {
             .value
             .as_ref()
             .is_none_or(|recorded| bytes_match_redacted(recorded, value));
-        if !matches_redacted(&next.key, key) || !value_matches {
+        // The expiry is part of the mutation: a five-second entry and a
+        // permanent one are different writes, whatever the bytes say.
+        if !matches_redacted(&next.key, key) || !value_matches || next.ttl_secs != ttl_secs {
             let expected = next.key.clone();
             drop(seam);
             self.diverge(EffectDivergence {
@@ -713,7 +722,7 @@ impl ReplayEffects {
             Some("its list-unsubscribe header")
         } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
             Some("its headers")
-        } else if next.attachments != sent.attachments {
+        } else if !attachments_match_redacted(&next.attachments, sent.attachments) {
             Some("its attachments")
         } else {
             None
@@ -1058,6 +1067,31 @@ fn body_matches_redacted(recorded: &CapsuleBody, actual: &CapsuleBody) -> bool {
 /// Order and count are compared exactly — a header the code stopped sending is
 /// a change — while a masked value matches whatever stood in its place, for the
 /// same reason [`matches_redacted`] exists.
+/// Whether the attachments a run sent match the ones recorded.
+///
+/// The filename is free-form text the redaction sweep masks like any other, so
+/// it compares through [`matches_redacted`] — a masked one stands for whatever
+/// was really there, exactly as a masked header value does. Everything else is
+/// exact: a content type, a length and a digest are not text a filter would
+/// ever rewrite, and they are what actually establish that the same file is
+/// still being sent.
+#[cfg(any(test, feature = "mail"))]
+fn attachments_match_redacted(
+    recorded: &[crate::capsule::schema::MailAttachmentEffect],
+    actual: &[crate::capsule::schema::MailAttachmentEffect],
+) -> bool {
+    recorded.len() == actual.len()
+        && recorded
+            .iter()
+            .zip(actual.iter())
+            .all(|(recorded, actual)| {
+                matches_redacted(&recorded.filename, &actual.filename)
+                    && recorded.content_type == actual.content_type
+                    && recorded.len == actual.len
+                    && recorded.sha256 == actual.sha256
+            })
+}
+
 /// Whether an optional recorded field matches what the replayed run set.
 ///
 /// Both absent matches; one present and one absent is a change; two present
@@ -1499,6 +1533,7 @@ mod tests {
                 CacheEffect::Insert {
                     key: "widgets".to_owned(),
                     value: base64_of(b"41"),
+                    ttl_secs: None,
                 },
             ],
             ..CapsuleEffects::default()
@@ -1508,7 +1543,7 @@ mod tests {
             CachedValue::Miss,
             "the recorded miss must replay as a miss"
         );
-        tape.cache_insert("widgets", b"41");
+        tape.cache_insert("widgets", b"41", None);
         assert_eq!(
             tape.cache_get("widgets"),
             CachedValue::Hit(b"41".to_vec()),
@@ -1922,6 +1957,57 @@ mod tests {
         );
     }
 
+    /// A five-second entry and a permanent one are different cache mutations,
+    /// however identical the bytes.
+    #[test]
+    fn a_changed_cache_expiry_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Insert {
+                key: "user:7".to_owned(),
+                value: "eyJhIjoxfQ==".to_owned(),
+                ttl_secs: Some(5),
+            }],
+            ..CapsuleEffects::default()
+        });
+        tape.cache_insert("user:7", b"{\"a\":1}", Some(3600));
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].seam, EffectSeam::Cache);
+    }
+
+    /// A filename is free-form text the redaction sweep masks like any other,
+    /// so a masked one must stand for whatever was really there — comparing it
+    /// exactly would report a divergence for code nobody changed.
+    #[test]
+    fn a_masked_attachment_filename_still_matches_the_file_being_sent() {
+        let attachment = |filename: &str| crate::capsule::schema::MailAttachmentEffect {
+            filename: filename.to_owned(),
+            content_type: "application/pdf".to_owned(),
+            len: 12,
+            sha256: "cd".repeat(32),
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                from: Some("billing@shop.example".to_owned()),
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("you paid $10".to_owned()),
+                attachments: vec![attachment(FILTERED)],
+                ..Default::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        let to = ["a@example.com".to_owned()];
+        let body = CapsuleBody::Text("you paid $10".to_owned());
+        let sent = [attachment("invoice-sk-live-42.pdf")];
+        assert_eq!(
+            tape.next_mail(&sent_full(&to, &body, &NO_BODY, &sent)),
+            MailVerdict::Sent,
+            "a masked filename stands for the real one"
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+    }
+
     #[test]
     fn a_recorded_enqueue_failure_is_reproduced_as_a_failure() {
         // A handler whose 500 came from `enqueue(..).await?` must meet the
@@ -1955,6 +2041,7 @@ mod tests {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
                 value: base64_of(b"41"),
+                ttl_secs: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -1969,10 +2056,11 @@ mod tests {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
                 value: base64_of(b"41"),
+                ttl_secs: None,
             }],
             ..CapsuleEffects::default()
         });
-        tape.cache_insert("widgets", b"42");
+        tape.cache_insert("widgets", b"42", None);
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert_eq!(divergences[0].kind, EffectDivergenceKind::Mismatch);
@@ -1984,10 +2072,11 @@ mod tests {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
                 value: base64_of(b"41"),
+                ttl_secs: None,
             }],
             ..CapsuleEffects::default()
         });
-        tape.cache_insert("widgets", b"41");
+        tape.cache_insert("widgets", b"41", None);
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
         assert_eq!(
             tape.cache_get("widgets"),

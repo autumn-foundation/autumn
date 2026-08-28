@@ -1770,6 +1770,7 @@ mod tests {
                 cache: vec![CacheEffect::Insert {
                     key: "creds".to_owned(),
                     value: secret,
+                    ttl_secs: None,
                 }],
                 ..CapsuleEffects::default()
             };

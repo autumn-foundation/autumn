@@ -439,6 +439,13 @@ enum BodyTap {
 const BODY_OVERFLOW_NOTE: &str =
     "request body exceeded max_body_bytes while streaming; it was not captured";
 
+/// The approximate serialized size of a recorded header list.
+fn headers_weight(headers: &[(String, String)]) -> usize {
+    headers.iter().fold(0, |total, (name, value)| {
+        total.saturating_add(name.len()).saturating_add(value.len())
+    })
+}
+
 /// Note recorded when an outbound body was too large to keep.
 ///
 /// The capsule is marked truncated alongside it: replay serves a skipped body
@@ -806,9 +813,16 @@ impl CaptureScope {
             self.note(HTTP_BODY_SKIPPED_NOTE);
             self.mark_truncated();
         }
+        // Every field the effect *retains*, not just the obvious two: a handler
+        // sending or receiving large headers would otherwise grow the buffer
+        // and the persisted capsule past `max_capsule_bytes` without ever
+        // tripping the bound that exists to stop exactly that.
         let weight = effect
             .url
             .len()
+            .saturating_add(effect.final_url.as_ref().map_or(0, String::len))
+            .saturating_add(headers_weight(&effect.request_headers))
+            .saturating_add(headers_weight(&effect.response_headers))
             .saturating_add(body_weight(&effect.request_body))
             .saturating_add(body_weight(&effect.response_body));
         let budget = self.settings.max_capsule_bytes;

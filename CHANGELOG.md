@@ -122,6 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path that resolves in an application that does not depend on Axum directly;
   and a non-UTF-8 outbound response header is preserved lossily rather than
   recorded as empty.
+  A cache write records the expiry it asked for and compares on it, since a
+  five-second entry and a permanent one are different mutations; a write whose
+  value will not serialize marks the capsule incomplete, as the matching read
+  already did; an attachment filename compares through the redaction wildcard
+  while its type, length and digest stay exact, so a masked filename does not
+  report a divergence against unchanged code; and outbound request and response
+  headers are charged against `max_capsule_bytes`, which they had escaped.
 
 ### Fixed
 

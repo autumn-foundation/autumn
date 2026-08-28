@@ -294,7 +294,7 @@ where
     // Failure-capsule seam (#1634): the write is recorded on capture, and on
     // replay it lands in the tape (so a read-back in the same run finds it)
     // instead of in a live backend.
-    if record_or_replay_cache_insert(key, bytes.as_deref()) {
+    if record_or_replay_cache_insert(key, bytes.as_deref(), ttl) {
         return;
     }
     // In-memory path (MokaCache, CountingCache in tests, …)
@@ -392,6 +392,11 @@ fn record_cache_get<V: serde::Serialize>(key: &str, value: Option<&V>) {
     });
 }
 
+/// Why a capsule that wrote an unserializable cache value is not replayable.
+#[cfg(feature = "reporting")]
+const UNRECORDABLE_CACHE_WRITE_NOTE: &str = "a cache write held a value that could not be serialized into the capsule, so replay would \
+     suppress a mutation the recorded run really made";
+
 /// Why a capsule that read an unserializable cache hit is not replayable.
 #[cfg(feature = "reporting")]
 const UNRECORDABLE_CACHE_HIT_NOTE: &str = "a cache read hit a value that could not be serialized into the capsule, and a hit with no \
@@ -407,28 +412,44 @@ const fn record_cache_get<V: serde::Serialize>(_key: &str, _value: Option<&V>) {
 /// Returns `true` when a replay handled the write and the live backend must
 /// not be touched.
 #[cfg(feature = "reporting")]
-fn record_or_replay_cache_insert(key: &str, bytes: Option<&[u8]>) -> bool {
+fn record_or_replay_cache_insert(
+    key: &str,
+    bytes: Option<&[u8]>,
+    ttl: Option<std::time::Duration>,
+) -> bool {
     if let Some(tape) = crate::capsule::effects::current_tape() {
         if let Some(bytes) = bytes {
-            tape.cache_insert(key, bytes);
+            tape.cache_insert(key, bytes, ttl.map(|ttl| ttl.as_secs()));
         }
         return true;
     }
-    if let Some(scope) = crate::capsule::current_scope()
-        && let Some(bytes) = bytes
-    {
-        use base64::Engine as _;
-        scope.record_cache(crate::capsule::CacheEffect::Insert {
-            key: key.to_owned(),
-            value: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
+    if let Some(scope) = crate::capsule::current_scope() {
+        if let Some(bytes) = bytes {
+            use base64::Engine as _;
+            scope.record_cache(crate::capsule::CacheEffect::Insert {
+                key: key.to_owned(),
+                value: base64::engine::general_purpose::STANDARD.encode(bytes),
+                ttl_secs: ttl.map(|ttl| ttl.as_secs()),
+            });
+        } else {
+            // The live backend accepted this write; the capsule cannot hold it.
+            // Recording nothing would let replay suppress a real cache mutation
+            // and still grade the run clean, which is the same falsification the
+            // unserializable *read* refuses — caught here a function later.
+            scope.note(UNRECORDABLE_CACHE_WRITE_NOTE);
+            scope.mark_truncated();
+        }
     }
     false
 }
 
 /// No capsule support compiled in: the live backend always takes the write.
 #[cfg(not(feature = "reporting"))]
-const fn record_or_replay_cache_insert(_key: &str, _bytes: Option<&[u8]>) -> bool {
+const fn record_or_replay_cache_insert(
+    _key: &str,
+    _bytes: Option<&[u8]>,
+    _ttl: Option<std::time::Duration>,
+) -> bool {
     false
 }
 
