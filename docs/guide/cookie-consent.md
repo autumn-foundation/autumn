@@ -238,6 +238,14 @@ The two headers are not optional: the page embeds the visitor's own live CSRF
 token, so a shared cache serving it to someone else would leak that token and
 break every other visitor's consent form.
 
+`DEFAULT_CSRF_FORM_FIELD` is shown here because it is what most apps run. It is
+the literal default, not a lookup — if you set `security.csrf.form_field`, pass
+the `CsrfFormField` extractor's value instead, to both `consent_banner_markup`
+and any hidden input you write yourself. `CsrfLayer` scans a URL-encoded body
+for the configured name only, so a widget named from the constant renders fine
+and `403`s on every button. `examples/reddit-clone`'s preferences page takes
+that extractor for exactly this reason.
+
 Reuse `consent_banner_markup` rather than writing a second set of buttons. The
 injector detects the marker and skips its own injection, so the page shows one
 banner, and the accept/reject semantics stay identical to the prompt.

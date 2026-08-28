@@ -92,6 +92,12 @@ pub async fn manage(
     seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
+    // `CsrfLayer` scans a URL-encoded body for the CONFIGURED field name only.
+    // Naming the hidden inputs `_csrf` — or `DEFAULT_CSRF_FORM_FIELD`, which is
+    // the same string — renders a page whose every button 403s on an app that
+    // set `security.csrf.form_field`. This extractor is the configured value,
+    // and is inert under the default.
+    csrf_field: CsrfFormField,
     consent: Consent,
     flash: Flash,
 ) -> impl IntoResponse {
@@ -120,12 +126,12 @@ pub async fn manage(
                 // HTML forms, no JavaScript required.
                 (autumn_web::consent::consent_banner_markup(
                     Some(csrf.token()),
-                    autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
+                    &csrf_field.0,
                 ))
 
                 @if consent.is_decided() {
                     form action=(paths::withdraw()) method="post" class="mt-6" {
-                        input type="hidden" name="_csrf" value=(csrf.token());
+                        input type="hidden" name=(csrf_field.0) value=(csrf.token());
                         button type="submit"
                                class="text-sm text-gray-500 underline hover:text-orange-600" {
                             "Clear my choice and ask me again"
@@ -199,7 +205,7 @@ mod tests {
         // Half 1 — compile-time: `manage` still receives the declared metadata.
         fn takes_route_seo<F, Fut>(_handler: F)
         where
-            F: Fn(SeoMeta, Session, CsrfToken, Consent, Flash) -> Fut,
+            F: Fn(SeoMeta, Session, CsrfToken, CsrfFormField, Consent, Flash) -> Fut,
         {
         }
         takes_route_seo(super::manage);

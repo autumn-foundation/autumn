@@ -40,6 +40,9 @@ pub struct TodoForm {
 
 #[get("/todos/new")]
 async fn new_todo(csrf: CsrfToken) -> Markup {
+    // Correct as written under the default CSRF field name. If your app sets
+    // `security.csrf.form_field`, this needs one more parameter — see
+    // "CSRF is not optional, and not your job" below.
     let blank = ChangesetForm::blank(TodoForm { title: String::new() }, csrf.token());
     layout(render_form(&blank))
 }
@@ -355,10 +358,12 @@ this attribute exists to remove.
 
 `ChangesetForm` captures the CSRF token from the request extensions during
 extraction, and `form_tag` emits the hidden input. In a POST handler that is the
-whole story — no parameter, no wiring.
+whole story — no parameter, no wiring. It picks up the configured field *name*
+from the extensions too, so a customized `security.csrf.form_field` is handled
+for you.
 
-GET handlers that render a blank form have no submitted body to capture from, so
-they pass the token explicitly:
+GET handlers that render a blank form get neither, because there is no request
+body to have captured them from. The token is the obvious half:
 
 ```rust,ignore
 #[get("/todos/new")]
@@ -367,6 +372,32 @@ async fn new_todo(csrf: CsrfToken) -> Markup {
     render_form(&blank)
 }
 ```
+
+**That is correct only while you use the default field name.** `blank` is a
+plain constructor with no access to configuration, so it hardcodes `_csrf`,
+while `CsrfLayer` scans an incoming body for the *configured* name only. Set
+`security.csrf.form_field` to anything else and this form renders happily and
+`403`s on its first submission — a failure that appears at the far end of the
+flow, on an app that "just changed a config value".
+
+If your app configures the field name, extract it and pass it through. It costs
+one parameter and is inert under the default:
+
+```rust,ignore
+// `CsrfFormField` is in the prelude, so this import is only for clarity.
+use autumn_web::security::CsrfFormField;
+
+#[get("/todos/new")]
+async fn new_todo(csrf: CsrfToken, csrf_field: CsrfFormField) -> Markup {
+    let blank = ChangesetForm::blank(TodoForm::default(), csrf.token())
+        .with_csrf_field(csrf_field.0);
+    render_form(&blank)
+}
+```
+
+`NestedChangesetForm::blank` has the same constraint and the same
+`with_csrf_field` remedy. So does any hand-written `<input type="hidden">`: name
+it from `CsrfFormField`, not from the literal `_csrf`.
 
 `ChangesetForm::without_csrf` exists for tests and for apps that have disabled
 the CSRF layer. If CSRF is enabled and you use it in a real handler, the form
