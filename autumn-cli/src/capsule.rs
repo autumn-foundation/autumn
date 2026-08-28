@@ -174,12 +174,69 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
             );
         }
     }
+    match ensure_suite_harness(&tests_dir) {
+        Ok(Some(created)) => {
+            let _ = writeln!(
+                report,
+                "wrote {} — the Cargo test target that compiles the suite",
+                created.display()
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = writeln!(
+                report,
+                "could not create a test target for the suite: {error}\n  add a file at \
+                 {}/{HARNESS_NAME} containing:\n    mod {TEST_SUBDIR};",
+                tests_dir.display()
+            );
+        }
+    }
     let _ = write!(
         report,
         "\nRun it with:  cargo test capsule_{slug}\nThe whole corpus:  autumn capsule verify"
     );
     Ok(report)
 }
+
+/// The top-level test target that compiles the consolidated suite.
+///
+/// Cargo treats each `tests/*.rs` file as a test target and does **not**
+/// descend into subdirectories, so `tests/integration/mod.rs` is compiled only
+/// if some top-level target declares `mod integration;`. An application created
+/// by `autumn new` has no such declaration — its `tests/integration_test.rs` is
+/// a standalone file — so without this the generated capsule tests are written,
+/// registered, and never built: `cargo test capsule_` matches nothing, exits 0,
+/// and the corpus reports that it replays clean having run nothing at all.
+///
+/// Returns the path of a harness this call created, or `None` when one already
+/// exists. Any existing top-level target that declares the suite counts, so a
+/// project with its own harness — this repository's own
+/// `tests/integration_tests.rs`, for instance — is left alone rather than given
+/// a second binary compiling the same modules.
+fn ensure_suite_harness(tests_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let declaration = format!("mod {TEST_SUBDIR};");
+    if let Ok(entries) = std::fs::read_dir(tests_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "rs")
+                && std::fs::read_to_string(&path).is_ok_and(|source| declares(&source, TEST_SUBDIR))
+            {
+                return Ok(None);
+            }
+        }
+    }
+    let harness = tests_dir.join(HARNESS_NAME);
+    let source = format!(
+        "//! Cargo test target for the capsule regression suite.\n         //!\n         //! Cargo does not descend into `tests/` subdirectories, so this file is\n         //! what makes `tests/{TEST_SUBDIR}/` compile at all. Without it the\n         //! generated capsule tests are never built and `cargo test capsule_`\n         //! silently matches nothing.\n\n         {declaration}\n"
+    );
+    std::fs::write(&harness, source)
+        .map_err(|error| format!("could not write {}: {error}", harness.display()))?;
+    Ok(Some(harness))
+}
+
+/// Name of the test target [`ensure_suite_harness`] writes when none exists.
+const HARNESS_NAME: &str = "capsule_tests.rs";
 
 /// Reduce a capsule id to characters legal in a Rust module and test name.
 fn slugify(id: &str) -> String {
@@ -452,11 +509,26 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
     // The generated tests live beside the fixtures, under the same `tests/`
     // root; `cargo test capsule_` can only run the ones that are still wired
     // in, so this is where their absence has to be caught.
-    let suite = dir.parent().map(|tests| tests.join(TEST_SUBDIR));
+    let tests_dir = dir.parent();
+    let suite = tests_dir.map(|tests| tests.join(TEST_SUBDIR));
     let declarations = suite
         .as_ref()
         .and_then(|suite| std::fs::read_to_string(suite.join("mod.rs")).ok())
         .unwrap_or_default();
+    // A registered module still never runs unless some top-level `tests/*.rs`
+    // target declares the suite — Cargo does not descend into subdirectories.
+    // Checked once for the corpus rather than per capsule, because it is one
+    // fact about the project, not about any fixture.
+    let harness = tests_dir.is_none_or(|tests| {
+        std::fs::read_dir(tests).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension().is_some_and(|ext| ext == "rs")
+                    && std::fs::read_to_string(&path)
+                        .is_ok_and(|source| declares(&source, TEST_SUBDIR))
+            })
+        })
+    });
 
     let mut text = String::new();
     let mut unusable = 0_usize;
@@ -484,6 +556,20 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
                 let _ = writeln!(text, "UNREADABLE  {}\n  {error}", path.display());
             }
         }
+    }
+    if !harness {
+        unusable = unusable.saturating_add(paths.len());
+        let _ = writeln!(
+            text,
+            "\nNO TEST TARGET: no file in {} declares `mod {TEST_SUBDIR};`, so Cargo never \
+             compiles the generated suite and `cargo test {TEST_NAME_PREFIX}` would match \
+             nothing at all. Convert a capsule again to have one written, or add a \
+             `tests/{HARNESS_NAME}` containing that line.",
+            tests_dir.map_or_else(
+                || dir.display().to_string(),
+                |tests| tests.display().to_string()
+            )
+        );
     }
     let _ = writeln!(
         text,
@@ -755,6 +841,8 @@ mod tests {
             "mod capsule_good;\nmod capsule_stale;\n",
         )
         .expect("write");
+        // A top-level target must declare the suite, or nothing compiles it.
+        std::fs::write(dir.path().join("capsule_tests.rs"), "mod integration;\n").expect("write");
         std::fs::write(corpus.join("stale.json"), {
             let mut value: serde_json::Value =
                 serde_json::from_str(&fixture_capsule("req-10")).expect("parses");
@@ -785,6 +873,7 @@ mod tests {
         std::fs::create_dir_all(&corpus).expect("mkdir");
         std::fs::create_dir_all(&suite).expect("mkdir");
         std::fs::write(corpus.join("orphan.json"), fixture_capsule("req-11")).expect("write");
+        std::fs::write(dir.path().join("capsule_tests.rs"), "mod integration;\n").expect("write");
 
         // The test file was deleted outright.
         std::fs::write(suite.join("mod.rs"), "mod capsule_orphan;\n").expect("write");
@@ -809,6 +898,67 @@ mod tests {
 
         // Both present: the capsule counts as runnable.
         std::fs::write(suite.join("mod.rs"), "mod capsule_orphan;\n").expect("write");
+        let report = verify_inner(&corpus).expect("a non-empty corpus reports");
+        assert_eq!(report.unusable, 0, "{}", report.text);
+    }
+
+    /// Cargo does not descend into `tests/` subdirectories, so a registered
+    /// module still never runs unless a top-level target declares the suite.
+    /// Without this, conversion wrote files that were never compiled and the
+    /// corpus reported a clean replay having run nothing.
+    #[test]
+    fn conversion_writes_a_cargo_test_target_for_the_suite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(&tests).expect("mkdir");
+
+        let created = ensure_suite_harness(&tests)
+            .expect("a harness is writable")
+            .expect("none existed, so one is created");
+        let source = std::fs::read_to_string(&created).expect("reads");
+        assert!(
+            declares(&source, TEST_SUBDIR),
+            "the harness must declare the suite: {source}"
+        );
+        assert_eq!(created.file_name().expect("named"), HARNESS_NAME);
+
+        // A second conversion does not add a second binary.
+        assert!(
+            ensure_suite_harness(&tests).expect("succeeds").is_none(),
+            "an existing harness is left alone"
+        );
+
+        // A project with its own differently-named harness is left alone too,
+        // rather than given a second binary compiling the same modules.
+        let other = tempfile::tempdir().expect("tempdir");
+        let tests = other.path().join("tests");
+        std::fs::create_dir_all(&tests).expect("mkdir");
+        std::fs::write(tests.join("integration_tests.rs"), "mod integration;\n").expect("write");
+        assert!(
+            ensure_suite_harness(&tests).expect("succeeds").is_none(),
+            "any target that declares the suite counts"
+        );
+    }
+
+    /// The corpus must not report a clean replay when nothing compiles it.
+    #[test]
+    fn a_corpus_with_no_test_target_is_not_a_vacuous_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = dir.path().join("capsules");
+        let suite = dir.path().join("integration");
+        std::fs::create_dir_all(&corpus).expect("mkdir");
+        std::fs::create_dir_all(&suite).expect("mkdir");
+        std::fs::write(corpus.join("solo.json"), fixture_capsule("req-12")).expect("write");
+        std::fs::write(suite.join("capsule_solo.rs"), "").expect("write");
+        std::fs::write(suite.join("mod.rs"), "mod capsule_solo;\n").expect("write");
+
+        // Registered, but no top-level target declares the suite.
+        let report = verify_inner(&corpus).expect("a non-empty corpus reports");
+        assert!(report.unusable > 0, "{}", report.text);
+        assert!(report.text.contains("NO TEST TARGET"), "{}", report.text);
+
+        // With a harness, the same corpus is usable.
+        std::fs::write(dir.path().join("capsule_tests.rs"), "mod integration;\n").expect("write");
         let report = verify_inner(&corpus).expect("a non-empty corpus reports");
         assert_eq!(report.unusable, 0, "{}", report.text);
     }

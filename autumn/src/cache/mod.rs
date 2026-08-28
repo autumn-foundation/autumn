@@ -356,26 +356,47 @@ where
 
 /// Tee a cache read into the in-flight request's capsule.
 ///
-/// A miss, and a hit whose value will not serialize, are both recorded as a
-/// *keyed* entry with no value: replay then knows the key was read (so it does
-/// not call it unrecorded) while still being honest that it has nothing to
-/// serve, and the handler takes its miss branch.
+/// A miss is recorded as a *keyed* entry with no value: replay then knows the
+/// key was read (so it does not call it unrecorded) while still being honest
+/// that it has nothing to serve, and the handler takes its miss branch.
+///
+/// A **hit** whose value will not serialize cannot be recorded that way. It
+/// would be indistinguishable from a miss, so replay would take the miss branch
+/// without a divergence and grade a run that never happened — the handler read
+/// a value in production and reads nothing here. There is no honest recording
+/// of a value that cannot be encoded, so the capsule declares itself
+/// incomplete instead.
 #[cfg(feature = "reporting")]
 fn record_cache_get<V: serde::Serialize>(key: &str, value: Option<&V>) {
     let Some(scope) = crate::capsule::current_scope() else {
         return;
     };
-    let encoded = value
-        .and_then(|value| serde_json::to_vec(value).ok())
-        .map(|bytes| {
+    let encoded = value.map(|value| {
+        serde_json::to_vec(value).map(|bytes| {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode(&bytes)
-        });
+        })
+    });
+    let encoded = match encoded {
+        None => None,
+        Some(Ok(encoded)) => Some(encoded),
+        Some(Err(_)) => {
+            scope.note(UNRECORDABLE_CACHE_HIT_NOTE);
+            scope.mark_truncated();
+            None
+        }
+    };
     scope.record_cache(crate::capsule::CacheEffect::Get {
         key: key.to_owned(),
         value: encoded,
     });
 }
+
+/// Why a capsule that read an unserializable cache hit is not replayable.
+#[cfg(feature = "reporting")]
+const UNRECORDABLE_CACHE_HIT_NOTE: &str = "a cache read hit a value that could not be serialized into the capsule, and a hit with no \
+     recorded value is indistinguishable from a miss; replay would take the miss branch the \
+     recorded run never took";
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]

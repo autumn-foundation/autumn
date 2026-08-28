@@ -1142,17 +1142,22 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
         .iter()
         .filter(|key| {
             key.starts_with("cache[")
-                || (key.starts_with("http[") && key.contains("].response_body"))
+                || key == &"tenant.id"
+                || (key.starts_with("http[")
+                    && (key.contains("].response_body")
+                        || key.contains("].response_header")
+                        || key.contains("].final_url")))
         })
         .map(String::as_str)
         .collect();
     if !masked_input.is_empty() {
         return Some(format!(
             "input the replayed run reads back was masked by `[log] filter_parameters` ({}). \
-             An outbound response body and a cache hit are handed to the code as data — parsed, \
-             deserialized, branched on — so unlike a compared field the `[FILTERED]` placeholder \
-             cannot stand in for what was really there, and the run would be graded on input \
-             production never returned. Redaction is not reversible: unfilter the field for this \
+             An outbound response (its body, its headers, the URL a redirect landed on), a cache \
+             hit and the resolved tenant are all handed to the code as data — parsed, \
+             deserialized, branched on, scoped by — so unlike a compared field the `[FILTERED]` \
+             placeholder cannot stand in for what was really there, and the run would be graded \
+             on input production never returned. Redaction is not reversible: unfilter the field for this \
              route, or debug it from the recorded outcome instead.",
             masked_input.join(", ")
         ));
@@ -1735,11 +1740,18 @@ mod tests {
             "the refusal must name the field and the knob: {reason}"
         );
 
-        capsule.request.redacted_keys = vec!["cache[0].user_id".to_owned()];
-        assert!(
-            refusal_reason(&capsule).is_some(),
-            "a masked cache hit is served as concrete input too"
-        );
+        for key in [
+            "cache[0].user_id",
+            "http[0].response_header:set-cookie",
+            "http[0].final_url.access_token",
+            "tenant.id",
+        ] {
+            capsule.request.redacted_keys = vec![key.to_owned()];
+            assert!(
+                refusal_reason(&capsule).is_some(),
+                "{key} is served to the code as concrete input, so it cannot replay"
+            );
+        }
 
         // A masked *request* header is compared, not consumed, so it still
         // replays: the placeholder stands for whatever was really there.

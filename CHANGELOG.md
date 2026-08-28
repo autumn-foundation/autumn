@@ -98,6 +98,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elsewhere cannot sit in the clear one field over; and a response's final
   post-redirect URL is recorded and restored, for handlers that inspect
   `Response::url()`.
+  Redaction reaches three places it had missed, two of which leaked: the URL a
+  redirect landed on (an OAuth callback carries `access_token` in its query as
+  a matter of course) and an enqueue rejection's free-form error text, both of
+  which could hold a value filtered everywhere else in the capsule. The third
+  is the resolved tenant, which — like a response header and the response body
+  — is *input* rather than compared data, so a masked one now refuses instead
+  of running the request under a tenant production never resolved. A cache hit
+  whose value will not serialize marks the capsule incomplete rather than
+  recording as a miss the handler never took. And `autumn capsule test` now
+  writes the Cargo test target that compiles the generated suite: Cargo does
+  not descend into `tests/` subdirectories, so without a top-level `mod
+  integration;` the generated tests were never built and `cargo test capsule_`
+  matched nothing — which `autumn capsule verify` now reports as unusable
+  rather than as a clean corpus.
 
 ### Fixed
 

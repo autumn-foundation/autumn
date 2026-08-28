@@ -396,6 +396,19 @@ pub fn redact_effects(
             keys,
             &format!("http[{index}].url"),
         );
+        // The URL a redirect *landed on* carries credentials at least as often
+        // as the one the call started with — an OAuth callback with
+        // `?access_token=` is the whole point of the pattern — so it is masked
+        // by the same rules rather than trusted for having been server-chosen.
+        if let Some(final_url) = exchange.final_url.as_ref() {
+            exchange.final_url = Some(redact_url_query(
+                final_url,
+                filter,
+                values,
+                keys,
+                &format!("http[{index}].final_url"),
+            ));
+        }
         let request_content_type = header_value(&exchange.request_headers, "content-type");
         let response_content_type = header_value(&exchange.response_headers, "content-type");
         redact_effect_headers(
@@ -550,6 +563,13 @@ pub fn redact_effects(
     // had masked that reappears under a key the filter does not name.
     for effect in &mut effects.jobs {
         effect.payload = mask_json_echoes(&effect.payload, values);
+        // A rejection's text is free-form and written by whatever refused the
+        // enqueue — a `JobInterceptor` can quote the payload field or the
+        // credential it rejected — so it can carry a value masked everywhere
+        // else in the capsule.
+        if let Some(error) = effect.error.as_mut() {
+            *error = mask_echoes(error, values);
+        }
     }
     if let Some(job) = job.as_mut() {
         job.payload = mask_json_echoes(&job.payload, values);
@@ -569,7 +589,16 @@ pub fn redact_effects(
     if let Some(tenant) = effects.tenant.as_mut()
         && let Some(id) = tenant.id.as_mut()
     {
-        *id = mask_echoes(id, values);
+        let masked = mask_echoes(id, values);
+        // The tenant is *input*: replay serves it to tenant-scoped code and to
+        // every database bind that scopes by it. A placeholder there would run
+        // the whole request under a tenant production never resolved, so the
+        // masking is recorded as a key and the capsule refused rather than
+        // replayed. (`mask_echoes` leaves an unmasked id untouched.)
+        if masked != *id {
+            keys.insert("tenant.id".to_owned());
+        }
+        *id = masked;
     }
 }
 
