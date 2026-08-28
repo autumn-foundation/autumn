@@ -509,13 +509,14 @@ fn deeply_nested_blocks_render_in_linear_time() {
         (started.elapsed(), html.len())
     }
 
+    const BASE_LEVELS: usize = 20_000;
+    const MAX_RATIO: f64 = 3.0;
+
     // Warm-up: keep one-off initialisation (allocator growth, the sanitizer's
     // lazily-built allowlist) out of the first measured sample, which would
     // otherwise inflate the baseline and depress the ratio.
     let _ = render_nested(1_000);
 
-    const BASE_LEVELS: usize = 20_000;
-    const MAX_RATIO: f64 = 3.0;
     // This test shares the consolidated `integration_tests` binary with ~1800
     // others running on a parallel thread pool, so contention can stretch one
     // sample and not the other. Preemption only ever makes a sample *slower*,
