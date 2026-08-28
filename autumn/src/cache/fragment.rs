@@ -649,6 +649,54 @@ mod tests {
         clear_global_cache();
     }
 
+    /// The limitation the `_in` variants exist for, pinned so the docs stay
+    /// true.
+    ///
+    /// `cache_fragment` keys under a bare `fragment:` prefix, which is not the
+    /// declared read's id, so a namespace sweep matches nothing — and
+    /// `invalidate_namespace` still returns `true`, because "matched no keys"
+    /// and "there were none" are the same observation to a prefix scan. That
+    /// combination is exactly why a `declare_cached_read!` fragment has to key
+    /// through `cache_fragment_in`; if this test ever goes green the other way,
+    /// the guide's warning is stale.
+    #[test]
+    fn a_plain_fragment_is_not_reachable_by_namespace_invalidation() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache.clone());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let render = |counter: Arc<AtomicUsize>| {
+            move || -> Markup {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "sidebar" } }
+            }
+        };
+
+        cache_fragment_global("post:1", "v1", None, render(counter.clone()));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Reports success...
+        assert!(crate::cache::coherence::invalidate_namespace(
+            "blog::sidebar_fragment"
+        ));
+
+        // ...having cleared nothing: the entry is still served.
+        cache_fragment_global("post:1", "v1", None, render(counter.clone()));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "if this became a miss, `cache_fragment` gained a namespace and the \
+             docs steering declared fragments to `cache_fragment_in` are stale"
+        );
+
+        clear_global_cache();
+    }
+
     /// A namespace sweep must not take another read's fragments with it.
     #[test]
     fn invalidating_one_fragment_namespace_leaves_the_others() {
