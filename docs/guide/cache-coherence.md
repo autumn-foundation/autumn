@@ -432,6 +432,15 @@ tell "we checked and it was fine" from "we never looked".
   cached read those dirty audits clean. The manifest names this under
   `excluded`, along with `CacheResponseLayer`, whose entries are keyed by URI
   with no annotated item to derive a dependency set from.
+* **Cascades and counters declared on the *model*.** A
+  `#[repository(..., dependent(...))]` cascade **is** covered: it registers a
+  write against the child model it deletes or nullifies, resolved from that
+  child repository's own published model rather than guessed from its type name
+  (`on_delete = restrict` is excluded — it probes and never writes). But
+  `#[has_many(Child, dependent = destroy)]` and
+  `#[belongs_to(Parent, counter_cache)]` are declared on the model, which
+  `#[repository]` cannot see, so the writes they cause carry no descriptor.
+  Declare such a cascade on the repository to bring it into the graph.
 * **That a declared dependency set is true.** `reads(...)` replaces the analysis
   rather than being checked against it, so naming the wrong model audits clean.
   A `derived` set is an approximation of a different kind — see

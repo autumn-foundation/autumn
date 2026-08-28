@@ -497,7 +497,7 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
     companion
 }
 
-/// The models a `dependent(...)` cascade writes, beyond this repository's own.
+/// The child repositories a `dependent(...)` cascade actually writes through.
 ///
 /// A `dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)`
 /// clause makes `delete_by_id`/`delete_many` delete or nullify rows in the
@@ -505,24 +505,32 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
 /// a false pass: a cached read derived from `Comment` really is stranded by
 /// `PostRepository::delete_by_id`.
 ///
-/// The child model is recovered from the declared child repository type by the
-/// same `Pg{Model}Repository` convention the rest of the macro generates, so it
-/// is a bare ident rather than a `type_name` — the child's model type is not in
-/// scope here. `models_match` handles that asymmetry.
-fn dependent_child_models(config: &RepoConfig) -> Vec<String> {
-    let mut models: Vec<String> = config
+/// `on_delete = restrict` is excluded, because that action only *probes* for
+/// child rows and then either rejects the parent delete or proceeds when there
+/// are none — it never writes the child's table. Registering it would demand an
+/// invalidation for a read that cannot go stale, and a gate that fails correct
+/// code is a gate that gets deleted.
+///
+/// Returns the child repository paths, deduplicated by their rendered form. The
+/// model is NOT inferred from the repository's type name — see
+/// `__AUTUMN_MODEL_NAME` in [`generate_coherence_items`] for why that guess is
+/// wrong exactly where it matters.
+fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut paths: Vec<syn::Path> = Vec::new();
+    for dep in config
         .dependents
         .iter()
-        .filter_map(|dep| {
-            let ident = dep.child_repo.segments.last()?.ident.to_string();
-            let base = ident.strip_suffix("Repository")?;
-            let base = base.strip_prefix("Pg").unwrap_or(base);
-            (!base.is_empty()).then(|| base.to_string())
-        })
-        .collect();
-    models.sort();
-    models.dedup();
-    models
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        let rendered = quote!(#child).to_string();
+        if !seen.contains(&rendered) {
+            seen.push(rendered);
+            paths.push(dep.child_repo.clone());
+        }
+    }
+    paths
 }
 
 /// Write methods that run the `dependent(...)` cascade.
@@ -541,7 +549,7 @@ fn cascade_mutation_registrations(
     writes: &[String],
     trait_name_str: &str,
 ) -> Vec<TokenStream> {
-    let child_models = dependent_child_models(config);
+    let child_repos = dependent_child_repositories(config);
     CASCADING_WRITES
         .iter()
         .filter(|method| writes.contains(&(*method).to_string()))
@@ -565,7 +573,7 @@ fn cascade_mutation_registrations(
                     || quote! { ::core::option::Option::None },
                     |reason| quote! { ::core::option::Option::Some(#reason) },
                 );
-            child_models
+            child_repos
                 .iter()
                 .map(|child| {
                     let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
@@ -574,7 +582,10 @@ fn cascade_mutation_registrations(
                         ::autumn_web::cache::coherence::MutationDescriptor {
                             repository: #trait_name_str,
                             method: #method,
-                            model: || #child,
+                            // The child repository publishes its own model, so
+                            // an escape-hatch name like `ModerationRepository`
+                            // over a `Comment` model resolves correctly.
+                            model: <#child>::__AUTUMN_MODEL_NAME,
                             // Empty rather than guessed: the child's table name
                             // lives on ITS `#[repository]`, which may override
                             // the inferred one, and a wrong table string in the
@@ -593,6 +604,40 @@ fn cascade_mutation_registrations(
         .collect()
 }
 
+/// Reject a cache-coherence attribute on a method that generates no write.
+///
+/// The trait is regenerated from scratch, so an attribute the macro does not
+/// consume vanishes without a trace — and a silently-dropped invalidation edge
+/// is exactly the bug this feature exists to prevent.
+fn reject_orphaned_coherence_attrs(
+    trait_def: &ItemTrait,
+    overrides: &std::collections::HashMap<String, MethodCoherence>,
+    writes: &[String],
+) -> syn::Result<()> {
+    let Some(orphan) = overrides.keys().find(|name| !writes.contains(name)) else {
+        return Ok(());
+    };
+    // Point the error at the method's own ident so the fix is where the reader
+    // is looking.
+    let span = trait_def
+        .items
+        .iter()
+        .find_map(|item| match item {
+            TraitItem::Fn(f) if f.sig.ident == **orphan => Some(f.sig.ident.span()),
+            _ => None,
+        })
+        .unwrap_or_else(proc_macro2::Span::call_site);
+    Err(syn::Error::new(
+        span,
+        format!(
+            "`{orphan}` is not a write method, so a cache-coherence attribute on it would \
+             never reach the manifest. Only the generated mutations carry one: {}. Move the \
+             attribute to the `#[repository(...)]` attribute to cover every write.",
+            writes.join(", ")
+        ),
+    ))
+}
+
 /// The `inventory` registrations and invalidator this repository publishes for
 /// the cache-coherence manifest (#1716).
 fn generate_coherence_items(
@@ -606,31 +651,7 @@ fn generate_coherence_items(
     let trait_name_str = trait_def.ident.to_string();
     let writes = write_method_names(config, trait_def);
 
-    // A coherence attribute on a method that generates no write would be
-    // silently dropped — the trait is regenerated from scratch, so nothing else
-    // would ever mention it. A silently-dropped invalidation edge is exactly the
-    // bug this feature exists to prevent, so it is an error instead.
-    if let Some(orphan) = overrides.keys().find(|name| !writes.contains(name)) {
-        // Point the error at the method's own ident so the fix is where the
-        // reader is looking.
-        let span = trait_def
-            .items
-            .iter()
-            .find_map(|item| match item {
-                TraitItem::Fn(f) if f.sig.ident == **orphan => Some(f.sig.ident.span()),
-                _ => None,
-            })
-            .unwrap_or_else(proc_macro2::Span::call_site);
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "`{orphan}` is not a write method, so a cache-coherence attribute on it would \
-                 never reach the manifest. Only the generated mutations carry one: {}. Move the \
-                 attribute to the `#[repository(...)]` attribute to cover every write.",
-                writes.join(", ")
-            ),
-        ));
-    }
+    reject_orphaned_coherence_attrs(trait_def, &overrides, &writes)?;
 
     let submissions: Vec<TokenStream> = writes
         .clone()
@@ -686,6 +707,22 @@ fn generate_coherence_items(
             declared_edges.extend(entry.invalidates.iter().cloned());
         }
     }
+    // Published unconditionally so a PARENT repository's `dependent(...)` cascade
+    // can name this child's model instead of guessing it from the repository's
+    // type name. The guess is wrong for the supported escape hatch where they
+    // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
+    // model means the cascade intersects nothing and the audit reports clean.
+    let published_model = quote! {
+        impl #pg_name {
+            /// The model this repository writes, for the cache-coherence
+            /// manifest (#1716). Read by a parent repository's `dependent(...)`
+            /// cascade registration.
+            #[doc(hidden)]
+            pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
+                || ::core::any::type_name::<#model_name>();
+        }
+    };
+
     let invalidator = if declared_edges.is_empty() {
         quote! {}
     } else {
@@ -729,6 +766,7 @@ fn generate_coherence_items(
         cascade_mutation_registrations(config, &overrides, &writes, &trait_name_str);
 
     Ok(quote! {
+        #published_model
         #(#submissions)*
         #(#cascade_submissions)*
         #invalidator
@@ -20182,16 +20220,75 @@ mod tests {
         )
         .to_string();
         assert!(
-            out.contains("method : \"delete_by_id\" , model : || \"Comment\""),
+            out.contains(
+                "method : \"delete_by_id\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
             "{out}"
         );
         assert!(
-            out.contains("method : \"delete_many\" , model : || \"Comment\""),
+            out.contains(
+                "method : \"delete_many\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
             "{out}"
         );
         // A non-cascading write must NOT claim to touch the child.
         assert!(
-            !out.contains("method : \"save\" , model : || \"Comment\""),
+            !out.contains(
+                "method : \"save\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_cascade_names_the_childs_own_model_not_its_repository_name() {
+        // The supported escape hatch: `#[repository(Comment)] trait
+        // ModerationRepository`. Inferring `Moderation` from the repository's
+        // name would intersect nothing, and the audit would report clean while
+        // the cascade really does delete `Comment` rows.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgModerationRepository, fk = "post_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("model : < PgModerationRepository > :: __AUTUMN_MODEL_NAME"),
+            "{out}"
+        );
+        assert!(!out.contains("\"Moderation\""), "no name guessing: {out}");
+    }
+
+    #[test]
+    fn a_repository_publishes_its_own_model_for_a_parents_cascade() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            out.contains(
+                "pub const __AUTUMN_MODEL_NAME : fn () -> & 'static :: core :: primitive :: str = || :: core :: any :: type_name :: < Post > ()"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_restrict_only_dependent_registers_no_cascade_write() {
+        // `on_delete = restrict` probes for child rows and then either rejects
+        // the parent delete or proceeds when there are none; it never writes the
+        // child's table. Registering it would fail CI over a read that cannot go
+        // stale.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            !out.contains("< PgCommentRepository > :: __AUTUMN_MODEL_NAME"),
             "{out}"
         );
     }
@@ -20209,7 +20306,7 @@ mod tests {
         .to_string();
         assert!(
             out.contains(
-                "method : \"delete_by_id\" , model : || \"Comment\" , table : \"\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_comments]"
+                "method : \"delete_by_id\" , model : < PgCommentRepository > :: __AUTUMN_MODEL_NAME , table : \"\" , invalidates : & [crate :: views :: __AUTUMN_CACHE_READ_ID__recent_comments]"
             ),
             "{out}"
         );

@@ -811,10 +811,15 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
         ExcludedDimension {
             dimension: "counter_cache_and_cascade_writes".to_string(),
             eventual_provenance: "provable".to_string(),
-            reason: "a `#[belongs_to(Parent, counter_cache)]` column is declared on the MODEL, \
-                     which `#[repository]` cannot see, so a child's write updating the parent's \
-                     counter is registered under the child's model only. `dependent(...)` \
-                     cascades ARE registered against the child model they delete or nullify"
+            reason: "both are declared on the MODEL, which `#[repository]` cannot see. A \
+                     `#[belongs_to(Parent, counter_cache)]` column means a child's write \
+                     updates the parent's counter, registered under the child's model only; a \
+                     `#[has_many(Child, dependent = destroy)]` means the parent's delete writes \
+                     the child's table with no descriptor for it. A cascade declared on the \
+                     REPOSITORY — `#[repository(..., dependent(...))]` — IS registered against \
+                     the child model it deletes or nullifies, resolved from that child \
+                     repository's own published model; `on_delete = restrict` is excluded \
+                     because it only probes and never writes"
                 .to_string(),
         },
         ExcludedDimension {
