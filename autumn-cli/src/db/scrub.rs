@@ -2325,15 +2325,19 @@ fn probe_database_facts(
     // ANY unique index counts (composite and partial included): the IR's
     // single-column `unique` flag answers a migration-diff question, not
     // "can this rewrite collide".
+    // `pg_index.indkey` is an `int2vector`, not a real array, so it is matched
+    // with `= ANY(...)` rather than `unnest`. The `[0:indnkeyatts-1]` slice is
+    // the KEY columns only — a covering index's `INCLUDE` columns carry no
+    // uniqueness and must not be treated as constrained.
     let unique_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
              JOIN pg_class rel ON rel.oid = i.indrelid \
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             CROSS JOIN LATERAL unnest(i.indkey[0:i.indnkeyatts-1]) AS k(attnum) \
-             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
-             WHERE i.indisunique AND k.attnum > 0",
+             JOIN pg_attribute att ON att.attrelid = rel.oid \
+             AND att.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) \
+             WHERE i.indisunique AND att.attnum > 0",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
@@ -2358,9 +2362,9 @@ fn probe_database_facts(
                  FROM pg_index i \
                  JOIN pg_class rel ON rel.oid = i.indrelid \
                  JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-                 CROSS JOIN LATERAL unnest(i.indkey[0:i.indnkeyatts-1]) AS k(attnum) \
-                 JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
-                 WHERE i.indisunique AND i.indnullsnotdistinct AND k.attnum > 0",
+                 JOIN pg_attribute att ON att.attrelid = rel.oid \
+                 AND att.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) \
+                 WHERE i.indisunique AND i.indnullsnotdistinct AND att.attnum > 0",
             )
             .load(&mut conn)
             .map_err(|e| ScrubError::Sql(e.to_string()))?,
@@ -2521,7 +2525,7 @@ fn purge_statements(present: &[String], config: &ScrubConfig) -> Vec<(String, St
     present
         .iter()
         .filter(|t| config.framework.purge.contains(t))
-        .map(|t| (t.clone(), format!("DELETE FROM {}", quote_ident(t))))
+        .map(|t| (t.clone(), format!("DELETE FROM {}", qualified_ident(t))))
         .collect()
 }
 
@@ -4254,7 +4258,7 @@ mod tests {
             statements,
             vec![(
                 "autumn_jobs".to_owned(),
-                r#"DELETE FROM "autumn_jobs""#.to_owned()
+                r#"DELETE FROM "public"."autumn_jobs""#.to_owned()
             )]
         );
     }
