@@ -108,6 +108,107 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Failure capsules: `capsule::execute` takes `ReplayFixtures`, and the capsule format is version 3
+
+**Why:** Capsules now record every framework effect a failing run produced —
+outbound HTTP, job enqueues, cache reads and writes, mail sends, the resolved
+tenant, and the random bytes it drew (issue #1634) — and replay serves all of
+them from the capsule. A replay is only deterministic if the clock, the entropy
+source and the effect tape all come from the *same* capsule, so `execute` takes
+one value that bundles them instead of a loose clock.
+
+Two consequences beyond the signature. The document's `format_version` bumps
+`2 → 3`, so **capsules recorded by an older Autumn are refused** rather than
+replayed with every new seam empty — a reader that tolerated them would report a
+verdict on an application shape production never ran. And an outbound HTTP call
+during replay is now *served from the capsule* instead of failing closed; a call
+the capsule never recorded is still refused, and is reported as a divergence.
+
+**Before:**
+
+```rust
+let clock = ReplayClock::new(capsule.clock.clone(), fallback);
+let outcome = capsule::execute(router, &capsule, divergences, Some(&clock)).await;
+```
+
+**After:**
+
+```rust
+let fixtures = ReplayFixtures::from_capsule(&capsule);
+// The router is now built *through* the fixtures, so the clock and the
+// entropy source it serves come from the same capsule the verdict judges.
+let router = TestApp::new()
+    .routes(routes![charge])
+    .with_clock(fixtures.clock())
+    .with_entropy(fixtures.entropy())
+    .build()
+    .into_router();
+let outcome = capsule::execute(router, &capsule, divergences, &fixtures).await;
+```
+
+Two smaller source breaks travel with it, both from added fields on
+non-`#[non_exhaustive]` types, so only struct-literal construction and
+wildcard-less `match`es are affected:
+
+* `ClientError` gains `ReplayedRequestFailure(String)` — a recorded outbound
+  transport failure, reproduced as a failure rather than downgraded to a
+  status. A `match` on `ClientError` without a `_` arm needs it.
+* `Capsule` gains `effects` and `job`, and `ReplayOutcome` gains
+  `effect_divergences`. Build capsules with
+  `capsule::schema::test_support::capsule(...)` (behind `test-support`) rather
+  than a struct literal, or add `..Default::default()`-style fields explicitly.
+
+One behaviour change worth knowing even though it does not break compilation:
+during a replay an outbound HTTP call is now **served from the capsule**
+instead of failing closed. A call the capsule never recorded is still refused,
+and is reported as an effect divergence rather than silently dialling. The
+recording answers a call only when its method, URL, caller-set headers *and*
+body match — the same endpoint with a different payload is a divergence — and
+a mail send is compared against its recorded body as well as its recipients
+and subject — and against its sender when the replayed run chose one, since a
+message that sets no `from` inherits `[mail] from` at send time and a replay
+boots without mail configuration.
+
+Three situations now produce a refusal or an incomplete capsule where an
+earlier build would have graded the run. A **job capsule whose payload was
+masked** by `[log] filter_parameters` is refused: a handler is handed its
+payload verbatim, so it would parse the `[FILTERED]` placeholder rather than
+the value production ran on. A run that **enqueued inside its own
+transaction** (`enqueue_on_conn`) marks its capsule incomplete, because that
+enqueue is also a job-row INSERT on the database tape which replay can serve
+but never issue. And an **effect whose future was cancelled** before it
+finished — a losing `tokio::select!` branch, a timeout — does the same rather
+than persist an outcome the run never had. Each case previously produced a
+verdict; each now says why it cannot.
+
+Two API changes come with the sharper failure reproduction. `ClientError` gains
+`ReplayedRequestFailure` and `MailError` gains `ReplayedFailure`, both of which
+print their recorded text and nothing else; a `match` on either enum without a
+`_` arm needs the new variant. Recorded failures are otherwise rebuilt as the
+variant production produced, so code branching on
+`ClientError::CircuitBreakerOpen` or `MailError::AllRecipientsSuppressed`
+behaves during replay as it did live.
+
+A **panicking job** now leaves a capsule on whatever attempt it panicked on.
+All three backends dead-letter a panic immediately regardless of remaining
+attempts, so a job configured with `max_attempts = 25` that panics on its
+first attempt never reaches a "final" one — and under the previous gate never
+produced a capsule at all. Ordinary failures are unchanged: still captured on
+the final attempt only.
+
+Capsules already on disk are not migrated: replay them with the version that
+wrote them, or re-record the failure. A committed regression corpus is
+re-recorded and re-converted the same way — `autumn capsule verify` reports
+every stale capsule as `UNREADABLE` and exits non-zero, deliberately, so a
+corpus cannot quietly stop testing anything. See
+[Failure Capsules › Compatibility across Autumn versions](../guide/failure-capsules.md).
+
+**Automation:** `manual` — the new argument is a value the caller has to
+construct from the capsule, and there is no textual rewrite that can invent it;
+`autumn upgrade` ships no codemod for this. Direct callers of `capsule::execute`
+are limited to code that drives replay itself, which is rare outside the
+framework.
+
 ---
 
 ## Compiler error cheat sheet

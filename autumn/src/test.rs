@@ -1905,6 +1905,17 @@ impl TestApp {
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
+        // Same for the entropy source (#1634): a handler that mints a session
+        // id, a token or a job id must mint the *recorded* one on replay, or
+        // the identifier in the capsule's SQL binds will not be the one the
+        // replayed code produced.
+        #[cfg(feature = "reporting")]
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingEntropy::new(state.entropy_arc()))
+                    as std::sync::Arc<dyn crate::entropy::Entropy>;
+            state = state.with_entropy(recording);
+        }
 
         for register in self.policy_registrations {
             register(state.policy_registry());

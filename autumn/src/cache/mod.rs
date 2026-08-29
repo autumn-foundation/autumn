@@ -244,16 +244,35 @@ pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, va
 /// is configured.
 pub fn get_cached<V>(cache: &dyn Cache, key: &str) -> Option<V>
 where
-    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    let arc = cache.get_value(key)?;
-    // Fast path: in-memory backend stored the concrete type directly.
-    if let Some(v) = arc.downcast_ref::<V>() {
-        return Some(v.clone());
+    // Failure-capsule seam (#1634). A replay is served entirely from the
+    // capsule: the live backend is never consulted, because the value it holds
+    // now is not the value the failing request read.
+    match replayed_cache_get::<V>(key) {
+        ReplayedRead::NoTape => {}
+        ReplayedRead::Miss => return None,
+        ReplayedRead::Hit(value) => return Some(value),
     }
-    // Slow path: serializing backend (e.g. Redis) stored RawCacheBytes.
-    arc.downcast_ref::<RawCacheBytes>()
-        .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
+    let arc = cache.get_value(key);
+    let value = arc.and_then(|arc| {
+        // Fast path: in-memory backend stored the concrete type directly.
+        if let Some(value) = arc.downcast_ref::<V>() {
+            return Some(value.clone());
+        }
+        // Slow path: serializing backend (e.g. Redis) stored RawCacheBytes.
+        arc.downcast_ref::<RawCacheBytes>()
+            .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
+    });
+    // Recorded from the *typed* value rather than from the stored `Arc<dyn
+    // Any>`: the in-process backend (Moka) stores `Arc<V>` and never
+    // `RawCacheBytes`, so reading the erased value would record every hit from
+    // the default backend as valueless — and replay would then take the miss
+    // branch of a handler whose bug is on the hit branch. The `Serialize`
+    // bound is what makes the recording possible at all; every caller already
+    // pairs this with `insert_cached`, which requires it too.
+    record_cache_get(key, value.as_ref());
+    value
 }
 
 /// Serde-aware insert: store the value both in-memory and as JSON bytes.
@@ -271,12 +290,167 @@ pub fn insert_cached<V>(cache: &dyn Cache, key: &str, value: V, ttl: Option<std:
 where
     V: Clone + serde::Serialize + Send + Sync + 'static,
 {
+    let bytes = serde_json::to_vec(&value).ok();
+    // Failure-capsule seam (#1634): the write is recorded on capture, and on
+    // replay it lands in the tape (so a read-back in the same run finds it)
+    // instead of in a live backend.
+    if record_or_replay_cache_insert(key, bytes.as_deref(), ttl) {
+        return;
+    }
     // In-memory path (MokaCache, CountingCache in tests, …)
-    cache.insert_value(key, Arc::new(value.clone()));
+    cache.insert_value(key, Arc::new(value));
     // Serialized path (RedisCache, any cross-replica backend)
-    if let Ok(bytes) = serde_json::to_vec(&value) {
+    if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
     }
+}
+
+// ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The `capsule` module is behind the `reporting` feature, so each helper here
+// has a no-op twin for builds without it — the seam stays one line at each
+// call site whatever the feature set.
+
+/// What a replay has to say about a cache read.
+///
+/// A named type rather than a nested `Option`: "no replay is in progress" and
+/// "the replay says this key missed" are opposite instructions to the caller,
+/// and `Option<Option<V>>` spells them the same way round as each other.
+enum ReplayedRead<V> {
+    /// No replay is in progress; read the real cache.
+    NoTape,
+    /// The tape has no value to serve — a recorded miss, an unrecorded key
+    /// (already logged as a divergence), or a hit the recording could not
+    /// serialize. The read replays as a miss.
+    Miss,
+    /// The recorded hit.
+    Hit(V),
+}
+
+/// Serve a cache read from the capsule's effect tape, when one is active.
+#[cfg(feature = "reporting")]
+fn replayed_cache_get<V>(key: &str) -> ReplayedRead<V>
+where
+    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    use crate::capsule::effects::CachedValue;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return ReplayedRead::NoTape;
+    };
+    match tape.cache_get(key) {
+        CachedValue::Hit(bytes) => {
+            serde_json::from_slice::<V>(&bytes).map_or(ReplayedRead::Miss, ReplayedRead::Hit)
+        }
+        CachedValue::Miss | CachedValue::Unrecorded => ReplayedRead::Miss,
+    }
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_cache_get<V>(_key: &str) -> ReplayedRead<V>
+where
+    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    ReplayedRead::NoTape
+}
+
+/// Tee a cache read into the in-flight request's capsule.
+///
+/// A miss is recorded as a *keyed* entry with no value: replay then knows the
+/// key was read (so it does not call it unrecorded) while still being honest
+/// that it has nothing to serve, and the handler takes its miss branch.
+///
+/// A **hit** whose value will not serialize cannot be recorded that way. It
+/// would be indistinguishable from a miss, so replay would take the miss branch
+/// without a divergence and grade a run that never happened — the handler read
+/// a value in production and reads nothing here. There is no honest recording
+/// of a value that cannot be encoded, so the capsule declares itself
+/// incomplete instead.
+#[cfg(feature = "reporting")]
+fn record_cache_get<V: serde::Serialize>(key: &str, value: Option<&V>) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    let encoded = value.map(|value| {
+        serde_json::to_vec(value).map(|bytes| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        })
+    });
+    let encoded = match encoded {
+        None => None,
+        Some(Ok(encoded)) => Some(encoded),
+        Some(Err(_)) => {
+            scope.note(UNRECORDABLE_CACHE_HIT_NOTE);
+            scope.mark_truncated();
+            None
+        }
+    };
+    scope.record_cache(crate::capsule::CacheEffect::Get {
+        key: key.to_owned(),
+        value: encoded,
+    });
+}
+
+/// Why a capsule that wrote an unserializable cache value is not replayable.
+#[cfg(feature = "reporting")]
+const UNRECORDABLE_CACHE_WRITE_NOTE: &str = "a cache write held a value that could not be serialized into the capsule, so replay would \
+     suppress a mutation the recorded run really made";
+
+/// Why a capsule that read an unserializable cache hit is not replayable.
+#[cfg(feature = "reporting")]
+const UNRECORDABLE_CACHE_HIT_NOTE: &str = "a cache read hit a value that could not be serialized into the capsule, and a hit with no \
+     recorded value is indistinguishable from a miss; replay would take the miss branch the \
+     recorded run never took";
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_cache_get<V: serde::Serialize>(_key: &str, _value: Option<&V>) {}
+
+/// Record a cache write, or divert it into the replay tape.
+///
+/// Returns `true` when a replay handled the write and the live backend must
+/// not be touched.
+#[cfg(feature = "reporting")]
+fn record_or_replay_cache_insert(
+    key: &str,
+    bytes: Option<&[u8]>,
+    ttl: Option<std::time::Duration>,
+) -> bool {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        if let Some(bytes) = bytes {
+            tape.cache_insert(key, bytes, ttl.map(|ttl| ttl.as_secs()));
+        }
+        return true;
+    }
+    if let Some(scope) = crate::capsule::current_scope() {
+        if let Some(bytes) = bytes {
+            use base64::Engine as _;
+            scope.record_cache(crate::capsule::CacheEffect::Insert {
+                key: key.to_owned(),
+                value: base64::engine::general_purpose::STANDARD.encode(bytes),
+                ttl_secs: ttl.map(|ttl| ttl.as_secs()),
+            });
+        } else {
+            // The live backend accepted this write; the capsule cannot hold it.
+            // Recording nothing would let replay suppress a real cache mutation
+            // and still grade the run clean, which is the same falsification the
+            // unserializable *read* refuses — caught here a function later.
+            scope.note(UNRECORDABLE_CACHE_WRITE_NOTE);
+            scope.mark_truncated();
+        }
+    }
+    false
+}
+
+/// No capsule support compiled in: the live backend always takes the write.
+#[cfg(not(feature = "reporting"))]
+const fn record_or_replay_cache_insert(
+    _key: &str,
+    _bytes: Option<&[u8]>,
+    _ttl: Option<std::time::Duration>,
+) -> bool {
+    false
 }
 
 // ── CacheableResult trait ────────────────────────────────────────────

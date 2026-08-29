@@ -249,8 +249,30 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     // The scheme the URI already carries, captured before the request record
     // is built: a resolved scheme equal to it did not come from a header.
     let uri_scheme = raw.uri.scheme_str().map(ToOwned::to_owned);
-    let (mut request, redacted, body_notes) =
+    let (mut request, mut redacted, body_notes) =
         crate::capsule::redact::redact_request(raw, &raw_body, scope.filter());
+    // The effect tape is masked through the *same* filter, and into the same
+    // echo set, before anything else is scrubbed: a secret a handler sent to a
+    // third party, or wrote into a cache value, must be gone from the outcome
+    // and the SQL binds too. Recording raw and masking here (rather than at
+    // each seam) keeps redaction's cost off requests that never fail.
+    let mut effects = scope.effects_snapshot();
+    // A job capsule's entry point is a payload like any other: it is the job's
+    // *arguments*, and they carry tokens and PII exactly the way a request body
+    // does. Redacted alongside the effect tape, through the same filter and
+    // into the same echo set.
+    let mut job = scope.job_entry();
+    let mut effect_keys = std::collections::BTreeSet::new();
+    crate::capsule::redact::redact_effects(
+        &mut effects,
+        job.as_mut(),
+        scope.filter(),
+        &mut redacted,
+        &mut effect_keys,
+    );
+    request.redacted_keys.extend(effect_keys);
+    request.redacted_keys.sort_unstable();
+    request.redacted_keys.dedup();
     request.peer_addr = scope.peer_addr();
     if let Some(identity) = scope.client_identity() {
         // The resolved identity is *derived from* headers, so it must obey the
@@ -367,6 +389,8 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
         db_roles: settings.db_roles.clone(),
         truncated: scope.is_truncated(),
         notes: scope.notes(),
+        effects,
+        job,
     })
 }
 

@@ -341,6 +341,476 @@ fn is_identifier_char(character: char) -> bool {
     character.is_alphanumeric() || character == '-' || character == '_'
 }
 
+// ── Effect tape redaction (#1634) ───────────────────────────────────────────
+
+/// Redact everything the effect tape recorded, in place.
+///
+/// The effect seams buffer *raw* values while the run is in flight — they have
+/// no filter handle and no business paying redaction's cost on a request that
+/// may never fail — so masking happens here, once, on the way to disk. The
+/// same [`ParameterFilter`] the inbound request is masked through is used, for
+/// a reason worth stating plainly: an **outbound** `Authorization` header
+/// carries a downstream credential exactly the way an inbound one carries the
+/// caller's, and a job payload or a cache value is as likely to hold a token
+/// as a request body is.
+///
+/// Runs in two passes, because the two mechanisms feed each other:
+///
+/// 1. **Filter pass** — sensitive header names are blanked and structured
+///    (JSON / urlencoded) payloads are scrubbed by key, seeding `values` with
+///    everything that was removed.
+/// 2. **Echo pass** — free-form text (URLs, cache keys, mail subjects, error
+///    strings) is swept for any value the first pass, *or the request's own
+///    redaction*, put in `values`.
+///
+/// Splitting them is what makes an outbound body's secret get masked out of an
+/// error message recorded by a *different* seam.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass per seam, then one echo pass per seam; splitting them \
+              would hide the two-phase ordering the doc comment above explains"
+)]
+pub fn redact_effects(
+    effects: &mut crate::capsule::schema::CapsuleEffects,
+    job: Option<&mut crate::capsule::schema::CapsuleJob>,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) {
+    // The job-entry payload first: it is the *input* the recorded run ran on,
+    // so anything masked out of it must be maskable out of every effect that
+    // quoted it back.
+    let mut job = job;
+    if let Some(job) = job.as_mut() {
+        job.payload = scrub_value(&job.payload, filter, "job_entry", values, keys);
+    }
+    for (index, exchange) in effects.http.iter_mut().enumerate() {
+        // The query string of an *outbound* URL carries secrets as readily as
+        // an inbound one's does — an API key passed as `?key=…` is the classic
+        // case — so it is masked by the same rules, before anything else reads
+        // the URL.
+        exchange.url = redact_url_query(
+            &exchange.url,
+            filter,
+            values,
+            keys,
+            &format!("http[{index}].url"),
+        );
+        // The URL a redirect *landed on* carries credentials at least as often
+        // as the one the call started with — an OAuth callback with
+        // `?access_token=` is the whole point of the pattern — so it is masked
+        // by the same rules rather than trusted for having been server-chosen.
+        if let Some(final_url) = exchange.final_url.as_ref() {
+            exchange.final_url = Some(redact_url_query(
+                final_url,
+                filter,
+                values,
+                keys,
+                &format!("http[{index}].final_url"),
+            ));
+        }
+        let request_content_type = header_value(&exchange.request_headers, "content-type");
+        let response_content_type = header_value(&exchange.response_headers, "content-type");
+        redact_effect_headers(
+            &mut exchange.request_headers,
+            filter,
+            values,
+            keys,
+            &format!("http[{index}].request_header"),
+        );
+        redact_effect_headers(
+            &mut exchange.response_headers,
+            filter,
+            values,
+            keys,
+            &format!("http[{index}].response_header"),
+        );
+        exchange.request_body = redact_effect_body(
+            &exchange.request_body,
+            &request_content_type,
+            filter,
+            values,
+            keys,
+            &format!("http[{index}].request_body"),
+        );
+        exchange.response_body = redact_effect_body(
+            &exchange.response_body,
+            &response_content_type,
+            filter,
+            values,
+            keys,
+            &format!("http[{index}].response_body"),
+        );
+    }
+
+    for (index, job) in effects.jobs.iter_mut().enumerate() {
+        job.payload = scrub_value(&job.payload, filter, &format!("job[{index}]"), values, keys);
+    }
+
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
+        match entry {
+            crate::capsule::schema::CacheEffect::Get { value, .. } => {
+                if let Some(encoded) = value.as_mut() {
+                    *encoded = scrub_encoded_json(
+                        encoded,
+                        filter,
+                        &format!("cache[{index}]"),
+                        values,
+                        keys,
+                    );
+                }
+            }
+            crate::capsule::schema::CacheEffect::Insert { value, .. } => {
+                *value =
+                    scrub_encoded_json(value, filter, &format!("cache[{index}]"), values, keys);
+            }
+        }
+    }
+
+    for (index, mail) in effects.mail.iter_mut().enumerate() {
+        mail.alternate_body = redact_effect_body(
+            &mail.alternate_body,
+            // An alternate body is the HTML half of a multipart message
+            // whenever there is one to record.
+            "text/html",
+            filter,
+            values,
+            keys,
+            &format!("mail[{index}].alternate_body"),
+        );
+        redact_effect_headers(
+            &mut mail.extra_headers,
+            filter,
+            values,
+            keys,
+            &format!("mail[{index}].header"),
+        );
+        mail.body = redact_effect_body(
+            &mail.body,
+            "text/plain",
+            filter,
+            values,
+            keys,
+            &format!("mail[{index}].body"),
+        );
+    }
+
+    // Echo pass — everything free-form, with the fully-seeded set.
+    for exchange in &mut effects.http {
+        exchange.url = mask_echoes(&exchange.url, values);
+        mask_body_echoes(&mut exchange.request_body, values);
+        mask_body_echoes(&mut exchange.response_body, values);
+        for (_, value) in exchange
+            .request_headers
+            .iter_mut()
+            .chain(exchange.response_headers.iter_mut())
+        {
+            *value = mask_echoes(value, values);
+        }
+        if let Some(error) = exchange.error.as_mut() {
+            *error = mask_echoes(error, values);
+        }
+    }
+    for entry in &mut effects.cache {
+        match entry {
+            crate::capsule::schema::CacheEffect::Get { key, .. }
+            | crate::capsule::schema::CacheEffect::Insert { key, .. } => {
+                // A cache key is routinely built out of the very arguments a
+                // request supplied (`make_cache_key` hashes them into it, and
+                // hand-built keys interpolate them), so it is free-form text
+                // that can quote a secret back.
+                *key = mask_echoes(key, values);
+            }
+        }
+    }
+    for mail in &mut effects.mail {
+        mail.subject = mask_echoes(&mail.subject, values);
+        mask_body_echoes(&mut mail.body, values);
+        mask_body_echoes(&mut mail.alternate_body, values);
+        // Recipients are the PII on this seam: an operator who filters
+        // `email` must not find the address sitting in the clear one field
+        // over, which is exactly the "filter defeated through a side door"
+        // the client-identity handling refuses to allow.
+        for recipient in &mut mail.to {
+            *recipient = mask_echoes(recipient, values);
+        }
+        // Every free-form field a caller can put a request value into, not just
+        // the obvious two: an address submitted in a form and reused as
+        // `Reply-To`, an unsubscribe link carrying a token, a filename built
+        // from user input. A value masked one field over must not sit in the
+        // clear here.
+        if let Some(reply_to) = mail.reply_to.as_mut() {
+            *reply_to = mask_echoes(reply_to, values);
+        }
+        if let Some(unsubscribe) = mail.list_unsubscribe.as_mut() {
+            *unsubscribe = mask_echoes(unsubscribe, values);
+        }
+        for (_, value) in &mut mail.extra_headers {
+            *value = mask_echoes(value, values);
+        }
+        for attachment in &mut mail.attachments {
+            attachment.filename = mask_echoes(&attachment.filename, values);
+        }
+        if let Some(from) = mail.from.as_mut() {
+            *from = mask_echoes(from, values);
+        }
+        if let Some(error) = mail.error.as_mut() {
+            *error = mask_echoes(error, values);
+        }
+    }
+    // Job payloads and cache values are structured, so the filter pass masked
+    // them *by key*; this catches the other half — a value the request already
+    // had masked that reappears under a key the filter does not name.
+    for effect in &mut effects.jobs {
+        effect.payload = mask_json_echoes(&effect.payload, values);
+        // A rejection's text is free-form and written by whatever refused the
+        // enqueue — a `JobInterceptor` can quote the payload field or the
+        // credential it rejected — so it can carry a value masked everywhere
+        // else in the capsule.
+        if let Some(error) = effect.error.as_mut() {
+            *error = mask_echoes(error, values);
+        }
+    }
+    if let Some(job) = job.as_mut() {
+        job.payload = mask_json_echoes(&job.payload, values);
+    }
+    for entry in &mut effects.cache {
+        match entry {
+            crate::capsule::schema::CacheEffect::Get { value, .. } => {
+                if let Some(encoded) = value.as_mut() {
+                    *encoded = mask_encoded_json_echoes(encoded, values);
+                }
+            }
+            crate::capsule::schema::CacheEffect::Insert { value, .. } => {
+                *value = mask_encoded_json_echoes(value, values);
+            }
+        }
+    }
+    if let Some(tenant) = effects.tenant.as_mut()
+        && let Some(id) = tenant.id.as_mut()
+    {
+        let masked = mask_echoes(id, values);
+        // The tenant is *input*: replay serves it to tenant-scoped code and to
+        // every database bind that scopes by it. A placeholder there would run
+        // the whole request under a tenant production never resolved, so the
+        // masking is recorded as a key and the capsule refused rather than
+        // replayed. (`mask_echoes` leaves an unmasked id untouched.)
+        if masked != *id {
+            keys.insert("tenant.id".to_owned());
+        }
+        *id = masked;
+    }
+}
+
+/// Mask the query string of a recorded outbound URL by parameter name.
+///
+/// Splices the masked query back onto the original prefix rather than
+/// rebuilding the URL, exactly as [`redact_uri`] does for the inbound target:
+/// re-serializing would drift percent-encoding and parameter order, and replay
+/// matches the recorded URL against the one the handler builds.
+fn redact_url_query(
+    url: &str,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) -> String {
+    let Some(split) = url.find('?') else {
+        return url.to_owned();
+    };
+    let head = url.get(..split).unwrap_or_default();
+    let query = url.get(split.saturating_add(1)..).unwrap_or_default();
+    // A fragment is not part of the query; leave it attached to the tail.
+    let (query, fragment) = query.find('#').map_or((query, ""), |hash| {
+        (
+            query.get(..hash).unwrap_or_default(),
+            query.get(hash..).unwrap_or_default(),
+        )
+    });
+    let Some(masked) = mask_raw_urlencoded(query, location, filter, values, keys) else {
+        return url.to_owned();
+    };
+    format!("{head}?{masked}{fragment}")
+}
+
+/// Sweep every string leaf of a JSON document for redacted values.
+fn mask_json_echoes(value: &serde_json::Value, redacted: &RedactedValues) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(mask_echoes(text, redacted)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| mask_json_echoes(item, redacted))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, child)| (key.clone(), mask_json_echoes(child, redacted)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// [`mask_json_echoes`] for the base64-encoded JSON cache values are stored as.
+///
+/// A value this cannot decode or parse is left alone: it was already replaced
+/// wholesale by the filter pass if it was unreadable there too.
+fn mask_encoded_json_echoes(encoded: &str, redacted: &RedactedValues) -> String {
+    let Ok(bytes) = STANDARD.decode(encoded.as_bytes()) else {
+        return encoded.to_owned();
+    };
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return encoded.to_owned();
+    };
+    let masked = mask_json_echoes(&parsed, redacted);
+    if masked == parsed {
+        return encoded.to_owned();
+    }
+    serde_json::to_vec(&masked).map_or_else(|_| encoded.to_owned(), |bytes| STANDARD.encode(&bytes))
+}
+
+/// The value of `name` in a recorded header list, lower-cased for matching.
+fn header_value(headers: &[(String, String)], name: &str) -> String {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Blank every header the filter calls sensitive, retaining what was removed.
+fn redact_effect_headers(
+    headers: &mut [(String, String)],
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) {
+    for (name, value) in headers.iter_mut() {
+        if header_is_sensitive(name, filter) || effect_header_is_sensitive(name) {
+            values.insert(value.as_bytes());
+            record_credential_components(name, value.as_bytes(), values);
+            keys.insert(format!("{location}:{name}"));
+            value.clear();
+            value.push_str(FILTERED_PLACEHOLDER);
+        }
+    }
+}
+
+/// Credential-carrying header names masked on the **outbound** seam whatever
+/// the application's filter says.
+///
+/// The inbound list can afford to be narrow: a client's own credential is what
+/// `[log] filter_parameters` is written for, and an operator who adds a custom
+/// header knows to name it. Outbound is the mirror image — the credential is
+/// the *application's*, the operator never sees these headers in a log to
+/// notice them, and the spellings are conventional rather than app-specific.
+/// Masking a header that turns out to hold nothing secret costs a replay
+/// nothing: outbound matching is on method and URL.
+const OUTBOUND_SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-auth-token",
+    "x-access-token",
+    "x-amz-security-token",
+    "x-goog-api-key",
+];
+
+/// Whether a recorded effect header is one of [`OUTBOUND_SENSITIVE_HEADERS`].
+fn effect_header_is_sensitive(name: &str) -> bool {
+    OUTBOUND_SENSITIVE_HEADERS
+        .iter()
+        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+}
+
+/// Mask a recorded effect body by key, the way an inbound body is masked.
+fn redact_effect_body(
+    body: &CapsuleBody,
+    content_type: &str,
+    filter: &ParameterFilter,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) -> CapsuleBody {
+    let CapsuleBody::Text(text) = body else {
+        // `Base64` is opaque bytes and `Absent`/`Skipped` hold nothing; there
+        // are no keys to match, so there is nothing this pass can do. The echo
+        // pass still sweeps `Text` bodies, and a binary body cannot quote a
+        // masked string back in a form a reader would recognise.
+        return body.clone();
+    };
+    if content_type.contains("json") {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+            // Same posture as an unparseable inbound JSON body: keys the
+            // filter could have matched may be in there, so retain the raw
+            // text for the echo set and do not copy it.
+            values.insert(text.as_bytes());
+            keys.insert(format!("{location}:<unparseable json>"));
+            return CapsuleBody::Text(FILTERED_PLACEHOLDER.to_owned());
+        };
+        let before = keys.len();
+        let scrubbed = scrub_value(&parsed, filter, location, values, keys);
+        if keys.len() == before {
+            return body.clone();
+        }
+        retain_raw_json_string_spellings(text.as_bytes(), values);
+        return serde_json::to_string(&scrubbed)
+            .map_or_else(|_| CapsuleBody::Absent, CapsuleBody::Text);
+    }
+    if content_type.contains("application/x-www-form-urlencoded")
+        && let Some(masked) = mask_raw_urlencoded(text, location, filter, values, keys)
+    {
+        return CapsuleBody::Text(masked);
+    }
+    body.clone()
+}
+
+/// Sweep a recorded body for values redaction removed elsewhere.
+fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) {
+    if let CapsuleBody::Text(text) = body {
+        *text = mask_echoes(text, values);
+    }
+}
+
+/// Scrub base64-encoded JSON (the form cache values are recorded in) by key,
+/// returning it re-encoded.
+///
+/// A value that is not base64, or not JSON, is replaced wholesale: a cache
+/// entry this pass cannot read is one it cannot prove is free of secrets.
+fn scrub_encoded_json(
+    encoded: &str,
+    filter: &ParameterFilter,
+    location: &str,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+) -> String {
+    let Ok(bytes) = STANDARD.decode(encoded.as_bytes()) else {
+        keys.insert(format!("{location}:<undecodable>"));
+        return STANDARD.encode(FILTERED_PLACEHOLDER.as_bytes());
+    };
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        values.insert(&bytes);
+        keys.insert(format!("{location}:<unparseable json>"));
+        return STANDARD.encode(FILTERED_PLACEHOLDER.as_bytes());
+    };
+    let before = keys.len();
+    let scrubbed = scrub_value(&parsed, filter, location, values, keys);
+    if keys.len() == before {
+        return encoded.to_owned();
+    }
+    retain_raw_json_string_spellings(&bytes, values);
+    serde_json::to_vec(&scrubbed).map_or_else(
+        |_| STANDARD.encode(FILTERED_PLACEHOLDER.as_bytes()),
+        |bytes| STANDARD.encode(&bytes),
+    )
+}
+
 /// Mask any bind parameter whose bytes exactly echo a redacted request value.
 pub fn mask_binds(binds: &mut [BindValue], redacted: &RedactedValues) {
     if redacted.is_empty() {
@@ -1170,6 +1640,232 @@ fn retain_raw_json_string_spellings(bytes: &[u8], values: &mut RedactedValues) {
 
 #[cfg(test)]
 mod tests {
+    // ── Effect-tape redaction (#1634) ───────────────────────────────────
+
+    mod effects {
+        use super::super::*;
+        use crate::capsule::schema::{
+            CacheEffect, CapsuleEffects, CapsuleJob, HttpEffect, JobEffect, MailEffect,
+            TenantEffect,
+        };
+
+        fn filter() -> ParameterFilter {
+            ParameterFilter::new(&["api_key".to_owned(), "email".to_owned()], &[])
+        }
+
+        fn exchange(url: &str) -> HttpEffect {
+            HttpEffect {
+                method: "POST".to_owned(),
+                url: url.to_owned(),
+                request_headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("x-api-key".to_owned(), "sk-live-42".to_owned()),
+                ],
+                request_body: CapsuleBody::Text(
+                    r#"{"api_key":"sk-live-42","amount":10}"#.to_owned(),
+                ),
+                status: 502,
+                response_headers: vec![(
+                    "set-cookie".to_owned(),
+                    "session=abc; HttpOnly".to_owned(),
+                )],
+                response_body: CapsuleBody::Text(r#"{"api_key":"sk-live-42"}"#.to_owned()),
+                error: None,
+                ..Default::default()
+            }
+        }
+
+        fn redact(effects: &mut CapsuleEffects) -> BTreeSet<String> {
+            let mut values = RedactedValues::default();
+            let mut keys = BTreeSet::new();
+            redact_effects(effects, None, &filter(), &mut values, &mut keys);
+            keys
+        }
+
+        #[test]
+        fn an_outbound_credential_header_is_masked_whatever_the_app_filter_says() {
+            // `x-api-key` is in no default inbound filter list, but on the
+            // outbound seam the credential is the *application's* and the
+            // operator never sees the header in a log to think to name it.
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://api.example/charge")],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let exchange = effects.http.first().expect("one exchange");
+            assert!(
+                exchange
+                    .request_headers
+                    .iter()
+                    .any(|(name, value)| name == "x-api-key" && value == "[FILTERED]"),
+                "{:?}",
+                exchange.request_headers
+            );
+            assert!(
+                exchange
+                    .response_headers
+                    .iter()
+                    .any(|(name, value)| name == "set-cookie" && value == "[FILTERED]"),
+                "a Set-Cookie on the response half carries a credential too: {:?}",
+                exchange.response_headers
+            );
+            assert!(
+                keys.iter()
+                    .any(|key| key.contains("http[0].request_header:x-api-key")),
+                "{keys:?}"
+            );
+        }
+
+        #[test]
+        fn an_outbound_url_query_is_masked_by_parameter_name() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange(
+                    "https://api.example/charge?api_key=sk-live-42&page=2",
+                )],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert!(!url.contains("sk-live-42"), "{url}");
+            assert!(
+                url.contains("page=2"),
+                "the rest of the query survives: {url}"
+            );
+        }
+
+        #[test]
+        fn outbound_json_bodies_are_masked_by_key_on_both_halves() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://api.example/charge")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let exchange = effects.http.first().expect("one exchange");
+            let serialized = serde_json::to_string(exchange).expect("serializes");
+            assert!(
+                !serialized.contains("sk-live-42"),
+                "no half of the exchange may carry the credential: {serialized}"
+            );
+            let CapsuleBody::Text(request_body) = &exchange.request_body else {
+                panic!("expected a text body, got {:?}", exchange.request_body);
+            };
+            assert!(
+                request_body.contains(r#""amount":10"#),
+                "unfiltered fields survive: {request_body}"
+            );
+        }
+
+        #[test]
+        fn job_payloads_cache_values_and_the_job_entry_are_masked_by_key() {
+            use base64::Engine as _;
+            let secret = STANDARD.encode(br#"{"api_key":"sk-live-42"}"#);
+            let mut effects = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "notify".to_owned(),
+                    payload: serde_json::json!({"api_key": "sk-live-42", "order": 7}),
+                    delay_secs: None,
+                    due_at: None,
+                    error: None,
+                }],
+                cache: vec![CacheEffect::Insert {
+                    key: "creds".to_owned(),
+                    value: secret,
+                    ttl_secs: None,
+                }],
+                ..CapsuleEffects::default()
+            };
+            let mut entry = CapsuleJob {
+                name: "notify".to_owned(),
+                payload: serde_json::json!({"api_key": "sk-live-42"}),
+            };
+            let mut values = RedactedValues::default();
+            let mut keys = BTreeSet::new();
+            redact_effects(
+                &mut effects,
+                Some(&mut entry),
+                &filter(),
+                &mut values,
+                &mut keys,
+            );
+
+            let serialized = serde_json::to_string(&effects).expect("serializes");
+            assert!(!serialized.contains("sk-live-42"), "{serialized}");
+            assert!(
+                !serde_json::to_string(&entry)
+                    .expect("serializes")
+                    .contains("sk-live-42"),
+                "a job capsule's own arguments are input, and are masked like any other"
+            );
+            let CacheEffect::Insert { value, .. } = effects.cache.first().expect("one entry")
+            else {
+                panic!("expected an insert, got {:?}", effects.cache.first());
+            };
+            let decoded = STANDARD.decode(value.as_bytes()).expect("base64");
+            assert!(
+                !String::from_utf8_lossy(&decoded).contains("sk-live-42"),
+                "cache values are masked inside their base64 envelope"
+            );
+        }
+
+        #[test]
+        fn a_value_masked_out_of_the_request_is_masked_wherever_an_effect_echoes_it() {
+            // The two-pass design: the filter pass seeds the echo set, the echo
+            // pass sweeps everything free-form — including seams whose own keys
+            // never matched the filter.
+            let mut values = RedactedValues::default();
+            values.insert(b"hunter2secret");
+            let mut effects = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "notify".to_owned(),
+                    // `pw` is in no filter list.
+                    payload: serde_json::json!({"pw": "hunter2secret"}),
+                    delay_secs: None,
+                    due_at: None,
+                    error: None,
+                }],
+                mail: vec![MailEffect {
+                    to: vec!["hunter2secret@example.com".to_owned()],
+                    from: None,
+                    subject: "hunter2secret".to_owned(),
+                    body: CapsuleBody::Text("your key is hunter2secret".to_owned()),
+                    error: None,
+                    ..Default::default()
+                }],
+                tenant: Some(TenantEffect {
+                    id: Some("hunter2secret".to_owned()),
+                }),
+                ..CapsuleEffects::default()
+            };
+            let mut keys = BTreeSet::new();
+            redact_effects(&mut effects, None, &filter(), &mut values, &mut keys);
+
+            let serialized = serde_json::to_string(&effects).expect("serializes");
+            assert!(
+                !serialized.contains("hunter2secret"),
+                "a value redaction already removed must not reappear on another seam: \
+                 {serialized}"
+            );
+        }
+
+        #[test]
+        fn an_unparseable_json_effect_body_is_replaced_rather_than_copied() {
+            let mut effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Text(r#"{"api_key":"sk-live-42","#.to_owned()),
+                    ..exchange("https://api.example/charge")
+                }],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let body = &effects.http.first().expect("one exchange").request_body;
+            assert_eq!(
+                body,
+                &CapsuleBody::Text("[FILTERED]".to_owned()),
+                "a body whose keys cannot be read cannot be shown to be safe"
+            );
+        }
+    }
+
     use super::*;
     use axum::http::{Request, header};
 

@@ -73,6 +73,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end
   to end, including the `git diff` / `git checkout --` revert path.
 
+- **Replay capsules now record every framework effect a failing request
+  touched, and one command turns a capsule into a committed regression test:**
+  [#1634](https://github.com/autumn-foundation/autumn/issues/1634) extends the
+  deterministic replay capsules from
+  [#1598](https://github.com/autumn-foundation/autumn/issues/1598) past the
+  inbound request, the database and the clock. A capsule now also carries the
+  **outbound HTTP** exchanges the run made (so outbound webhook deliveries come
+  along, they send through the same client), the **jobs** it enqueued, its
+  **cache** reads and writes, the **mail** it sent, the **tenant** it resolved,
+  and every **random draw** it took — each captured at the one choke point every
+  code path funnels through, so a capsule cannot miss an effect because a
+  handler reached it a different way. Replay serves all of them from the
+  capsule with the same no-live-effects posture the database tape has: an
+  outbound call is answered from the recording rather than dialled, an enqueue
+  is asserted and never written to a queue, mail is asserted and never
+  delivered (a recorded *delivery failure* is reproduced as one, so a handler
+  whose bug is that it mishandles a suppressed recipient meets it again), and a
+  framework-minted identifier — a session id, a CSRF token, a
+  request id, a job id — reappears byte-for-byte, because Autumn records the
+  drawn bytes rather than a seed (production runs the OS CSPRNG, which has none,
+  and a re-seeded stream would mint different UUIDs than the ones the capsule's
+  own SQL binds were bound with). An effect the replayed code performs that the
+  recording never did — and a recorded effect it never performs — are both
+  divergences, exactly as they already were for SQL. A failure *inside* a job
+  execution produces a job-scoped capsule replayable the same way.
+  `autumn capsule test <capsule>` converts a triaged capsule into a
+  `#[tokio::test]` in the app's consolidated integration suite: the capsule's
+  bytes are copied **verbatim** into `tests/capsules/` — nothing re-derived, so
+  whatever redaction removed stays removed — a test is generated beside it, both
+  are registered in `tests/integration/mod.rs`, and a router hook is scaffolded
+  once and then left alone. The generated test drives the same
+  `capsule::execute` engine `autumn replay` does (so the two can never disagree
+  about what a reproduction is) and runs under plain `cargo test` with **zero
+  live dependencies** — no network, database, queue or Docker, including for
+  DB-touching capsules, whose pool comes from the in-process stub server
+  rebuilt out of the recorded wire frames. `autumn capsule verify` is the
+  whole-corpus mode; an empty corpus is a failure, never a vacuous pass. Effects
+  are redacted through the same `[log] filter_parameters` list the inbound
+  request is — an *outbound* `Authorization` header carries a downstream
+  credential exactly the way an inbound one carries the caller's — and the
+  `redacted_keys` manifest names every masked effect location. See
+  [Failure Capsules](docs/guide/failure-capsules.md).
+  **Breaking:** the capsule `format_version` bumps `2 → 3`, so a capsule
+  recorded by an older Autumn is **refused** rather than replayed with every new
+  seam empty, and `capsule::execute` takes a `ReplayFixtures` (the clock, the
+  entropy source and the effect tape from one capsule) in place of its
+  `Option<&ReplayClock>`. Capsules on disk are not migrated: replay them with
+  the version that wrote them, or re-record. See
+  [the migration guide](docs/migrations/next.md).
+  A capsule commits to a verdict only where it can be honest about one, so
+  four cases refuse or declare themselves incomplete rather than grade a run:
+  an outbound call or a mail send is served from the tape only when its
+  *contents* match too — same endpoint but a different amount, or the same
+  recipients but a different letter, is a divergence rather than a clean
+  reproduction (a mail *sender* counts only when the replayed run chose one,
+  since a message that names no `from` inherits `[mail] from` at send time and
+  a replay boots without mail configuration); a job capsule whose payload `[log] filter_parameters` masked is
+  refused, because a handler is handed its payload verbatim and would parse the
+  `[FILTERED]` placeholder; an effect whose future was cancelled before it
+  finished (a losing `tokio::select!` branch) marks the capsule incomplete
+  instead of persisting a backend failure the run never had; and a run that
+  enqueued inside its own transaction (`enqueue_on_conn`) does the same, since
+  that enqueue is also a job-row INSERT on the database tape that replay can
+  serve but never issue. A **panicking** job now leaves a capsule whatever its
+  attempt number: all three backends dead-letter a panic immediately, so its
+  first attempt is also its last, and gating capture on the final attempt meant
+  the job failure most worth a capsule never produced one.
+  Two further rules keep a verdict honest. A recorded **failure** is rebuilt
+  with its own error variant and its exact recorded text — no replay marker —
+  so a handler that branches on `ClientError::CircuitBreakerOpen` or
+  `MailError::AllRecipientsSuppressed` takes the branch it took in production,
+  and one that propagates the error produces the same outcome message rather
+  than a spurious mismatch. And a **mail send** is compared on everything a
+  recipient would notice: both halves of a multipart body, reply-to,
+  `List-Unsubscribe`, caller-set headers, and each attachment by name, type,
+  size and SHA-256 (never its bytes — an invoice has no business being copied
+  into a capsule). `autumn capsule verify` now also checks that every committed
+  capsule still has a generated test wired into the consolidated suite: it runs
+  the corpus by name filter, so a deleted test would otherwise be skipped in
+  silence while the corpus reported that it replays clean.
+  An `enqueue_at` deadline is compared as a deadline rather than as a delay
+  derived from it, so a job rescheduled to a different instant is noticed; a
+  capsule whose outbound *response body* or *cache hit* was masked is refused,
+  since that data reaches the handler as input rather than as something
+  compared; the mail redaction sweep covers reply-to, `List-Unsubscribe`,
+  caller-set header values and attachment filenames, so a value filtered
+  elsewhere cannot sit in the clear one field over; and a response's final
+  post-redirect URL is recorded and restored, for handlers that inspect
+  `Response::url()`.
+  Redaction reaches three places it had missed, two of which leaked: the URL a
+  redirect landed on (an OAuth callback carries `access_token` in its query as
+  a matter of course) and an enqueue rejection's free-form error text, both of
+  which could hold a value filtered everywhere else in the capsule. The third
+  is the resolved tenant, which — like a response header and the response body
+  — is *input* rather than compared data, so a masked one now refuses instead
+  of running the request under a tenant production never resolved. A cache hit
+  whose value will not serialize marks the capsule incomplete rather than
+  recording as a miss the handler never took. And `autumn capsule test` now
+  writes the Cargo test target that compiles the generated suite: Cargo does
+  not descend into `tests/` subdirectories, so without a top-level `mod
+  integration;` the generated tests were never built and `cargo test capsule_`
+  matched nothing — which `autumn capsule verify` now reports as unusable
+  rather than as a clean corpus.
+  Replay also dispatches a recorded job through the application's
+  `JobInterceptor` when one is registered, since that is part of how the
+  recorded run executed; an `enqueue_after_commit` is recorded where the
+  handler registers it, because the deferred callback runs on a task that does
+  not inherit the capture scope and the enqueue would otherwise be missing from
+  the capsule and diverge on every faithful replay; the generated support
+  module names Axum through `autumn_web::reexports::axum`, which is the only
+  path that resolves in an application that does not depend on Axum directly;
+  and a non-UTF-8 outbound response header is preserved lossily rather than
+  recorded as empty.
+  A cache write records the expiry it asked for and compares on it, since a
+  five-second entry and a permanent one are different mutations; a write whose
+  value will not serialize marks the capsule incomplete, as the matching read
+  already did; an attachment filename compares through the redaction wildcard
+  while its type, length and digest stay exact, so a masked filename does not
+  report a divergence against unchanged code; and outbound request and response
+  headers are charged against `max_capsule_bytes`, which they had escaped.
+
 ### Fixed
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
@@ -7088,4 +7209,3 @@ To opt out of the generated `page` method: implement your own list handler using
 - Commit CHANGELOG.md back to trunk on release([6b5eb82](https://github.com/madmax983/autumn/commit/6b5eb82b27d3932880f21b3cc3afc0fc29fa8790))
 - Add codecov, dependabot, and changelog tooling for v0.1 (#9)([db0d670](https://github.com/madmax983/autumn/commit/db0d6705c6379880fd51c48ae728824530cce5cb))
 - Update sprint status — Sprint 2 complete (13/12 pts)([07e0738](https://github.com/madmax983/autumn/commit/07e07387190401f4208f4a3eca1298bcaef5e856))
-

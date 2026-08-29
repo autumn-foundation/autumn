@@ -3492,6 +3492,17 @@ impl AppBuilder {
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
+        // Same for the entropy source (#1634): a handler that mints a session
+        // id, a token or a job id must mint the *recorded* one on replay, or
+        // the identifier in the capsule's SQL binds will not be the one the
+        // replayed code produced.
+        #[cfg(feature = "reporting")]
+        if config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingEntropy::new(state.entropy_arc()))
+                    as std::sync::Arc<dyn crate::entropy::Entropy>;
+            state = state.with_entropy(recording);
+        }
 
         // Wire the in-memory log capture buffer from the telemetry guard into the
         // app state so the `/actuator/logfile` endpoint can serve it.
@@ -6317,6 +6328,15 @@ impl AppBuilder {
             state_initializers,
             config_loader_factory,
             telemetry_provider,
+            // Kept (rather than dropped with the rest of the runtime) so a
+            // *job-entry* capsule can dispatch the recorded job's handler
+            // (#1634). No job runtime, scheduler or backend is started: the
+            // handler is called directly, exactly once, with the recorded
+            // payload — through the application's `JobInterceptor` when it
+            // registered one, since that is part of how the recorded run
+            // executed and dropping it would replay a different path.
+            jobs,
+            job_interceptor,
             // F15: deliberately *not* destructured. A store installed with
             // `with_session_store(...)` outranks `config.session.backend` in
             // `apply_session_layer`, so forwarding it would let a replay dial —
@@ -6437,25 +6457,12 @@ impl AppBuilder {
             None,
         );
 
-        // Time is an input like any other: serve the readings the capture took,
-        // in order.
-        let fallback = capsule
-            .clock
-            .first()
-            .copied()
-            .unwrap_or(capsule.captured_at);
-        let clock = std::sync::Arc::new(
-            crate::capsule::ReplayClock::new(capsule.clock.clone(), fallback).with_monotonic(
-                capsule
-                    .clock_monotonic_us
-                    .iter()
-                    .map(|us| std::time::Duration::from_micros(*us))
-                    .collect(),
-            ),
-        );
-        state = state.with_clock(
-            std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::time::ClockSource>
-        );
+        // Time, randomness and the effect seams are all inputs like any other:
+        // serve what the capture took, in order (#1598 for the clock, #1634
+        // for entropy and the effect tape).
+        let fixtures = crate::capsule::ReplayFixtures::from_capsule(&capsule);
+        state = state.with_clock(fixtures.clock());
+        state = state.with_entropy(fixtures.entropy());
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
@@ -6492,6 +6499,9 @@ impl AppBuilder {
         // comment in `run()`.
         state.insert_extension(config.clone());
 
+        // Cloned before the builder consumes it, so a job capsule can dispatch
+        // its handler against the same rebuilt state the router serves from.
+        let router_state = state.clone();
         let router = crate::router::try_build_router_inner(
             routes,
             &config,
@@ -6519,8 +6529,36 @@ impl AppBuilder {
             ))
         });
 
-        let outcome =
-            crate::capsule::execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+        // A job capsule has no request to drive: dispatch the recorded job's
+        // handler instead, with the same clock, entropy and effect tape.
+        let outcome = if let Some(job) = capsule.job.as_ref() {
+            let Some(info) = jobs.iter().find(|info| info.name == job.name) else {
+                std::process::exit(crate::capsule::print_refusal(
+                    &format!(
+                        "the capsule records a failure in job {:?}, which this build does not \
+                         register; replay it against the build that ran it, or add the job to \
+                         `AppBuilder::jobs()`",
+                        job.name
+                    ),
+                    &path,
+                ));
+            };
+            let handler = info.handler;
+            let job_state = router_state.clone();
+            if let Some(interceptor) = job_interceptor {
+                job_state.insert_extension(interceptor);
+            }
+            let job_name = job.name.clone();
+            let dispatch: crate::capsule::JobDispatch = Box::new(move |payload| {
+                Box::pin(async move {
+                    crate::job::run_handler_with_interceptor(&job_name, handler, job_state, payload)
+                        .await
+                })
+            });
+            crate::capsule::execute_job(dispatch, &capsule, divergences, &fixtures).await
+        } else {
+            crate::capsule::execute(router, &capsule, divergences, &fixtures).await
+        };
         std::process::exit(crate::capsule::print_verdict(&outcome, &path));
     }
 }
