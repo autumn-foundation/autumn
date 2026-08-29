@@ -16,6 +16,8 @@ mod bot_protection_pipeline;
 mod boundary_hooks_integration;
 #[cfg(feature = "ws")]
 mod broadcast_recorder;
+#[cfg(all(feature = "db", feature = "cache-moka"))]
+mod cache_coherence;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(feature = "ws")]
@@ -85,6 +87,8 @@ mod failure_capsule_capture;
     not(feature = "sqlite")
 ))]
 mod failure_capsule_db;
+#[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
+mod failure_capsule_effects;
 #[cfg(all(
     feature = "reporting",
     feature = "db",
@@ -116,6 +120,9 @@ mod htmx_serving;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 mod idempotency_middleware;
+mod impersonation;
+#[cfg(feature = "db")]
+mod impersonation_versioned_db;
 #[cfg(feature = "inbound-mail")]
 mod inbound_mail_integration;
 mod ingress_named_futures;

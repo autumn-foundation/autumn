@@ -1,0 +1,5 @@
+error: `reads()` must name at least one model, e.g. `reads(Post)`; omit it entirely to let the macro derive the dependency set
+ --> tests/compile-fail/cached_reads_empty.rs:5:10
+  |
+5 | #[cached(reads())]
+  |          ^^^^^^^

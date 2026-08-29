@@ -154,6 +154,67 @@ CSRF tokens are injected by the plugin into every state-changing form
 (`POST /admin/{slug}`, `POST /admin/{slug}/{id}`, `DELETE /admin/{slug}/{id}`)
 when the app enables CSRF protection. No changes to generated code are needed.
 
+## Impersonation
+
+Turn on "log in as this user" for the panel with one call:
+
+```rust,ignore
+use autumn_admin_plugin::AdminPlugin;
+use autumn_web::auth::impersonation::ImpersonationGate;
+
+AdminPlugin::new()
+    .register(UserAdmin::default())
+    .with_impersonation(ImpersonationGate::allow_roles(["admin"]))
+```
+
+That mounts two routes:
+
+| Route | Guard |
+|---|---|
+| `POST /admin/impersonate` (body: `user_id`, optional `return_to`) | admin role + step-up (if enabled) + the gate |
+| `POST /admin/impersonate/stop` | none — reverting must always work |
+
+The revert route sits **outside** the role gate on purpose: while impersonating,
+the session carries the target's role (usually none), so a gated revert would
+trap the operator in the target's identity. It is self-gating — a session that
+is not impersonating gets a `400` and nothing changes.
+
+Every admin page renders a persistent banner naming both parties with a
+one-click revert — but with the default `target_role` the impersonated session
+carries no role, so the admin panel itself is closed to it. **The banner belongs
+in your application's layout**, which is the surface an operator actually looks
+at while impersonating a customer:
+
+```rust,ignore
+#[get("/")]
+async fn home(State(state): State<AppState>, session: Session, csrf: CsrfToken) -> Markup {
+    let banner = autumn_admin_plugin::impersonation_banner_for(
+        &state, &session, "/admin", csrf.token(), "_csrf",
+    ).await;
+    html! {
+        body {
+            @if let Some(banner) = banner { (banner) }
+            main { "…" }
+        }
+    }
+}
+```
+
+Add `autumn_admin_plugin::IMPERSONATION_BANNER_CSS` to that layout's stylesheet;
+the plugin's own pages already include it. To send the operator back to the page
+they were on instead of to `/admin`, build the banner yourself and set a return
+path: `ImpersonationBanner::new(state, "/admin", token, field).returning_to(path)`
+— the revert route re-validates it as a same-origin relative path.
+
+Impersonation also requires an audit sink: `begin_impersonation` refuses with
+`500` when none is installed, and the plugin logs an error at startup so you
+find out at boot rather than in front of a customer.
+
+Without `with_impersonation` neither route is mounted, and the underlying
+primitive default-denies — see the [authentication
+guide](./authentication.md#impersonation-log-in-as-this-user) for what the swap
+guarantees and refuses.
+
 ## Running the generated smoke tests
 
 Three tests are generated in `tests/<snake>_admin.rs`:

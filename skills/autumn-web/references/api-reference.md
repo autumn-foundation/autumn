@@ -112,14 +112,14 @@ copy of the publish order.
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)` |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
-| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
+| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
-| `#[cached]` | Memoize function results |
+| `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
 | `#[job]`, `jobs![...]` | Request-triggered background jobs |
 | `#[task]`, `one_off_tasks![...]` | Operator tasks invoked by CLI |
@@ -921,6 +921,31 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
+- **(unreleased, #1394)**: admin impersonation —
+  `autumn_web::auth::impersonation::{begin_impersonation, end_impersonation,
+  impersonator_id, is_impersonating, impersonation_state, audit_actor_id, clear,
+  Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationTarget,
+  ImpersonationState, IMPERSONATOR_SESSION_KEY, IMPERSONATED_SESSION_KEY}`, plus
+  `AppBuilder::impersonation_gate`. Default-deny behind an
+  `ImpersonationGate` registered in `AppState`, and refused outright without an
+  audit sink
+  (`allow_roles([..])` / `custom(policy)` / `deny_all()`); the session's
+  effective user becomes the target while `Current::actor` — and therefore
+  `#[repository(versioned)]` rows and audit events — stays the real
+  impersonator. Both edges rotate the session id and emit
+  `auth.impersonation.begin` / `.end` audit events carrying
+  `actor_id` = the impersonator and `target_resource_id` = the target. No
+  nesting (`409`); the impersonated role comes only from
+  `ImpersonationPolicy::target_role`, never request input; the operator's
+  step-up claim is stashed for the duration; a record whose recorded target no
+  longer matches the session's effective user is stale and is ignored; an
+  `auth.session_key` colliding with `RESERVED_SESSION_KEYS` is refused
+  (`is_reserved_session_key`).
+  Admin UI: `AdminPlugin::with_impersonation(gate)`,
+  `autumn_admin_plugin::{impersonation_banner_for, impersonation_banner,
+  ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes
+  `POST {prefix}/impersonate` (gated) and `POST {prefix}/impersonate/stop`
+  (ungated on purpose). Session-based auth only.
 
 ## Submit tokens (0.6.0, #1360)
 

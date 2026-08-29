@@ -9,7 +9,7 @@
 //! `{"type":"object","title":"X"}` placeholder.
 //!
 //! This derive mirrors the schema `#[model]` already generates
-//! (`crate::model::emit_schema_fn_body`): each field becomes a JSON-schema
+//! (`crate::schema::emit_schema_fn_body`): each field becomes a JSON-schema
 //! property and every non-`Option` field is `required`. It additionally submits
 //! the schema into the compile-time `DerivedSchemaDescriptor` inventory that the
 //! spec/MCP back-fill loops consult, so a referenced struct resolves to its real
@@ -66,9 +66,9 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
     // Honor a container `#[serde(rename_all = "...")]` on the derived struct so
     // the advertised property names + `required` entries match the serialized
     // wire names — same helper/precedence `#[model]` and `FormModel` use.
-    let rename_all_rule = crate::model::serde_rename_all_serialize_rule(&input.attrs);
+    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
     let schema_body =
-        crate::model::emit_schema_fn_body(&field_ref_refs, false, rename_all_rule.as_deref());
+        crate::schema::emit_schema_fn_body(&field_ref_refs, false, rename_all_rule.as_deref());
 
     quote! {
         impl ::autumn_web::openapi::OpenApiSchema for #name {

@@ -84,7 +84,8 @@ the framework almost certainly already generates or ships it:
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
-| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + PostgreSQL wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598) |
+| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
+| Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -978,6 +979,51 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
+
+### Admin impersonation (unreleased, issue #1394)
+
+"Log in as this user" without breaking the audit trail. Never hand-roll it
+with `session.insert("user_id", target)` — that makes every subsequent version
+row and audit event claim the *customer* did it.
+
+`autumn_web::auth::impersonation::begin_impersonation(&state, &session, target)`
+swaps the session's **effective** user and records the real admin separately
+under a reserved `impersonator_id` key, so `#[secured]` / `RequireAuth` /
+`PolicyContext` see the impersonated user while the ambient current actor
+(`Current::actor`, which seeds `#[repository(versioned)]` rows and audit
+events) stays the **real impersonator**. `end_impersonation(&state, &session)`
+reverts. `impersonator_id(&state, &session)` is the separate accessor;
+`impersonation_state(&state, &session)` returns both ids, and the
+`Impersonation` extractor is the handler-side form. Register the gate with
+`AppBuilder::impersonation_gate(...)`.
+
+Default-deny: it needs an `ImpersonationGate` in `AppState` —
+`ImpersonationGate::allow_roles(["admin"])`, or `::custom(policy)` with an
+`ImpersonationPolicy` (the seam for tenancy checks and for
+`target_role`, which resolves the impersonated session's role **server-side**;
+never accept a role from request input). Missing gate or a refusal is `403`.
+Both edges rotate the session id and write `auth.impersonation.begin` /
+`.end` audit events carrying `{impersonator_id, target_id}`; a begin is refused
+when the audit write fails **or when no audit sink is installed at all** — wire
+`AppBuilder::with_audit_sink(...)` before enabling it. The operator's step-up
+claim is stashed and dropped for the duration (so a `#[step_up]` action cannot
+be run on the target's account on the operator's re-auth) and restored on
+revert; the record is bound to the user it names *and* to the session
+generation that created it, so a login (which rotates the session id) retires
+it — a forgotten impersonation cannot be inherited by the next user, not even by
+the impersonated customer signing in as themselves. Call
+`impersonation::clear(&session)` from any login flow to drop it outright. No nesting (`409`), no self-impersonation, and
+the admin's own step-up claim is preserved rather than refreshed.
+
+For the UI, `AdminPlugin::with_impersonation(gate)` mounts
+`POST {prefix}/impersonate` (behind the role gate + the `ImpersonationGate`)
+and `POST {prefix}/impersonate/stop` — deliberately *outside* the role gate, so
+an operator impersonating a non-admin is never trapped — and renders a
+persistent "Viewing as … — Stop impersonating" banner on every admin page. Put
+the same banner in the app's own layout with
+`autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
+csrf_token, csrf_form_field)` plus `IMPERSONATION_BANNER_CSS`. Session-based
+auth only. See `docs/guide/authentication.md` and `docs/guide/admin.md`.
 
 ### Cookie consent (0.7.0, issue #1214)
 
