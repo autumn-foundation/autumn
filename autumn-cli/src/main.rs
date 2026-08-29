@@ -4,6 +4,7 @@ mod a11y;
 mod alert;
 mod assets;
 mod build;
+mod cache_audit;
 mod canary;
 mod capsule;
 mod check;
@@ -98,6 +99,62 @@ pub enum RoutesSubcommands {
         #[arg(long)]
         strict: bool,
     },
+}
+
+/// Arguments for [`CacheSubcommands::Audit`].
+///
+/// A separate `Args` struct rather than inline variant fields, for the same
+/// reason as `UpgradeArgs`: clap's derive builds every inline field of every
+/// variant inside one `Commands::augment_subcommands` frame, and that frame is
+/// already within a kilobyte of libtest's 2 MiB thread stack. Five more inline
+/// fields is exactly the kind of increment that decides whether the
+/// argument-parsing tests overflow, so this command keeps its share out of the
+/// shared frame: an `Args` struct gets its own `CacheAuditArgs::augment_args`
+/// frame, which pops before the next variant is built.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct CacheAuditArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON cache-coherence manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Also fail when a cached read's dependency set could not be established
+    /// (the default only warns, so the gate never cries wolf).
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the audited binary with (repeatable; a
+    /// comma-separated list also works). A `#[cached]` read or `#[repository]`
+    /// write behind a feature the build does not enable is not compiled in, so
+    /// it cannot appear in the manifest — audit the feature set you deploy.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the audited binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the audited binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+}
+
+/// Subcommands for `autumn cache`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum CacheSubcommands {
+    /// Prove cached reads are never left stale by a repository write (#1716).
+    ///
+    /// Compiles the app, reads back the cache-coherence manifest the framework
+    /// assembles from every `#[cached]` read and every `#[repository]` write it
+    /// links, and exits non-zero when a mutation's model appears in a cached
+    /// read's dependency set with no invalidation covering the pair — naming
+    /// the read, the mutation and the shared model. This is the CI gate.
+    Audit(CacheAuditArgs),
 }
 
 /// Subcommands for `autumn i18n`.
@@ -1241,6 +1298,21 @@ enum Commands {
     ///   autumn canary status
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
+
+    /// Cache-coherence tooling — prove no write can leave a cached read stale.
+    ///
+    /// `autumn cache audit` compiles the application, reads back the
+    /// cache-coherence manifest the framework assembles from every `#[cached]`
+    /// read and every `#[repository]` write it links, and exits non-zero when a
+    /// write can strand a cached value with no invalidation covering the pair.
+    ///
+    /// # Examples
+    ///
+    ///   autumn cache audit
+    ///   autumn cache audit --manifest target/cache-coherence.json
+    ///   autumn cache audit --strict -p blog
+    #[command(subcommand, verbatim_doc_comment)]
+    Cache(CacheSubcommands),
 
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
@@ -3702,6 +3774,21 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Cache(CacheSubcommands::Audit(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            cache_audit::run(&cache_audit::CacheAuditOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                strict: args.strict,
+                features,
+            });
+        }
         Commands::Routes {
             package,
             bin,
@@ -6732,6 +6819,138 @@ mod tests {
             Commands::Routes { command, .. } => assert!(command.is_none()),
             _ => panic!("expected Routes command"),
         }
+    }
+
+    // ── autumn cache audit tests (#1716) ───────────────────────────────────
+
+    #[test]
+    fn parse_cache_audit_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(args.package.is_none());
+                assert!(args.bin.is_none());
+                assert!(args.manifest.is_none());
+                assert!(!args.json);
+                // The default gate never fails on what it merely could not
+                // read; `--strict` is opt-in.
+                assert!(!args.strict);
+                assert!(args.features.is_empty());
+                assert!(!args.all_features);
+                assert!(!args.no_default_features);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    /// The manifest describes the binary that produced it, so the audited
+    /// build has to be the one that ships. A read or a repository behind a
+    /// non-default feature is not compiled into a default build at all — it
+    /// cannot appear in the manifest, and the gate exits green on a
+    /// configuration it never looked at.
+    #[test]
+    fn parse_cache_audit_forwards_the_cargo_feature_selection() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "cache",
+            "audit",
+            "--no-default-features",
+            "--features",
+            "db,cache-moka",
+            "--features",
+            "redis",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert_eq!(args.features, vec!["db,cache-moka", "redis"]);
+                assert!(args.no_default_features);
+                assert!(!args.all_features);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        let all = Cli::try_parse_from(["autumn", "cache", "audit", "--all-features"]).unwrap();
+        match all.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => assert!(args.all_features),
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_cache_audit_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "cache",
+            "audit",
+            "-p",
+            "blog",
+            "--bin",
+            "server",
+            "--manifest",
+            "target/cache-coherence.json",
+            "--json",
+            "--strict",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert_eq!(args.package.as_deref(), Some("blog"));
+                assert_eq!(args.bin.as_deref(), Some("server"));
+                assert_eq!(
+                    args.manifest.as_deref(),
+                    Some("target/cache-coherence.json")
+                );
+                assert!(args.json);
+                assert!(args.strict);
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn cache_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["autumn", "cache"]).is_err());
+    }
+
+    /// A variant inserted between a doc comment and the variant it documents
+    /// silently steals that help text and leaves the other with none — which is
+    /// exactly what happened to `routes` when `cache` was added.
+    ///
+    /// Runs on its own 16 MiB thread for the reason documented on
+    /// [`UpgradeArgs`]: building the whole `Command` tree walks
+    /// `Commands::augment_subcommands`, whose stack frame is already close to
+    /// libtest's 2 MiB per-test stack. This is the only test that materializes
+    /// it, so it brings its own headroom rather than making the suite depend on
+    /// `RUST_MIN_STACK`.
+    #[test]
+    fn every_command_has_its_own_help_text() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use clap::CommandFactory as _;
+                let cmd = Cli::command();
+                for name in ["cache", "routes"] {
+                    let sub = cmd
+                        .get_subcommands()
+                        .find(|s| s.get_name() == name)
+                        .unwrap_or_else(|| panic!("`{name}` subcommand must exist"));
+                    let about = sub
+                        .get_about()
+                        .unwrap_or_else(|| panic!("`{name}` must have help text"))
+                        .to_string();
+                    assert!(!about.trim().is_empty(), "`{name}` has empty help text");
+                    assert!(
+                        !about.contains("mounted route") || name == "routes",
+                        "`{name}` is showing another command's help: {about}"
+                    );
+                }
+                // And clap itself is satisfied with the whole definition.
+                cmd.debug_assert();
+            })
+            .expect("spawn help-text check thread")
+            .join()
+            .expect("help-text check panicked");
     }
 
     // ── autumn doctor tests ────────────────────────────────────────────────

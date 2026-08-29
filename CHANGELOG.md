@@ -364,6 +364,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
 
+- **Cache coherence is now proven at build time — the build fails when a write
+  can leave a cached read stale (#1716):** Autumn’s cache was powerful and its
+  coherence was entirely manual. `Cache::invalidate(key)` was hand-called,
+  `#[cached]` memoized by argument hash, and nothing linked a cached value to
+  the rows it was derived from or to the `#[repository]` write that dirties
+  them. A forgotten invalidation shipped as a silent staleness bug — the most
+  common and hardest-to-catch class of cache defect, and one no mainstream
+  framework catches before production, because everywhere else cache keys are
+  stringly typed and invalidation is convention. Autumn owns both ends of that
+  dependency, so it can assemble the graph instead of hoping. `#[cached]` now
+  publishes which models a value is derived from — declared with
+  `reads(Post, Comment)`, or derived by the macro from the function’s own
+  signature and body — and `#[repository]` publishes which model each of its
+  write methods mutates. `autumn cache audit` reads both back out of the built
+  binary (whole-app, so a read in one crate and a write in another or in a
+  plugin are still compared), emits a stable-ordered, provenance-tagged
+  cache-coherence manifest as a build artifact, and exits non-zero on any
+  uncovered pair — naming the read, the write, the model they share, both
+  source locations, and the two ways to discharge it. The obligation is
+  discharged with `invalidates(path::to::cached_fn)` on the repository (or
+  `#[invalidates(...)]` on one method), which is resolved by **rustc**: the path
+  rewrites to the identity constant `#[cached]` emits beside the function, so an
+  edge that names a non-cached function does not compile — it is a resolved
+  path, not a string in a table somebody has to keep in sync. Alternatively
+  `acknowledge_stale = "reason"` opts out, with a mandatory non-blank reason that
+  lands in the manifest so every escape hatch is visible in review. A repository
+  that declares any edge also gets a generated `invalidate_declared_caches()` that
+  really does clear those reads — including on a shared cross-replica backend, via
+  a new `Cache::invalidate_namespace` that `MokaCache` implements by iteration and
+  `RedisCache` by a `SCAN MATCH` one segment narrower than its existing `clear`; a
+  custom backend that cannot pattern-match its key space returns `false`, and the
+  caller is told so rather than left believing the value is gone. A fill already
+  in flight when an invalidation lands cannot write its stale value back
+  afterwards: `#[cached]` samples the namespace’s epoch before the lookup and
+  inserts through `with_fill_fence`, which re-checks it and inserts as one step
+  that cannot interleave with the invalidation’s bump.
+  Deliberately conservative in the direction
+  that keeps the gate alive: a read whose dependency set could not be
+  established is `undetermined` — reported in the manifest and the summary, never
+  failed, unless `--strict` — because a checker that fails on what it merely
+  could not read is a checker that gets deleted from CI. Reads the macros cannot
+  see (fragment, read-through) declare themselves with `declare_cached_read!`,
+  and `cache_fragment_in` / `cache_fragment_global_in` key a fragment under that
+  declared id so the invalidation edge actually reaches it — the plain
+  `cache_fragment` keys under a bare `fragment:` prefix that every fragment
+  shares, which no per-read namespace sweep can match.
+  `#[cached]` also gained `key(a, b)` to build the cache key from named
+  parameters only, which is what lets a cached read take the repository handle it
+  reads through — the handle is `Clone` but not `Hash`, and was never part of the
+  value’s identity. A derived dependency resolves the model through the
+  repository’s own `__AUTUMN_MODEL_NAME` rather than string-stripping its type
+  name, so `#[repository(Comment)] trait ModerationRepository` yields `Comment`;
+  a repository reached only through its trait is recorded `undetermined`, since
+  the trait carries no such constant and a guessed model that names nothing
+  would turn a real violation into a clean audit.
+  What is proven and what is not is stated on the tin: the
+  `invalidations` dimension carries a `runtime_caveat` saying the edge’s target
+  is proven — rustc resolves it to the read’s own generated id constant — but
+  its *invocation* on the write path is not, and the manifest’s `excluded` list
+  names row/column granularity,
+  cross-service coherence and TTL semantics as out of this slice. `examples/saas`
+  demonstrates both halves — the app audits clean, and deleting the one
+  `invalidates(...)` clause turns the build red. See
+  `docs/guide/cache-coherence.md`.
+
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
   shipped until now — rolling, blue/green, canary — routes **real** traffic to

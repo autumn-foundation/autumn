@@ -3074,6 +3074,18 @@ impl AppBuilder {
             return;
         }
 
+        // ── Cache-coherence manifest dump mode ─────────────────────────
+        // When AUTUMN_DUMP_CACHE_COHERENCE=1, print the cache-coherence
+        // manifest (#1716) and exit. Triggered by `autumn cache audit`, which
+        // needs the whole binary's registrations — every `#[cached]` read and
+        // every `#[repository]` write, across the app AND its plugins — and
+        // link-time `inventory` collection is the only place they all exist
+        // together. Runs before any database or port is touched.
+        if crate::cache::coherence::is_dump_mode() {
+            crate::cache::coherence::print_manifest_dump(&crate::cache::coherence::audit());
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`

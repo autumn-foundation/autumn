@@ -117,6 +117,101 @@ pub fn cache_fragment_global(
     cache_fragment(global.as_deref(), identity, version, ttl, render)
 }
 
+/// Cache a Maud fragment under a **cache-key namespace**, so the entries can be
+/// invalidated as a group.
+///
+/// Identical to [`cache_fragment`] except that the key is prefixed with
+/// `namespace`, which is what makes
+/// [`invalidate_namespace`](super::coherence::invalidate_namespace) able to
+/// reach it. [`cache_fragment`] keys entries under a bare `fragment:` prefix
+/// that carries no per-read identity, so *every* fragment shares it and a
+/// namespace sweep for one read matches none of them; a
+/// [`declare_cached_read!`](crate::declare_cached_read) entry with
+/// `kind = Fragment` that wants a working `invalidates(...)` edge has to key
+/// through here (#1716).
+///
+/// `namespace` should be the same string the declaration uses as its `id`.
+///
+/// ```rust,ignore
+/// autumn_web::declare_cached_read! {
+///     id = "blog::sidebar_fragment",
+///     kind = Fragment,
+///     reads = [crate::models::Post],
+/// }
+///
+/// let markup = cache_fragment_in(
+///     Some(cache.as_ref()),
+///     "blog::sidebar_fragment",
+///     format_args!("post:{}", post.id),
+///     post.updated_at.timestamp(),
+///     None,
+///     || html! { h1 { (post.title) } },
+/// );
+/// ```
+///
+/// Version-token invalidation still works exactly as it does for
+/// [`cache_fragment`]; the namespace is the *additional* handle a repository
+/// write can pull.
+pub fn cache_fragment_in(
+    cache: Option<&dyn Cache>,
+    namespace: &str,
+    identity: impl std::fmt::Display,
+    version: impl std::fmt::Display,
+    ttl: Option<std::time::Duration>,
+    render: impl FnOnce() -> Markup,
+) -> Markup {
+    let Some(cache) = cache else {
+        return render();
+    };
+
+    // Sampled BEFORE the lookup, so the fence covers the whole miss-and-render
+    // window. Being namespaced is exactly what exposes this helper to the race
+    // `cache_fragment` cannot have: an invalidation can now clear these entries
+    // mid-render, and an unfenced insert would put the pre-write markup back
+    // after the clear — stale until its TTL, or forever without one.
+    let epoch = super::coherence::namespace_epoch(namespace);
+    let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
+
+    // Same length-prefixed identity as `cache_fragment`, behind the namespace
+    // that `invalidate_namespace` scans for: `{namespace}:` is exactly the
+    // prefix `MokaCache` matches on and `RedisCache` builds its `SCAN MATCH`
+    // from, so the declared id and the runtime key space finally agree.
+    let identity = identity.to_string();
+    let key = format!(
+        "{namespace}:fragment:{}:{identity}:{version}",
+        identity.len()
+    );
+
+    if let Some(html) = get_cached::<String>(cache, &key) {
+        return PreEscaped(html);
+    }
+
+    let markup = render();
+    // Check and insert as one step, the same way `#[cached]` does — see
+    // `with_fill_fence`. A fenced-out fill still returns its markup to *this*
+    // caller; it just does not publish it.
+    super::coherence::with_fill_fence(&epoch, sampled, || {
+        insert_cached(cache, &key, markup.0.clone(), ttl);
+    });
+    markup
+}
+
+/// [`cache_fragment_in`] against the **process-global** cache backend.
+///
+/// The namespaced counterpart of [`cache_fragment_global`]: use it when the
+/// fragment is declared with [`declare_cached_read!`](crate::declare_cached_read)
+/// and a repository write is expected to invalidate it.
+pub fn cache_fragment_global_in(
+    namespace: &str,
+    identity: impl std::fmt::Display,
+    version: impl std::fmt::Display,
+    ttl: Option<std::time::Duration>,
+    render: impl FnOnce() -> Markup,
+) -> Markup {
+    let global = super::global_cache();
+    cache_fragment_in(global.as_deref(), namespace, identity, version, ttl, render)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "cache-moka"))]
@@ -128,7 +223,9 @@ mod tests {
 
     use maud::{Markup, html};
 
-    use super::{cache_fragment, cache_fragment_global};
+    use super::{
+        cache_fragment, cache_fragment_global, cache_fragment_global_in, cache_fragment_in,
+    };
     use crate::cache::{
         Cache, GLOBAL_CACHE_TEST_LOCK, MokaCache, clear_global_cache, set_global_cache,
     };
@@ -497,5 +594,273 @@ mod tests {
             "a `:` in the identity must not collide with a different (identity, version) split"
         );
         assert!(second.into_string().contains("right"));
+    }
+
+    // ── Namespaced fragments (#1716) ─────────────────────────────────────────
+
+    /// The whole point of the namespaced variant: `invalidate_namespace` has to
+    /// be able to reach the entry.
+    ///
+    /// `cache_fragment` keys under a bare `fragment:` prefix that carries no
+    /// per-read identity, so a sweep for `blog::sidebar_fragment` matches
+    /// nothing and reports success — a declared `invalidates(...)` edge that
+    /// silently clears zero entries. The `_in` variant puts the declared id
+    /// where the sweep actually looks.
+    #[test]
+    fn a_namespaced_fragment_is_reachable_by_namespace_invalidation() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let render = |counter: Arc<AtomicUsize>| {
+            move || -> Markup {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "sidebar" } }
+            }
+        };
+
+        cache_fragment_global_in(
+            "blog::sidebar_fragment",
+            "post:1",
+            "v1",
+            None,
+            render(counter.clone()),
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first call is a miss");
+
+        cache_fragment_global_in(
+            "blog::sidebar_fragment",
+            "post:1",
+            "v1",
+            None,
+            render(counter.clone()),
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "second call is a hit");
+
+        assert!(crate::cache::coherence::invalidate_namespace(
+            "blog::sidebar_fragment"
+        ));
+
+        cache_fragment_global_in(
+            "blog::sidebar_fragment",
+            "post:1",
+            "v1",
+            None,
+            render(counter.clone()),
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the invalidation must have dropped the entry"
+        );
+
+        clear_global_cache();
+    }
+
+    /// A render that spans an invalidation must not publish its stale markup.
+    ///
+    /// Being namespaced is what creates this race: `cache_fragment` has no
+    /// namespace, so nothing can clear it mid-render, but `cache_fragment_in`
+    /// entries are exactly what `invalidate_namespace` drops. Without the fence
+    /// the insert lands after the clear and the pre-write markup sits there
+    /// until its TTL — forever, with none.
+    ///
+    /// The invalidation is fired from inside the render closure, which is
+    /// precisely the window: the epoch was sampled before the lookup, and the
+    /// insert happens after this returns.
+    #[test]
+    fn a_render_that_spans_an_invalidation_does_not_publish_stale_markup() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache);
+
+        let markup = cache_fragment_global_in("blog::racing", "post:1", "v1", None, || {
+            // A repository write commits and invalidates while this renders.
+            assert!(crate::cache::coherence::invalidate_namespace(
+                "blog::racing"
+            ));
+            html! { p { "stale" } }
+        });
+        // The caller still gets what it rendered — the fence withholds the
+        // publish, it does not fail the call.
+        assert!(markup.into_string().contains("stale"));
+
+        // The next call must be a MISS: nothing stale was left behind.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let tally = renders.clone();
+        cache_fragment_global_in("blog::racing", "post:1", "v1", None, move || {
+            tally.fetch_add(1, Ordering::SeqCst);
+            html! { p { "fresh" } }
+        });
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "the fill that raced the invalidation must not have been published"
+        );
+
+        clear_global_cache();
+    }
+
+    /// The limitation the `_in` variants exist for, pinned so the docs stay
+    /// true.
+    ///
+    /// `cache_fragment` keys under a bare `fragment:` prefix, which is not the
+    /// declared read's id, so a namespace sweep matches nothing — and
+    /// `invalidate_namespace` still returns `true`, because "matched no keys"
+    /// and "there were none" are the same observation to a prefix scan. That
+    /// combination is exactly why a `declare_cached_read!` fragment has to key
+    /// through `cache_fragment_in`; if this test ever goes green the other way,
+    /// the guide's warning is stale.
+    #[test]
+    fn a_plain_fragment_is_not_reachable_by_namespace_invalidation() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let render = |counter: Arc<AtomicUsize>| {
+            move || -> Markup {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "sidebar" } }
+            }
+        };
+
+        cache_fragment_global("post:1", "v1", None, render(counter.clone()));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Reports success...
+        assert!(crate::cache::coherence::invalidate_namespace(
+            "blog::sidebar_fragment"
+        ));
+
+        // ...having cleared nothing: the entry is still served.
+        cache_fragment_global("post:1", "v1", None, render(counter.clone()));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "if this became a miss, `cache_fragment` gained a namespace and the \
+             docs steering declared fragments to `cache_fragment_in` are stale"
+        );
+
+        clear_global_cache();
+    }
+
+    /// A namespace sweep must not take another read's fragments with it.
+    #[test]
+    fn invalidating_one_fragment_namespace_leaves_the_others() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_global_cache();
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(64, None));
+        set_global_cache(cache);
+
+        let other = Arc::new(AtomicUsize::new(0));
+        let render = |counter: Arc<AtomicUsize>| {
+            move || -> Markup {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "footer" } }
+            }
+        };
+
+        cache_fragment_global_in("blog::sidebar", "post:1", "v1", None, render(other.clone()));
+        cache_fragment_global_in("blog::footer", "post:1", "v1", None, render(other.clone()));
+        assert_eq!(other.load(Ordering::SeqCst), 2);
+
+        assert!(crate::cache::coherence::invalidate_namespace(
+            "blog::sidebar"
+        ));
+
+        cache_fragment_global_in("blog::footer", "post:1", "v1", None, render(other.clone()));
+        assert_eq!(
+            other.load(Ordering::SeqCst),
+            2,
+            "the footer fragment must survive a sidebar invalidation"
+        );
+
+        clear_global_cache();
+    }
+
+    /// The namespace prefix must not weaken the identity/version boundary the
+    /// unnamespaced helper is careful about.
+    #[test]
+    fn a_namespaced_identity_containing_a_colon_still_cannot_alias() {
+        let cache = MokaCache::new(64, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let counter = counter.clone();
+            cache_fragment_in(Some(&cache), "ns", "a:b", "c", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "left" } }
+            })
+        };
+        assert!(first.into_string().contains("left"));
+
+        let second = {
+            let counter = counter.clone();
+            cache_fragment_in(Some(&cache), "ns", "a", "b:c", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "right" } }
+            })
+        };
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a `:` in the identity must not collide with a different split"
+        );
+        assert!(second.into_string().contains("right"));
+    }
+
+    /// Two namespaces must not alias each other through the identity either.
+    #[test]
+    fn two_namespaces_do_not_share_a_fragment() {
+        let cache = MokaCache::new(64, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for ns in ["a", "b"] {
+            let counter = counter.clone();
+            cache_fragment_in(Some(&cache), ns, "post:1", "v1", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "x" } }
+            });
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "each namespace owns its own entry"
+        );
+    }
+
+    /// The `None` fallback has to behave the same as the unnamespaced helper.
+    #[test]
+    fn a_namespaced_fragment_without_a_cache_still_renders() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let counter = counter.clone();
+            cache_fragment_in(None, "ns", "post:1", "v1", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "x" } }
+            });
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "no cache → always render"
+        );
     }
 }

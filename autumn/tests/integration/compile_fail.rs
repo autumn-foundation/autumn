@@ -213,9 +213,37 @@ fn query_budget_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
 }
 
+/// Build-time cache coherence (#1716). Its own `TestCases` for the same
+/// reason `#[query_budget]` has one: a self-contained feature, and one fewer
+/// line in the umbrella registry.
+#[test]
+fn cache_coherence_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
+
+    // The declaration surface refuses to accept a claim it cannot defend.
+    t.compile_fail("tests/compile-fail/cached_reads_empty.rs");
+    t.compile_fail("tests/compile-fail/cached_acknowledge_stale_blank_reason.rs");
+
+    // An invalidation edge is resolved by rustc: `invalidates(path)` rewrites
+    // to the id constant `#[cached]` generates beside the function, so naming
+    // anything else cannot compile.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_invalidates_unknown_read.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_invalidates_empty.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
+}
+
 #[test]
 fn compile_pass_tests() {
     let t = trybuild::TestCases::new();
+
+    // Build-time cache coherence (#1716): a declared dependency set, an
+    // acknowledged-stale opt-out, macro-derived dependencies, and both a
+    // trait-level and a method-level invalidation edge.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/cached_coherence.rs");
 
     // Route macro passes (always available)
     t.pass("tests/compile-pass/valid_handlers.rs");
