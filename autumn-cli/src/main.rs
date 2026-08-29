@@ -6275,6 +6275,84 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
+    // ── autumn db scrub tests (issue #1602) ────────────────────────────────
+
+    #[test]
+    fn parse_db_scrub_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "scrub"]).unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(profile.is_none());
+        assert!(artifact.is_none());
+        assert!(output.is_none());
+        assert!(config.is_none());
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_db_scrub_with_artifact_output_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--profile",
+            "staging",
+            "--artifact",
+            "backups/prod/20260101T000000Z",
+            "--output",
+            "scrubbed",
+            "--config",
+            "config/scrub.toml",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(
+            artifact.as_deref(),
+            Some(std::path::Path::new("backups/prod/20260101T000000Z"))
+        );
+        assert_eq!(output.as_deref(), Some(std::path::Path::new("scrubbed")));
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("config/scrub.toml"))
+        );
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_db_scrub_check_conflicts_with_dry_run() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--check", "--dry-run"]).is_err(),
+            "--check and --dry-run are two different no-write modes; asking for both is a mistake"
+        );
+    }
+
     // ── autumn console tests (issue #1039) ─────────────────────────────────
 
     #[test]
