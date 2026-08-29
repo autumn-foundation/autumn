@@ -2767,6 +2767,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/maintenance-mode.md`
 - `docs/guide/deployment.md`
 - `docs/guide/fleet-deploys.md`
+- `docs/guide/hot-upgrades.md`
 - `docs/guide/staged-deploys.md`
 - `docs/guide/dev-loop-latency.md`
 - `docs/guide/system-tests.md`

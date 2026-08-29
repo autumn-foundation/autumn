@@ -28,6 +28,16 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    env:
+      # `cargo clippy --workspace --all-targets` compiles autumn-web alongside
+      # every example crate at once. At the default parallelism (one job per
+      # vCPU) that peaks close enough to a 16 GB hosted runner's memory that the
+      # job has repeatedly died ~60s in with `exit 143` and "The runner has
+      # received a shutdown signal" — the host reclaiming the runner agent, not
+      # a lint failure: when it survives, the same step passes in ~7 minutes.
+      # Capping the compile jobs bounds that peak. This job gates `test`,
+      # `loom` and `coverage`, so a runner death here skips the whole suite.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

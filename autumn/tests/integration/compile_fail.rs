@@ -191,6 +191,33 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
 }
 
+/// The `state_migration!` fixtures get their own `TestCases` for the same
+/// reason `query_budget` does: they are a self-contained feature (#1674) whose
+/// guarantee — an in-place upgrade's old->new state mapping is total or the
+/// build fails — is worth being able to run on its own.
+#[test]
+fn state_migration_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
+
+    // Always available: `state_migration!` is exported unconditionally and the
+    // fixtures name only the live-state traits and serde.
+    //
+    // A field of the new shape left unmapped is `missing field ... in
+    // initializer` — the upgrade cannot quietly leave it at its default.
+    t.compile_fail("tests/compile-fail/state_migration_missing_field.rs");
+    // ...and there is no rest-pattern escape hatch to opt out with.
+    t.compile_fail("tests/compile-fail/state_migration_rest_pattern.rs");
+    // For an enum shape, a forgotten variant is a non-exhaustive `match`...
+    t.compile_fail("tests/compile-fail/state_migration_missing_variant.rs");
+    // ...and a catch-all arm is not expressible: the grammar takes variant
+    // names, not patterns, so `_` is refused by the macro itself.
+    t.compile_fail("tests/compile-fail/state_migration_wildcard_arm.rs");
+    // A shape change without the matching `VERSION` bump is refused too: the
+    // two shapes would be indistinguishable on the wire, so the migration
+    // could never run and the old payload would be fed to the new shape.
+    t.compile_fail("tests/compile-fail/state_migration_same_version.rs");
+}
+
 /// The `#[query_budget]` fixtures get their own `TestCases` rather than
 /// riding along in `compile_fail_tests`: they are a self-contained feature
 /// (#1667), and keeping them separate holds that function under the

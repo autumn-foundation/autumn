@@ -73,6 +73,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end
   to end, including the `git diff` / `git checkout --` revert path.
 
+- **Zero-downtime in-place upgrades with a compile-checked state migration
+  (`SIGUSR2`):** a running app can now swap itself to a newly-built binary
+  without dropping a connection *or* its in-memory state. On `SIGUSR2` the
+  process snapshots and freezes the block of state it designated with
+  `AppBuilder::with_live_state(...)`, execs the new binary handing over the
+  already-bound listening socket, waits for that build to signal it is serving,
+  and only then drains itself — so connections queued on the shared socket are
+  picked up by the successor rather than refused, and the drain skips the
+  `/ready`→503 flip and prestop grace a real shutdown needs (the address never
+  goes away). The new build adopts the snapshot through
+  `with_live_state_from::<Old, _>(...)`, whose migration is written with the new
+  `state_migration!` macro and is **total by construction**: a struct shape
+  whose field mapping is missing fails to build (`missing field … in
+  initializer`, with no `..Default::default()` escape hatch in the grammar), and
+  an enum shape maps every variant *by name*, so a forgotten variant is a
+  non-exhaustive `match` and a `_` catch-all cannot be written at all — four
+  `tests/compile-fail/state_migration_*.rs` fixtures pin each refusal. Writes
+  attempted after the snapshot are refused with `Err(LiveStateFrozen)` rather
+  than silently lost, and every failure path (missing or broken binary, a
+  successor that crashes or hangs, a state this build cannot account for, a
+  listener that cannot be handed over) abandons the upgrade with the old build
+  still serving and its state writable again. Linux/Unix and plain TCP
+  listeners; `[server.upgrade] enabled/ready_timeout_secs` configure it. Worked
+  example in `examples/hot-upgrade` (whose `live_upgrade` test proves zero
+  refused connections and 100% carry-over under sustained load across the
+  cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
+
+### Changed
+
+- **The `Listening` log line now reports the address actually bound** rather
+  than the one configured, so `server.port = 0` (and a socket inherited from an
+  in-place upgrade) shows the real port instead of `0`. Issue #1674.
+
 - **Replay capsules now record every framework effect a failing request
   touched, and one command turns a capsule into a committed regression test:**
   [#1634](https://github.com/autumn-foundation/autumn/issues/1634) extends the
