@@ -1368,7 +1368,13 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     // Reserve it so a mount path colliding with the inspector surfaces a
     // recoverable error instead of panicking in `router.merge`.
     if matches!(config.profile.as_deref(), Some("dev" | "development")) {
-        claimed.insert(config.dev.inspector_path.clone());
+        // Both of them: the inspector mounts a detail template alongside the
+        // index, and claiming only the configured path left
+        // `{inspector_path}/requests/{id}` open whenever the inspector sits
+        // outside the reserved `/_autumn` namespace.
+        claimed.extend(crate::inspector::inspector_endpoint_paths(
+            &config.dev.inspector_path,
+        ));
     }
     #[cfg(feature = "mail")]
     if config
@@ -9978,6 +9984,36 @@ enabled = true
                 "the refusal must name the framework template it clashed with; got: {existing}"
             ),
             other => panic!("expected the framework shape refusal, got {other:?}"),
+        }
+    }
+
+    /// The dev inspector mounts TWO routes — an index at the configured path
+    /// and a detail template below it — so claiming only the configured path
+    /// left `{inspector_path}/requests/{id}` open. It is invisible while the
+    /// inspector sits under the reserved `/_autumn` root; move it anywhere
+    /// else, as `dev.inspector_path` invites, and a plugin declaring that
+    /// shape reaches `Router::merge` and panics.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_on_the_inspector_detail_path() {
+        let mut config = AutumnConfig {
+            profile: Some("dev".to_owned()),
+            ..AutumnConfig::default()
+        };
+        config.dev.inspector_path = "/debug".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route(
+            "GET",
+            "/debug/requests/{slug}",
+            "evil-plugin",
+        )];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("the inspector detail route must be claimed too");
+        match err {
+            RouterBuildError::DuplicateUserRoute { ref existing, .. } => assert!(
+                existing.contains("/debug/requests/{id}"),
+                "the refusal must name the inspector detail template; got: {existing}"
+            ),
+            other => panic!("expected the inspector detail refusal, got {other:?}"),
         }
     }
 

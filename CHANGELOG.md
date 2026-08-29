@@ -44,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over a collision that cannot happen. Framework paths are compared through the
   same matchit oracle as user routes, not by string equality, so a framework
   template carrying a capture (`/_stories/{slug}`, or an operator-configured
-  probe or actuator path) is not an exact-string miss and a startup panic.
+  probe or actuator path) is not an exact-string miss and a startup panic. The
+  dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
+  alongside its index — both now derive from `inspector_endpoint_paths`, so the
+  claim set cannot drift from what the router actually mounts.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every

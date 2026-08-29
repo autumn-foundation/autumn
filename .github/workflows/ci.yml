@@ -426,10 +426,16 @@ jobs:
           # The plugin-sandbox suites have their own merge-blocking test lane
           # above; without a coverage leg the whole module is instrumented and
           # never executed, which reads as a large new uncovered surface.
+          #
+          # The test-name filter goes after `--`, unlike the `cargo test` lane
+          # above where it is a bare positional. `cargo llvm-cov` has its own
+          # subcommands (`report`, `clean`, `nextest`, …), so a bare word in
+          # that position is read as one:
+          #     error: unrecognized subcommand plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
-            --lib plugin_sandbox
+            --lib -- plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
-            --test integration_tests plugin_sandbox
+            --test integration_tests -- plugin_sandbox
           # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
           # the only place the `--all-features` catch-all compiled autumn-web
           # under the `sqlite` + `mail` union — which is exactly the
