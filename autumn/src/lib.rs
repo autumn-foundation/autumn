@@ -113,6 +113,12 @@ pub mod canary;
 #[cfg(feature = "reporting")]
 pub mod capsule;
 pub mod circuit_breaker;
+/// Compile-time data classification (issue #1654).
+///
+/// Carries a "personal data" classification on the *type* of a `#[model]`
+/// column and gates the `Json` response sink on it, so a leak is a build
+/// failure rather than a production incident.
+pub mod classify;
 pub mod cluster;
 pub mod config;
 pub mod consent;

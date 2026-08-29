@@ -50,6 +50,8 @@ mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
 mod custom_layer;
+#[cfg(feature = "db")]
+mod data_classification;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;

@@ -108,9 +108,20 @@ where
     }
 }
 
+/// The one gated sink of the first compile-time data-classification slice
+/// (issue #1654).
+///
+/// [`JsonSink`](crate::classify::JsonSink) is blanket-implemented for every
+/// `Serialize` type, so an ordinary handler never notices the bound. What it
+/// excludes is exactly the set autumn withholds `Serialize` from: a `#[model]`
+/// carrying a `#[classified]` column. Releasing such a column at a declared
+/// declassification boundary yields a plain value again, and the released view
+/// serializes here like anything else.
+///
+/// See `docs/guide/data-classification.md`.
 impl<T> IntoResponse for Json<T>
 where
-    axum::Json<T>: IntoResponse,
+    T: crate::classify::JsonSink,
 {
     fn into_response(self) -> Response {
         axum::Json(self.0).into_response()

@@ -1,0 +1,7 @@
+error: `#[classified]` cannot be combined with `#[encrypted]`: an encrypted column already routes through its own Diesel wrapper, and the two wrappers cannot both own the column's representation. `#[encrypted]` protects the value at rest; `#[classified]` proves where it may go. Combining them lands in a later slice.
+  --> tests/compile-fail/classified_with_encrypted.rs:14:5
+   |
+14 | /     #[classified]
+15 | |     #[encrypted]
+16 | |     pub email: String,
+   | |_____________________^

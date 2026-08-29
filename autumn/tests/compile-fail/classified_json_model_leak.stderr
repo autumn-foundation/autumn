@@ -1,0 +1,25 @@
+error[E0277]: `Customer` cannot be released into autumn's `Json` response sink
+  --> tests/compile-fail/classified_json_model_leak.rs:22:32
+   |
+22 | fn leak(customer: Customer) -> impl IntoResponse {
+   |                                ^^^^^^^^^^^^^^^^^ classified personal data would be released here
+23 |     Json(customer)
+   |     -------------- return type was inferred to be `autumn_web::Json<Customer>` here
+   |
+help: the trait `JsonSink` is not implemented for `Customer`
+  --> tests/compile-fail/classified_json_model_leak.rs:13:1
+   |
+13 | #[autumn_web::model(table = "customers")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: an autumn `#[model]` with `#[classified]` columns has no `Serialize` impl: the classification is carried by the type, so the whole record cannot reach a sink
+   = note: release each classified column at a declared boundary and respond with the released view, e.g. `Json(SupportView::from_released(customer.email.declassify(&YOUR_BOUNDARY)))`
+   = note: declare the boundary with `autumn_web::declassify!`; see docs/guide/data-classification.md
+help: the trait `IntoResponse` is implemented for `autumn_web::Json<T>`
+  --> src/extract.rs
+   |
+   | / impl<T> IntoResponse for Json<T>
+   | | where
+   | |     T: crate::classify::JsonSink,
+   | |_________________________________^
+   = note: required for `autumn_web::Json<Customer>` to implement `IntoResponse`
+   = note: this error originates in the attribute macro `autumn_web::model` (in Nightly builds, run with -Z macro-backtrace for more info)
