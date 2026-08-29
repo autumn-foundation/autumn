@@ -130,7 +130,8 @@ paste-ready stanza:
     - users.full_name
     - users.role
   Declare each one in scrub.toml — under [tables.<table>.pii] to replace it, or
-  in `safe` to keep it verbatim.
+  in `safe` to keep it verbatim. Run `autumn db scrub --check` for a paste-ready
+  starting point.
 
 # Paste into scrub.toml, then replace `auto` with an explicit strategy
 # (email/name/phone/redact/null/uuid/bytes/json/zero/epoch), or move the
@@ -149,11 +150,16 @@ Paste it, move the genuinely-safe columns into `safe = [...]`, and re-run.
 
 ```yaml
 - name: PII classification is complete
-  run: autumn db scrub --check
+  run: |
+    autumn db create
+    autumn migrate
+    autumn db scrub --check
 ```
 
-`--check` writes nothing and exits non-zero when any column is unclassified, so
-a pull request that adds a column without declaring it fails before it merges.
+`--check` reads the schema from a live database — the same one `autumn migrate`
+resolves — so run it after the migration step your CI already has. It writes
+nothing and exits non-zero when any column is unclassified, so a pull request
+that adds a column without declaring it fails before it merges.
 That is the property no third-party scrubber can offer: the classification is
 checked against the real schema, not against yesterday's config file.
 

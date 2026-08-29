@@ -1,4 +1,4 @@
-//! `autumn db scrub` — turn a production database (or a `autumn db backup`
+//! `autumn db scrub` — turn a production database (or an `autumn db backup`
 //! artifact) into an anonymized copy that is safe on a laptop or a shared
 //! staging box (issue #1602).
 //!
@@ -34,7 +34,9 @@
 //!
 //! - **Fail-closed.** Unclassified, stale (naming a column that no longer
 //!   exists), and self-contradictory declarations all refuse before a single row
-//!   is touched.
+//!   is touched. The one exception is `--artifact`: the restore must run before
+//!   the classification can read the schema it creates, so a refusal after a
+//!   restore leaves unscrubbed data in the target — and says so, loudly.
 //! - **Production guard.** Writing refuses outside `dev`/`test` without
 //!   `--force`, the identical protocol as `autumn db drop`
 //!   ([`crate::db::guard_destructive`]).
@@ -42,8 +44,14 @@
 //!   refused outright (so referential integrity is untouched), `NULL` is refused
 //!   on a `NOT NULL` column, a constant replacement is refused on a `UNIQUE`
 //!   column, and a `varchar(n)` bound narrows the generated value or refuses.
-//! - **Atomic.** Every statement for one database runs in a single transaction:
-//!   a half-scrubbed database is never left behind.
+//! - **Atomic.** Every target is classified before any target is written (so an
+//!   undeclared column on one shard cannot leave the topology half anonymized),
+//!   and every statement for one database runs in a single transaction: a
+//!   half-scrubbed database is never left behind.
+//! - **Framework-aware.** Introspection excludes `autumn_*` tables from the
+//!   classified universe, so the ones that carry app-supplied payloads (queued
+//!   jobs, offline-sync rows, `api_tokens`) are reported separately and emptied
+//!   when the app opts in with `[framework] purge`.
 //! - **Credential-safe.** No error or report ever embeds a resolved URL.
 
 use std::collections::{BTreeMap, BTreeSet};
