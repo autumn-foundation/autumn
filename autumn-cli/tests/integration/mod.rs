@@ -4,6 +4,7 @@ mod cloud_native_scaffold;
 mod console;
 mod db;
 mod db_pull;
+mod db_scrub;
 mod deploy;
 mod edge;
 mod generate_json_postgres;

@@ -1,0 +1,279 @@
+# Data Scrubbing — Refreshing Staging From Production
+
+The most common reason a team copies a production database is to reproduce a bug
+or rehearse a migration. With [`autumn db backup`](daemon.md#database-backups)
+that copy is one command away — PII and all — onto laptops and shared staging
+boxes.
+
+`autumn db scrub` closes that gap. It rewrites every PII-classified column with
+deterministic, constraint-valid fake values, so the copy still behaves like the
+real database (same row counts, same foreign keys, same uniqueness) while
+carrying none of the real values.
+
+The classification is **fail-closed and schema-driven**: the column universe
+comes from introspecting the live database, not from a config file, so a column
+added yesterday cannot be missing from it. A column that is neither
+PII-classified nor explicitly declared safe aborts the scrub.
+
+> **Postgres only.** Scrubbing targets the same databases `autumn migrate`
+> resolves — the control database plus every configured shard.
+
+---
+
+## The drill: production → staging in one pass
+
+```sh
+# 1. On the production host: take a backup.
+AUTUMN_ENV=prod autumn db backup --keep 7
+
+# 2. Move the run directory to the staging host (scp, rsync, or
+#    `autumn db backup --upload` + `autumn db restore offsite:prod/latest`).
+
+# 3. On the staging host: restore it and scrub it in one command.
+AUTUMN_ENV=staging autumn db scrub \
+    --artifact backups/prod/20260101T020000Z --force
+```
+
+Step 3 restores the artifact into the database the `staging` profile resolves,
+then anonymizes it. `--force` is required because `staging` is not `dev`/`test`
+— the same production guard as `autumn db drop`.
+
+To hand a teammate an artifact that is *already* scrubbed, add `--output`:
+
+```sh
+AUTUMN_ENV=staging autumn db scrub \
+    --artifact backups/prod/20260101T020000Z \
+    --output backups/scrubbed --force
+```
+
+That writes a fresh, self-describing backup run under `backups/scrubbed/` taken
+from the scrubbed database — safe to copy onto a laptop.
+
+You can also scrub a database in place, with no artifact involved:
+
+```sh
+autumn db scrub                 # scrub the resolved dev database
+autumn db scrub --check         # classify only; write nothing (CI)
+autumn db scrub --dry-run       # print the exact SQL; write nothing
+```
+
+---
+
+## The classification workflow
+
+Autumn classifies columns from three sources, in precedence order.
+
+### 1. What the framework already knows
+
+Two sources need **no declaration at all**:
+
+- **`#[encrypted]` model columns.** An at-rest-encrypted column is PII by
+  construction, so it is always scrubbed. A `safe` declaration may **not**
+  override it — that combination is an error.
+- **Tables registered with the GDPR anonymize strategy** — a
+  `GdprRegistry::register(ModelRegistration::anonymize("comments"))` call in your
+  app classifies every non-key column of `comments` as PII. Because that is a
+  table-level signal, a `safe` declaration **may** narrow it. The scanner reads
+  the registration statically, so it needs a string-literal table name; a
+  computed one is reported rather than silently ignored.
+
+Primary- and foreign-key columns are never claimed by the table-level
+inference: rewriting a key would break referential integrity.
+
+### 2. What you declare
+
+Everything else lives in `scrub.toml` at the project root (override with
+`--config`):
+
+```toml
+# scrub.toml
+
+# Columns that are safe in EVERY table — the one-line escape from repeating
+# `id` / `created_at` / `updated_at` in every stanza.
+[defaults]
+safe_columns = ["id", "created_at", "updated_at"]
+
+[tables.users]
+# Reviewed and deliberately kept verbatim.
+safe = ["role", "locale", "is_active"]
+
+[tables.users.pii]
+email = "email"
+full_name = "name"
+phone = "phone"
+bio = "redact"
+last_login_ip = "redact"
+
+[tables.invoices]
+safe = ["amount_cents", "currency", "status"]
+
+[tables.invoices.pii]
+billing_address = "redact"
+```
+
+### 3. Adopting it on an existing schema
+
+You do not have to write that file by hand. Run:
+
+```sh
+autumn db scrub --check
+```
+
+On a schema with undeclared columns it exits non-zero, lists them, and prints a
+paste-ready stanza:
+
+```text
+✗ 4 column(s) are neither PII-classified nor declared safe, so the scrub cannot
+  prove they carry no real data:
+    - users.bio
+    - users.email
+    - users.full_name
+    - users.role
+  Declare each one in scrub.toml — under [tables.<table>.pii] to replace it, or
+  in `safe` to keep it verbatim.
+
+# Paste into scrub.toml, then replace `auto` with an explicit strategy
+# (email/name/phone/redact/null/uuid/bytes/json/zero/epoch), or move the
+# column into that table's `safe = [...]` list if it holds no PII.
+
+[tables.users.pii]
+bio = "auto"
+email = "auto"
+full_name = "auto"
+role = "auto"
+```
+
+Paste it, move the genuinely-safe columns into `safe = [...]`, and re-run.
+
+### Keep it honest in CI
+
+```yaml
+- name: PII classification is complete
+  run: autumn db scrub --check
+```
+
+`--check` writes nothing and exits non-zero when any column is unclassified, so
+a pull request that adds a column without declaring it fails before it merges.
+That is the property no third-party scrubber can offer: the classification is
+checked against the real schema, not against yesterday's config file.
+
+### 4. Framework-owned tables
+
+Introspection deliberately skips `autumn_*` / `_autumn*` tables — exactly as
+`autumn db pull` and `autumn schema pull` do — so their columns are not part of
+the classified universe. Some of them nonetheless carry **app-supplied**
+payloads: a queued job's arguments, an offline-sync row buffer, an experiment
+assignment.
+
+A scrub therefore *warns* about the ones it finds and tells you which they are.
+`api_tokens` is on that list too — production API tokens inherited by a staging
+copy are a live credential leak, not merely a PII one.
+
+To have them emptied as part of the scrub, opt in:
+
+```toml
+[framework]
+purge = ["api_tokens", "autumn_jobs", "autumn_job_tracking", "autumn_sync_pending", "autumn_sync_rows"]
+```
+
+Those `DELETE`s run inside the same transaction as the column rewrites. `purge`
+only accepts framework-owned names (`autumn_*` / `_autumn*`, plus the
+framework's unprefixed tables such as `api_tokens`) — a user table
+listed there is an error, because emptying one outright is never something a
+scrub should do behind a one-word config key. Schema bookkeeping
+(`autumn_migration_checksums`, `_autumn_shard_map`) is never offered.
+
+---
+
+## Replacement strategies
+
+| Strategy | Produces | Unique-safe |
+|---|---|---|
+| `auto` | Derived from the column type (the default for automatically-classified columns) | depends |
+| `email` | `scrubbed+<token>@example.invalid` — syntactically valid, permanently undeliverable | ✅ |
+| `name` | `Scrubbed <token>` | ✅ |
+| `phone` | `+1555<digits>` | ❌ |
+| `redact` | `[scrubbed:<token>]` | ✅ |
+| `null` | `NULL` (refused on a `NOT NULL` column) | ✅ |
+| `uuid` | A deterministic replacement UUID | ✅ |
+| `bytes` | Deterministic replacement bytes | ✅ |
+| `json` | `{"scrubbed": true}` | ❌ |
+| `zero` | `0` / `false` | ❌ |
+| `epoch` | `1970-01-01T00:00:00Z` | ❌ |
+
+`<token>` is an `md5` over the row's primary key, salted with the column name.
+That makes every replacement:
+
+- **deterministic** — the same row scrubs to the same value on every run, so
+  re-running a scrub is idempotent;
+- **unique per row** — a `UNIQUE` column stays unique; and
+- **distinct per column** — two PII columns of one row never collide.
+
+A table with **no** primary key falls back to the physical `ctid`: still unique
+within the statement (so constraints hold), but not stable between runs.
+
+`auto` derives a strategy from the column's type: text columns whose name
+contains `email` get an address, other text is redacted, `uuid`/`bytea`/`jsonb`
+get type-matched fakes, numbers become `0`, booleans `false`, and timestamps the
+epoch. It refuses to guess for a closed-set (enum) or exotic Postgres type — a
+fabricated value would violate the column's `CHECK` — and asks for an explicit
+strategy instead.
+
+---
+
+## What the scrub guarantees
+
+- **Nothing runs against production by accident.** Writing refuses outside the
+  `dev`/`test` profile without `--force`, the same protocol as `autumn db drop`.
+  As defence in depth, a scrub also refuses when the write target is the
+  database an artifact's own (non-dev/test) profile *config file* declares.
+- **A refusal writes nothing.** Classification completes before a single row is
+  touched. The one exception is `--artifact`: the restore has to run before the
+  scrub can read the schema it created, so a refusal *after* a restore leaves
+  unscrubbed data in the target. The command says so in the loudest possible
+  terms, and `autumn db scrub --check` catches an incomplete declaration before
+  any restore happens — run it in CI.
+- **Constraints survive.** PII on a primary- or foreign-key column is refused
+  outright; `null` is refused on a `NOT NULL` column; a constant replacement is
+  refused on a `UNIQUE` column; and a `varchar(n)` bound narrows the generated
+  value (or refuses, rather than truncating into collisions).
+- **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
+- **It is atomic.** Every statement for one database runs in a single
+  transaction, so a failure can never leave a half-scrubbed database behind —
+  and with shards configured, *every* database is classified before *any* of
+  them is written, so an undeclared column on one shard cannot leave the rest of
+  the topology half anonymized.
+- **Credentials never appear.** No message ever prints a resolved URL.
+
+---
+
+## Limits
+
+- **Postgres only.**
+- **Full-copy only.** Row subsetting/sampling for very large databases is not
+  supported — scrub the whole copy.
+- **Values are fake, not statistically faithful.** Replacements only need to be
+  constraint-valid; there is no synthetic-data modelling or differential
+  privacy.
+- **Composite `UNIQUE` indexes are your responsibility.** Single-column
+  uniqueness is checked at plan time; a multi-column unique index that a
+  constant-valued strategy would violate fails the transaction loudly (and rolls
+  back) rather than being caught up front.
+- **Framework-owned tables are not column-classified**, exactly as `autumn db
+  pull` and `autumn schema pull` skip them. The scrub warns about the ones that
+  carry app-supplied payloads and can empty them on request — see
+  [Framework-owned tables](#4-framework-owned-tables).
+- **The artifact itself is still unscrubbed.** `autumn db scrub --artifact`
+  anonymizes the *database*, not the dump it restored from. Delete the source
+  artifact from the staging host once the scrub succeeds, or hand teammates the
+  `--output` artifact instead.
+
+## See also
+
+- [Database backups](daemon.md#database-backups) — `autumn db backup` /
+  `autumn db restore`, the other half of the drill.
+- [Attribute encryption](attribute-encryption.md) — `#[encrypted]`, one of the
+  two automatic classification sources.
+- [Logging & PII](logging-pii.md) — the log-side scrubber, which is a different
+  thing entirely.
+- [Seeding](seeding.md) — synthetic data when you do not need production shapes.

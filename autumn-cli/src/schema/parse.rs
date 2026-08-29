@@ -85,6 +85,7 @@
 //!   `idx_<table>_<field>_unique` form; exact parity for pathological long names
 //!   is a later refinement.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use autumn_schema_core::{
@@ -291,6 +292,126 @@ pub fn parse_models_path(path: &Path, backend: Backend) -> Result<ParsedSchema, 
             ),
         })
     }
+}
+
+/// Read the `#[encrypted]` column set out of `#[model]` structs, keyed by the
+/// resolved table name.
+///
+/// `#[encrypted]` does not change a column's *shape*, so [`parse_model_source`]
+/// deliberately ignores it — but it is machine-readable PII semantics the
+/// framework already holds, and `autumn db scrub` (issue #1602) classifies those
+/// columns as PII with no developer declaration at all. Table names are resolved
+/// through the same `#[model(table = "...")]`-else-convention path
+/// [`build_table`] uses, so the two can never disagree about which table a
+/// model's encrypted column belongs to.
+///
+/// Tables with no encrypted column are omitted entirely (an empty map means "no
+/// `#[encrypted]` columns anywhere", never "no models").
+///
+/// # Errors
+///
+/// Returns [`SchemaParseError::Syntax`] if `src` is not valid Rust.
+pub fn parse_encrypted_columns(
+    src: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>, SchemaParseError> {
+    let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for item in &file.items {
+        let syn::Item::Struct(item_struct) = item else {
+            continue;
+        };
+        let Some(model_attr) = find_model_attr(&item_struct.attrs) else {
+            continue;
+        };
+        let syn::Fields::Named(named) = &item_struct.fields else {
+            continue;
+        };
+        let model_name = item_struct.ident.to_string();
+        let table = parse_model_args(model_attr)
+            .table
+            .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
+        for field in &named.named {
+            let Some(ident) = field.ident.as_ref() else {
+                continue;
+            };
+            if field.attrs.iter().any(is_encrypted_attr) {
+                out.entry(table.clone())
+                    .or_default()
+                    .insert(ident.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read the `#[encrypted]` column set from a models file or directory, using the
+/// same file-vs-directory dispatch as [`parse_models_path`].
+///
+/// # Errors
+///
+/// Returns [`SchemaParseError::Io`] if `path` does not exist or cannot be read,
+/// or [`SchemaParseError::Syntax`] if a file is not valid Rust.
+pub fn parse_encrypted_columns_path(
+    path: &Path,
+) -> Result<BTreeMap<String, BTreeSet<String>>, SchemaParseError> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for file in model_source_files(path)? {
+        let src = std::fs::read_to_string(&file).map_err(|source| SchemaParseError::Io {
+            path: file.display().to_string(),
+            source,
+        })?;
+        for (table, columns) in parse_encrypted_columns(&src)? {
+            out.entry(table).or_default().extend(columns);
+        }
+    }
+    Ok(out)
+}
+
+/// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
+/// directly under the directory (sorted, so aggregation is deterministic).
+fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaParseError> {
+    if path.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !path.is_dir() {
+        return Err(SchemaParseError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "expected a `.rs` model file or a directory of model files",
+            ),
+        });
+    }
+    let read = std::fs::read_dir(path).map_err(|source| SchemaParseError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|source| SchemaParseError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let candidate = entry.path();
+        let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
+            path: candidate.display().to_string(),
+            source,
+        })?;
+        if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
+            paths.push(candidate);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Whether an attribute is the field-level `#[encrypted]` marker, in either its
+/// bare (`#[encrypted]`) or configured (`#[encrypted(deterministic)]`) spelling.
+fn is_encrypted_attr(attr: &syn::Attribute) -> bool {
+    attr.path()
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "encrypted")
 }
 
 /// Find the `#[model]` / `#[autumn_web::model]` attribute on a struct, if any.
@@ -734,6 +855,90 @@ fn type_to_string(ty: &syn::Type) -> String {
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
+
+    // ── `#[encrypted]` PII annotations (issue #1602) ────────────────────────
+
+    #[test]
+    fn encrypted_columns_are_read_per_table() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct Account {
+                #[id]
+                pub id: i64,
+                #[encrypted]
+                pub api_token: String,
+                #[encrypted(deterministic)]
+                pub email: String,
+                pub name: String,
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            found.get("accounts"),
+            Some(&BTreeSet::from([
+                "api_token".to_owned(),
+                "email".to_owned()
+            ]))
+        );
+    }
+
+    #[test]
+    fn encrypted_columns_honor_the_table_name_override() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model(table = "legacy_people")]
+            pub struct Person {
+                #[id]
+                pub id: i64,
+                #[encrypted]
+                pub ssn: String,
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(found.contains_key("legacy_people"));
+        assert!(!found.contains_key("people"));
+    }
+
+    #[test]
+    fn a_model_without_encrypted_columns_is_omitted() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn encrypted_fields_outside_a_model_struct_are_ignored() {
+        let found = parse_encrypted_columns(
+            r#"
+            pub struct NotAModel {
+                #[encrypted]
+                pub secret: String,
+            }
+            "#,
+        )
+        .unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn encrypted_column_scan_reports_a_syntax_error() {
+        assert!(matches!(
+            parse_encrypted_columns("this is not rust"),
+            Err(SchemaParseError::Syntax { .. })
+        ));
+    }
 
     fn parse_one(src: &str) -> Table {
         let parsed = parse_model_source(src, Backend::Postgres).expect("parse");

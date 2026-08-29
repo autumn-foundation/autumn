@@ -150,6 +150,11 @@ app that bundles them), install the PostgreSQL client tools or point
 `AUTUMN_PG_BIN_DIR` at their `bin` directory. `autumn doctor` warns when they are
 missing.
 
+> **Copying a backup to staging or a laptop?** Run it through
+> [`autumn db scrub`](data-scrubbing.md) first — it anonymizes every
+> PII-classified column and refuses (rather than silently passing data through)
+> when a column has not been classified at all.
+
 ### Scheduling
 
 **cron** — a nightly backup with 7-day retention:
