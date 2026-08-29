@@ -2194,6 +2194,7 @@ autumn test                      # provision/target an isolated *_test DB, migra
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
+autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
@@ -2392,6 +2393,66 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 [--force]` verifies every artifact before touching a database and is gated by the
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
+
+### `autumn db scrub` (issue #1602)
+
+`autumn db scrub [--artifact ARTIFACT] [--output DIR] [--config PATH] [--check]
+[--dry-run] [--force]` turns a production database — or an `autumn db backup`
+artifact restored into the resolved target — into an anonymized copy safe for
+staging/dev. It rewrites every PII-classified column with deterministic,
+constraint-valid fake values, resolving the target(s) exactly like `db backup`
+(control plus every shard) and refusing non-dev/test profiles without `--force`
+(the same guard as `db drop`).
+
+Classification is **fail-closed and schema-driven** — the column universe comes
+from introspecting the live database, not from a config file — in precedence
+order:
+
+1. `[tables.<t>.pii]` in `scrub.toml` (the explicit declaration + strategy);
+2. `#[encrypted]` model columns (PII by construction — a `safe` declaration may
+   NOT override one);
+3. tables registered with the GDPR anonymize strategy
+   (`ModelRegistration::anonymize("t")`, read statically) — every non-key column
+   of that table, narrowable with `safe`.
+
+Anything left over aborts the scrub, listing the columns and printing a
+paste-ready `scrub.toml` stanza. So a newly added column can never silently
+carry real data into staging.
+
+```toml
+# scrub.toml
+[defaults]
+safe_columns = ["id", "created_at", "updated_at"]   # safe in EVERY table
+
+[tables.users]
+safe = ["role", "locale"]          # reviewed, kept verbatim
+
+[tables.users.pii]
+email = "email"                    # scrubbed+<token>@example.invalid
+full_name = "name"
+phone = "phone"
+bio = "redact"
+
+[framework]
+# `autumn_*` tables are outside the classified universe; empty the ones whose
+# rows carry app payloads (opt-in; framework-owned names only).
+purge = ["api_tokens", "autumn_jobs", "autumn_sync_rows"]
+```
+
+Strategies: `auto` (derived from the column type), `email`, `name`, `phone`,
+`redact`, `null`, `uuid`, `bytes`, `json`, `zero`, `epoch`. Each value derives
+from an `md5` over the row's primary key salted with the column name, so a
+`UNIQUE` column stays unique, two columns of one row never collide, and a re-run
+is idempotent. `NULL`s stay `NULL`; PII on a primary- or foreign-key column is
+refused outright (referential integrity survives); `null` is refused on `NOT
+NULL`; a constant-valued strategy is refused on a `UNIQUE` column; a
+`varchar(n)` bound narrows the token or refuses. Every target is classified
+before any is written, and each database's statements run in one transaction.
+
+`--check` classifies and writes nothing, exiting non-zero on any unclassified
+column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
+`--output DIR` re-dumps the scrubbed database as a fresh backup run. See
+`docs/guide/data-scrubbing.md`.
 
 ### Offsite S3 backups (0.6.0, issue #1619)
 
