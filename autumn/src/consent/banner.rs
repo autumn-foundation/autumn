@@ -36,7 +36,7 @@
 use axum::body::{Body, Bytes};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
+    CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
 };
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
@@ -490,10 +490,39 @@ fn htmx_header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
         .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
 }
 
+/// Drop the headers that describe the exact bytes of a representation.
+///
+/// Called only where this middleware rewrites the body. `Content-Length` is
+/// recomputed at the call site; these cannot be, because they are whatever the
+/// inner layer chose to compute, so the honest move is to remove them rather
+/// than ship a validator for bytes nobody will receive.
+fn drop_stale_representation_metadata(headers: &mut axum::http::HeaderMap) {
+    headers.remove(ETAG);
+    // Not `http::header` constants, so they are named here. `Content-Digest`
+    // and `Repr-Digest` are RFC 9530; `Digest` and `Content-MD5` are the
+    // obsolete spellings still emitted by some proxies and SDKs.
+    for name in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        headers.remove(name);
+    }
+}
+
 /// Whether the client offered to accept an HTML document.
 fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
-    headers.get(axum::http::header::ACCEPT).is_none_or(|value| {
-        value.to_str().is_ok_and(|accept| {
+    // RFC 9110 lets a list-valued field arrive as several field lines that mean
+    // exactly the comma-joined list, so `Accept: application/json` followed by
+    // `Accept: text/html` is an HTML offer. `HeaderMap::get` returns only the
+    // first line and would read that pair as a refusal, keeping the client's
+    // validators and letting an inner `EtagLayer` answer `304` — no body, so no
+    // banner, for a client that does render one. Scan every line; a missing
+    // `Accept` (no lines at all) still means yes, per the doc comment above.
+    let mut offered = false;
+    for value in headers.get_all(axum::http::header::ACCEPT) {
+        offered = true;
+        // A non-UTF-8 line tells us nothing; another line may still offer HTML.
+        let Ok(accept) = value.to_str() else {
+            continue;
+        };
+        let names_html = {
             accept.split(',').any(|range| {
                 let mut parts = range.split(';').map(str::trim);
                 let Some(media) = parts.next() else {
@@ -522,8 +551,12 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
                         .is_some_and(|(k, v)| k.eq_ignore_ascii_case("q") && is_zero_quality(v))
                 })
             })
-        })
-    })
+        };
+        if names_html {
+            return true;
+        }
+    }
+    !offered
 }
 
 /// Whether an RFC 9110 quality value is exactly zero (`0`, `0.`, `0.000`).
@@ -732,6 +765,15 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             parts
                 .headers
                 .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
+            // The bytes just changed, so any validator or digest an inner layer
+            // computed describes a representation that is no longer being sent.
+            // Leaving them attached is worse than dropping them: a client that
+            // verifies `Content-Digest` rejects every banner-injected page, and
+            // a stale `ETag` names bytes without the banner. Dropping is always
+            // safe — the response simply cannot be revalidated — and dropping
+            // beats recomputing here, which would have to re-derive whatever
+            // scheme the inner layer chose.
+            drop_stale_representation_metadata(&mut parts.headers);
             // A live, per-visitor CSRF token was just embedded in this body —
             // never let a CDN/proxy (or the browser) cache and replay it to
             // someone else.
@@ -3074,6 +3116,166 @@ mod tests {
         assert!(
             !html.contains("autumn-consent-banner"),
             "an internal build/ISR render must never have the banner baked in: {html}"
+        );
+    }
+
+    // ── Codex round 24: representation metadata and multi-line Accept ──
+
+    #[tokio::test]
+    async fn a_split_accept_header_still_counts_as_offering_html() {
+        // RFC 9110: a list-valued field may arrive as several field lines that
+        // mean the comma-joined list. `HeaderMap::get` sees only the first, so
+        // this pair used to read as a refusal -- the request kept its
+        // `If-None-Match`, an inner `EtagLayer` could answer `304`, and an
+        // HTML-rendering client silently never got prompted.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        headers.append(axum::http::header::ACCEPT, "text/html".parse().unwrap());
+        assert!(
+            accepts_html(&headers),
+            "HTML offered on the second Accept field line must still count"
+        );
+
+        // The `*/*`-is-not-a-document carve-out must survive the change.
+        let mut api = axum::http::HeaderMap::new();
+        api.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        api.append(axum::http::header::ACCEPT, "*/*".parse().unwrap());
+        assert!(
+            !accepts_html(&api),
+            "an API client splitting its Accept must keep its validators"
+        );
+
+        // And a refusal spread across lines is still a refusal.
+        let mut refused = axum::http::HeaderMap::new();
+        refused.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        refused.append(axum::http::header::ACCEPT, "text/html;q=0".parse().unwrap());
+        assert!(
+            !accepts_html(&refused),
+            "`text/html;q=0` on a later line is an explicit refusal"
+        );
+
+        assert!(
+            accepts_html(&axum::http::HeaderMap::new()),
+            "a missing Accept still means yes"
+        );
+    }
+
+    #[tokio::test]
+    async fn splicing_the_banner_drops_a_now_wrong_etag_and_digest() {
+        // The handler stands in for an inner `EtagLayer`: it labels the body it
+        // produced. Once the banner is spliced in, those bytes are not what
+        // ships, so the validator and the digest describe a representation the
+        // client will never see -- a `Content-Digest`-verifying client would
+        // reject the page outright.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(axum::http::header::ETAG, "\"pre-splice\"")
+                        .header("content-digest", "sha-256=:deadbeef:")
+                        .header("digest", "SHA-256=deadbeef")
+                        .body(Body::from("<html><body>hi</body></html>"))
+                        .unwrap()
+                }),
+            )
+            // `None` for the CSRF cookie name, matching the other
+            // injection tests: with `Some(..)` and no such cookie on the
+            // request there is no token to embed and the middleware
+            // correctly declines to inject at all.
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("autumn-consent-banner"),
+            "precondition: this request must actually get a banner: {html}"
+        );
+        assert!(
+            !headers.contains_key(axum::http::header::ETAG),
+            "a validator for the pre-splice bytes must not survive the splice"
+        );
+        assert!(
+            !headers.contains_key("content-digest"),
+            "Content-Digest describes bytes that are no longer being sent"
+        );
+        assert!(
+            !headers.contains_key("digest"),
+            "the obsolete Digest spelling must go too"
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok()),
+            Some(html.len()),
+            "Content-Length must match the spliced body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_is_not_rewritten_keeps_its_etag() {
+        // The mirror of the test above: when nothing is spliced, the inner
+        // layer's validator is still accurate and must be left alone. Without
+        // this, "drop the ETag" could quietly become "never revalidate".
+        let app = Router::new()
+            .route(
+                "/data.json",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(axum::http::header::ETAG, "\"kept\"")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/data.json")
+                    .header(axum::http::header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"kept\""),
+            "an untouched body keeps its validator"
         );
     }
 }
