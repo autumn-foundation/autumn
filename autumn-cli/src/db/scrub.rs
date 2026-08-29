@@ -24,7 +24,7 @@
 //!    PII unless explicitly declared `safe`.
 //!
 //! Everything left over is **unclassified**, and an unclassified column is a
-//! hard failure ([`ScrubError::Unclassified`]) — never a silent pass-through.
+//! hard failure (`ScrubError::Unclassified`) — never a silent pass-through.
 //! Because the column universe comes from **introspecting the live database**
 //! (not from the config file), a column added yesterday cannot be missing from
 //! that universe: adding a column without declaring it breaks the scrub, which
@@ -743,7 +743,8 @@ fn parse_config_str(src: &str) -> Result<ScrubConfig, ScrubError> {
     parse_config_at(src, Path::new(SCRUB_CONFIG_FILE))
 }
 
-/// [`parse_config_str`], attributing any error to the file it came from.
+/// Parse a `scrub.toml` document, attributing any error to the file it came
+/// from.
 fn parse_config_at(src: &str, path: &Path) -> Result<ScrubConfig, ScrubError> {
     toml::from_str(src).map_err(|e| ScrubError::Config {
         path: path.display().to_string(),
