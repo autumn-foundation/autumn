@@ -16,6 +16,7 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+#[cfg(feature = "db")]
 mod commentable;
 mod edge;
 mod edge_routes_macro;
@@ -33,6 +34,7 @@ mod mail_previews_macro;
 mod mailer;
 mod mailer_preview;
 mod main_macro;
+#[cfg(feature = "db")]
 mod model;
 mod oauth2_callback;
 mod one_off_task;
@@ -43,10 +45,12 @@ mod parse;
 mod paths_macro;
 mod public;
 mod query_budget;
+#[cfg(feature = "db")]
 mod repository;
 mod route;
 mod routes_macro;
 mod scheduled;
+mod schema;
 mod secured;
 mod service;
 mod sim_test;
@@ -646,6 +650,7 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// `react()` acquires its **own** pooled connection and does not join an
 /// enclosing `Db::tx` — do not hold a `Db` extractor across the call on a small
 /// connection pool.
+#[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
@@ -711,7 +716,30 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// // Reads pinned to the primary even when a replica is configured.
 /// #[repository(LedgerEntry, primary_reads)]
 /// trait LedgerEntryRepository {}
+///
+/// // Cache coherence (#1716): every write below can strand
+/// // `views::recent_posts`, so the edge is declared here. The path resolves
+/// // to the identity constant `#[cached]` generates beside that function, so
+/// // naming anything else does not compile.
+/// #[repository(Post, invalidates(crate::views::recent_posts))]
+/// trait CoherentPostRepository {
+///     // A per-method edge adds to the trait-level ones.
+///     #[invalidates(crate::views::by_author)]
+///     fn delete_by_author_id(author_id: i64) -> ();
+/// }
 /// ```
+///
+/// # Cache coherence (issue #1716)
+///
+/// Every generated write method publishes which model it mutates, so
+/// `autumn cache audit` can fail the build when a write's model appears in a
+/// `#[cached]` read's dependency set with no invalidation covering the pair.
+/// Discharge the obligation with `invalidates(...)` — on the attribute for
+/// every write, or as `#[invalidates(...)]` on one trait method — or opt out
+/// with `acknowledge_stale = "reason"`. A repository that declares any edge
+/// also gets a generated `invalidate_declared_caches()` for its write paths to
+/// call. See `docs/guide/cache-coherence.md`.
+#[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
     repository::repository_macro(attr.into(), item.into()).into()
@@ -1280,7 +1308,7 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Cache the return value of a function based on its arguments.
 ///
 /// Wraps a function with an in-memory cache backed by a per-function
-/// static `Cache` (from `autumn_web::cache::Cache`). Arguments
+/// static `Cache` (from `autumn_web::cache::Cache`). Key arguments
 /// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
 ///
 /// # Attributes
@@ -1290,6 +1318,19 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `ttl` | `"5m"` | Time-to-live per entry (uses `parse_duration` syntax) |
 /// | `max` | `1000` | Max entries; oldest evicted on overflow |
 /// | `result` | (flag) | Only cache `Ok` values; pass `Err` through uncached |
+/// | `key` | `key(tenant_id)` | Build the key from *these* parameters only |
+/// | `reads` | `reads(Post, Comment)` | Declared cache-coherence dependency set |
+/// | `acknowledge_stale` | `"5s TTL is tight enough"` | Opt out of the coherence gate |
+///
+/// # Cache coherence (issue #1716)
+///
+/// Every annotated function publishes which models its value is derived from,
+/// and `autumn cache audit` fails the build when a `#[repository]` write can
+/// leave that value stale with no invalidation covering the pair. `reads(...)`
+/// declares the dependency set; without it the macro derives what it can from
+/// the signature and body, and a function nothing could be recovered from is
+/// recorded as `undetermined` — reported, never gated. See
+/// `docs/guide/cache-coherence.md`.
 ///
 /// # Examples
 ///
@@ -1300,6 +1341,16 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[cached(ttl = "5m", max = 100, result)]
 /// async fn get_user(id: i64) -> AutumnResult<User> {
 ///     db.find(id).await
+/// }
+///
+/// // A repository-backed read: the handle is not part of the value's
+/// // identity, so `key(...)` keeps it out of the cache key, and `reads(...)`
+/// // tells the coherence gate what a write to `Project` would strand.
+/// #[cached(ttl = "30s", key(tenant_id), reads(Project), result)]
+/// async fn project_count(tenant_id: String, repo: &PgProjectRepository)
+///     -> AutumnResult<i64>
+/// {
+///     repo.count().await
 /// }
 ///
 /// // Cache forever with no size limit

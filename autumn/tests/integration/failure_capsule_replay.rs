@@ -26,8 +26,8 @@ use autumn_web::AppState;
 use autumn_web::capsule::{
     AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb, CapsuleError,
     CapsuleOutcome, CapsuleRequest, ConnectionTape, DivergenceKind, DivergenceLog, Exchange,
-    ExchangeProtocol, ReplayClock, Verdict, execute, pool_from_capsule, print_refusal,
-    print_verdict, refusal_reason,
+    ExchangeProtocol, ReplayClock, ReplayFixtures, Verdict, execute, pool_from_capsule,
+    print_refusal, print_verdict, refusal_reason,
 };
 use autumn_web::config::AutumnConfig;
 use autumn_web::db::Db;
@@ -188,6 +188,8 @@ fn capsule(request: CapsuleRequest, outcome: CapsuleOutcome) -> Capsule {
         db_roles: Vec::new(),
         truncated: false,
         notes: Vec::new(),
+        effects: autumn_web::capsule::CapsuleEffects::default(),
+        job: None,
     }
 }
 
@@ -445,7 +447,13 @@ async fn replay_reproduces_the_recorded_500() {
         .into_router();
 
     let divergences = Arc::new(DivergenceLog::new());
-    let outcome = execute(router, &recorded, divergences, None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        divergences,
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -475,7 +483,13 @@ async fn replay_reproduces_the_recorded_panic() {
     // `execute`'s `catch_unwind` exists for.
     let bare = axum::Router::new().route("/boom", axum::routing::get(bare_boom));
     let divergences = Arc::new(DivergenceLog::new());
-    let outcome = execute(bare, &recorded, Arc::clone(&divergences), None).await;
+    let outcome = execute(
+        bare,
+        &recorded,
+        Arc::clone(&divergences),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -499,7 +513,13 @@ async fn replay_reproduces_the_recorded_panic() {
         .routes(routes![boom])
         .build()
         .into_router();
-    let outcome = execute(framework, &recorded, Arc::new(DivergenceLog::new()), None).await;
+    let outcome = execute(
+        framework,
+        &recorded,
+        Arc::new(DivergenceLog::new()),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
     assert_eq!(
         outcome.verdict,
         Verdict::Reproduced,
@@ -529,7 +549,13 @@ async fn replay_reports_divergence_on_unrecorded_query() {
         .build()
         .into_router();
 
-    let outcome = execute(router, &recorded, Arc::clone(&divergences), None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        Arc::clone(&divergences),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -581,7 +607,13 @@ async fn replay_reports_divergence_when_a_recorded_exchange_is_never_issued() {
         .build()
         .into_router();
 
-    let outcome = execute(router, &recorded, Arc::clone(&divergences), None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        Arc::clone(&divergences),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -645,7 +677,13 @@ async fn replay_reports_divergence_when_a_whole_tape_is_never_claimed() {
         .build()
         .into_router();
 
-    let outcome = execute(router, &recorded, Arc::clone(&divergences), None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        Arc::clone(&divergences),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -737,7 +775,13 @@ async fn a_capsule_without_database_traffic_is_unaffected_by_the_tape_audit() {
         .build()
         .into_router();
 
-    let outcome = execute(router, &recorded, divergences, None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        divergences,
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,
@@ -918,25 +962,21 @@ async fn clock_over_read_reuses_last_reading_and_warns() {
     // One reading recorded, two reads at replay: the code changed.
     recorded.clock = vec![at(1)];
 
-    let clock = Arc::new(ReplayClock::new(recorded.clock.clone(), at(0)));
+    let fixtures = ReplayFixtures::from_capsule(&recorded);
     let router = TestApp::new()
         .config(test_config())
         .routes(routes![clock_twice])
-        .with_clock(SharedClock(Arc::clone(&clock)))
+        .with_clock(fixtures.clock())
         .build()
         .into_router();
 
-    let outcome = execute(
-        router,
-        &recorded,
-        Arc::new(DivergenceLog::new()),
-        Some(clock.as_ref()),
-    )
-    .await;
+    let outcome = execute(router, &recorded, Arc::new(DivergenceLog::new()), &fixtures).await;
 
     assert!(
-        clock.over_reads() >= 1,
-        "reading past the end of the recording must be counted"
+        fixtures.clock_over_reads() >= 1,
+        "reading past the end of the recording must be counted — the *unconsumed* \
+         warning also mentions the clock, so asserting on the warning alone would \
+         pass for the opposite condition"
     );
     assert!(
         outcome
@@ -1028,7 +1068,13 @@ async fn divergence_report_mentions_redaction_when_status_is_401() {
         .routes(routes![denied])
         .build()
         .into_router();
-    let outcome = execute(router, &recorded, Arc::new(DivergenceLog::new()), None).await;
+    let outcome = execute(
+        router,
+        &recorded,
+        Arc::new(DivergenceLog::new()),
+        &ReplayFixtures::from_capsule(&recorded),
+    )
+    .await;
 
     assert_eq!(
         outcome.verdict,

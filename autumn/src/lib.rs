@@ -267,6 +267,14 @@ pub use plugin::{Plugin, Plugins};
 
 pub mod route_listing;
 
+/// In-place upgrades: swap a running app to a new binary without dropping
+/// connections or in-memory state (#1674).
+///
+/// Documented from inside the module: the `SIGUSR2` handoff protocol, the
+/// designated live-state block, and the compile-checked
+/// [`state_migration!`](crate::state_migration) between shapes.
+pub mod upgrade;
+
 /// Inbound (server-side) TLS support (issue #1603).
 ///
 /// Load and validate a certificate + key, build a reloadable rustls

@@ -509,7 +509,7 @@ where
 {
     type Response = Response;
     type Error = S::Error;
-    type Future = ReportingFuture<S::Future>;
+    type Future = ReportingOuterFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -541,7 +541,20 @@ where
         // `call` before returning a future), not just panics raised while
         // polling. Mirrors `tower_http::catch_panic`.
         let inner = &mut self.inner;
-        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.call(req))) {
+        // A replay enters its scope around the inner `call` as well as around
+        // the future it returns, matching `CaptureService`, which runs `call`
+        // inside the capture scope. A one-`call` difference between the two
+        // boundaries would shift the whole clock/entropy tape by however many
+        // readings an inner middleware takes synchronously.
+        let replaying = crate::capsule::effects::tape_active();
+        let called = || {
+            if replaying {
+                crate::capsule::clock::sync_scope_replay_request(|| inner.call(req))
+            } else {
+                inner.call(req)
+            }
+        };
+        let future = match std::panic::catch_unwind(AssertUnwindSafe(called)) {
             Ok(future) => ReportingFuture {
                 inner: Some(future),
                 pending_panic: None,
@@ -554,6 +567,19 @@ where
                 context,
                 chain: Arc::clone(&self.chain),
             },
+        };
+        // A capsule replay consumes its recorded clock readings and entropy
+        // draws from *here* inwards, because that is exactly where capture
+        // recorded them: `CaptureLayer` sits immediately outside this layer, so
+        // anything further out (a minted request id, a minted session id) was
+        // never on the tape and must not eat it. See
+        // `capsule::clock::with_replay_request_scope`.
+        if replaying {
+            ReportingOuterFuture::Replaying {
+                inner: crate::capsule::clock::scope_replay_request(future),
+            }
+        } else {
+            ReportingOuterFuture::Plain { inner: future }
         }
     }
 }
@@ -569,6 +595,46 @@ pin_project! {
         pending_panic: Option<Box<dyn Any + Send>>,
         context: Option<RequestContext>,
         chain: Arc<ReporterChain>,
+    }
+}
+
+pin_project! {
+    /// The future [`ReportingService`] returns: [`ReportingFuture`], optionally
+    /// wrapped in the scope a capsule replay consumes its recorded clock
+    /// readings and random draws from.
+    ///
+    /// A hand-written enum rather than `futures::future::Either` — which would
+    /// be equally zero-cost — because naming `Either` in a public associated
+    /// type would make the `futures` crate part of Autumn's semver surface, and
+    /// rather than a boxed future, which would cost every request of every
+    /// application an allocation for the sake of the rarer arm.
+    #[project = ReportingOuterProj]
+    pub enum ReportingOuterFuture<F> {
+        /// Ordinary serving: no replay in progress.
+        Plain {
+            #[pin]
+            inner: ReportingFuture<F>,
+        },
+        /// A capsule replay, inside the scope that consumes the recorded clock
+        /// readings and random draws.
+        Replaying {
+            #[pin]
+            inner: tokio::task::futures::TaskLocalFuture<(), ReportingFuture<F>>,
+        },
+    }
+}
+
+impl<F, E> Future for ReportingOuterFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            ReportingOuterProj::Plain { inner } => inner.poll(cx),
+            ReportingOuterProj::Replaying { inner } => inner.poll(cx),
+        }
     }
 }
 

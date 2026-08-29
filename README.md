@@ -236,6 +236,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
+- [Cache Coherence](docs/guide/cache-coherence.md) — `autumn cache audit`: the build fails when a `#[repository]` write can leave a `#[cached]` read stale with no invalidation covering it, turning cache invalidation from a runtime footgun into a compile-time obligation
 - [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
@@ -264,7 +265,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
-- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code after showing you the diff; everything it cannot safely rewrite is listed with `file:line` and a guide link
+- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code **and** reconciles your project's framework-owned scaffold files (`Dockerfile`, `build.rs`, CI workflow, toolchain configs) against the current release, after showing you the diff; files you edited are flagged as conflicts rather than overwritten, `--check` exits nonzero on drift for CI, and everything it cannot safely rewrite is listed with `file:line` and a guide link
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 - [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
 - [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget

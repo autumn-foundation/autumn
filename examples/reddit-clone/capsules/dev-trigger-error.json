@@ -1,7 +1,7 @@
 {
-  "format_version": 2,
-  "id": "94a4cfd1-c7d0-4b3f-82f8-ffb6448220e1",
-  "captured_at": "2026-08-27T17:21:29.826775098Z",
+  "format_version": 3,
+  "id": "2d95cb69-49bc-43b0-8e73-b0d59cc9073e",
+  "captured_at": "2026-08-28T00:31:11.348203097Z",
   "autumn_version": "0.7.0",
   "app": {
     "name": "autumn-app",
@@ -34,5 +34,14 @@
   "db": null,
   "db_roles": [],
   "truncated": false,
-  "notes": []
+  "notes": [],
+  "effects": {
+    "http": [],
+    "jobs": [],
+    "cache": [],
+    "mail": [],
+    "tenant": null,
+    "random": []
+  },
+  "job": null
 }

@@ -636,6 +636,241 @@ pub struct Mail {
     pub inline_css: Option<bool>,
 }
 
+// ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The `capsule` module is behind the `reporting` feature, so each seam helper
+// has a no-op twin for builds without it. Shims rather than `#[cfg]` at the
+// call sites: the seam is then one line in `send`, whatever the feature set,
+// and a future reader cannot miss it among conditional compilation.
+
+/// Answer a mail send from the capsule's effect tape, when one is serving this
+/// task.
+///
+/// `Some(Ok(()))` means the send matched a recorded success and **nothing was
+/// delivered**; `Some(Err(..))` is either a recorded delivery failure being
+/// reproduced or a divergence failing closed. `None` means no replay is in
+/// progress.
+#[cfg(feature = "reporting")]
+fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
+    use crate::capsule::effects::MailVerdict;
+
+    let tape = crate::capsule::effects::current_tape()?;
+    // Derived by `capsule_body`, the same rule the recorder applies, so the
+    // comparison is like with like.
+    let body = capsule_body(mail);
+    let alternate_body = capsule_alternate_body(mail);
+    let attachments: Vec<_> = mail.attachments.iter().map(attachment_effect).collect();
+    let sent = crate::capsule::effects::SentMail {
+        to: &mail.to,
+        from: mail.from.as_deref(),
+        subject: &mail.subject,
+        body: &body,
+        alternate_body: &alternate_body,
+        reply_to: mail.reply_to.as_deref(),
+        list_unsubscribe: mail.list_unsubscribe.as_deref(),
+        extra_headers: &mail.extra_headers,
+        attachments: &attachments,
+    };
+    Some(match tape.next_mail(&sent) {
+        MailVerdict::Sent => Ok(()),
+        // A recorded delivery *failure* is reproduced as one. A handler whose
+        // bug is that it does not handle a suppressed recipient or an SMTP
+        // refusal has to meet that error again, not a synthesized success.
+        // Rebuilt as the variant and text the recorded send produced: a
+        // handler that branches on `AllRecipientsSuppressed`, or propagates the
+        // error into its response, must see what production saw.
+        MailVerdict::Failed(error, kind) => Err(rebuild_mail_error(kind, error)),
+        // `next_mail` already logged the divergence; the send fails closed
+        // rather than reaching a transport.
+        MailVerdict::Diverged => Err(MailError::RuntimeUnavailable(format!(
+            "the replayed run sent mail ({:?} to {} recipient(s)) the capsule has no \
+             recording for; nothing was delivered",
+            mail.subject,
+            mail.to.len()
+        ))),
+    })
+}
+
+/// Reserve this send's tape position, before the transport is asked.
+#[cfg(feature = "reporting")]
+fn reserve_mail_slot() -> Option<(std::sync::Arc<crate::capsule::CaptureScope>, usize)> {
+    let scope = crate::capsule::current_scope()?;
+    let index = scope.reserve_mail()?;
+    Some((scope, index))
+}
+
+/// Complete a reserved send slot with what the transport actually did.
+#[cfg(feature = "reporting")]
+fn fill_mail_slot(
+    slot: Option<(std::sync::Arc<crate::capsule::CaptureScope>, usize)>,
+    mail: &Mail,
+    error: Option<&MailError>,
+) {
+    if let Some((scope, index)) = slot {
+        scope.fill_mail(index, mail_effect(mail, error));
+    }
+}
+
+/// No capsule support compiled in: nothing to reserve.
+#[cfg(not(feature = "reporting"))]
+const fn reserve_mail_slot() -> Option<()> {
+    None
+}
+
+/// No capsule support compiled in: nothing to fill.
+#[cfg(not(feature = "reporting"))]
+const fn fill_mail_slot(_slot: Option<()>, _mail: &Mail, _error: Option<&MailError>) {}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_send(_mail: &Mail) -> Option<Result<(), MailError>> {
+    None
+}
+
+/// The capsule record for one message.
+///
+/// The plain-text body is preferred over the HTML one: it is the same content,
+/// it is what redaction can scan, and an inlined HTML body is mostly markup
+/// that would dominate the capsule's size budget for no reproduction value.
+#[cfg(feature = "reporting")]
+fn mail_effect(mail: &Mail, error: Option<&MailError>) -> crate::capsule::MailEffect {
+    crate::capsule::MailEffect {
+        to: mail.to.clone(),
+        from: mail.from.clone(),
+        subject: mail.subject.clone(),
+        body: capsule_body(mail),
+        alternate_body: capsule_alternate_body(mail),
+        reply_to: mail.reply_to.clone(),
+        list_unsubscribe: mail.list_unsubscribe.clone(),
+        extra_headers: mail.extra_headers.clone(),
+        attachments: mail.attachments.iter().map(attachment_effect).collect(),
+        error: error.map(ToString::to_string),
+        error_kind: error.map(mail_error_kind),
+    }
+}
+
+/// The alternative body `capsule_body` did not take.
+///
+/// A multipart message has two, and either can change on its own; recording
+/// only the preferred one lets a rewritten HTML template ride along under an
+/// untouched text fallback.
+#[cfg(feature = "reporting")]
+fn capsule_alternate_body(mail: &Mail) -> crate::capsule::CapsuleBody {
+    // `capsule_body` prefers text, so the alternate is html — unless there was
+    // no text at all, in which case html was already taken as the primary and
+    // there is no second body to record.
+    let alternate = if mail.text.is_some() {
+        mail.html.as_ref()
+    } else {
+        None
+    };
+    alternate.map_or(crate::capsule::CapsuleBody::Absent, |body| {
+        crate::capsule::CapsuleBody::Text(body.clone())
+    })
+}
+
+/// Record one attachment by identity rather than by content.
+#[cfg(feature = "reporting")]
+fn attachment_effect(attachment: &MailAttachment) -> crate::capsule::schema::MailAttachmentEffect {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(&attachment.bytes);
+    crate::capsule::schema::MailAttachmentEffect {
+        filename: attachment.filename.clone(),
+        content_type: attachment.content_type.clone(),
+        len: attachment.bytes.len(),
+        sha256: digest.iter().fold(String::new(), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        }),
+    }
+}
+
+/// Which [`MailErrorKind`](crate::capsule::schema::MailErrorKind) a failure is,
+/// so replay can reproduce the variant a handler branches on — a
+/// `matches!(err, MailError::AllRecipientsSuppressed)` guard takes a different
+/// path against a catch-all.
+#[cfg(feature = "reporting")]
+const fn mail_error_kind(error: &MailError) -> crate::capsule::schema::MailErrorKind {
+    use crate::capsule::schema::MailErrorKind as Kind;
+    match error {
+        MailError::InvalidMessage(_) => Kind::InvalidMessage,
+        MailError::RuntimeUnavailable(_) => Kind::RuntimeUnavailable,
+        MailError::InvalidAddress { .. } => Kind::InvalidAddress,
+        MailError::Build(_) => Kind::Build,
+        MailError::Smtp(_) => Kind::Smtp,
+        MailError::Io(_) => Kind::Io,
+        MailError::AllRecipientsSuppressed => Kind::AllRecipientsSuppressed,
+        MailError::CssInline(_) => Kind::CssInline,
+        _ => Kind::Other,
+    }
+}
+
+/// Rebuild the mail failure a recorded send produced, as the handler saw it.
+///
+/// Variants carrying nothing but a string are rebuilt exactly; the ones
+/// wrapping a foreign error (`Smtp`, `Build`, `Io`, `InvalidAddress`) have no
+/// public constructor, so they come back as
+/// [`MailError::ReplayedFailure`] with the recorded text verbatim.
+#[cfg(feature = "reporting")]
+fn rebuild_mail_error(
+    kind: Option<crate::capsule::schema::MailErrorKind>,
+    text: String,
+) -> MailError {
+    use crate::capsule::schema::MailErrorKind as Kind;
+    match kind {
+        Some(Kind::AllRecipientsSuppressed) => MailError::AllRecipientsSuppressed,
+        Some(Kind::InvalidMessage) => {
+            MailError::InvalidMessage(strip_mail_prefix(&text, "invalid mail message: "))
+        }
+        Some(Kind::RuntimeUnavailable) => {
+            MailError::RuntimeUnavailable(strip_mail_prefix(&text, "mail runtime unavailable: "))
+        }
+        Some(Kind::CssInline) => MailError::CssInline(strip_mail_prefix(
+            &text,
+            "failed to inline CSS into HTML mail body: ",
+        )),
+        Some(Kind::Build | Kind::Smtp | Kind::Io | Kind::InvalidAddress | Kind::Other) | None => {
+            MailError::ReplayedFailure(text)
+        }
+    }
+}
+
+/// The payload of a single-field mail error, recovered from its recorded
+/// `Display`. See `strip_prefix_payload` in `http_client`.
+#[cfg(feature = "reporting")]
+fn strip_mail_prefix(text: &str, prefix: &str) -> String {
+    text.strip_prefix(prefix).unwrap_or(text).to_owned()
+}
+
+/// The body a capsule records for one message.
+///
+/// One definition for both halves of the seam — the recorder stores this, and
+/// replay compares against it — so the two can never disagree about which of a
+/// multipart message's two bodies the capsule is talking about.
+#[cfg(feature = "reporting")]
+fn capsule_body(mail: &Mail) -> crate::capsule::CapsuleBody {
+    mail.text
+        .as_ref()
+        .or(mail.html.as_ref())
+        .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+            crate::capsule::CapsuleBody::Text(body.clone())
+        })
+}
+
+/// Tee a send that never reaches [`Mailer::send`] into the capsule.
+///
+/// Only the deferred path needs this: it spawns, so the awaited two-phase
+/// recording in `send` cannot cover it.
+#[cfg(feature = "reporting")]
+fn record_send(mail: &Mail, error: Option<&MailError>) {
+    fill_mail_slot(reserve_mail_slot(), mail, error);
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_send(_mail: &Mail, _error: Option<&MailError>) {}
+
 /// Stable root path for the dev mail preview UI.
 pub const MAIL_PREVIEW_PATH: &str = "/_autumn/mail";
 
@@ -1043,6 +1278,16 @@ pub enum MailError {
         "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback"
     )]
     NoDurableQueueInProduction,
+    /// A failure a capsule recorded, reproduced during replay (#1634).
+    ///
+    /// Used only for failures whose own variant cannot be rebuilt — `Smtp`,
+    /// `Build` and `Io` wrap foreign error types with no public constructor.
+    /// Its `Display` is the recorded text *exactly*: a handler that propagates
+    /// the error writes this into the capsule's outcome, and the replay verdict
+    /// compares outcome text verbatim, so any marker of its own would report an
+    /// unchanged failure as a mismatch.
+    #[error("{0}")]
+    ReplayedFailure(String),
 }
 
 /// Escape hatch for custom transports.
@@ -1713,7 +1958,35 @@ impl Mailer {
     /// suppressed, an error from the selected transport, or from the suppression
     /// store when a suppression check fails.
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
-        let mut mail = mail.with_defaults(&self.defaults);
+        let mail = mail.with_defaults(&self.defaults);
+
+        // Failure-capsule seam (#1634). A replay asserts the send against the
+        // recording and returns without touching a transport — the check sits
+        // ahead of suppression, CSS inlining and the list-mail branch because
+        // all three consult live state (a suppression store, an unsubscribe
+        // runtime) a replay does not have.
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        // Two-phase, for two reasons that pull in opposite directions. The
+        // tape *position* is taken before the send, so two messages a handler
+        // sends concurrently land in initiation order — the order replay
+        // consumes them in — rather than in whichever order their transports
+        // happened to finish. The *content* is filled in afterwards, error
+        // included, because a handler whose bug is "we do not handle
+        // `AllRecipientsSuppressed`" must meet that error again on replay, and
+        // recording up front would tell the capsule the message went out when
+        // it never did.
+        let slot = reserve_mail_slot();
+        let recorded = mail.clone();
+        let result = self.send_inner(mail).await;
+        fill_mail_slot(slot, &recorded, result.as_ref().err());
+        result
+    }
+
+    /// [`send`](Self::send), minus the replay gate and the capture tee.
+    async fn send_inner(&self, mail: Mail) -> Result<(), MailError> {
+        let mut mail = mail;
 
         // Inline `<style>` CSS into element `style="…"` attributes before
         // transport, so every transport (SMTP, file, log, preview) delivers the
@@ -2043,6 +2316,19 @@ impl Mailer {
     }
 
     fn spawn_mail_delivery(&self, mail: Mail) -> Result<(), MailError> {
+        // Failure-capsule seam (#1634). Deferred delivery is the one mail path
+        // that leaves the request's task, and a task-local tape does not cross
+        // `tokio::spawn` — so a replayed handler that called `deliver_later`
+        // would send *for real* from the spawned task, where the seam in
+        // `send` can no longer see a tape. The check has to happen here, on the
+        // calling task, before anything is spawned.
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        // Recorded here for the same reason: the spawned task carries no
+        // capture scope either, so a `deliver_later` would otherwise be missing
+        // from the capsule and then report an unrecorded-effect divergence.
+        record_send(&mail, None);
         // Honor the disabled-transport contract: if the operator turned mail off
         // for this profile, deliver_later must drop the message just like
         // immediate `send` does — even when a queue is attached.

@@ -48,9 +48,13 @@ pub use crate::assets::asset_url;
 /// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
 #[cfg(feature = "maud")]
 pub use crate::assets::javascript_include_tag;
-/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+/// Cache a rendered Maud fragment keyed by `(identity, version)`; the `_in`
+/// variants add a cache-key namespace so a repository write can invalidate the
+/// fragment as a group (#1716).
 #[cfg(feature = "maud")]
-pub use crate::cache::{cache_fragment, cache_fragment_global};
+pub use crate::cache::{
+    cache_fragment, cache_fragment_global, cache_fragment_global_in, cache_fragment_in,
+};
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};

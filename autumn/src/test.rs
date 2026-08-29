@@ -1169,6 +1169,32 @@ impl TestApp {
         self
     }
 
+    /// Install a designated live-state block, so handlers that read it through
+    /// [`AppState::live_state`](crate::AppState::live_state) can be tested.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::with_live_state`]. A test app never
+    /// adopts a snapshot from a predecessor — there is no upgrade in flight —
+    /// so `initial` is always the value handlers see.
+    #[must_use]
+    pub fn with_live_state<T>(mut self, initial: T) -> Self
+    where
+        T: crate::upgrade::LiveState,
+    {
+        self.state_initializers.push(Box::new(move |state| {
+            assert!(
+                state
+                    .extension::<crate::upgrade::LiveStateRegistry>()
+                    .is_none(),
+                "an app may designate only one block of live state; the real builder \
+                 refuses a second one at startup, so a test app does too"
+            );
+            let handle = crate::upgrade::LiveStateHandle::new(initial);
+            state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
+            state.insert_extension(handle);
+        }));
+        self
+    }
+
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend so
     /// the [`Flags`](crate::feature_flags::Flags) extractor works in test handlers.
     ///
@@ -1904,6 +1930,17 @@ impl TestApp {
                 std::sync::Arc::new(crate::capsule::RecordingClock::new(state.clock_arc()))
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
+        }
+        // Same for the entropy source (#1634): a handler that mints a session
+        // id, a token or a job id must mint the *recorded* one on replay, or
+        // the identifier in the capsule's SQL binds will not be the one the
+        // replayed code produced.
+        #[cfg(feature = "reporting")]
+        if self.config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingEntropy::new(state.entropy_arc()))
+                    as std::sync::Arc<dyn crate::entropy::Entropy>;
+            state = state.with_entropy(recording);
         }
 
         for register in self.policy_registrations {

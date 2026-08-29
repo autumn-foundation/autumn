@@ -28,23 +28,16 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    # Cap cargo's parallelism for every step in this job. `ubuntu-latest` is 4
-    # vCPU / 16 GiB, so an uncapped `cargo clippy --workspace --all-targets`
-    # runs four rustc processes at once — and several of them are type-checking
-    # `autumn-web`, which is by far the largest crate here (its `--all-targets`
-    # slice alone is the lib plus the consolidated `integration_tests` binary
-    # plus the benches). That peak exceeds the runner's memory: the job dies
-    # roughly 60-90s into `Checking autumn-web` with `exit code 143` and "The
-    # runner has received a shutdown signal", and — because the runner agent is
-    # what got killed — with no clippy diagnostic at all, which makes it read
-    # like a mystery infrastructure flake rather than OOM. It reproduces on a
-    # 4 vCPU / 16 GiB box with the same command and passes there at `-j 2`.
-    #
-    # Two jobs still saturate 4 vCPU reasonably well once the `rust-cache` hit
-    # covers the dependency graph, so this costs a few minutes, not a rebuild.
-    # Raise it only alongside a runner with more memory.
     env:
-      CARGO_BUILD_JOBS: "2"
+      # `cargo clippy --workspace --all-targets` compiles autumn-web alongside
+      # every example crate at once. At the default parallelism (one job per
+      # vCPU) that peaks close enough to a 16 GB hosted runner's memory that the
+      # job has repeatedly died ~60s in with `exit 143` and "The runner has
+      # received a shutdown signal" — the host reclaiming the runner agent, not
+      # a lint failure: when it survives, the same step passes in ~7 minutes.
+      # Capping the compile jobs bounds that peak. This job gates `test`,
+      # `loom` and `coverage`, so a runner death here skips the whole suite.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

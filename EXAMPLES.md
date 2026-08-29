@@ -259,6 +259,25 @@ design record is `docs/adr/0011-edge-capsule-read-lane.md`.
 
 ---
 
+### `examples/hot-upgrade` — In-Place Upgrade (`SIGUSR2` socket + state handoff)
+
+<!-- catalog:example name=hot-upgrade tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator of a single-binary Autumn app who wants to deploy continuously without a load balancer, a cold cache, or a dropped connection |
+| **Journey** | In-place upgrade: designate a block of live state, build a new binary whose state shape changed, `kill -USR2`, and watch the same socket keep serving while the state is carried across a compile-checked migration |
+| **Key capabilities** | `AppBuilder::with_live_state`, `with_live_state_from`, `AppState::live_state`, `state_migration!`, `LiveStateHandle` freeze semantics, `[server.upgrade]` |
+| **Prerequisites** | Rust 1.88.0+ on Linux or another Unix. No database, no config file |
+| **Run command** | `cargo build -p hot-upgrade`, then `AUTUMN_UPGRADE_BINARY=target/debug/hot-upgrade-v2 ./target/debug/hot-upgrade-v1` |
+| **Success proof** | `cargo test -p hot-upgrade --test live_upgrade` boots the real v1 binary, upgrades it to the real v2 binary under sustained load, and asserts zero refused connections, zero failed reads, 100% carry-over of the pre-upgrade value, and a bounded cutover latency spike |
+| **Rationale for the tier** | Its proof is a live two-process upgrade under load, not a Chromium smoke: what it demonstrates has no page to click. The test runs in the ordinary `cargo test --workspace` lane. |
+
+Two binaries rather than one — the whole point is the *old* build becoming the
+*new* one. The companion narrative is `docs/guide/hot-upgrades.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal

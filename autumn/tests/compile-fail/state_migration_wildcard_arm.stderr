@@ -1,0 +1,11 @@
+error: no rules expected reserved identifier `_`
+  --> tests/compile-fail/state_migration_wildcard_arm.rs:33:13
+   |
+33 |             _ => Mode::Slow { level: 0 },
+   |             ^ no rules expected this token in macro call
+   |
+note: while trying to match meta-variable `$variant:ident`
+  --> src/upgrade.rs
+   |
+   |             $( $variant:ident
+   |                ^^^^^^^^^^^^^^
