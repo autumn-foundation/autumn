@@ -222,8 +222,9 @@ scrub should do behind a one-word config key. Schema bookkeeping
 | `encrypted` | A valid ciphertext envelope (chosen automatically for `#[encrypted]` columns; not declarable) | ✅ |
 
 `<token>` is a hash over the row's primary key, salted with the column name —
-`md5` normally, and a wider `sha256` for a column that must stay unique, so a
-length-bounded `varchar(n)` still has room for enough entropy.
+one `md5` normally, and two independently-salted ones concatenated for a column
+that must stay unique, so a length-bounded `varchar(n)` still has room for
+enough entropy.
 That makes every replacement:
 
 - **deterministic** — the same row scrubs to the same value on every run, so

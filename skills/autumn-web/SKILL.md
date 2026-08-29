@@ -2441,8 +2441,8 @@ purge = ["api_tokens", "autumn_jobs", "autumn_sync_rows"]
 
 Strategies: `auto` (derived from the column type), `email`, `name`, `phone`,
 `redact`, `null`, `uuid`, `bytes`, `json`, `zero`, `epoch`. Each value derives
-from a hash over the row's primary key salted with the column name (`sha256` for
-a column that must stay unique), so a `UNIQUE` column stays unique, two columns
+from a hash over the row's primary key salted with the column name (a doubled
+`md5` for a column that must stay unique), so a `UNIQUE` column stays unique, two columns
 of one row never collide, and a re-run is idempotent.
 
 `#[encrypted]` columns are **re-encrypted** under the target's own key (same

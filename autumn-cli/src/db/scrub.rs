@@ -1321,7 +1321,11 @@ fn token_expr(table: &Table, column: &str, unique: bool) -> String {
 fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
     let seed = format!("{} || '|' || {row_key}", quote_literal(column));
     if unique {
-        format!("encode(sha256(({seed})::bytea), 'hex')")
+        // Two independently-salted `md5`s concatenated, rather than `sha256`:
+        // both halves would have to collide at once, and this needs no
+        // `text`-to-`bytea` cast (whose escape-format interpretation would
+        // mangle a row key containing a backslash) and no Postgres 11 floor.
+        format!("md5({seed}) || md5(({seed}) || '#2')")
     } else {
         format!("md5({seed})")
     }
@@ -2583,11 +2587,10 @@ fn rewrite_encrypted_column(
     use autumn_web::encryption::{Mode, encrypt_text};
 
     let ident = quote_ident(&rewrite.column);
+    let seed = format!("{} || '|' || ({row_key})", quote_literal(&rewrite.column));
     let rows: Vec<RowTokenRow> = sql_query(format!(
-        "SELECT ({row_key}) AS row_key, \
-         encode(sha256((({row_key}) || '|' || {})::bytea), 'hex') AS token \
+        "SELECT ({row_key}) AS row_key, md5({seed}) || md5(({seed}) || '#2') AS token \
          FROM {} WHERE {ident} IS NOT NULL",
-        quote_literal(&rewrite.column),
         qualified_ident(table),
     ))
     .load(conn)?;
@@ -3253,9 +3256,12 @@ mod tests {
     #[test]
     fn a_unique_column_gets_a_wider_token_and_a_higher_floor() {
         let table = users_table();
-        assert!(
-            token_expr(&table, "email", true).contains("sha256"),
-            "a unique column needs more entropy than md5's 32 hex characters"
+        let unique_token = token_expr(&table, "email", true);
+        assert_eq!(
+            unique_token.matches("md5(").count(),
+            2,
+            "a unique column needs more entropy than one md5's 32 hex characters: \
+             {unique_token}"
         );
         assert!(token_expr(&table, "bio", false).contains("md5("));
 
