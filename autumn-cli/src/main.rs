@@ -1744,6 +1744,11 @@ enum DbCommands {
         /// Allow the scrub against a non-dev/test (e.g. production) profile.
         #[arg(long)]
         force: bool,
+        /// Allow writing over the database an artifact's own (non-dev/test)
+        /// profile config file declares. Separate from `--force`, which the
+        /// staging drill always passes.
+        #[arg(long)]
+        allow_source_overwrite: bool,
     },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
@@ -3575,6 +3580,7 @@ fn run_command(command: Commands) {
                 check,
                 dry_run,
                 force,
+                allow_source_overwrite,
             } => db::scrub::run(&db::scrub::ScrubArgs {
                 profile,
                 artifact,
@@ -3583,6 +3589,7 @@ fn run_command(command: Commands) {
                 check,
                 dry_run,
                 force,
+                allow_source_overwrite,
             }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
@@ -6357,10 +6364,12 @@ mod tests {
             check,
             dry_run,
             force,
+            allow_source_overwrite,
         }) = cli.command
         else {
             panic!("expected db scrub");
         };
+        assert!(!allow_source_overwrite);
         assert!(profile.is_none());
         assert!(artifact.is_none());
         assert!(output.is_none());
@@ -6395,10 +6404,12 @@ mod tests {
             check,
             dry_run,
             force,
+            allow_source_overwrite,
         }) = cli.command
         else {
             panic!("expected db scrub");
         };
+        assert!(!allow_source_overwrite);
         assert_eq!(profile.as_deref(), Some("staging"));
         assert_eq!(
             artifact.as_deref(),

@@ -85,7 +85,7 @@
 //!   `idx_<table>_<field>_unique` form; exact parity for pathological long names
 //!   is a later refinement.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use autumn_schema_core::{
@@ -313,9 +313,9 @@ pub fn parse_models_path(path: &Path, backend: Backend) -> Result<ParsedSchema, 
 /// Returns [`SchemaParseError::Syntax`] if `src` is not valid Rust.
 pub fn parse_encrypted_columns(
     src: &str,
-) -> Result<BTreeMap<String, BTreeSet<String>>, SchemaParseError> {
+) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
     for item in &file.items {
         let syn::Item::Struct(item_struct) = item else {
             continue;
@@ -334,10 +334,10 @@ pub fn parse_encrypted_columns(
             let Some(ident) = field.ident.as_ref() else {
                 continue;
             };
-            if field.attrs.iter().any(is_encrypted_attr) {
+            if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
                 out.entry(table.clone())
                     .or_default()
-                    .insert(ident.to_string());
+                    .insert(ident.to_string(), is_deterministic_encrypted(attr));
             }
         }
     }
@@ -353,8 +353,8 @@ pub fn parse_encrypted_columns(
 /// or [`SchemaParseError::Syntax`] if a file is not valid Rust.
 pub fn parse_encrypted_columns_path(
     path: &Path,
-) -> Result<BTreeMap<String, BTreeSet<String>>, SchemaParseError> {
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
+    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
     for file in model_source_files(path)? {
         let src = std::fs::read_to_string(&file).map_err(|source| SchemaParseError::Io {
             path: file.display().to_string(),
@@ -368,7 +368,12 @@ pub fn parse_encrypted_columns_path(
 }
 
 /// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
-/// directly under the directory (sorted, so aggregation is deterministic).
+/// under the directory (sorted, so aggregation is deterministic).
+///
+/// The walk is **recursive**, unlike [`parse_models_dir`]'s: a PII scan that
+/// missed `src/models/billing/card.rs` would not merely under-report, it would
+/// silently disable the "a `safe` declaration may not override `#[encrypted]`"
+/// refusal for every nested model.
 fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaParseError> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
@@ -382,23 +387,28 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
             ),
         });
     }
-    let read = std::fs::read_dir(path).map_err(|source| SchemaParseError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
     let mut paths = Vec::new();
-    for entry in read {
-        let entry = entry.map_err(|source| SchemaParseError::Io {
-            path: path.display().to_string(),
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = std::fs::read_dir(&dir).map_err(|source| SchemaParseError::Io {
+            path: dir.display().to_string(),
             source,
         })?;
-        let candidate = entry.path();
-        let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
-            path: candidate.display().to_string(),
-            source,
-        })?;
-        if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
-            paths.push(candidate);
+        for entry in read {
+            let entry = entry.map_err(|source| SchemaParseError::Io {
+                path: dir.display().to_string(),
+                source,
+            })?;
+            let candidate = entry.path();
+            let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
+                path: candidate.display().to_string(),
+                source,
+            })?;
+            if file_type.is_dir() {
+                stack.push(candidate);
+            } else if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
+                paths.push(candidate);
+            }
         }
     }
     paths.sort();
@@ -412,6 +422,29 @@ fn is_encrypted_attr(attr: &syn::Attribute) -> bool {
         .segments
         .last()
         .is_some_and(|seg| seg.ident == "encrypted")
+}
+
+/// Whether an `#[encrypted(...)]` attribute selects deterministic mode.
+///
+/// A deterministic column is the one an app can still equality-query after the
+/// scrub (via `deterministic_ciphertext`), so a replacement envelope has to be
+/// produced in the same mode or those lookups quietly stop matching.
+fn is_deterministic_encrypted(attr: &syn::Attribute) -> bool {
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        return false;
+    }
+    let mut deterministic = false;
+    let _ = attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("deterministic") {
+            deterministic = true;
+        } else if meta.input.peek(syn::token::Paren) {
+            let _ = meta.parse_nested_meta(|_| Ok(()));
+        } else if let Ok(value) = meta.value() {
+            let _ = value.parse::<syn::Lit>();
+        }
+        Ok(())
+    });
+    deterministic
 }
 
 /// Find the `#[model]` / `#[autumn_web::model]` attribute on a struct, if any.
@@ -877,9 +910,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             found.get("accounts"),
-            Some(&BTreeSet::from([
-                "api_token".to_owned(),
-                "email".to_owned()
+            Some(&BTreeMap::from([
+                ("api_token".to_owned(), false),
+                // `#[encrypted(deterministic)]` must be recorded as such: a
+                // scrub has to re-encrypt in the same mode, or equality lookups
+                // against the column quietly stop matching.
+                ("email".to_owned(), true),
             ]))
         );
     }

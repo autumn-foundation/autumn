@@ -116,14 +116,16 @@ const FIXTURE_SCHEMA: &str = "\
 /// app-booting test must not create these itself: `autumn migrate` runs the
 /// framework's own migrations, which own `autumn_jobs` with a different shape.
 ///
-/// `autumn_scrub_outbox` is opted into `[framework] purge`; `autumn_jobs` is a
-/// built-in payload carrier left un-purged, so the warning path is exercised too.
+/// `autumn_sync_rows` (a real built-in payload carrier) is opted into
+/// `[framework] purge`; `autumn_jobs` is another one left un-purged, so the
+/// warning path is exercised too. Both are minimal stand-ins for the real
+/// framework tables — the scrub only ever reads their names.
 const FIXTURE_FRAMEWORK_TABLES: &str = "\
-    CREATE TABLE autumn_scrub_outbox ( \
+    CREATE TABLE autumn_sync_rows ( \
         id BIGSERIAL PRIMARY KEY, \
         payload TEXT NOT NULL \
     ); \
-    INSERT INTO autumn_scrub_outbox (payload) \
+    INSERT INTO autumn_sync_rows (payload) \
         VALUES ('{\"to\": \"alice@real-corp.example\"}'); \
     CREATE TABLE autumn_jobs ( \
         id BIGSERIAL PRIMARY KEY, \
@@ -160,7 +162,7 @@ bio = "redact"
 # Framework-owned tables are not column-classified; this app opts into
 # emptying its outbox, whose payloads embed customer addresses.
 [framework]
-purge = ["autumn_scrub_outbox"]
+purge = ["autumn_sync_rows"]
 "#;
 
 /// Write the project files the scrub reads its automatic classification from:
@@ -310,12 +312,13 @@ async fn scrub_round_trip_leaves_zero_original_values() {
 
     // ── Back up the source ──────────────────────────────────────────────────
     let source_envs = [("AUTUMN_DATABASE__URL", source_url.as_str())];
-    let (_o, backup_err) = run_autumn_ok(dir, &["db", "backup"], &source_envs);
-    assert!(
-        backup_err.contains("Backup complete") || backup_err.contains("integrity"),
-        "backup should report success: {backup_err}"
-    );
+    run_autumn_ok(dir, &["db", "backup"], &source_envs);
     let run_dir = newest_run_dir(&dir.join("backups").join("dev"));
+    assert!(
+        run_dir.join("manifest.json").is_file() && run_dir.join("control.dump").is_file(),
+        "the backup must have produced a real artifact, not just a log line: {}",
+        run_dir.display()
+    );
 
     // ── Fail-closed: with no declaration the scrub refuses ──────────────────
     let staging_envs = [("AUTUMN_DATABASE__URL", staging_url.as_str())];
@@ -366,7 +369,7 @@ async fn scrub_round_trip_leaves_zero_original_values() {
     // Framework-owned tables are outside the classified universe: the opted-in
     // one is emptied, and the one left alone is warned about by name.
     assert!(
-        scrub_err.contains("autumn_scrub_outbox") && scrub_err.contains("emptied"),
+        scrub_err.contains("autumn_sync_rows") && scrub_err.contains("emptied"),
         "the opted-in framework table must be emptied: {scrub_err}"
     );
     assert!(
@@ -394,7 +397,7 @@ async fn scrub_round_trip_leaves_zero_original_values() {
     assert_eq!(distinct_emails, 2, "the UNIQUE email column stays unique");
 
     let outbox_rows: i64 = staging
-        .query_one("SELECT count(*) FROM autumn_scrub_outbox", &[])
+        .query_one("SELECT count(*) FROM autumn_sync_rows", &[])
         .await
         .unwrap()
         .get(0);
@@ -506,7 +509,7 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
         "--check must not write anything"
     );
     let outbox_before: i64 = client
-        .query_one("SELECT count(*) FROM autumn_scrub_outbox", &[])
+        .query_one("SELECT count(*) FROM autumn_sync_rows", &[])
         .await
         .unwrap()
         .get(0);
@@ -554,6 +557,19 @@ async fn a_newly_added_column_breaks_a_previously_passing_scrub() {
         .batch_execute("ALTER TABLE users ADD COLUMN ssn TEXT;")
         .await
         .unwrap();
+
+    // `--check` is the gate the docs tell teams to put in CI, so it is the one
+    // that has to go red — a plain `db scrub` failing would not prove it.
+    let (check_out, check_err) = run_autumn_fail(dir, &["db", "scrub", "--check"], &envs);
+    assert!(
+        check_err.contains("users.ssn"),
+        "--check must name the undeclared column: {check_err}"
+    );
+    assert!(
+        check_out.contains("[tables.users.pii]") && check_out.contains("ssn = \"auto\""),
+        "the paste-ready stanza must go to stdout so it can be appended to \
+         scrub.toml: {check_out}"
+    );
 
     let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub"], &envs);
     assert!(
@@ -699,6 +715,26 @@ fn newest_run_dir(profile_root: &Path) -> PathBuf {
 /// RAII guard that kills the child server on drop (even on test failure).
 struct ServerGuard(std::process::Child);
 
+impl ServerGuard {
+    /// Whatever the child has written so far, for a failure message. Reading
+    /// the pipes also keeps a chatty app from blocking on a full buffer.
+    fn drain(&mut self) -> String {
+        use std::io::Read as _;
+        let mut out = String::new();
+        if let Some(stdout) = self.0.stdout.as_mut() {
+            let mut buf = String::new();
+            let _ = stdout.read_to_string(&mut buf);
+            out.push_str(&buf);
+        }
+        if let Some(stderr) = self.0.stderr.as_mut() {
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf);
+            out.push_str(&buf);
+        }
+        out
+    }
+}
+
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -722,9 +758,11 @@ fn patch_generated_cargo_toml(project_dir: &Path) {
     std::fs::write(&manifest, content).expect("patch generated Cargo.toml");
 }
 
-/// The last acceptance criterion the round-trip test cannot cover on its own:
-/// after a scrub, `autumn migrate` reports a clean status and a real generated
-/// app boots against the scrubbed database and answers `GET /health` with 200.
+/// The one criterion the Docker round-trip cannot cover on its own: after the
+/// FULL drill (seed → `db backup` → `db scrub --artifact` → zero original
+/// values), `autumn migrate` reports a clean status against the scrubbed
+/// database and a real generated app boots against it and answers `GET /health`
+/// with 200.
 ///
 /// Scaffolds, migrates, seeds, scrubs, re-checks migrations and then compiles
 /// and boots the app, so it needs the `diesel` CLI on `PATH` in addition to
@@ -772,16 +810,27 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
     let client = connect(&url).await;
     client.batch_execute(FIXTURE_ROWS).await.unwrap();
 
-    // ── Scrub ───────────────────────────────────────────────────────────────
-    run_autumn_ok(&project, &["db", "scrub"], &envs);
+    // ── The full AC #6 chain in one test: backup → scrub the restored copy ──
+    // Going through an artifact here (rather than scrubbing the live URL) is
+    // what makes this test cover the whole documented drill end to end: seed →
+    // backup → restore → scrub → assert → boot.
+    run_autumn_ok(&project, &["db", "backup"], &envs);
+    let run_dir = newest_run_dir(&project.join("backups").join("dev"));
+    run_autumn_ok(
+        &project,
+        &["db", "scrub", "--artifact", run_dir.to_str().unwrap()],
+        &envs,
+    );
     assert_no_secrets_survive(&client).await;
 
     // ── `autumn migrate` reports a clean status against the scrubbed DB ─────
     let (_o, migrate_err) = run_autumn_ok(&project, &["migrate"], &envs);
+    // Assert the POSITIVE signal `autumn migrate` actually prints. A negative
+    // assertion on a string the command never emits would pass on empty output.
     assert!(
-        !migrate_err.contains("Pending migrations")
-            && !migrate_err.to_lowercase().contains("error"),
-        "migrations must be clean against the scrubbed database: {migrate_err}"
+        migrate_err.contains("Migrations are already up to date.")
+            || migrate_err.contains("Migrations applied successfully."),
+        "migrations must report a clean status against the scrubbed database: {migrate_err}"
     );
 
     // ── The app boots against it and answers GET /health ────────────────────
@@ -810,21 +859,29 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the generated app");
-    let _guard = ServerGuard(child);
+    let mut guard = ServerGuard(child);
 
     let base = format!("http://127.0.0.1:{app_port}");
     let client_http = reqwest::Client::new();
     let mut status = None;
     for _ in 0..60 {
+        // A child that died at boot must fail fast with ITS OWN output, not
+        // after 30 s of silence.
+        if let Some(exit) = guard.0.try_wait().expect("poll the app process") {
+            let output = guard.drain();
+            panic!("the generated app exited before serving: {exit}\n{output}");
+        }
         if let Ok(resp) = client_http.get(format!("{base}/health")).send().await {
             status = Some(resp.status().as_u16());
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let output = guard.drain();
     assert_eq!(
         status,
         Some(200),
-        "the app must boot against the scrubbed database and answer GET /health with 200"
+        "the app must boot against the scrubbed database and answer GET /health \
+         with 200\n{output}"
     );
 }

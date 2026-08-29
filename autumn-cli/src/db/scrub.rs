@@ -58,6 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use autumn_schema_core::{Column, ColumnType, Table};
+use diesel::connection::SimpleConnection as _;
 use diesel::{Connection as _, PgConnection, RunQueryDsl as _, sql_query};
 use serde::Deserialize;
 
@@ -73,10 +74,19 @@ pub const SCRUB_CONFIG_FILE: &str = "scrub.toml";
 /// Width of the per-row `md5` token, in hex characters.
 const TOKEN_HEX_LEN: usize = 32;
 
-/// Narrowest token a length-bounded column may carry and still be treated as
-/// per-row unique. Below this the column is refused rather than silently
-/// truncated into collisions.
+/// Width of the per-row `sha256` token used for columns that must stay unique.
+const UNIQUE_TOKEN_HEX_LEN: usize = 64;
+
+/// Narrowest token a length-bounded, non-unique column may carry. Below this the
+/// column is refused rather than silently truncated.
 const MIN_TOKEN_WIDTH: usize = 8;
+
+/// Narrowest token a length-bounded **unique** column may carry: 16 hex
+/// characters is 64 bits, so the birthday bound puts a collision beyond any
+/// plausible row count. Eight (32 bits) is not enough — it collides in practice
+/// around 10⁵ rows, which is a routine table size, and the resulting
+/// unique-violation aborts the whole scrub.
+const MIN_UNIQUE_TOKEN_WIDTH: usize = 16;
 
 /// The reserved, permanently undeliverable domain scrubbed addresses use
 /// (RFC 6761 reserves `.invalid`).
@@ -86,6 +96,8 @@ const SCRUB_EMAIL_DOMAIN: &str = "@example.invalid";
 
 /// Arguments for `autumn db scrub`.
 #[derive(Debug, Clone, Default)]
+// Each flag is an independent switch on one run, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScrubArgs {
     /// Profile overlay to resolve the connection under (see `db create`).
     pub profile: Option<String>,
@@ -104,6 +116,9 @@ pub struct ScrubArgs {
     pub dry_run: bool,
     /// Bypass the production guard (mirrors `autumn db drop --force`).
     pub force: bool,
+    /// Bypass the separate guard that refuses to write over the database an
+    /// artifact's own non-dev/test profile config declares.
+    pub allow_source_overwrite: bool,
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -178,6 +193,49 @@ pub enum ScrubError {
         limit: usize,
         /// Characters the strategy's fixed affixes already consume.
         overhead: usize,
+        /// Token characters the column must still have room for.
+        floor: usize,
+    },
+    /// A declaration tried to write plaintext into an `#[encrypted]` column.
+    PlaintextIntoEncrypted {
+        /// Each entry is `table.column` plus the strategy that was declared.
+        columns: Vec<String>,
+    },
+    /// A PII column is covered by a `CHECK` constraint, which no fabricated
+    /// value can be proven to satisfy.
+    CheckConstrainedColumn {
+        /// `table.column`.
+        column: String,
+    },
+    /// The target holds `#[encrypted]` columns but no encryption key could be
+    /// resolved, so a valid replacement envelope cannot be produced.
+    EncryptionKeyUnavailable {
+        /// The profile whose credentials were read.
+        profile: String,
+        /// A credential-safe reason.
+        detail: String,
+    },
+    /// The target has base tables outside `public`, which the classification
+    /// universe does not cover.
+    UnsupportedSchemas {
+        /// The schema names, sorted.
+        schemas: Vec<String>,
+    },
+    /// The target has row-level security on a table the scrub would rewrite.
+    RowLevelSecurity {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// `[tables.<t>]` declares a framework-owned table, which the column
+    /// classification never sees.
+    FrameworkTableDeclared {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// `[framework] purge` names a table whose contents the database needs.
+    PurgeSchemaBookkeeping {
+        /// The table names, sorted.
+        tables: Vec<String>,
     },
     /// The declaration file could not be read or parsed.
     Config {
@@ -245,8 +303,7 @@ impl std::fmt::Display for ScrubError {
                 "{} column(s) are neither PII-classified nor declared safe, so the scrub \
                  cannot prove they carry no real data:\n{}\n  \
                  Declare each one in {SCRUB_CONFIG_FILE} — under [tables.<table>.pii] to \
-                 replace it, or in `safe` to keep it verbatim. Run `autumn db scrub --check` \
-                 for a paste-ready starting point.",
+                 replace it, or in `safe` to keep it verbatim.",
                 columns.len(),
                 bullet_list(columns),
             ),
@@ -314,12 +371,79 @@ impl std::fmt::Display for ScrubError {
                 column,
                 limit,
                 overhead,
+                floor,
             } => write!(
                 f,
                 "{column:?} holds at most {limit} characters, but the chosen strategy needs \
-                 {overhead} for its fixed text plus at least {MIN_TOKEN_WIDTH} more for a \
-                 per-row-unique token.\n  Use a shorter strategy (`redact`), widen the \
-                 column, or declare it `safe`."
+                 {overhead} for its fixed text plus at least {floor} more for a per-row token.\n  \
+                 Strategies by fixed overhead: `phone` (5), `name` (9), `redact` (11), \
+                 `email` (25). Pick one that fits, use `null` if the column is nullable, \
+                 widen the column, or declare it `safe`."
+            ),
+            Self::PlaintextIntoEncrypted { columns } => write!(
+                f,
+                "{} column(s) carry #[encrypted] in the model but {SCRUB_CONFIG_FILE} declares a \
+                 plaintext strategy for them:\n{}\n  \
+                 Writing a plain string into an at-rest-encrypted column makes every later read \
+                 of that row fail as malformed ciphertext. An #[encrypted] column is \
+                 re-encrypted automatically — remove the declaration, or use `null` if the \
+                 column is nullable.",
+                columns.len(),
+                bullet_list(columns),
+            ),
+            Self::CheckConstrainedColumn { column } => write!(
+                f,
+                "{column:?} is covered by a CHECK constraint, so no fabricated value can be \
+                 proven to satisfy it (a closed-set column reaches the database as TEXT plus a \
+                 CHECK, which is why the type alone does not reveal this).\n  \
+                 Declare the column `safe` if the constraint means it holds no free-form PII, \
+                 or drop the constraint on the copy before scrubbing."
+            ),
+            Self::EncryptionKeyUnavailable { profile, detail } => write!(
+                f,
+                "This database has #[encrypted] columns, but no encryption key could be resolved \
+                 for the {profile:?} profile: {detail}\n  \
+                 A scrub must write a VALID ciphertext envelope into an encrypted column — a \
+                 plaintext replacement would make every later read of that row fail. Provide the \
+                 target's `active_record_encryption` credentials (`autumn credentials edit`), or \
+                 declare those columns `null` in {SCRUB_CONFIG_FILE} if they are nullable."
+            ),
+            Self::UnsupportedSchemas { schemas } => write!(
+                f,
+                "This database has base tables in {} schema(s) outside `public`:\n{}\n  \
+                 The classification universe is `public`-only, so a scrub cannot prove those \
+                 tables carry no PII and refuses rather than reporting a completeness it did \
+                 not check. Scrub those schemas separately, or drop them from the copy.",
+                schemas.len(),
+                bullet_list(schemas),
+            ),
+            Self::RowLevelSecurity { tables } => write!(
+                f,
+                "{} table(s) the scrub would rewrite have row-level security enabled:\n{}\n  \
+                 A role that does not bypass RLS updates only the rows its policies expose and \
+                 reports success, leaving the rest of the PII in place — a silent partial scrub. \
+                 Connect as the table owner or a BYPASSRLS role.",
+                tables.len(),
+                bullet_list(tables),
+            ),
+            Self::FrameworkTableDeclared { tables } => write!(
+                f,
+                "{SCRUB_CONFIG_FILE} declares {} framework-owned table(s) under [tables.*]:\n{}\n  \
+                 Framework-owned tables are deliberately outside the column classification \
+                 (exactly as `autumn db pull` and `autumn schema pull` skip them), so a \
+                 per-column declaration for them has no effect. Use \
+                 `[framework] purge = [...]` to empty one instead.",
+                tables.len(),
+                bullet_list(tables),
+            ),
+            Self::PurgeSchemaBookkeeping { tables } => write!(
+                f,
+                "[framework] purge in {SCRUB_CONFIG_FILE} names {} table(s) that hold schema \
+                 bookkeeping, not app payloads:\n{}\n  \
+                 Emptying them would make the copy un-migratable or un-routable. Remove them \
+                 from `purge`.",
+                tables.len(),
+                bullet_list(tables),
             ),
             Self::Config { path, detail } => write!(f, "Cannot read {path}: {detail}"),
             Self::SourceScan { detail } => write!(
@@ -348,8 +472,9 @@ impl std::fmt::Display for ScrubError {
                 f,
                 "Refusing to scrub {database:?}: it is the database the {profile:?} profile's \
                  config file declares.\n  \
-                 The scrub would overwrite the source it was taken from. Point the target at \
-                 a separate staging database, or re-run with --force."
+                 The scrub would overwrite the source the artifact was taken from. Point the \
+                 target at a separate staging database, or re-run with \
+                 --allow-source-overwrite if that really is what you mean."
             ),
             Self::PurgeNotFrameworkTable { tables } => write!(
                 f,
@@ -417,6 +542,14 @@ pub enum Strategy {
     Zero,
     /// The Unix epoch.
     Epoch,
+    /// Re-encrypt: replace an `#[encrypted]` column with a valid AEAD envelope
+    /// of a fake plaintext, produced under the target database's own key.
+    ///
+    /// This is the only strategy that cannot be expressed as SQL — writing a
+    /// plain string into an `#[encrypted]` column would make every subsequent
+    /// repository read of that row fail as malformed ciphertext, so the
+    /// replacement is built in Rust and shipped back per row.
+    Encrypted,
 }
 
 impl Strategy {
@@ -434,6 +567,7 @@ impl Strategy {
             Self::Json => "json",
             Self::Zero => "zero",
             Self::Epoch => "epoch",
+            Self::Encrypted => "encrypted",
         }
     }
 
@@ -445,13 +579,13 @@ impl Strategy {
     const fn allowed_on_unique(self) -> bool {
         matches!(
             self,
-            Self::Auto
-                | Self::Email
+            Self::Email
                 | Self::Name
                 | Self::Redact
                 | Self::Null
                 | Self::Uuid
                 | Self::Bytes
+                | Self::Encrypted
         )
     }
 }
@@ -515,12 +649,22 @@ pub struct ScrubConfig {
 /// payload, an offline-sync row buffer, an experiment assignment — never
 /// schema-bearing bookkeeping like `autumn_migration_checksums`.
 const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
+    // A full verbatim copy of every mutated row, including `#[private]` and
+    // `#[encrypted]` columns — so an unscrubbed ledger hands back exactly the
+    // plaintext the column-level scrub just removed.
+    "_autumn_ledger_revisions",
+    // Before/after values for every tracked column; only those named in
+    // `#[version_history(sensitive = [...])]` are redacted.
+    "_autumn_version_history",
     // Hashed API tokens minted in production. A staging copy that inherits them
     // is a live credential leak, not merely a PII one.
     "api_tokens",
     "autumn_experiment_assignments",
     "autumn_job_tracking",
     "autumn_jobs",
+    // The indexed text of app records — the search index is a second copy of
+    // whatever was made searchable.
+    "autumn_search_documents",
     "autumn_sync_applied",
     "autumn_sync_pending",
     "autumn_sync_rows",
@@ -544,10 +688,36 @@ fn is_framework_table(table: &str) -> bool {
         || UNPREFIXED_FRAMEWORK_TABLES.contains(&table)
 }
 
-/// Validate a `[framework] purge` list: it may only name framework-owned tables.
-/// A user table listed there would be silently emptied, which is never what a
-/// scrub should do behind a one-word config key.
+/// Framework-owned tables `[framework] purge` must never accept: emptying them
+/// does not remove a payload, it breaks the copy. `__diesel_schema_migrations`
+/// and `autumn_migration_checksums` are the migration ledger (an empty one
+/// replays every migration against a populated database); `_autumn_shard_map` /
+/// `_autumn_shard_directory` are the routing tables a sharded app reads at boot.
+const NEVER_PURGEABLE_TABLES: &[&str] = &[
+    "__diesel_schema_migrations",
+    "_autumn_shard_directory",
+    "_autumn_shard_map",
+    "autumn_migration_checksums",
+];
+
+/// Validate a `[framework] purge` list: it may only name framework-owned
+/// tables, and never schema bookkeeping. A user table listed there would be
+/// silently emptied, which is never what a scrub should do behind a one-word
+/// config key.
 fn check_purge_list(config: &ScrubConfig) -> Result<(), ScrubError> {
+    let mut bookkeeping: Vec<String> = config
+        .framework
+        .purge
+        .iter()
+        .filter(|t| NEVER_PURGEABLE_TABLES.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    if !bookkeeping.is_empty() {
+        bookkeeping.sort();
+        return Err(ScrubError::PurgeSchemaBookkeeping {
+            tables: bookkeeping,
+        });
+    }
     let mut offenders: Vec<String> = config
         .framework
         .purge
@@ -638,10 +808,13 @@ pub struct ClassificationInputs<'a> {
     pub tables: &'a [Table],
     /// The developer's declaration.
     pub config: &'a ScrubConfig,
-    /// `#[encrypted]` columns, keyed by table.
-    pub encrypted: &'a BTreeMap<String, BTreeSet<String>>,
+    /// `#[encrypted]` columns keyed by table, each mapped to whether the model
+    /// declared `#[encrypted(deterministic)]`.
+    pub encrypted: &'a BTreeMap<String, BTreeMap<String, bool>>,
     /// Tables registered with the GDPR anonymize strategy.
     pub anonymize_tables: &'a BTreeSet<String>,
+    /// Catalog facts the schema IR does not carry (see [`DatabaseFacts`]).
+    pub facts: &'a DatabaseFacts,
 }
 
 /// One column the scrub will rewrite.
@@ -655,6 +828,20 @@ pub struct ColumnPlan {
     pub source: ClassSource,
 }
 
+/// One `#[encrypted]` column's rewrite. Its replacement is an AEAD envelope
+/// built in Rust per row, so it cannot join the table's batched `UPDATE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedRewrite {
+    /// The column name.
+    pub column: String,
+    /// Whether the model declared `#[encrypted(deterministic)]`, so equality
+    /// lookups against the column keep working after the scrub.
+    pub deterministic: bool,
+    /// The shape of the fake plaintext to encrypt ([`Strategy::Email`] for an
+    /// email-named column, else [`Strategy::Redact`]).
+    pub shape: Strategy,
+}
+
 /// One table's scrub statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePlan {
@@ -662,8 +849,14 @@ pub struct TablePlan {
     pub table: String,
     /// The columns rewritten, in table column order.
     pub columns: Vec<ColumnPlan>,
-    /// The single `UPDATE` that rewrites them all.
-    pub sql: String,
+    /// The single `UPDATE` rewriting every SQL-expressible column, or `None`
+    /// when the table's only PII columns are `#[encrypted]` ones.
+    pub sql: Option<String>,
+    /// The SQL expression identifying a row (see [`row_key_expr`]), reused to
+    /// match rows when shipping encrypted replacements back.
+    pub row_key: String,
+    /// Columns whose replacement must be produced in Rust.
+    pub encrypted: Vec<EncryptedRewrite>,
 }
 
 /// The full set of statements a scrub will run against one database.
@@ -702,6 +895,7 @@ impl ScrubPlan {
 /// # Errors
 ///
 /// Returns the corresponding [`ScrubError`] variant for each refusal above.
+#[allow(clippy::too_many_lines)]
 pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubError> {
     let by_name: BTreeMap<&str, &Table> =
         inputs.tables.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -712,9 +906,16 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
 
     let mut unclassified = Vec::new();
     let mut key_pii = Vec::new();
+    let mut plaintext_into_encrypted: Vec<(String, &'static str)> = Vec::new();
     let mut planned: Vec<(&Table, Vec<(ColumnPlan, &Column)>)> = Vec::new();
 
     for table in inputs.tables {
+        // A partition's rows are rewritten through its parent, so planning it
+        // again would double-update them (and, on a table with no primary key,
+        // re-randomize the values the parent pass just wrote).
+        if inputs.facts.partitions.contains(&table.name) {
+            continue;
+        }
         let rule = inputs.config.tables.get(&table.name);
         let anonymized = inputs.anonymize_tables.contains(&table.name);
         let encrypted = inputs.encrypted.get(&table.name);
@@ -722,16 +923,43 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
 
         for column in &table.columns {
             let qualified = format!("{}.{}", table.name, column.name);
-            let is_key = is_key_column(table, column);
+            // A generated column is derived data Postgres refuses to `UPDATE`
+            // at all — scrubbing the columns it reads already covers it — so it
+            // is structurally safe rather than something to declare.
+            if inputs
+                .facts
+                .generated_columns
+                .contains(&(table.name.clone(), column.name.clone()))
+            {
+                continue;
+            }
+            let is_key = is_key_column(table, column, inputs.facts);
             let declared_pii = rule.and_then(|r| r.pii.get(&column.name)).copied();
-            let is_encrypted = encrypted.is_some_and(|e| e.contains(&column.name));
-            let declared_safe = rule.is_some_and(|r| r.safe.contains(&column.name))
-                || inputs.config.defaults.safe_columns.contains(&column.name);
+            let is_encrypted = encrypted.is_some_and(|e| e.contains_key(&column.name));
+            let declared_safe_here = rule.is_some_and(|r| r.safe.contains(&column.name));
+            // A cross-table convenience list is not a per-column review, so it
+            // may not narrow a table-level GDPR anonymize registration: only an
+            // explicit `[tables.<t>] safe` entry can.
+            let declared_safe = declared_safe_here
+                || (!anonymized && inputs.config.defaults.safe_columns.contains(&column.name));
 
-            let (spec, source) = if let Some(strategy) = declared_pii {
+            let (spec, source) = if is_encrypted {
+                // An at-rest-encrypted column is never rewritten with a plain
+                // string: the resolved strategy is always a re-encryption (see
+                // `Strategy::Encrypted`), so a declaration can only choose to
+                // NULL it, never to write plaintext into it.
+                match declared_pii {
+                    None | Some(Strategy::Encrypted) => {
+                        (Strategy::Encrypted, ClassSource::Encrypted)
+                    }
+                    Some(Strategy::Null) => (Strategy::Null, ClassSource::Config),
+                    Some(other) => {
+                        plaintext_into_encrypted.push((qualified, other.as_str()));
+                        continue;
+                    }
+                }
+            } else if let Some(strategy) = declared_pii {
                 (strategy, ClassSource::Config)
-            } else if is_encrypted {
-                (Strategy::Auto, ClassSource::Encrypted)
             } else if declared_safe {
                 continue;
             } else if anonymized {
@@ -763,6 +991,15 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
         planned.push((table, columns));
     }
 
+    if !plaintext_into_encrypted.is_empty() {
+        plaintext_into_encrypted.sort();
+        return Err(ScrubError::PlaintextIntoEncrypted {
+            columns: plaintext_into_encrypted
+                .into_iter()
+                .map(|(column, strategy)| format!("{column} (declared `{strategy}`)"))
+                .collect(),
+        });
+    }
     if !key_pii.is_empty() {
         key_pii.sort();
         return Err(ScrubError::PiiOnKeyColumn { columns: key_pii });
@@ -781,34 +1018,77 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
         }
         let mut resolved = Vec::with_capacity(columns.len());
         let mut assignments = Vec::with_capacity(columns.len());
+        let mut encrypted_rewrites = Vec::new();
         for (mut plan, column) in columns {
             let qualified = format!("{}.{}", table.name, column.name);
+            let pair = (table.name.clone(), column.name.clone());
+            let unique = is_unique_column(table, column, inputs.facts);
+
+            // A `CHECK` predicate is arbitrary SQL, so no fabricated value can be
+            // proven to satisfy it — and a real Autumn closed-set column reaches
+            // the database as plain `TEXT` plus a `CHECK`, so this (not the
+            // model-IR-only `ColumnType::Enum`) is what actually catches it.
+            if inputs.facts.checked_columns.contains(&pair) {
+                return Err(ScrubError::CheckConstrainedColumn { column: qualified });
+            }
             if plan.strategy == Strategy::Auto {
                 plan.strategy = auto_strategy(column).map_err(|e| qualify(e, &qualified))?;
             }
-            if plan.strategy == Strategy::Null && !column.nullable {
-                return Err(ScrubError::NullOnNotNull { column: qualified });
+            if plan.strategy == Strategy::Null {
+                if !column.nullable {
+                    return Err(ScrubError::NullOnNotNull { column: qualified });
+                }
+                // Postgres normally allows any number of NULLs in a unique
+                // index — but not under `NULLS NOT DISTINCT`.
+                if inputs.facts.nulls_not_distinct_columns.contains(&pair) {
+                    return Err(ScrubError::NonUniqueStrategy {
+                        column: qualified,
+                        strategy: plan.strategy.as_str(),
+                    });
+                }
             }
-            if is_unique_column(table, column) && !plan.strategy.allowed_on_unique() {
+            if unique && !plan.strategy.allowed_on_unique() {
                 return Err(ScrubError::NonUniqueStrategy {
                     column: qualified,
                     strategy: plan.strategy.as_str(),
                 });
             }
-            let token = token_expr(table, &column.name);
-            let value = replacement_expr(plan.strategy, column, &token)
+
+            if plan.strategy == Strategy::Encrypted {
+                // Not expressible as SQL: the replacement is an AEAD envelope
+                // produced in Rust, row by row, under the target's own key.
+                encrypted_rewrites.push(EncryptedRewrite {
+                    column: column.name.clone(),
+                    deterministic: inputs
+                        .encrypted
+                        .get(&table.name)
+                        .and_then(|c| c.get(&column.name))
+                        .copied()
+                        .unwrap_or(false),
+                    shape: email_shaped(&column.name),
+                });
+                resolved.push(plan);
+                continue;
+            }
+
+            let token = token_expr(table, &column.name, unique);
+            let value = replacement_expr(plan.strategy, column, &token, unique)
                 .map_err(|e| qualify(e, &qualified))?;
-            assignments.push(assignment(column, &value));
+            assignments.push(assignment(column, &value, plan.strategy));
             resolved.push(plan);
         }
         out.tables.push(TablePlan {
             table: table.name.clone(),
             columns: resolved,
-            sql: format!(
-                "UPDATE {} SET {}",
-                quote_ident(&table.name),
-                assignments.join(", ")
-            ),
+            sql: (!assignments.is_empty()).then(|| {
+                format!(
+                    "UPDATE {} SET {}",
+                    qualified_ident(&table.name),
+                    assignments.join(", ")
+                )
+            }),
+            row_key: row_key_expr(table),
+            encrypted: encrypted_rewrites,
         });
     }
     Ok(out)
@@ -832,11 +1112,15 @@ fn qualify(error: ScrubError, qualified: &str) -> ScrubError {
             detail,
         },
         ScrubError::ColumnTooNarrow {
-            limit, overhead, ..
+            limit,
+            overhead,
+            floor,
+            ..
         } => ScrubError::ColumnTooNarrow {
             column,
             limit,
             overhead,
+            floor,
         },
         other => other,
     }
@@ -849,9 +1133,17 @@ fn check_config_freshness(
     by_name: &BTreeMap<&str, &Table>,
 ) -> Result<(), ScrubError> {
     let mut stale = Vec::new();
+    let mut framework = Vec::new();
     for (name, rule) in &inputs.config.tables {
         let Some(table) = by_name.get(name.as_str()) else {
-            stale.push(name.clone());
+            // A framework-owned table is not "missing" — it is deliberately
+            // outside the classified universe, and saying "the database does
+            // not have it" would send the developer hunting for a typo.
+            if is_framework_table(name) {
+                framework.push(name.clone());
+            } else {
+                stale.push(name.clone());
+            }
             continue;
         };
         let columns: BTreeSet<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
@@ -860,6 +1152,10 @@ fn check_config_freshness(
                 stale.push(format!("{name}.{column}"));
             }
         }
+    }
+    if !framework.is_empty() {
+        framework.sort();
+        return Err(ScrubError::FrameworkTableDeclared { tables: framework });
     }
     if stale.is_empty() {
         return Ok(());
@@ -900,10 +1196,20 @@ fn check_safe_overrides_encrypted(
             continue;
         }
         let rule = inputs.config.tables.get(table);
-        for column in encrypted {
+        for column in encrypted.keys() {
             // An explicit PII entry is not an override — it only picks the
             // strategy — so only `safe` declarations conflict.
             if rule.is_some_and(|r| r.pii.contains_key(column)) {
+                continue;
+            }
+            // A key column is exempt: it can never be rewritten anyway (see
+            // `is_key_column`), so refusing its `safe` declaration would leave
+            // the developer with no configuration that terminates.
+            if by_name
+                .get(table.as_str())
+                .and_then(|t| t.columns.iter().find(|c| &c.name == column))
+                .is_some_and(|c| c.primary_key || c.references.is_some())
+            {
                 continue;
             }
             if rule.is_some_and(|r| r.safe.contains(column))
@@ -920,30 +1226,50 @@ fn check_safe_overrides_encrypted(
     Err(ScrubError::SafeOverridesEncrypted { columns })
 }
 
-/// Whether a column participates in the table's primary key or is a foreign key.
-fn is_key_column(table: &Table, column: &Column) -> bool {
-    column.primary_key || table.primary_key.contains(&column.name) || column.references.is_some()
+/// Whether a column is structural — a primary key, either side of any foreign
+/// key, or a generated column Postgres will not let an `UPDATE` touch.
+///
+/// The foreign-key half comes from [`DatabaseFacts`], not from the schema IR:
+/// the IR records only the *referencing* side and only a composite key's first
+/// component, so a natural key another table points at (`users.email` ←
+/// `orders.user_email`) would otherwise look freely rewritable and fail the
+/// constraint at apply time — or, under `ON UPDATE CASCADE`, silently rewrite a
+/// child column that was declared safe.
+fn is_key_column(table: &Table, column: &Column, facts: &DatabaseFacts) -> bool {
+    let pair = (table.name.clone(), column.name.clone());
+    column.primary_key
+        || table.primary_key.contains(&column.name)
+        || column.references.is_some()
+        || facts.foreign_key_columns.contains(&pair)
+        || facts.generated_columns.contains(&pair)
 }
 
-/// Whether a column is constrained unique on its own — either the column flag
-/// introspection sets for a single-column unique index, or such an index listed
-/// on the table. A **partial** unique index does not count: it only constrains
-/// the rows matching its predicate.
-fn is_unique_column(table: &Table, column: &Column) -> bool {
-    if column.unique {
-        return true;
-    }
-    table.indexes.iter().any(|index| {
-        if !index.unique || index.is_partial {
-            return false;
-        }
-        let keys = if index.key_columns.is_empty() {
-            &index.columns
-        } else {
-            &index.key_columns
-        };
-        keys.len() == 1 && keys[0] == column.name
-    })
+/// Whether a rewrite of this column could violate a uniqueness constraint.
+///
+/// This is deliberately **broader** than the schema IR's single-column `unique`
+/// flag, which answers the migration-diff question "does this satisfy a model
+/// `#[unique]`" and therefore excludes composite and partial unique indexes. For
+/// a writer both of those still abort the statement: one member of a composite
+/// unique key set to a constant collides as soon as its partner repeats, and a
+/// partial unique index constrains every row its predicate matches. So the
+/// probed `unique_columns` set — every column of every unique index — is what
+/// gates strategy choice.
+fn is_unique_column(table: &Table, column: &Column, facts: &DatabaseFacts) -> bool {
+    column.unique
+        || facts
+            .unique_columns
+            .contains(&(table.name.clone(), column.name.clone()))
+        || table.indexes.iter().any(|index| {
+            if !index.unique {
+                return false;
+            }
+            let keys = if index.key_columns.is_empty() {
+                &index.columns
+            } else {
+                &index.key_columns
+            };
+            keys.iter().any(|k| k == &column.name)
+        })
 }
 
 // ─── Replacement expressions ────────────────────────────────────────────────
@@ -964,22 +1290,40 @@ fn row_key_expr(table: &Table) -> String {
     if keys.is_empty() {
         return "ctid::text".to_owned();
     }
-    keys.iter()
-        .map(|key| format!("coalesce({}::text, '')", quote_ident(key)))
-        .collect::<Vec<_>>()
-        .join(" || '|' || ")
+    if keys.len() == 1 {
+        return format!("coalesce({}::text, '')", quote_ident(keys[0]));
+    }
+    // `ROW(...)::text` renders a composite key with Postgres's own quoting, so
+    // ('a|','b') and ('a','|b') cannot collapse to one row key the way a plain
+    // separator-joined concatenation does.
+    format!(
+        "ROW({})::text",
+        keys.iter()
+            .map(|key| quote_ident(key))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// The per-row, per-column token every replacement is derived from. Salting with
 /// the column name keeps two PII columns of one row from receiving identical
 /// fake values.
-fn token_expr(table: &Table, column: &str) -> String {
-    token_expr_from(&row_key_expr(table), column)
+fn token_expr(table: &Table, column: &str, unique: bool) -> String {
+    token_expr_from(&row_key_expr(table), column, unique)
 }
 
 /// [`token_expr`] against an already-computed row key.
-fn token_expr_from(row_key: &str, column: &str) -> String {
-    format!("md5({} || '|' || {row_key})", quote_literal(column))
+///
+/// A column that must stay unique gets a 64-hex-character `sha256` token rather
+/// than `md5`'s 32, so a length-bounded column still has room for a token wide
+/// enough to make collisions impossible in practice (see [`bounded_token`]).
+fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
+    let seed = format!("{} || '|' || {row_key}", quote_literal(column));
+    if unique {
+        format!("encode(sha256(({seed})::bytea), 'hex')")
+    } else {
+        format!("md5({seed})")
+    }
 }
 
 /// The character limit a length-bounded Postgres type imposes, if any.
@@ -1033,6 +1377,22 @@ fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
         | ColumnType::Decimal { .. } => Strategy::Zero,
         ColumnType::Timestamp | ColumnType::TimestampTz => Strategy::Epoch,
         ty @ ColumnType::Opaque { .. } if is_texty(ty) => email_shaped(&column.name),
+        // `from_pg_udt` maps only Autumn's own scalar surface, so several
+        // everyday PII column types arrive as `Opaque` — `date_of_birth DATE`
+        // most of all. Without these arms `auto` refuses them and the explicit
+        // fallbacks (`epoch`, `zero`) reject them too, leaving no usable
+        // strategy at all.
+        ColumnType::Opaque { pg_type }
+            if matches!(pg_type.as_str(), "date" | "time" | "timetz") =>
+        {
+            Strategy::Epoch
+        }
+        ColumnType::Opaque { pg_type }
+            if matches!(pg_type.as_str(), "int2" | "money" | "oid")
+                || pg_type.starts_with("numeric") =>
+        {
+            Strategy::Zero
+        }
         other => {
             return Err(ScrubError::NoAutoStrategy {
                 column: column.name.clone(),
@@ -1062,17 +1422,36 @@ fn email_shaped(name: &str) -> Strategy {
 /// hold a per-row-unique value, [`ScrubError::StrategyTypeMismatch`] when the
 /// strategy cannot produce the column's type, or [`ScrubError::NoAutoStrategy`]
 /// when [`Strategy::Auto`] cannot be resolved.
+#[allow(clippy::too_many_lines)]
 fn replacement_expr(
     strategy: Strategy,
     column: &Column,
     token: &str,
+    unique: bool,
 ) -> Result<String, ScrubError> {
     let limit = char_max_len(&column.ty);
     let narrow = |overhead: usize| -> Result<String, ScrubError> {
-        bounded_token(token, limit, overhead, &column.name)
+        bounded_token(token, limit, overhead, &column.name, unique)
     };
+    // Every text-shaped strategy needs a character column to land in. Without
+    // this gate `age = "redact"` on an `integer` (or `last_login_ip = "redact"`
+    // on an `inet`) passes classification and only fails once Postgres runs the
+    // statement — after an `--artifact` restore has already written real data.
+    if matches!(
+        strategy,
+        Strategy::Email | Strategy::Name | Strategy::Redact | Strategy::Phone
+    ) {
+        require_type(column, strategy, is_texty(&column.ty))?;
+    }
     Ok(match strategy {
-        Strategy::Auto => replacement_expr(auto_strategy(column)?, column, token)?,
+        Strategy::Auto => replacement_expr(auto_strategy(column)?, column, token, unique)?,
+        Strategy::Encrypted => {
+            return Err(ScrubError::StrategyTypeMismatch {
+                column: column.name.clone(),
+                strategy: strategy.as_str(),
+                detail: "an encrypted replacement is built in Rust, not in SQL".to_owned(),
+            });
+        }
         Strategy::Email => {
             let tok = narrow("scrubbed+".len() + SCRUB_EMAIL_DOMAIN.len())?;
             format!("'scrubbed+' || {tok} || '{SCRUB_EMAIL_DOMAIN}'")
@@ -1097,6 +1476,7 @@ fn replacement_expr(
                     column: column.name.clone(),
                     limit,
                     overhead,
+                    floor: PHONE_DIGITS,
                 });
             }
             format!("'+1555' || translate(substr({token}, 1, {PHONE_DIGITS}), 'abcdef', '0123456')")
@@ -1115,7 +1495,23 @@ fn replacement_expr(
             match &column.ty {
                 ColumnType::Json | ColumnType::Attachment => format!("{json}::jsonb"),
                 ColumnType::Opaque { pg_type } if pg_type == "json" => format!("{json}::json"),
-                ty if is_texty(ty) => json.to_owned(),
+                ty if is_texty(ty) => {
+                    // Unlike every other text-producing strategy this one is a
+                    // fixed literal, so a narrow `varchar(n)` has to be checked
+                    // explicitly rather than by narrowing a token.
+                    const JSON_LITERAL_LEN: usize = 18;
+                    if let Some(limit) = limit
+                        && limit < JSON_LITERAL_LEN
+                    {
+                        return Err(ScrubError::ColumnTooNarrow {
+                            column: column.name.clone(),
+                            limit,
+                            overhead: JSON_LITERAL_LEN,
+                            floor: 0,
+                        });
+                    }
+                    json.to_owned()
+                }
                 other => {
                     return Err(ScrubError::StrategyTypeMismatch {
                         column: column.name.clone(),
@@ -1132,7 +1528,12 @@ fn replacement_expr(
             | ColumnType::Float32
             | ColumnType::Float64
             | ColumnType::Decimal { .. } => "0".to_owned(),
-            ColumnType::Opaque { pg_type } if pg_type.starts_with("numeric") => "0".to_owned(),
+            ColumnType::Opaque { pg_type }
+                if pg_type.starts_with("numeric")
+                    || matches!(pg_type.as_str(), "int2" | "money" | "oid") =>
+            {
+                "0".to_owned()
+            }
             other => {
                 return Err(ScrubError::StrategyTypeMismatch {
                     column: column.name.clone(),
@@ -1144,6 +1545,11 @@ fn replacement_expr(
         Strategy::Epoch => match &column.ty {
             ColumnType::Timestamp => "'1970-01-01 00:00:00'::timestamp".to_owned(),
             ColumnType::TimestampTz => "'1970-01-01 00:00:00+00'::timestamptz".to_owned(),
+            ColumnType::Opaque { pg_type } if pg_type == "date" => "'1970-01-01'::date".to_owned(),
+            ColumnType::Opaque { pg_type } if pg_type == "time" => "'00:00:00'::time".to_owned(),
+            ColumnType::Opaque { pg_type } if pg_type == "timetz" => {
+                "'00:00:00+00'::timetz".to_owned()
+            }
             other => {
                 return Err(ScrubError::StrategyTypeMismatch {
                     column: column.name.clone(),
@@ -1174,20 +1580,27 @@ fn bounded_token(
     limit: Option<usize>,
     overhead: usize,
     column: &str,
+    unique: bool,
 ) -> Result<String, ScrubError> {
+    let (full, floor) = if unique {
+        (UNIQUE_TOKEN_HEX_LEN, MIN_UNIQUE_TOKEN_WIDTH)
+    } else {
+        (TOKEN_HEX_LEN, MIN_TOKEN_WIDTH)
+    };
     let Some(limit) = limit else {
         return Ok(token.to_owned());
     };
     let available = limit.saturating_sub(overhead);
-    if available >= TOKEN_HEX_LEN {
+    if available >= full {
         Ok(token.to_owned())
-    } else if available >= MIN_TOKEN_WIDTH {
+    } else if available >= floor {
         Ok(format!("substr({token}, 1, {available})"))
     } else {
         Err(ScrubError::ColumnTooNarrow {
             column: column.to_owned(),
             limit,
             overhead,
+            floor,
         })
     }
 }
@@ -1195,13 +1608,28 @@ fn bounded_token(
 /// One `SET` clause. A nullable column keeps its `NULL`s (a scrub anonymizes
 /// values, it does not invent them), so it is wrapped in a `CASE`; a `NOT NULL`
 /// column needs no guard.
-fn assignment(column: &Column, value: &str) -> String {
+fn assignment(column: &Column, value: &str, strategy: Strategy) -> String {
     let ident = quote_ident(&column.name);
-    if column.nullable {
+    // A `CASE` whose arms are both bare `NULL` has no type to infer from, so
+    // Postgres resolves it to `text` and the assignment fails on every
+    // non-character column. The guard is pointless there anyway: the
+    // replacement already IS null.
+    if column.nullable && strategy != Strategy::Null {
         format!("{ident} = CASE WHEN {ident} IS NULL THEN NULL ELSE {value} END")
     } else {
         format!("{ident} = {value}")
     }
+}
+
+/// A `public`-qualified table identifier.
+///
+/// Every catalog read that produced the plan is scoped to `public`, so the
+/// writes must be too: a database- or role-level `search_path` (which Autumn
+/// supports for tenant schemas) would otherwise resolve a bare `UPDATE "users"`
+/// to a *different* table than the one that was classified — leaving the
+/// classified rows unscrubbed and overwriting rows nothing planned.
+fn qualified_ident(table: &str) -> String {
+    format!("\"public\".{}", quote_ident(table))
 }
 
 // ─── GDPR anonymize registrations ───────────────────────────────────────────
@@ -1311,7 +1739,7 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
 /// empty map when the project has no models directory at all.
 fn encrypted_columns(
     project_root: &Path,
-) -> Result<BTreeMap<String, BTreeSet<String>>, ScrubError> {
+) -> Result<BTreeMap<String, BTreeMap<String, bool>>, ScrubError> {
     let Some(path) = crate::schema::existing_models_path(project_root) else {
         return Ok(BTreeMap::new());
     };
@@ -1366,13 +1794,17 @@ fn same_database(a: &str, b: &str) -> bool {
 /// Deliberately reads only `autumn.toml` / `autumn-<profile>.toml`, never the
 /// environment: an env-provided `DATABASE_URL` is shared by every profile
 /// resolution, so consulting it would make this guard fire on legitimate scrubs.
-/// It is defence in depth on top of [`guard_scrub_target`], not a replacement.
+///
+/// It has its own waiver (`--allow-source-overwrite`) rather than riding on
+/// `--force`: the documented staging drill ALWAYS passes `--force` (staging is
+/// not `dev`/`test`), so a guard that `--force` waived would be inert in exactly
+/// the workflow it exists for.
 fn guard_configured_source(
     source_profile: &str,
     targets: &[(String, String)],
-    force: bool,
+    allowed: bool,
 ) -> Result<(), ScrubError> {
-    if force || super::is_safe_destructive_profile(source_profile) {
+    if allowed || super::is_safe_destructive_profile(source_profile) {
         return Ok(());
     }
     let table = migrate::read_autumn_toml_table_with_profile(Some(source_profile));
@@ -1442,7 +1874,10 @@ pub fn run(args: &ScrubArgs) {
     if let Err(e) = scrub(args) {
         eprintln!("\u{2717} {e}");
         if let ScrubError::Unclassified { columns } = &e {
-            eprintln!("\n{}", suggested_config_stanza(columns));
+            // stdout, not stderr: the diagnostics above are stderr, so
+            // `autumn db scrub --check 2>/dev/null >> scrub.toml` appends a
+            // valid stanza instead of a wall of interleaved prose.
+            println!("{}", suggested_config_stanza(columns));
         }
         std::process::exit(1);
     }
@@ -1455,12 +1890,25 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         guard_scrub_target(&profile, args.force)?;
     }
 
+    // Everything that does NOT need the database is resolved first, so a typo in
+    // `scrub.toml`, an unknown strategy, a `purge` entry naming a user table, or
+    // an unparsable model file fails BEFORE an `--artifact` restore writes real
+    // data into the target. Only schema-dependent refusals can land after it.
+    let sources = load_source_classification(args)?;
+
     let targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
 
     let restored = if let Some(artifact) = &args.artifact {
+        // `--check`/`--dry-run` promise to write nothing, and a restore is the
+        // largest write there is. clap already rejects the combination; this
+        // keeps the invariant true inside the function that relies on it.
+        debug_assert!(
+            writes,
+            "--check/--dry-run must never reach an artifact restore"
+        );
         if let Some(source_profile) = super::backup::artifact_source_profile(artifact) {
             eprintln!("  \u{2139} Artifact was taken under the {source_profile:?} profile.");
-            guard_configured_source(&source_profile, &targets, args.force)?;
+            guard_configured_source(&source_profile, &targets, args.allow_source_overwrite)?;
         }
         eprintln!(
             "\u{2500}\u{2500} restoring {} \u{2500}\u{2500}",
@@ -1478,20 +1926,61 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         false
     };
 
-    // A restore has already written the artifact's REAL data into the target, so
-    // any refusal from here on leaves unscrubbed data behind. The classification
-    // cannot run earlier — it reads the schema the restore just created — so the
-    // outcome is stated in the loudest possible terms instead of being implied.
-    classify_and_apply(args, &targets).inspect_err(|_| {
+    // The classification that remains reads the schema the restore just created,
+    // so it cannot run earlier — and a refusal here leaves the artifact's real
+    // data in the target. Say so in the loudest possible terms.
+    classify_and_apply(args, &profile, &targets, &sources).inspect_err(|_| {
         if restored {
             eprintln!(
-                "\n\u{26A0} The artifact was ALREADY RESTORED before this failure, so the \
-                 target database now holds UNSCRUBBED data.\n  \
+                "\n\u{26A0}\u{FE0F}  The artifact was ALREADY RESTORED before this failure, so \
+                 the target database now holds UNSCRUBBED data.\n  \
                  Do not hand it to anyone: fix the problem below and re-run the same \
-                 command, or drop the database. `autumn db scrub --check` catches this \
-                 before a restore."
+                 command, or drop the database."
             );
         }
+    })
+}
+
+/// The classification inputs that come from files rather than from the database.
+struct SourceClassification {
+    config: ScrubConfig,
+    encrypted: BTreeMap<String, BTreeMap<String, bool>>,
+    anonymize: BTreeSet<String>,
+}
+
+/// Read and validate every file-based classification source, reporting what each
+/// one contributed.
+///
+/// The counts are printed rather than assumed: both automatic sources degrade to
+/// empty when the command runs outside the project root (a deployed staging host
+/// often has the binary and `scrub.toml` but no source tree), and a silently
+/// empty `#[encrypted]` map would also silently disable the "a `safe`
+/// declaration may not override `#[encrypted]`" refusal.
+fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, ScrubError> {
+    let config = load_config(args.config.as_deref())?;
+    check_purge_list(&config)?;
+    let project_root = Path::new(".");
+    let encrypted = encrypted_columns(project_root)?;
+    let anonymize = scan_anonymize_tables(&project_root.join("src"))?;
+
+    let encrypted_count: usize = encrypted.values().map(BTreeMap::len).sum();
+    eprintln!(
+        "  \u{2139} Automatic classification: {encrypted_count} #[encrypted] column(s), \
+         {} GDPR anonymize registration(s).",
+        anonymize.len()
+    );
+    if encrypted_count == 0 && anonymize.is_empty() && !project_root.join("src").is_dir() {
+        eprintln!(
+            "  \u{26A0}\u{FE0F}  No `src/` directory here, so NEITHER automatic source could be \
+             read. Run the scrub from the project root, or every column must be declared in \
+             {SCRUB_CONFIG_FILE} by hand."
+        );
+    }
+
+    Ok(SourceClassification {
+        config,
+        encrypted,
+        anonymize,
     })
 }
 
@@ -1503,42 +1992,82 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
 /// shards, a single-pass loop would scrub the control database and only then
 /// discover that a shard has an undeclared column, leaving the topology half
 /// anonymized.
-fn classify_and_apply(args: &ScrubArgs, targets: &[(String, String)]) -> Result<(), ScrubError> {
-    let config = load_config(args.config.as_deref())?;
-    check_purge_list(&config)?;
-    let project_root = Path::new(".");
-    let encrypted = encrypted_columns(project_root)?;
-    let anonymize = scan_anonymize_tables(&project_root.join("src"))?;
-
+#[allow(clippy::too_many_lines)]
+fn classify_and_apply(
+    args: &ScrubArgs,
+    profile: &str,
+    targets: &[(String, String)],
+    sources: &SourceClassification,
+) -> Result<(), ScrubError> {
     // ── Pass 1: classify everything ─────────────────────────────────────────
     let mut plans = Vec::with_capacity(targets.len());
     for (label, url) in targets {
+        let facts = probe_database_facts(url, label, &sources.config)?;
+
+        // A universe the classifier never looked at cannot be reported clean.
+        if !facts.other_schemas.is_empty() {
+            return Err(ScrubError::UnsupportedSchemas {
+                schemas: facts.other_schemas.iter().cloned().collect(),
+            });
+        }
+
         let tables = introspect::introspect_postgres(url).map_err(|e| ScrubError::Introspect {
             label: label.clone(),
             detail: e.to_string(),
         })?;
         let plan = build_plan(&ClassificationInputs {
             tables: &tables,
-            config: &config,
-            encrypted: &encrypted,
-            anonymize_tables: &anonymize,
+            config: &sources.config,
+            encrypted: &sources.encrypted,
+            anonymize_tables: &sources.anonymize,
+            facts: &facts,
         })?;
+
+        // RLS makes an `UPDATE` silently apply to policy-visible rows only,
+        // which is a fail-OPEN in a fail-closed tool — refuse rather than
+        // report a partial scrub as complete.
+        let rls: Vec<String> = plan
+            .tables
+            .iter()
+            .filter(|t| facts.rls_tables.contains(&t.table))
+            .map(|t| t.table.clone())
+            .collect();
+        if !rls.is_empty() {
+            return Err(ScrubError::RowLevelSecurity { tables: rls });
+        }
+
         report_plan(label, &plan);
-        let framework = framework_payload_tables_present(url, label, &config)?;
-        report_framework_tables(&framework, &config);
-        plans.push((label, url, plan, framework));
+        report_framework_tables(&facts.framework_tables, &sources.config);
+        report_triggers(&plan, &facts);
+        plans.push((label, url, plan, facts));
     }
 
     if args.check {
-        eprintln!("\n\u{2713} Every column is classified \u{2014} no unclassified data can leak.");
+        eprintln!(
+            "\n\u{2713} Every column in `public` is classified \u{2014} no unclassified data can leak."
+        );
         return Ok(());
     }
     if args.dry_run {
-        for (_, _, plan, framework) in &plans {
+        for (_, _, plan, facts) in &plans {
             for table in &plan.tables {
-                eprintln!("  {};", table.sql);
+                if let Some(sql) = &table.sql {
+                    eprintln!("  {sql};");
+                }
+                for rewrite in &table.encrypted {
+                    eprintln!(
+                        "  -- {}.{}: re-encrypted per row under the target's key ({} mode)",
+                        table.table,
+                        rewrite.column,
+                        if rewrite.deterministic {
+                            "deterministic"
+                        } else {
+                            "randomized"
+                        }
+                    );
+                }
             }
-            for (_, statement) in purge_statements(framework, &config) {
+            for (_, statement) in purge_statements(&facts.framework_tables, &sources.config) {
                 eprintln!("  {statement};");
             }
         }
@@ -1546,11 +2075,35 @@ fn classify_and_apply(args: &ScrubArgs, targets: &[(String, String)]) -> Result<
         return Ok(());
     }
 
+    // An encrypted rewrite needs the target's key BEFORE anything is written,
+    // so a missing key is a refusal rather than a half-scrubbed database.
+    if plans
+        .iter()
+        .any(|(_, _, plan, _)| plan.tables.iter().any(|t| !t.encrypted.is_empty()))
+    {
+        let ring = resolve_key_ring(profile, Path::new("."))?;
+        autumn_web::encryption::install_key_ring(ring);
+    }
+
     // ── Pass 2: apply ───────────────────────────────────────────────────────
-    for (label, url, plan, framework) in &plans {
-        for (table, rows) in execute(url, plan, &purge_statements(framework, &config), label)? {
+    let mut committed: Vec<&str> = Vec::new();
+    for (label, url, plan, facts) in &plans {
+        let purges = purge_statements(&facts.framework_tables, &sources.config);
+        let applied = execute(url, plan, &purges, label).inspect_err(|_| {
+            if !committed.is_empty() {
+                eprintln!(
+                    "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
+                     Those databases ARE scrubbed; every later target is untouched and still \
+                     holds real data.",
+                    committed.join(", ")
+                );
+            }
+        })?;
+        for (table, rows) in applied {
             eprintln!("  \u{2713} {table}: {rows} row(s) scrubbed.");
         }
+        refresh_materialized_views(url, label, &facts.materialized_views)?;
+        committed.push(label);
     }
 
     if let Some(dir) = &args.output {
@@ -1567,6 +2120,31 @@ fn classify_and_apply(args: &ScrubArgs, targets: &[(String, String)]) -> Result<
 
     eprintln!("\n\u{2713} Scrub complete.");
     Ok(())
+}
+
+/// Warn when a table the scrub rewrites carries user-defined triggers.
+///
+/// An audit/history trigger copies the pre-scrub `OLD` row into another table as
+/// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
+/// re-populated with real values behind the scrub's back.
+fn report_triggers(plan: &ScrubPlan, facts: &DatabaseFacts) {
+    let triggered: Vec<&str> = plan
+        .tables
+        .iter()
+        .filter(|t| facts.triggered_tables.contains(&t.table))
+        .map(|t| t.table.as_str())
+        .collect();
+    if triggered.is_empty() {
+        return;
+    }
+    eprintln!(
+        "  \u{26A0}\u{FE0F}  {} rewritten table(s) carry user-defined triggers: {}.\n    \
+         An audit or history trigger copies the PRE-scrub row into another table as the \
+         rewrite runs, which can re-introduce real values. Check those triggers, or disable \
+         them on the copy before scrubbing.",
+        triggered.len(),
+        triggered.join(", ")
+    );
 }
 
 /// Print what one database's scrub will do: every column, its strategy, and what
@@ -1591,39 +2169,302 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
     }
 }
 
-/// The framework-owned payload tables that actually exist in one database.
+/// Everything about one live database that the pure classifier cannot read from
+/// the schema IR, gathered in a single connection.
 ///
-/// Introspection filters `autumn_*` / `_autumn*` out of the classified universe,
-/// so this is a separate probe: the scrub still has to say something about them
-/// rather than pretend they are not there.
-fn framework_payload_tables_present(
+/// The IR [`crate::schema::introspect`] produces is shaped for *migration
+/// diffing*, not for "is it safe to rewrite this column": it records only
+/// outgoing single-column foreign keys, drops generated/identity semantics, and
+/// says nothing about row-level security, triggers, partitions, materialized
+/// views, or schemas outside `public`. Every one of those decides whether an
+/// `UPDATE` this command emits succeeds, silently under-applies, or leaks — so
+/// they are probed here rather than assumed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DatabaseFacts {
+    /// Every column on either side of any foreign key, all components of a
+    /// composite key included, as `(table, column)`. Rewriting any of them
+    /// breaks referential integrity (or is silently cascaded into a child).
+    pub foreign_key_columns: BTreeSet<(String, String)>,
+    /// Columns named by a `CHECK` constraint. A fabricated value has no way to
+    /// satisfy an arbitrary predicate, so these are refused rather than guessed.
+    pub checked_columns: BTreeSet<(String, String)>,
+    /// Generated / `GENERATED ALWAYS AS IDENTITY` columns. Postgres refuses to
+    /// `UPDATE` them at all, and they are derived data that a scrub of their
+    /// source columns already covers.
+    pub generated_columns: BTreeSet<(String, String)>,
+    /// Columns covered by ANY unique index — composite and partial included.
+    /// Broader than the IR's single-column `unique` flag, which is the right
+    /// question for a migration diff and the wrong one for "can this rewrite
+    /// collide".
+    pub unique_columns: BTreeSet<(String, String)>,
+    /// Columns covered by a `NULLS NOT DISTINCT` unique index, where more than
+    /// one `NULL` is itself a uniqueness violation.
+    pub nulls_not_distinct_columns: BTreeSet<(String, String)>,
+    /// Tables that are partitions of another table. Their rows are rewritten
+    /// through the parent, so planning them again double-updates.
+    pub partitions: BTreeSet<String>,
+    /// Tables with row-level security enabled. A non-bypassing role silently
+    /// updates only the rows its policies expose — a fail-open a scrub cannot
+    /// tolerate.
+    pub rls_tables: BTreeSet<String>,
+    /// Tables carrying user-defined triggers, which can copy pre-scrub values
+    /// into another table mid-scrub.
+    pub triggered_tables: BTreeSet<String>,
+    /// Materialized views, in dependency order (sources before dependents), so
+    /// refreshing them in sequence never re-derives from stale data.
+    pub materialized_views: Vec<String>,
+    /// Non-system schemas other than `public` that hold base tables. The whole
+    /// classification universe is `public`-only, so these are refused.
+    pub other_schemas: BTreeSet<String>,
+    /// Framework-owned tables present that the classification never sees.
+    pub framework_tables: Vec<String>,
+}
+
+/// A single `name` column.
+#[derive(diesel::QueryableByName)]
+struct NameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
+/// A `(table, column)` pair.
+#[derive(diesel::QueryableByName)]
+struct PairRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    tbl: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    col: String,
+}
+
+fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
+    rows.into_iter().map(|r| (r.tbl, r.col)).collect()
+}
+
+/// Open a connection for a probe, mapping failure to a credential-safe error.
+fn probe_connection(url: &str, label: &str, what: &str) -> Result<PgConnection, ScrubError> {
+    PgConnection::establish(url).map_err(|_| ScrubError::Introspect {
+        label: label.to_owned(),
+        detail: format!(
+            "could not connect to database {:?} to {what}",
+            parsed_db_name(url)
+        ),
+    })
+}
+
+/// Gather every catalog fact the plan validation needs.
+// One catalog read per fact; splitting it would scatter closely-related SQL
+// across helpers that each need the same connection.
+#[allow(clippy::too_many_lines)]
+fn probe_database_facts(
     url: &str,
     label: &str,
     config: &ScrubConfig,
-) -> Result<Vec<String>, ScrubError> {
-    let mut conn = PgConnection::establish(url).map_err(|_| ScrubError::Introspect {
-        label: label.to_owned(),
-        detail: format!(
-            "could not connect to database {:?} to inspect framework-owned tables",
-            parsed_db_name(url)
-        ),
-    })?;
-    // The known payload carriers PLUS anything the app explicitly opted into
-    // purging — otherwise a `purge` entry outside the built-in list would be
-    // accepted by the config check and then silently do nothing.
+) -> Result<DatabaseFacts, ScrubError> {
+    let mut conn = probe_connection(url, label, "inspect its catalog")?;
+
+    // ── Foreign keys: BOTH sides, every component ───────────────────────────
+    // `pg_constraint.conkey`/`confkey` are arrays; `unnest` covers composite
+    // keys, which the IR (first component, referencing side only) cannot.
+    let foreign_key_columns = pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_constraint c \
+             JOIN pg_class rel ON rel.oid = c.conrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             CROSS JOIN LATERAL unnest(c.conkey) AS k(attnum) \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
+             WHERE c.contype = 'f' \
+             UNION \
+             SELECT frel.relname AS tbl, fatt.attname AS col \
+             FROM pg_constraint c \
+             JOIN pg_class frel ON frel.oid = c.confrelid \
+             JOIN pg_namespace fns ON fns.oid = frel.relnamespace AND fns.nspname = 'public' \
+             CROSS JOIN LATERAL unnest(c.confkey) AS fk(attnum) \
+             JOIN pg_attribute fatt ON fatt.attrelid = frel.oid AND fatt.attnum = fk.attnum \
+             WHERE c.contype = 'f'",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
+
+    // ── CHECK-constrained columns ───────────────────────────────────────────
+    let checked_columns = pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_constraint c \
+             JOIN pg_class rel ON rel.oid = c.conrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             CROSS JOIN LATERAL unnest(c.conkey) AS k(attnum) \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
+             WHERE c.contype = 'c'",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
+
+    // ── Generated / identity-always columns ─────────────────────────────────
+    let generated_columns = pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_attribute att \
+             JOIN pg_class rel ON rel.oid = att.attrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE att.attnum > 0 AND NOT att.attisdropped \
+             AND (att.attgenerated <> '' OR att.attidentity = 'a')",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
+
+    // ── Uniqueness, the write-side question ─────────────────────────────────
+    // ANY unique index counts (composite and partial included): the IR's
+    // single-column `unique` flag answers a migration-diff question, not
+    // "can this rewrite collide".
+    let unique_columns = pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             CROSS JOIN LATERAL unnest(i.indkey[0:i.indnkeyatts-1]) AS k(attnum) \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
+             WHERE i.indisunique AND k.attnum > 0",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
+
+    // `NULLS NOT DISTINCT` (PG15+) makes a second NULL a violation, so the
+    // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
+    // exist before 15; probe the column's presence first so this stays
+    // compatible with older servers.
+    let has_nnd: Vec<NameRow> = sql_query(
+        "SELECT 'yes' AS name FROM pg_attribute \
+         WHERE attrelid = 'pg_index'::regclass AND attname = 'indnullsnotdistinct'",
+    )
+    .load(&mut conn)
+    .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    let nulls_not_distinct_columns = if has_nnd.is_empty() {
+        BTreeSet::new()
+    } else {
+        pair_set(
+            sql_query(
+                "SELECT rel.relname AS tbl, att.attname AS col \
+                 FROM pg_index i \
+                 JOIN pg_class rel ON rel.oid = i.indrelid \
+                 JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+                 CROSS JOIN LATERAL unnest(i.indkey[0:i.indnkeyatts-1]) AS k(attnum) \
+                 JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = k.attnum \
+                 WHERE i.indisunique AND i.indnullsnotdistinct AND k.attnum > 0",
+            )
+            .load(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?,
+        )
+    };
+
+    // ── Table-level facts ───────────────────────────────────────────────────
+    let names = |q: &str, conn: &mut PgConnection| -> Result<Vec<String>, ScrubError> {
+        let rows: Vec<NameRow> = sql_query(q)
+            .load(conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.name).collect())
+    };
+
+    let partitions = names(
+        "SELECT rel.relname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE rel.relispartition",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
+    let rls_tables = names(
+        "SELECT rel.relname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE rel.relrowsecurity",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
+    let triggered_tables = names(
+        "SELECT DISTINCT rel.relname AS name FROM pg_trigger t \
+         JOIN pg_class rel ON rel.oid = t.tgrelid \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE NOT t.tgisinternal",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
+    let other_schemas = names(
+        "SELECT DISTINCT ns.nspname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
+         WHERE rel.relkind IN ('r', 'p') AND ns.nspname NOT IN ('public', 'information_schema') \
+         AND ns.nspname NOT LIKE 'pg\\_%'",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
+    // Materialized views in dependency order: a view that reads another must be
+    // refreshed after it, or it re-derives from pre-scrub data.
+    let materialized_views = names(
+        "WITH RECURSIVE mv AS ( \
+             SELECT rel.oid FROM pg_class rel \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relkind = 'm' \
+         ), edge AS ( \
+             SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
+             FROM pg_depend d \
+             JOIN pg_rewrite r ON r.oid = d.objid \
+             WHERE d.classid = 'pg_rewrite'::regclass \
+               AND r.ev_class IN (SELECT oid FROM mv) \
+               AND d.refobjid IN (SELECT oid FROM mv) \
+               AND d.refobjid <> r.ev_class \
+         ), depth AS ( \
+             SELECT oid, 0 AS lvl FROM mv \
+             WHERE oid NOT IN (SELECT dependent FROM edge) \
+             UNION ALL \
+             SELECT e.dependent, d.lvl + 1 FROM edge e JOIN depth d ON d.oid = e.source \
+             WHERE d.lvl < 32 \
+         ) \
+         SELECT rel.relname AS name FROM (SELECT oid, max(lvl) AS lvl FROM depth GROUP BY oid) o \
+         JOIN pg_class rel ON rel.oid = o.oid ORDER BY o.lvl, rel.relname",
+        &mut conn,
+    )?;
+
+    // ── Framework-owned tables (read from pg_class, not information_schema,
+    //    which hides tables the connecting role has no privilege on) ─────────
     let wanted = probe_table_names(config)
         .iter()
         .map(|t| quote_literal(t))
         .collect::<Vec<_>>()
         .join(", ");
-    let rows: Vec<NameRow> = sql_query(format!(
-        "SELECT table_name AS name FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
-         AND table_name IN ({wanted}) ORDER BY table_name"
-    ))
-    .load(&mut conn)
-    .map_err(|e| ScrubError::Sql(e.to_string()))?;
-    Ok(rows.into_iter().map(|r| r.name).collect())
+    let framework_tables = names(
+        &format!(
+            "SELECT rel.relname AS name FROM pg_class rel \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relkind IN ('r', 'p') AND rel.relname IN ({wanted}) \
+             ORDER BY rel.relname"
+        ),
+        &mut conn,
+    )?;
+
+    Ok(DatabaseFacts {
+        foreign_key_columns,
+        checked_columns,
+        generated_columns,
+        unique_columns,
+        nulls_not_distinct_columns,
+        partitions,
+        rls_tables,
+        triggered_tables,
+        materialized_views,
+        other_schemas,
+        framework_tables,
+    })
 }
 
 /// The framework-owned table names worth probing for: the built-in payload
@@ -1634,13 +2475,6 @@ fn probe_table_names(config: &ScrubConfig) -> BTreeSet<String> {
         .map(|t| (*t).to_owned())
         .chain(config.framework.purge.iter().cloned())
         .collect()
-}
-
-/// A single `name` column produced by the framework-table probe.
-#[derive(diesel::QueryableByName)]
-struct NameRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
 }
 
 /// Tell the operator about framework-owned payload tables the classification
@@ -1665,7 +2499,7 @@ fn report_framework_tables(present: &[String], config: &ScrubConfig) {
         return;
     }
     eprintln!(
-        "  \u{26A0} {} framework-owned table(s) are NOT scrubbed and may carry app-supplied \
+        "  \u{26A0}\u{FE0F}  {} framework-owned table(s) are NOT scrubbed and may carry app-supplied \
          payloads (queued jobs, offline-sync rows, experiment assignments):\n{}\n    \
          Add them to `[framework] purge = [...]` in {SCRUB_CONFIG_FILE} to empty them, or \
          empty them yourself.",
@@ -1686,6 +2520,119 @@ fn purge_statements(present: &[String], config: &ScrubConfig) -> Vec<(String, St
         .collect()
 }
 
+/// Resolve the target's attribute-encryption key ring from the project's
+/// credentials for `profile`.
+///
+/// Refused rather than skipped when the plan needs one: writing a plain string
+/// into an `#[encrypted]` column would make every later repository read of that
+/// row fail as malformed ciphertext, so a missing key is a hard stop, not a
+/// silent downgrade.
+fn resolve_key_ring(
+    profile: &str,
+    project_root: &Path,
+) -> Result<autumn_web::encryption::KeyRing, ScrubError> {
+    let store = autumn_web::credentials::load_credentials(profile, project_root).map_err(|e| {
+        ScrubError::EncryptionKeyUnavailable {
+            profile: profile.to_owned(),
+            detail: e.to_string(),
+        }
+    })?;
+    match autumn_web::encryption::key_ring_from_credentials(&store) {
+        Ok(Some(ring)) => Ok(ring),
+        Ok(None) => Err(ScrubError::EncryptionKeyUnavailable {
+            profile: profile.to_owned(),
+            detail: format!(
+                "`{}.primary_key` is not configured",
+                autumn_web::encryption::CREDENTIALS_NAMESPACE
+            ),
+        }),
+        Err(e) => Err(ScrubError::EncryptionKeyUnavailable {
+            profile: profile.to_owned(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
+/// How many rows of encrypted replacements are shipped back per statement.
+const ENCRYPTED_BATCH_ROWS: usize = 500;
+
+/// One row's encrypted replacement.
+#[derive(diesel::QueryableByName)]
+struct RowTokenRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    row_key: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    token: String,
+}
+
+/// Rewrite one `#[encrypted]` column, row by row, with a valid AEAD envelope of
+/// a fake plaintext produced under the target's own key.
+///
+/// This is the one rewrite that cannot be a SQL expression: the envelope is
+/// `base64(header ‖ nonce ‖ ciphertext)` built by [`autumn_web::encryption`], so
+/// the rows are read, encrypted in Rust, and shipped back in batched
+/// `UPDATE … FROM (VALUES …)` statements. Rows whose value is already `NULL` are
+/// left alone, exactly as the SQL path's `CASE` does.
+fn rewrite_encrypted_column(
+    conn: &mut PgConnection,
+    table: &str,
+    row_key: &str,
+    rewrite: &EncryptedRewrite,
+) -> Result<usize, diesel::result::Error> {
+    use autumn_web::encryption::{Mode, encrypt_text};
+
+    let ident = quote_ident(&rewrite.column);
+    let rows: Vec<RowTokenRow> = sql_query(format!(
+        "SELECT ({row_key}) AS row_key, \
+         encode(sha256((({row_key}) || '|' || {})::bytea), 'hex') AS token \
+         FROM {} WHERE {ident} IS NOT NULL",
+        quote_literal(&rewrite.column),
+        qualified_ident(table),
+    ))
+    .load(conn)?;
+
+    let mode = if rewrite.deterministic {
+        Mode::Deterministic
+    } else {
+        Mode::Randomized
+    };
+    let mut updated = 0;
+    for chunk in rows.chunks(ENCRYPTED_BATCH_ROWS) {
+        let mut values = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            let plaintext = match rewrite.shape {
+                Strategy::Email => format!("scrubbed+{}{SCRUB_EMAIL_DOMAIN}", row.token),
+                _ => format!("[scrubbed:{}]", row.token),
+            };
+            // A key ring is installed before the apply pass, so this can only
+            // fail on a genuinely broken key — surfaced as a SQL-shaped error so
+            // the transaction rolls back with everything else.
+            let envelope = encrypt_text(mode, &plaintext).map_err(|e| {
+                diesel::result::Error::QueryBuilderError(
+                    format!(
+                        "could not encrypt a replacement for {table}.{}: {e}",
+                        rewrite.column
+                    )
+                    .into(),
+                )
+            })?;
+            values.push(format!(
+                "({}, {})",
+                quote_literal(&row.row_key),
+                quote_literal(&envelope)
+            ));
+        }
+        updated += sql_query(format!(
+            "UPDATE {} AS t SET {ident} = v.val FROM (VALUES {}) AS v(k, val) \
+             WHERE ({row_key}) = v.k",
+            qualified_ident(table),
+            values.join(", ")
+        ))
+        .execute(conn)?;
+    }
+    Ok(updated)
+}
+
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
 fn execute(
@@ -1697,18 +2644,38 @@ fn execute(
     if plan.tables.is_empty() && purges.is_empty() {
         return Ok(Vec::new());
     }
-    let mut conn = PgConnection::establish(url).map_err(|_| ScrubError::Introspect {
-        label: label.to_owned(),
-        detail: format!(
-            "could not connect to database {:?} to apply the scrub",
-            parsed_db_name(url)
-        ),
-    })?;
+    let mut conn = probe_connection(url, label, "apply the scrub")?;
     let mut counts = Vec::with_capacity(plan.tables.len());
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        // Pin the resolution of every unqualified name and the meaning of every
+        // string literal for the whole transaction, so a role- or
+        // database-level `search_path` (tenant schemas) cannot redirect a write
+        // to a table nothing classified, and `quote_literal`'s doubled quotes
+        // cannot be re-interpreted under `standard_conforming_strings = off`.
+        conn.batch_execute(
+            "SET LOCAL search_path = pg_catalog, public; \
+             SET LOCAL standard_conforming_strings = on",
+        )?;
+        // Hold the tables for the duration: the plan was built from a snapshot
+        // taken on another connection, and a row inserted between the two would
+        // otherwise survive the scrub unnoticed. SHARE ROW EXCLUSIVE blocks
+        // writers while still allowing plain reads.
         for table in &plan.tables {
-            let rows = sql_query(&table.sql).execute(conn)?;
-            counts.push((table.table.clone(), rows));
+            sql_query(format!(
+                "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+                qualified_ident(&table.table)
+            ))
+            .execute(conn)?;
+        }
+        for table in &plan.tables {
+            if let Some(sql) = &table.sql {
+                let rows = sql_query(sql).execute(conn)?;
+                counts.push((table.table.clone(), rows));
+            }
+            for rewrite in &table.encrypted {
+                let rows = rewrite_encrypted_column(conn, &table.table, &table.row_key, rewrite)?;
+                counts.push((format!("{}.{}", table.table, rewrite.column), rows));
+            }
         }
         for (table, statement) in purges {
             let rows = sql_query(statement).execute(conn)?;
@@ -1718,6 +2685,29 @@ fn execute(
     })
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
     Ok(counts)
+}
+
+/// Refresh every materialized view, sources first.
+///
+/// A materialized view holds its own copy of whatever it selected, so scrubbing
+/// the base tables leaves it holding the original values — and `pg_restore`
+/// populates them from the still-real data it just restored. They are refreshed
+/// in dependency order so a view reading another view never re-derives from
+/// stale content.
+fn refresh_materialized_views(url: &str, label: &str, views: &[String]) -> Result<(), ScrubError> {
+    if views.is_empty() {
+        return Ok(());
+    }
+    let mut conn = probe_connection(url, label, "refresh its materialized views")?;
+    for view in views {
+        conn.batch_execute(&format!(
+            "REFRESH MATERIALIZED VIEW {}",
+            qualified_ident(view)
+        ))
+        .map_err(|e| ScrubError::Sql(format!("refreshing materialized view {view:?}: {e}")))?;
+        eprintln!("  \u{2713} refreshed materialized view {view}.");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1759,8 +2749,19 @@ mod tests {
         t
     }
 
-    fn empty_encrypted() -> BTreeMap<String, BTreeSet<String>> {
+    fn empty_encrypted() -> BTreeMap<String, BTreeMap<String, bool>> {
         BTreeMap::new()
+    }
+
+    /// `#[encrypted]` columns for one table, all randomized-mode.
+    fn encrypted_columns_of(
+        table: &str,
+        columns: &[&str],
+    ) -> BTreeMap<String, BTreeMap<String, bool>> {
+        BTreeMap::from([(
+            table.to_owned(),
+            columns.iter().map(|c| ((*c).to_owned(), false)).collect(),
+        )])
     }
 
     fn no_anonymize() -> BTreeSet<String> {
@@ -1770,15 +2771,43 @@ mod tests {
     fn plan_for(
         tables: &[Table],
         config: &ScrubConfig,
-        encrypted: &BTreeMap<String, BTreeSet<String>>,
+        encrypted: &BTreeMap<String, BTreeMap<String, bool>>,
         anonymize: &BTreeSet<String>,
+    ) -> Result<ScrubPlan, ScrubError> {
+        plan_with_facts(
+            tables,
+            config,
+            encrypted,
+            anonymize,
+            &DatabaseFacts::default(),
+        )
+    }
+
+    fn plan_with_facts(
+        tables: &[Table],
+        config: &ScrubConfig,
+        encrypted: &BTreeMap<String, BTreeMap<String, bool>>,
+        anonymize: &BTreeSet<String>,
+        facts: &DatabaseFacts,
     ) -> Result<ScrubPlan, ScrubError> {
         build_plan(&ClassificationInputs {
             tables,
             config,
             encrypted,
             anonymize_tables: anonymize,
+            facts,
         })
+    }
+
+    /// The single `UPDATE` a table plan carries (panics when it has none).
+    fn sql_of(plan: &ScrubPlan, table: &str) -> String {
+        plan.tables
+            .iter()
+            .find(|t| t.table == table)
+            .unwrap_or_else(|| panic!("no plan for {table}"))
+            .sql
+            .clone()
+            .unwrap_or_else(|| panic!("{table} has no SQL statement"))
     }
 
     // ── Config parsing ──────────────────────────────────────────────────────
@@ -1990,8 +3019,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut encrypted = BTreeMap::new();
-        encrypted.insert("users".to_owned(), BTreeSet::from(["email".to_owned()]));
+        let encrypted = encrypted_columns_of("users", &["email"]);
 
         let plan = plan_for(&[users_table()], &config, &encrypted, &no_anonymize())
             .expect("an #[encrypted] column needs no declaration");
@@ -2012,8 +3040,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut encrypted = BTreeMap::new();
-        encrypted.insert("users".to_owned(), BTreeSet::from(["email".to_owned()]));
+        let encrypted = encrypted_columns_of("users", &["email"]);
 
         let err = plan_for(&[users_table()], &config, &encrypted, &no_anonymize())
             .expect_err("marking an #[encrypted] column safe must be refused");
@@ -2027,8 +3054,8 @@ mod tests {
     fn gdpr_anonymize_table_classifies_its_columns_as_pii() {
         let config = parse_config_str(
             r#"
-            [defaults]
-            safe_columns = ["id", "created_at"]
+            [tables.users]
+            safe = ["id", "created_at"]
             "#,
         )
         .unwrap();
@@ -2042,9 +3069,320 @@ mod tests {
                 .unwrap_or_else(|| panic!("{column} must be scrubbed"));
             assert_eq!(decision.source, ClassSource::GdprAnonymize);
         }
-        // `id`/`created_at` were explicitly declared safe, so they are untouched.
+        // `id`/`created_at` were explicitly declared safe FOR THIS TABLE, so
+        // they are untouched.
         assert!(plan.column("users", "id").is_none());
         assert!(plan.column("users", "created_at").is_none());
+    }
+
+    #[test]
+    fn the_global_safe_list_may_not_narrow_a_gdpr_anonymize_table() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let anonymize = BTreeSet::from(["users".to_owned()]);
+        let plan = plan_for(&[users_table()], &config, &empty_encrypted(), &anonymize).unwrap();
+        // A cross-table convenience list is not a per-column review, so it must
+        // not silently exempt a column from a table the app registered for
+        // anonymization.
+        assert!(
+            plan.column("users", "full_name").is_some(),
+            "a global safe_columns entry must not narrow an anonymize registration"
+        );
+        // Structural columns are still skipped: the registration says nothing
+        // about them and rewriting one would break referential integrity.
+        assert!(plan.column("users", "id").is_none());
+    }
+
+    #[test]
+    fn a_check_constrained_column_is_refused_rather_than_guessed_at() {
+        // A real Autumn closed-set column reaches the database as plain TEXT
+        // plus a CHECK, so the model-IR-only `ColumnType::Enum` never fires
+        // against a live schema — this is what actually catches it.
+        let facts = DatabaseFacts {
+            checked_columns: BTreeSet::from([("users".to_owned(), "bio".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            [tables.users.pii]
+            bio = "redact"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("no fabricated value can be proven to satisfy an arbitrary CHECK");
+        assert!(
+            matches!(err, ScrubError::CheckConstrainedColumn { ref column } if column == "users.bio"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_referenced_side_of_a_foreign_key_is_refused() {
+        // `orders.user_email REFERENCES users(email)` leaves `users.email` with
+        // no `references` of its own, so only the probed catalog set can see it.
+        let facts = DatabaseFacts {
+            foreign_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            [tables.users.pii]
+            email = "email"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("rewriting a referenced natural key breaks its children");
+        assert!(
+            matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["users.email".to_owned()]),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_generated_column_is_never_rewritten() {
+        // Postgres refuses `UPDATE` on a generated column outright, and it is
+        // derived data that a scrub of its source columns already covers.
+        let facts = DatabaseFacts {
+            generated_columns: BTreeSet::from([("users".to_owned(), "full_name".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "bio"]
+            "#,
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect("a generated column needs no declaration");
+        assert!(plan.column("users", "full_name").is_none());
+    }
+
+    #[test]
+    fn a_partition_is_scrubbed_through_its_parent_not_twice() {
+        let mut partition = users_table();
+        partition.name = "users_2026_01".to_owned();
+        let facts = DatabaseFacts {
+            partitions: BTreeSet::from(["users_2026_01".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at"]
+            [tables.users.pii]
+            email = "email"
+            full_name = "name"
+            bio = "redact"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table(), partition],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect("a partition needs no declaration of its own");
+        assert_eq!(
+            plan.tables.len(),
+            1,
+            "the parent UPDATE already covers the partition's rows"
+        );
+        assert_eq!(plan.tables[0].table, "users");
+    }
+
+    #[test]
+    fn null_is_refused_on_a_nulls_not_distinct_unique_column() {
+        let mut t = users_table();
+        t.columns[3].unique = true; // `bio`, nullable
+        let facts = DatabaseFacts {
+            nulls_not_distinct_columns: BTreeSet::from([("users".to_owned(), "bio".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            [tables.users.pii]
+            bio = "null"
+            "#,
+        )
+        .unwrap();
+        // `null` is normally unique-safe (Postgres allows many NULLs in a
+        // unique index) — but not under NULLS NOT DISTINCT.
+        let err = plan_with_facts(&[t], &config, &empty_encrypted(), &no_anonymize(), &facts)
+            .expect_err("a second NULL is a violation under NULLS NOT DISTINCT");
+        assert!(
+            matches!(err, ScrubError::NonUniqueStrategy { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_unique_column_gets_a_wider_token_and_a_higher_floor() {
+        let table = users_table();
+        assert!(
+            token_expr(&table, "email", true).contains("sha256"),
+            "a unique column needs more entropy than md5's 32 hex characters"
+        );
+        assert!(token_expr(&table, "bio", false).contains("md5("));
+
+        // 19 chars with `redact`'s 11 of affixes leaves 8 — fine for a
+        // non-unique column, a collision generator for a unique one (32 bits
+        // collides in practice around 10^5 rows).
+        let narrow = Column::new(
+            "code",
+            ColumnType::Opaque {
+                pg_type: "varchar(19)".to_owned(),
+            },
+        );
+        assert!(replacement_expr(Strategy::Redact, &narrow, "TOK", false).is_ok());
+        assert!(matches!(
+            replacement_expr(Strategy::Redact, &narrow, "TOK", true),
+            Err(ScrubError::ColumnTooNarrow { .. })
+        ));
+    }
+
+    #[test]
+    fn a_text_strategy_is_refused_on_a_non_character_column() {
+        for (name, ty) in [
+            ("age", ColumnType::Int32),
+            ("seen_at", ColumnType::TimestampTz),
+            (
+                "ip",
+                ColumnType::Opaque {
+                    pg_type: "inet".to_owned(),
+                },
+            ),
+        ] {
+            let column = Column::new(name, ty);
+            for strategy in [
+                Strategy::Email,
+                Strategy::Name,
+                Strategy::Redact,
+                Strategy::Phone,
+            ] {
+                assert!(
+                    matches!(
+                        replacement_expr(strategy, &column, "TOK", false),
+                        Err(ScrubError::StrategyTypeMismatch { .. })
+                    ),
+                    "{strategy:?} on {name} must be refused at plan time, not at apply time"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_null_assignment_carries_no_untyped_case() {
+        // A `CASE` whose arms are both bare NULL has no type to infer from, so
+        // Postgres resolves it to `text` and the assignment fails on every
+        // non-character column.
+        let mut column = Column::new("token", ColumnType::Uuid);
+        column.nullable = true;
+        assert_eq!(
+            assignment(&column, "NULL", Strategy::Null),
+            r#""token" = NULL"#
+        );
+        assert!(
+            assignment(&column, "X", Strategy::Uuid).contains("CASE WHEN"),
+            "every other strategy still preserves NULLs"
+        );
+    }
+
+    #[test]
+    fn auto_strategy_covers_the_everyday_opaque_pii_types() {
+        for (pg_type, expected) in [
+            ("date", Strategy::Epoch),
+            ("time", Strategy::Epoch),
+            ("int2", Strategy::Zero),
+            ("numeric(12,2)", Strategy::Zero),
+        ] {
+            let column = Column::new(
+                "value",
+                ColumnType::Opaque {
+                    pg_type: pg_type.to_owned(),
+                },
+            );
+            assert_eq!(
+                auto_strategy(&column).unwrap(),
+                expected,
+                "`{pg_type}` is an everyday PII column type and needs a usable strategy"
+            );
+            assert!(replacement_expr(expected, &column, "TOK", false).is_ok());
+        }
+    }
+
+    #[test]
+    fn purge_never_accepts_schema_bookkeeping() {
+        for table in NEVER_PURGEABLE_TABLES {
+            let config =
+                parse_config_str(&format!("[framework]\npurge = [\"{table}\"]\n")).unwrap();
+            assert!(
+                matches!(
+                    check_purge_list(&config),
+                    Err(ScrubError::PurgeSchemaBookkeeping { .. })
+                ),
+                "emptying {table} would make the copy un-migratable or un-routable"
+            );
+        }
+    }
+
+    #[test]
+    fn declaring_a_framework_table_points_at_the_right_mechanism() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name", "bio"]
+            [tables.api_tokens.pii]
+            token = "redact"
+            "#,
+        )
+        .unwrap();
+        let err = plan_for(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+        )
+        .expect_err("a framework table cannot be declared column-by-column");
+        // Not "the database does not have it" — that would send the developer
+        // hunting for a typo in a name that is spelled correctly.
+        assert!(
+            matches!(err, ScrubError::FrameworkTableDeclared { ref tables } if tables == &vec!["api_tokens".to_owned()]),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2069,21 +3407,112 @@ mod tests {
         let config = parse_config_str(
             r#"
             [defaults]
+            safe_columns = ["id", "created_at", "email", "bio"]
+            [tables.users.pii]
+            full_name = "redact"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_for(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+        )
+        .unwrap();
+        let column = plan.column("users", "full_name").unwrap();
+        assert_eq!(column.strategy, Strategy::Redact);
+        assert_eq!(column.source, ClassSource::Config);
+    }
+
+    #[test]
+    fn a_plaintext_strategy_is_refused_on_an_encrypted_column() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
             safe_columns = ["id", "created_at", "full_name", "bio"]
             [tables.users.pii]
             email = "redact"
             "#,
         )
         .unwrap();
-        let mut encrypted = BTreeMap::new();
-        encrypted.insert("users".to_owned(), BTreeSet::from(["email".to_owned()]));
-        let plan = plan_for(&[users_table()], &config, &encrypted, &no_anonymize()).unwrap();
-        let column = plan.column("users", "email").unwrap();
-        assert_eq!(column.strategy, Strategy::Redact);
-        assert_eq!(column.source, ClassSource::Config);
+        // Writing a plain string into an at-rest-encrypted column makes every
+        // later read of that row fail as malformed ciphertext, so a declaration
+        // may not choose one.
+        let err = plan_for(
+            &[users_table()],
+            &config,
+            &encrypted_columns_of("users", &["email"]),
+            &no_anonymize(),
+        )
+        .expect_err("plaintext must never be written into an #[encrypted] column");
+        assert!(
+            matches!(err, ScrubError::PlaintextIntoEncrypted { ref columns } if columns[0].starts_with("users.email")),
+            "got {err:?}"
+        );
     }
 
-    // ── Constraint safety (AC #4) ───────────────────────────────────────────
+    #[test]
+    fn an_encrypted_column_resolves_to_a_re_encryption_and_carries_its_mode() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            "#,
+        )
+        .unwrap();
+        let encrypted = BTreeMap::from([(
+            "users".to_owned(),
+            BTreeMap::from([("email".to_owned(), true)]),
+        )]);
+        let plan = plan_for(&[users_table()], &config, &encrypted, &no_anonymize()).unwrap();
+        assert_eq!(
+            plan.column("users", "email").unwrap().strategy,
+            Strategy::Encrypted
+        );
+        let table = &plan.tables[0];
+        assert!(
+            table.sql.is_none(),
+            "an encrypted rewrite is not expressible as SQL: {:?}",
+            table.sql
+        );
+        assert_eq!(table.encrypted.len(), 1);
+        assert!(
+            table.encrypted[0].deterministic,
+            "a deterministic column must be re-encrypted deterministically, or equality \
+             lookups against it stop matching"
+        );
+        assert_eq!(table.encrypted[0].shape, Strategy::Email);
+    }
+
+    #[test]
+    fn null_may_still_be_declared_on_a_nullable_encrypted_column() {
+        let mut t = users_table();
+        t.columns[1].nullable = true;
+        t.columns[1].unique = false;
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            [tables.users.pii]
+            email = "null"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_for(
+            &[t],
+            &config,
+            &encrypted_columns_of("users", &["email"]),
+            &no_anonymize(),
+        )
+        .expect("NULL is a valid, readable value for an encrypted column");
+        assert_eq!(
+            plan.column("users", "email").unwrap().strategy,
+            Strategy::Null
+        );
+    }
+
+    // ── Constraint safety (AC #4)     // ── Constraint safety (AC #4) ───────────────────────────────────────────
 
     #[test]
     fn pii_on_a_primary_key_is_refused() {
@@ -2246,25 +3675,25 @@ mod tests {
         let mut team_id = Column::new("team_id", ColumnType::Int64);
         team_id.primary_key = true;
         t.columns = vec![user_id, team_id];
-        assert_eq!(
-            row_key_expr(&t),
-            r#"coalesce("user_id"::text, '') || '|' || coalesce("team_id"::text, '')"#
-        );
+        // `ROW(...)::text` carries Postgres's own quoting, so ('a|','b') and
+        // ('a','|b') cannot collapse into one row key the way a plain
+        // separator-joined concatenation does.
+        assert_eq!(row_key_expr(&t), r#"ROW("user_id", "team_id")::text"#);
     }
 
     #[test]
     fn token_is_salted_per_column_so_two_columns_never_match() {
         let table = users_table();
         assert_ne!(
-            token_expr(&table, "email"),
-            token_expr(&table, "full_name"),
+            token_expr(&table, "email", false),
+            token_expr(&table, "full_name", false),
             "two PII columns of one row must not receive the same fake value"
         );
     }
 
     #[test]
     fn email_expression_is_unique_per_row_and_uses_a_reserved_domain() {
-        let expr = replacement_expr(Strategy::Email, &text_col("email"), "TOK").unwrap();
+        let expr = replacement_expr(Strategy::Email, &text_col("email"), "TOK", false).unwrap();
         assert!(expr.contains("TOK"), "must vary per row: {expr}");
         assert!(
             expr.contains("@example.invalid"),
@@ -2280,7 +3709,7 @@ mod tests {
                 pg_type: "varchar(40)".to_owned(),
             },
         );
-        let expr = replacement_expr(Strategy::Email, &column, "TOK").unwrap();
+        let expr = replacement_expr(Strategy::Email, &column, "TOK", false).unwrap();
         // `scrubbed+` (9) + token + `@example.invalid` (16) must fit in 40.
         assert!(
             expr.contains("substr(TOK, 1, 15)"),
@@ -2296,7 +3725,7 @@ mod tests {
                 pg_type: "varchar(28)".to_owned(),
             },
         );
-        let err = replacement_expr(Strategy::Email, &column, "TOK")
+        let err = replacement_expr(Strategy::Email, &column, "TOK", false)
             .expect_err("a column too narrow for a unique fake must be refused");
         assert!(matches!(err, ScrubError::ColumnTooNarrow { .. }), "{err:?}");
     }
@@ -2399,8 +3828,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.tables.len(), 1, "one statement per table");
-        let sql = &plan.tables[0].sql;
-        assert!(sql.starts_with(r#"UPDATE "users" SET "#), "{sql}");
+        let sql = sql_of(&plan, "users");
+        assert!(sql.starts_with(r#"UPDATE "public"."users" SET "#), "{sql}");
         assert!(
             sql.contains(r#""bio" = CASE WHEN "bio" IS NULL THEN NULL ELSE"#),
             "a nullable column must keep its NULLs: {sql}"
@@ -2446,12 +3875,10 @@ mod tests {
             },
         );
         let plan = plan_for(&[t], &config, &empty_encrypted(), &no_anonymize()).unwrap();
+        let sql = sql_of(&plan, r#"we"ird"#);
         assert!(
-            plan.tables[0]
-                .sql
-                .starts_with(r#"UPDATE "we""ird" SET "na""me" = "#),
-            "{}",
-            plan.tables[0].sql
+            sql.starts_with(r#"UPDATE "public"."we""ird" SET "na""me" = "#),
+            "{sql}"
         );
     }
 
@@ -2603,7 +4030,7 @@ mod tests {
 
     #[test]
     fn a_strategy_that_cannot_produce_the_column_type_is_refused() {
-        let err = replacement_expr(Strategy::Uuid, &text_col("note"), "TOK")
+        let err = replacement_expr(Strategy::Uuid, &text_col("note"), "TOK", false)
             .expect_err("a uuid cannot be written into a text column");
         assert!(
             matches!(err, ScrubError::StrategyTypeMismatch { .. }),
@@ -2611,14 +4038,19 @@ mod tests {
         );
         assert!(
             matches!(
-                replacement_expr(Strategy::Zero, &text_col("note"), "TOK"),
+                replacement_expr(Strategy::Zero, &text_col("note"), "TOK", false),
                 Err(ScrubError::StrategyTypeMismatch { .. })
             ),
             "zero is meaningless for a text column"
         );
         assert!(
             matches!(
-                replacement_expr(Strategy::Epoch, &Column::new("n", ColumnType::Int64), "TOK"),
+                replacement_expr(
+                    Strategy::Epoch,
+                    &Column::new("n", ColumnType::Int64),
+                    "TOK",
+                    false
+                ),
                 Err(ScrubError::StrategyTypeMismatch { .. })
             ),
             "epoch is meaningless for an integer column"
@@ -2628,35 +4060,54 @@ mod tests {
     #[test]
     fn typed_strategies_render_their_casts() {
         assert_eq!(
-            replacement_expr(Strategy::Uuid, &Column::new("t", ColumnType::Uuid), "TOK").unwrap(),
+            replacement_expr(
+                Strategy::Uuid,
+                &Column::new("t", ColumnType::Uuid),
+                "TOK",
+                false
+            )
+            .unwrap(),
             "(TOK)::uuid"
         );
         assert_eq!(
-            replacement_expr(Strategy::Bytes, &Column::new("b", ColumnType::Bytes), "TOK").unwrap(),
+            replacement_expr(
+                Strategy::Bytes,
+                &Column::new("b", ColumnType::Bytes),
+                "TOK",
+                false
+            )
+            .unwrap(),
             "decode(TOK, 'hex')"
         );
         assert_eq!(
-            replacement_expr(Strategy::Zero, &Column::new("ok", ColumnType::Bool), "TOK").unwrap(),
+            replacement_expr(
+                Strategy::Zero,
+                &Column::new("ok", ColumnType::Bool),
+                "TOK",
+                false
+            )
+            .unwrap(),
             "false"
         );
         assert_eq!(
             replacement_expr(
                 Strategy::Epoch,
                 &Column::new("at", ColumnType::TimestampTz),
-                "TOK"
+                "TOK",
+                false
             )
             .unwrap(),
             "'1970-01-01 00:00:00+00'::timestamptz"
         );
         assert_eq!(
-            replacement_expr(Strategy::Null, &text_col("bio"), "TOK").unwrap(),
+            replacement_expr(Strategy::Null, &text_col("bio"), "TOK", false).unwrap(),
             "NULL"
         );
     }
 
     #[test]
     fn phone_produces_digits_and_refuses_a_column_that_cannot_hold_them() {
-        let expr = replacement_expr(Strategy::Phone, &text_col("phone"), "TOK").unwrap();
+        let expr = replacement_expr(Strategy::Phone, &text_col("phone"), "TOK", false).unwrap();
         assert!(
             expr.contains("translate("),
             "must map hex onto digits: {expr}"
@@ -2670,13 +4121,13 @@ mod tests {
             },
         );
         assert!(matches!(
-            replacement_expr(Strategy::Phone, &narrow, "TOK"),
+            replacement_expr(Strategy::Phone, &narrow, "TOK", false),
             Err(ScrubError::ColumnTooNarrow { .. })
         ));
     }
 
     #[test]
-    fn a_partial_unique_index_does_not_constrain_the_whole_column() {
+    fn a_partial_unique_index_still_constrains_the_rows_it_covers() {
         let mut t = users_table();
         t.columns[1].unique = false;
         let mut index = Index::new("idx_users_email", vec!["email".to_owned()], true);
@@ -2691,11 +4142,48 @@ mod tests {
             "#,
         )
         .unwrap();
-        // A partial unique index only constrains the rows matching its
-        // predicate, so it must not be treated as table-wide uniqueness.
-        let plan = plan_for(&[t], &config, &empty_encrypted(), &no_anonymize())
-            .expect("a partial unique index is not table-wide uniqueness");
-        assert!(plan.column("users", "email").is_some());
+        // A partial unique index does not satisfy a model `#[unique]` — but it
+        // absolutely does abort an UPDATE that writes one constant into every
+        // row its predicate matches, which is the only question a writer asks.
+        let err = plan_for(&[t], &config, &empty_encrypted(), &no_anonymize())
+            .expect_err("a partial unique index still constrains the rows it covers");
+        assert!(
+            matches!(err, ScrubError::NonUniqueStrategy { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_composite_unique_index_constrains_each_of_its_members() {
+        let mut t = Table::new("cards", Backend::Postgres);
+        t.primary_key = vec!["id".to_owned()];
+        t.columns = vec![
+            pk_col("id"),
+            Column::new("user_id", ColumnType::Int64),
+            Column::new("last4", ColumnType::Int32),
+        ];
+        let mut config = ScrubConfig::default();
+        config.defaults.safe_columns = vec!["id".to_owned(), "user_id".to_owned()];
+        config.tables.insert(
+            "cards".to_owned(),
+            TableRule {
+                safe: Vec::new(),
+                pii: BTreeMap::from([("last4".to_owned(), Strategy::Zero)]),
+            },
+        );
+        let facts = DatabaseFacts {
+            unique_columns: BTreeSet::from([
+                ("cards".to_owned(), "user_id".to_owned()),
+                ("cards".to_owned(), "last4".to_owned()),
+            ]),
+            ..DatabaseFacts::default()
+        };
+        let err = plan_with_facts(&[t], &config, &empty_encrypted(), &no_anonymize(), &facts)
+            .expect_err("a constant in one member of a composite unique key collides");
+        assert!(
+            matches!(err, ScrubError::NonUniqueStrategy { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

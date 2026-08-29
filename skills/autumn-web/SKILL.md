@@ -2441,13 +2441,26 @@ purge = ["api_tokens", "autumn_jobs", "autumn_sync_rows"]
 
 Strategies: `auto` (derived from the column type), `email`, `name`, `phone`,
 `redact`, `null`, `uuid`, `bytes`, `json`, `zero`, `epoch`. Each value derives
-from an `md5` over the row's primary key salted with the column name, so a
-`UNIQUE` column stays unique, two columns of one row never collide, and a re-run
-is idempotent. `NULL`s stay `NULL`; PII on a primary- or foreign-key column is
-refused outright (referential integrity survives); `null` is refused on `NOT
-NULL`; a constant-valued strategy is refused on a `UNIQUE` column; a
-`varchar(n)` bound narrows the token or refuses. Every target is classified
-before any is written, and each database's statements run in one transaction.
+from a hash over the row's primary key salted with the column name (`sha256` for
+a column that must stay unique), so a `UNIQUE` column stays unique, two columns
+of one row never collide, and a re-run is idempotent.
+
+`#[encrypted]` columns are **re-encrypted** under the target's own key (same
+deterministic/randomized mode as the model), never overwritten with a plain
+string — that would make every later read of the row fail as malformed
+ciphertext — so the scrub needs the target's `active_record_encryption`
+credentials and refuses before writing if they are missing.
+
+`NULL`s stay `NULL`. PII is refused on a primary key, on **either side** of any
+foreign key (composite components included), on `CHECK`-constrained columns, and
+on generated columns; `null` is refused on `NOT NULL` and under `NULLS NOT
+DISTINCT`; a constant-valued strategy is refused on any column in a unique index
+(partial and composite included); a `varchar(n)` bound narrows the token or
+refuses. Statements are `public`-qualified with a pinned `search_path` and the
+planned tables are locked; non-`public` schemas and RLS-enabled tables are
+refused rather than silently under-scrubbed; materialized views are refreshed in
+dependency order. Every target is classified before any is written, and each
+database's statements run in one transaction.
 
 `--check` classifies and writes nothing, exiting non-zero on any unclassified
 column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.

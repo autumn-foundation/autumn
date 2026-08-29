@@ -68,8 +68,15 @@ Autumn classifies columns from three sources, in precedence order.
 Two sources need **no declaration at all**:
 
 - **`#[encrypted]` model columns.** An at-rest-encrypted column is PII by
-  construction, so it is always scrubbed. A `safe` declaration may **not**
-  override it — that combination is an error.
+  construction, so it is always scrubbed — and it is **re-encrypted**, not
+  overwritten with a plain string: the replacement is a valid AEAD envelope
+  produced row by row under the target database's own key, in the same
+  (deterministic or randomized) mode the model declared. Writing plaintext there
+  would make every later repository read of that row fail as malformed
+  ciphertext, so a `safe` declaration may not override the classification and a
+  plaintext strategy is refused outright. `null` is accepted on a nullable
+  encrypted column. The scrub needs the target's `active_record_encryption`
+  credentials for this and refuses before writing anything if they are missing.
 - **Tables registered with the GDPR anonymize strategy** — a
   `GdprRegistry::register(ModelRegistration::anonymize("comments"))` call in your
   app classifies every non-key column of `comments` as PII. Because that is a
@@ -78,7 +85,13 @@ Two sources need **no declaration at all**:
   computed one is reported rather than silently ignored.
 
 Primary- and foreign-key columns are never claimed by the table-level
-inference: rewriting a key would break referential integrity.
+inference: rewriting a key would break referential integrity. Neither are
+generated columns, which Postgres refuses to `UPDATE` and which a scrub of their
+source columns already covers.
+
+`[defaults] safe_columns` is a cross-table convenience, not a per-column review,
+so it does **not** narrow a GDPR anonymize registration — only an explicit
+`[tables.<t>] safe` entry does.
 
 ### 2. What you declare
 
@@ -206,8 +219,11 @@ scrub should do behind a one-word config key. Schema bookkeeping
 | `json` | `{"scrubbed": true}` | ❌ |
 | `zero` | `0` / `false` | ❌ |
 | `epoch` | `1970-01-01T00:00:00Z` | ❌ |
+| `encrypted` | A valid ciphertext envelope (chosen automatically for `#[encrypted]` columns; not declarable) | ✅ |
 
-`<token>` is an `md5` over the row's primary key, salted with the column name.
+`<token>` is a hash over the row's primary key, salted with the column name —
+`md5` normally, and a wider `sha256` for a column that must stay unique, so a
+length-bounded `varchar(n)` still has room for enough entropy.
 That makes every replacement:
 
 - **deterministic** — the same row scrubs to the same value on every run, so
@@ -220,10 +236,15 @@ within the statement (so constraints hold), but not stable between runs.
 
 `auto` derives a strategy from the column's type: text columns whose name
 contains `email` get an address, other text is redacted, `uuid`/`bytea`/`jsonb`
-get type-matched fakes, numbers become `0`, booleans `false`, and timestamps the
-epoch. It refuses to guess for a closed-set (enum) or exotic Postgres type — a
-fabricated value would violate the column's `CHECK` — and asks for an explicit
-strategy instead.
+get type-matched fakes, numbers (including `smallint`, `numeric` and `money`)
+become `0`, booleans `false`, and timestamps — plus `date`, `time` and `timetz` —
+the epoch. It refuses to guess for a Postgres type outside that set rather than
+emit a statement that will fail.
+
+Every strategy is also checked against the column *before* anything is written:
+a text-shaped strategy on an `integer` or an `inet`, a `uuid` on a `text`
+column, or a `null` on a `NOT NULL` column is a plan-time refusal, never an
+apply-time error.
 
 ---
 
@@ -233,16 +254,29 @@ strategy instead.
   `dev`/`test` profile without `--force`, the same protocol as `autumn db drop`.
   As defence in depth, a scrub also refuses when the write target is the
   database an artifact's own (non-dev/test) profile *config file* declares.
+  That guard has its own waiver, `--allow-source-overwrite`, rather than riding
+  on `--force`: the staging drill always passes `--force`, so a guard `--force`
+  waived would be inert in exactly the workflow it exists for.
 - **A refusal writes nothing.** Classification completes before a single row is
   touched. The one exception is `--artifact`: the restore has to run before the
   scrub can read the schema it created, so a refusal *after* a restore leaves
   unscrubbed data in the target. The command says so in the loudest possible
   terms, and `autumn db scrub --check` catches an incomplete declaration before
   any restore happens — run it in CI.
-- **Constraints survive.** PII on a primary- or foreign-key column is refused
-  outright; `null` is refused on a `NOT NULL` column; a constant replacement is
-  refused on a `UNIQUE` column; and a `varchar(n)` bound narrows the generated
-  value (or refuses, rather than truncating into collisions).
+- **Constraints survive.** PII is refused outright on a primary key, on **either
+  side** of any foreign key (including every component of a composite one — so a
+  natural key another table references, like `users.email` ← `orders.user_email`,
+  is protected too), and on a `CHECK`-constrained column, where no fabricated
+  value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
+  column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
+  refused on any column covered by a unique index — composite and partial
+  included; and a `varchar(n)` bound narrows the generated token or refuses,
+  rather than truncating into collisions.
+- **Writes cannot be redirected.** Every statement is `public`-qualified and the
+  transaction pins `search_path`, so a role- or database-level tenant
+  `search_path` cannot send an `UPDATE` to a table nothing classified. The
+  planned tables are locked for the duration, so a row inserted between the
+  classification snapshot and the rewrite cannot slip through.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
@@ -255,16 +289,26 @@ strategy instead.
 
 ## Limits
 
-- **Postgres only.**
+- **Postgres only**, and the `public` schema only. A database with base tables
+  in another non-system schema is **refused** rather than reported clean over a
+  universe the classifier never looked at.
+- **Row-level security is refused.** A role that does not bypass RLS would update
+  only the rows its policies expose and report success — a silent partial scrub.
+  Connect as the table owner or a `BYPASSRLS` role.
+- **Triggers are warned about, not disabled.** An audit or history trigger can
+  copy the pre-scrub row into another table as the rewrite runs. The scrub names
+  the tables carrying user triggers; check or disable them on the copy.
+- **Materialized views are refreshed** (in dependency order) after the rewrite,
+  since they hold their own copy of whatever they selected.
+- **A key column holding PII can only be declared `safe`.** A natural key
+  (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
+  every row that references it, which this command does not do — so it is kept
+  verbatim and listed in the report. Restructure the schema or scrub it by hand.
 - **Full-copy only.** Row subsetting/sampling for very large databases is not
   supported — scrub the whole copy.
 - **Values are fake, not statistically faithful.** Replacements only need to be
   constraint-valid; there is no synthetic-data modelling or differential
   privacy.
-- **Composite `UNIQUE` indexes are your responsibility.** Single-column
-  uniqueness is checked at plan time; a multi-column unique index that a
-  constant-valued strategy would violate fails the transaction loudly (and rolls
-  back) rather than being caught up front.
 - **Framework-owned tables are not column-classified**, exactly as `autumn db
   pull` and `autumn schema pull` skip them. The scrub warns about the ones that
   carry app-supplied payloads and can empty them on request — see

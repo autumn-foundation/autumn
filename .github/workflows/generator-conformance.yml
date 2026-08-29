@@ -28,6 +28,13 @@ on:
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
       - "autumn-cli/tests/integration/scaffold_validation.rs"
+      # The `autumn db scrub` boot gate (#1602) lives in this workflow because
+      # it needs the diesel CLI and compiles a generated app. Without these
+      # paths a scrub-only change would run the ci.yml round-trip and skip the
+      # one test that proves the scrubbed database still boots an app.
+      - "autumn-cli/src/db/**"
+      - "autumn-cli/src/schema/**"
+      - "autumn-cli/tests/integration/db_scrub.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -47,6 +54,13 @@ on:
       - "autumn-cli/tests/generate.rs"
       - "autumn-cli/tests/integration/console.rs"
       - "autumn-cli/tests/integration/scaffold_validation.rs"
+      # The `autumn db scrub` boot gate (#1602) lives in this workflow because
+      # it needs the diesel CLI and compiles a generated app. Without these
+      # paths a scrub-only change would run the ci.yml round-trip and skip the
+      # one test that proves the scrubbed database still boots an app.
+      - "autumn-cli/src/db/**"
+      - "autumn-cli/src/schema/**"
+      - "autumn-cli/tests/integration/db_scrub.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -490,9 +504,15 @@ jobs:
       # The scrub gate below drives `autumn db backup`, which shells out to the
       # HOST pg_dump/pg_restore; ubuntu-latest does not guarantee them on PATH.
       - name: Install Postgres client tools
+        # Guarded: this job can route to the self-hosted runner, where
+        # `pg_dump` is already present and passwordless apt may not be — an
+        # unconditional install would take the four pre-existing gates in this
+        # job down with it.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          if ! command -v pg_dump >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
           pg_dump --version
 
       - name: generated_scaffold_serves_posts_index_and_json_api
