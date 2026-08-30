@@ -113,10 +113,21 @@ helpers do not cover, read the state yourself:
 | `form.errors_for("title")` | this field's error messages |
 | `form.is_valid()` | whether the changeset has any errors at all |
 
-The free functions in `autumn_web::form` cover the rest of the control types —
+The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
-`date_input`, `datetime_input`, `select_input`, and a `required_*` variant of
-each that adds the HTML5 constraint attributes.
+`date_input`, `datetime_input`, and `select_input`.
+
+A `required_*` variant — one that adds the HTML5 constraint attributes for you —
+exists for **some but not all** of them:
+
+| Has a `required_*` variant | Does not |
+|---|---|
+| `text_input`, `number_input`, `date_input`, `datetime_input`, `select_input`, `rich_text_area` | `password_input`, `textarea_input`, `checkbox_input` |
+
+For the three without one, set the attribute yourself in the markup. Server-side
+validation is unaffected either way: `required_*` only writes the client-side
+hint, and `#[validate(presence)]` on the model is what actually rejects a blank
+submission.
 
 ### Rendering a whole form in one call
 

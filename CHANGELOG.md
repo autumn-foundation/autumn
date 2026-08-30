@@ -407,10 +407,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `docs/guide/forms.md` — the changeset round-trip end to end: `ChangesetForm`
     and why a rejected submission is *data* rather than an error, `Valid<T>` /
     `Validated<T>` / `ValidateExt` for callers that are programs, model-level
-    `#[validate(...)]` and the merged-model rule that makes it hold on updates,
+    `#[validate(...)]` and the merged-model rule that makes it hold on updates
+    **where it applies** — a repository with hooks or `validate_on_update =
+    fetch` validates the merged model, while a plain generated repository takes
+    the blind-update path and runs no model validation at all — plus
     `#[normalize(trim, downcase, upcase, squish, with = …)]` and exactly where
     it runs on the write path (before validation, before hooks, and on derived
-    finders), CSRF, `form_for`, htmx inline validation and the no-JavaScript
+    finders) **and where it does not**: both update paths persist the raw
+    patch, so a direct `repo.update(...)` writes unnormalized values. CSRF,
+    `form_for`, htmx inline validation and the no-JavaScript
     fallback that costs nothing to keep, accessible fields, and how to test the
     failure path. This was the last core-surface subsystem documented only
     obliquely.
