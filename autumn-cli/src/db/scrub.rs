@@ -2359,6 +2359,29 @@ fn probe_connection(url: &str, label: &str, what: &str) -> Result<PgConnection, 
     })
 }
 
+/// Whether a system catalog has a given column on this server.
+///
+/// The catalog grows with each Postgres release — `attgenerated` arrives in 12,
+/// `indnkeyatts` in 11, `indnullsnotdistinct` in 15 — and a scrub that only ran
+/// on the newest server would be useless. Each version-specific fact is probed
+/// for first and degrades to "no such thing on this server", which is the
+/// correct answer: a release without generated columns has none to skip.
+fn has_catalog_column(
+    conn: &mut PgConnection,
+    relation: &str,
+    column: &str,
+) -> Result<bool, ScrubError> {
+    let rows: Vec<NameRow> = sql_query(format!(
+        "SELECT 'yes' AS name FROM pg_attribute \
+         WHERE attrelid = {}::regclass AND attname = {} AND NOT attisdropped",
+        quote_literal(relation),
+        quote_literal(column)
+    ))
+    .load(conn)
+    .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    Ok(!rows.is_empty())
+}
+
 /// Gather every catalog fact the plan validation needs.
 // One catalog read per fact; splitting it would scatter closely-related SQL
 // across helpers that each need the same connection.
@@ -2411,18 +2434,29 @@ fn probe_database_facts(
     );
 
     // ── Generated / identity-always columns ─────────────────────────────────
-    let generated_columns = pair_set(
-        sql_query(
-            "SELECT rel.relname AS tbl, att.attname AS col \
-             FROM pg_attribute att \
-             JOIN pg_class rel ON rel.oid = att.attrelid \
-             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE att.attnum > 0 AND NOT att.attisdropped \
-             AND (att.attgenerated <> '' OR att.attidentity = 'a')",
+    let mut generated_predicates: Vec<&str> = Vec::new();
+    if has_catalog_column(&mut conn, "pg_attribute", "attgenerated")? {
+        generated_predicates.push("att.attgenerated <> ''");
+    }
+    if has_catalog_column(&mut conn, "pg_attribute", "attidentity")? {
+        generated_predicates.push("att.attidentity = 'a'");
+    }
+    let generated_columns = if generated_predicates.is_empty() {
+        BTreeSet::new()
+    } else {
+        pair_set(
+            sql_query(format!(
+                "SELECT rel.relname AS tbl, att.attname AS col \
+                 FROM pg_attribute att \
+                 JOIN pg_class rel ON rel.oid = att.attrelid \
+                 JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+                 WHERE att.attnum > 0 AND NOT att.attisdropped AND ({})",
+                generated_predicates.join(" OR ")
+            ))
+            .load(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?,
         )
-        .load(&mut conn)
-        .map_err(|e| ScrubError::Sql(e.to_string()))?,
-    );
+    };
 
     // ── Uniqueness, the write-side question ─────────────────────────────────
     // ANY unique index counts (composite and partial included): the IR's
@@ -2432,16 +2466,23 @@ fn probe_database_facts(
     // with `= ANY(...)` rather than `unnest`. The `[0:indnkeyatts-1]` slice is
     // the KEY columns only — a covering index's `INCLUDE` columns carry no
     // uniqueness and must not be treated as constrained.
+    // Covering indexes (`INCLUDE`) arrived with `indnkeyatts` in Postgres 11; on
+    // an older server every `indkey` entry IS a key column.
+    let key_slice = if has_catalog_column(&mut conn, "pg_index", "indnkeyatts")? {
+        "i.indkey[0:i.indnkeyatts-1]"
+    } else {
+        "i.indkey"
+    };
     let unique_columns = pair_set(
-        sql_query(
+        sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
              JOIN pg_class rel ON rel.oid = i.indrelid \
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
              JOIN pg_attribute att ON att.attrelid = rel.oid \
-             AND att.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) \
-             WHERE i.indisunique AND att.attnum > 0",
-        )
+             AND att.attnum = ANY({key_slice}) \
+             WHERE i.indisunique AND att.attnum > 0"
+        ))
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
@@ -2450,29 +2491,24 @@ fn probe_database_facts(
     // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
     // exist before 15; probe the column's presence first so this stays
     // compatible with older servers.
-    let has_nnd: Vec<NameRow> = sql_query(
-        "SELECT 'yes' AS name FROM pg_attribute \
-         WHERE attrelid = 'pg_index'::regclass AND attname = 'indnullsnotdistinct'",
-    )
-    .load(&mut conn)
-    .map_err(|e| ScrubError::Sql(e.to_string()))?;
-    let nulls_not_distinct_columns = if has_nnd.is_empty() {
-        BTreeSet::new()
-    } else {
-        pair_set(
-            sql_query(
-                "SELECT rel.relname AS tbl, att.attname AS col \
+    let nulls_not_distinct_columns =
+        if has_catalog_column(&mut conn, "pg_index", "indnullsnotdistinct")? {
+            pair_set(
+                sql_query(format!(
+                    "SELECT rel.relname AS tbl, att.attname AS col \
                  FROM pg_index i \
                  JOIN pg_class rel ON rel.oid = i.indrelid \
                  JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
                  JOIN pg_attribute att ON att.attrelid = rel.oid \
-                 AND att.attnum = ANY(i.indkey[0:i.indnkeyatts-1]) \
-                 WHERE i.indisunique AND i.indnullsnotdistinct AND att.attnum > 0",
+                 AND att.attnum = ANY({key_slice}) \
+                 WHERE i.indisunique AND i.indnullsnotdistinct AND att.attnum > 0"
+                ))
+                .load(&mut conn)
+                .map_err(|e| ScrubError::Sql(e.to_string()))?,
             )
-            .load(&mut conn)
-            .map_err(|e| ScrubError::Sql(e.to_string()))?,
-        )
-    };
+        } else {
+            BTreeSet::new()
+        };
 
     // ── Table-level facts ───────────────────────────────────────────────────
     let names = |q: &str, conn: &mut PgConnection| -> Result<Vec<String>, ScrubError> {
@@ -2482,14 +2518,18 @@ fn probe_database_facts(
         Ok(rows.into_iter().map(|r| r.name).collect())
     };
 
-    let partitions = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relispartition",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    let partitions = if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
+        names(
+            "SELECT rel.relname AS name FROM pg_class rel \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relispartition",
+            &mut conn,
+        )?
+        .into_iter()
+        .collect()
+    } else {
+        BTreeSet::new()
+    };
 
     let rls_tables = names(
         "SELECT rel.relname AS name FROM pg_class rel \
