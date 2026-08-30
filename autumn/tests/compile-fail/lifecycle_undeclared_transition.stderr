@@ -12,4 +12,5 @@ error[E0599]: no method named `to_delivered` found for struct `Machine<order_sta
 28 |       let _ = order_state::Machine::start().to_delivered();
    |                                             ^^^^^^^^^^^^ method not found in `Machine<order_state::Pending>`
    |
-   = note: the method was found for `Machine<Shipped>`
+   = note: the method was found for
+           - `Machine<Shipped>`
