@@ -759,32 +759,39 @@ fn newest_run_dir(profile_root: &Path) -> PathBuf {
 // ─── AC #4: the app boots against the scrubbed database ─────────────────────
 
 /// RAII guard that kills the child server on drop (even on test failure).
-struct ServerGuard(std::process::Child);
+/// A running app plus the files its output is redirected to.
+struct ServerGuard {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
 
 impl ServerGuard {
-    /// Whatever the child has written so far, for a failure message. Reading
-    /// the pipes also keeps a chatty app from blocking on a full buffer.
+    /// Everything the app has written, for a failure message.
+    ///
+    /// The output goes to FILES rather than pipes, which is load-bearing rather
+    /// than incidental. Reading a pipe with `read_to_string` blocks until EOF,
+    /// and EOF arrives only once every writer has closed it. A healthy server
+    /// never closes its pipes, so draining one would block until the workflow's
+    /// 90-minute timeout — the success path would hang instead of passing,
+    /// which is precisely the path this test exists to prove. The failure paths
+    /// hid it: a child that already died has reached EOF, so the read returns.
+    ///
+    /// Killing the child first is not enough either. The app is spawned through
+    /// `cargo run`, so the server is a GRANDchild that inherits these handles:
+    /// killing `cargo` leaves the server holding the pipe open. Files sidestep
+    /// the whole question — no EOF to wait for, no pipe buffer to fill, and the
+    /// output survives however the process tree happens to die.
     fn drain(&mut self) -> String {
-        use std::io::Read as _;
-        let mut out = String::new();
-        if let Some(stdout) = self.0.stdout.as_mut() {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
-            out.push_str(&buf);
-        }
-        if let Some(stderr) = self.0.stderr.as_mut() {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            out.push_str(&buf);
-        }
-        out
+        let read = |path: &PathBuf| std::fs::read_to_string(path).unwrap_or_default();
+        format!("{}{}", read(&self.stdout), read(&self.stderr))
     }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -896,16 +903,26 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         listener.local_addr().unwrap().port()
     };
+    let stdout_path = project.join("app-stdout.log");
+    let stderr_path = project.join("app-stderr.log");
     let child = Command::new("cargo")
         .args(["run"])
         .current_dir(&project)
         .env("AUTUMN_SERVER__PORT", app_port.to_string())
         .env("AUTUMN_DATABASE__URL", &url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(
+            std::fs::File::create(&stdout_path).expect("create the app stdout log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&stderr_path).expect("create the app stderr log"),
+        ))
         .spawn()
         .expect("spawn the generated app");
-    let mut guard = ServerGuard(child);
+    let mut guard = ServerGuard {
+        child,
+        stdout: stdout_path,
+        stderr: stderr_path,
+    };
 
     let base = format!("http://127.0.0.1:{app_port}");
     let client_http = reqwest::Client::new();
@@ -913,7 +930,7 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
     for _ in 0..60 {
         // A child that died at boot must fail fast with ITS OWN output, not
         // after 30 s of silence.
-        if let Some(exit) = guard.0.try_wait().expect("poll the app process") {
+        if let Some(exit) = guard.child.try_wait().expect("poll the app process") {
             let output = guard.drain();
             panic!("the generated app exited before serving: {exit}\n{output}");
         }
