@@ -214,8 +214,8 @@ pub fn gdpr_registry() -> GdprRegistry {
 /// incidental setup, and it goes through the same `autumn credentials edit`
 /// an operator would use rather than reaching past the CLI.
 ///
-/// Both profiles get a key: the tests that exercise the production-profile
-/// refusal must fail on THAT guard, not on a missing key.
+/// Every profile the tests drive gets a key, so a test that exercises the
+/// production-profile refusal fails on THAT guard rather than on a missing key.
 fn write_encryption_credentials(dir: &Path) {
     let editor = dir.join("fixture-editor.sh");
     std::fs::write(
@@ -233,7 +233,12 @@ fn write_encryption_credentials(dir: &Path) {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    for profile in ["dev", "production"] {
+    // Every profile the tests actually drive, not the ones that sound right:
+    // `AUTUMN_ENV=prod` is what the production-refusal test sets, and `dev` is
+    // the CLI's default when no profile is given. Provisioning "production"
+    // instead of "prod" left the `--force` leg of that test failing on a
+    // missing key rather than exercising the guard it exists to check.
+    for profile in ["dev", "test", "prod", "production"] {
         let output = Command::new(autumn_bin())
             .args(["credentials", "edit", "--env", profile])
             .current_dir(dir)
@@ -330,8 +335,16 @@ async fn scrub_round_trip_leaves_zero_original_values() {
 
     // ── Two databases: the "production" source and the staging target ───────
     let admin = connect(&admin_url).await;
+    // One statement per call, deliberately: `batch_execute` uses the simple
+    // query protocol, and Postgres wraps a MULTI-statement simple query in an
+    // implicit transaction block — where `CREATE DATABASE` is rejected with
+    // `25001 PreventInTransactionBlock`. Sent singly, each runs outside one.
     admin
-        .batch_execute("CREATE DATABASE scrub_source; CREATE DATABASE scrub_staging;")
+        .batch_execute("CREATE DATABASE scrub_source")
+        .await
+        .unwrap();
+    admin
+        .batch_execute("CREATE DATABASE scrub_staging")
         .await
         .unwrap();
 
