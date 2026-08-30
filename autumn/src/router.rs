@@ -1351,11 +1351,28 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
         claimed.insert(config.health.ready_path.clone());
         claimed.insert(config.health.startup_path.clone());
     }
+    // Some entries in `actuator_endpoint_paths` exist only to seed the runtime
+    // startup-barrier allow-list (#1627) and are actually mounted with a
+    // mutating method — `/webhooks/replay` is a POST. Claiming those as GETs
+    // refuses a plugin's GET at a path where GET and the framework's POST
+    // merge cleanly. `route_listing` already subtracts them for the same
+    // reason; the two lists must agree or one refuses what the other permits.
+    let actuator_mutating = crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    );
+    let mutating_paths: std::collections::HashSet<&str> = actuator_mutating
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
     for path in crate::actuator::actuator_endpoint_paths(
         &config.actuator.prefix,
         config.actuator.sensitive,
         config.actuator.prometheus,
     ) {
+        if mutating_paths.contains(path.as_str()) {
+            continue;
+        }
         claimed.insert(path);
     }
     #[cfg(feature = "htmx")]
@@ -1969,6 +1986,13 @@ fn reject_declared_framework_collisions(
     // (the framework has yielded it), so this only fires where the framework
     // really mounts.
     let framework_get_paths = collect_framework_get_paths(config);
+    // The framework's mutating mounts, carrying their real methods. The GET
+    // claim set deliberately excludes these paths, so without this pass a
+    // declared PUT or POST at one of them is compared against nothing.
+    let actuator_mutating_routes = crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    );
     for declared in declared_routes {
         // Namespaces first, and for EVERY method: `/static` and `/_autumn` are
         // owned wholesale, so a declared route anywhere beneath them is refused
@@ -1984,6 +2008,26 @@ fn reject_declared_framework_collisions(
                 existing: format!("autumn framework namespace {namespace}"),
                 incoming: declared.handler.clone(),
             });
+        }
+        // The framework mounts non-GET routes too, and only GET was ever
+        // compared — so a manifest declaring `PUT {prefix}/loggers/{name}`
+        // passed this check and panicked at the nest, because the actuator
+        // mounts exactly that. These carry their real method, so the
+        // comparison is method-aware rather than GET-shaped.
+        for (framework_method, framework_path) in &actuator_mutating_routes {
+            if !declared.method.eq_ignore_ascii_case(framework_method) {
+                continue;
+            }
+            if framework_path == &declared.path
+                || paths_conflict_under_matchit(framework_path, &declared.path)
+            {
+                return Err(RouterBuildError::DuplicateUserRoute {
+                    method: (*framework_method).to_owned(),
+                    path: declared.path.clone(),
+                    existing: format!("autumn framework route {framework_path}"),
+                    incoming: declared.handler.clone(),
+                });
+            }
         }
         let is_get = declared.method.eq_ignore_ascii_case("GET")
             || declared.method.eq_ignore_ascii_case("WS");
@@ -10029,6 +10073,61 @@ enabled = true
             }
             other => panic!("expected the framework-path refusal, got {other:?}"),
         }
+    }
+
+    /// The framework mounts non-GET routes too, and only GET was compared.
+    ///
+    /// With sensitive actuator endpoints on, `PUT {prefix}/loggers/{name}` is
+    /// a real mount — so a manifest declaring it passed the preflight and
+    /// panicked at `Router::nest`, which is the whole class this check exists
+    /// to close.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_plugin_route_on_a_framework_mutating_path() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let loggers =
+            crate::actuator::actuator_route_path(&config.actuator.prefix, "/loggers/{name}");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("PUT", &loggers, "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a declared PUT at the actuator's own PUT must be refused");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref existing,
+                ..
+            } => {
+                assert_eq!(method, "PUT", "the refusal must name the real method");
+                assert!(
+                    existing.contains(&loggers),
+                    "the refusal must name the framework route; got: {existing}"
+                );
+            }
+            other => panic!("expected the framework mutating-route refusal, got {other:?}"),
+        }
+    }
+
+    /// The other direction: a path the framework mounts only as POST must not
+    /// be claimed as a GET.
+    ///
+    /// `{prefix}/webhooks/replay` is in `actuator_endpoint_paths` solely to
+    /// seed the startup barrier (#1627), and it is mounted POST-only. GET and
+    /// that POST merge into one `MethodRouter` cleanly, so refusing a declared
+    /// GET there rejects a mount axum accepts — the failure mode this check
+    /// has to avoid as much as the panic it prevents.
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn try_build_router_allows_a_declared_get_at_a_post_only_framework_path() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let replay =
+            crate::actuator::actuator_route_path(&config.actuator.prefix, "/webhooks/replay");
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("GET", &replay, "honest-plugin")];
+        assert!(
+            super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).is_ok(),
+            "a GET at a POST-only framework path merges cleanly and must be allowed"
+        );
     }
 
     /// A framework path that carries a capture conflicts with a differently
