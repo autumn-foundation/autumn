@@ -40,7 +40,7 @@ pub fn run(opts: &ManifestOptions<'_>) {
         // `AUTUMN_DUMP_JOBS` in `AppBuilder::run`: one left over in the
         // CLI's own environment would answer this command with the
         // data-flow manifest instead of the jobs one.
-        .env_remove("AUTUMN_DUMP_DATA_FLOW")
+        .env_remove(crate::data_flow::DUMP_ENV)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()

@@ -27,6 +27,15 @@ use autumn_web::classify::manifest::{DataFlowManifest, parse_manifest_dump};
 
 use crate::routes;
 
+/// The env var selecting the app binary's data-flow dump mode.
+///
+/// Named rather than spelled out at each site because it is set in one place
+/// and must be *cleared* in every other place that spawns the app binary:
+/// `AppBuilder::run` dispatches this mode before the jobs, task, migrate,
+/// retention and replay one-shots and before the server binds a listener, so
+/// an inherited value silently wins over whatever was actually asked for.
+pub const DUMP_ENV: &str = "AUTUMN_DUMP_DATA_FLOW";
+
 /// Options controlling `autumn data-flow`.
 pub struct DataFlowOptions<'a> {
     /// Cargo package to build and run.
@@ -157,7 +166,7 @@ pub fn run(opts: &DataFlowOptions<'_>) {
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, opts.release);
 
     let output = Command::new(&binary)
-        .env("AUTUMN_DUMP_DATA_FLOW", "1")
+        .env(DUMP_ENV, "1")
         // All three are checked BEFORE the data-flow dump in `AppBuilder::run`,
         // so an exported one in the ambient environment would silently win and
         // hand us a marker-less stdout.
