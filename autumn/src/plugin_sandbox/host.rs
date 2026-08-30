@@ -64,6 +64,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use tokio::sync::Semaphore;
 use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::artifact::SandboxArtifact;
@@ -358,6 +359,12 @@ pub enum SandboxFailure {
         /// The ceiling it blew through.
         max: usize,
     },
+    /// The plugin already has `max_concurrency` requests executing, so this
+    /// one was not started.
+    AtCapacity {
+        /// The ceiling it ran into.
+        max: usize,
+    },
     /// The request handed to [`SandboxHost::run`] carried a body over the
     /// manifest's declared ceiling. The guest was never started.
     RequestBudget {
@@ -384,6 +391,7 @@ impl SandboxFailure {
                 http::StatusCode::GATEWAY_TIMEOUT
             }
             Self::RequestBudget { .. } => http::StatusCode::PAYLOAD_TOO_LARGE,
+            Self::AtCapacity { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             _ => http::StatusCode::BAD_GATEWAY,
         }
     }
@@ -417,6 +425,10 @@ impl fmt::Display for SandboxFailure {
             Self::OutputBudget { max } => write!(
                 f,
                 "the plugin wrote more than its {max}-byte response ceiling without ending a frame"
+            ),
+            Self::AtCapacity { max } => write!(
+                f,
+                "the plugin already has its {max} permitted requests executing"
             ),
             Self::RequestBudget { max, len } => write!(
                 f,
@@ -558,6 +570,21 @@ impl SandboxOutcome {
 pub struct SandboxHost {
     engine: Engine,
     module: Module,
+    /// One permit per concurrently-executing request.
+    ///
+    /// `SandboxedPlugin::serve` has a semaphore of its own, which it holds
+    /// across the body read as well as the run, so the declared footprint
+    /// bounds the whole request rather than only the part a guest is running.
+    /// This one is narrower and lives here because [`run`](SandboxHost::run)
+    /// is public: an embedder calling it directly never passes through
+    /// `serve`, and `request_footprint_bytes() × max_concurrency` is the
+    /// premise the manifest validator accepts limits on.
+    ///
+    /// The two never fight. At most `max_concurrency` requests are in `serve`
+    /// at once, so they can hold at most that many of these — this semaphore
+    /// is only ever the binding constraint on a direct caller, which is the
+    /// one it exists for.
+    permits: Semaphore,
     /// What one instantiation of this module costs, in fuel. Bounded at load by
     /// [`MAX_INIT_SEGMENTS`] and [`MAX_INIT_SECTION_BYTES`]; charged per request
     /// so the declared CPU ceiling prices it — see [`SandboxHost::run`].
@@ -681,6 +708,7 @@ impl SandboxHost {
         Ok(Self {
             engine,
             module,
+            permits: Semaphore::new(manifest.limits.max_concurrency),
             instantiation_fuel: instantiation_fuel(segments, init_bytes),
             manifest,
         })
@@ -763,6 +791,24 @@ impl SandboxHost {
                 0,
             );
         }
+
+        // Admission, before a single buffer is built. `serve` holds a permit of
+        // its own across the whole request, so this is never what stops an
+        // ordinary HTTP request — it is here for the embedder who calls this
+        // public method directly and would otherwise start as many instances
+        // as it liked, against a footprint the manifest validator accepted on
+        // the premise that `max_concurrency` bounds them.
+        //
+        // Held for the body of the run: dropping the guard on the way out is
+        // what makes the permit mean "executing now".
+        let Ok(_permit) = self.permits.try_acquire() else {
+            return SandboxOutcome::refused(
+                SandboxFailure::AtCapacity {
+                    max: limits.max_concurrency,
+                },
+                0,
+            );
+        };
 
         // Building the guest's stdin is host work proportional to the request:
         // the body is cloned into the frame and base64-expanded into the NDJSON
@@ -909,9 +955,16 @@ fn finish(
         Ok(response) => {
             let (response, denied) = response.sanitize();
             for name in denied {
+                // The name is the guest's, so it is as long and as hostile as
+                // the guest cares to make it — bounded only by the stdout line
+                // ceiling. `deny` clones it into the ledger and logs it, and a
+                // name is not validated before it gets here (that it is invalid
+                // is often *why* it was denied), so it can carry newlines and
+                // terminal escapes too. Same treatment as every other
+                // guest-influenced string that reaches a log.
                 state.deny(
                     DeniedCapability::ResponseHeader,
-                    &name,
+                    &guest_text(&name),
                     "a sandboxed plugin may not set this response header",
                 );
             }
@@ -2910,6 +2963,47 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn a_denied_response_header_name_is_bounded_before_it_is_logged() {
+        // The sibling of the content-type cap, on the header *name* rather
+        // than its value. A denied name is often denied precisely because it
+        // is not a valid header name, so it can carry newlines and escapes as
+        // well as megabytes — and `deny` both stores it and logs it.
+        let name = "x-".to_owned() + &"y".repeat(20_000);
+        let frame = format!(
+            r#"{{"op":"response","status":200,"headers":[["content-type","text/plain"],["{name}","v"]],"body_b64":""}}"#
+        );
+        let len = frame.len() + 1;
+        let wat = format!(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 1024) "{escaped}\0a")
+  (func (export "_start")
+    (i32.store (i32.const 0) (i32.const 1024))
+    (i32.store (i32.const 4) (i32.const {len}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
+            escaped = frame.replace('"', "\\\""),
+        );
+
+        let outcome = host(&wat).run(&get("/hello/greet"));
+        let logged = outcome
+            .denials
+            .iter()
+            .find(|denial| denial.capability == DeniedCapability::ResponseHeader)
+            .expect("the stripped header is recorded as a denial");
+        assert!(
+            logged.operation.len() < 1_024,
+            "the denial carries the guest's whole header name: {} bytes",
+            logged.operation.len()
+        );
+        assert!(
+            logged.operation.contains("truncated"),
+            "{:?}",
+            logged.operation
+        );
+    }
+
+    #[test]
     fn a_refused_content_type_is_bounded_before_it_is_logged() {
         // `refused_content_type` takes everything before the first `;`, so a
         // guest that writes no parameter hands back its entire header value —
@@ -3032,6 +3126,43 @@ path = "/hello/greet"
             outcome.fuel_used >= 200_000 / BYTES_PER_FUEL,
             "the encoding was not charged: {} units",
             outcome.fuel_used
+        );
+    }
+
+    #[test]
+    fn a_direct_caller_cannot_start_more_instances_than_the_manifest_allows() {
+        // `SandboxedPlugin::serve` has a semaphore of its own, so HTTP traffic
+        // is bounded. `run` is public, though, and an embedder calling it
+        // directly used to bypass admission entirely — while the manifest
+        // validator accepts limits on the premise that
+        // `request_footprint_bytes() × max_concurrency` bounds the plugin.
+        let host = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                max_concurrency: 1,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect("the fixture loads");
+
+        // Hold the only permit, exactly as an in-flight request would, rather
+        // than racing a real one: the property is the admission, not the race.
+        let held = host
+            .permits
+            .try_acquire()
+            .expect("the first permit is free");
+        assert_eq!(
+            host.run(&get("/hello/greet")).result,
+            Err(SandboxFailure::AtCapacity { max: 1 }),
+            "a second concurrent run was admitted past max_concurrency = 1"
+        );
+
+        // And the permit comes back: the ceiling is on requests executing at
+        // once, not a budget the plugin spends down.
+        drop(held);
+        assert!(
+            host.run(&get("/hello/greet")).result.is_ok(),
+            "the permit was not returned when the run finished"
         );
     }
 
