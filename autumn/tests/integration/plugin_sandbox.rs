@@ -157,6 +157,73 @@ async fn host_greet() -> &'static str {
     "the host already serves this"
 }
 
+/// Two artifacts naming the same prefix must not abort the application at boot.
+///
+/// This is the case no route-level check can see. `mount_raw_routers` gives
+/// every nested router a fallback before mounting it, and axum cannot merge two
+/// method routers that both have one — so the second nest at a prefix the first
+/// already owns panics with "Cannot merge two `MethodRouter`s that both have a
+/// fallback". The declared routes here are deliberately *disjoint*, so the
+/// duplicate-route preflight finds nothing to complain about: the collision is
+/// between the mounts, not between the routes.
+///
+/// A third-party artifact picking a plausible prefix is the likely case, not an
+/// exotic one, and two of them picking the same plausible prefix is what this
+/// covers.
+#[test]
+fn two_plugins_sharing_a_prefix_are_refused_not_a_boot_panic() {
+    let manifest_for = |name: &str, path: &str| {
+        format!(
+            r#"
+name = "{name}"
+version = "0.1.0"
+wire_version = 1
+prefix = "{PREFIX}"
+capabilities = ["http-request"]
+sha256 = "{digest}"
+
+[[routes]]
+method = "GET"
+path = "{path}"
+"#,
+            digest = "a".repeat(64)
+        )
+    };
+    let load = |name: &str, path: &str| {
+        let manifest = SandboxManifest::parse(&manifest_for(name, path)).expect("valid manifest");
+        let module = wat::parse_str(guests::HELLO).expect("valid WAT");
+        let artifact = SandboxArtifact::seal(manifest, module).expect("seals");
+        SandboxedPlugin::from_artifact(&artifact).expect("loads")
+    };
+
+    let outcome = std::panic::catch_unwind(|| {
+        let _ = autumn_web::test::TestApp::new()
+            .plugin(load("autumn-plugin-hello", "/hello/greet"))
+            .plugin(load("autumn-plugin-other", "/hello/other"))
+            .build();
+    });
+    let failure = outcome.expect_err("two plugins at one prefix must not mount");
+    let message = failure
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| failure.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+
+    assert!(
+        message.contains("DuplicateNestPrefix"),
+        "expected the structured refusal; got: {message}"
+    );
+    assert!(
+        !message.contains("Cannot merge two"),
+        "the axum mount panic escaped the preflight; got: {message}"
+    );
+    // The operator has to learn which prefix, and which artifacts want it.
+    assert!(
+        message.contains(PREFIX) && message.contains("autumn-plugin-other"),
+        "the refusal must name the prefix and the artifacts; got: {message}"
+    );
+}
+
 /// An untrusted artifact must not be able to abort the application at boot.
 ///
 /// The manifest is the mount, and `axum::Router::nest` panics with "Overlapping

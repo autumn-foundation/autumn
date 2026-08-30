@@ -146,6 +146,30 @@ pub enum RouterBuildError {
         /// the collision.
         incoming: String,
     },
+    /// Two routers were registered at the SAME nest prefix via
+    /// [`AppBuilder::nest`](crate::app::AppBuilder::nest).
+    ///
+    /// Every nested router is given a fallback before it is mounted
+    /// (`mount_raw_routers`), and axum cannot merge two method routers that
+    /// both have one — nesting the second at a prefix the first already owns
+    /// panics with *"Cannot merge two `MethodRouter`s that both have a
+    /// fallback"* while the router is built.
+    ///
+    /// The declared-route preflight cannot catch this: two sandboxed plugins
+    /// sharing a prefix while declaring *disjoint* routes have no route
+    /// collision at all, and are accepted right up until the second nest
+    /// panics. A prefix is therefore owned by whoever nests at it first.
+    #[error(
+        "two routers are nested at {prefix:?} ({owners}); axum gives each nested router a fallback \
+         and cannot merge two that both have one, so the second panics at startup — give each \
+         router its own prefix"
+    )]
+    DuplicateNestPrefix {
+        /// The prefix both routers were nested at.
+        prefix: String,
+        /// Who claims the prefix, as far as the declared routes reveal.
+        owners: String,
+    },
     /// Two user- or plugin-registered routes normalize to the SAME Axum path
     /// shape but use DIFFERENT exact path templates — e.g. their capture names
     /// differ (`/users/{id}` vs `/users/{slug}`) or a normal capture meets a
@@ -1856,6 +1880,36 @@ fn reject_duplicate_user_routes(
              routers on disjoint paths from your `.routes()`/`.scoped()` registrations."
         );
     }
+    // Two routers at one prefix is a startup panic no route-level check can
+    // see: sandboxed plugins sharing a prefix while declaring disjoint routes
+    // collide nowhere in the route table, and axum still refuses the second
+    // nest because both carry a fallback. Caught here so an unaudited artifact
+    // cannot abort boot by naming a prefix another plugin already took.
+    let mut nested_at: std::collections::HashMap<&str, ()> = std::collections::HashMap::new();
+    for (prefix, _) in nest_routers {
+        if nested_at.insert(prefix.as_str(), ()).is_some() {
+            // Declared routes are the only attribution available — a raw
+            // nested router is anonymous — so name whoever we can and say so
+            // when we cannot.
+            let mut owners: Vec<&str> = declared_routes
+                .iter()
+                .filter(|declared| declared.path.starts_with(prefix.as_str()))
+                .map(|declared| declared.handler.as_str())
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            let owners = if owners.is_empty() {
+                "two undeclared nested routers".to_owned()
+            } else {
+                owners.join(", ")
+            };
+            return Err(RouterBuildError::DuplicateNestPrefix {
+                prefix: prefix.clone(),
+                owners,
+            });
+        }
+    }
+
     if !nest_routers.is_empty() {
         tracing::warn!(
             nested_routers = nest_routers.len(),
