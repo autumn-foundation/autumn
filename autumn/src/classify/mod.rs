@@ -35,7 +35,7 @@
 //!
 //! autumn_web::declassify! {
 //!     /// Support agents need the customer's email address to answer the ticket.
-//!     pub SUPPORT_LOOKUP: CustomerEmailField => JsonResponse,
+//!     pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
 //!     purpose = "support_lookup",
 //!     reason = "Support agents need the email address to answer the ticket.",
 //! }
@@ -49,9 +49,14 @@
 //!
 //! The threat model is **drift detection, not an adversarial author** -- the
 //! same posture `docs/guide/security-posture-manifest.md` states for the
-//! security manifest. An author who reaches for
-//! [`Declassification::__declare`] directly instead of [`declassify!`] is lying
-//! to their own manifest, and no build-time artifact can stop that.
+//! security manifest. Two things follow from that, and both are deliberate:
+//! an author who reaches for [`Declassification::__declare`] directly instead
+//! of [`declassify!`] is lying to their own manifest, and the boolean surface
+//! the wrapper must keep ([`PartialEq`], the `validator` rules) is an oracle
+//! someone could loop over. Neither is reachable by accident, and an author who
+//! wanted the value could simply declare a boundary. What this module closes is
+//! every path that hands a classified value -- or a serializable view of one --
+//! to a sink *without anyone meaning to*.
 //!
 //! See `docs/guide/data-classification.md`.
 
@@ -136,7 +141,7 @@ impl std::fmt::Display for Sink {
 /// The identity of one classified `#[model]` column, as a type.
 ///
 /// `#[model]` generates one zero-sized marker per `#[classified]` column
-/// (`Customer::email` becomes `CustomerEmailField`) and implements this trait on
+/// (`Customer::email` becomes `CustomerEmailClassified`) and implements this trait on
 /// it. The marker does three jobs at once: it names the field inside the
 /// compiler diagnostic when a leak is attempted, it keys a
 /// [`Declassification`] to exactly one column, and it turns a release into a
@@ -150,12 +155,24 @@ pub trait ClassifiedField: 'static {
     const CLASSIFICATION: Classification;
 }
 
+mod sealed {
+    /// Sealed: outside this crate there is no way to name, let alone implement,
+    /// this trait, so [`super::ReleasedForSink`] cannot be implemented either.
+    pub trait NeverReleased {}
+}
+
 /// The proof obligation a classified value can never discharge.
 ///
 /// [`Classified<T, F>`](Classified) implements [`Serialize`] only for an `F`
 /// that implements this trait, and nothing implements it. The impl exists at all
 /// so the failure is reported *with autumn's own diagnostic*, naming the field,
 /// rather than as serde's bare "trait bound not satisfied".
+///
+/// **Sealed.** The field markers `#[model]` generates live in the *application's*
+/// crate, so without the private supertrait one safe line
+/// (`impl ReleasedForSink for CustomerEmailClassified {}`) would satisfy the orphan
+/// rule and turn the `Serialize` impl back on for that column -- silently, with
+/// no boundary and no manifest row.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is classified personal data and cannot be serialized into a sink",
     label = "classified personal data would be released here",
@@ -163,13 +180,27 @@ pub trait ClassifiedField: 'static {
     note = "declare a boundary with `autumn_web::declassify!` and release the value first: `value.declassify(&YOUR_BOUNDARY)`",
     note = "see docs/guide/data-classification.md"
 )]
-pub trait ReleasedForSink {}
+pub trait ReleasedForSink: sealed::NeverReleased {}
 
 /// A value carrying a data classification.
 ///
 /// `T` is the underlying value; `F` is the [`ClassifiedField`] marker naming the
 /// `#[model]` column it came from. Deliberately missing: `Serialize`, `Display`,
-/// `Deref`, `AsRef`, `into_inner`. The only exit is [`declassify`](Self::declassify).
+/// `Deref`, `AsRef`, `Hash`, `into_inner`. The only exit is
+/// [`declassify`](Self::declassify).
+///
+/// # Residual surface
+///
+/// [`PartialEq`] is kept because the generated repository code needs it (record
+/// correlation, `UpdateDraft`'s changed-field check), and the `validator`
+/// delegations answer their rules over the real value. Both are *boolean*
+/// oracles: an author who writes a loop around `validate_regex` or `==` can
+/// narrow the value down without a boundary. That is deliberate, and it is the
+/// same posture `docs/guide/security-posture-manifest.md` states for the
+/// security manifest -- these gates detect drift, not an author attacking their
+/// own application, who could simply declare a boundary. What is closed is every
+/// path that hands the value, or a serializable view of it, to a sink by
+/// accident.
 pub struct Classified<T, F: ClassifiedField> {
     value: T,
     field: PhantomData<fn() -> F>,
@@ -279,12 +310,6 @@ impl<T: PartialEq, F: ClassifiedField> PartialEq for Classified<T, F> {
 
 impl<T: Eq, F: ClassifiedField> Eq for Classified<T, F> {}
 
-impl<T: std::hash::Hash, F: ClassifiedField> std::hash::Hash for Classified<T, F> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
-    }
-}
-
 /// Redacted: the whole point is that the plaintext has no unaudited exit, and
 /// `Debug` output reaches panic messages, error pages and logs.
 impl<T, F: ClassifiedField> std::fmt::Debug for Classified<T, F> {
@@ -363,7 +388,7 @@ impl<F: ClassifiedField> Declassification<F> {
         self.reason
     }
 
-    fn record(&self) -> DeclassificationRecord {
+    const fn record(&self) -> DeclassificationRecord {
         DeclassificationRecord {
             model: F::MODEL,
             field: F::FIELD,
@@ -421,9 +446,10 @@ pub struct ReleaseObserverGuard(u64);
 
 impl Drop for ReleaseObserverGuard {
     fn drop(&mut self) {
-        if let Ok(mut list) = observers().lock() {
-            list.retain(|(id, _)| *id != self.0);
-        }
+        let mut list = observers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.retain(|(id, _)| *id != self.0);
     }
 }
 
@@ -438,9 +464,14 @@ where
 {
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut list) = observers().lock() {
-        list.push((id, Arc::new(observer)));
-    }
+    // Recover from poisoning rather than silently handing back a live-looking
+    // guard for an observer that was never registered: the list holds only
+    // `Arc`s, so a panic while another observer ran left nothing inconsistent.
+    let mut list = observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    list.push((id, Arc::new(observer)));
+    drop(list);
     ReleaseObserverGuard(id)
 }
 
@@ -458,10 +489,12 @@ fn record_release(record: &DeclassificationRecord) {
     // Clone the handles out before calling any of them: an observer that
     // declassifies (or installs another observer) would otherwise deadlock on
     // the same lock.
-    let snapshot: Vec<Observer> = match observers().lock() {
-        Ok(list) => list.iter().map(|(_, o)| Arc::clone(o)).collect(),
-        Err(_) => Vec::new(),
-    };
+    let snapshot: Vec<Observer> = observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(_, o)| Arc::clone(o))
+        .collect();
     for observer in snapshot {
         observer(record);
     }
@@ -494,13 +527,13 @@ impl<T: Serialize + ?Sized> JsonSink for T {}
 /// ```ignore
 /// autumn_web::declassify! {
 ///     /// Support agents need the customer's email address to answer the ticket.
-///     pub SUPPORT_LOOKUP: CustomerEmailField => JsonResponse,
+///     pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
 ///     purpose = "support_lookup",
 ///     reason = "Support agents need the email address to answer the ticket.",
 /// }
 /// ```
 ///
-/// The field marker (`CustomerEmailField`) is generated by `#[model]` for the
+/// The field marker (`CustomerEmailClassified`) is generated by `#[model]` for the
 /// `#[classified]` column. The sink name is a [`Sink`] variant. Both the
 /// `purpose` and the `reason` are string literals so the manifest can carry them
 /// without running the app.
@@ -546,19 +579,14 @@ macro_rules! declassify {
 
 /// Whether a declared justification is blank (empty or all whitespace).
 ///
-/// `const` so [`declassify!`] can reject it at compile time.
+/// `const` so [`declassify!`] can reject it at compile time. Delegates to the
+/// cache-coherence gate's rule rather than carrying a second copy: two spellings
+/// of "blank" that could disagree is exactly the drift these gates exist to
+/// catch. That one is Unicode-aware, so a non-breaking space is still blank.
 #[doc(hidden)]
 #[must_use]
 pub const fn reason_is_blank(reason: &str) -> bool {
-    let bytes = reason.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    crate::cache::coherence::reason_is_blank(reason)
 }
 
 #[cfg(test)]
@@ -571,6 +599,22 @@ mod tests {
         const FIELD: &'static str = "email";
         const CLASSIFICATION: Classification = Classification::PersonalData;
     }
+
+    /// A marker of its own for the observer tests. The observer registry is
+    /// process-wide and the test binary runs these in parallel, so a test that
+    /// counts releases has to be able to tell its own apart from a sibling's.
+    struct ObservedField;
+    impl ClassifiedField for ObservedField {
+        const MODEL: &'static str = "ObserverCustomer";
+        const FIELD: &'static str = "email";
+        const CLASSIFICATION: Classification = Classification::PersonalData;
+    }
+
+    static OBSERVED_BOUNDARY: Declassification<ObservedField> = Declassification::__declare(
+        "support_lookup",
+        Sink::JsonResponse,
+        "Support agents need the email address to answer the ticket.",
+    );
 
     static BOUNDARY: Declassification<TestField> = Declassification::__declare(
         "support_lookup",
@@ -592,13 +636,13 @@ mod tests {
             sink.lock().expect("observer").push(r.clone());
         });
 
-        let c: Classified<String, TestField> = "ada@example.com".to_string().into();
-        assert_eq!(c.declassify(&BOUNDARY), "ada@example.com");
+        let c: Classified<String, ObservedField> = "ada@example.com".to_string().into();
+        assert_eq!(c.declassify(&OBSERVED_BOUNDARY), "ada@example.com");
 
         let records = seen.lock().expect("observer").clone();
         let mine: Vec<_> = records
             .iter()
-            .filter(|r| r.model == "Customer" && r.field == "email")
+            .filter(|r| r.model == ObservedField::MODEL)
             .collect();
         assert_eq!(mine.len(), 1, "{records:?}");
         assert_eq!(mine[0].purpose, "support_lookup");
@@ -616,18 +660,31 @@ mod tests {
 
     #[test]
     fn the_observer_is_removed_when_its_guard_drops() {
+        struct GuardField;
+        impl ClassifiedField for GuardField {
+            const MODEL: &'static str = "GuardCustomer";
+            const FIELD: &'static str = "email";
+            const CLASSIFICATION: Classification = Classification::PersonalData;
+        }
+        static GUARD_BOUNDARY: Declassification<GuardField> =
+            Declassification::__declare("support_lookup", Sink::JsonResponse, "Because.");
+
         let seen = Arc::new(Mutex::new(0_usize));
         {
             let sink = Arc::clone(&seen);
-            let _guard = capture_releases(move |_: &DeclassificationRecord| {
-                *sink.lock().expect("observer") += 1;
+            // Count only this test's own releases: the registry is process-wide.
+            let _guard = capture_releases(move |r: &DeclassificationRecord| {
+                if r.model == GuardField::MODEL {
+                    *sink.lock().expect("observer") += 1;
+                }
             });
-            let c: Classified<String, TestField> = "a".to_string().into();
-            let _ = c.declassify(&BOUNDARY);
+            let c: Classified<String, GuardField> = "a".to_string().into();
+            let _ = c.declassify(&GUARD_BOUNDARY);
+            assert_eq!(*seen.lock().expect("observer"), 1);
         }
         let after_guard = *seen.lock().expect("observer");
-        let c: Classified<String, TestField> = "b".to_string().into();
-        let _ = c.declassify(&BOUNDARY);
+        let c: Classified<String, GuardField> = "b".to_string().into();
+        let _ = c.declassify(&GUARD_BOUNDARY);
         assert_eq!(*seen.lock().expect("observer"), after_guard);
     }
 
@@ -658,14 +715,21 @@ mod tests {
     }
 
     #[test]
-    fn equality_and_hashing_see_through_the_wrapper() {
-        use std::collections::HashSet;
+    fn equality_sees_through_the_wrapper_but_hashing_is_not_offered() {
+        // `PartialEq` is what the generated repository correlation and
+        // `UpdateDraft` changed-field check need. `Hash` is deliberately absent:
+        // a stable digest of a low-entropy personal value is `Serialize`, and so
+        // is an offline-brute-forceable view of the value itself.
         let a: Classified<String, TestField> = "x".to_string().into();
         let b: Classified<String, TestField> = "x".to_string().into();
+        let c: Classified<String, TestField> = "y".to_string().into();
         assert_eq!(a, b);
-        let mut set = HashSet::new();
-        set.insert(a);
-        assert!(set.contains(&b));
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn unicode_whitespace_is_still_a_blank_justification() {
+        assert!(reason_is_blank("\u{00a0}\u{2003}"));
     }
 
     #[test]

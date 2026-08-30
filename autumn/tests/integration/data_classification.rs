@@ -2,7 +2,7 @@
 //!
 //! Proves the headline acceptance criteria over a real `#[model]`:
 //! * a `#[classified]` field carries its classification on the *generated type*
-//!   (`Classified<String, CustomerEmailField>`), not in a name denylist;
+//!   (`Classified<String, CustomerEmailClassified>`), not in a name denylist;
 //! * a declared declassification boundary releases the value for a recorded
 //!   purpose, and the released value serializes into the `Json` sink;
 //! * the build-time data-flow manifest lists each classified field and every
@@ -56,7 +56,7 @@ pub struct Widget {
 
 autumn_web::declassify! {
     /// Support agents need the customer's email address to answer the ticket.
-    pub SUPPORT_LOOKUP: CustomerEmailField => JsonResponse,
+    pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
     purpose = "support_lookup",
     reason = "Support agents need the email address to answer the ticket.",
 }
@@ -73,10 +73,10 @@ fn customer() -> Customer {
 
 #[test]
 fn classified_field_marker_carries_model_field_and_tier() {
-    assert_eq!(CustomerEmailField::MODEL, "Customer");
-    assert_eq!(CustomerEmailField::FIELD, "email");
+    assert_eq!(CustomerEmailClassified::MODEL, "Customer");
+    assert_eq!(CustomerEmailClassified::FIELD, "email");
     assert_eq!(
-        CustomerEmailField::CLASSIFICATION,
+        CustomerEmailClassified::CLASSIFICATION,
         Classification::PersonalData
     );
 }
@@ -85,7 +85,7 @@ fn classified_field_marker_carries_model_field_and_tier() {
 fn classified_field_is_wrapped_in_the_taint_type() {
     let c = customer();
     // The generated field type is the taint wrapper, not a bare `String`.
-    let _: &autumn_web::classify::Classified<String, CustomerEmailField> = &c.email;
+    let _: &autumn_web::classify::Classified<String, CustomerEmailClassified> = &c.email;
     assert_eq!(c.name, "Ada");
 }
 
@@ -112,8 +112,9 @@ fn declassifying_at_a_boundary_yields_the_value_and_records_the_release() {
     let released: String = customer().email.declassify(&SUPPORT_LOOKUP);
     assert_eq!(released, "ada@example.com");
 
-    // Filter rather than count: the observer is process-wide, and another test
-    // in this binary may release at the same moment.
+    // Filter rather than count: the observer registry is process-wide, and the
+    // sibling test that serializes a released view runs in parallel with this
+    // one, releasing the same column.
     let captured = records.lock().expect("release recorder").clone();
     let mine: Vec<_> = captured
         .iter()
@@ -178,7 +179,11 @@ fn manifest_reports_an_empty_reachable_set_for_a_never_released_field() {
         manifest.fields[0].reachable_sinks.is_empty(),
         "{manifest:?}"
     );
-    assert!(manifest.summary().contains("no sink"), "{}", manifest.summary());
+    assert!(
+        manifest.summary().contains("no sink"),
+        "{}",
+        manifest.summary()
+    );
 }
 
 #[test]
@@ -206,10 +211,16 @@ fn manifest_join_is_keyed_on_model_and_field() {
         }],
     );
     let user = &manifest.fields[1];
-    assert_eq!((user.model.as_str(), user.field.as_str()), ("User", "email"));
+    assert_eq!(
+        (user.model.as_str(), user.field.as_str()),
+        ("User", "email")
+    );
     assert_eq!(user.reachable_sinks.len(), 1);
     let order = &manifest.fields[0];
-    assert_eq!((order.model.as_str(), order.field.as_str()), ("Order", "email"));
+    assert_eq!(
+        (order.model.as_str(), order.field.as_str()),
+        ("Order", "email")
+    );
     assert!(order.reachable_sinks.is_empty());
 }
 

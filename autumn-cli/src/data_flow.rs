@@ -79,7 +79,18 @@ pub fn format_drift(committed: &DataFlowManifest, current: &DataFlowManifest) ->
             Some(before) if before != row => {
                 let was = sink_list(before);
                 let now = sink_list(row);
-                lines.push(format!("  ~ {} reaches {was} -> {now}", key(row)));
+                if was == now {
+                    // Same sinks, different tier or different justification --
+                    // a re-worded reason is exactly the kind of change a
+                    // reviewer must see, so say so rather than printing an
+                    // identical before/after pair.
+                    lines.push(format!(
+                        "  ~ {} still reaches {now}, but its classification or its                          declared reason changed",
+                        key(row)
+                    ));
+                } else {
+                    lines.push(format!("  ~ {} reaches {was} -> {now}", key(row)));
+                }
             }
             Some(_) => {}
         }
@@ -167,6 +178,23 @@ pub fn run(opts: &DataFlowOptions<'_>) {
         std::process::exit(1);
     };
 
+    // Read the committed copy BEFORE writing anything. `--manifest P --check P`
+    // would otherwise compare the fresh manifest against the copy this very run
+    // just wrote and always pass -- a gate that certifies itself.
+    let committed = opts.check.map(|path| match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<DataFlowManifest>(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("\u{2717} {path} is not a data-flow manifest: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("\u{2717} Failed to read {path}: {e}");
+            std::process::exit(1);
+        }
+    });
+
     if let Some(path) = opts.manifest {
         if let Err(e) = write_manifest(&manifest, std::path::Path::new(path)) {
             eprintln!("\u{2717} Failed to write manifest to {path}: {e}");
@@ -181,20 +209,7 @@ pub fn run(opts: &DataFlowOptions<'_>) {
         println!("{}", format_report(&manifest));
     }
 
-    if let Some(path) = opts.check {
-        let committed = match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<DataFlowManifest>(&text) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("\u{2717} {path} is not a data-flow manifest: {e}");
-                    std::process::exit(1);
-                }
-            },
-            Err(e) => {
-                eprintln!("\u{2717} Failed to read {path}: {e}");
-                std::process::exit(1);
-            }
-        };
+    if let (Some(path), Some(committed)) = (opts.check, committed) {
         if let Some(drift) = format_drift(&committed, &manifest) {
             eprintln!("{drift}");
             eprintln!(
@@ -208,9 +223,7 @@ pub fn run(opts: &DataFlowOptions<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use autumn_web::classify::manifest::{
-        ClassifiedFieldDescriptor, DeclassificationDescriptor,
-    };
+    use autumn_web::classify::manifest::{ClassifiedFieldDescriptor, DeclassificationDescriptor};
     use autumn_web::classify::{Classification, Sink};
 
     use super::*;
@@ -246,7 +259,10 @@ mod tests {
         );
         let report = format_report(&manifest);
         assert!(report.contains("User.email"), "{report}");
-        assert!(report.contains("json_response for support_lookup"), "{report}");
+        assert!(
+            report.contains("json_response for support_lookup"),
+            "{report}"
+        );
         assert!(report.contains("Order.card_number"), "{report}");
         assert!(report.contains("no sink"), "{report}");
     }
@@ -267,20 +283,47 @@ mod tests {
         let drift = format_drift(&before, &after).expect("drift");
         assert!(drift.contains("User.email"), "{drift}");
         assert!(drift.contains("no sink"), "{drift}");
-        assert!(drift.contains("json_response for marketing_export"), "{drift}");
+        assert!(
+            drift.contains("json_response for marketing_export"),
+            "{drift}"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_justification_is_reported_even_when_the_sinks_match() {
+        let before = DataFlowManifest::build(
+            &[field("User", "email")],
+            &[release("User", "email", "support_lookup")],
+        );
+        let mut changed = release("User", "email", "support_lookup");
+        changed.reason = "Marketing would also like it.";
+        let after = DataFlowManifest::build(&[field("User", "email")], &[changed]);
+        let drift = format_drift(&before, &after).expect("drift");
+        assert!(drift.contains("declared reason changed"), "{drift}");
+    }
+
+    #[test]
+    fn a_removed_release_edge_is_named() {
+        let before = DataFlowManifest::build(
+            &[field("User", "email")],
+            &[release("User", "email", "support_lookup")],
+        );
+        let after = DataFlowManifest::build(&[field("User", "email")], &[]);
+        let drift = format_drift(&before, &after).expect("drift");
+        assert!(drift.contains("-> no sink"), "{drift}");
     }
 
     #[test]
     fn an_added_or_removed_classified_field_is_named() {
         let before = DataFlowManifest::build(&[field("User", "email")], &[]);
-        let after = DataFlowManifest::build(
-            &[field("User", "email"), field("User", "phone")],
-            &[],
-        );
+        let after = DataFlowManifest::build(&[field("User", "email"), field("User", "phone")], &[]);
         let added = format_drift(&before, &after).expect("drift");
         assert!(added.contains("+ classified field User.phone"), "{added}");
         let removed = format_drift(&after, &before).expect("drift");
-        assert!(removed.contains("- classified field User.phone"), "{removed}");
+        assert!(
+            removed.contains("- classified field User.phone"),
+            "{removed}"
+        );
     }
 
     #[test]

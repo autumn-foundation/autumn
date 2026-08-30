@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renaming a column, adding an endpoint, or routing personal data through a
   differently-named field silently reopened the hole. A `#[model]` column can
   now be annotated `#[classified]`, and the classification is carried by the
-  *type*: the field is generated as `Classified<String, CustomerEmailField>`,
+  *type*: the field is generated as `Classified<String, CustomerEmailClassified>`,
   a wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`,
   and the model itself loses its `Serialize` derive. There is no expression that
   puts the value where a serializer can reach it, so `Json(customer)` and

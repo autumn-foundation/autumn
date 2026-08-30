@@ -8,7 +8,7 @@ them is one rename away from silently letting personal data through, because the
 classification lives in the developer's memory rather than in a type.
 
 `#[classified]` moves one tier — **personal data** — into the type system, and
-gates one sink — the [`Json`](extractors.md) response — on it. A leak stops being
+gates one sink — the `Json` response — on it. A leak stops being
 a production incident and becomes a build failure.
 
 ```rust,ignore
@@ -24,10 +24,10 @@ pub struct Customer {
 
 That one attribute changes three things:
 
-1. the generated field is `Classified<String, CustomerEmailField>`, not `String`;
+1. the generated field is `Classified<String, CustomerEmailClassified>`, not `String`;
 2. `Customer` no longer implements `Serialize`, so it cannot be handed to a sink;
-3. the column and the boundaries that release it appear in the build's
-   **data-flow manifest**.
+3. the column and the boundaries that release it appear in the
+   **data-flow manifest** `autumn data-flow` emits.
 
 ## What stops compiling
 
@@ -57,21 +57,33 @@ would otherwise reopen:
 struct SupportView { email: String }
 
 SupportView { email: customer.email } // ❌ expected `String`,
-                                      //    found `Classified<String, CustomerEmailField>`
+                                      //    found `Classified<String, CustomerEmailClassified>`
 ```
 
 And putting the wrapper itself in a serializable struct:
 
 ```text
-error[E0277]: `CustomerEmailField` is classified personal data and cannot be
+error[E0277]: `CustomerEmailClassified` is classified personal data and cannot be
               serialized into a sink
   = note: declare a boundary with `autumn_web::declassify!` and release the value
           first: `value.declassify(&YOUR_BOUNDARY)`
 ```
 
-The wrapper has no `Serialize`, no `Display`, no `Deref` and no `into_inner`, so
-there is no expression that gets the value to a serializer. That is the whole
-guarantee: it is a property of the type, not a list of field names.
+The wrapper has no `Serialize`, no `Display`, no `Deref`, no `Hash` and no
+`into_inner`, so no expression hands the value — or a serializable view of it —
+to a sink. That is the guarantee: it is a property of the type, not a list of
+field names.
+
+Two pieces of surface survive on purpose, and both are boolean: `PartialEq`,
+which the generated repository code needs to correlate records and to compute an
+`UpdateDraft`'s changed fields, and the `validator` rules below, which answer
+`true`/`false` over the real value. An author who writes a loop around
+`==` or `validate_regex` can narrow a value down without a boundary. That is
+accepted: the threat model here is **drift detection, not an author attacking
+their own application** — the same posture
+[the security posture manifest](security-posture-manifest.md) states — and such
+an author could simply declare a boundary instead. What is closed is every path
+that leaks the value *by accident*.
 
 ## Declassifying at a boundary
 
@@ -81,18 +93,18 @@ sink, the purpose and the reason:
 ```rust,ignore
 autumn_web::declassify! {
     /// Support agents need the customer's email address to answer the ticket.
-    pub SUPPORT_LOOKUP: CustomerEmailField => JsonResponse,
+    pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
     purpose = "support_lookup",
     reason = "Support agents need the email address to answer the ticket.",
 }
 ```
 
-`CustomerEmailField` is the marker `#[model]` generated for the column
-(`{Model}{Field}Field`). It types the boundary, so one column's approved purpose
+`CustomerEmailClassified` is the marker `#[model]` generated for the column
+(`{Model}{Column}Classified`). It types the boundary, so one column's approved purpose
 cannot release another's:
 
 ```rust,ignore
-customer.phone.declassify(&SUPPORT_LOOKUP) // ❌ expected Declassification<CustomerPhoneField>
+customer.phone.declassify(&SUPPORT_LOOKUP) // ❌ expected Declassification<CustomerPhoneClassified>
 ```
 
 Both `purpose` and `reason` must be non-blank string literals — a boundary whose
@@ -144,7 +156,9 @@ The guard removes the observer when it drops.
 autumn data-flow --manifest target/autumn/data-flow-manifest.json
 ```
 
-Builds the app, runs it in dump mode, and emits one row per classified column
+A bare `cargo build` does not write the manifest, and cannot: reachability is a
+whole-app fact that only exists once everything is linked. `autumn data-flow`
+builds the app, runs it in dump mode, and emits one row per classified column
 listing every sink it is proven reachable to:
 
 ```json
@@ -175,8 +189,13 @@ listing every sink it is proven reachable to:
 ```
 
 An **empty `reachable_sinks` means no leak**: nothing in the binary declares a
-boundary for that column, and the type system guarantees a boundary is the only
-way to a gated sink.
+boundary for that column, and a boundary is the only way to a gated sink.
+
+The reachable set is an *over*-approximation in the safe direction: a row lists
+every sink a declared boundary could release the column to, not the call sites
+that actually do. A boundary declared and never used still shows up. That is
+deliberate — a manifest that under-reports a reachable sink would be worse than
+no manifest.
 
 Why it runs the binary rather than parsing sources: reachability is a whole-app
 fact. A column declared in one crate can be released by a boundary declared in
@@ -212,10 +231,20 @@ autumn data-flow --check data-flow-manifest.json
   renders as `<classified>`, so it cannot reach a panic message or an error page.
 - **`#[validate]` still runs** on the classified column. The wrapper forwards
   `validator`'s string rules (`email`, `length`, `contains`, `does_not_contain`,
-  `url`, `regex`, `ip`) to the inner value.
+  `url`, `regex`, `ip`) to the inner value, answering each with a `bool`.
+  `ValidateEmail::as_email_string` and `ValidateUrl::as_url_string` — the two
+  rules whose trait shape hands the *value* back rather than a verdict — return
+  `None` on the wrapper, so the rule still evaluates on the real value while
+  nothing can read it back out.
 - **The database sees a plain `Text` column.** Classification says where a value
   may *go*, not how it is stored. For at-rest protection, that is
   [`#[encrypted]`](attribute-encryption.md).
+- **The column drops out of the client-controlled list surface.** A repository's
+  `list()` allowlists every scalar column for `?filter[col]=` and `?sort=col`. A
+  classified column is excluded from both: the filter would be an
+  unauthenticated equality oracle over the personal data and the sort would order
+  the result set by it, neither through a boundary nor visible in the manifest.
+  Filtering or sorting on it is simply ignored, exactly as for any unlisted key.
 
 ## Restrictions in this slice
 
@@ -231,16 +260,31 @@ diagnostic that says why:
 | `#[translatable]` | a per-locale container is a document, not a value |
 | `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]` | framework-managed columns |
 | `#[serde(rename)]` / `#[serde(rename_all)]` | the manifest is keyed on the Rust name |
+| `#[serde(with/serialize_with/deserialize_with)]` | the adapter is written against the declared type, and a `serialize_with` serializes the withheld value |
+| the `tenant_id` column | the tenancy codegen reads it directly as an isolation key |
 
 Two further limitations are worth knowing before you classify a column:
 
 - A `#[repository]` that records **version history** or is **ledgered**
-  serializes the whole model into its snapshot, which a classified model cannot
-  do. Version history is itself a sink, and gating it is a follow-up slice; for
-  now, do not classify a column on a versioned or ledgered model.
+  serializes the whole model into its snapshot, so it does not compile against a
+  classified model (the snapshot needs the `Serialize` impl the classification
+  withholds). A repository with **durable commit hooks** compiles, but building
+  the payload returns an error at runtime naming the model and the columns.
+  Both of those payloads are second, unclassified copies of the record — gating
+  them is a follow-up slice. For now, do not classify a column on a versioned,
+  ledgered, or durable-commit-hook model.
 - Only the JSON response sink is gated. Log/tracing events, outbound HTTP bodies
   and analytics emission are follow-up slices — for those, the runtime
   name-based scrubbing is still what protects you.
+- Anything else in the framework that needs the model to serialize needs a
+  released view instead, and says so at build time: `form_for::<Customer>` and
+  `#[repository(..., api = "/customers")]` are the two you are most likely to
+  meet. The generated REST handlers assert the sink bound directly, so the
+  failure names the model and points here rather than surfacing as an axum
+  `Handler` bound.
+- A `#[repository(..., cursor_key = <classified column>)]` does not compile: a
+  cursor is echoed back to the client verbatim, which is a release with no
+  boundary. Page on a non-classified column.
 
 ## Adding a second tier or a second sink
 

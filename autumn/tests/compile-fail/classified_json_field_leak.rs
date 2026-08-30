@@ -19,7 +19,7 @@ pub struct Customer {
 
 #[derive(serde::Serialize)]
 struct SupportView {
-    email: Classified<String, CustomerEmailField>,
+    email: Classified<String, CustomerEmailClassified>,
 }
 
 fn leak(customer: Customer) -> SupportView {

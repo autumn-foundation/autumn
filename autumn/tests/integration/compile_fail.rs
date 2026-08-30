@@ -162,9 +162,6 @@ fn compile_fail_tests() {
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/story_captures_environment.rs");
 
-    // Typed accessible UI primitives (#1706): an accessible name is a
-    // compile-time obligation, so inaccessible construction does not build.
-    #[cfg(feature = "maud")]
     // #1654: compile-time data classification. A classified column cannot reach
     // the `Json` response sink -- not as a whole model, not lifted into a DTO --
     // and a boundary declared for one field cannot release another's data. The
@@ -179,7 +176,12 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/classified_non_string.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_with_encrypted.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_released_for_sink_is_sealed.rs");
 
+    // Typed accessible UI primitives (#1706): an accessible name is a
+    // compile-time obligation, so inaccessible construction does not build.
+    #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_img_missing_alt.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_button_missing_name.rs");

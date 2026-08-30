@@ -153,8 +153,14 @@ impl DataFlowManifest {
         }
         let mut fields: Vec<ClassifiedFieldFlow> = rows.into_values().collect();
         for row in &mut fields {
-            row.reachable_sinks
-                .sort_by(|a, b| (a.sink, &a.purpose).cmp(&(b.sink, &b.purpose)));
+            // Sort on every field `dedup` compares. `inventory` hands descriptors
+            // back in link order, which is unspecified across builds, so two
+            // boundaries sharing a sink and purpose but differing in reason would
+            // otherwise reorder between builds and show up as spurious drift in
+            // `autumn data-flow --check`.
+            row.reachable_sinks.sort_by(|a, b| {
+                (a.sink, &a.purpose, &a.reason).cmp(&(b.sink, &b.purpose, &b.reason))
+            });
             row.reachable_sinks.dedup();
         }
         Self {
@@ -233,10 +239,14 @@ const fn plural(n: usize) -> &'static str {
 /// Assemble the manifest from everything linked into this binary.
 #[must_use]
 pub fn audit() -> DataFlowManifest {
-    let fields: Vec<ClassifiedFieldDescriptor> =
-        inventory::iter::<ClassifiedFieldDescriptor>.into_iter().copied().collect();
-    let releases: Vec<DeclassificationDescriptor> =
-        inventory::iter::<DeclassificationDescriptor>.into_iter().copied().collect();
+    let fields: Vec<ClassifiedFieldDescriptor> = inventory::iter::<ClassifiedFieldDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
+    let releases: Vec<DeclassificationDescriptor> = inventory::iter::<DeclassificationDescriptor>
+        .into_iter()
+        .copied()
+        .collect();
     DataFlowManifest::build(&fields, &releases)
 }
 
@@ -296,7 +306,11 @@ mod tests {
         let manifest = DataFlowManifest::build(&[field("Order", "card_number")], &[]);
         assert_eq!(manifest.fields.len(), 1);
         assert!(manifest.fields[0].reachable_sinks.is_empty());
-        assert!(manifest.summary().contains("no sink"), "{}", manifest.summary());
+        assert!(
+            manifest.summary().contains("no sink"),
+            "{}",
+            manifest.summary()
+        );
     }
 
     #[test]
@@ -311,7 +325,10 @@ mod tests {
         assert!(manifest.fields[0].reachable_sinks.is_empty());
         assert_eq!(manifest.fields[1].model, "User");
         assert_eq!(manifest.fields[1].reachable_sinks.len(), 1);
-        assert_eq!(manifest.fields[1].reachable_sinks[0].purpose, "support_lookup");
+        assert_eq!(
+            manifest.fields[1].reachable_sinks[0].purpose,
+            "support_lookup"
+        );
     }
 
     #[test]
@@ -329,6 +346,17 @@ mod tests {
             .map(|r| r.purpose.as_str())
             .collect();
         assert_eq!(purposes, ["billing_receipt", "support_lookup"]);
+    }
+
+    #[test]
+    fn the_row_order_does_not_depend_on_registration_order() {
+        let a = release("User", "email", "support_lookup");
+        let mut b = release("User", "email", "support_lookup");
+        b.reason = "A different justification, same sink and purpose.";
+        let forwards = DataFlowManifest::build(&[field("User", "email")], &[a, b]);
+        let backwards = DataFlowManifest::build(&[field("User", "email")], &[b, a]);
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards.fields[0].reachable_sinks.len(), 2);
     }
 
     #[test]
@@ -353,7 +381,8 @@ mod tests {
 
     #[test]
     fn duplicate_field_registrations_collapse_to_one_row() {
-        let manifest = DataFlowManifest::build(&[field("User", "email"), field("User", "email")], &[]);
+        let manifest =
+            DataFlowManifest::build(&[field("User", "email"), field("User", "email")], &[]);
         assert_eq!(manifest.fields.len(), 1);
     }
 
@@ -386,7 +415,11 @@ mod tests {
     #[test]
     fn the_summary_counts_models_and_released_fields() {
         let manifest = DataFlowManifest::build(
-            &[field("User", "email"), field("User", "phone"), field("Order", "email")],
+            &[
+                field("User", "email"),
+                field("User", "phone"),
+                field("Order", "email"),
+            ],
             &[release("User", "email", "support_lookup")],
         );
         let summary = manifest.summary();

@@ -3118,7 +3118,7 @@ fn validate_classified_tier(field: &syn::Field) -> syn::Result<()> {
 }
 
 /// The generated zero-sized marker naming one classified column, e.g.
-/// `Customer::email` -> `CustomerEmailField`.
+/// `Customer::email` -> `CustomerEmailClassified`.
 ///
 /// The name is load bearing twice over: it is what the compiler prints when a
 /// leak is attempted (so it has to read as the field it guards), and it is what
@@ -3136,7 +3136,17 @@ fn classified_marker_ident(model: &syn::Ident, field: &syn::Ident) -> syn::Ident
             camel.push(ch);
         }
     }
-    format_ident!("{}{}Field", unraw_ident(model), camel, span = field.span())
+    // `Classified`, not `Field`: `{Model}Field` is already the generated
+    // field enum, so `Customer::email` -> `CustomerEmailClassified` would collide
+    // with a sibling `#[model] struct CustomerEmail`'s field enum. No column
+    // name can be empty, so `{Model}{Column}Classified` cannot collide with
+    // another model's marker either.
+    format_ident!(
+        "{}{}Classified",
+        unraw_ident(model),
+        camel,
+        span = field.span()
+    )
 }
 
 /// Validate a `#[classified]` field.
@@ -3151,16 +3161,6 @@ fn validate_classified_field(field: &syn::Field) -> syn::Result<()> {
         return Ok(());
     }
     validate_classified_tier(field)?;
-
-    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
-    if !is_string {
-        return Err(syn::Error::new_spanned(
-            &field.ty,
-            "`#[classified]` is only supported on non-null `String` fields in v1 \
-             (issue #1654). Model the column as a `String`, or classify a \
-             neighbouring string column that holds the personal data.",
-        ));
-    }
 
     for (marker, why) in [
         (
@@ -3212,6 +3212,35 @@ fn validate_classified_field(field: &syn::Field) -> syn::Result<()> {
         }
     }
 
+    // The `String`-only rule is checked *after* the conflicting-marker loop on
+    // purpose: several of those markers (`#[translatable]`, `#[lock_version]`,
+    // `#[position]`, `#[id]`) imply a non-`String` column, and the reason that
+    // names the conflict is the one that tells the author what to do.
+    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+    if !is_string {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[classified]` is only supported on non-null `String` fields in v1 \
+             (issue #1654). Model the column as a `String`, or classify a \
+             neighbouring string column that holds the personal data.",
+        ));
+    }
+
+    // `tenant_id` is read directly by the tenancy codegen (preload scoping,
+    // `ModelTenantIdMeta`, the search-text projection), all of which expect the
+    // declared type. It is also an isolation key, not personal data.
+    if field
+        .ident
+        .as_ref()
+        .is_some_and(|i| unraw_ident(i) == "tenant_id")
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` cannot be applied to `tenant_id`: the tenancy codegen reads \
+             the column directly as its isolation key, and a tenant identifier is not the \
+             personal data this tier describes.",
+        ));
+    }
     // A custom serde adapter is written against the declared type and would be
     // handed the taint wrapper instead -- and a `serialize_with` is a serializer
     // for the very value the classification is withholding.
@@ -6183,18 +6212,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map(|(_, _, marker)| {
                     quote! { ::autumn_web::classify::Classified<#ty, #marker> }
                 });
-            let (ident_ty, classified_diesel) = match classified_ty {
-                Some(wrapped) => (
-                    wrapped,
-                    quote! {
-                        #[diesel(
-                            serialize_as = ::autumn_web::classify::ClassifiedText,
-                            deserialize_as = ::autumn_web::classify::ClassifiedText
-                        )]
-                    },
-                ),
-                None => (quote! { #ty }, quote! {}),
-            };
+            let (ident_ty, classified_diesel) = classified_ty.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |wrapped| {
+                    (
+                        wrapped,
+                        quote! {
+                            #[diesel(
+                                serialize_as = ::autumn_web::classify::ClassifiedText,
+                                deserialize_as = ::autumn_web::classify::ClassifiedText
+                            )]
+                        },
+                    )
+                },
+            );
             quote! { #(#val_attrs)* #(#attrs)* #enc #classified_diesel #private pub #ident: #ident_ty }
         })
         .collect();
@@ -6267,9 +6298,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let val_attrs = validate_attrs_for_patch(f);
             // #1654: see the `NewX` comment -- a classified column is readable in
             // from a PATCH body and never written back out.
-            let classified_skip = (field_is_classified(f)
-                && !field_already_skips_serialization(f))
-            .then(|| quote! { #[serde(skip_serializing)] });
+            let classified_skip = (field_is_classified(f) && !field_already_skips_serialization(f))
+                .then(|| quote! { #[serde(skip_serializing)] });
             quote! {
                 #(#val_attrs)*
                 #[serde(default)]
@@ -6341,10 +6371,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let model_field_ty = |f: &Field| -> TokenStream {
         let ty = &f.ty;
-        match classified_marker_for(f) {
-            Some(marker) => quote! { ::autumn_web::classify::Classified<#ty, #marker> },
-            None => quote! { #ty },
-        }
+        classified_marker_for(f).map_or_else(
+            || quote! { #ty },
+            |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+        )
     };
 
     // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
@@ -7438,8 +7468,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             // #1654: the local binding feeds `Self { #ident: #ident }`, so it has
             // to be the *model's* field type -- the taint wrapper for a
-            // classified column, which deserializes transparently.
+            // classified column, which deserializes transparently. A
+            // `#[serde(default = "path")]` fallback returns the *declared* type,
+            // so it is classified on the way into the binding.
             let ty = model_field_ty(f);
+            let missing_default = if classified_marker_for(f).is_some() {
+                missing_default
+                    .map(|d| quote! { ::autumn_web::classify::Classified::new(#d) })
+            } else {
+                missing_default
+            };
             missing_default.map_or_else(
                 || {
                     quote! {
@@ -7491,10 +7529,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let cols = classified_column_names.join("`, `");
         let message = format!(
             "`{}` has `#[classified]` column(s) `{cols}`, so it cannot be written into the \
-             durable commit-hook / ledger payload: that payload is a second, unclassified copy \
-             of the record. Gating it is a follow-up slice of issue #1654 -- until then, use \
-             non-durable `after_commit` hooks and drop `ledgered = true` on this model, or drop \
-             `#[classified]` from the column.",
+             durable commit-hook payload: that payload is a second, unclassified copy of the \
+             record. Gating it is a follow-up slice of issue #1654 -- until then, use \
+             non-durable `after_commit` hooks on this model, or drop `#[classified]` from the \
+             column. (`versioned = true` and `ledgered = true` take the same snapshot and are \
+             rejected earlier, at compile time.)",
             unraw_ident(name),
         );
         quote! {
@@ -7658,6 +7697,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let Some(ident) = field.ident.as_ref() else {
             continue;
         };
+        // #1654: `?filter[col]=` and `?sort=col` are client-controlled, so a
+        // classified column in either allowlist is a leak that compiles: the
+        // filter is an unauthenticated equality oracle over the personal data,
+        // and the sort orders the whole result set by it. Neither goes through a
+        // declassification boundary, so neither can appear in the manifest.
+        // Look it up by name explicitly rather than by trusting the DB column,
+        // then leave it out of both allowlists.
+        if classified_columns.iter().any(|(cid, ..)| *cid == ident) {
+            continue;
+        }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
         let is_option = option_inner_type(&field.ty).is_some();
@@ -7854,6 +7903,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
                 &[#(#encrypted_column_names),*];
+
+            /// Column names on this model marked `#[classified]` (#1654).
+            ///
+            /// Emitted for every model (empty when none are classified). The
+            /// compile-time guarantee is carried by the columns' types, not by
+            /// this list -- it exists so a surface without a compile-time view
+            /// of the model (the admin plugin, an operator report) can ask which
+            /// columns hold personal data, and so the `Json` sink diagnostic can
+            /// point somewhere when it can only name the model.
+            #[doc(hidden)]
+            pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
+                &[#(#classified_column_names),*];
 
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
@@ -10955,7 +11016,7 @@ mod tests {
     fn a_classified_column_is_generated_as_the_taint_wrapper() {
         let generated = classified_model();
         assert!(
-            generated.contains("classify :: Classified < String , CustomerEmailField >"),
+            generated.contains("classify :: Classified < String , CustomerEmailClassified >"),
             "the read struct must carry the classification on the type: {generated}"
         );
         assert!(
@@ -10968,9 +11029,13 @@ mod tests {
     fn a_classified_model_does_not_derive_serialize() {
         let generated = classified_model();
         // `Deserialize` stays: taking personal data in is not a release.
-        assert!(generated.contains("derive (:: serde :: Deserialize)"), "{generated}");
         assert!(
-            !generated.contains("derive (:: serde :: Serialize , :: serde :: Deserialize) ] # [ doc"),
+            generated.contains("derive (:: serde :: Deserialize)"),
+            "{generated}"
+        );
+        assert!(
+            !generated
+                .contains("derive (:: serde :: Serialize , :: serde :: Deserialize) ] # [ doc"),
             "{generated}"
         );
         let query_struct = generated
@@ -10986,9 +11051,12 @@ mod tests {
     #[test]
     fn a_classified_column_publishes_its_field_marker_and_manifest_row() {
         let generated = classified_model();
-        assert!(generated.contains("struct CustomerEmailField"), "{generated}");
         assert!(
-            generated.contains("classify :: ClassifiedField for CustomerEmailField"),
+            generated.contains("struct CustomerEmailClassified"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("classify :: ClassifiedField for CustomerEmailClassified"),
             "{generated}"
         );
         assert!(
@@ -11028,8 +11096,62 @@ mod tests {
     fn a_classified_model_refuses_the_durable_commit_hook_payload() {
         let generated = classified_model();
         assert!(
-            generated.contains("durable commit-hook / ledger payload"),
+            generated.contains("durable commit-hook payload"),
             "the second, unclassified copy of the record must be refused: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_is_not_client_filterable_or_sortable() {
+        // `?filter[email]=` and `?sort=email` are client-controlled. A
+        // classified column in either allowlist is an equality oracle and an
+        // ordering leak that compiles, with no boundary and no manifest row.
+        let generated = classified_model();
+        let filters_start = generated
+            .find("fn __autumn_list_apply_filters")
+            .expect("filter helper must be generated");
+        let orders_start = generated
+            .find("fn __autumn_list_apply_order")
+            .expect("order helper must be generated");
+        let filters = &generated[filters_start..orders_start];
+        assert!(filters.contains("\"name\""), "{filters}");
+        assert!(!filters.contains("\"email\""), "{filters}");
+        // The order helper is the last item in its `impl` block; bound the slice
+        // so the rest of the expansion (which legitimately names the column)
+        // cannot satisfy the assertion.
+        let orders_end = generated[orders_start..]
+            .find("} impl ")
+            .map_or(generated.len(), |o| orders_start + o);
+        let orders = &generated[orders_start..orders_end];
+        assert!(orders.contains("\"name\""), "{orders}");
+        assert!(!orders.contains("\"email\""), "{orders}");
+    }
+
+    #[test]
+    fn every_model_publishes_its_classified_column_list() {
+        assert!(
+            classified_model().contains("__AUTUMN_CLASSIFIED_COLUMNS"),
+            "the column list is what a surface with no compile-time view of the model reads"
+        );
+    }
+
+    #[test]
+    fn classified_is_rejected_on_the_tenant_isolation_key() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub tenant_id: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be applied to `tenant_id`"),
+            "{generated}"
         );
     }
 
@@ -11088,7 +11210,10 @@ mod tests {
             },
         )
         .to_string();
-        assert!(generated.contains("unsupported `#[classified]` tier"), "{generated}");
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
     }
 
     #[test]
@@ -11123,6 +11248,56 @@ mod tests {
     }
 
     #[test]
+    fn classified_rejects_a_custom_serde_adapter() {
+        for adapter in [
+            quote! { #[serde(with = "my_codec")] },
+            quote! { #[serde(serialize_with = "my_ser")] },
+            quote! { #[serde(deserialize_with = "my_de")] },
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    pub struct Customer {
+                        #[id]
+                        pub id: i64,
+                        #[classified]
+                        #adapter
+                        pub email: String,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot be combined with `#[serde(with"),
+                "{generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicting_marker_reports_the_conflict_not_the_string_rule() {
+        // `#[translatable]` implies a non-`String` column, so checking the type
+        // first would bury the reason that tells the author what to do.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[translatable]
+                    pub bio: Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be combined with `#[translatable]`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
     fn classified_rejects_a_serde_rename() {
         let generated = model_macro(
             quote! {},
@@ -11137,7 +11312,10 @@ mod tests {
             },
         )
         .to_string();
-        assert!(generated.contains("cannot use `#[serde(rename"), "{generated}");
+        assert!(
+            generated.contains("cannot use `#[serde(rename"),
+            "{generated}"
+        );
     }
 
     #[test]
@@ -11155,7 +11333,7 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("struct CustomerHomeAddressLineField"),
+            generated.contains("struct CustomerHomeAddressLineClassified"),
             "{generated}"
         );
     }

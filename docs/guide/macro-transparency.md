@@ -565,7 +565,7 @@ column. See [Attribute Encryption](./attribute-encryption.md).
 #### `#[classified]` / `#[classified(personal_data)]`
 
 Marks a `String` column as personal data and carries that classification on the
-**type**: the generated field is `Classified<String, {Model}{Field}Field>`, a
+**type**: the generated field is `Classified<String, {Model}{Column}Classified>`, a
 wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`, and
 the model itself loses its `Serialize` derive. There is no expression that gets
 the value to a serializer, so `Json(model)` and `Json(View { email: model.email })`
@@ -576,12 +576,12 @@ are both compile errors.
 pub struct Customer {
     #[id] pub id: i64,
     pub name: String,
-    #[classified] pub email: String, // Classified<String, CustomerEmailField>
+    #[classified] pub email: String, // Classified<String, CustomerEmailClassified>
 }
 
 autumn_web::declassify! {
     /// Support agents need the customer's email address to answer the ticket.
-    pub SUPPORT_LOOKUP: CustomerEmailField => JsonResponse,
+    pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
     purpose = "support_lookup",
     reason = "Support agents need the email address to answer the ticket.",
 }
