@@ -178,6 +178,8 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/classified_with_encrypted.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_released_for_sink_is_sealed.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_column_wrapper_cannot_retype.rs");
 
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.

@@ -99,6 +99,7 @@ mod tests {
     struct EmailField;
     impl crate::classify::ClassifiedField for EmailField {
         const MODEL: &'static str = "Customer";
+        const MODEL_PATH: &'static str = "test::Customer";
         const FIELD: &'static str = "email";
         const CLASSIFICATION: Classification = Classification::PersonalData;
     }

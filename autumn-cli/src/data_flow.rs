@@ -70,8 +70,12 @@ pub fn format_drift(committed: &DataFlowManifest, current: &DataFlowManifest) ->
             committed.schema_version, current.schema_version
         ));
     }
+    // Keyed and printed on the module-qualified path, not the display name: two
+    // crates can each define a `Customer` with a classified `email`, and a drift
+    // report that cannot tell them apart would attribute one model's new release
+    // edge to the other. This is a CI failure message, so exactness beats brevity.
     let key = |f: &autumn_web::classify::manifest::ClassifiedFieldFlow| {
-        format!("{}.{}", f.model, f.field)
+        format!("{}.{}", f.model_path, f.field)
     };
     for row in &current.fields {
         match committed.fields.iter().find(|c| key(c) == key(row)) {
@@ -231,6 +235,7 @@ mod tests {
     fn field(model: &'static str, name: &'static str) -> ClassifiedFieldDescriptor {
         ClassifiedFieldDescriptor {
             model,
+            model_path: model,
             field: name,
             classification: Classification::PersonalData,
         }
@@ -243,6 +248,7 @@ mod tests {
     ) -> DeclassificationDescriptor {
         DeclassificationDescriptor {
             model,
+            model_path: model,
             field: name,
             classification: Classification::PersonalData,
             purpose,
@@ -311,6 +317,38 @@ mod tests {
         let after = DataFlowManifest::build(&[field("User", "email")], &[]);
         let drift = format_drift(&before, &after).expect("drift");
         assert!(drift.contains("-> no sink"), "{drift}");
+    }
+
+    #[test]
+    fn same_named_models_in_different_modules_drift_independently() {
+        let billing = ClassifiedFieldDescriptor {
+            model: "Customer",
+            model_path: "billing::Customer",
+            field: "email",
+            classification: Classification::PersonalData,
+        };
+        let support = ClassifiedFieldDescriptor {
+            model: "Customer",
+            model_path: "support::Customer",
+            field: "email",
+            classification: Classification::PersonalData,
+        };
+        let before = DataFlowManifest::build(&[billing, support], &[]);
+        let after = DataFlowManifest::build(
+            &[billing, support],
+            &[DeclassificationDescriptor {
+                model: "Customer",
+                model_path: "support::Customer",
+                field: "email",
+                classification: Classification::PersonalData,
+                purpose: "support_lookup",
+                sink: Sink::JsonResponse,
+                reason: "Support agents need it.",
+            }],
+        );
+        let drift = format_drift(&before, &after).expect("drift");
+        assert!(drift.contains("support::Customer.email"), "{drift}");
+        assert!(!drift.contains("billing::Customer.email"), "{drift}");
     }
 
     #[test]

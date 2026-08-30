@@ -6117,6 +6117,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 impl ::autumn_web::classify::ClassifiedField for #marker {
                     const MODEL: &'static str = stringify!(#name);
+                    // Module-qualified, because the manifest keys on this: two
+                    // linked crates can each define a `Customer` with a
+                    // classified `email`, and the bare name would merge them
+                    // into one row.
+                    const MODEL_PATH: &'static str =
+                        concat!(module_path!(), "::", stringify!(#name));
                     const FIELD: &'static str = #col;
                     const CLASSIFICATION: ::autumn_web::classify::Classification =
                         ::autumn_web::classify::Classification::PersonalData;
@@ -6125,6 +6131,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::inventory::submit! {
                     ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
                         model: stringify!(#name),
+                        model_path: concat!(module_path!(), "::", stringify!(#name)),
                         field: #col,
                         classification: ::autumn_web::classify::Classification::PersonalData,
                     }
@@ -6206,21 +6213,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // the type. Diesel round-trips through the opaque `ClassifiedText`
             // column wrapper, which is the only conversion out of `Classified`
             // that is not a declassification -- and it dead-ends in the database.
-            let classified_ty = classified_columns
+            // The Diesel wrapper carries the same marker as the field: an
+            // `F`-erasing column type would let a value be converted in as one
+            // column and back out as another, releasing it through the wrong
+            // boundary and recording it against the wrong column.
+            let classified_marker = classified_columns
                 .iter()
                 .find(|(cid, ..)| *cid == ident.as_ref().expect("named field"))
-                .map(|(_, _, marker)| {
-                    quote! { ::autumn_web::classify::Classified<#ty, #marker> }
-                });
-            let (ident_ty, classified_diesel) = classified_ty.map_or_else(
+                .map(|(_, _, marker)| marker);
+            let (ident_ty, classified_diesel) = classified_marker.map_or_else(
                 || (quote! { #ty }, quote! {}),
-                |wrapped| {
+                |marker| {
                     (
-                        wrapped,
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
                         quote! {
                             #[diesel(
-                                serialize_as = ::autumn_web::classify::ClassifiedText,
-                                deserialize_as = ::autumn_web::classify::ClassifiedText
+                                serialize_as = ::autumn_web::classify::ClassifiedText<#marker>,
+                                deserialize_as = ::autumn_web::classify::ClassifiedText<#marker>
                             )]
                         },
                     )
@@ -11062,6 +11071,11 @@ mod tests {
         assert!(
             generated.contains("ClassifiedFieldDescriptor"),
             "the column must reach the data-flow manifest: {generated}"
+        );
+        assert!(
+            generated.contains("module_path !"),
+            "the manifest identity must be module-qualified so two `Customer`s \
+             in different crates cannot share a row: {generated}"
         );
         assert!(
             generated.contains("Classification :: PersonalData"),

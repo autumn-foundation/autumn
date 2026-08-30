@@ -168,6 +168,7 @@ listing every sink it is proven reachable to:
   "fields": [
     {
       "model": "Customer",
+      "model_path": "shop::models::customer::Customer",
       "field": "email",
       "classification": "personal_data",
       "reachable_sinks": [
@@ -180,6 +181,7 @@ listing every sink it is proven reachable to:
     },
     {
       "model": "Order",
+      "model_path": "shop::models::order::Order",
       "field": "card_number",
       "classification": "personal_data",
       "reachable_sinks": []
@@ -187,6 +189,11 @@ listing every sink it is proven reachable to:
   ]
 }
 ```
+
+Rows are keyed on `model_path`, not the display name: two crates can each define
+a `Customer` with a classified `email`, and merging them into one row would hide
+one model's column behind the other's. The report prints the short name unless
+two rows share it.
 
 An **empty `reachable_sinks` means no leak**: nothing in the binary declares a
 boundary for that column, and a boundary is the only way to a gated sink.
@@ -238,7 +245,11 @@ autumn data-flow --check data-flow-manifest.json
   nothing can read it back out.
 - **The database sees a plain `Text` column.** Classification says where a value
   may *go*, not how it is stored. For at-rest protection, that is
-  [`#[encrypted]`](attribute-encryption.md).
+  [`#[encrypted]`](attribute-encryption.md). The column round-trips through
+  `ClassifiedText<CustomerEmailClassified>`, which carries the same field marker
+  as the value: an `F`-erasing column type would have been a way to convert a
+  value in as one classified column and back out as another, releasing it through
+  the wrong boundary and recording it against the wrong column.
 - **The column drops out of the client-controlled list surface.** A repository's
   `list()` allowlists every scalar column for `?filter[col]=` and `?sort=col`. A
   classified column is excluded from both: the filter would be an

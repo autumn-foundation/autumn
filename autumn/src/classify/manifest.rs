@@ -42,8 +42,11 @@ pub const DATA_FLOW_MANIFEST_MARKER: &str = "[autumn:data-flow] ";
 /// One `#[classified]` column, published by `#[model]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassifiedFieldDescriptor {
-    /// The model type's name.
+    /// The model type's name, for display.
     pub model: &'static str,
+    /// The model type's module-qualified path -- the join key, so two crates
+    /// that each define a `Customer` cannot share one manifest row.
+    pub model_path: &'static str,
     /// The column's Rust field name.
     pub field: &'static str,
     /// The tier it was annotated with.
@@ -56,8 +59,10 @@ inventory::collect!(ClassifiedFieldDescriptor);
 /// [`declassify!`](crate::declassify).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeclassificationDescriptor {
-    /// The model the released column belongs to.
+    /// The model the released column belongs to, for display.
     pub model: &'static str,
+    /// That model's module-qualified path -- the join key.
+    pub model_path: &'static str,
     /// The released column's field name.
     pub field: &'static str,
     /// The tier the column was classified at.
@@ -88,8 +93,11 @@ pub struct ReachableSink {
 /// One classified column and everywhere it can reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassifiedFieldFlow {
-    /// The model type's name.
+    /// The model type's name, for display.
     pub model: String,
+    /// The model type's module-qualified path, which is what makes this row
+    /// distinct from a same-named model in another module or crate.
+    pub model_path: String,
     /// The column's Rust field name.
     pub field: String,
     /// The tier it was annotated with.
@@ -121,11 +129,15 @@ impl DataFlowManifest {
         fields: &[ClassifiedFieldDescriptor],
         releases: &[DeclassificationDescriptor],
     ) -> Self {
+        // Keyed on the module-qualified path, not the bare name: two linked
+        // crates can each define a `Customer` with a classified `email`, and
+        // merging them would hide one model's column behind the other's row.
         let mut rows: BTreeMap<(&str, &str), ClassifiedFieldFlow> = BTreeMap::new();
         for descriptor in fields {
-            rows.entry((descriptor.model, descriptor.field))
+            rows.entry((descriptor.model_path, descriptor.field))
                 .or_insert_with(|| ClassifiedFieldFlow {
                     model: descriptor.model.to_string(),
+                    model_path: descriptor.model_path.to_string(),
                     field: descriptor.field.to_string(),
                     classification: descriptor.classification,
                     reachable_sinks: Vec::new(),
@@ -138,9 +150,10 @@ impl DataFlowManifest {
             // dropped, because silently losing a release edge is the one failure
             // mode a leak manifest must not have.
             let row = rows
-                .entry((release.model, release.field))
+                .entry((release.model_path, release.field))
                 .or_insert_with(|| ClassifiedFieldFlow {
                     model: release.model.to_string(),
+                    model_path: release.model_path.to_string(),
                     field: release.field.to_string(),
                     classification: release.classification,
                     reachable_sinks: Vec::new(),
@@ -209,14 +222,20 @@ impl DataFlowManifest {
                 let _ = write!(
                     out,
                     "\n  {}.{} ({}) -> no sink (no declassification boundary declared)",
-                    row.model, row.field, row.classification
+                    self.display_model(row),
+                    row.field,
+                    row.classification
                 );
             } else {
                 for reach in &row.reachable_sinks {
                     let _ = write!(
                         out,
                         "\n  {}.{} ({}) -> {} for {}",
-                        row.model, row.field, row.classification, reach.sink, reach.purpose
+                        self.display_model(row),
+                        row.field,
+                        row.classification,
+                        reach.sink,
+                        reach.purpose
                     );
                 }
             }
@@ -225,10 +244,25 @@ impl DataFlowManifest {
     }
 
     fn model_count(&self) -> usize {
-        let mut models: Vec<&str> = self.fields.iter().map(|f| f.model.as_str()).collect();
+        let mut models: Vec<&str> = self.fields.iter().map(|f| f.model_path.as_str()).collect();
         models.sort_unstable();
         models.dedup();
         models.len()
+    }
+
+    /// How a row is named in the human report: the short name, unless another
+    /// row's model shares it, in which case the full path is the only honest
+    /// spelling.
+    fn display_model(&self, row: &ClassifiedFieldFlow) -> String {
+        let ambiguous = self
+            .fields
+            .iter()
+            .any(|other| other.model == row.model && other.model_path != row.model_path);
+        if ambiguous {
+            row.model_path.clone()
+        } else {
+            row.model.clone()
+        }
     }
 }
 
@@ -281,6 +315,22 @@ mod tests {
     fn field(model: &'static str, name: &'static str) -> ClassifiedFieldDescriptor {
         ClassifiedFieldDescriptor {
             model,
+            model_path: model,
+            field: name,
+            classification: Classification::PersonalData,
+        }
+    }
+
+    /// Same display name, different module -- the collision the join key exists
+    /// to keep apart.
+    fn field_in(
+        path: &'static str,
+        model: &'static str,
+        name: &'static str,
+    ) -> ClassifiedFieldDescriptor {
+        ClassifiedFieldDescriptor {
+            model,
+            model_path: path,
             field: name,
             classification: Classification::PersonalData,
         }
@@ -293,6 +343,7 @@ mod tests {
     ) -> DeclassificationDescriptor {
         DeclassificationDescriptor {
             model,
+            model_path: model,
             field: name,
             classification: Classification::PersonalData,
             purpose,
@@ -357,6 +408,24 @@ mod tests {
         let backwards = DataFlowManifest::build(&[field("User", "email")], &[b, a]);
         assert_eq!(forwards, backwards);
         assert_eq!(forwards.fields[0].reachable_sinks.len(), 2);
+    }
+
+    #[test]
+    fn same_named_models_in_different_modules_stay_separate_rows() {
+        let manifest = DataFlowManifest::build(
+            &[
+                field_in("billing::Customer", "Customer", "email"),
+                field_in("support::Customer", "Customer", "email"),
+            ],
+            &[],
+        );
+        assert_eq!(manifest.fields.len(), 2, "{manifest:?}");
+        // Ambiguous short names are reported by their full path, or the report
+        // would show the same row twice.
+        let summary = manifest.summary();
+        assert!(summary.contains("billing::Customer.email"), "{summary}");
+        assert!(summary.contains("support::Customer.email"), "{summary}");
+        assert!(summary.contains("2 models"), "{summary}");
     }
 
     #[test]

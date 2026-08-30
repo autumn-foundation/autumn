@@ -74,6 +74,13 @@ fn customer() -> Customer {
 #[test]
 fn classified_field_marker_carries_model_field_and_tier() {
     assert_eq!(CustomerEmailClassified::MODEL, "Customer");
+    // Module-qualified: the manifest keys on this, so two crates that each
+    // define a `Customer` with a classified `email` stay separate rows.
+    assert!(
+        CustomerEmailClassified::MODEL_PATH.ends_with("::data_classification::Customer"),
+        "{}",
+        CustomerEmailClassified::MODEL_PATH
+    );
     assert_eq!(CustomerEmailClassified::FIELD, "email");
     assert_eq!(
         CustomerEmailClassified::CLASSIFICATION,
@@ -169,6 +176,7 @@ fn manifest_reports_an_empty_reachable_set_for_a_never_released_field() {
     let manifest = DataFlowManifest::build(
         &[ClassifiedFieldDescriptor {
             model: "Order",
+            model_path: "shop::models::Order",
             field: "card_number",
             classification: Classification::PersonalData,
         }],
@@ -192,17 +200,20 @@ fn manifest_join_is_keyed_on_model_and_field() {
         &[
             ClassifiedFieldDescriptor {
                 model: "User",
+                model_path: "shop::models::User",
                 field: "email",
                 classification: Classification::PersonalData,
             },
             ClassifiedFieldDescriptor {
                 model: "Order",
+                model_path: "shop::models::Order",
                 field: "email",
                 classification: Classification::PersonalData,
             },
         ],
         &[DeclassificationDescriptor {
             model: "User",
+            model_path: "shop::models::User",
             field: "email",
             classification: Classification::PersonalData,
             purpose: "support_lookup",

@@ -147,8 +147,17 @@ impl std::fmt::Display for Sink {
 /// [`Declassification`] to exactly one column, and it turns a release into a
 /// *build-time* manifest edge rather than a runtime observation.
 pub trait ClassifiedField: 'static {
-    /// The model type's name, e.g. `"Customer"`.
+    /// The model type's name, e.g. `"Customer"`. For display.
     const MODEL: &'static str;
+    /// The model type's module-qualified path, e.g.
+    /// `"my_app::models::customer::Customer"`.
+    ///
+    /// This, not [`MODEL`](Self::MODEL), is the manifest's identity for the
+    /// column: two crates (or two modules) can each define a `Customer` with a
+    /// classified `email`, and keying on the bare name would merge them into one
+    /// row -- hiding an added classified column, or attributing one model's
+    /// reachable sinks to the other's.
+    const MODEL_PATH: &'static str;
     /// The column's Rust field name, e.g. `"email"`.
     const FIELD: &'static str;
     /// The tier the column was annotated with.
@@ -254,6 +263,12 @@ impl<T, F: ClassifiedField> Classified<T, F> {
     #[must_use]
     pub const fn model() -> &'static str {
         F::MODEL
+    }
+
+    /// The module-qualified path of the model this column belongs to.
+    #[must_use]
+    pub const fn model_path() -> &'static str {
+        F::MODEL_PATH
     }
 
     /// The column's field name.
@@ -391,6 +406,7 @@ impl<F: ClassifiedField> Declassification<F> {
     const fn record(&self) -> DeclassificationRecord {
         DeclassificationRecord {
             model: F::MODEL,
+            model_path: F::MODEL_PATH,
             field: F::FIELD,
             classification: F::CLASSIFICATION,
             purpose: self.purpose,
@@ -403,7 +419,7 @@ impl<F: ClassifiedField> Declassification<F> {
 impl<F: ClassifiedField> std::fmt::Debug for Declassification<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Declassification")
-            .field("model", &F::MODEL)
+            .field("model", &F::MODEL_PATH)
             .field("field", &F::FIELD)
             .field("purpose", &self.purpose)
             .field("sink", &self.sink)
@@ -420,6 +436,9 @@ impl<F: ClassifiedField> std::fmt::Debug for Declassification<F> {
 pub struct DeclassificationRecord {
     /// The model the column belongs to.
     pub model: &'static str,
+    /// That model's module-qualified path -- its identity, where `model` is its
+    /// display name.
+    pub model_path: &'static str,
     /// The column's field name.
     pub field: &'static str,
     /// The tier the column was classified at.
@@ -567,6 +586,7 @@ macro_rules! declassify {
         $crate::reexports::inventory::submit! {
             $crate::classify::manifest::DeclassificationDescriptor {
                 model: <$field as $crate::classify::ClassifiedField>::MODEL,
+                model_path: <$field as $crate::classify::ClassifiedField>::MODEL_PATH,
                 field: <$field as $crate::classify::ClassifiedField>::FIELD,
                 classification: <$field as $crate::classify::ClassifiedField>::CLASSIFICATION,
                 purpose: $purpose,
@@ -597,6 +617,7 @@ mod tests {
     struct TestField;
     impl ClassifiedField for TestField {
         const MODEL: &'static str = "Customer";
+        const MODEL_PATH: &'static str = "test::Customer";
         const FIELD: &'static str = "email";
         const CLASSIFICATION: Classification = Classification::PersonalData;
     }
@@ -607,6 +628,7 @@ mod tests {
     struct ObservedField;
     impl ClassifiedField for ObservedField {
         const MODEL: &'static str = "ObserverCustomer";
+        const MODEL_PATH: &'static str = "test::ObserverCustomer";
         const FIELD: &'static str = "email";
         const CLASSIFICATION: Classification = Classification::PersonalData;
     }
@@ -664,6 +686,7 @@ mod tests {
         struct GuardField;
         impl ClassifiedField for GuardField {
             const MODEL: &'static str = "GuardCustomer";
+            const MODEL_PATH: &'static str = "test::GuardCustomer";
             const FIELD: &'static str = "email";
             const CLASSIFICATION: Classification = Classification::PersonalData;
         }
@@ -705,6 +728,10 @@ mod tests {
             Classification::PersonalData
         );
         assert_eq!(Classified::<String, TestField>::model(), "Customer");
+        assert_eq!(
+            Classified::<String, TestField>::model_path(),
+            "test::Customer"
+        );
         assert_eq!(Classified::<String, TestField>::field(), "email");
     }
 

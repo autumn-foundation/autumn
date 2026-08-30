@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--check` fails the build when it drifts from the committed copy, so a new
   release edge has to be reviewed rather than merged silently.
 
+  The manifest keys each row on the model's module-qualified path, so two crates
+  that each define a `Customer` with a classified `email` cannot merge into one
+  row, and the Diesel column wrapper carries the column's field marker, so a
+  value cannot be converted in as one classified column and back out as another.
+
   The first slice deliberately stops at one tier and one sink. Name-based log
   and header redaction are untouched and still run; the write structs keep the
   plain `String` (taking personal data *in* is not a release) and simply never
