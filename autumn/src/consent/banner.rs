@@ -35,8 +35,8 @@
 
 use axum::body::{Body, Bytes};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
 };
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
@@ -498,6 +498,14 @@ fn htmx_header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
 /// than ship a validator for bytes nobody will receive.
 fn drop_stale_representation_metadata(headers: &mut axum::http::HeaderMap) {
     headers.remove(ETAG);
+    // `Accept-Ranges: bytes` invites the client to resume with a `Range`
+    // request -- but a range request is answered by the handler, and this
+    // middleware passes a `206` through untouched, so those offsets address the
+    // ORIGINAL bannerless bytes while the client is splicing them into the
+    // longer body it already received. That silently corrupts the result.
+    // Withdrawing the offer is the honest move: ranges over a representation
+    // this middleware rewrote are not something the origin can serve.
+    headers.remove(ACCEPT_RANGES);
     // Not `http::header` constants, so they are named here. `Content-Digest`
     // and `Repr-Digest` are RFC 9530; `Digest` and `Content-MD5` are the
     // obsolete spellings still emitted by some proxies and SDKs.
@@ -3240,6 +3248,7 @@ mod tests {
                         .header(axum::http::header::ETAG, "\"pre-splice\"")
                         .header("content-digest", "sha-256=:deadbeef:")
                         .header("digest", "SHA-256=deadbeef")
+                        .header(axum::http::header::ACCEPT_RANGES, "bytes")
                         .body(Body::from("<html><body>hi</body></html>"))
                         .unwrap()
                 }),
@@ -3284,6 +3293,12 @@ mod tests {
             !headers.contains_key("digest"),
             "the obsolete Digest spelling must go too"
         );
+        assert!(
+            !headers.contains_key(axum::http::header::ACCEPT_RANGES),
+            "a range offer over bytes this middleware rewrote must be withdrawn: \
+             a resumed 206 comes from the handler and addresses the original, \
+             bannerless representation"
+        );
         assert_eq!(
             headers
                 .get(CONTENT_LENGTH)
@@ -3306,6 +3321,7 @@ mod tests {
                     Response::builder()
                         .header(CONTENT_TYPE, "application/json")
                         .header(axum::http::header::ETAG, "\"kept\"")
+                        .header(axum::http::header::ACCEPT_RANGES, "bytes")
                         .body(Body::from("{}"))
                         .unwrap()
                 }),
@@ -3331,6 +3347,14 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("\"kept\""),
             "an untouched body keeps its validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "and keeps its range offer -- those bytes are still what ships"
         );
     }
 }
