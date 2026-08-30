@@ -77,6 +77,17 @@ Two sources need **no declaration at all**:
   plaintext strategy is refused outright. `null` is accepted on a nullable
   encrypted column. The scrub needs the target's `active_record_encryption`
   credentials for this and refuses before writing anything if they are missing.
+  It also refuses if it cannot tell *which* columns are encrypted — a host with
+  the CLI and `scrub.toml` but no `src/models` must name them, with their mode,
+  under `[tables.<t>.encrypted]`:
+
+  ```toml
+  [tables.users.encrypted]
+  api_token = "randomized"
+  email = "deterministic"   # the mode matters: re-encrypting a deterministic
+                            # column in randomized mode leaves ciphertext the
+                            # app can no longer equality-query
+  ```
 - **Tables registered with the GDPR anonymize strategy** — a
   `GdprRegistry::register(ModelRegistration::anonymize("comments"))` call in your
   app classifies every non-key column of `comments` as PII. Because that is a
@@ -273,8 +284,9 @@ apply-time error.
   is protected too), and on a `CHECK`-constrained column, where no fabricated
   value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
-  refused on any column covered by a unique index — composite and partial
-  included; and a `varchar(n)` bound narrows the generated token or refuses,
+  refused on any column covered by a unique index — composite, partial, and the
+  input columns of a unique *expression* index (`(lower(email))`), whose
+  uniqueness a per-row token cannot preserve through an arbitrary expression; and a `varchar(n)` bound narrows the generated token or refuses,
   rather than truncating into collisions.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
@@ -298,8 +310,10 @@ apply-time error.
   in another non-system schema is **refused** rather than reported clean over a
   universe the classifier never looked at. The same applies to a table the
   connecting role cannot see: the scrub compares `pg_class` against what it
-  could actually read and refuses on any difference, so a privilege gap can
-  never look like a clean bill of health.
+  could actually read — tables **and** columns, since privileges are granted per
+  column too — and refuses on any difference, so a privilege gap can never look
+  like a clean bill of health. Foreign tables count as part of that universe: one
+  left pointing at production would otherwise be classified by nothing.
 - **Row-level security is refused.** A role that does not bypass RLS would update
   only the rows its policies expose and report success — a silent partial scrub.
   Connect as the table owner or a `BYPASSRLS` role.

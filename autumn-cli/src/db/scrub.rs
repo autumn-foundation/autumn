@@ -215,6 +215,9 @@ pub enum ScrubError {
         /// A credential-safe reason.
         detail: String,
     },
+    /// Neither the model source nor the declaration says which columns are
+    /// `#[encrypted]`, so the scrub cannot tell them apart from plain text.
+    EncryptedMetadataUnavailable,
     /// `public` holds base tables the connecting role cannot see, so they never
     /// reached the classifier.
     InaccessibleTables {
@@ -413,6 +416,19 @@ impl std::fmt::Display for ScrubError {
                  plaintext replacement would make every later read of that row fail. Provide the \
                  target's `active_record_encryption` credentials (`autumn credentials edit`), or \
                  declare those columns `null` in {SCRUB_CONFIG_FILE} if they are nullable."
+            ),
+            Self::EncryptedMetadataUnavailable => write!(
+                f,
+                "No model source was found, so the scrub cannot tell which columns are \
+                 #[encrypted].\n  \
+                 That matters more than it sounds: an unrecognised encrypted column declared \
+                 `safe` keeps its production ciphertext, and one given a plaintext strategy \
+                 becomes permanently unreadable. Run the scrub from the project root (where \
+                 `src/models` lives), or name them — with their mode — in {SCRUB_CONFIG_FILE}:\n    \
+                 [tables.users.encrypted]\n    api_token = \"randomized\"\n    \
+                 email = \"deterministic\"\n  \
+                 An app with no encrypted columns at all still needs one empty \
+                 `[tables.<any>.encrypted]` section to say so deliberately."
             ),
             Self::InaccessibleTables { tables } => write!(
                 f,
@@ -616,6 +632,23 @@ pub struct ScrubDefaults {
     pub safe_columns: Vec<String>,
 }
 
+/// The at-rest encryption mode a column was written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionMode {
+    /// `#[encrypted]` — a fresh nonce per write.
+    Randomized,
+    /// `#[encrypted(deterministic)]` — equality-queryable.
+    Deterministic,
+}
+
+impl EncryptionMode {
+    /// Whether this is the deterministic mode.
+    const fn is_deterministic(self) -> bool {
+        matches!(self, Self::Deterministic)
+    }
+}
+
 /// One table's declaration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -626,6 +659,14 @@ pub struct TableRule {
     /// PII columns and how each is replaced.
     #[serde(default)]
     pub pii: BTreeMap<String, Strategy>,
+    /// At-rest-encrypted columns and their mode, for a host that has the CLI and
+    /// `scrub.toml` but not the model source the `#[encrypted]` markers live in.
+    ///
+    /// The mode matters: re-encrypting a `deterministic` column in randomized
+    /// mode leaves valid ciphertext that the app can no longer equality-query,
+    /// so it cannot be guessed.
+    #[serde(default)]
+    pub encrypted: BTreeMap<String, EncryptionMode>,
 }
 
 /// How framework-owned tables are handled.
@@ -676,10 +717,15 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     // is a live credential leak, not merely a PII one.
     "api_tokens",
     "autumn_experiment_assignments",
+    // `actor` on both: who was pinned to a variant, and who changed what.
+    "autumn_experiment_changes",
+    "autumn_experiment_overrides",
     // `actor_allowlist` names the individual users a flag is switched on for.
     "autumn_feature_flags",
     "autumn_job_tracking",
     "autumn_jobs",
+    // `context` / `record` JSONB hold the full row a hook was queued for.
+    "autumn_repository_commit_hooks",
     // The indexed text of app records — the search index is a second copy of
     // whatever was made searchable.
     "autumn_search_documents",
@@ -1168,7 +1214,12 @@ fn check_config_freshness(
             continue;
         };
         let columns: BTreeSet<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-        for column in rule.safe.iter().chain(rule.pii.keys()) {
+        for column in rule
+            .safe
+            .iter()
+            .chain(rule.pii.keys())
+            .chain(rule.encrypted.keys())
+        {
             if !columns.contains(column.as_str()) {
                 stale.push(format!("{name}.{column}"));
             }
@@ -1257,7 +1308,31 @@ fn unreachable_tables(facts: &DatabaseFacts, introspected: &[Table]) -> Vec<Stri
         .filter(|t| !seen.contains(t.as_str()) && !is_framework_table(t))
         .cloned()
         .collect();
+
+    // Privileges are per COLUMN as well as per table: a table can be visible
+    // while some of its columns are not, and those would be scrubbed by nothing
+    // while the table itself classified cleanly.
+    let seen_columns: BTreeSet<(&str, &str)> = introspected
+        .iter()
+        .flat_map(|t| {
+            t.columns
+                .iter()
+                .map(move |c| (t.name.as_str(), c.name.as_str()))
+        })
+        .collect();
+    missing.extend(
+        facts
+            .public_columns
+            .iter()
+            .filter(|(table, column)| {
+                seen.contains(table.as_str())
+                    && !is_framework_table(table)
+                    && !seen_columns.contains(&(table.as_str(), column.as_str()))
+            })
+            .map(|(table, column)| format!("{table}.{column}")),
+    );
     missing.sort();
+    missing.dedup();
     missing
 }
 
@@ -2051,7 +2126,34 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
     let config = load_config(args.config.as_deref())?;
     check_purge_list(&config)?;
     let project_root = Path::new(".");
-    let encrypted = encrypted_columns(project_root)?;
+    let models_path = crate::schema::existing_models_path(project_root);
+    let declared_encrypted = config
+        .tables
+        .iter()
+        .any(|(_, rule)| !rule.encrypted.is_empty());
+
+    // Without the model source there is no way to know WHICH columns are
+    // `#[encrypted]`, and an unknown one is the worst possible outcome: declared
+    // `safe` it keeps production ciphertext, given a plaintext strategy it
+    // becomes permanently unreadable. So this is a refusal, not a warning —
+    // unless the declaration names them (and their mode) itself.
+    if models_path.is_none() && !declared_encrypted {
+        return Err(ScrubError::EncryptedMetadataUnavailable);
+    }
+
+    let mut encrypted = encrypted_columns(project_root)?;
+    // A declaration supplements the model scan (and supplies everything when
+    // there is no model source at all); the model stays authoritative where the
+    // two overlap, since it is the definition rather than a copy of it.
+    for (table, rule) in &config.tables {
+        for (column, mode) in &rule.encrypted {
+            encrypted
+                .entry(table.clone())
+                .or_default()
+                .entry(column.clone())
+                .or_insert_with(|| mode.is_deterministic());
+        }
+    }
     let anonymize = scan_anonymize_tables(&project_root.join("src"))?;
 
     let encrypted_count: usize = encrypted.values().map(BTreeMap::len).sum();
@@ -2060,13 +2162,6 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
          {} GDPR anonymize registration(s).",
         anonymize.len()
     );
-    if encrypted_count == 0 && anonymize.is_empty() && !project_root.join("src").is_dir() {
-        eprintln!(
-            "  \u{26A0}\u{FE0F}  No `src/` directory here, so NEITHER automatic source could be \
-             read. Run the scrub from the project root, or every column must be declared in \
-             {SCRUB_CONFIG_FILE} by hand."
-        );
-    }
 
     Ok(SourceClassification {
         config,
@@ -2318,6 +2413,13 @@ pub struct DatabaseFacts {
     pub other_schemas: BTreeSet<String>,
     /// Framework-owned tables present that the classification never sees.
     pub framework_tables: Vec<String>,
+    /// Every column of every `public` table, read from `pg_attribute`.
+    ///
+    /// A role can hold privileges on some columns of a table but not others, and
+    /// `information_schema.columns` (what introspection reads) omits the ones it
+    /// cannot see — so the table would classify, the visible columns would be
+    /// rewritten, and the hidden PII would survive.
+    pub public_columns: BTreeSet<(String, String)>,
     /// Every base table in `public`, read from `pg_class`.
     ///
     /// Introspection enumerates through `information_schema.tables`, which shows
@@ -2473,7 +2575,7 @@ fn probe_database_facts(
     } else {
         "i.indkey"
     };
-    let unique_columns = pair_set(
+    let mut unique_columns = pair_set(
         sql_query(format!(
             "SELECT rel.relname AS tbl, att.attname AS col \
              FROM pg_index i \
@@ -2486,6 +2588,29 @@ fn probe_database_facts(
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
+
+    // A unique EXPRESSION index (`CREATE UNIQUE INDEX ON users (left(email, 1))`)
+    // stores `0` in `indkey` for the expression position, so the join above sees
+    // no column at all. Its real inputs come from `pg_depend`. Uniqueness after
+    // an arbitrary expression cannot be preserved by a per-row token — `left(x,1)`
+    // collapses every scrubbed value onto one character — so those columns are
+    // marked unique-constrained and any non-injective strategy on them is
+    // refused. (An injective strategy is refused too, which is the fail-closed
+    // side of the trade: the expression's output is what has to stay distinct,
+    // and only the developer knows whether it does.)
+    unique_columns.extend(pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
+             WHERE i.indisunique AND i.indexprs IS NOT NULL AND d.refobjsubid > 0",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    ));
 
     // `NULLS NOT DISTINCT` (PG15+) makes a second NULL a violation, so the
     // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
@@ -2553,7 +2678,8 @@ fn probe_database_facts(
     let other_schemas = names(
         "SELECT DISTINCT ns.nspname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
-         WHERE rel.relkind IN ('r', 'p') AND ns.nspname NOT IN ('public', 'information_schema') \
+         WHERE rel.relkind IN ('r', 'p', 'f') \
+         AND ns.nspname NOT IN ('public', 'information_schema') \
          AND ns.nspname NOT LIKE 'pg\\_%'",
         &mut conn,
     )?
@@ -2604,14 +2730,29 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
+    // `f` (foreign tables) is deliberately included: introspection reads only
+    // `BASE TABLE`, so a foreign table left pointing at production would be
+    // classified by nothing at all and still report a clean scrub.
     let public_base_tables = names(
         "SELECT rel.relname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relkind IN ('r', 'p')",
+         WHERE rel.relkind IN ('r', 'p', 'f')",
         &mut conn,
     )?
     .into_iter()
     .collect();
+
+    let public_columns = pair_set(
+        sql_query(
+            "SELECT rel.relname AS tbl, att.attname AS col \
+             FROM pg_attribute att \
+             JOIN pg_class rel ON rel.oid = att.attrelid \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped",
+        )
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+    );
 
     Ok(DatabaseFacts {
         foreign_key_columns,
@@ -2625,6 +2766,7 @@ fn probe_database_facts(
         materialized_views,
         other_schemas,
         framework_tables,
+        public_columns,
         public_base_tables,
     })
 }
@@ -3290,6 +3432,74 @@ mod tests {
         let column = Column::new("token", ColumnType::Uuid);
         let expr = replacement_expr(Strategy::Uuid, &column, "TOK", true).unwrap();
         assert_eq!(expr, "(substr(TOK, 1, 32))::uuid");
+    }
+
+    #[test]
+    fn column_level_privilege_gaps_are_refused_too() {
+        // A role can see a table but not all of its columns: the table
+        // classifies, the visible columns are rewritten, and the hidden PII
+        // survives a "successful" scrub.
+        let facts = DatabaseFacts {
+            public_base_tables: BTreeSet::from(["users".to_owned()]),
+            public_columns: BTreeSet::from([
+                ("users".to_owned(), "id".to_owned()),
+                ("users".to_owned(), "email".to_owned()),
+                ("users".to_owned(), "ssn".to_owned()),
+            ]),
+            ..DatabaseFacts::default()
+        };
+        // `users_table()` has no `ssn`, standing in for a column introspection
+        // could not see.
+        assert_eq!(
+            unreachable_tables(&facts, &[users_table()]),
+            vec!["users.ssn".to_owned()]
+        );
+    }
+
+    #[test]
+    fn every_payload_bearing_framework_table_is_listed() {
+        // Each of these is excluded from classification by the `autumn_` prefix
+        // (or the explicit filter) while holding app-supplied payloads or actor
+        // identities.
+        for table in [
+            "_autumn_ledger_revisions",
+            "_autumn_version_history",
+            "api_tokens",
+            "autumn_experiment_assignments",
+            "autumn_experiment_changes",
+            "autumn_experiment_overrides",
+            "autumn_feature_flags",
+            "autumn_jobs",
+            "autumn_repository_commit_hooks",
+            "autumn_search_documents",
+            "autumn_sync_rows",
+            "feature_flag_changes",
+        ] {
+            assert!(
+                FRAMEWORK_PAYLOAD_TABLES.contains(&table),
+                "{table} carries app data the classification never sees"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_columns_may_be_declared_when_there_is_no_model_source() {
+        let config = parse_config_str(
+            r#"
+            [tables.users.encrypted]
+            api_token = "randomized"
+            email = "deterministic"
+            "#,
+        )
+        .unwrap();
+        let users = config.tables.get("users").unwrap();
+        assert_eq!(
+            users.encrypted.get("email"),
+            Some(&EncryptionMode::Deterministic),
+            "the mode cannot be guessed: re-encrypting a deterministic column in \
+             randomized mode leaves ciphertext the app can no longer equality-query"
+        );
+        assert!(!users.encrypted["api_token"].is_deterministic());
     }
 
     #[test]
@@ -4083,6 +4293,7 @@ mod tests {
             TableRule {
                 safe: Vec::new(),
                 pii: BTreeMap::from([(r#"na"me"#.to_owned(), Strategy::Redact)]),
+                encrypted: BTreeMap::new(),
             },
         );
         let plan = plan_for(&[t], &config, &empty_encrypted(), &no_anonymize()).unwrap();
@@ -4423,6 +4634,7 @@ mod tests {
             TableRule {
                 safe: Vec::new(),
                 pii: BTreeMap::from([("last4".to_owned(), Strategy::Zero)]),
+                encrypted: BTreeMap::new(),
             },
         );
         let facts = DatabaseFacts {

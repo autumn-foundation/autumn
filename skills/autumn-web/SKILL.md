@@ -2455,7 +2455,7 @@ credentials and refuses before writing if they are missing.
 foreign key (composite components included), on `CHECK`-constrained columns, and
 on generated columns; `null` is refused on `NOT NULL` and under `NULLS NOT
 DISTINCT`; a constant-valued strategy is refused on any column in a unique index
-(partial and composite included); a `varchar(n)` bound narrows the token or
+(partial, composite, and expression-index inputs); a `varchar(n)` bound narrows the token or
 refuses. Statements are `public`-qualified with a pinned `search_path` and the
 planned tables are locked; non-`public` schemas, tables the role
 cannot see, and RLS-enabled tables are refused rather than silently
