@@ -530,6 +530,24 @@ pub struct SandboxOutcome {
     pub stderr: String,
 }
 
+impl SandboxOutcome {
+    /// A request refused before the guest produced anything: no denials, no
+    /// peak, no stderr, because nothing of the guest's ever ran.
+    ///
+    /// `fuel_used` is what the *host* had already committed on its behalf — the
+    /// whole budget when a charge could not be covered, zero when the request
+    /// was turned away before it was priced.
+    fn refused(failure: SandboxFailure, fuel_used: u64) -> Self {
+        Self {
+            result: Err(failure),
+            denials: Vec::new(),
+            fuel_used,
+            peak_memory_bytes: 0,
+            stderr: String::new(),
+        }
+    }
+}
+
 // ── The host ─────────────────────────────────────────────────────────────
 
 /// A compiled sandboxed plugin, ready to serve requests.
@@ -737,16 +755,13 @@ impl SandboxHost {
         // budget buys an arbitrarily large host-side copy. So the ceiling is
         // checked first, before the request is priced or walked at all.
         if request.body.len() > limits.max_request_body_bytes {
-            return SandboxOutcome {
-                result: Err(SandboxFailure::RequestBudget {
+            return SandboxOutcome::refused(
+                SandboxFailure::RequestBudget {
                     max: limits.max_request_body_bytes,
                     len: request.body.len(),
-                }),
-                denials: Vec::new(),
-                fuel_used: 0,
-                peak_memory_bytes: 0,
-                stderr: String::new(),
-            };
+                },
+                0,
+            );
         }
 
         // Building the guest's stdin is host work proportional to the request:
@@ -762,15 +777,12 @@ impl SandboxHost {
         // left, which is the same arrangement instantiation already has.
         let encoding = encoding_fuel(request);
         let Some(after_encoding) = limits.fuel.checked_sub(encoding) else {
-            return SandboxOutcome {
-                result: Err(SandboxFailure::FuelExhausted {
+            return SandboxOutcome::refused(
+                SandboxFailure::FuelExhausted {
                     budget: limits.fuel,
-                }),
-                denials: Vec::new(),
-                fuel_used: limits.fuel,
-                peak_memory_bytes: 0,
-                stderr: String::new(),
-            };
+                },
+                limits.fuel,
+            );
         };
 
         let granted: Vec<SandboxCapability> = self.manifest.capabilities.clone();
@@ -782,13 +794,10 @@ impl SandboxHost {
                 // The host could not encode its own request. Report it as a
                 // plugin-prefix failure rather than propagating: the rest of
                 // the application is unaffected either way.
-                return SandboxOutcome {
-                    result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
-                    denials: Vec::new(),
-                    fuel_used: 0,
-                    peak_memory_bytes: 0,
-                    stderr: String::new(),
-                };
+                return SandboxOutcome::refused(
+                    SandboxFailure::Instantiation(guest_text(&err.to_string())),
+                    0,
+                );
             }
         };
         // The frame's bytes are *moved* into the queue rather than copied into
@@ -804,13 +813,10 @@ impl SandboxHost {
         // Set before instantiation, so the budget is in place the moment the
         // first guest instruction runs.
         if let Err(err) = store.set_fuel(after_encoding) {
-            return SandboxOutcome {
-                result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
-                denials: Vec::new(),
-                fuel_used: 0,
-                peak_memory_bytes: 0,
-                stderr: String::new(),
-            };
+            return SandboxOutcome::refused(
+                SandboxFailure::Instantiation(guest_text(&err.to_string())),
+                0,
+            );
         }
 
         // wasmi does not meter instantiation: every request copies the module's
@@ -823,13 +829,10 @@ impl SandboxHost {
         match after_encoding.checked_sub(self.instantiation_fuel) {
             Some(left) => {
                 if let Err(err) = store.set_fuel(left) {
-                    return SandboxOutcome {
-                        result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
-                        denials: Vec::new(),
-                        fuel_used: 0,
-                        peak_memory_bytes: 0,
-                        stderr: String::new(),
-                    };
+                    return SandboxOutcome::refused(
+                        SandboxFailure::Instantiation(guest_text(&err.to_string())),
+                        0,
+                    );
                 }
             }
             None => {
@@ -845,13 +848,10 @@ impl SandboxHost {
 
         let mut linker = <Linker<HostState>>::new(&self.engine);
         if let Err(err) = define_wasi_shim(&mut linker) {
-            return SandboxOutcome {
-                result: Err(SandboxFailure::Instantiation(guest_text(&err.to_string()))),
-                denials: Vec::new(),
-                fuel_used: 0,
-                peak_memory_bytes: 0,
-                stderr: String::new(),
-            };
+            return SandboxOutcome::refused(
+                SandboxFailure::Instantiation(guest_text(&err.to_string())),
+                0,
+            );
         }
 
         let started = linker
