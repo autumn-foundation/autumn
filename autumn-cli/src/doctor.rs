@@ -3085,7 +3085,7 @@ fn check_replica_migration_versions(
 /// The effective primary backend is `primary_url` if set, else the legacy `url`
 /// (mirroring `DatabaseConfig::effective_primary_url`). Returns `true` only when
 /// the effective primary is `SQLite` *and* the real validation accepts the
-/// topology; a non-SQLite primary returns `false` because this helper only gates
+/// topology; a non-`SQLite` primary returns `false` because this helper only gates
 /// the `SQLite` Pass path (Postgres roles keep their TCP reachability checks).
 fn sqlite_primary_target_is_bootable(
     legacy_url: Option<&str>,

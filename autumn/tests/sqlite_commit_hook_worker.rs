@@ -182,7 +182,7 @@ async fn total_notes(pool: &SqlitePool) -> i64 {
 }
 
 /// Enqueue a durable hook through the REAL enqueue surface, inside the ambient
-/// tenant scope (so the SQLite worker's tenant round-trip is exercised).
+/// tenant scope (so the `SQLite` worker's tenant round-trip is exercised).
 async fn enqueue(
     pool: &SqlitePool,
     handler_key: &str,

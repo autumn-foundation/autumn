@@ -1,0 +1,5 @@
+error: `acknowledge_stale` requires a non-empty reason: it is the only record of why this cached read is allowed to serve stale data
+ --> tests/compile-fail/cached_acknowledge_stale_blank_reason.rs:4:30
+  |
+4 | #[cached(acknowledge_stale = "   ")]
+  |                              ^^^^^

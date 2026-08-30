@@ -224,7 +224,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, a two-node self-clustering substrate needing no coordination service, and Docker Compose deployment |
 | [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, route-level SEO (`seo(...)`, `sitemap.xml`, `robots.txt`), live-tunable config, failure capsules with an `autumn replay` walkthrough, and a seeded `#[sim_test]` |
+| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, route-level SEO (`seo(...)`, `sitemap.xml`, `robots.txt`), typed accessible forms, sanitized user-submitted rich text, cookie consent, offset pagination, live-tunable config, failure capsules with an `autumn replay` walkthrough, and a seeded `#[sim_test]` |
 | [`examples/saas`](examples/saas) | Multi-tenant SaaS starter: session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype (see the [starters guide](docs/guide/starters.md)) |
 | [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
 | [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
@@ -236,6 +236,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Authentication](docs/guide/authentication.md) — sessions, password policy, login/logout, `#[secured]`, lockout, and remember-me; the hub that links OAuth, step-up, and MFA
 - [Dev-Loop Latency Budget](docs/guide/dev-loop-latency.md) — p50/p95/max budgets per change class, measurement methodology, and CI gates for `autumn dev`
+- [Cache Coherence](docs/guide/cache-coherence.md) — `autumn cache audit`: the build fails when a `#[repository]` write can leave a `#[cached]` read stale with no invalidation covering it, turning cache invalidation from a runtime footgun into a compile-time obligation
 - [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
@@ -265,11 +266,14 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
-- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code after showing you the diff; everything it cannot safely rewrite is listed with `file:line` and a guide link
+- [Upgrading](docs/guide/upgrading.md) — `autumn upgrade` applies each release's mechanical API migrations to your own code **and** reconciles your project's framework-owned scaffold files (`Dockerfile`, `build.rs`, CI workflow, toolchain configs) against the current release, after showing you the diff; files you edited are flagged as conflicts rather than overwritten, `--check` exits nonzero on drift for CI, and everything it cannot safely rewrite is listed with `file:line` and a guide link
 - [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 - [Counter Caches](docs/guide/counter-cache.md) — `#[belongs_to(Post, counter_cache)]` keeps `posts.comment_count` current atomically, in the same transaction, with an idempotent `recompute` for drift
 - [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
 - [SEO](docs/guide/seo.md) — `seo(...)` on any route macro plus the `SeoMeta` extractor, canonical URLs, `robots = "noindex"` and its sitemap exclusion, `SitemapSource`, and the auto-mounted `/sitemap.xml` + `/robots.txt`
+- [Forms, Validation and Normalization](docs/guide/forms.md) — the `ChangesetForm` round-trip that re-renders a rejected submission with the user's input and inline errors, `Valid<T>` / `Validated<T>` for API endpoints, model-level `#[validate(...)]`, `#[normalize(trim, downcase, …)]` and where it runs on the write path, htmx inline validation and its automatic no-JavaScript fallback
+- [Extractors](docs/guide/extractors.md) — the full extractor catalog, the two ordering rules, writing your own, and `Query<T>`'s structured decoding: repeated keys, `tags[]`, `tags[0]`, `filter[status]` and `items[0][sku]` all decode into typed sequences and nested structs
+- [Cookie Consent](docs/guide/cookie-consent.md) — the `Consent` gate that is the actual compliance (not the banner), `inject_consent_banner`, the strictly-necessary exemption, policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow
 - [Threaded Comments on Anything](docs/guide/commentable.md) — `#[commentable]`, the polymorphic `(commentable_type, commentable_id)` association, `add_comment()` / `comment_thread()` / `delete_comment()`, the registry-driven comment router, and the no-JS `comment_thread` widget
 
 ## Stability

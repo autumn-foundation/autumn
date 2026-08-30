@@ -1125,11 +1125,30 @@ async fn get_user(id: i64) -> AutumnResult<User> {
 
 ```rust
 async fn get_user(id: i64) -> AutumnResult<User> {
-    static __AUTUMN_CACHE: OnceLock<MokaCache> = OnceLock::new();
-    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
+    // #1716: registers this read in the cache-coherence manifest. It lives in
+    // the BODY, not beside the function, because it expands to an anonymous
+    // `const _` that an `impl` block cannot hold.
+    inventory::submit! {
+        CachedReadDescriptor {
+            id: concat!(module_path!(), "::", "get_user"),
+            kind: ReadKind::Cached,
+            reads: &[/* declared `reads(...)`, else what derivation found */],
+            provenance: DependencyProvenance::Undetermined,
+            acknowledged_stale: None,
+            location: concat!(file!(), ":", line!()),
+        }
+    }
+    // `Arc` so a clone can be handed to the coherence registry; the store is
+    // still a per-function static.
+    static __AUTUMN_CACHE: OnceLock<Arc<MokaCache>> = OnceLock::new();
+    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
+        let store = Arc::new(MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
+        coherence::register_namespace_store(concat!(module_path!(), "::", "get_user"), store.clone());
+        store
+    });
     // Prefer a process-wide shared backend (e.g. Redis) when registered,
     // else fall back to the per-function Moka store.
-    let __autumn_cache = global_cache().unwrap_or(__autumn_moka);
+    let __autumn_cache = global_cache().unwrap_or(&**__autumn_moka);
     let __autumn_key = make_cache_key(concat!(module_path!(), "::", "get_user"), &(id.clone(),));
     if let Some(hit) = get_cached::<User>(__autumn_cache, &__autumn_key) {
         return Ok(hit); // `result` mode caches only Ok values
@@ -1138,14 +1157,31 @@ async fn get_user(id: i64) -> AutumnResult<User> {
     // insert on success ...
     out
 }
+
+// Two companion items beside the function. Both are valid ASSOCIATED items, so
+// `#[cached]` still works on an associated function; that is also why the
+// identity above is spliced rather than referenced through this constant.
+#[doc(hidden)]
+const __AUTUMN_CACHE_READ_ID__get_user: &'static str =
+    concat!(module_path!(), "::", "get_user");
+
+#[doc(hidden)]
+fn __autumn_cache_invalidate__get_user() -> bool {
+    coherence::invalidate_namespace(concat!(module_path!(), "::", "get_user"))
+}
 ```
 
 Options: `ttl` (duration string, e.g. `"5m"`), `max` (entry cap, default
-`10_000`, LRU eviction), and the `result` flag (cache only `Ok` values, pass
-`Err` through uncached).
+`10_000`, LRU eviction), the `result` flag (cache only `Ok` values, pass `Err`
+through uncached), `key(a, b)` (hash only the named parameters — this is what
+lets a cached read take a repository handle, which is `Clone` but not `Hash`),
+and the cache-coherence pair `reads(Model, …)` / `acknowledge_stale = "…"`.
 
 **Gotcha:** `#[cached]` cannot be applied to methods with a `self` receiver.
-See [Fragment Caching](./fragment-caching.md) and [Cache Stampede](./cache-stampede.md).
+The `__AUTUMN_CACHE_READ_ID__…` constant inherits the function's visibility, so
+a private cached read cannot be named by an `invalidates(...)` in another module.
+See [Fragment Caching](./fragment-caching.md), [Cache Stampede](./cache-stampede.md)
+and [Cache Coherence](./cache-coherence.md).
 
 ---
 

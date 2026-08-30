@@ -3726,6 +3726,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hot-upgrade"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

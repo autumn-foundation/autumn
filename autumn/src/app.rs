@@ -1532,6 +1532,105 @@ impl AppBuilder {
         self
     }
 
+    /// Designate a block of typed in-memory state to survive an in-place
+    /// upgrade (issue #1674).
+    ///
+    /// On `SIGUSR2` the block is snapshotted, frozen against further writes,
+    /// and handed to the successor build along with the listening socket; the
+    /// successor installs it before it serves its first request. On an ordinary
+    /// cold start `initial` is used.
+    ///
+    /// Reach the block from a handler with
+    /// [`AppState::live_state`](crate::AppState::live_state). Use
+    /// [`with_live_state_from`](Self::with_live_state_from) when the new build
+    /// changed the shape.
+    ///
+    /// One block per app: designating a second is a startup error, because
+    /// silently carrying only one of them is exactly the data loss this feature
+    /// exists to prevent.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::upgrade::LiveState;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Default, Serialize, Deserialize)]
+    /// struct Stats { hits: u64 }
+    /// impl LiveState for Stats { const VERSION: u32 = 1; }
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .with_live_state(Stats::default())
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_live_state<T>(self, initial: T) -> Self
+    where
+        T: crate::upgrade::LiveState,
+    {
+        self.state_initializer(move |state| {
+            install_live_state(state, initial, crate::upgrade::decode::<T>);
+        })
+    }
+
+    /// Designate a live-state block whose shape changed since the previous
+    /// build, carrying an `Old` snapshot across through the
+    /// [`state_migration!`](crate::state_migration) declared for it.
+    ///
+    /// A snapshot at `T`'s own version is adopted directly; one at `Old`'s
+    /// version is migrated; anything else refuses to start, which aborts the
+    /// upgrade and leaves the previous build serving.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::state_migration;
+    /// use autumn_web::upgrade::LiveState;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize)]
+    /// struct StatsV1 { hits: u64 }
+    /// #[derive(Default, Serialize, Deserialize)]
+    /// struct Stats { hits: u64, upgrades: u64 }
+    /// impl LiveState for StatsV1 { const VERSION: u32 = 1; }
+    /// impl LiveState for Stats { const VERSION: u32 = 2; }
+    ///
+    /// state_migration! {
+    ///     from StatsV1 as old => Stats {
+    ///         hits: old.hits,
+    ///         upgrades: 1,
+    ///     }
+    /// }
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .with_live_state_from::<StatsV1, _>(Stats::default())
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_live_state_from<Old, T>(self, initial: T) -> Self
+    where
+        Old: crate::upgrade::LiveState,
+        T: crate::upgrade::MigrateFrom<Old>,
+    {
+        self.state_initializer(move |state| {
+            install_live_state(state, initial, crate::upgrade::decode_migrating::<Old, T>);
+        })
+    }
+
     /// Register an async shutdown hook that runs during graceful shutdown.
     ///
     /// Hooks execute in reverse registration order so later-added runtimes
@@ -1576,6 +1675,38 @@ impl AppBuilder {
             }
         }
         self
+    }
+
+    /// Enable **user impersonation** for this app, gated by `gate`.
+    ///
+    /// Impersonation is default-deny: without this call (or
+    /// `AdminPlugin::with_impersonation`, which does it for you)
+    /// [`begin_impersonation`](crate::auth::impersonation::begin_impersonation)
+    /// refuses every attempt with `403`. It also requires an audit sink — see
+    /// [`with_audit_sink`](Self::with_audit_sink).
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::auth::impersonation::ImpersonationGate;
+    ///
+    /// # fn wire(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
+    /// app.impersonation_gate(ImpersonationGate::allow_roles(["admin"]))
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn impersonation_gate(self, gate: crate::auth::impersonation::ImpersonationGate) -> Self {
+        self.state_initializer(move |state| {
+            // Surface a self-destructive `[auth].session_key` at boot rather
+            // than at the first impersonation attempt, which refuses outright.
+            let auth_key = state.auth_session_key();
+            if crate::auth::impersonation::is_reserved_session_key(auth_key) {
+                tracing::error!(
+                    auth_session_key = %auth_key,
+                    "impersonation is enabled but `auth.session_key` collides with a key the \
+                     impersonation record reserves; every attempt will be refused"
+                );
+            }
+            state.insert_extension(gate);
+        })
     }
 
     /// Store or replace a typed builder extension.
@@ -3062,6 +3193,12 @@ impl AppBuilder {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) {
+        // Remember the binary this process was started from, before a deploy
+        // can replace the file underneath it: an in-place upgrade (#1674) execs
+        // that path, and `/proc/self/exe` reports "… (deleted)" once the file
+        // has been swapped.
+        crate::upgrade::record_startup_exe();
+
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
         // instead of starting the HTTP server. This is triggered by `autumn build`.
@@ -3076,6 +3213,18 @@ impl AppBuilder {
         // route table without booting the server or connecting to a database.
         if is_dump_routes_mode() {
             self.run_dump_routes_mode().await;
+            return;
+        }
+
+        // ── Cache-coherence manifest dump mode ─────────────────────────
+        // When AUTUMN_DUMP_CACHE_COHERENCE=1, print the cache-coherence
+        // manifest (#1716) and exit. Triggered by `autumn cache audit`, which
+        // needs the whole binary's registrations — every `#[cached]` read and
+        // every `#[repository]` write, across the app AND its plugins — and
+        // link-time `inventory` collection is the only place they all exist
+        // together. Runs before any database or port is touched.
+        if crate::cache::coherence::is_dump_mode() {
+            crate::cache::coherence::print_manifest_dump(&crate::cache::coherence::audit());
             return;
         }
 
@@ -3147,6 +3296,24 @@ impl AppBuilder {
                 std::process::exit(2);
             }
         }
+
+        // Register the in-place upgrade signal (#1674) before the long boot —
+        // config, database, migrations — rather than when the watcher task
+        // first runs. Until a handler is installed, `SIGUSR2`'s default
+        // disposition is to *terminate* the process, so a deploy script that
+        // signals a process that is still booting would kill it.
+        #[cfg(unix)]
+        let upgrade_signal =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+                Ok(signal) => Some(signal),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not install the SIGUSR2 handler; in-place upgrade is unavailable"
+                    );
+                    None
+                }
+            };
 
         let Self {
             routes,
@@ -3497,6 +3664,17 @@ impl AppBuilder {
                     as std::sync::Arc<dyn crate::time::ClockSource>;
             state = state.with_clock(recording);
         }
+        // Same for the entropy source (#1634): a handler that mints a session
+        // id, a token or a job id must mint the *recorded* one on replay, or
+        // the identifier in the capsule's SQL binds will not be the one the
+        // replayed code produced.
+        #[cfg(feature = "reporting")]
+        if config.failure_capture.enabled {
+            let recording =
+                std::sync::Arc::new(crate::capsule::RecordingEntropy::new(state.entropy_arc()))
+                    as std::sync::Arc<dyn crate::entropy::Entropy>;
+            state = state.with_entropy(recording);
+        }
 
         // Wire the in-memory log capture buffer from the telemetry guard into the
         // app state so the `/actuator/logfile` endpoint can serve it.
@@ -3744,6 +3922,16 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        // A live-state block that could not be installed is a refusal to start,
+        // not a silent fallback: the previous build is still serving and still
+        // holds the only copy of that state (#1674). Checked here, in async
+        // context, so a managed-Postgres child is stopped rather than orphaned.
+        if let Some(failure) = state.extension::<crate::upgrade::LiveStateInstallFailure>() {
+            tracing::error!("refusing to start: {}", failure.0);
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let env = crate::config::OsEnv;
@@ -4100,18 +4288,33 @@ impl AppBuilder {
                 std::process::exit(1);
             }
         } else {
-            let addr = format!("{}:{}", config.server.host, config.server.port);
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    tracing::error!(addr = %addr, "Failed to bind: {e}");
-                    // Stop the managed Postgres child started by `setup_database`
-                    // before bailing; `process::exit` skips `on_shutdown`.
-                    #[cfg(feature = "managed-pg")]
-                    crate::managed_pg::emergency_stop_async().await;
-                    std::process::exit(1);
-                }
-            };
+            // A successor that terminates TLS cannot take over a plaintext
+            // listener: the socket it inherited is mid-conversation with HTTP
+            // clients, and wrapping it in rustls fails every one of them while
+            // both builds accept from the shared queue. Refuse the same way an
+            // existing TLS or Unix listener is refused — before binding
+            // anything, so the predecessor's wait ends on this process exiting.
+            #[cfg(feature = "tls")]
+            if config.server.tls.is_some() && crate::upgrade::handoff_requested() {
+                tracing::error!(
+                    "refusing to start: this build terminates TLS ([server.tls]) but was \
+                     handed the previous build's plaintext listening socket. An in-place \
+                     upgrade cannot change the transport — restart the process to apply it. \
+                     The previous build keeps serving"
+                );
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+            let configured_addr = format!("{}:{}", config.server.host, config.server.port);
+            let listener = bind_or_adopt_tcp_listener(&configured_addr).await;
+            // Report where this process is *actually* listening, not what was
+            // asked for: a socket inherited from a predecessor (#1674) keeps
+            // that process's port, and `server.port = 0` resolves to whichever
+            // ephemeral port the kernel picked.
+            let addr = listener
+                .local_addr()
+                .map_or(configured_addr, |bound| bound.to_string());
             // When `[server.tls]` is set (and the `tls` feature is built in),
             // wrap the just-bound TCP listener in a rustls acceptor so the same
             // host:port serves HTTPS. Fail fast on any cert/key problem — the
@@ -4514,8 +4717,26 @@ impl AppBuilder {
         // the resulting `JoinHandle<io::Result<()>>` are identical. Handlers
         // extracting `ConnectInfo<SocketAddr>` are unsupported under a Unix
         // socket (acceptable: daemon mode is loopback-equivalent and local).
+        // A duplicate of the listening socket, kept aside so a `SIGUSR2`
+        // in-place upgrade (#1674) can hand it to a successor while this
+        // process goes on serving through the original. Only a plain TCP
+        // listener can be handed over in this release.
+        #[cfg(unix)]
+        let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
+
         let server_task = match bound_listener {
             BoundListener::Tcp(listener) => {
+                #[cfg(unix)]
+                {
+                    match crate::upgrade::HandoffSocket::from_listener(&listener) {
+                        Ok(socket) => handoff_socket = Some(socket),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not duplicate the listening socket; in-place upgrade \
+                             (SIGUSR2) will be refused for this process"
+                        ),
+                    }
+                }
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         std::net::SocketAddr,
@@ -4577,6 +4798,48 @@ impl AppBuilder {
             }
         };
 
+        // Cancelled by the in-place upgrade watcher once a successor has taken
+        // over the listening socket; the drain below then runs without the
+        // load-balancer choreography a real shutdown needs (#1674).
+        let upgrade_cutover = tokio_util::sync::CancellationToken::new();
+        let upgrade_cutover_wait = upgrade_cutover.clone();
+
+        // In-place upgrade watcher (#1674): on `SIGUSR2`, hand this process's
+        // listening socket and designated live state to a freshly-execed build
+        // and, once that build is serving, cancel `upgrade_cutover` so the
+        // drain below runs.
+        #[cfg(unix)]
+        {
+            let upgrade_config = config.server.upgrade.clone();
+            let upgrade_state = state.clone();
+            let cutover = upgrade_cutover.clone();
+            let socket = handoff_socket.take();
+            // A child of `server_shutdown`, so an ordinary drain ends the
+            // watcher: it drops the duplicated listening socket (which would
+            // otherwise keep the port bound and accepting into a queue nobody
+            // serves for the whole drain), and drops any handoff in flight,
+            // whose cleanup kills the half-started successor and unfreezes the
+            // live state.
+            let watcher_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = watch_for_in_place_upgrade(
+                        &upgrade_config,
+                        upgrade_signal,
+                        socket,
+                        upgrade_state,
+                        cutover,
+                    ) => {}
+                    () = watcher_shutdown.cancelled() => {
+                        tracing::debug!(
+                            "shutting down: in-place upgrade is no longer available in this \
+                             process"
+                        );
+                    }
+                }
+            });
+        }
+
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
         #[cfg(feature = "ws")]
@@ -4623,22 +4886,39 @@ impl AppBuilder {
         // in main after server_task completes — within the remaining portion
         // of the same shutdown_timeout_secs budget, not an additional window.
         let shutdown_task = tokio::spawn(async move {
-            // Phase 1: Wait for OS signal.
-            shutdown_signal().await;
-            tracing::info!(
-                phase = "signal_received",
-                prestop_grace_secs = prestop_grace,
-                shutdown_timeout_secs = shutdown_timeout,
-                "shutdown: graceful shutdown initiated"
-            );
+            // Phase 1: Wait for an OS signal — or for an in-place upgrade
+            // (#1674) whose successor is already serving on this same socket.
+            let cause = shutdown_signal(upgrade_cutover_wait).await;
+            let upgrade_cutover = matches!(cause, DrainCause::UpgradeCutover);
 
-            // Phase 2: flip /ready → 503 strictly before the listener closes.
-            shutdown_state.begin_shutdown();
-            tracing::info!(phase = "ready_draining", "shutdown: /ready now 503");
+            if upgrade_cutover {
+                // Phases 2 and 3 exist to let a load balancer take this replica
+                // out of rotation before its socket closes. An in-place upgrade
+                // has no such gap to cover: the successor is already accepting
+                // on the *same* listening socket, so flipping `/ready` to 503
+                // would only make a live address look unhealthy, and the
+                // prestop grace would delay the handover for nothing.
+                tracing::info!(
+                    phase = "upgrade_cutover",
+                    shutdown_timeout_secs = shutdown_timeout,
+                    "shutdown: successor is serving; draining without a readiness flip"
+                );
+            } else {
+                tracing::info!(
+                    phase = "signal_received",
+                    prestop_grace_secs = prestop_grace,
+                    shutdown_timeout_secs = shutdown_timeout,
+                    "shutdown: graceful shutdown initiated"
+                );
 
-            // Phase 3: prestop grace — wait for load balancers to deregister.
-            if prestop_grace > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(prestop_grace)).await;
+                // Phase 2: flip /ready → 503 strictly before the listener closes.
+                shutdown_state.begin_shutdown();
+                tracing::info!(phase = "ready_draining", "shutdown: /ready now 503");
+
+                // Phase 3: prestop grace — wait for load balancers to deregister.
+                if prestop_grace > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(prestop_grace)).await;
+                }
             }
             tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
 
@@ -4733,6 +5013,47 @@ impl AppBuilder {
                 }
             }
             state.probes().mark_startup_complete();
+            // Release a predecessor that is waiting on this build (#1674). Only
+            // now, with startup hooks done and the router serving, is it safe
+            // for the old process to stop accepting — and only if this build
+            // actually took over everything it was handed.
+            #[cfg(unix)]
+            {
+                if let Err(reason) = crate::upgrade::verify_handover_complete() {
+                    tracing::error!("{reason}");
+                    // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                // Publishing readiness is the last thing that can fail, so the
+                // adopted state stays frozen until it has *succeeded*. A
+                // readiness signal that never reaches the predecessor (a full
+                // or read-only handoff filesystem) means the predecessor times
+                // out and kills this process — anything acknowledged in the
+                // meantime would go with it. Refusing here instead ends the
+                // predecessor's wait on this process exiting, ~20ms rather than
+                // the readiness timeout, and it resumes writable.
+                match crate::upgrade::publish_upgrade_readiness() {
+                    Ok(had_predecessor) => {
+                        if had_predecessor {
+                            unfreeze_adopted_live_state(&state);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "refusing to start: this build took over but could not tell the \
+                             previous build it is serving, so the handover cannot complete. \
+                             The previous build keeps serving"
+                        );
+                        // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+                        #[cfg(feature = "managed-pg")]
+                        crate::managed_pg::emergency_stop_async().await;
+                        std::process::exit(1);
+                    }
+                }
+            }
             signal_serve_ready(
                 config
                     .server
@@ -6328,6 +6649,15 @@ impl AppBuilder {
             state_initializers,
             config_loader_factory,
             telemetry_provider,
+            // Kept (rather than dropped with the rest of the runtime) so a
+            // *job-entry* capsule can dispatch the recorded job's handler
+            // (#1634). No job runtime, scheduler or backend is started: the
+            // handler is called directly, exactly once, with the recorded
+            // payload — through the application's `JobInterceptor` when it
+            // registered one, since that is part of how the recorded run
+            // executed and dropping it would replay a different path.
+            jobs,
+            job_interceptor,
             // F15: deliberately *not* destructured. A store installed with
             // `with_session_store(...)` outranks `config.session.backend` in
             // `apply_session_layer`, so forwarding it would let a replay dial —
@@ -6448,25 +6778,12 @@ impl AppBuilder {
             None,
         );
 
-        // Time is an input like any other: serve the readings the capture took,
-        // in order.
-        let fallback = capsule
-            .clock
-            .first()
-            .copied()
-            .unwrap_or(capsule.captured_at);
-        let clock = std::sync::Arc::new(
-            crate::capsule::ReplayClock::new(capsule.clock.clone(), fallback).with_monotonic(
-                capsule
-                    .clock_monotonic_us
-                    .iter()
-                    .map(|us| std::time::Duration::from_micros(*us))
-                    .collect(),
-            ),
-        );
-        state = state.with_clock(
-            std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::time::ClockSource>
-        );
+        // Time, randomness and the effect seams are all inputs like any other:
+        // serve what the capture took, in order (#1598 for the clock, #1634
+        // for entropy and the effect tape).
+        let fixtures = crate::capsule::ReplayFixtures::from_capsule(&capsule);
+        state = state.with_clock(fixtures.clock());
+        state = state.with_entropy(fixtures.entropy());
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
@@ -6503,6 +6820,9 @@ impl AppBuilder {
         // comment in `run()`.
         state.insert_extension(config.clone());
 
+        // Cloned before the builder consumes it, so a job capsule can dispatch
+        // its handler against the same rebuilt state the router serves from.
+        let router_state = state.clone();
         let router = crate::router::try_build_router_inner(
             routes,
             &config,
@@ -6531,8 +6851,36 @@ impl AppBuilder {
             ))
         });
 
-        let outcome =
-            crate::capsule::execute(router, &capsule, divergences, Some(clock.as_ref())).await;
+        // A job capsule has no request to drive: dispatch the recorded job's
+        // handler instead, with the same clock, entropy and effect tape.
+        let outcome = if let Some(job) = capsule.job.as_ref() {
+            let Some(info) = jobs.iter().find(|info| info.name == job.name) else {
+                std::process::exit(crate::capsule::print_refusal(
+                    &format!(
+                        "the capsule records a failure in job {:?}, which this build does not \
+                         register; replay it against the build that ran it, or add the job to \
+                         `AppBuilder::jobs()`",
+                        job.name
+                    ),
+                    &path,
+                ));
+            };
+            let handler = info.handler;
+            let job_state = router_state.clone();
+            if let Some(interceptor) = job_interceptor {
+                job_state.insert_extension(interceptor);
+            }
+            let job_name = job.name.clone();
+            let dispatch: crate::capsule::JobDispatch = Box::new(move |payload| {
+                Box::pin(async move {
+                    crate::job::run_handler_with_interceptor(&job_name, handler, job_state, payload)
+                        .await
+                })
+            });
+            crate::capsule::execute_job(dispatch, &capsule, divergences, &fixtures).await
+        } else {
+            crate::capsule::execute(router, &capsule, divergences, &fixtures).await
+        };
         std::process::exit(crate::capsule::print_verdict(&outcome, &path));
     }
 }
@@ -7388,6 +7736,92 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
     Ok(())
 }
 
+/// Install a designated live-state block into `state`, adopting the snapshot a
+/// predecessor handed over when this process was started by an in-place
+/// upgrade (issue #1674).
+///
+/// A snapshot this build cannot account for is a hard startup failure, not a
+/// silent fallback to `initial`: the predecessor is still serving and still
+/// holds the only copy of that state, so exiting here abandons the upgrade and
+/// keeps the data. On a cold start there is no snapshot and `initial` is used.
+fn install_live_state<T>(
+    state: &AppState,
+    initial: T,
+    decode: fn(&crate::upgrade::StateEnvelope) -> Result<T, crate::upgrade::AdoptError>,
+) where
+    T: crate::upgrade::LiveState,
+{
+    if let Some(existing) = state.extension::<crate::upgrade::LiveStateRegistry>() {
+        state.insert_extension(crate::upgrade::LiveStateInstallFailure(format!(
+            "an app may designate only one block of live state for in-place upgrades, but \
+             both {} and {} were designated; carrying just one of two designated blocks \
+             would be the silent state loss this feature exists to prevent",
+            existing.type_name(),
+            std::any::type_name::<T>(),
+        )));
+        return;
+    }
+
+    let value = match crate::upgrade::carried_snapshot_path() {
+        None => initial,
+        Some(path) => {
+            match crate::upgrade::read_snapshot(&path).and_then(|envelope| {
+                let decoded = decode(&envelope);
+                if decoded.is_ok() {
+                    tracing::info!(
+                        state = std::any::type_name::<T>(),
+                        from_version = envelope.version,
+                        to_version = T::VERSION,
+                        generation = envelope.generation,
+                        "adopted the live state handed over by the previous build"
+                    );
+                }
+                decoded
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    state.insert_extension(crate::upgrade::LiveStateInstallFailure(format!(
+                        "the previous build's live state cannot be carried into this one \
+                         ({}): {error}. The previous build keeps serving; fix the \
+                         migration (autumn_web::state_migration!) and try the upgrade again",
+                        std::any::type_name::<T>(),
+                    )));
+                    return;
+                }
+            }
+        }
+    };
+
+    // A successor installs its state **frozen**. It starts accepting the moment
+    // it adopts the socket — before its startup hooks have run — and until it
+    // signals readiness the upgrade can still be abandoned, at which point the
+    // predecessor resumes from the snapshot it took. A write acknowledged in
+    // that window would die with this process: refuse it instead, so the
+    // client's retry lands on whichever process is actually keeping state.
+    // `unfreeze_adopted_live_state` lifts it at the readiness point.
+    let handle = if crate::upgrade::handoff_requested() {
+        crate::upgrade::LiveStateHandle::new_frozen(value)
+    } else {
+        crate::upgrade::LiveStateHandle::new(value)
+    };
+    state.insert_extension(crate::upgrade::LiveStateRegistry::new(&handle));
+    state.insert_extension(handle);
+}
+
+/// Make an adopted live-state block writable, once this build has finished
+/// starting up and is about to release its predecessor (#1674).
+///
+/// A no-op on a cold start (the block was never frozen) and for an app that
+/// designated none.
+fn unfreeze_adopted_live_state(state: &AppState) {
+    if !crate::upgrade::handoff_requested() {
+        return;
+    }
+    if let Some(registry) = state.extension::<crate::upgrade::LiveStateRegistry>() {
+        registry.unfreeze();
+    }
+}
+
 fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState) {
     for initializer in initializers {
         initializer(state);
@@ -7465,6 +7899,75 @@ fn initialize_job_runtime(
         Ok(())
     } else {
         crate::job::start_runtime(jobs, state, shutdown, config, run_workers)
+    }
+}
+
+/// Bind the configured TCP address — or adopt the listening socket a
+/// predecessor handed over during an in-place upgrade (issue #1674).
+///
+/// Adopting is what makes the cutover connectionless-loss-free: the socket is
+/// never closed and re-opened, so a connection queued on it while both builds
+/// are alive is served by whichever one accepts it. Exits (rather than falling
+/// back to `bind`) if an inherited socket turns out to be unusable: the
+/// predecessor still holds the real one and is still serving, so a successor
+/// that cannot adopt must abandon the upgrade, not race it for the port.
+async fn bind_or_adopt_tcp_listener(addr: &str) -> tokio::net::TcpListener {
+    #[cfg(unix)]
+    {
+        if let Some(inherited) = crate::upgrade::adopt_inherited_listener() {
+            match tokio::net::TcpListener::from_std(inherited) {
+                Ok(listener) => {
+                    // The socket is the predecessor's, so a `server.host` /
+                    // `server.port` change in the new build does NOT take
+                    // effect: say so rather than let an operator believe a
+                    // narrowed bind address is live.
+                    if let Ok(bound) = listener.local_addr()
+                        && bound.to_string() != addr
+                    {
+                        tracing::warn!(
+                            inherited = %bound,
+                            configured = %addr,
+                            "the inherited listening socket does not match this build's \
+                             configured address; an in-place upgrade cannot change where the \
+                             app listens — restart the process to apply it"
+                        );
+                    }
+                    return listener;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to adopt the inherited listening socket: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+        // A predecessor handed us a socket and we could not take it: binding
+        // instead would either collide with the process still serving that
+        // address, or — worse, with an ephemeral port — succeed somewhere else
+        // entirely and release the predecessor to drain away from the address
+        // clients are using.
+        if crate::upgrade::handoff_requested() {
+            tracing::error!(
+                "refusing to start: this build was handed the previous build's listening \
+                 socket but could not adopt it (see the error above). The previous build \
+                 keeps serving"
+            );
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+    }
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!(addr = %addr, "Failed to bind: {e}");
+            // Stop the managed Postgres child started by `setup_database`
+            // before bailing; `process::exit` skips `on_shutdown`.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
     }
 }
 
@@ -10746,8 +11249,102 @@ pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::pa
     )
 }
 
+/// Serve in-place upgrades for the lifetime of the process (issue #1674).
+///
+/// Each `SIGUSR2` attempts one handover. A failed attempt is logged and the
+/// current build carries on serving — including its live state, which is
+/// unfrozen again — so a later signal (with a fixed binary) can retry.
+#[cfg(unix)]
+async fn watch_for_in_place_upgrade(
+    config: &crate::config::UpgradeConfig,
+    signal: Option<tokio::signal::unix::Signal>,
+    socket: Option<crate::upgrade::HandoffSocket>,
+    state: AppState,
+    cutover: tokio_util::sync::CancellationToken,
+) {
+    // Registered at the top of `run()` so the signal is never fatal; `None`
+    // means the handler could not be installed at all, which was reported then.
+    let Some(mut signal) = signal else {
+        return;
+    };
+    // Clamped: a zero-second budget would abandon every successor before it
+    // could possibly have finished booting.
+    let ready_timeout = std::time::Duration::from_secs(config.ready_timeout_secs.max(1));
+
+    while signal.recv().await.is_some() {
+        if !config.enabled {
+            tracing::warn!(
+                "SIGUSR2 received but in-place upgrade is disabled \
+                 ([server.upgrade] enabled = false); ignoring"
+            );
+            continue;
+        }
+        // Documented as incompatible, and refused rather than attempted: the
+        // successor would start a second postmaster over the same data
+        // directory, and this process's drain would stop the cluster under it.
+        #[cfg(feature = "managed-pg")]
+        if crate::managed_pg::is_supervising() {
+            let error = crate::upgrade::UpgradeError::Unsupported(
+                "it supervises a managed Postgres cluster, which cannot be handed over with \
+                 the socket — the successor would start a second postmaster over the same \
+                 data directory",
+            );
+            tracing::error!(error = %error, "in-place upgrade refused");
+            continue;
+        }
+        let Some(socket) = socket.as_ref() else {
+            let error = crate::upgrade::UpgradeError::UnsupportedListener(
+                "the server is not bound to a plain TCP listener",
+            );
+            tracing::error!(error = %error, "in-place upgrade refused");
+            continue;
+        };
+        tracing::info!("SIGUSR2 received, starting an in-place upgrade");
+        let plan = crate::upgrade::UpgradePlan {
+            socket,
+            registry: state.extension::<crate::upgrade::LiveStateRegistry>(),
+            ready_timeout,
+            clock: state.clock_arc(),
+            entropy: state.entropy_arc(),
+        };
+        match crate::upgrade::upgrade_in_place(plan).await {
+            Ok(handover) => {
+                tracing::info!(
+                    successor_pid = handover.successor_pid,
+                    generation = handover.generation,
+                    elapsed_ms = u64::try_from(handover.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "in-place upgrade complete: the successor is serving on this socket, \
+                     draining this build"
+                );
+                cutover.cancel();
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "in-place upgrade abandoned; this build is still serving and its live \
+                     state is writable again"
+                );
+            }
+        }
+    }
+}
+
+enum DrainCause {
+    /// `SIGTERM`/Ctrl-C, or a canary rollback flag: the process is going away
+    /// and its address goes with it.
+    Signal,
+    /// An in-place upgrade (#1674): a successor is already accepting on this
+    /// process's listening socket, so the address stays up throughout.
+    UpgradeCutover,
+}
+
 /// Wait for a shutdown signal (Ctrl+C, SIGTERM on Unix, or a canary rollback
 /// flag file written by a controller).
+///
+/// Returns the reason the drain began. Also resolves on an in-place
+/// upgrade cutover (#1674), whose drain skips the readiness flip and the
+/// prestop grace because the address never goes away.
 ///
 /// Returns when any signal is received. Axum's `with_graceful_shutdown`
 /// then stops accepting new connections and drains in-flight requests.
@@ -10756,7 +11353,7 @@ pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::pa
 /// retire a bad canary replica without sending `SIGTERM` by hand: it writes
 /// [`crate::canary::CANARY_ROLLBACK_FLAG_FILE`] and Autumn runs the identical
 /// graceful-shutdown sequence (ready → 503, prestop grace, drain, clean exit).
-async fn shutdown_signal() {
+async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -> DrainCause {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -10784,10 +11381,16 @@ async fn shutdown_signal() {
         tracing::info!("Canary rollback signalled, starting graceful shutdown");
     };
 
+    let upgrade = async {
+        upgrade_cutover.cancelled().await;
+        tracing::info!("Successor is serving after an in-place upgrade, draining this build");
+    };
+
     tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
-        () = canary_rollback => {},
+        () = ctrl_c => DrainCause::Signal,
+        () = terminate => DrainCause::Signal,
+        () = canary_rollback => DrainCause::Signal,
+        () = upgrade => DrainCause::UpgradeCutover,
     }
 }
 

@@ -7,6 +7,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`autumn upgrade` now reconciles framework-owned scaffold files, not just
+  app code (#1593):** `autumn new` writes about a dozen framework-owned files
+  into every project — `Dockerfile`, `.dockerignore`, `build.rs`, `autumn.toml`,
+  `tailwind.config.js`, `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`,
+  the CI workflow, `static/css/input.css` — and those templates keep evolving,
+  but bumping `autumn-web` in `Cargo.toml` updates the library, not the project
+  skeleton. An app scaffolded on 0.5 therefore kept 0.5-vintage project files
+  forever, and the only remedy was diffing a freshly generated throwaway project
+  by hand. `autumn upgrade` now renders the current release's scaffold in memory
+  and reports a per-file verdict alongside the existing codemod report: `add`
+  for a file a later release introduced (a pre-#1492 app is offered
+  `rust-toolchain.toml`), `update` for one whose template moved while your copy
+  stayed untouched, `conflict` for one you edited, and `removed` for one you
+  deleted on purpose. Preview stays the default; `--apply` writes the additions
+  and updates and never a conflict.
+
+  Knowing which files you edited needs a baseline, so `autumn new` now records
+  one: `.autumn/scaffold.toml` holds the release that scaffolded the project,
+  the flags it was created with, and a digest of every framework-owned file as
+  Autumn wrote it. Commit it — its value is being the baseline a later checkout
+  compares against. Projects created before this feature have no manifest and
+  are handled best-effort rather than refused: missing files are still offered,
+  and everything that differs is a conflict for review, because "untouched"
+  cannot be proven. Digests are taken over LF-normalised text, so a
+  `core.autocrlf` checkout on Windows is not mistaken for a rewrite of every
+  file.
+
+  Application source is out of bounds throughout: the command never reads,
+  writes, or names a path under `src/`, and `Cargo.toml`, `README.md`,
+  `tests/`, `migrations/`, `i18n/`, `config/credentials/` and the vendored
+  `static/js/` assets are not framework-owned either. `autumn new` and the
+  reconciler render from one shared function, so what the scaffold writes and
+  what the upgrade considers current cannot drift apart.
+
+  Nothing that cannot be read is ever written: a framework-owned path that is a
+  symlink, a directory, or not UTF-8 is reported as a conflict and left exactly
+  as it is, rather than being mistaken for a missing file and truncated —
+  which matters most for the projects with no manifest, where nothing else
+  vouches for the file. Every write is staged in the same directory and
+  renamed into place, so an interrupted apply cannot leave a half-written
+  `Dockerfile` or a truncated new file — which would be permanent, since a file
+  with no recorded baseline is a conflict the command then refuses to repair.
+  An updated file keeps its permissions; an added one lands with the mode
+  `autumn new` would have given it. The project
+  name is read from `[package] name` and validated, never guessed from the
+  directory: it is interpolated into `autumn.toml`, the CI workflow and the
+  `Dockerfile`'s `CMD`, so a guessed name would render a different scaffold and
+  rewrite files that had not actually drifted.
+
+  New: `autumn upgrade --check` reconciles the scaffold files, writes nothing,
+  and exits `3` when anything has drifted, so CI can gate on scaffold freshness
+  (`1` still means the apply step died partway, and a deliberately deleted file
+  does not hold the gate red forever). It prints verdicts without the per-file
+  diffs, so a CI log does not accumulate the working contents of `autumn.toml`.
+  `autumn upgrade --accept <path>` records a file as yours for good, so a team
+  whose `Dockerfile` is deliberately theirs can still hold a green gate rather
+  than deleting it. A crate inside a Cargo workspace is not offered the files
+  that workspace owns at its root — a crate-local `clippy.toml` shadows the
+  workspace's rather than adding to it. Every report ends with a link to that
+  release's migration guide, so file reconciliation and API migration are one
+  workflow. `--json` carries the whole thing under a `scaffold` key.
+  [`docs/guide/upgrading.md`](docs/guide/upgrading.md) covers the workflow end
+  to end, including the `git diff` / `git checkout --` revert path.
+
+- **Zero-downtime in-place upgrades with a compile-checked state migration
+  (`SIGUSR2`):** a running app can now swap itself to a newly-built binary
+  without dropping a connection *or* its in-memory state. On `SIGUSR2` the
+  process snapshots and freezes the block of state it designated with
+  `AppBuilder::with_live_state(...)`, execs the new binary handing over the
+  already-bound listening socket, waits for that build to signal it is serving,
+  and only then drains itself — so connections queued on the shared socket are
+  picked up by the successor rather than refused, and the drain skips the
+  `/ready`→503 flip and prestop grace a real shutdown needs (the address never
+  goes away). The new build adopts the snapshot through
+  `with_live_state_from::<Old, _>(...)`, whose migration is written with the new
+  `state_migration!` macro and is **total by construction**: a struct shape
+  whose field mapping is missing fails to build (`missing field … in
+  initializer`, with no `..Default::default()` escape hatch in the grammar), and
+  an enum shape maps every variant *by name*, so a forgotten variant is a
+  non-exhaustive `match` and a `_` catch-all cannot be written at all — four
+  `tests/compile-fail/state_migration_*.rs` fixtures pin each refusal. Writes
+  attempted after the snapshot are refused with `Err(LiveStateFrozen)` rather
+  than silently lost, and every failure path (missing or broken binary, a
+  successor that crashes or hangs, a state this build cannot account for, a
+  listener that cannot be handed over) abandons the upgrade with the old build
+  still serving and its state writable again. Linux/Unix and plain TCP
+  listeners; `[server.upgrade] enabled/ready_timeout_secs` configure it. Worked
+  example in `examples/hot-upgrade` (whose `live_upgrade` test proves zero
+  refused connections and 100% carry-over under sustained load across the
+  cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
+
+### Changed
+
+- **The `Listening` log line now reports the address actually bound** rather
+  than the one configured, so `server.port = 0` (and a socket inherited from an
+  in-place upgrade) shows the real port instead of `0`. Issue #1674.
+
+- **Replay capsules now record every framework effect a failing request
+  touched, and one command turns a capsule into a committed regression test:**
+  [#1634](https://github.com/autumn-foundation/autumn/issues/1634) extends the
+  deterministic replay capsules from
+  [#1598](https://github.com/autumn-foundation/autumn/issues/1598) past the
+  inbound request, the database and the clock. A capsule now also carries the
+  **outbound HTTP** exchanges the run made (so outbound webhook deliveries come
+  along, they send through the same client), the **jobs** it enqueued, its
+  **cache** reads and writes, the **mail** it sent, the **tenant** it resolved,
+  and every **random draw** it took — each captured at the one choke point every
+  code path funnels through, so a capsule cannot miss an effect because a
+  handler reached it a different way. Replay serves all of them from the
+  capsule with the same no-live-effects posture the database tape has: an
+  outbound call is answered from the recording rather than dialled, an enqueue
+  is asserted and never written to a queue, mail is asserted and never
+  delivered (a recorded *delivery failure* is reproduced as one, so a handler
+  whose bug is that it mishandles a suppressed recipient meets it again), and a
+  framework-minted identifier — a session id, a CSRF token, a
+  request id, a job id — reappears byte-for-byte, because Autumn records the
+  drawn bytes rather than a seed (production runs the OS CSPRNG, which has none,
+  and a re-seeded stream would mint different UUIDs than the ones the capsule's
+  own SQL binds were bound with). An effect the replayed code performs that the
+  recording never did — and a recorded effect it never performs — are both
+  divergences, exactly as they already were for SQL. A failure *inside* a job
+  execution produces a job-scoped capsule replayable the same way.
+  `autumn capsule test <capsule>` converts a triaged capsule into a
+  `#[tokio::test]` in the app's consolidated integration suite: the capsule's
+  bytes are copied **verbatim** into `tests/capsules/` — nothing re-derived, so
+  whatever redaction removed stays removed — a test is generated beside it, both
+  are registered in `tests/integration/mod.rs`, and a router hook is scaffolded
+  once and then left alone. The generated test drives the same
+  `capsule::execute` engine `autumn replay` does (so the two can never disagree
+  about what a reproduction is) and runs under plain `cargo test` with **zero
+  live dependencies** — no network, database, queue or Docker, including for
+  DB-touching capsules, whose pool comes from the in-process stub server
+  rebuilt out of the recorded wire frames. `autumn capsule verify` is the
+  whole-corpus mode; an empty corpus is a failure, never a vacuous pass. Effects
+  are redacted through the same `[log] filter_parameters` list the inbound
+  request is — an *outbound* `Authorization` header carries a downstream
+  credential exactly the way an inbound one carries the caller's — and the
+  `redacted_keys` manifest names every masked effect location. See
+  [Failure Capsules](docs/guide/failure-capsules.md).
+  **Breaking:** the capsule `format_version` bumps `2 → 3`, so a capsule
+  recorded by an older Autumn is **refused** rather than replayed with every new
+  seam empty, and `capsule::execute` takes a `ReplayFixtures` (the clock, the
+  entropy source and the effect tape from one capsule) in place of its
+  `Option<&ReplayClock>`. Capsules on disk are not migrated: replay them with
+  the version that wrote them, or re-record. See
+  [the migration guide](docs/migrations/next.md).
+  A capsule commits to a verdict only where it can be honest about one, so
+  four cases refuse or declare themselves incomplete rather than grade a run:
+  an outbound call or a mail send is served from the tape only when its
+  *contents* match too — same endpoint but a different amount, or the same
+  recipients but a different letter, is a divergence rather than a clean
+  reproduction (a mail *sender* counts only when the replayed run chose one,
+  since a message that names no `from` inherits `[mail] from` at send time and
+  a replay boots without mail configuration); a job capsule whose payload `[log] filter_parameters` masked is
+  refused, because a handler is handed its payload verbatim and would parse the
+  `[FILTERED]` placeholder; an effect whose future was cancelled before it
+  finished (a losing `tokio::select!` branch) marks the capsule incomplete
+  instead of persisting a backend failure the run never had; and a run that
+  enqueued inside its own transaction (`enqueue_on_conn`) does the same, since
+  that enqueue is also a job-row INSERT on the database tape that replay can
+  serve but never issue. A **panicking** job now leaves a capsule whatever its
+  attempt number: all three backends dead-letter a panic immediately, so its
+  first attempt is also its last, and gating capture on the final attempt meant
+  the job failure most worth a capsule never produced one.
+  Two further rules keep a verdict honest. A recorded **failure** is rebuilt
+  with its own error variant and its exact recorded text — no replay marker —
+  so a handler that branches on `ClientError::CircuitBreakerOpen` or
+  `MailError::AllRecipientsSuppressed` takes the branch it took in production,
+  and one that propagates the error produces the same outcome message rather
+  than a spurious mismatch. And a **mail send** is compared on everything a
+  recipient would notice: both halves of a multipart body, reply-to,
+  `List-Unsubscribe`, caller-set headers, and each attachment by name, type,
+  size and SHA-256 (never its bytes — an invoice has no business being copied
+  into a capsule). `autumn capsule verify` now also checks that every committed
+  capsule still has a generated test wired into the consolidated suite: it runs
+  the corpus by name filter, so a deleted test would otherwise be skipped in
+  silence while the corpus reported that it replays clean.
+  An `enqueue_at` deadline is compared as a deadline rather than as a delay
+  derived from it, so a job rescheduled to a different instant is noticed; a
+  capsule whose outbound *response body* or *cache hit* was masked is refused,
+  since that data reaches the handler as input rather than as something
+  compared; the mail redaction sweep covers reply-to, `List-Unsubscribe`,
+  caller-set header values and attachment filenames, so a value filtered
+  elsewhere cannot sit in the clear one field over; and a response's final
+  post-redirect URL is recorded and restored, for handlers that inspect
+  `Response::url()`.
+  Redaction reaches three places it had missed, two of which leaked: the URL a
+  redirect landed on (an OAuth callback carries `access_token` in its query as
+  a matter of course) and an enqueue rejection's free-form error text, both of
+  which could hold a value filtered everywhere else in the capsule. The third
+  is the resolved tenant, which — like a response header and the response body
+  — is *input* rather than compared data, so a masked one now refuses instead
+  of running the request under a tenant production never resolved. A cache hit
+  whose value will not serialize marks the capsule incomplete rather than
+  recording as a miss the handler never took. And `autumn capsule test` now
+  writes the Cargo test target that compiles the generated suite: Cargo does
+  not descend into `tests/` subdirectories, so without a top-level `mod
+  integration;` the generated tests were never built and `cargo test capsule_`
+  matched nothing — which `autumn capsule verify` now reports as unusable
+  rather than as a clean corpus.
+  Replay also dispatches a recorded job through the application's
+  `JobInterceptor` when one is registered, since that is part of how the
+  recorded run executed; an `enqueue_after_commit` is recorded where the
+  handler registers it, because the deferred callback runs on a task that does
+  not inherit the capture scope and the enqueue would otherwise be missing from
+  the capsule and diverge on every faithful replay; the generated support
+  module names Axum through `autumn_web::reexports::axum`, which is the only
+  path that resolves in an application that does not depend on Axum directly;
+  and a non-UTF-8 outbound response header is preserved lossily rather than
+  recorded as empty.
+  A cache write records the expiry it asked for and compares on it, since a
+  five-second entry and a permanent one are different mutations; a write whose
+  value will not serialize marks the capsule incomplete, as the matching read
+  already did; an attachment filename compares through the redaction wildcard
+  while its type, length and digest stay exact, so a masked filename does not
+  report a divergence against unchanged code; and outbound request and response
+  headers are charged against `max_capsule_bytes`, which they had escaped.
+
 ### Fixed
 
 - **A sandboxed plugin can no longer abort the application at boot:** the
@@ -101,6 +321,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Admin user impersonation with an audit trail and a revert banner (#1394):**
+  every support team eventually needs to "log in as this user" to reproduce a
+  bug or verify a permission, and until now that meant hand-rolling a session
+  swap — `session.set("user_id", target)` — which silently destroys the audit
+  trail: from that moment on every version row and audit event claims the
+  *customer* did it. A new additive API, `autumn_web::auth::impersonation`,
+  makes the secure version the easy one. `begin_impersonation` swaps the
+  session's effective user to the target and records the real admin separately
+  under a reserved `impersonator_id` key, so the resolution the *framework* owns
+  (`#[secured]`, `RequireAuth`, `PolicyContext`) transparently sees the
+  **impersonated** user — `Auth<T>` is populated by the app's own loader
+  middleware from request extensions, so it follows only if that loader reads the
+  auth session key — while the framework's ambient current actor (#1383) — the
+  value that seeds `#[repository(versioned)]` version rows and `AuditEvent`s — is
+  published as the **real impersonator**. `end_impersonation` reverses it.
+  Beginning is default-deny: it requires an `ImpersonationGate` in `AppState`
+  (`ImpersonationGate::allow_roles(["admin"])` for the common case, or a custom
+  `ImpersonationPolicy` — the seam where an app enforces its own tenancy
+  boundary), so an app can never acquire impersonation by accident. Both
+  directions rotate the session id (no fixation) and write an audit event
+  carrying `{impersonator_id, target_id}`; a *denied* attempt is audited as a
+  failure, and a begin is refused outright — rather than taking effect
+  unrecorded — both when the audit write fails and when the app has installed
+  no audit sink at all (`audit::write_from_state` is a silent no-op without
+  one, so impersonation requires a real sink before it will swap anything). Impersonation does not nest — starting a second hop
+  is a `409`, so it cannot be chained to escalate — and the impersonated
+  session's role is resolved **server-side** by
+  `ImpersonationPolicy::target_role`, never taken from request input, so an
+  operator cannot mint a session more privileged than the target really is. The
+  operator's step-up (`last_strong_auth_at`) claim is a bare timestamp with no
+  identity bound to it, so begin stashes and drops it — otherwise a `#[step_up]`
+  route could run a destructive action on the *target's* account on the strength
+  of the operator's re-authentication — and end restores it. Impersonation also
+  does not survive a change of identity: the record is bound both to the user it
+  describes and to the session generation that created it, so either a different
+  effective user or a session-id rotation (which every login performs) retires
+  it — it stops counting for attribution and the revert route refuses it, rather
+  than handing whoever comes next the operator's identity and role. The
+  generation binding covers the case an id check alone misses: the impersonated
+  customer signing in as themselves on the same browser.
+  `impersonation::clear` scrubs it from a login flow outright. An `auth.session_key`
+  configured as one of the reserved keys would make the swap clobber its own
+  record, so both directions refuse it and registering the gate logs it at
+  startup (`impersonation::is_reserved_session_key` /
+  `RESERVED_SESSION_KEYS` expose the check).
+
+- **`AdminPlugin::with_impersonation(gate)` — the impersonation UI (#1394):**
+  opts an admin panel into the primitive above and mounts two routes:
+  `POST {prefix}/impersonate` (behind the admin role gate, the step-up guard
+  when enabled, *and* the `ImpersonationGate`) and `POST
+  {prefix}/impersonate/stop`, deliberately mounted **outside** the role gate —
+  while impersonating, the session carries the target's role, so a gated revert
+  would trap the operator in the target's identity with no way back. The admin
+  router also publishes the request's current actor unconditionally —
+  attribution must not depend on the *optional* role check — so admin-surface
+  writes are attributed at all (previously `SYSTEM_ACTOR`) and correctly while
+  impersonating; runtime-config changes are recorded against the operator rather
+  than the customer for the same reason. Every admin page then renders a
+  persistent "Viewing as … — Stop impersonating" banner with one-click revert. The same banner goes in an application's own layout — the
+  surface an operator actually looks at while impersonating a non-admin — via
+  `autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
+  csrf_token, csrf_form_field)` plus the exported
+  `IMPERSONATION_BANNER_CSS`. Without `with_impersonation` neither route is
+  mounted at all.
 - **Examples for the four flagship 0.7.0 subsystems that shipped a guide and
   nothing runnable (#2320, T2):** the 0.7.0 docs audit found guide coverage at
   91.1% and example coverage at 59.4% — the debt had moved wholesale from docs
@@ -202,6 +486,150 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handling under the declared prefix is the only capability that exists, so no
   manifest can ask for a database, a session or an outbound call. See
   `docs/guide/sandboxed-plugins.md`.
+
+- **UI/routing documentation and the flagship example that proves it (#2320):**
+  the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing
+  doc gaps and almost no showcased example coverage. Four narrative guides and
+  a reworked `examples/reddit-clone` close it.
+
+  New guides:
+
+  - `docs/guide/forms.md` — the changeset round-trip end to end: `ChangesetForm`
+    and why a rejected submission is *data* rather than an error, `Valid<T>` /
+    `Validated<T>` / `ValidateExt` for callers that are programs, model-level
+    `#[validate(...)]` and the merged-model rule that makes it hold on updates
+    **where it applies** — a repository with hooks or `validate_on_update =
+    fetch` validates the merged model, while a plain generated repository takes
+    the blind-update path and runs no model validation at all — plus
+    `#[normalize(trim, downcase, upcase, squish, with = …)]` and exactly where
+    it runs on the write path (before validation, before hooks, and on derived
+    finders) **and where it does not**: both update paths persist the raw
+    patch, so a direct `repo.update(...)` writes unnormalized values. CSRF,
+    `form_for`, htmx inline validation and the no-JavaScript
+    fallback that costs nothing to keep, accessible fields, and how to test the
+    failure path. This was the last core-surface subsystem documented only
+    obliquely.
+  - `docs/guide/extractors.md` — the extractor catalog, the two ordering rules
+    (one body extractor, and it goes last; head extractors run left to right,
+    which is why `Db` must be dropped before a second pooled checkout), writing
+    your own, and a full section on `Query<T>`'s structured decoding: repeated
+    keys, `tags[]`, `tags[0]`, `filter[status]`, `items[0][sku]`, the depth cap,
+    duplicate-key rejection, why errors never echo a value, and the
+    `HashMap`-typed-target upgrade note.
+  - `docs/guide/cookie-consent.md` — the gate as the actual compliance rather
+    than the banner, the strictly-necessary exemption, `accept_all_cookie` /
+    `reject_non_essential_cookie` / `expire_consent_cookie`, why accept and
+    reject are `POST` while only the preferences page is a `GET`,
+    `inject_consent_banner` and the four bugs its special cases prevent,
+    policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow.
+  - `docs/guide/middleware.md` gains a "which hook do I reach for" decision
+    table, a full `#[intercept(...)]` section (per-route tower layers, stacking
+    order, when to use something else instead, and the `#[edge]` and idempotency
+    trade-offs), and a section on the non-HTTP interceptors —
+    `with_mail_interceptor` / `with_job_interceptor` / `with_db_interceptor` /
+    `with_channels_interceptor` / `with_http_interceptor` — which no tower layer
+    can reach.
+  - `docs/guide/pagination.md` gains the `ListQuery` section the feature never
+    had (allowlisted `sort` / `dir` / `filter[col]`, and why the allowlist lives
+    in the generated `list()` rather than the extractor), plus a costs section:
+    `COUNT(*)`, deep-offset scans, offset instability under concurrent inserts,
+    and the two-connection deadlock.
+
+  `examples/reddit-clone` now exercises the features those guides describe:
+
+  - **Typed accessible forms** — the submit and edit forms are built from
+    `a11y::TextField` / `TextArea` / `Select` / `Button` / `Link`, whose
+    unlabeled forms do not implement `Render` and therefore do not compile.
+    Errors are wired with `aria-invalid` plus `aria-describedby` pointing at a
+    `role="alert"` message element.
+  - **The changeset round-trip** — `submit` and `update` are `ChangesetForm`
+    handlers that re-render the form on 422 with the author's title, URL and
+    body intact, replacing hand-rolled `unprocessable_msg` errors that discarded
+    the draft.
+  - **Rich text** — post bodies are user-submitted Markdown rendered through
+    `markdown::render_user_content` at display time, so the stored source stays
+    editable and a later allowlist change protects posts already written.
+  - **Cookie consent** — `inject_consent_banner` on spliceable HTML pages
+    (registering the layer is not the same as "every page prompts": several
+    response shapes are deliberately passed through untouched, all of them
+    still receiving `Vary: Cookie` — `docs/guide/cookie-consent.md` enumerates
+    them, and is the one place that list is maintained), `POST`
+    accept/reject/withdraw routes, a `GET /consent/manage` preferences page
+    reusing the framework banner widget, a footer link on every page, and the
+    app's one non-essential category gated at its single call site.
+  - **Pagination** — the community listing is offset-paginated with
+    `PageRequest` + `Page` + `pagination_nav`, with page links that are plain
+    `<a href>`, a self-referential canonical on deeper pages, and the live SSE
+    feed wired on page 1 only.
+  - **No-JavaScript fallbacks** — the forms carry no `hx-*` attributes and
+    submit normally; unit tests assert that, the CSRF hidden input, the label
+    and error wiring, and the rich-text sanitizer's script/image/scheme
+    rejections.
+
+- **Cache coherence is now proven at build time — the build fails when a write
+  can leave a cached read stale (#1716):** Autumn’s cache was powerful and its
+  coherence was entirely manual. `Cache::invalidate(key)` was hand-called,
+  `#[cached]` memoized by argument hash, and nothing linked a cached value to
+  the rows it was derived from or to the `#[repository]` write that dirties
+  them. A forgotten invalidation shipped as a silent staleness bug — the most
+  common and hardest-to-catch class of cache defect, and one no mainstream
+  framework catches before production, because everywhere else cache keys are
+  stringly typed and invalidation is convention. Autumn owns both ends of that
+  dependency, so it can assemble the graph instead of hoping. `#[cached]` now
+  publishes which models a value is derived from — declared with
+  `reads(Post, Comment)`, or derived by the macro from the function’s own
+  signature and body — and `#[repository]` publishes which model each of its
+  write methods mutates. `autumn cache audit` reads both back out of the built
+  binary (whole-app, so a read in one crate and a write in another or in a
+  plugin are still compared), emits a stable-ordered, provenance-tagged
+  cache-coherence manifest as a build artifact, and exits non-zero on any
+  uncovered pair — naming the read, the write, the model they share, both
+  source locations, and the two ways to discharge it. The obligation is
+  discharged with `invalidates(path::to::cached_fn)` on the repository (or
+  `#[invalidates(...)]` on one method), which is resolved by **rustc**: the path
+  rewrites to the identity constant `#[cached]` emits beside the function, so an
+  edge that names a non-cached function does not compile — it is a resolved
+  path, not a string in a table somebody has to keep in sync. Alternatively
+  `acknowledge_stale = "reason"` opts out, with a mandatory non-blank reason that
+  lands in the manifest so every escape hatch is visible in review. A repository
+  that declares any edge also gets a generated `invalidate_declared_caches()` that
+  really does clear those reads — including on a shared cross-replica backend, via
+  a new `Cache::invalidate_namespace` that `MokaCache` implements by iteration and
+  `RedisCache` by a `SCAN MATCH` one segment narrower than its existing `clear`; a
+  custom backend that cannot pattern-match its key space returns `false`, and the
+  caller is told so rather than left believing the value is gone. A fill already
+  in flight when an invalidation lands cannot write its stale value back
+  afterwards: `#[cached]` samples the namespace’s epoch before the lookup and
+  inserts through `with_fill_fence`, which re-checks it and inserts as one step
+  that cannot interleave with the invalidation’s bump.
+  Deliberately conservative in the direction
+  that keeps the gate alive: a read whose dependency set could not be
+  established is `undetermined` — reported in the manifest and the summary, never
+  failed, unless `--strict` — because a checker that fails on what it merely
+  could not read is a checker that gets deleted from CI. Reads the macros cannot
+  see (fragment, read-through) declare themselves with `declare_cached_read!`,
+  and `cache_fragment_in` / `cache_fragment_global_in` key a fragment under that
+  declared id so the invalidation edge actually reaches it — the plain
+  `cache_fragment` keys under a bare `fragment:` prefix that every fragment
+  shares, which no per-read namespace sweep can match.
+  `#[cached]` also gained `key(a, b)` to build the cache key from named
+  parameters only, which is what lets a cached read take the repository handle it
+  reads through — the handle is `Clone` but not `Hash`, and was never part of the
+  value’s identity. A derived dependency resolves the model through the
+  repository’s own `__AUTUMN_MODEL_NAME` rather than string-stripping its type
+  name, so `#[repository(Comment)] trait ModerationRepository` yields `Comment`;
+  a repository reached only through its trait is recorded `undetermined`, since
+  the trait carries no such constant and a guessed model that names nothing
+  would turn a real violation into a clean audit.
+  What is proven and what is not is stated on the tin: the
+  `invalidations` dimension carries a `runtime_caveat` saying the edge’s target
+  is proven — rustc resolves it to the read’s own generated id constant — but
+  its *invocation* on the write path is not, and the manifest’s `excluded` list
+  names row/column granularity,
+  cross-service coherence and TTL semantics as out of this slice. `examples/saas`
+  demonstrates both halves — the app audits clean, and deleting the one
+  `invalidates(...)` clause turns the build red. See
+  `docs/guide/cache-coherence.md`.
 
 - **Shadow (differential) deploys — mirror live traffic to a candidate build and
   diff its responses before cutover (#1653):** every deploy strategy Autumn
@@ -605,6 +1033,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other decline, so the origin serves the request instead.
 
 ### Performance
+
+- **a no-database app no longer compiles the framework's database codegen:**
+  `autumn-macros` had no `[features]` section at all, so `model.rs` and
+  `repository.rs` — together ~40k of the crate's ~60k lines, and the bulk of its
+  compile time — were built in full for every consuming app, including one that
+  can reach neither macro (`autumn-web` already gates both re-exports on its own
+  `db` feature). `autumn-macros` now has a default-on `db` feature covering that
+  codegen, and `autumn-web` takes the crate with `default-features = false` and
+  forwards its own `db` to it, so a DB-free app skips the modules instead of
+  compiling them and throwing them away. Measured on a 4-core box, a debug build
+  of `autumn-macros` drops from 31.1s to 2.7s (-91%) with `db` off; the crate sits
+  on the serial critical path of a first build (nothing else starts until it
+  finishes), so that time comes straight off cold-start onboarding. End to end,
+  `autumn dev-loop-bench --cold-start` — `autumn new` to the first HTTP 200 for
+  the no-DB starter — drops from 136.6s to 90.8s (-33%) on the same box. That
+  does not on its own bring the gate's p95 60s / max 90s budget green, so the
+  budget question issue #2309 raises stays open (issue #2309). A DB-backed app
+  enables `db` and is unaffected — same macros, same expansions. The serde /
+  JSON-schema field helpers shared with
+  `#[derive(OpenApiSchema)]` moved out of `model.rs` into a new always-compiled
+  `schema` module, so the derive keeps working (and keeps its tests) with `db`
+  off. Direct dependants of `autumn-macros` see no change: `db` is on by default
+  there.
 
 - **`autumn-search`'s Postgres backend now batches a document write into one
   statement instead of one per document:** `PostgresSearchStore::write_documents`
@@ -7025,4 +7476,3 @@ To opt out of the generated `page` method: implement your own list handler using
 - Commit CHANGELOG.md back to trunk on release([6b5eb82](https://github.com/madmax983/autumn/commit/6b5eb82b27d3932880f21b3cc3afc0fc29fa8790))
 - Add codecov, dependabot, and changelog tooling for v0.1 (#9)([db0d670](https://github.com/madmax983/autumn/commit/db0d6705c6379880fd51c48ae728824530cce5cb))
 - Update sprint status — Sprint 2 complete (13/12 pts)([07e0738](https://github.com/madmax983/autumn/commit/07e07387190401f4208f4a3eca1298bcaef5e856))
-

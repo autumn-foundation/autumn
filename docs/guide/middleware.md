@@ -4,13 +4,233 @@ Autumn ships a curated stack of built-in middleware — request IDs, security
 headers, CSRF, CORS, sessions, metrics, exception filters. That covers the
 boring-but-critical concerns most applications share. When you need something
 off the beaten path (a timeout, a rate limiter, a custom tracing span, a
-legacy header injector), reach for [`AppBuilder::layer`] and drop in any
-standard [`tower::Layer`].
+legacy header injector), you have several places to put it.
 
-This guide explains where user layers sit in the stack, how to register them,
-and the common recipes.
+This guide explains **which hook to reach for**, where each one sits in the
+stack, how to register it, and the common recipes.
 
 ---
+
+## Which hook do I reach for?
+
+Start here. Most "I need middleware" questions are answered by a row that is
+not a tower layer at all.
+
+| You want to… | Reach for | Scope | Why this one |
+|---|---|---|---|
+| Bound how long a request may take | `[server.timeouts] request_timeout_ms`, or `#[get(..., timeout_ms = N)]` | app / route | Built in. A hand-rolled `TimeoutLayer` gets the error shape, the counter, and the SSE/WebSocket exemptions wrong. |
+| Throttle a caller | `#[throttle(...)]` | route | Built in, and keyed on the resolved client identity. See [rate limiting](./rate-limiting.md). |
+| Require a logged-in user | `#[secured]` | route | Runs after the session layer, so it sees the session. |
+| Decide *whether this actor may act on this record* | `#[authorize(...)]` | route | Policies need the loaded record; middleware runs before the handler and has none. See [authorization](./authorization.md). |
+| Read something off the request in one handler | an **extractor** | handler | No layer needed. `ClientAddr`, `Session`, `CsrfToken`, `Query<T>`, your own `FromRequestParts`. See [extractors](./extractors.md). |
+| Wrap **one route or a handful** in a tower layer | `#[intercept(MyLayer)]` | route | Per-route layering with no router surgery. See below for the path-only constraint. |
+| Wrap **a URL-prefixed group** in a tower layer | `AppBuilder::scoped(prefix, layer, routes)` | group | One registration for `/api/*` without touching each handler. |
+| Wrap **every** request | `AppBuilder::layer(..)` | app | Cross-cutting concerns that genuinely apply everywhere. |
+| Redirect/reject **before a cached page is served** | `AppBuilder::static_gate(..)` | app, outermost | The only hook that runs ahead of the SSG/ISG cache. |
+| Wrap something that is **not an HTTP request** — an outgoing mail, a job enqueue/execute, a DB checkout, a channel publish, an outbound HTTP call | `AppBuilder::with_*_interceptor(..)` | subsystem | Those pipelines never pass through the tower stack. See [non-HTTP interceptors](#non-http-interceptors-mail-jobs-db-channels-outbound-http). |
+| Run logic around a **model save** | repository hooks | model | See [hooks and transactions](./hooks-and-transactions.md). |
+| Ship the whole thing for someone else to install in one line | a `Plugin` | crate | See [extensibility](./extensibility.md). |
+
+Two rules of thumb behind the table:
+
+1. **Prefer the narrowest scope that works.** A layer on every request is a
+   layer you pay for on `/health`, on `/static/*`, and on the error path. If
+   only `/api/*` needs it, `scoped` says so in one line and the route listing
+   (`autumn routes`) shows it.
+2. **A layer cannot see handler state, and a handler cannot short-circuit a
+   layer.** If your logic needs the loaded record, the resolved policy, or the
+   deserialized body, it is not middleware — it is an extractor, a guard, or
+   handler code.
+
+---
+
+## `#[intercept(...)]` — per-route tower layers
+
+`#[intercept(PATH)]` attaches a [`tower::Layer`] to **one route**.
+
+> **The argument must be a path, not a call.** The route macro parses it as a
+> [`syn::Path`] and uses it directly as a value, so `MyLayer` works and
+> `MyLayer::new(config)` does **not** — the latter fails to parse and the
+> attribute is currently dropped **silently**, mounting no layer at all. Write
+> the layer as a unit struct (or a `const`/`static` path) and have it read
+> whatever it needs from application state at request time.
+
+```rust,ignore
+use autumn_web::prelude::*;
+
+/// A unit-struct layer: nameable as a bare path, so the attribute accepts it.
+#[derive(Clone)]
+struct CacheExpensive;
+
+#[get("/expensive")]
+#[intercept(CacheExpensive)]
+async fn expensive() -> &'static str {
+    "computed once, served many"
+}
+```
+
+Stack several by repeating the attribute. They compose like
+[`tower::ServiceBuilder`]: **the first attribute is the outermost layer**, so it
+sees the request first and the response last.
+
+```rust,ignore
+#[get("/reports/{id}")]
+#[intercept(TenantLayer)]     // outermost: runs first on ingress
+#[intercept(CacheExpensive)]  // innermost: closest to the handler
+async fn report(Path(id): Path<i64>) -> Markup { /* … */ }
+```
+
+Because the argument cannot carry configuration, a layer that needs some has two
+options: read it from `State<AppState>`/an extension inside the service, or use
+`AppBuilder::scoped`, whose layer **is** an ordinary expression and can capture
+anything.
+
+### When `#[intercept]` is the right answer
+
+Reach for it when **all** of these hold:
+
+- the behaviour is genuinely per-request wrapping — it needs to see the request
+  before the handler runs *and* the response after, or it needs to
+  short-circuit and never call the handler at all;
+- it applies to a specific route (or a few), not the whole app;
+- it is expressible as a tower layer over the whole request/response.
+
+Response caching is the canonical case: `CacheResponseLayer` must return a
+stored response *without* running the handler, which no extractor can do.
+Per-route auth *shape* (a bearer-token layer on API routes while the browser
+routes keep session cookies) is the second most common.
+
+### When to use something else instead
+
+| Situation | Use instead |
+|---|---|
+| The logic only *reads* the request and hands a value to the handler | an extractor — cheaper, testable as a plain function, visible in the handler signature |
+| Every route needs it | `AppBuilder::layer` — one registration instead of an attribute per handler |
+| Every route under one prefix needs it | `AppBuilder::scoped` — same, and `autumn routes` reports the group |
+| It must run before a pre-rendered page is served | `static_gate` — `#[intercept]` sits inside the static cache and never runs on a cache hit |
+| It is an authorization decision about a record | `#[authorize]` |
+| It is a deadline, a throttle, or a security header | the built-in config knobs — see the table above |
+
+### Trade-offs worth knowing before you reach for it
+
+- **A non-path argument is silently ignored.** `#[intercept(MyLayer::new(..))]`
+  compiles and mounts nothing. Verify a new interceptor actually runs (a log
+  line, a test asserting its header) rather than assuming the attribute took —
+  this matters most for a layer whose whole job is to *reject* requests.
+- **`#[intercept]` is incompatible with `#[edge]`.** Interceptor layers are
+  origin-only tower middleware; combining the two is a compile error, because
+  the edge capsule has no tower stack to host the layer.
+- **An intercepted route opts out of implicit idempotency replay.** Because a
+  layer may legitimately produce a different response than the handler alone,
+  such a route fails closed and requires an explicit replay scope rather than
+  inheriting one. See [idempotency](./idempotency.md).
+- **It stacks inside the framework stack, not outside it.** Session, CSRF,
+  error pages, and metrics have already run by the time your layer sees the
+  request — which is usually exactly what you want.
+- **Bounds are the standard tower bounds** (`Clone + Send + Sync + 'static`,
+  `Service::Error = Infallible`). Wrap fallible layers in
+  [`axum::error_handling::HandleErrorLayer`], as shown further down.
+
+---
+
+## Non-HTTP interceptors (mail, jobs, DB, channels, outbound HTTP)
+
+A tower layer only sees inbound HTTP. Four other pipelines never touch it, and
+each has its own interceptor trait installed on the builder:
+
+| Builder method | Trait | Wraps |
+|---|---|---|
+| `with_mail_interceptor` | `MailInterceptor` | every outgoing `Mail` delivery |
+| `with_job_interceptor` | `JobInterceptor` | every job enqueue **and** every job execution |
+| `with_db_interceptor` | `DbConnectionInterceptor` | checkouts through `Db::checkout` — see the caveat below |
+| `with_channels_interceptor` | `ChannelsInterceptor` | publishes through the app's `Channels` registry |
+| `with_http_interceptor` | `HttpInterceptor` | outbound requests sent through `auth::HttpClient` — see the caveat below |
+
+None of these means *every* without qualification, and the gaps share a shape:
+each hook is installed on the thing the framework hands you, so anything
+constructed outside that registry — or running outside a request — escapes it.
+`with_mail_interceptor` wraps the configured `Mailer`'s transport,
+`with_channels_interceptor` the `AppState` `Channels` registry; a `Mailer` or
+`Channels` your own code builds is untouched by either. The two worth spelling
+out:
+
+`DbConnectionInterceptor` sees only checkouts made through `Db::checkout` (the
+`Db` extractor and the shard-routed paths). The scheduler and the job runtime
+take connections straight from the pool, so a hook used for auditing or fault
+injection will not observe them. It is a request-path tool.
+
+`HttpInterceptor` is the one to read the fine print on. Only
+`auth::HttpRequestBuilder::send` consults the interceptor list, and that type
+lives behind the `oauth2` feature — so a request made through the SSRF-guarded
+`Client` extractor, or through a `reqwest::Client` your own code built, does not
+run it. It is a hook on the OAuth path, not a chokepoint for arbitrary outbound
+traffic; if you need every call audited, that has to come from routing calls
+through a named client (see the [outbound HTTP guide](./outbound-http.md)), not
+from registering this.
+
+They all share the "around" contract — you receive the operation plus a `next`,
+and decide whether, when, and how to invoke it — but **`next` comes in two
+forms, and the difference decides what you can build**:
+
+| `next` is | Traits | You can |
+|---|---|---|
+| an owned `Pin<Box<dyn Future>>` | `MailInterceptor`, `JobInterceptor`, `DbConnectionInterceptor` | await it **once**, or drop it to suppress the operation |
+| a callable `&dyn Fn(..)` | `ChannelsInterceptor`, `HttpInterceptor` | invoke it zero, one, or **many** times, **and choose what to pass** |
+
+The first three are *observe* hooks, not rewrite hooks. The owned future has
+already captured its operation — the mail to send, the job payload, the
+checkout — so nothing in the signature reaches inside it. Such an interceptor
+can wrap, time, refuse, or log a job; it cannot edit the payload that gets
+enqueued, and it cannot retry, because nothing there builds a second attempt.
+To retry a mail send or a job, use the subsystem's own retry policy.
+
+`ChannelsInterceptor` and `HttpInterceptor` take the operation as *arguments*
+to `next` — `next(topic, message)` and `next(request)` — so those two can do
+what the others cannot: rewrite what gets published or sent, call `next` more
+than once to retry, or not at all to drop it.
+
+```rust,ignore
+use autumn_web::interceptor::JobInterceptor;
+
+struct TracingJobs;
+
+impl JobInterceptor for TracingJobs {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            tracing::info!(job = name, "enqueuing");
+            next.await
+        })
+    }
+
+    fn intercept_execute<'a>(
+        &'a self,
+        _name: &'a str,
+        _payload: &'a serde_json::Value,
+        next: std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>> {
+        next
+    }
+}
+
+autumn_web::app()
+    .with_job_interceptor(TracingJobs)
+    .run()
+    .await;
+```
+
+Unlike `.layer()`, these are **last-one-wins installs**, not a stack: a second
+`with_job_interceptor` replaces the first. Compose inside a single interceptor
+if you need two behaviours. `DbConnectionInterceptor` is also how the test
+harness implements transactional test isolation, which is why it carries an
+`is_transactional_test` marker.
+
+---
+
 
 ## Built-in request timeout
 
@@ -158,7 +378,9 @@ order:
                                                                                     └─ RateLimit
                                                                                          └─ CSRF
                                                                                               └─ CORS
-                                                                                                   └─ route handler
+                                                                                                   └─ [your .scoped() layer, for routes in that group]
+                                                                                                        └─ [your #[intercept] layers, first attribute = outermost]
+                                                                                                             └─ route handler
 ```
 
 Config-gated layers (Compression, ServerTiming, AccessLog, Timeout, RateLimit,
@@ -178,12 +400,22 @@ short-circuit above it — session-store outages, and in production startup
 outermost **fallback** `AccessLog`, which logs them with the wire status (and
 without a request id, since `RequestIdLayer` never ran for them).
 
-The ordering guarantee that matters most: **user layers run inside
-`RequestIdLayer` on ingress**, so every `.layer()` you register can read the
-generated `RequestId` from the request extensions. Exception filters,
-metrics, and error-page rendering all sit *outside* your layers, which means
-errors you produce (and errors you let bubble up from handlers) are still
-caught by Autumn's error pipeline.
+The ordering guarantee that matters most: **in a fully dynamic build, user
+layers run inside `RequestIdLayer` on ingress**, so every `.layer()` you
+register can read the generated `RequestId` from the request extensions.
+Exception filters, metrics, and error-page rendering all sit *outside* your
+layers, which means errors you produce (and errors you let bubble up from
+handlers) are still caught by Autumn's error pipeline.
+
+> **This inverts when a `dist` manifest is active (SSG/ISR).** To let your
+> layers see pre-rendered responses — to compress them, for instance —
+> `try_build_router_with_static_inner` drains the registered layers and
+> reapplies them **outside** the static-first middleware, which puts them
+> outside `RequestIdLayer` and the session layer too. In that mode a layer
+> reading `RequestId` finds nothing, on cached hits *and* on dynamic misses.
+> Read it as `Option` and degrade, rather than unwrapping. The same
+> repositioning is why `request_timeout_ms` does not bound those layers in
+> static builds — a limitation `router.rs` documents at the same site.
 
 Multiple `.layer()` calls stack in registration order, mirroring
 [`tower::ServiceBuilder`]: the first `.layer(A)` call becomes the outermost
@@ -319,17 +551,31 @@ Key properties and trade-offs:
 
 ---
 
+## Scope, side by side
+
+The three tower-layer registrations differ only in *what they wrap*:
+
+| Registration | Wraps | Position among user layers |
+|---|---|---|
+| `#[intercept(L)]` | the annotated route | innermost — inside `.scoped` and `.layer` |
+| `.scoped(prefix, L, routes)` | the routes in that group | between `.layer` and `#[intercept]` |
+| `.layer(L)` | every request | outermost user position (see the diagram above) |
+| `.static_gate(L)` | every request, **ahead of the static cache** | outside the framework stack entirely |
+
+All four take the same `tower::Layer` bounds, so a layer written for one can be
+moved to another without changing its code — only the registration line moves.
+
 ## Limitations (for now)
 
-- **No per-route layers.** `.layer()` wraps the whole app. If you need a
-  middleware scoped to a group of routes, use
-  [`AppBuilder::scoped`] — it accepts the same `tower::Layer` bounds and
-  applies the layer only to the routes in that group. Per-route layering
-  (equivalent to axum's `route_layer`) is tracked as a follow-up.
 - **`Service::Error = Infallible`.** Any layer you register must produce
   `Infallible` on its service's `Error` associated type. For layers that
   surface real errors (timeouts, rate limits, circuit breakers), wrap them
   with [`axum::error_handling::HandleErrorLayer`] as shown above.
+- **`#[intercept]` and `#[edge]` are mutually exclusive.** Interceptor layers
+  are origin-only; an edge capsule has no tower stack to host one, so the
+  combination is refused at compile time.
+- **Non-HTTP interceptors are last-one-wins.** `with_job_interceptor` and its
+  siblings replace rather than stack. Compose inside one implementation.
 
 ---
 
@@ -384,11 +630,16 @@ header for downstream services.
   panic-aware promotion of the `ExceptionFilter` concept shown in the ordering
   diagram above.
 - [Extensibility guide](./extensibility.md) — picks the right tier for your
-  extension point.
+  extension point; `#[intercept]` is its tier 2.
+- [Extractors guide](./extractors.md) — the other half of the decision table:
+  when reading the request in the handler beats wrapping it in a layer.
+- [Authorization guide](./authorization.md) — `#[authorize]`, policies, and
+  why record-level decisions cannot live in middleware.
 
 [`AppBuilder::layer`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.layer
 [`AppBuilder::scoped`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.scoped
 [`tower::Layer`]: https://docs.rs/tower/latest/tower/trait.Layer.html
+[`syn::Path`]: https://docs.rs/syn/latest/syn/struct.Path.html
 [`tower::ServiceBuilder`]: https://docs.rs/tower/latest/tower/struct.ServiceBuilder.html
 [`axum::error_handling::HandleErrorLayer`]: https://docs.rs/axum/latest/axum/error_handling/struct.HandleErrorLayer.html
 

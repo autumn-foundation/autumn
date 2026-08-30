@@ -84,7 +84,8 @@ the framework almost certainly already generates or ships it:
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
-| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + PostgreSQL wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598) |
+| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
+| Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -978,6 +979,51 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
+
+### Admin impersonation (unreleased, issue #1394)
+
+"Log in as this user" without breaking the audit trail. Never hand-roll it
+with `session.insert("user_id", target)` — that makes every subsequent version
+row and audit event claim the *customer* did it.
+
+`autumn_web::auth::impersonation::begin_impersonation(&state, &session, target)`
+swaps the session's **effective** user and records the real admin separately
+under a reserved `impersonator_id` key, so `#[secured]` / `RequireAuth` /
+`PolicyContext` see the impersonated user while the ambient current actor
+(`Current::actor`, which seeds `#[repository(versioned)]` rows and audit
+events) stays the **real impersonator**. `end_impersonation(&state, &session)`
+reverts. `impersonator_id(&state, &session)` is the separate accessor;
+`impersonation_state(&state, &session)` returns both ids, and the
+`Impersonation` extractor is the handler-side form. Register the gate with
+`AppBuilder::impersonation_gate(...)`.
+
+Default-deny: it needs an `ImpersonationGate` in `AppState` —
+`ImpersonationGate::allow_roles(["admin"])`, or `::custom(policy)` with an
+`ImpersonationPolicy` (the seam for tenancy checks and for
+`target_role`, which resolves the impersonated session's role **server-side**;
+never accept a role from request input). Missing gate or a refusal is `403`.
+Both edges rotate the session id and write `auth.impersonation.begin` /
+`.end` audit events carrying `{impersonator_id, target_id}`; a begin is refused
+when the audit write fails **or when no audit sink is installed at all** — wire
+`AppBuilder::with_audit_sink(...)` before enabling it. The operator's step-up
+claim is stashed and dropped for the duration (so a `#[step_up]` action cannot
+be run on the target's account on the operator's re-auth) and restored on
+revert; the record is bound to the user it names *and* to the session
+generation that created it, so a login (which rotates the session id) retires
+it — a forgotten impersonation cannot be inherited by the next user, not even by
+the impersonated customer signing in as themselves. Call
+`impersonation::clear(&session)` from any login flow to drop it outright. No nesting (`409`), no self-impersonation, and
+the admin's own step-up claim is preserved rather than refreshed.
+
+For the UI, `AdminPlugin::with_impersonation(gate)` mounts
+`POST {prefix}/impersonate` (behind the role gate + the `ImpersonationGate`)
+and `POST {prefix}/impersonate/stop` — deliberately *outside* the role gate, so
+an operator impersonating a non-admin is never trapped — and renders a
+persistent "Viewing as … — Stop impersonating" banner on every admin page. Put
+the same banner in the app's own layout with
+`autumn_admin_plugin::impersonation_banner_for(&state, &session, "/admin",
+csrf_token, csrf_form_field)` plus `IMPERSONATION_BANNER_CSS`. Session-based
+auth only. See `docs/guide/authentication.md` and `docs/guide/admin.md`.
 
 ### Cookie consent (0.7.0, issue #1214)
 
@@ -2243,8 +2289,10 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
-autumn upgrade                   # preview each release's mechanical app-code migrations (renames) as a per-file diff; writes nothing
-autumn upgrade --apply           # take them; --from/--to override the range, --list-migrations shows what ships (#1629)
+autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
+autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
+autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)
+autumn upgrade --accept <PATH>   # record a framework-owned file as the developer's own: never offered or written again, and not drift (#1593)
 autumn deploy check              # SSH/secret/DB/migrate-safety preflight per configured host; `doctor --online` runs the same graders
 autumn deploy plan               # dry-run: representative unit + ordered steps (+ fleet rollout order when `[deploy] hosts` is set)
 autumn deploy up                 # real deploy over SSH; with `[deploy] hosts` a serial rolling deploy across the fleet (#1621)
@@ -2254,13 +2302,25 @@ autumn deploy status --json --strict          # read-only per-host state + versi
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
 ```
 
-### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629)
+### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
 
-**Reach for this before hand-editing call sites out of a migration guide.**
-For each release between the `autumn-web` version the app's `Cargo.toml`
-records and the target, it applies that release's *mechanical* migrations —
-API renames — to the app's own Rust source. First shipped: 0.6.0's
-`with_pool` → `with_pool_untracked`.
+**Reach for this before hand-editing call sites out of a migration guide, or
+hand-diffing a throwaway `autumn new` project.** One run covers both halves of
+an upgrade:
+
+1. **The app's own Rust source.** For each release between the `autumn-web`
+   version `Cargo.toml` records and the target, it applies that release's
+   *mechanical* migrations — API renames — to `src/`, `tests/`, `examples/`,
+   `benches/` and every workspace member. First shipped: 0.6.0's `with_pool`
+   → `with_pool_untracked`.
+2. **The project's framework-owned files.** `Dockerfile`, `.dockerignore`,
+   `build.rs`, `autumn.toml`, `.gitignore`, `.env.example`,
+   `.github/workflows/ci.yml`, `rust-toolchain.toml`, `rustfmt.toml`,
+   `clippy.toml`, and (fullstack only) `tailwind.config.js` +
+   `static/css/input.css`, reconciled against this release's scaffold.
+   Bumping `autumn-web` updates the library, not the project skeleton, so
+   without this an app scaffolded on 0.5 keeps 0.5-vintage project files
+   forever.
 
 Three things to get right when advising on it:
 
@@ -2281,6 +2341,40 @@ Three things to get right when advising on it:
 Every breaking change in `docs/migrations/*.md` carries an `**Automation:**`
 label — `auto` (the codemod does it), `review` (it rewrites, and flags each
 site), or `manual` (read the guide section). See `docs/guide/upgrading.md`.
+
+For the scaffold half, five more things (issue #1593):
+
+- **`src/` is out of bounds.** The set is a fixed allowlist with no `src/`
+  entry, and `Cargo.toml`, `README.md`, `tests/`, `migrations/`, `i18n/`,
+  `config/credentials/` and the vendored `static/js/` assets are not
+  framework-owned either. Application code is the *first* half's business.
+- **`.autumn/scaffold.toml` is the baseline, and must be committed.**
+  `autumn new` records the scaffolding release, the flags the project was made
+  with, and a digest of every framework-owned file as Autumn wrote it. That
+  digest is the only thing that can distinguish "the template moved" from "the
+  developer edited this". Verdicts: `add` (this release's scaffold has it and
+  the project does not — including files a later release introduced),
+  `update` (template moved, the copy is provably untouched), `conflict`
+  (never written), `removed` (deleted on purpose, never restored), `pinned`
+  (accepted as the developer's).
+- **A project with no manifest still upgrades, best-effort.** Every app
+  predating this feature is in that state: missing files are still offered,
+  and everything that differs is a conflict, because "untouched" cannot be
+  proven. Never an error.
+- **A conflict has to be able to conclude.** Where a file is deliberately the
+  team's — a `Dockerfile` with their own base image — `autumn upgrade --accept
+  <path>` records it in the manifest's `pinned` list so `--check` can go green
+  again. Removing a line from that list brings the file back.
+- **Inside a Cargo workspace, member crates are not offered `clippy.toml`,
+  `rustfmt.toml`, `rust-toolchain.toml` or a CI workflow.** Those resolve from
+  the nearest ancestor, so a crate-local copy *shadows* the workspace's rather
+  than adding to it, and GitHub never runs a workflow from a subdirectory.
+
+`--to` selects which codemods run; the scaffold half always reconciles to the
+release the CLI itself ships templates for — downgrades and historical
+scaffolds are out of scope. `--json` carries the scaffold report under a
+`scaffold` key in both modes, splitting `writable` (the plan) from `written`
+(what reached disk).
 
 `autumn console` is Autumn's `rails console` equivalent. Rust has no stable
 `eval`, so it follows loco.rs's edit-and-run model instead of shipping a REPL:
@@ -2755,11 +2849,16 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/resilience.md`
 - `docs/guide/generators.md`
 - `docs/guide/seo.md`
+- `docs/guide/forms.md`
+- `docs/guide/extractors.md`
+- `docs/guide/cookie-consent.md`
+- `docs/guide/middleware.md`
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
 - `docs/guide/maintenance-mode.md`
 - `docs/guide/deployment.md`
 - `docs/guide/fleet-deploys.md`
+- `docs/guide/hot-upgrades.md`
 - `docs/guide/staged-deploys.md`
 - `docs/guide/dev-loop-latency.md`
 - `docs/guide/system-tests.md`

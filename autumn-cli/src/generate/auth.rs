@@ -11368,7 +11368,7 @@ mod tests {
     /// `autumn destroy auth` recomputes this same plan via the `for_revert`
     /// builder before [`Plan::revert`], so it must build a revert plan on a
     /// `SQLite` app (the `for_revert` flag still suppresses the generate-only
-    /// shared-layout preflight — issue #1927 made the migrations SQLite-valid, so
+    /// shared-layout preflight — issue #1927 made the migrations `SQLite`-valid, so
     /// generate no longer rejects, but the preflight-suppression path must stay
     /// exercised).
     #[test]

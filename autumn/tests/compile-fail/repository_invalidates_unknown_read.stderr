@@ -1,0 +1,5 @@
+error[E0425]: cannot find value `__AUTUMN_CACHE_READ_ID__not_a_cached_function` in this scope
+  --> tests/compile-fail/repository_invalidates_unknown_read.rs:22:47
+   |
+22 | #[autumn_web::repository(Article, invalidates(not_a_cached_function))]
+   |                                               ^^^^^^^^^^^^^^^^^^^^^ not found in this scope

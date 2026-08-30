@@ -28,6 +28,16 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    env:
+      # `cargo clippy --workspace --all-targets` compiles autumn-web alongside
+      # every example crate at once. At the default parallelism (one job per
+      # vCPU) that peaks close enough to a 16 GB hosted runner's memory that the
+      # job has repeatedly died ~60s in with `exit 143` and "The runner has
+      # received a shutdown signal" — the host reclaiming the runner agent, not
+      # a lint failure: when it survives, the same step passes in ~7 minutes.
+      # Capping the compile jobs bounds that peak. This job gates `test`,
+      # `loom` and `coverage`, so a runner death here skips the whole suite.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +47,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # `-j 2` caps codegen parallelism. This step checks the whole workspace
+        # with `--all-targets`, and at cargo's default (one job per core, 4 on
+        # ubuntu-latest) its peak memory exceeds the runner's 16 GB while
+        # `Checking autumn-web` — the largest crate. The runner is then
+        # reclaimed mid-step and the job reports `exit code 143` with
+        # "The runner has received a shutdown signal" and no clippy diagnostic
+        # at all, which reads like infrastructure flake rather than what it is.
+        #
+        # It is marginal rather than deterministic — the same command succeeds
+        # on some runs — so it surfaced as an intermittent red that re-running
+        # sometimes cleared, on trunk-dev and on every branch cut from it.
+        # Reproduced locally on a 15 GB box: `--workspace --all-targets` is
+        # OOM-killed at `-j 4` and completes clean at `-j 2`.
+        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
       - name: Clippy (autumn-web, gated request-path features — panic gate)
         # The default-feature Clippy above does not compile the feature-gated
         # request-path modules (channels→ws, mail→mail, sync/*→offline-sync,

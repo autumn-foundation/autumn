@@ -152,11 +152,11 @@ The island crate that produces the wasm lives in `examples/island-flock`
 | Field | Value |
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
-| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve) |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, cookie consent, and live-tunable runtime config |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve) |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
-| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts |
+| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML *and* the cookie-consent banner; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts; `curl 'http://localhost:3000/r/rust?page=2'` returns page 2 with a `<nav aria-label="Pagination">` of plain links |
 
 ---
 
@@ -259,6 +259,25 @@ design record is `docs/adr/0011-edge-capsule-read-lane.md`.
 
 ---
 
+### `examples/hot-upgrade` — In-Place Upgrade (`SIGUSR2` socket + state handoff)
+
+<!-- catalog:example name=hot-upgrade tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Operator of a single-binary Autumn app who wants to deploy continuously without a load balancer, a cold cache, or a dropped connection |
+| **Journey** | In-place upgrade: designate a block of live state, build a new binary whose state shape changed, `kill -USR2`, and watch the same socket keep serving while the state is carried across a compile-checked migration |
+| **Key capabilities** | `AppBuilder::with_live_state`, `with_live_state_from`, `AppState::live_state`, `state_migration!`, `LiveStateHandle` freeze semantics, `[server.upgrade]` |
+| **Prerequisites** | Rust 1.88.0+ on Linux or another Unix. No database, no config file |
+| **Run command** | `cargo build -p hot-upgrade`, then `AUTUMN_UPGRADE_BINARY=target/debug/hot-upgrade-v2 ./target/debug/hot-upgrade-v1` |
+| **Success proof** | `cargo test -p hot-upgrade --test live_upgrade` boots the real v1 binary, upgrades it to the real v2 binary under sustained load, and asserts zero refused connections, zero failed reads, 100% carry-over of the pre-upgrade value, and a bounded cutover latency spike |
+| **Rationale for the tier** | Its proof is a live two-process upgrade under load, not a Chromium smoke: what it demonstrates has no page to click. The test runs in the ordinary `cargo test --workspace` lane. |
+
+Two binaries rather than one — the whole point is the *old* build becoming the
+*new* one. The companion narrative is `docs/guide/hot-upgrades.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal
@@ -300,7 +319,7 @@ can pick the closest starting point without overlap.
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
-| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
+| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |

@@ -39,6 +39,7 @@ mcp = ["openapi"]
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
 db = [
+    "autumn-macros/db",
     "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
@@ -246,7 +247,12 @@ autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
 wasmi = { version = "0.40", optional = true }
-autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
+# `default-features = false` drops the `#[model]` / `#[repository]` codegen from
+# the macro crate; the `db` feature above forwards it back on. A no-database app
+# could never reach either macro anyway (both re-exports are `#[cfg(feature =
+# "db")]` in `src/lib.rs`), and skipping them cuts the macro crate's own compile
+# time by ~90% on the no-DB onboarding path (issue #2309).
+autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
 axum.workspace = true
 bytes = "1"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->

@@ -2856,7 +2856,7 @@ mod tests {
     /// The diesel `schema.rs` types on the `SQLite` path must be types diesel's
     /// `SQLite` backend implements — never the Postgres-only `Timestamptz`,
     /// `Jsonb`, `Uuid`, `Bytea`, or `Numeric`. `DateTime<Utc>` maps to the
-    /// SQLite-valid `TimestamptzSqlite` (issue #1924).
+    /// `SQLite`-valid `TimestamptzSqlite` (issue #1924).
     #[test]
     fn sqlite_schema_type_avoids_postgres_only_diesel_types() {
         let cases = [

@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: a live-state migration needs two different LiveState::VERSIONs: bump the new shape's VERSION in the same commit that changes its fields, or the snapshot cannot be told apart on the wire and this migration would never run
+  --> tests/compile-fail/state_migration_same_version.rs:31:1
+   |
+31 | / state_migration! {
+32 | |     from StatsV1 as old => Stats {
+33 | |         hits: old.hits,
+34 | |         upgrades: 1,
+35 | |     }
+36 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `state_migration` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -652,6 +652,168 @@ and include the table in your GDPR export.
 
 ---
 
+## Impersonation ("log in as this user")
+
+Support eventually needs to see what a customer sees. Doing it by hand —
+`session.insert("user_id", target)` — quietly breaks the audit trail: from that
+point on every version row and audit event claims the *customer* did it.
+`autumn_web::auth::impersonation` is the primitive that keeps the real operator
+on the record.
+
+Opt in first — it is **default-deny**, so an app without a registered gate
+refuses every attempt with `403`:
+
+```rust,ignore
+use autumn_web::auth::impersonation::ImpersonationGate;
+
+autumn_web::app()
+    .state_initializer(|state| {
+        state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+    })
+```
+
+Then begin and end it from your own routes:
+
+```rust,ignore
+use autumn_web::auth::impersonation;
+
+#[post("/support/impersonate/{user_id}")]
+#[secured("admin")]
+async fn start(
+    State(state): State<AppState>,
+    session: Session,
+    Path(user_id): Path<String>,
+) -> AutumnResult<Redirect> {
+    impersonation::begin_impersonation(&state, &session, user_id).await?;
+    Ok(Redirect::to("/"))
+}
+
+#[post("/support/stop-impersonating")]
+async fn stop(State(state): State<AppState>, session: Session) -> AutumnResult<Redirect> {
+    impersonation::end_impersonation(&state, &session).await?;
+    Ok(Redirect::to("/"))
+}
+```
+
+What the framework guarantees while impersonation is active:
+
+| Question | Answer |
+|---|---|
+| Who do `#[secured]`, `RequireAuth` and `PolicyContext` resolve? | the **impersonated** user |
+| Who do audit events and `#[repository(versioned)]` rows record? | the **real impersonator** |
+| Who does `impersonation::impersonator_id(&state, &session)` return? | the **real impersonator** |
+| Session id | rotated on begin *and* end |
+| Audit | one event on begin, one on end, each with `actor_id` = the impersonator and `target_resource_id` = the target |
+
+`Auth<T>` is not in that first row: it is populated by your own loader
+middleware from request extensions, so it follows the impersonated user only if
+that loader reads the auth session key. The same caveat applies to any identity
+key your app writes alongside `user_id` at login (a generated `{model}_id` /
+`{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
+key and nothing else, so map the rest yourself if your handlers read them.
+
+`RequireAuth` also publishes `RateLimitPrincipal` and the log context's
+`user_id` as the **effective** user, so rate-limit buckets and log lines follow
+the target while attribution follows the operator.
+
+Read the state with the `Impersonation` extractor when you just want to branch
+on it:
+
+```rust,ignore
+use autumn_web::auth::impersonation::Impersonation;
+
+#[get("/")]
+async fn home(impersonation: Impersonation) -> Markup {
+    match impersonation.state() {
+        Some(active) => /* show a banner naming active.impersonator_id */,
+        None => /* normal page */,
+    }
+}
+```
+
+And what it refuses:
+
+- **No nesting.** Starting a second hop while impersonating is a `409`, so it
+  cannot be chained to escalate.
+- **No self-impersonation**, and no blank target.
+- **No unaudited swap.** `begin_impersonation` returns `500` — leaving the
+  session untouched — if the audit write fails *or* if the app has no audit sink
+  installed at all (`audit::write_from_state` is a silent no-op without one, so
+  a missing sink would otherwise mean a swap with no record). Register one with
+  `AppBuilder::with_audit_sink(TracingAuditSink)` at minimum before enabling
+  impersonation. Ending is the opposite trade-off: a sink failure is logged, but
+  the revert still happens.
+- **No client-chosen role.** The impersonated session's role comes from
+  `ImpersonationPolicy::target_role`, resolved server-side; it defaults to *no*
+  role rather than inheriting the admin's.
+- **No laundering past step-up.** `last_strong_auth_at` is a bare timestamp with
+  no identity bound to it, so begin **stashes and drops** the operator's claim
+  rather than carrying it over — otherwise a `#[step_up]` route could run a
+  destructive action on the *target's* account on the strength of the operator's
+  re-authentication. Ending restores the operator's own claim. The practical
+  consequence: sensitive, step-up-gated actions cannot be performed while
+  impersonating.
+
+- **No self-destructive configuration.** `auth.session_key` must not be one of
+  the keys the impersonation record reserves (`impersonator_id`,
+  `impersonated_id`, `impersonator_role`, `impersonator_last_strong_auth_at`,
+  `role`) — the swap would clobber its own record. Both directions refuse the
+  misconfiguration, and registering the gate logs it at startup. Check it
+  yourself with `impersonation::is_reserved_session_key`.
+
+- **No inherited record.** The record is bound both to *which* user it describes
+  and to the session generation that created it. Either a different effective
+  user, or a session-id rotation — which every login must perform anyway, to
+  prevent fixation — retires it: it stops counting for attribution and the
+  revert route refuses it, instead of handing whoever comes next the operator's
+  identity and role. The generation binding is what covers the case an id check
+  alone misses: the impersonated customer signing in **as themselves** on the
+  same browser. Belt and braces: call `impersonation::clear(&session)` from your
+  own login / magic-link / passkey promotion too, so the record is gone outright
+  rather than merely inert.
+
+Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
+not look at the target at all, so it will happily impersonate any string
+including another admin or a user in a different tenant. For anything
+multi-tenant, implement `ImpersonationPolicy` and consult `ctx` (which carries
+the session and the DB pool) to confirm the target exists and is in the caller's
+tenant. `begin_impersonation` trims the target id **before** the policy sees it,
+so the id you authorize is exactly the id that lands in the session.
+
+```rust,ignore
+use autumn_web::auth::impersonation::{ImpersonationPolicy, ImpersonationTarget};
+use autumn_web::authorization::{BoxFuture, PolicyContext};
+
+struct SupportDesk;
+
+impl ImpersonationPolicy for SupportDesk {
+    fn can_impersonate<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("support") && same_tenant(ctx, target).await })
+    }
+
+    fn target_role<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { lookup_role(target.user_id()).await })
+    }
+}
+```
+
+Session-based auth only: an API-token principal has no session to swap, so the
+bearer-token path is untouched.
+
+`autumn-admin-plugin` ships the whole flow — routes, a persistent "Viewing as …
+— Stop impersonating" banner, and one-click revert — behind
+`AdminPlugin::with_impersonation(gate)`. See the [admin guide](./admin.md).
+
+---
+
 ## Testing authenticated routes
 
 The test client can mint an authenticated session directly, so a test of a
