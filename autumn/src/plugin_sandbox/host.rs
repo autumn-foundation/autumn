@@ -537,7 +537,7 @@ impl SandboxOutcome {
     /// `fuel_used` is what the *host* had already committed on its behalf — the
     /// whole budget when a charge could not be covered, zero when the request
     /// was turned away before it was priced.
-    fn refused(failure: SandboxFailure, fuel_used: u64) -> Self {
+    const fn refused(failure: SandboxFailure, fuel_used: u64) -> Self {
         Self {
             result: Err(failure),
             denials: Vec::new(),
@@ -930,6 +930,16 @@ fn finish(
                         )
                 },
                 |essence| {
+                    // `refused_content_type` returns everything before the
+                    // first `;`, so a guest that writes no parameter at all
+                    // hands back its whole header value — bounded whether it
+                    // likes it or not by the stdout ceiling, which is
+                    // megabytes. Both strings built here are logged (the
+                    // denial by `deny`, the failure by `serve`), so the
+                    // guest's text gets the same cap and control-escaping
+                    // every other guest-influenced string gets. The branch
+                    // beside this one already did; this one did not.
+                    let essence = guest_text(&essence);
                     let detail = format!(
                         "a sandboxed plugin may not serve `{essence}`: a document or a script \
                          from the host's own origin would carry the host's authority"
@@ -2896,6 +2906,60 @@ path = "/hello/greet"
         assert!(
             rendered.contains("forged"),
             "the detail is still legible enough to debug with: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_content_type_is_bounded_before_it_is_logged() {
+        // `refused_content_type` takes everything before the first `;`, so a
+        // guest that writes no parameter hands back its entire header value —
+        // capped only by the stdout ceiling, which is megabytes. That string
+        // reached both the denial detail and the `ResponseRefused` text, and
+        // both are logged, so a guest could flood an operator's log with a
+        // header rather than with output.
+        let essence = "x".repeat(20_000);
+        let frame = format!(
+            r#"{{"op":"response","status":200,"headers":[["content-type","{essence}"]],"body_b64":""}}"#
+        );
+        // The frame is ASCII, so its byte length is its char length; + 1 for
+        // the newline that ends it. The WAT literal needs its quotes escaped,
+        // which changes the *source* length but not the decoded bytes.
+        let len = frame.len() + 1;
+        let wat = format!(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 1024) "{escaped}\0a")
+  (func (export "_start")
+    (i32.store (i32.const 0) (i32.const 1024))
+    (i32.store (i32.const 4) (i32.const {len}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#,
+            escaped = frame.replace('"', "\\\""),
+        );
+
+        let outcome = host(&wat).run(&get("/hello/greet"));
+        let Err(SandboxFailure::ResponseRefused(detail)) = outcome.result else {
+            panic!(
+                "an unsupported content type must be refused: {:?}",
+                outcome.result
+            );
+        };
+        assert!(
+            detail.len() < 1_024,
+            "the failure text carries the guest's whole header: {} bytes",
+            detail.len()
+        );
+        assert!(detail.contains("truncated"), "{detail}");
+
+        let logged = outcome
+            .denials
+            .iter()
+            .find(|denial| denial.capability == DeniedCapability::ResponseHeader)
+            .expect("the refusal is recorded as a denial");
+        assert!(
+            logged.detail.len() < 1_024,
+            "the denial detail carries the guest's whole header: {} bytes",
+            logged.detail.len()
         );
     }
 
