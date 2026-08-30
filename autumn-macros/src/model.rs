@@ -6182,6 +6182,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
 
     // Build query struct fields (strip #[id], #[indexed], #[validate])
+    // #1654: the field marker for a `#[classified]` column, or `None`. Every
+    // generated struct that carries the column -- the read struct, `NewX`,
+    // `UpdateX` and the changeset -- looks it up through here so they cannot
+    // drift apart on whether the column is classified.
+    let classified_marker_for = |f: &Field| -> Option<&syn::Ident> {
+        let ident = f.ident.as_ref()?;
+        classified_columns
+            .iter()
+            .find(|(cid, ..)| *cid == ident)
+            .map(|(_, _, marker)| marker)
+    };
+    // The Diesel column mapping for a classified field. Write-only structs
+    // (`NewX`, the changeset) need `serialize_as` alone; the read struct also
+    // needs `deserialize_as`.
+    let classified_serialize_as = |marker: &syn::Ident| {
+        quote! {
+            #[diesel(serialize_as = ::autumn_web::classify::ClassifiedText<#marker>)]
+        }
+    };
+
     let query_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -6223,10 +6243,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `F`-erasing column type would let a value be converted in as one
             // column and back out as another, releasing it through the wrong
             // boundary and recording it against the wrong column.
-            let classified_marker = classified_columns
-                .iter()
-                .find(|(cid, ..)| *cid == ident.as_ref().expect("named field"))
-                .map(|(_, _, marker)| marker);
+            let classified_marker = classified_marker_for(f);
             let (ident_ty, classified_diesel) = classified_marker.map_or_else(
                 || (quote! { #ty }, quote! {}),
                 |marker| {
@@ -6273,15 +6290,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // deserializer (which also still accepts RFC 3339 JSON bodies);
             // see `datetime_local_serde_attr`.
             let datetime_local = datetime_local_serde_attr(ty);
-            // #1654: the write structs keep the plain `String` -- taking personal
-            // data *in* is what an application does, and the form/validation path
-            // needs the bare type. What they must not do is hand it back out, so
-            // the column is excluded from their `Serialize`. `skip_serializing`
-            // (not `skip`) keeps `Deserialize` intact.
-            let classified_skip = (field_is_classified(f)
+            // #1654 (review round 2): the write structs carry the taint wrapper
+            // too. Taking personal data *in* is not a release -- `Classified`
+            // keeps its `Deserialize`, and the declarative validators see
+            // through it (see `autumn/src/classify/validate.rs`), so the form
+            // and validation paths are unaffected. What must not happen is the
+            // plaintext being moved back *out*: these fields are `pub`, so a
+            // bare `String` here let a handler write
+            // `Json(View { email: input.email })` and release the value with no
+            // boundary and no audit record. `skip_serializing` alone could not
+            // stop that -- it only governs serializing the write struct itself.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some()
                 && !field_already_skips_serialization(f))
             .then(|| quote! { #[serde(skip_serializing)] });
-            quote! { #(#val_attrs)* #enc #bool_default #datetime_local #classified_skip pub #ident: #ty }
+            let (new_ty, classified_diesel) = classified.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #(#val_attrs)* #enc #classified_diesel #bool_default #datetime_local #classified_skip pub #ident: #new_ty }
         })
         .collect();
 
@@ -6311,15 +6343,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // (`custom`, `must_match`, `nested`, …) must be stripped here or the
             // `UpdateModel` would fail to compile. `NewModel` keeps them all.
             let val_attrs = validate_attrs_for_patch(f);
-            // #1654: see the `NewX` comment -- a classified column is readable in
-            // from a PATCH body and never written back out.
-            let classified_skip = (field_is_classified(f) && !field_already_skips_serialization(f))
+            // #1654: see the `NewX` comment -- the patch carries the wrapper for
+            // the same reason. `Patch<T>` forwards `Deserialize` and every
+            // declarative validator to `T`, so `Patch<Classified<T, F>>` keeps
+            // both.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some() && !field_already_skips_serialization(f))
                 .then(|| quote! { #[serde(skip_serializing)] });
+            let patch_ty = classified.map_or_else(
+                || quote! { #ty },
+                |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+            );
             quote! {
                 #(#val_attrs)*
                 #[serde(default)]
                 #classified_skip
-                pub #ident: ::autumn_web::hooks::Patch<#ty>
+                pub #ident: ::autumn_web::hooks::Patch<#patch_ty>
             }
         })
         .collect();
@@ -6373,17 +6412,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // #1654: the read struct's type for a field -- the taint wrapper for a
+    // #1654: a field's generated type -- the taint wrapper for a
     // `#[classified]` column, the declared type otherwise. Everything that
-    // touches the *model's* field (rather than the write structs') has to agree
-    // with the struct definition, so it goes through this.
-    let classified_marker_for = |f: &Field| -> Option<&syn::Ident> {
-        let ident = f.ident.as_ref()?;
-        classified_columns
-            .iter()
-            .find(|(cid, ..)| *cid == ident)
-            .map(|(_, _, marker)| marker)
-    };
+    // touches the field has to agree with the struct definition, so it goes
+    // through this.
     let model_field_ty = |f: &Field| -> TokenStream {
         let ty = &f.ty;
         classified_marker_for(f).map_or_else(
@@ -6407,17 +6439,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             } else {
-                // #1654: the patch carries the plain value (the write path is not
-                // a gated sink); the merged model's column is classified again on
-                // the way in, so nothing widens.
-                let set_expr = if classified_marker_for(f).is_some() {
-                    quote! { after.#ident = ::autumn_web::classify::Classified::new(v.clone()) }
-                } else {
-                    quote! { after.#ident = v.clone() }
-                };
                 quote! {
                     match &patch.#ident {
-                        ::autumn_web::hooks::Patch::Set(v) => #set_expr,
+                        ::autumn_web::hooks::Patch::Set(v) => after.#ident = v.clone(),
                         ::autumn_web::hooks::Patch::Clear => {
                             return Err(::autumn_web::AutumnError::bad_request_msg(
                                 format!("Cannot clear non-nullable field `{}`", stringify!(#ident))
@@ -6878,38 +6902,21 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // `__autumn_correlate_model` compares two models, so both sides already have
-    // the same field types.
-    let compare_fields_model = fields_for_new.iter().map(|f| {
+    // Field-by-field equality, shared by `__autumn_correlate_model` (two models)
+    // and `__autumn_correlate_new` (a `New*` input against a persisted model).
+    // #1654: one expression serves both because the write struct carries the
+    // same taint wrapper as the model, so the two sides always have the same
+    // field types. Comparing `Classified` to `Classified` also keeps the
+    // correlation off the release path -- unwrapping either side to compare
+    // would be an unrecorded release.
+    let compare_fields = fields_for_new.iter().map(|f| {
         let ident = &f.ident;
         quote! { input.#ident == record.#ident }
     });
     let compare_expr = if fields_for_new.is_empty() {
         quote! { true }
     } else {
-        quote! { #(#compare_fields_model)&&* }
-    };
-    // `__autumn_correlate_new` compares a `New*` input against a persisted
-    // model. #1654: the input carries the plain value while the record's column
-    // is classified, so the comparison classifies the *input* side rather than
-    // unwrapping the record's -- an unwrap here would be an unrecorded release.
-    // `Classified`'s `PartialEq` is over the inner value, so the answer is the
-    // same either way.
-    let compare_fields_new = fields_for_new.iter().map(|f| {
-        let ident = &f.ident;
-        if classified_marker_for(f).is_some() {
-            quote! {
-                record.#ident
-                    == ::autumn_web::classify::Classified::new(input.#ident.clone())
-            }
-        } else {
-            quote! { input.#ident == record.#ident }
-        }
-    });
-    let compare_expr_new = if fields_for_new.is_empty() {
-        quote! { true }
-    } else {
-        quote! { #(#compare_fields_new)&&* }
+        quote! { #(#compare_fields)&&* }
     };
 
     let mut changeset_fields: Vec<TokenStream> = fields_for_new
@@ -6929,7 +6936,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #enc pub #ident: Option<#ty> }
+            // #1654: the changeset is built from `UpdateX`'s `Patch` values, so
+            // it holds the wrapper too and writes through the opaque Diesel
+            // column type -- the same round trip the read struct uses, and the
+            // only conversion out of `Classified` that is not a declassification.
+            let (changeset_ty, classified_diesel) = classified_marker_for(f).map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #enc #classified_diesel pub #ident: Option<#changeset_ty> }
         })
         .collect();
     // The lock_version column must be in the changeset so the UPDATE can
@@ -7172,11 +7192,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Struct-shorthand field list for `NewX { … }` (local bindings named to match).
+    // #1654: a classified column's binding is a plain value from the factory's
+    // fake/default data, so it is classified here rather than at every producer.
     let new_construct_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            quote! { #ident }
+            if classified_marker_for(f).is_some() {
+                quote! { #ident: ::autumn_web::classify::Classified::new(#ident) }
+            } else {
+                quote! { #ident }
+            }
         })
         .collect();
 
@@ -8031,7 +8057,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::core::option::Option<usize> {
                 for (i, input) in inputs.iter().enumerate() {
                     if !matched[i] {
-                        if #compare_expr_new {
+                        if #compare_expr {
                             return ::core::option::Option::Some(i);
                         }
                     }
@@ -11041,6 +11067,39 @@ mod tests {
     }
 
     #[test]
+    fn the_write_structs_carry_the_classification_too() {
+        // #1654 review round 2 (P1): `NewCustomer`/`UpdateCustomer` are the
+        // primary way an application *receives* a classified value, and their
+        // fields are `pub`. Leaving them as a bare `String` meant a handler
+        // could move the plaintext straight into a serializable view --
+        // `Json(View { email: input.email })` -- releasing personal data with
+        // no boundary and no audit record. `skip_serializing` only stops the
+        // write struct itself from being serialized; it does nothing about the
+        // value being moved out of it.
+        let generated = classified_model();
+        let write_structs = generated
+            .split("pub struct NewCustomer")
+            .nth(1)
+            .expect("the generated write structs");
+        assert!(
+            write_structs.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "NewCustomer must carry the classification on the field type: {write_structs}"
+        );
+        assert!(
+            write_structs.contains(
+                "Patch < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "UpdateCustomer's patch field must carry it too: {write_structs}"
+        );
+        // The unclassified column is untouched, so this is not a blanket rewrite.
+        assert!(
+            write_structs.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {write_structs}"
+        );
+    }
+
+    #[test]
     fn a_classified_model_does_not_derive_serialize() {
         let generated = classified_model();
         // `Deserialize` stays: taking personal data in is not a release.
@@ -11090,19 +11149,36 @@ mod tests {
     }
 
     #[test]
-    fn the_write_structs_keep_the_plain_type_but_never_serialize_it() {
+    fn the_write_structs_never_serialize_a_classified_column() {
+        // The companion to `the_write_structs_carry_the_classification_too`:
+        // the wrapper stops the value being moved out, and `skip_serializing`
+        // stops the write struct itself from carrying it into a response body.
+        // `skip_serializing` (not `skip`) keeps `Deserialize` intact, which is
+        // what makes the create/PATCH bodies decode at all.
         let generated = classified_model();
-        let new_struct_start = generated
-            .find("pub struct NewCustomer")
-            .expect("NewCustomer must be generated");
-        let new_struct = &generated[new_struct_start..new_struct_start + 400];
-        assert!(
-            new_struct.contains("email : String"),
-            "the write path keeps the bare type: {new_struct}"
-        );
         assert!(
             generated.contains("serde (skip_serializing)"),
             "the write structs must not serialize a classified column: {generated}"
+        );
+    }
+
+    #[test]
+    fn the_changeset_writes_a_classified_column_through_the_opaque_column_type() {
+        let generated = classified_model();
+        let changeset = generated
+            .split("pub struct __CustomerChangeset")
+            .nth(1)
+            .expect("the generated changeset");
+        assert!(
+            changeset.contains("ClassifiedText < CustomerEmailClassified >"),
+            "the changeset must write through the opaque Diesel type: {changeset}"
+        );
+        assert!(
+            changeset.contains(
+                "Option < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "and hold the wrapper, not the plaintext: {changeset}"
         );
     }
 

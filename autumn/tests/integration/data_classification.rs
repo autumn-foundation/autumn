@@ -277,12 +277,15 @@ fn the_name_based_log_scrubber_still_filters_unclassified_payloads() {
 }
 
 #[test]
-fn a_classified_model_does_not_change_the_write_path() {
-    // The write structs keep the plain `String`: taking personal data in is not
-    // a release. What they must never do is hand it back out.
+fn a_classified_model_still_accepts_personal_data_on_the_write_path() {
+    // Taking personal data *in* is not a release, so the write structs still
+    // deserialize a create body unchanged. What they must never do is hand the
+    // value back out -- hence the wrapper on the field (see
+    // `the_write_structs_cannot_hand_the_plaintext_back_out` below) and the
+    // absence of the column from their `Serialize`.
     let new = NewCustomer {
         name: "Ada".to_string(),
-        email: "ada@example.com".to_string(),
+        email: "ada@example.com".to_string().into(),
     };
     let body = serde_json::to_string(&new).expect("serialize");
     assert!(!body.contains("ada@example.com"), "{body}");
@@ -290,9 +293,43 @@ fn a_classified_model_does_not_change_the_write_path() {
 
     let round_tripped: NewCustomer =
         serde_json::from_str(r#"{"name":"Ada","email":"ada@example.com"}"#).expect("deserialize");
-    assert_eq!(round_tripped.email, "ada@example.com");
     assert!(
         !format!("{round_tripped:?}").contains("ada@example.com"),
         "write-struct Debug must redact the classified column"
+    );
+}
+
+#[test]
+fn the_write_structs_cannot_hand_the_plaintext_back_out() {
+    // Review round 2 of #1654 (P1). `NewCustomer`/`UpdateCustomer` are how an
+    // application *receives* a classified value and their fields are `pub`, so
+    // a bare `String` here was a complete bypass of the guarantee: a handler
+    // could write `Json(View { email: input.email })` and release personal data
+    // with no boundary and no audit record. `skip_serializing` did not help --
+    // it only governs serializing the write struct itself, not moving a value
+    // out of it.
+    //
+    // The wrapper is what closes it. The compile-fail half of this pair is
+    // `tests/compile-fail/classified_write_struct_leak.rs`; here we check the
+    // runtime-visible half, that the value is still *usable* on the write path
+    // it was accepted on.
+    let new = NewCustomer {
+        name: "Ada".to_string(),
+        email: "ada@example.com".to_string().into(),
+    };
+    // Equality still works through the wrapper, so the value is not write-only.
+    assert_eq!(new.email, "ada@example.com".to_string().into());
+    assert_ne!(new.email, "grace@example.com".to_string().into());
+
+    // The patch field carries it too.
+    let patch: UpdateCustomer =
+        serde_json::from_str(r#"{"email":"ada@example.com"}"#).expect("deserialize");
+    let autumn_web::hooks::Patch::Set(email) = patch.email else {
+        panic!("the patch must decode a Set value");
+    };
+    assert_eq!(email, "ada@example.com".to_string().into());
+    assert!(
+        !format!("{email:?}").contains("ada@example.com"),
+        "the patch value must redact in Debug too"
     );
 }

@@ -587,10 +587,14 @@ autumn_web::declassify! {
 }
 ```
 
-The write structs (`New*` / `Update*` / changeset) keep the plain `String` — a
-client still *sets* the value — and get `#[serde(skip_serializing)]` so they
-never write it back out. `Debug` renders `<classified>` on every generated
-struct. `autumn data-flow` emits the manifest of which sinks each classified
+The write structs (`New*` / `Update*` / changeset) still *accept* the value —
+a client sets it, and deserialization, `#[validate]` and form rendering are
+unchanged — but they carry the wrapper too (`Classified<String, F>`, or
+`Patch<Classified<String, F>>` on the patch) and get
+`#[serde(skip_serializing)]`. Their fields are `pub`, so a bare `String` there
+would have let a handler move the plaintext into a response view and release it
+with no boundary; building one by hand now costs an `.into()`. `Debug` renders
+`<classified>` on every generated struct. `autumn data-flow` emits the manifest of which sinks each classified
 column can reach.
 
 **Gotcha:** it cannot be combined with `#[encrypted]`, `#[searchable]`,

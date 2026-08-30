@@ -230,10 +230,30 @@ autumn data-flow --check data-flow-manifest.json
 - **The name-based redaction still runs.** `log/filter.rs` and the HTTP client's
   header denylist are untouched; classification composes with them rather than
   replacing them.
-- **The write path keeps the plain type.** `NewCustomer`, `UpdateCustomer` and
-  the changeset hold a `String`, because taking personal data *in* is what an
-  application does; forms, `#[validate]` rules and deserialization are unchanged.
-  Those structs simply never serialize the column.
+- **The write path still accepts personal data.** Taking a classified value
+  *in* is what an application does, so `NewCustomer`, `UpdateCustomer` and the
+  changeset all still deserialize the column, run its `#[validate]` rules and
+  render its form field. What changed is the field's *type*: they hold
+  `Classified<String, CustomerEmailClassified>` (the patch holds
+  `Patch<Classified<…>>`), not a bare `String`.
+
+  Those fields are `pub`, so a bare `String` would have been a way around the
+  whole guarantee — a handler could write `Json(View { email: input.email })`
+  and release the value with no boundary and no audit record. Excluding the
+  column from the write struct's own `Serialize` does not help, because that
+  governs serializing `NewCustomer`, not moving a value out of it.
+
+  In practice this costs one `.into()` when you build a write struct by hand:
+
+  ```rust
+  let new = NewCustomer {
+      name: form.name,
+      email: form.email.into(),
+  };
+  ```
+
+  Decoding a request body needs no change at all — `Json<NewCustomer>` and
+  `Form<NewCustomer>` deserialize exactly as before.
 - **`Debug` is redacted** on the model and on the write structs — the value
   renders as `<classified>`, so it cannot reach a panic message or an error page.
 - **`#[validate]` still runs** on the classified column. The wrapper forwards
