@@ -254,10 +254,13 @@ apply-time error.
 - **Nothing runs against production by accident.** Writing refuses outside the
   `dev`/`test` profile without `--force`, the same protocol as `autumn db drop`.
   As defence in depth, a scrub also refuses when the write target is the
-  database an artifact's own (non-dev/test) profile *config file* declares.
-  That guard has its own waiver, `--allow-source-overwrite`, rather than riding
-  on `--force`: the staging drill always passes `--force`, so a guard `--force`
-  waived would be inert in exactly the workflow it exists for.
+  database that **any** non-dev/test profile's *config file* declares — every
+  `autumn-<profile>.toml` in the project is checked, not just the one an
+  artifact's manifest names, so a bare `.dump` with no manifest is not treated
+  as permission to continue. That guard has its own waiver,
+  `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
+  always passes `--force`, so a guard `--force` waived would be inert in exactly
+  the workflow it exists for.
 - **A refusal writes nothing.** Classification completes before a single row is
   touched. The one exception is `--artifact`: the restore has to run before the
   scrub can read the schema it created, so a refusal *after* a restore leaves
@@ -276,8 +279,9 @@ apply-time error.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
   `search_path` cannot send an `UPDATE` to a table nothing classified. The
-  planned tables are locked for the duration, so a row inserted between the
-  classification snapshot and the rewrite cannot slip through.
+  planned tables — and the ones `[framework] purge` empties — are locked for the
+  duration, so a row inserted between the classification snapshot and the
+  rewrite cannot slip through.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
@@ -299,8 +303,10 @@ apply-time error.
 - **Triggers are warned about, not disabled.** An audit or history trigger can
   copy the pre-scrub row into another table as the rewrite runs. The scrub names
   the tables carrying user triggers; check or disable them on the copy.
-- **Materialized views are refreshed** (in dependency order) after the rewrite,
-  since they hold their own copy of whatever they selected.
+- **Materialized views are refreshed** (in dependency order, inside the scrub's
+  own transaction) since they hold their own copy of whatever they selected — so
+  a refresh the role is not allowed to run rolls the rewrites back rather than
+  committing base tables a stale view contradicts.
 - **A key column holding PII can only be declared `safe`.** A natural key
   (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
   every row that references it, which this command does not do — so it is kept

@@ -1792,9 +1792,15 @@ fn same_database(a: &str, b: &str) -> bool {
     }
 }
 
-/// Refuse to scrub the database a **config file** declares for the artifact's
-/// own (non-dev/test) profile — the "I pointed staging at the production URL"
+/// Refuse to scrub a database that a **config file** declares for a
+/// production-ish profile — the "I pointed staging at the production URL"
 /// mistake the profile guard alone cannot see.
+///
+/// Every non-dev/test profile with an `autumn-<profile>.toml` in the project is
+/// checked, not just the one an artifact's manifest names. A bare `.dump`/`.sql`
+/// artifact carries no manifest at all, so keying the guard off known provenance
+/// would silently skip it in exactly the case where the operator knows least
+/// about what they are restoring.
 ///
 /// Deliberately reads only `autumn.toml` / `autumn-<profile>.toml`, never the
 /// environment: an env-provided `DATABASE_URL` is shared by every profile
@@ -1805,29 +1811,61 @@ fn same_database(a: &str, b: &str) -> bool {
 /// not `dev`/`test`), so a guard that `--force` waived would be inert in exactly
 /// the workflow it exists for.
 fn guard_configured_source(
-    source_profile: &str,
+    artifact_profile: Option<&str>,
+    project_root: &Path,
     targets: &[(String, String)],
     allowed: bool,
 ) -> Result<(), ScrubError> {
-    if allowed || super::is_safe_destructive_profile(source_profile) {
+    if allowed {
         return Ok(());
     }
-    let table = migrate::read_autumn_toml_table_with_profile(Some(source_profile));
-    let Some(declared) = migrate::resolve_primary_database_url_from_sources(
-        |_| Err(std::env::VarError::NotPresent),
-        table.as_ref(),
-    ) else {
-        return Ok(());
-    };
-    for (_, url) in targets {
-        if same_database(&declared, url) {
-            return Err(ScrubError::OverwritesConfiguredTarget {
-                profile: source_profile.to_owned(),
-                database: parsed_db_name(url),
-            });
+    let mut candidates: Vec<String> = artifact_profile
+        .map(str::to_owned)
+        .into_iter()
+        .chain(profiles_with_config(project_root))
+        .filter(|p| !super::is_safe_destructive_profile(p))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+
+    for profile in candidates {
+        let table = migrate::read_autumn_toml_table_with_profile(Some(&profile));
+        let Some(declared) = migrate::resolve_primary_database_url_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            table.as_ref(),
+        ) else {
+            continue;
+        };
+        for (_, url) in targets {
+            if same_database(&declared, url) {
+                return Err(ScrubError::OverwritesConfiguredTarget {
+                    profile,
+                    database: parsed_db_name(url),
+                });
+            }
         }
     }
     Ok(())
+}
+
+/// Profile names that have an `autumn-<profile>.toml` overlay in the project.
+fn profiles_with_config(project_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(project_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("autumn-")
+                .and_then(|rest| rest.strip_suffix(".toml"))
+                .map(str::to_owned)
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The database name in a connection URL, for credential-safe reporting.
@@ -1904,6 +1942,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     let targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
 
     let restored = if let Some(artifact) = &args.artifact {
+        let artifact_profile = super::backup::artifact_source_profile(artifact);
         // `--check`/`--dry-run` promise to write nothing, and a restore is the
         // largest write there is. clap already rejects the combination; this
         // keeps the invariant true inside the function that relies on it.
@@ -1911,10 +1950,19 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
             writes,
             "--check/--dry-run must never reach an artifact restore"
         );
-        if let Some(source_profile) = super::backup::artifact_source_profile(artifact) {
-            eprintln!("  \u{2139} Artifact was taken under the {source_profile:?} profile.");
-            guard_configured_source(&source_profile, &targets, args.allow_source_overwrite)?;
-        }
+        eprintln!(
+            "  \u{2139} Artifact provenance: {}.",
+            artifact_profile.as_deref().map_or_else(
+                || "unknown (no manifest)".to_owned(),
+                |p| format!("{p:?} profile")
+            )
+        );
+        guard_configured_source(
+            artifact_profile.as_deref(),
+            Path::new("."),
+            &targets,
+            args.allow_source_overwrite,
+        )?;
         eprintln!(
             "\u{2500}\u{2500} restoring {} \u{2500}\u{2500}",
             artifact.display()
@@ -2094,20 +2142,20 @@ fn classify_and_apply(
     let mut committed: Vec<&str> = Vec::new();
     for (label, url, plan, facts) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
-        let applied = execute(url, plan, &purges, label).inspect_err(|_| {
-            if !committed.is_empty() {
-                eprintln!(
-                    "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
+        let applied =
+            execute(url, plan, &purges, &facts.materialized_views, label).inspect_err(|_| {
+                if !committed.is_empty() {
+                    eprintln!(
+                        "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
                      Those databases ARE scrubbed; every later target is untouched and still \
                      holds real data.",
-                    committed.join(", ")
-                );
-            }
-        })?;
+                        committed.join(", ")
+                    );
+                }
+            })?;
         for (table, rows) in applied {
             eprintln!("  \u{2713} {table}: {rows} row(s) scrubbed.");
         }
-        refresh_materialized_views(url, label, &facts.materialized_views)?;
         committed.push(label);
     }
 
@@ -2647,9 +2695,10 @@ fn execute(
     url: &str,
     plan: &ScrubPlan,
     purges: &[(String, String)],
+    materialized_views: &[String],
     label: &str,
 ) -> Result<Vec<(String, usize)>, ScrubError> {
-    if plan.tables.is_empty() && purges.is_empty() {
+    if plan.tables.is_empty() && purges.is_empty() && materialized_views.is_empty() {
         return Ok(Vec::new());
     }
     let mut conn = probe_connection(url, label, "apply the scrub")?;
@@ -2668,10 +2717,19 @@ fn execute(
         // taken on another connection, and a row inserted between the two would
         // otherwise survive the scrub unnoticed. SHARE ROW EXCLUSIVE blocks
         // writers while still allowing plain reads.
-        for table in &plan.tables {
+        // Every table the transaction writes, including the ones it empties: a
+        // producer inserting into a purged job/sync/token table after that
+        // `DELETE` took its snapshot would otherwise survive a run that reports
+        // the table emptied.
+        let locked = plan
+            .tables
+            .iter()
+            .map(|t| t.table.as_str())
+            .chain(purges.iter().map(|(table, _)| table.as_str()));
+        for table in locked {
             sql_query(format!(
                 "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
-                qualified_ident(&table.table)
+                qualified_ident(table)
             ))
             .execute(conn)?;
         }
@@ -2689,33 +2747,21 @@ fn execute(
             let rows = sql_query(statement).execute(conn)?;
             counts.push((format!("{table} (emptied)"), rows));
         }
+        // Inside the transaction, so a refresh the role is not allowed to run
+        // rolls the rewrites back rather than committing base tables that a
+        // stale materialized view still contradicts.
+        for view in materialized_views {
+            sql_query(format!(
+                "REFRESH MATERIALIZED VIEW {}",
+                qualified_ident(view)
+            ))
+            .execute(conn)?;
+            counts.push((format!("{view} (materialized view refreshed)"), 0));
+        }
         Ok(())
     })
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
     Ok(counts)
-}
-
-/// Refresh every materialized view, sources first.
-///
-/// A materialized view holds its own copy of whatever it selected, so scrubbing
-/// the base tables leaves it holding the original values — and `pg_restore`
-/// populates them from the still-real data it just restored. They are refreshed
-/// in dependency order so a view reading another view never re-derives from
-/// stale content.
-fn refresh_materialized_views(url: &str, label: &str, views: &[String]) -> Result<(), ScrubError> {
-    if views.is_empty() {
-        return Ok(());
-    }
-    let mut conn = probe_connection(url, label, "refresh its materialized views")?;
-    for view in views {
-        conn.batch_execute(&format!(
-            "REFRESH MATERIALIZED VIEW {}",
-            qualified_ident(view)
-        ))
-        .map_err(|e| ScrubError::Sql(format!("refreshing materialized view {view:?}: {e}")))?;
-        eprintln!("  \u{2713} refreshed materialized view {view}.");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3977,6 +4023,49 @@ mod tests {
         ));
         // An unparsable URL never claims a match.
         assert!(!same_database("not a url", "not a url"));
+    }
+
+    #[test]
+    fn a_bare_artifact_with_no_manifest_still_gets_the_source_guard() {
+        // `autumn-prod.toml` declares the very database the scrub would write.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[database]\nprimary_url = \"postgres://app:pw@db.example.com:5432/myapp\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("autumn-dev.toml"), "[database]\n").unwrap();
+
+        assert_eq!(
+            profiles_with_config(dir.path()),
+            vec!["dev".to_owned(), "prod".to_owned()],
+            "every profile overlay is a candidate, not just the one an artifact names"
+        );
+        // A bare `.dump` carries no manifest, so provenance is `None` — which
+        // must not read as permission to continue.
+        assert!(
+            !profiles_with_config(dir.path()).is_empty(),
+            "the guard has candidates to check even with unknown provenance"
+        );
+    }
+
+    #[test]
+    fn the_source_guard_waiver_is_not_force() {
+        // `--force` is mandatory in the documented staging drill, so a guard it
+        // waived would be inert in exactly the workflow it exists for.
+        let targets = vec![(
+            "control".to_owned(),
+            "postgres://app:pw@db.example.com:5432/myapp".to_owned(),
+        )];
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            guard_configured_source(Some("prod"), empty.path(), &targets, false).is_ok(),
+            "no config overlay means nothing to compare against"
+        );
+        assert!(
+            guard_configured_source(Some("prod"), empty.path(), &targets, true).is_ok(),
+            "--allow-source-overwrite is the waiver"
+        );
     }
 
     #[test]
