@@ -323,8 +323,11 @@ impl fmt::Display for CapabilityDenial {
 
 /// Why a request produced no answer from the plugin.
 ///
-/// Every variant is a *plugin* failure. None of them is a host failure, and
-/// none of them can be anything other than a 5xx on the plugin's own prefix.
+/// Almost every variant is a *plugin* failure — none of those is a host
+/// failure, and none can be anything other than a 5xx on the plugin's own
+/// prefix. [`RequestBudget`](Self::RequestBudget) is the one exception: it is
+/// the *caller's* request that was refused, before the plugin was asked
+/// anything, so it answers 413 the way the ceiling does everywhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SandboxFailure {
@@ -355,20 +358,32 @@ pub enum SandboxFailure {
         /// The ceiling it blew through.
         max: usize,
     },
+    /// The request handed to [`SandboxHost::run`] carried a body over the
+    /// manifest's declared ceiling. The guest was never started.
+    RequestBudget {
+        /// The ceiling it blew through.
+        max: usize,
+        /// What the caller actually handed over.
+        len: usize,
+    },
 }
 
 impl SandboxFailure {
     /// The status this failure serves on the plugin's prefix.
     ///
     /// A budget exhaustion is a 504: the plugin was given a deadline and missed
-    /// it. Everything else is a 502: the plugin answered badly or not at all,
-    /// which is exactly what a bad gateway is.
+    /// it. An oversized request is a 413, the same answer the adapter gives
+    /// before it ever gets here — one condition must not have two statuses
+    /// depending on which door the request came through. Everything else is a
+    /// 502: the plugin answered badly or not at all, which is exactly what a
+    /// bad gateway is.
     #[must_use]
     pub const fn status(&self) -> http::StatusCode {
         match self {
             Self::FuelExhausted { .. } | Self::OutputBudget { .. } => {
                 http::StatusCode::GATEWAY_TIMEOUT
             }
+            Self::RequestBudget { .. } => http::StatusCode::PAYLOAD_TOO_LARGE,
             _ => http::StatusCode::BAD_GATEWAY,
         }
     }
@@ -402,6 +417,10 @@ impl fmt::Display for SandboxFailure {
             Self::OutputBudget { max } => write!(
                 f,
                 "the plugin wrote more than its {max}-byte response ceiling without ending a frame"
+            ),
+            Self::RequestBudget { max, len } => write!(
+                f,
+                "the request body is {len} bytes, over the plugin's {max}-byte request ceiling"
             ),
         }
     }
@@ -703,6 +722,32 @@ impl SandboxHost {
     #[must_use]
     pub fn run(&self, request: &SandboxRequest) -> SandboxOutcome {
         let limits = self.manifest.limits;
+
+        // The body ceiling is enforced *here*, not only in the Axum adapter.
+        // The adapter applies it while reading, so an oversized body never even
+        // gets buffered on that path — but `run` is public, and an embedder
+        // calling it directly hands over a `SandboxRequest` that has already
+        // been built. Without this check that body is cloned into the frame and
+        // base64-expanded regardless of the ceiling the manifest declared, and
+        // the footprint the manifest advertises — which counts the body at
+        // `4 × max_request_body_bytes` — stops bounding anything.
+        //
+        // The encoding price below is a real bound, but only against a manifest
+        // whose fuel is small relative to its body ceiling; a generous fuel
+        // budget buys an arbitrarily large host-side copy. So the ceiling is
+        // checked first, before the request is priced or walked at all.
+        if request.body.len() > limits.max_request_body_bytes {
+            return SandboxOutcome {
+                result: Err(SandboxFailure::RequestBudget {
+                    max: limits.max_request_body_bytes,
+                    len: request.body.len(),
+                }),
+                denials: Vec::new(),
+                fuel_used: 0,
+                peak_memory_bytes: 0,
+                stderr: String::new(),
+            };
+        }
 
         // Building the guest's stdin is host work proportional to the request:
         // the body is cloned into the frame and base64-expanded into the NDJSON
@@ -2924,6 +2969,54 @@ path = "/hello/greet"
             "the encoding was not charged: {} units",
             outcome.fuel_used
         );
+    }
+
+    #[test]
+    fn a_body_over_the_ceiling_is_refused_by_run_itself() {
+        // The Axum adapter applies the ceiling while reading, so nothing
+        // oversized reaches `run` on that path. But `run` is public: an
+        // embedder builds the `SandboxRequest` itself, and a manifest with
+        // generous fuel would otherwise buy an arbitrarily large host-side
+        // copy — cloned into the frame and base64-expanded — of a body the
+        // manifest said it would never accept.
+        let host = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                max_request_body_bytes: 1_024,
+                // Deliberately generous — the largest a manifest may declare.
+                // The encoding price must not be what saves us here, or the
+                // ceiling is decorative on this path.
+                fuel: 100_000_000_000,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect("the fixture loads");
+
+        let mut request = get("/hello/greet");
+        request.body = vec![b'x'; 1_025];
+        let outcome = host.run(&request);
+        assert_eq!(
+            outcome.result,
+            Err(SandboxFailure::RequestBudget {
+                max: 1_024,
+                len: 1_025,
+            }),
+            "a body over the ceiling must be refused, not encoded"
+        );
+        // Refused before the request was priced or walked at all.
+        assert_eq!(outcome.fuel_used, 0);
+        assert_eq!(outcome.peak_memory_bytes, 0);
+        // The same answer the adapter gives for the same condition.
+        assert_eq!(
+            outcome.result.unwrap_err().status(),
+            http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        // And a body exactly at the ceiling is still served: the check is a
+        // ceiling, not an off-by-one that costs the last byte.
+        request.body = vec![b'x'; 1_024];
+        let outcome = host.run(&request);
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
     }
 
     #[test]
