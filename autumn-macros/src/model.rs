@@ -3099,8 +3099,14 @@ fn validate_classified_tier(field: &syn::Field) -> syn::Result<()> {
         if !attr.path().is_ident("classified") {
             continue;
         }
+        // `continue`, not `return`: a bare marker validates itself, but a field
+        // can carry more than one `#[classified]` attribute and every one of
+        // them has to be checked. Returning here let
+        // `#[classified] #[classified(top_secret)]` through, recording the
+        // column as `personal_data` while silently ignoring the tier the author
+        // actually asked for.
         if matches!(attr.meta, syn::Meta::Path(_)) {
-            return Ok(());
+            continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("personal_data") {
@@ -11259,6 +11265,30 @@ mod tests {
                 "`#[classified]` + `#[{marker}]` must be rejected: {generated}"
             );
         }
+    }
+
+    #[test]
+    fn classified_rejects_an_unknown_tier_behind_a_bare_marker() {
+        // The bare marker must not short-circuit validation of the attributes
+        // after it, or the column is recorded as `personal_data` while the tier
+        // the author asked for is silently dropped.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[classified(top_secret)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
     }
 
     #[test]

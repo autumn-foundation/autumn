@@ -132,6 +132,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
     for var in [
         "AUTUMN_BUILD_STATIC",
         "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_DATA_FLOW",
         "AUTUMN_DUMP_JOBS",
         "AUTUMN_LIST_TASKS",
         "AUTUMN_RUN_TASK",
@@ -261,8 +262,9 @@ mod tests {
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_retention_dry_run() {
         // Regression (#1342 review round 23): AppBuilder::run checks
-        // AUTUMN_BUILD_STATIC, AUTUMN_DUMP_ROUTES, AUTUMN_DUMP_JOBS,
-        // AUTUMN_LIST_TASKS, AUTUMN_RUN_TASK, and AUTUMN_MIGRATE *before*
+        // AUTUMN_BUILD_STATIC, AUTUMN_DUMP_ROUTES, AUTUMN_DUMP_DATA_FLOW,
+        // AUTUMN_DUMP_JOBS, AUTUMN_LIST_TASKS, AUTUMN_RUN_TASK, and
+        // AUTUMN_MIGRATE *before*
         // AUTUMN_RETENTION_DRY_RUN in its dispatch chain — any of them left
         // over in the CLI's own environment would hijack a --dry-run
         // invocation into a completely different (potentially mutating)
@@ -270,6 +272,7 @@ mod tests {
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_DUMP_DATA_FLOW",
             "AUTUMN_DUMP_JOBS",
             "AUTUMN_LIST_TASKS",
             "AUTUMN_RUN_TASK",

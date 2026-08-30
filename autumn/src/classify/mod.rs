@@ -498,6 +498,9 @@ fn record_release(record: &DeclassificationRecord) {
     tracing::info!(
         target: "autumn::declassification",
         model = record.model,
+        // The qualified path too, not just the display name: this event is the
+        // audit record, and two crates can each release a `Customer.email`.
+        model_path = record.model_path,
         field = record.field,
         classification = record.classification.as_str(),
         purpose = record.purpose,
