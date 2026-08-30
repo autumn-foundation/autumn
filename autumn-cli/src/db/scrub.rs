@@ -2612,10 +2612,15 @@ fn probe_database_facts(
     //   COVERS — pulling previously-excluded duplicates into it.
     //
     // `pg_depend` records both the expression- and the predicate-referenced
-    // columns, so one query covers them. Marking them unique-constrained is the
-    // fail-closed side of the trade: only the developer knows whether a given
-    // replacement keeps the expression's output (or the predicate's membership)
-    // distinct.
+    // columns, so one query covers them.
+    //
+    // NOTE: adding them here is only a PARTIAL guard, and deliberately recorded
+    // as such. `Strategy::allowed_on_unique` permits `email`/`name`/`redact` on
+    // a unique column because those are injective on the column's own value —
+    // but injectivity does not survive an arbitrary expression. Every scrubbed
+    // address starts `scrubbed+`, so `UNIQUE (left(email, 1))` still collides at
+    // execution time. A correct guard needs its own refusal for expression
+    // operands rather than folding them into the unique set; tracked in #2366.
     unique_columns.extend(pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
