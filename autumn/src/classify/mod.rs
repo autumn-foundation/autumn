@@ -51,12 +51,12 @@
 //! same posture `docs/guide/security-posture-manifest.md` states for the
 //! security manifest. Two things follow from that, and both are deliberate:
 //! an author who reaches for [`Declassification::__declare`] directly instead
-//! of [`declassify!`] is lying to their own manifest, and the boolean surface
-//! the wrapper must keep ([`PartialEq`], the `validator` rules) is an oracle
-//! someone could loop over. Neither is reachable by accident, and an author who
-//! wanted the value could simply declare a boundary. What this module closes is
-//! every path that hands a classified value -- or a serializable view of one --
-//! to a sink *without anyone meaning to*.
+//! of [`declassify!`](crate::declassify) is lying to their own manifest, and the
+//! boolean surface the wrapper must keep ([`PartialEq`], the `validator` rules)
+//! is an oracle someone could loop over. Neither is reachable by accident, and
+//! an author who wanted the value could simply declare a boundary. What this
+//! module closes is every path that hands a classified value -- or a
+//! serializable view of one -- to a sink *without anyone meaning to*.
 //!
 //! See `docs/guide/data-classification.md`.
 
@@ -579,10 +579,11 @@ macro_rules! declassify {
 
 /// Whether a declared justification is blank (empty or all whitespace).
 ///
-/// `const` so [`declassify!`] can reject it at compile time. Delegates to the
-/// cache-coherence gate's rule rather than carrying a second copy: two spellings
-/// of "blank" that could disagree is exactly the drift these gates exist to
-/// catch. That one is Unicode-aware, so a non-breaking space is still blank.
+/// `const` so [`declassify!`](crate::declassify) can reject it at compile time.
+/// Delegates to the cache-coherence gate's rule rather than carrying a second
+/// copy: two spellings of "blank" that could disagree is exactly the drift these
+/// gates exist to catch. That one is Unicode-aware, so a non-breaking space is
+/// still blank.
 #[doc(hidden)]
 #[must_use]
 pub const fn reason_is_blank(reason: &str) -> bool {

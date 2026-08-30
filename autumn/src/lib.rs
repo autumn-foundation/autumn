@@ -113,11 +113,16 @@ pub mod canary;
 #[cfg(feature = "reporting")]
 pub mod capsule;
 pub mod circuit_breaker;
-/// Compile-time data classification (issue #1654).
-///
-/// Carries a "personal data" classification on the *type* of a `#[model]`
-/// column and gates the `Json` response sink on it, so a leak is a build
-/// failure rather than a production incident.
+// Compile-time data classification (issue #1654): carries a "personal data"
+// classification on the *type* of a `#[model]` column and gates the `Json`
+// response sink on it, so a leak is a build failure rather than a production
+// incident.
+//
+// A plain comment, not a doc comment: an outer `///` here would be merged with
+// the module's own `//!` docs and the whole merged block would then resolve its
+// intra-doc links in *this* scope, where `Classified` and `Declassification` are
+// not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
+// The module documents itself.
 pub mod classify;
 pub mod cluster;
 pub mod config;
