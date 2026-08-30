@@ -1274,13 +1274,29 @@ fn check_safe_overrides_encrypted(
             if rule.is_some_and(|r| r.pii.contains_key(column)) {
                 continue;
             }
-            // A key column is exempt: it can never be rewritten anyway (see
-            // `is_key_column`), so refusing its `safe` declaration would leave
-            // the developer with no configuration that terminates.
+            // A key column is exempt: it can never be rewritten anyway, so
+            // refusing its `safe` declaration would leave the developer with no
+            // configuration that terminates.
+            //
+            // This asks `is_key_column` rather than re-deriving the test from
+            // the IR flags alone: the catalog contributes two more sources (the
+            // REFERENCED side of a foreign key, and generated columns) that the
+            // IR does not carry, so the two tests disagreed about what counts as
+            // structural.
+            //
+            // Necessary but NOT sufficient to make such a column configurable:
+            // classification resolves `#[encrypted]` before it looks at `safe`,
+            // so a structural encrypted column still fails as `PiiOnKeyColumn`
+            // with no declaration that terminates. Tracked in #2366.
             if by_name
                 .get(table.as_str())
-                .and_then(|t| t.columns.iter().find(|c| &c.name == column))
-                .is_some_and(|c| c.primary_key || c.references.is_some())
+                .and_then(|t| {
+                    t.columns
+                        .iter()
+                        .find(|c| &c.name == column)
+                        .map(|c| (*t, c))
+                })
+                .is_some_and(|(t, c)| is_key_column(t, c, inputs.facts))
             {
                 continue;
             }
