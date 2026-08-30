@@ -1,17 +1,18 @@
-error[E0277]: the trait bound `Classified<std::string::String, CustomerPhoneClassified>: From<ClassifiedText<CustomerEmailClassified>>` is not satisfied
+error[E0277]: the trait bound `Classified<std::string::String, CustomerPhoneClassified>: std::convert::From<ClassifiedText<CustomerEmailClassified>>` is not satisfied
   --> tests/compile-fail/classified_column_wrapper_cannot_retype.rs:27:12
    |
 27 |     erased.into()
-   |            ^^^^ the trait `From<ClassifiedText<CustomerEmailClassified>>` is not implemented for `Classified<std::string::String, CustomerPhoneClassified>`
+   |            ^^^^ unsatisfied trait bound
    |
-help: the following other types implement trait `From<T>`
+   = help: the trait `std::convert::From<ClassifiedText<CustomerEmailClassified>>` is not implemented for `Classified<std::string::String, CustomerPhoneClassified>`
+help: the following other types implement trait `std::convert::From<T>`
   --> src/classify/mod.rs
    |
    | impl<T, F: ClassifiedField> From<T> for Classified<T, F> {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Classified<T, F>` implements `From<T>`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Classified<T, F>` implements `std::convert::From<T>`
    |
   ::: src/classify/diesel_types.rs
    |
    | impl<F: ClassifiedField> From<ClassifiedText<F>> for Classified<String, F> {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Classified<std::string::String, F>` implements `From<ClassifiedText<F>>`
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Classified<std::string::String, F>` implements `std::convert::From<ClassifiedText<F>>`
    = note: required for `ClassifiedText<CustomerEmailClassified>` to implement `Into<Classified<std::string::String, CustomerPhoneClassified>>`
