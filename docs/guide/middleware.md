@@ -168,12 +168,26 @@ traffic; if you need every call audited, that has to come from routing calls
 through a named client (see the [outbound HTTP guide](./outbound-http.md)), not
 from registering this.
 
-The rest share one shape: you receive the operation plus a `next` future, and
-you decide whether, when, and how to call it — the same "around" contract as a
-tower layer, on a non-HTTP pipeline. Note that this is an *observe* hook, not a
-rewrite hook: the operation is borrowed and `next` already captured it, so an
-interceptor can wrap, time, refuse, or log a job — but it cannot edit the
-payload that gets enqueued.
+They all share the "around" contract — you receive the operation plus a `next`,
+and decide whether, when, and how to invoke it — but **`next` comes in two
+forms, and the difference decides what you can build**:
+
+| `next` is | Traits | You can |
+|---|---|---|
+| an owned `Pin<Box<dyn Future>>` | `MailInterceptor`, `JobInterceptor`, `DbConnectionInterceptor` | await it **once**, or drop it to suppress the operation |
+| a callable `&dyn Fn(..)` | `ChannelsInterceptor`, `HttpInterceptor` | invoke it zero, one, or **many** times, **and choose what to pass** |
+
+The first three are *observe* hooks, not rewrite hooks. The owned future has
+already captured its operation — the mail to send, the job payload, the
+checkout — so nothing in the signature reaches inside it. Such an interceptor
+can wrap, time, refuse, or log a job; it cannot edit the payload that gets
+enqueued, and it cannot retry, because nothing there builds a second attempt.
+To retry a mail send or a job, use the subsystem's own retry policy.
+
+`ChannelsInterceptor` and `HttpInterceptor` take the operation as *arguments*
+to `next` — `next(topic, message)` and `next(request)` — so those two can do
+what the others cannot: rewrite what gets published or sent, call `next` more
+than once to retry, or not at all to drop it.
 
 ```rust,ignore
 use autumn_web::interceptor::JobInterceptor;

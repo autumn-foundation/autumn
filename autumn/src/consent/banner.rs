@@ -508,55 +508,69 @@ fn drop_stale_representation_metadata(headers: &mut axum::http::HeaderMap) {
 
 /// Whether the client offered to accept an HTML document.
 fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
-    // RFC 9110 lets a list-valued field arrive as several field lines that mean
-    // exactly the comma-joined list, so `Accept: application/json` followed by
-    // `Accept: text/html` is an HTML offer. `HeaderMap::get` returns only the
-    // first line and would read that pair as a refusal, keeping the client's
-    // validators and letting an inner `EtagLayer` answer `304` — no body, so no
-    // banner, for a client that does render one. Scan every line; a missing
-    // `Accept` (no lines at all) still means yes, per the doc comment above.
+    // Two RFC 9110 rules decide this, and both bite.
+    //
+    // §5.3: a list-valued field may arrive as several field lines meaning the
+    // comma-joined list, so `Accept: application/json` then `Accept: text/html`
+    // is an HTML offer. Scanning only the first line reads it as a refusal.
+    //
+    // §12.5.1: the MOST SPECIFIC matching media range decides, so in
+    // `text/*;q=1, text/html;q=0` the exact range overrides the wildcard and
+    // the client has refused HTML. Taking the first acceptable-looking range
+    // instead would strip that client's validators on every request and cost
+    // it every `304` — the precise harm the `*/*` carve-out exists to avoid.
+    //
+    // So: collect the verdict for each specificity, then let the specific one
+    // win. First occurrence of a given range wins; a repeated range is
+    // malformed and not worth a tiebreak rule.
     let mut offered = false;
+    let mut exact: Option<bool> = None;
+    let mut wildcard: Option<bool> = None;
+
     for value in headers.get_all(axum::http::header::ACCEPT) {
         offered = true;
-        // A non-UTF-8 line tells us nothing; another line may still offer HTML.
+        // A non-UTF-8 line tells us nothing; another line may still decide.
         let Ok(accept) = value.to_str() else {
             continue;
         };
-        let names_html = {
-            accept.split(',').any(|range| {
-                let mut parts = range.split(';').map(str::trim);
-                let Some(media) = parts.next() else {
-                    return false;
-                };
-                // `text/*` is a valid range that includes HTML, and a client
-                // sending it is a document client. `*/*` stays excluded
-                // deliberately — it is the XHR default, so treating it as a
-                // document offer would strip every API client's conditional
-                // validators. That carve-out is about `*/*` specifically, not
-                // about wildcards in general, which is what this missed.
-                if !media.eq_ignore_ascii_case("text/html") && !media.eq_ignore_ascii_case("text/*")
-                {
-                    return false;
-                }
-                // `text/html;q=0` is an explicit refusal, not an offer. A
-                // substring check reads it as acceptance and then strips the
-                // client's conditional validators on every request — so an API
-                // client that names HTML only to reject it would never get a
-                // `304` again. Anything that is not a zero quality (including a
-                // malformed one) is treated as accepted, matching the lenient
-                // spirit of the rest of this predicate.
-                !parts.any(|param| {
-                    param
-                        .split_once('=')
-                        .is_some_and(|(k, v)| k.eq_ignore_ascii_case("q") && is_zero_quality(v))
-                })
-            })
-        };
-        if names_html {
-            return true;
+        for range in accept.split(',') {
+            let mut parts = range.split(';').map(str::trim);
+            let Some(media) = parts.next() else {
+                continue;
+            };
+            // `*/*` stays excluded deliberately — it is the XHR default, so
+            // treating it as a document offer would strip every API client's
+            // conditional validators. That carve-out is about `*/*`
+            // specifically, not about wildcards in general.
+            let slot = if media.eq_ignore_ascii_case("text/html") {
+                &mut exact
+            } else if media.eq_ignore_ascii_case("text/*") {
+                &mut wildcard
+            } else {
+                continue;
+            };
+            // `q=0` is an explicit refusal, not an offer. Anything that is not
+            // a zero quality (including a malformed one) counts as accepted,
+            // matching the lenient spirit of the rest of this predicate.
+            let accepted = !parts.any(|param| {
+                param
+                    .split_once('=')
+                    .is_some_and(|(k, v)| k.eq_ignore_ascii_case("q") && is_zero_quality(v))
+            });
+            slot.get_or_insert(accepted);
         }
     }
-    !offered
+
+    match (exact, wildcard) {
+        // `text/html` named explicitly: its quality is the answer, either way.
+        (Some(accepted), _) => accepted,
+        // Only `text/*`: it covers HTML, so its quality decides.
+        (None, Some(accepted)) => accepted,
+        // Neither named. No `Accept` at all means yes (the header is optional
+        // and defaulting the other way would skip the prompt for a client that
+        // does render pages); an `Accept` that names neither means no.
+        (None, None) => !offered,
+    }
 }
 
 /// Whether an RFC 9110 quality value is exactly zero (`0`, `0.`, `0.000`).
@@ -3166,6 +3180,49 @@ mod tests {
         assert!(
             accepts_html(&axum::http::HeaderMap::new()),
             "a missing Accept still means yes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_specific_html_refusal_overrides_a_text_wildcard_offer() {
+        // RFC 9110 §12.5.1: the most specific matching media range decides.
+        // `text/*;q=1, text/html;q=0` therefore REFUSES html -- the exact range
+        // overrides the wildcard. Scanning for the first acceptable-looking
+        // range instead accepted the wildcard and never saw the refusal, which
+        // stripped that client's validators and cost it every `304`.
+        let refuse = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.append(axum::http::header::ACCEPT, v.parse().unwrap());
+            accepts_html(&h)
+        };
+
+        assert!(
+            !refuse("text/*;q=1, text/html;q=0"),
+            "an exact `text/html;q=0` must override a `text/*` offer"
+        );
+        assert!(
+            !refuse("text/html;q=0, text/*;q=1"),
+            "order must not matter -- specificity decides, not position"
+        );
+
+        // The precedence must cut the other way too: a specific ACCEPTANCE
+        // overrides a wildcard refusal, or this becomes "any q=0 anywhere wins".
+        assert!(
+            refuse("text/*;q=0, text/html"),
+            "an exact `text/html` offer must override a `text/*;q=0` refusal"
+        );
+
+        // And a wildcard alone still decides when html is never named.
+        assert!(refuse("text/*"), "`text/*` alone still offers html");
+        assert!(!refuse("text/*;q=0"), "`text/*;q=0` alone still refuses");
+
+        // Precedence must survive the split-field-line path as well.
+        let mut split = axum::http::HeaderMap::new();
+        split.append(axum::http::header::ACCEPT, "text/*;q=1".parse().unwrap());
+        split.append(axum::http::header::ACCEPT, "text/html;q=0".parse().unwrap());
+        assert!(
+            !accepts_html(&split),
+            "the specific refusal wins even when it arrives on a later line"
         );
     }
 
