@@ -1,0 +1,37 @@
+running 1 test
+test bulk_delete_profile::token_bulk_delete_batch_profile ... 
+=== pg_stat_statements: BEFORE tier=small (100 ids) ===
+calls=100    buffers=526      wal_bytes=13386      UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE $2 WHERE id = $1 AND revoked_at IS NULL
+-- UPDATE statements: calls=100 buffers=526 wal_bytes=13386 --
+
+=== pg_stat_statements: BEFORE tier=medium (500 ids) ===
+calls=500    buffers=2703     wal_bytes=67928      UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE $2 WHERE id = $1 AND revoked_at IS NULL
+-- UPDATE statements: calls=500 buffers=2703 wal_bytes=67928 --
+
+=== pg_stat_statements: BEFORE tier=large (2000 ids) ===
+calls=2000   buffers=10815    wal_bytes=272708     UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE $2 WHERE id = $1 AND revoked_at IS NULL
+-- UPDATE statements: calls=2000 buffers=10815 wal_bytes=272708 --
+
+=== BEFORE: statement-count / buffer / WAL scaling across tiers ===
+tier          ids      calls      buffers    wal_bytes
+small         100        100          526        13386
+medium        500        500         2703        67928
+large        2000       2000        10815       272708
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row revoke UPDATE issued once per id (the pre-fix shape) ===
+UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' WHERE id = 999999999 AND revoked_at IS NULL
+Update on public.api_tokens  (cost=0.29..8.31 rows=0 width=0) (actual time=0.045..0.045 rows=0 loops=1)
+  Buffers: shared hit=5
+  ->  Index Scan using api_tokens_pkey on public.api_tokens  (cost=0.29..8.31 rows=1 width=14) (actual time=0.044..0.044 rows=0 loops=1)
+        Output: (now() AT TIME ZONE 'utc'::text), ctid
+        Index Cond: (api_tokens.id = 999999999)
+        Filter: (api_tokens.revoked_at IS NULL)
+        Buffers: shared hit=5
+Query Identifier: -4408102355092219719
+Planning Time: 0.061 ms
+Execution Time: 0.080 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 6.21s
+
+EXIT=0

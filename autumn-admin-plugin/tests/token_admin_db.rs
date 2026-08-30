@@ -309,3 +309,289 @@ async fn token_admin_create_accepts_rfc3339_expires_at() {
     let fetched = model.get(&pool, id).await.unwrap().unwrap();
     assert!(!fetched["expires_at"].is_null(), "expires_at must be set");
 }
+
+/// Ledger: `AdminModel::execute_action`'s default `"delete"` branch
+/// (`autumn-admin-plugin/src/traits.rs`) loops over the submitted ids and
+/// calls `self.delete(id)` once per id. For `TokenAdminModel` that is one
+/// `UPDATE api_tokens SET revoked_at = ... WHERE id = $1 AND revoked_at IS
+/// NULL` **per token**. `POST /admin/tokens/actions` with `action=delete`
+/// and a batch of selected rows is the real, public entry point that drives
+/// this loop directly — an operator revoking a batch of tokens (e.g.
+/// incident response: revoke every token for a compromised principal).
+///
+/// This module puts a measured number on that N+1 via `pg_stat_statements`
+/// against a production-shaped fixture. See
+/// `docs/reports/2026-08-30-ledger-token-admin-bulk-delete-batch/README.md`.
+mod bulk_delete_profile {
+    use super::{AdminModel, AsyncDieselConnectionManager, Pool, TokenAdminModel};
+    use diesel::connection::SimpleConnection;
+    use diesel::sql_types::{Array, BigInt, Text};
+    use diesel::{Connection, PgConnection, QueryableByName};
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    const PROFILE_TOTAL_TOKENS: i64 = 20_000;
+    const TIERS: [(&str, i64); 3] = [("small", 100), ("medium", 500), ("large", 2_000)];
+
+    async fn setup_profiling_env() -> (
+        PgConnection,
+        Pool<::autumn_web::RuntimeConnection>,
+        testcontainers::ContainerAsync<Postgres>,
+    ) {
+        let container = Postgres::default()
+            .with_tag("16-alpine")
+            .with_cmd([
+                "-c",
+                "fsync=off",
+                "-c",
+                "shared_preload_libraries=pg_stat_statements",
+                "-c",
+                "pg_stat_statements.track=all",
+                "-c",
+                "pg_stat_statements.max=2000",
+            ])
+            .start()
+            .await
+            .expect("failed to start postgres container");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        let mut sync_conn = PgConnection::establish(&url).expect("sync db connection");
+        sync_conn
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .expect("create pg_stat_statements extension");
+        sync_conn
+            .batch_execute(super::CREATE_TABLE_SQL)
+            .expect("create api_tokens");
+        seed_fixture(&mut sync_conn);
+
+        let manager = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(&url);
+        let pool = Pool::builder(manager).max_size(10).build().expect("pool");
+
+        (sync_conn, pool, container)
+    }
+
+    /// Production-shaped `api_tokens` fixture: 20,000 rows. Principal
+    /// cardinality is skewed — 400 rows (2%) belong to 20 heavy-churn
+    /// service accounts (~20 tokens each, the pattern of a rotated
+    /// service-account credential), the remaining 19,600 spread across
+    /// 15,000 `user:*` principals (mostly 1, some 2-3 — the real long tail).
+    /// 30% of rows are already revoked (a real token store's history, not a
+    /// freshly-seeded all-active table) and `scopes` varies from a 1-element
+    /// to a 5-element JSON array. A follow-up `UPDATE` before `ANALYZE`
+    /// leaves real dead tuples, same technique the other Ledger harnesses in
+    /// this repo use.
+    fn seed_fixture(conn: &mut PgConnection) {
+        conn.batch_execute(&format!(
+            "INSERT INTO api_tokens \
+             (token_hash, principal_id, created_at, revoked_at, name, scopes) \
+             SELECT \
+               'hash_' || i, \
+               CASE WHEN i % 50 = 0 THEN 'service:' || ((i / 50) % 20) \
+                    ELSE 'user:' || (i % 15000) END, \
+               TIMESTAMP '2024-01-01 00:00:00' + (i || ' minutes')::interval, \
+               CASE WHEN i % 10 < 3 \
+                    THEN TIMESTAMP '2024-01-01 00:00:00' + ((i + 5000) || ' minutes')::interval \
+                    ELSE NULL END, \
+               'token-' || i, \
+               (CASE i % 5 \
+                  WHEN 0 THEN '[\"read\"]' \
+                  WHEN 1 THEN '[\"read\",\"write\"]' \
+                  WHEN 2 THEN '[\"read\",\"write\",\"admin\"]' \
+                  WHEN 3 THEN '[\"read\",\"billing\"]' \
+                  ELSE '[\"read\",\"write\",\"admin\",\"billing\",\"deploy\"]' \
+                END)::jsonb \
+             FROM generate_series(1, {PROFILE_TOTAL_TOKENS}) AS i"
+        ))
+        .expect("seed api_tokens");
+
+        // Real dead tuples: touch a slice of rows post-insert, same
+        // technique the offline-sync and CSV-export Ledger harnesses use.
+        conn.batch_execute(
+            "UPDATE api_tokens SET last_used_at = created_at + INTERVAL '1 day' \
+             WHERE id % 7 = 0",
+        )
+        .expect("create dead tuples");
+        conn.batch_execute("ANALYZE api_tokens").expect("analyze");
+    }
+
+    fn reset_stats(conn: &mut PgConnection) {
+        conn.batch_execute("SELECT pg_stat_statements_reset()")
+            .expect("reset pg_stat_statements");
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct StatementRow {
+        #[diesel(sql_type = Text)]
+        query: String,
+        #[diesel(sql_type = BigInt)]
+        calls: i64,
+        #[diesel(sql_type = BigInt)]
+        buffers: i64,
+        #[diesel(sql_type = BigInt)]
+        wal_bytes: i64,
+    }
+
+    /// Every `api_tokens` `UPDATE` statement issued since the last
+    /// [`reset_stats`], from `pg_stat_statements`. Returns the summed
+    /// `(calls, buffers, wal_bytes)` across every distinct normalized
+    /// statement shape (there is exactly one shape per code path here, but
+    /// summing is robust regardless).
+    fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64) {
+        use diesel::RunQueryDsl;
+        println!("\n=== pg_stat_statements: {label} ===");
+        let rows = diesel::sql_query(
+            // `pg_stat_statements.wal_bytes` is `numeric`, not `bigint` (it
+            // has to outrun a lifetime of WAL past i64 range) — cast it down;
+            // nowhere near overflow for one test run.
+            "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers, \
+                    wal_bytes::bigint AS wal_bytes \
+             FROM pg_stat_statements \
+             WHERE query ILIKE '%api_tokens%' AND query ILIKE '%UPDATE%' \
+               AND query NOT ILIKE '%pg_stat_statements%' \
+             ORDER BY calls DESC",
+        )
+        .load::<StatementRow>(conn)
+        .expect("query pg_stat_statements");
+
+        let mut total = (0i64, 0i64, 0i64);
+        for row in &rows {
+            let normalized = row.query.split_whitespace().collect::<Vec<_>>().join(" ");
+            println!(
+                "calls={:<6} buffers={:<8} wal_bytes={:<10} {normalized}",
+                row.calls, row.buffers, row.wal_bytes
+            );
+            total.0 += row.calls;
+            total.1 += row.buffers;
+            total.2 += row.wal_bytes;
+        }
+        println!(
+            "-- UPDATE statements: calls={} buffers={} wal_bytes={} --",
+            total.0, total.1, total.2
+        );
+        total
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct ExplainLine {
+        #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    fn explain(conn: &mut PgConnection, label: &str, sql: &str) {
+        use diesel::RunQueryDsl;
+        println!("\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} ===");
+        println!("{sql}");
+        let lines = diesel::sql_query(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) {sql}"
+        ))
+        .load::<ExplainLine>(conn)
+        .expect("explain");
+        for line in lines {
+            println!("{}", line.line);
+        }
+    }
+
+    #[derive(QueryableByName, Debug)]
+    struct IdRow {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+
+    /// The next `limit` currently-active token ids after `offset` (ordered
+    /// by id) — a disjoint slice of the fixture's active pool, mirroring an
+    /// operator paging through the admin list view and selecting rows.
+    fn active_ids(conn: &mut PgConnection, limit: i64, offset: i64) -> Vec<i64> {
+        use diesel::RunQueryDsl;
+        diesel::sql_query(
+            "SELECT id FROM api_tokens WHERE revoked_at IS NULL \
+             ORDER BY id LIMIT $1 OFFSET $2",
+        )
+        .bind::<BigInt, _>(limit)
+        .bind::<BigInt, _>(offset)
+        .load::<IdRow>(conn)
+        .expect("fetch active ids")
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+    }
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+
+    fn revoked_count(conn: &mut PgConnection, ids: &[i64]) -> i64 {
+        use diesel::RunQueryDsl;
+        diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM api_tokens WHERE id = ANY($1) AND revoked_at IS NOT NULL",
+        )
+        .bind::<Array<BigInt>, _>(ids.to_vec())
+        .load::<CountRow>(conn)
+        .expect("count revoked")
+        .into_iter()
+        .next()
+        .map_or(0, |r| r.n)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn token_bulk_delete_batch_profile() {
+        let (mut conn, pool, _container) = setup_profiling_env().await;
+        let model = TokenAdminModel;
+
+        // ── BEFORE: the current `execute_action` "delete" loop, replicated
+        // call-for-call (`self.delete(&pool, id)` per id) — this is exactly
+        // what `traits.rs`'s default `execute_action` does today. ──────────
+        let mut offset = 0i64;
+        let mut baseline_results = Vec::new();
+        for (label, size) in TIERS {
+            let ids = active_ids(&mut conn, size, offset);
+            offset += size;
+            assert_eq!(
+                i64::try_from(ids.len()).expect("tier size fits in i64"),
+                size,
+                "tier {label}: fixture must have enough active ids"
+            );
+
+            reset_stats(&mut conn);
+            for &id in &ids {
+                model.delete(&pool, id).await.expect("delete");
+            }
+            let (calls, buffers, wal_bytes) =
+                print_profile(&mut conn, &format!("BEFORE tier={label} ({size} ids)"));
+            assert_eq!(
+                calls, size,
+                "tier {label}: one UPDATE call per id, exactly (the N+1)"
+            );
+            assert_eq!(
+                revoked_count(&mut conn, &ids),
+                size,
+                "tier {label}: every targeted id must end up revoked"
+            );
+            baseline_results.push((label, size, calls, buffers, wal_bytes));
+        }
+
+        println!("\n=== BEFORE: statement-count / buffer / WAL scaling across tiers ===");
+        println!(
+            "{:<8} {:>8} {:>10} {:>12} {:>12}",
+            "tier", "ids", "calls", "buffers", "wal_bytes"
+        );
+        for (label, size, calls, buffers, wal_bytes) in &baseline_results {
+            println!("{label:<8} {size:>8} {calls:>10} {buffers:>12} {wal_bytes:>12}");
+        }
+
+        // Representative plan for the per-id statement (nonexistent id, so
+        // `ANALYZE` doesn't mutate the fixture): shows the access method,
+        // not the scale claim — the scale claim is the table above.
+        explain(
+            &mut conn,
+            "single-row revoke UPDATE issued once per id (the pre-fix shape)",
+            "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+             WHERE id = 999999999 AND revoked_at IS NULL",
+        );
+    }
+}
