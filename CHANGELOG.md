@@ -397,6 +397,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
 
+- **UI/routing documentation and the flagship example that proves it (#2320):**
+  the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing
+  doc gaps and almost no showcased example coverage. Four narrative guides and
+  a reworked `examples/reddit-clone` close it.
+
+  New guides:
+
+  - `docs/guide/forms.md` — the changeset round-trip end to end: `ChangesetForm`
+    and why a rejected submission is *data* rather than an error, `Valid<T>` /
+    `Validated<T>` / `ValidateExt` for callers that are programs, model-level
+    `#[validate(...)]` and the merged-model rule that makes it hold on updates
+    **where it applies** — a repository with hooks or `validate_on_update =
+    fetch` validates the merged model, while a plain generated repository takes
+    the blind-update path and runs no model validation at all — plus
+    `#[normalize(trim, downcase, upcase, squish, with = …)]` and exactly where
+    it runs on the write path (before validation, before hooks, and on derived
+    finders) **and where it does not**: both update paths persist the raw
+    patch, so a direct `repo.update(...)` writes unnormalized values. CSRF,
+    `form_for`, htmx inline validation and the no-JavaScript
+    fallback that costs nothing to keep, accessible fields, and how to test the
+    failure path. This was the last core-surface subsystem documented only
+    obliquely.
+  - `docs/guide/extractors.md` — the extractor catalog, the two ordering rules
+    (one body extractor, and it goes last; head extractors run left to right,
+    which is why `Db` must be dropped before a second pooled checkout), writing
+    your own, and a full section on `Query<T>`'s structured decoding: repeated
+    keys, `tags[]`, `tags[0]`, `filter[status]`, `items[0][sku]`, the depth cap,
+    duplicate-key rejection, why errors never echo a value, and the
+    `HashMap`-typed-target upgrade note.
+  - `docs/guide/cookie-consent.md` — the gate as the actual compliance rather
+    than the banner, the strictly-necessary exemption, `accept_all_cookie` /
+    `reject_non_essential_cookie` / `expire_consent_cookie`, why accept and
+    reject are `POST` while only the preferences page is a `GET`,
+    `inject_consent_banner` and the four bugs its special cases prevent,
+    policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow.
+  - `docs/guide/middleware.md` gains a "which hook do I reach for" decision
+    table, a full `#[intercept(...)]` section (per-route tower layers, stacking
+    order, when to use something else instead, and the `#[edge]` and idempotency
+    trade-offs), and a section on the non-HTTP interceptors —
+    `with_mail_interceptor` / `with_job_interceptor` / `with_db_interceptor` /
+    `with_channels_interceptor` / `with_http_interceptor` — which no tower layer
+    can reach.
+  - `docs/guide/pagination.md` gains the `ListQuery` section the feature never
+    had (allowlisted `sort` / `dir` / `filter[col]`, and why the allowlist lives
+    in the generated `list()` rather than the extractor), plus a costs section:
+    `COUNT(*)`, deep-offset scans, offset instability under concurrent inserts,
+    and the two-connection deadlock.
+
+  `examples/reddit-clone` now exercises the features those guides describe:
+
+  - **Typed accessible forms** — the submit and edit forms are built from
+    `a11y::TextField` / `TextArea` / `Select` / `Button` / `Link`, whose
+    unlabeled forms do not implement `Render` and therefore do not compile.
+    Errors are wired with `aria-invalid` plus `aria-describedby` pointing at a
+    `role="alert"` message element.
+  - **The changeset round-trip** — `submit` and `update` are `ChangesetForm`
+    handlers that re-render the form on 422 with the author's title, URL and
+    body intact, replacing hand-rolled `unprocessable_msg` errors that discarded
+    the draft.
+  - **Rich text** — post bodies are user-submitted Markdown rendered through
+    `markdown::render_user_content` at display time, so the stored source stays
+    editable and a later allowlist change protects posts already written.
+  - **Cookie consent** — `inject_consent_banner` on spliceable HTML pages
+    (registering the layer is not the same as "every page prompts": several
+    response shapes are deliberately passed through untouched, all of them
+    still receiving `Vary: Cookie` — `docs/guide/cookie-consent.md` enumerates
+    them, and is the one place that list is maintained), `POST`
+    accept/reject/withdraw routes, a `GET /consent/manage` preferences page
+    reusing the framework banner widget, a footer link on every page, and the
+    app's one non-essential category gated at its single call site.
+  - **Pagination** — the community listing is offset-paginated with
+    `PageRequest` + `Page` + `pagination_nav`, with page links that are plain
+    `<a href>`, a self-referential canonical on deeper pages, and the live SSE
+    feed wired on page 1 only.
+  - **No-JavaScript fallbacks** — the forms carry no `hx-*` attributes and
+    submit normally; unit tests assert that, the CSRF hidden input, the label
+    and error wiring, and the rich-text sanitizer's script/image/scheme
+    rejections.
+
 - **Cache coherence is now proven at build time — the build fails when a write
   can leave a cached read stale (#1716):** Autumn’s cache was powerful and its
   coherence was entirely manual. `Cache::invalidate(key)` was hand-called,

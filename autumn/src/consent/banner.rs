@@ -5,14 +5,38 @@
 //! (re-)prompting, inserts the banner markup right before `</body>`. This
 //! mirrors [`crate::middleware::dev::inject_live_reload`]'s proven
 //! detect-HTML / splice-before-`</body>` / fix-`Content-Length` pattern, so
-//! every HTML page in the app shows the banner automatically — no per-handler
+//! HTML pages in the app show the banner automatically — no per-handler
 //! wiring, and no change to the app's shared `layout()` function signature
 //! (which `autumn generate scaffold` depends on staying a stable 4-arg call).
+//!
+//! Six cases are deliberately **not** injected into, so "the layer is
+//! registered" is not the same as "every page prompts":
+//!
+//! 1. an htmx *fragment* response, which has no `</body>` to splice before and
+//!    whose swap would put a second banner on the page;
+//! 2. a *static cache hit* where CSRF is enforced but no token is obtainable,
+//!    since the banner's buttons would `403`;
+//! 3. an **encoded** body (`Content-Encoding`), which cannot be spliced without
+//!    decoding it first — see [`is_html_response`]. Whether this happens is
+//!    decided by layer order: injection sees plain HTML only if it runs
+//!    *inside* the compression layer;
+//! 4. a `206 Partial Content` body (or any response carrying `Content-Range`),
+//!    whose bytes are a slice of a larger representation that `Content-Range`
+//!    describes — splicing would corrupt the range;
+//! 5. a **download** (`Content-Disposition: attachment`), whose bytes become a
+//!    file on disk rather than a page — splicing would edit the export and
+//!    write the visitor's live CSRF token into it;
+//! 6. a body over [`MAX_SPLICE_BODY_BYTES`].
+//!
+//! All six still get `Vary: Cookie`, because the representation depends on the
+//! consent cookie whether or not anything was injected. Each is documented on
+//! [`inject_consent_banner`] and summarized for app authors in
+//! `docs/guide/cookie-consent.md`.
 
 use axum::body::{Body, Bytes};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, SET_COOKIE, VARY,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, SET_COOKIE, VARY,
 };
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
@@ -114,7 +138,7 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 ///             req,
 ///             next,
 ///             CONSENT_POLICY_VERSION,
-///             autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME,
+///             Some(autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME),
 ///             autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
 ///         ).await
 ///     }));
@@ -163,6 +187,20 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// one. `Cache-Control` is left alone in that case, since nothing per-visitor
 /// was freshly embedded and the app's own caching choice should stand.
 ///
+/// Both headers are instructions to *HTTP* caches — the browser, a CDN, a
+/// reverse proxy. They do not reach a cache living inside the application:
+/// [`CacheResponseLayer`](crate::cache::CacheResponseLayer) keys its entries
+/// on the request URI alone and reads neither header, so a consent-varying
+/// route registered behind it is unsafe in either stacking order. Inside
+/// this middleware, the layer stores the handler's pre-injection body, and a
+/// visitor who allowed a category populates it with
+/// `consent.allows(..)`-gated markup that a visitor who refused then gets on
+/// a cache hit — this middleware injects nothing for them, because they have
+/// decided, so nothing corrects it. Outside this middleware, it stores the
+/// *injected* body, CSRF token and all, and replays that. Keep
+/// consent-varying routes out of `CacheResponseLayer`, or give it a key that
+/// includes the consent decision.
+///
 /// If the response already contains the banner's own marker class (e.g. a
 /// "manage cookie preferences" handler rendered [`consent_banner_markup`]
 /// itself so an already-decided visitor can change their choice), this
@@ -178,18 +216,35 @@ pub fn consent_banner_markup(csrf_token: Option<&str>, csrf_field_name: &str) ->
 /// `Content-Length` before emptying the body for `HEAD`, so the `HEAD`
 /// response's metadata always matches the equivalent `GET`'s.
 ///
-/// # Known limitation: `#[static_get]` pages and CSRF
+/// # `#[static_get]` pages: the banner is skipped, not broken
 ///
 /// A first-time visitor whose very first hit lands on a pre-rendered
-/// `#[static_get]` page is served that page by the static-first middleware
-/// before the dynamic router (and therefore `CsrfLayer`) ever runs, so no
-/// CSRF cookie exists yet. This middleware then has no token to embed in the
-/// banner's hidden field, and the resulting `/consent/accept` /
-/// `/consent/reject` submission is rejected by `CsrfLayer` with a `403`. This
-/// does not affect the default `autumn new` scaffold (which has no
-/// `#[static_get]` routes); an app that adds one should exempt its consent
-/// routes' path prefix, or route visitors through a dynamic page at least
-/// once before relying on the static-served banner's buttons.
+/// `#[static_get]` page is served that page by the static-first middleware.
+/// User `.layer()` middleware — including this one — is applied *outside* that
+/// layer so it can process pre-rendered responses, but `CsrfLayer` runs inside
+/// the dynamic router and therefore never runs at all on a static cache hit,
+/// so no CSRF cookie exists yet.
+///
+/// When `csrf_cookie_name` is `Some(..)` and no token can be found, this
+/// middleware **skips injection** rather than emitting a banner whose
+/// `/consent/accept` / `/consent/reject` submission `CsrfLayer` would reject
+/// with a `403`. The visitor is simply not prompted on that page; the first
+/// dynamic page they reach issues a token and prompts them normally, and the
+/// gate stays closed in the meantime, so no non-essential cookie is set while
+/// they are undecided.
+///
+/// Do **not** exempt the consent routes from CSRF to work around this. Those
+/// are the state-changing `POST`s the protection exists for, and the skip
+/// above already removes the failure that made exemption tempting.
+///
+/// One residual edge remains, and it is not specific to consent: on a static
+/// hit the request's own CSRF cookie is used as the fallback token, and
+/// `CsrfLayer` never ran to validate or refresh it. A cookie that is stale
+/// (signing key rotated) or tampered is therefore embedded as-is, and the
+/// accept/reject `POST` will `403`. This middleware cannot tell the difference
+/// — it is given a cookie *name*, not the signing key — and the same stale
+/// cookie would fail on any other cached form page in the app. The visitor
+/// recovers on their first dynamic page, which reissues a valid token.
 ///
 /// # Known limitation: no true streaming for an undecided visitor
 ///
@@ -211,7 +266,7 @@ pub async fn inject_consent_banner(
     mut request: Request<Body>,
     next: Next,
     policy_version: u32,
-    csrf_cookie_name: &str,
+    csrf_cookie_name: Option<&str>,
     csrf_form_field: &str,
 ) -> Response<Body> {
     if request
@@ -222,32 +277,127 @@ pub async fn inject_consent_banner(
         return next.run(request).await;
     }
 
+    // An htmx *fragment* request asks for a piece of a page, not a document.
+    // Such a response carries no `</body>`, so the splice below would append
+    // the banner to the end of the fragment — and htmx would then swap that
+    // copy into whatever element it targets, while the banner already injected
+    // into the enclosing page stays put. The visitor sees duplicate consent
+    // controls, and on a page whose fragments refresh (a live feed, a vote
+    // button) a new copy on every swap. A fragment is never the right place to
+    // prompt, so skip it: the enclosing document already carries the banner,
+    // and the next full page load re-evaluates consent as usual.
+    //
+    // A *boosted* navigation (`hx-boost`) is deliberately NOT treated as a
+    // fragment. It also carries `HX-Request`, but the response is a complete
+    // document whose body replaces the current one — so skipping it would both
+    // omit the banner from the new page and destroy the one on the old page in
+    // the same swap, leaving an undecided visitor silently unprompted until
+    // they made a non-htmx navigation.
+    //
+    // Note this only skips the *banner*. A fragment still gets `Vary: Cookie`
+    // below: skipping injection is about where a prompt belongs, not about
+    // cache correctness, and a fragment handler may itself render
+    // consent-dependent markup via `Consent::allows`.
+
     let consent = Consent::from_headers(request.headers());
-    let request_csrf_cookie = find_cookie(request.headers(), csrf_cookie_name);
+    let request_csrf_cookie =
+        csrf_cookie_name.and_then(|name| find_cookie(request.headers(), name));
 
     let needs_prompt = consent.needs_prompt(policy_version);
-    if needs_prompt {
+    // Strip the conditional validators only for a client that could actually
+    // be shown a banner. The reason to strip them is that an inner `EtagLayer`
+    // could otherwise answer `304` with no body, replaying a browser-cached,
+    // banner-less page and skipping a prompt that is now due.
+    //
+    // That reasoning applies only to responses this middleware could inject
+    // into, and the check has to happen here — before `next` runs — where the
+    // response's content type is not yet known. `Accept` normally
+    // distinguishes the two cases: a browser navigation offers `text/html`,
+    // while an API client asks for JSON. Stripping unconditionally would mean
+    // every request from a consent-less client loses `If-None-Match` /
+    // `If-Modified-Since` — and an API client never acquires a consent cookie,
+    // so its conditional requests could never return `304` again and it would
+    // refetch full bodies forever.
+    //
+    // htmx requests are the exception `Accept` alone gets wrong: they go over
+    // XHR without setting `Accept`, so they arrive with the XHR default `*/*`,
+    // which this deliberately does not treat as HTML. Any of them may still be
+    // a whole-document swap (see `could_render_a_banner`). Leaving their
+    // validators intact would let an inner `EtagLayer` answer `304` with no
+    // body to inject, so a policy bump or a withdrawal could leave the visitor
+    // unprompted for as long as their cache stays fresh.
+    if needs_prompt && could_render_a_banner(request.headers()) {
         request.headers_mut().remove(IF_NONE_MATCH);
         request.headers_mut().remove(IF_MODIFIED_SINCE);
     }
 
     let mut response = next.run(request).await;
 
-    if !is_html_response(&response) {
+    if !is_html_content_type(&response) {
         return response;
     }
 
-    // No `HEAD`-specific handling is needed here, even though this can
-    // splice a banner into the body below: Axum's own per-route wrapper
-    // (added by `.layer()`, wrapping this entire middleware) is what
-    // actually converts a `GET` handler's response into a `HEAD` one — it
-    // computes `Content-Length` from *this* middleware's returned body and
-    // *then* empties it for `HEAD`, strictly after this function returns.
-    // So by the time this code runs, `response` still carries the real,
-    // full body (and no `Content-Length` yet) regardless of request method;
-    // splicing into it here and letting `Content-Length` reflect the
-    // spliced body is exactly the metadata Axum will carry through to the
-    // final `HEAD` response once it empties the body.
+    // A `206 Partial Content` body is a byte slice of a larger representation,
+    // and `Content-Range` states which bytes. Splicing would insert markup into
+    // the middle of that range and rewrite `Content-Length` while leaving
+    // `Content-Range` describing the original — so a range cache or a resuming
+    // download would reassemble a corrupted document. The selected bytes can
+    // easily satisfy the document test too, since a first range of an HTML file
+    // begins exactly like one.
+    //
+    // Checked by header as well as status: a proxy or a handler can attach
+    // `Content-Range` without the canonical status.
+    // `Content-Disposition: attachment` means these bytes become a file on the
+    // visitor's disk, not a page in their browser. Splicing would edit the
+    // export they asked for and write their live CSRF token into it — a token
+    // that then sits in a saved file, possibly shared. An exported document is
+    // also never where a consent prompt belongs.
+    if is_attachment(&response)
+        || response.status() == axum::http::StatusCode::PARTIAL_CONTENT
+        || response.headers().contains_key(CONTENT_RANGE)
+    {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        return response;
+    }
+
+    // On a route Axum wraps, `HEAD` needs no special handling here: Axum's
+    // per-route wrapper computes `Content-Length` from *this* middleware's
+    // returned body and empties it strictly afterwards, so splicing here is
+    // what makes the `HEAD` metadata match the equivalent `GET`. The test
+    // `undecided_visitors_head_request_matches_the_spliced_gets_content_length_and_cache_control`
+    // pins that.
+    //
+    // The pre-rendered path is the exception, and it is caught below by the
+    // empty-body check rather than by the method: with a `dist` manifest the
+    // static-first middleware answers a `HEAD` hit itself with `Body::empty()`
+    // and this layer is reapplied *outside* it, so no wrapper will fix up what
+    // we return.
+    // A fragment never carries the banner, but it may well carry markup the
+    // handler gated on `Consent::allows` — an analytics snippet, a
+    // personalised control. Without `Vary: Cookie` a shared cache could store
+    // one visitor's fragment and replay it to a visitor whose consent differs,
+    // serving gated markup to someone who rejected it. Skipping the banner is
+    // correct; skipping the cache variance is not.
+    // Everything below here is an HTML response, so its representation can
+    // depend on the consent cookie whether or not this middleware injects
+    // anything. Two cases get the cache variance and nothing else:
+    //
+    //   * a `Content-Encoding` body — HTML we cannot splice into without
+    //     decoding it, but HTML all the same. Since we already know the media
+    //     type is HTML, `!is_html_response` here means exactly "encoded".
+    //
+    // A fragment is no longer detected here: it is recognised further down by
+    // having no `</body>`, which is the property that actually matters and the
+    // only one that does not depend on guessing from request headers.
+    if !is_html_response(&response) {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        return response;
+    }
+
     if !needs_prompt {
         // A handler can still render differently based on the visitor's
         // Consent cookie even when this middleware injects nothing (e.g.
@@ -265,12 +415,190 @@ pub async fn inject_consent_banner(
         return response;
     }
 
-    let csrf_token =
-        extract_response_csrf_cookie(&response, csrf_cookie_name).or(request_csrf_cookie);
+    let csrf_token = csrf_cookie_name
+        .and_then(|name| extract_response_csrf_cookie(&response, name))
+        .or(request_csrf_cookie);
+
+    // With CSRF enforced but no token obtainable, the banner's buttons would
+    // POST to a CSRF-protected route without the hidden field and get a `403`.
+    // Rendering controls that cannot work is worse than rendering none: the
+    // visitor is invited to decide and then silently refused.
+    //
+    // This is reachable in a built (SSG/ISG) deployment. User `.layer()`
+    // middleware is applied OUTSIDE the static-first layer precisely so it can
+    // process pre-rendered responses — which means that on a static cache hit
+    // `CsrfLayer` never runs, sets no cookie, and there is nothing to embed.
+    // Skipping leaves the visitor unprompted on that page; the next dynamic
+    // page prompts them normally, and no non-essential cookie was set in the
+    // meantime because the gate stays closed while undecided.
+    if csrf_cookie_name.is_some() && csrf_token.is_none() {
+        tracing::debug!(
+            "consent banner skipped: CSRF is enforced but no token was available \
+             (typically a pre-rendered static page, where CsrfLayer never runs)"
+        );
+        // `Vary: Cookie` for the same reason as every other HTML pass-through:
+        // this response is bannerless *because this visitor had no CSRF
+        // cookie*. Cached without the header, a CDN could replay it to a
+        // visitor who does have one — and who could therefore have been
+        // prompted — suppressing the banner for as long as the entry stays
+        // fresh. The response varies on the cookie jar whether or not anything
+        // was injected.
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Cookie"));
+        return response;
+    }
+
     let banner_html = consent_banner_markup(csrf_token.as_deref(), csrf_form_field).into_string();
     splice_into_response(response, &banner_html).await
 }
 
+/// Whether the client offered to accept an HTML document.
+///
+/// Only such a request can be answered with a page carrying the banner, so
+/// only such a request has a reason to lose its conditional validators (see
+/// [`inject_consent_banner`]). A missing `Accept` header is treated as
+/// accepting HTML: the header is optional, and defaulting the other way would
+/// silently skip the prompt for a client that does render pages.
+///
+/// A bare `*/*` — what `curl` and many API clients send — is deliberately NOT
+/// treated as accepting HTML: those callers do not render a banner, and
+/// keeping their validators is what preserves their `304`s.
+fn could_render_a_banner(headers: &axum::http::HeaderMap) -> bool {
+    // Any htmx request counts, deliberately, because no header distinguishes a
+    // fragment swap from a whole-document one. `hx-boost` and a history-cache
+    // miss have their own headers; an ordinary `hx-get` with `hx-target="body"`
+    // has none (htmx sends `HX-Target` only when the target has an id, and the
+    // body usually has none) yet replaces the document just the same. Three
+    // attempts at enumerating the document cases from headers each missed one.
+    //
+    // htmx also issues these over XHR, whose default `Accept` is `*/*`, so
+    // `accepts_html` says no for precisely the requests that most need a
+    // prompt. The cost of being generous here is bounded and falls only on
+    // htmx clients: one full response instead of a `304`, while a prompt is
+    // due. An API client sends neither `text/html` nor `HX-Request` and keeps
+    // its conditional requests — which is the property this predicate exists
+    // to protect.
+    accepts_html(headers) || htmx_header_is_true(headers, "hx-request")
+}
+
+/// An htmx boolean header: present and not the literal `false` htmx never sends.
+fn htmx_header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+}
+
+/// Drop the headers that describe the exact bytes of a representation.
+///
+/// Called only where this middleware rewrites the body. `Content-Length` is
+/// recomputed at the call site; these cannot be, because they are whatever the
+/// inner layer chose to compute, so the honest move is to remove them rather
+/// than ship a validator for bytes nobody will receive.
+fn drop_stale_representation_metadata(headers: &mut axum::http::HeaderMap) {
+    headers.remove(ETAG);
+    // `Accept-Ranges: bytes` invites the client to resume with a `Range`
+    // request -- but a range request is answered by the handler, and this
+    // middleware passes a `206` through untouched, so those offsets address the
+    // ORIGINAL bannerless bytes while the client is splicing them into the
+    // longer body it already received. That silently corrupts the result.
+    // Withdrawing the offer is the honest move: ranges over a representation
+    // this middleware rewrote are not something the origin can serve.
+    headers.remove(ACCEPT_RANGES);
+    // Not `http::header` constants, so they are named here. `Content-Digest`
+    // and `Repr-Digest` are RFC 9530; `Digest` and `Content-MD5` are the
+    // obsolete spellings still emitted by some proxies and SDKs.
+    for name in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        headers.remove(name);
+    }
+}
+
+/// Whether the client offered to accept an HTML document.
+fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
+    // Two RFC 9110 rules decide this, and both bite.
+    //
+    // §5.3: a list-valued field may arrive as several field lines meaning the
+    // comma-joined list, so `Accept: application/json` then `Accept: text/html`
+    // is an HTML offer. Scanning only the first line reads it as a refusal.
+    //
+    // §12.5.1: the MOST SPECIFIC matching media range decides, so in
+    // `text/*;q=1, text/html;q=0` the exact range overrides the wildcard and
+    // the client has refused HTML. Taking the first acceptable-looking range
+    // instead would strip that client's validators on every request and cost
+    // it every `304` — the precise harm the `*/*` carve-out exists to avoid.
+    //
+    // So: collect the verdict for each specificity, then let the specific one
+    // win. First occurrence of a given range wins; a repeated range is
+    // malformed and not worth a tiebreak rule.
+    let mut offered = false;
+    let mut exact: Option<bool> = None;
+    let mut wildcard: Option<bool> = None;
+
+    for value in headers.get_all(axum::http::header::ACCEPT) {
+        offered = true;
+        // A non-UTF-8 line tells us nothing; another line may still decide.
+        let Ok(accept) = value.to_str() else {
+            continue;
+        };
+        for range in accept.split(',') {
+            let mut parts = range.split(';').map(str::trim);
+            let Some(media) = parts.next() else {
+                continue;
+            };
+            // `*/*` stays excluded deliberately — it is the XHR default, so
+            // treating it as a document offer would strip every API client's
+            // conditional validators. That carve-out is about `*/*`
+            // specifically, not about wildcards in general.
+            let slot = if media.eq_ignore_ascii_case("text/html") {
+                &mut exact
+            } else if media.eq_ignore_ascii_case("text/*") {
+                &mut wildcard
+            } else {
+                continue;
+            };
+            // `q=0` is an explicit refusal, not an offer. Anything that is not
+            // a zero quality (including a malformed one) counts as accepted,
+            // matching the lenient spirit of the rest of this predicate.
+            let accepted = !parts.any(|param| {
+                param
+                    .split_once('=')
+                    .is_some_and(|(k, v)| k.eq_ignore_ascii_case("q") && is_zero_quality(v))
+            });
+            slot.get_or_insert(accepted);
+        }
+    }
+
+    // Precedence in one line: `exact` wins whenever it is present -- either way,
+    // offer or refusal -- and `text/*` decides only when HTML was never named.
+    //
+    // When neither is named the fallback is `!offered`: no `Accept` at all means
+    // yes (the header is optional, and defaulting the other way would skip the
+    // prompt for a client that does render pages), while an `Accept` naming
+    // neither means no.
+    exact.or(wildcard).unwrap_or(!offered)
+}
+
+/// Whether an RFC 9110 quality value is exactly zero (`0`, `0.`, `0.000`).
+fn is_zero_quality(v: &str) -> bool {
+    let v = v.trim();
+    let (int, frac) = v.split_once('.').unwrap_or((v, ""));
+    int == "0" && frac.chars().all(|c| c == '0')
+}
+
+/// Whether this request came from htmx, and therefore expects a fragment
+/// rather than a complete document.
+///
+/// htmx sets `HX-Request: true` on every request it issues, and additionally
+/// `HX-Boosted: true` when the request came from an `hx-boost`ed link or form.
+/// A boosted request is a full-page navigation — the response is a complete
+/// document that replaces the current body — so only a request that is htmx
+/// *and not* boosted is a fragment request.
+///
+/// Matching the framework's other htmx-aware paths (`crate::htmx`, the
+/// tracked-job poll route), a header's presence is what matters — the value is
+/// not parsed beyond confirming it is not the literal `false` htmx never
+/// actually sends.
 /// Find a fresh CSRF cookie value the wrapped handler's response is about to
 /// set (e.g. the very first request from a visitor, before any CSRF cookie
 /// existed on the way in).
@@ -293,9 +621,25 @@ fn extract_response_csrf_cookie(
 }
 
 fn is_html_response(response: &Response<Body>) -> bool {
+    // A `Content-Encoding` body is HTML we cannot splice into without decoding
+    // it first, so it is not injectable — but it is still HTML, and still
+    // varies on the consent cookie. See `is_html_content_type`.
     if response.headers().contains_key(CONTENT_ENCODING) {
         return false;
     }
+    is_html_content_type(response)
+}
+
+/// Whether the response's media type is `text/html`, **regardless of whether it
+/// is encoded**.
+///
+/// [`is_html_response`] answers "can this be spliced into"; this answers "is
+/// this a page whose representation depends on the consent cookie". The two
+/// differ for a compressed response, and conflating them meant a
+/// `Content-Encoding` HTML response skipped `Vary: Cookie` entirely — so a
+/// shared cache could serve one visitor's consent-dependent markup to a visitor
+/// who chose differently.
+fn is_html_content_type(response: &Response<Body>) -> bool {
     response
         .headers()
         .get(CONTENT_TYPE)
@@ -387,6 +731,29 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
             // `RENDERED_BANNER_MARKER`'s doc for why the whole opening tag,
             // not just the bare class name) rather than assuming any
             // particular route.
+
+            // An already-empty HTML body is not a page to prompt in, and
+            // appending a bare banner to one produces a document that is
+            // nothing but a banner. The case that makes this reachable is a
+            // `HEAD` hit on a pre-rendered page: with a `dist` manifest the
+            // static-first middleware answers it directly with `Body::empty()`
+            // and `Content-Type: text/html`, and user layers — this one
+            // included — are reapplied *outside* that middleware, so no Axum
+            // per-route wrapper will fix up what we return. Splicing there
+            // would give a `HEAD` response a body and a `Content-Length` of the
+            // banner rather than of the equivalent `GET`.
+            //
+            // Deliberately keyed on the empty body rather than on the method:
+            // on a route Axum *does* wrap, a `HEAD` still carries the full body
+            // here and must be spliced, so that its `Content-Length` matches
+            // the `GET`.
+            if bytes.is_empty() {
+                parts
+                    .headers
+                    .append(VARY, HeaderValue::from_static("Cookie"));
+                return Response::from_parts(parts, Body::from(bytes));
+            }
+
             if contains_ascii_case_insensitive(&bytes, RENDERED_BANNER_MARKER.as_bytes()) {
                 // The handler's own rendering already carries a live,
                 // per-visitor CSRF token (see `consent_banner_markup`) —
@@ -402,14 +769,31 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
                 return Response::from_parts(parts, Body::from(bytes));
             }
 
-            let updated = splice_before_body_close(&bytes, snippet);
-            if updated == bytes.as_ref() {
+            // The presence of `</body>` *is* the fragment test. An htmx swap
+            // that replaces the whole document has one; a fragment does not.
+            // Deciding here rather than from request headers is what makes this
+            // correct for `hx-boost`, a history-cache miss, and an ordinary
+            // `hx-get` with `hx-target="body"` alike — the last of which sends
+            // no header distinguishing it from a fragment at all.
+            let Some(updated) = splice_before_body_close(&bytes, snippet) else {
+                parts
+                    .headers
+                    .append(VARY, HeaderValue::from_static("Cookie"));
                 return Response::from_parts(parts, Body::from(bytes));
-            }
+            };
 
             parts
                 .headers
                 .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
+            // The bytes just changed, so any validator or digest an inner layer
+            // computed describes a representation that is no longer being sent.
+            // Leaving them attached is worse than dropping them: a client that
+            // verifies `Content-Digest` rejects every banner-injected page, and
+            // a stale `ETag` names bytes without the banner. Dropping is always
+            // safe — the response simply cannot be revalidated — and dropping
+            // beats recomputing here, which would have to re-derive whatever
+            // scheme the inner layer chose.
+            drop_stale_representation_metadata(&mut parts.headers);
             // A live, per-visitor CSRF token was just embedded in this body —
             // never let a CDN/proxy (or the browser) cache and replay it to
             // someone else.
@@ -479,18 +863,152 @@ async fn splice_into_response(response: Response<Body>, snippet: &str) -> Respon
 /// HTML as lowercase), which a byte-for-byte comparison must do explicitly.
 /// `snippet` is always plain ASCII-safe markup, so splicing it in at an
 /// ASCII tag's byte offset can never straddle a multi-byte UTF-8 sequence.
-fn splice_before_body_close(body: &[u8], snippet: &str) -> Vec<u8> {
-    if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>") {
+fn splice_before_body_close(body: &[u8], snippet: &str) -> Option<Vec<u8>> {
+    // The opening is checked FIRST, and it gates both branches.
+    //
+    // Searching for `</body>` alone is not a document test: a fragment can
+    // contain those bytes without being one — inside a `<script>` string, or an
+    // HTML comment — and splicing at that offset would drop the banner inside
+    // the script or the comment, corrupting the fragment and rendering no
+    // usable controls. A real document both opens like one and (usually) closes
+    // its body; a fragment that merely mentions the tag does neither.
+    //
+    // This is a shape test, not a parser. It is deliberately fail-safe: an
+    // input it cannot recognise is left alone rather than spliced blind, so the
+    // failure mode is a missing banner, never mangled markup.
+    if !starts_like_a_document(body) {
+        return None;
+    }
+
+    // Splice before `</body>` ONLY when it is the document's actual ending —
+    // that is, when nothing but `</html>` and whitespace follows it.
+    //
+    // A raw reverse search cannot tell a real closing tag from the same bytes
+    // sitting in a `<script>` string or an HTML comment, and this middleware
+    // has no HTML parser. So instead of trying to identify the tag, it checks
+    // the one thing that distinguishes the real one: a document ends
+    // `…</body></html>`, while a script literal or a trailing comment has other
+    // content after it. When the tail does not look like an ending, the banner
+    // is appended instead — which is already the correct, tested behaviour for
+    // a document that omits `</body>` entirely, and cannot corrupt markup the
+    // way splicing into a script string would.
+    if let Some(index) = rfind_ascii_case_insensitive(body, b"</body>")
+        && tail_is_document_end(&body[index + b"</body>".len()..])
+    {
         let mut out = Vec::with_capacity(body.len() + snippet.len());
         out.extend_from_slice(&body[..index]);
         out.extend_from_slice(snippet.as_bytes());
         out.extend_from_slice(&body[index..]);
-        return out;
+        return out.into();
     }
 
+    // HTML5 permits omitting `</body>`, so a document can legitimately lack
+    // one — `<!doctype html><main>…</main>` is a real page a browser renders,
+    // and it must still be prompted.
     let mut out = body.to_vec();
     out.extend_from_slice(snippet.as_bytes());
-    out
+    out.into()
+}
+
+/// Whether everything after a `</body>` is just the document closing out:
+/// optional whitespace, an optional `</html>`, optional whitespace.
+///
+/// This is what separates the real closing tag from the same bytes inside a
+/// `<script>` string or a trailing comment, without parsing the document.
+fn tail_is_document_end(tail: &[u8]) -> bool {
+    let rest = trim_ascii_whitespace(tail);
+    let rest = if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"</html>") {
+        trim_ascii_whitespace(&rest[7..])
+    } else {
+        rest
+    };
+    rest.is_empty()
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Whether the response is served as a download rather than rendered in place.
+///
+/// Only the disposition **type** is inspected: `attachment` is a download,
+/// `inline` and anything unrecognised are not. A `filename` parameter is
+/// irrelevant here and may itself contain the word.
+fn is_attachment(response: &Response<Body>) -> bool {
+    response
+        .headers()
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
+        })
+}
+
+/// Whether the body opens as a complete document rather than a fragment.
+///
+/// A document begins with a doctype or an `<html>` tag even when it omits its
+/// closing tags; a swap fragment begins with the element being swapped in.
+fn starts_like_a_document(body: &[u8]) -> bool {
+    // A UTF-8 BOM is an encoding artifact, not content — plenty of editors and
+    // template toolchains emit one — and a browser reads the document straight
+    // through it. It is three fixed bytes in exactly one position, so stripping
+    // it is normalization rather than another guess about HTML shape.
+    let mut head = body
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(body);
+    // Skip whitespace and any leading comments: a generator's `<!-- built at
+    // … -->` preamble ahead of the doctype is still a document, and treating
+    // it as a fragment would silently cost that page its banner.
+    loop {
+        let trimmed = head
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(&[][..], |i| &head[i..]);
+        let Some(rest) = trimmed.strip_prefix(b"<!--".as_slice()) else {
+            head = trimmed;
+            break;
+        };
+        let Some(end) = rfind_first(rest, b"-->") else {
+            // An unterminated comment is not something to guess about.
+            return false;
+        };
+        head = &rest[end + 3..];
+    }
+
+    let starts_with = |prefix: &[u8]| {
+        head.len() >= prefix.len() && head[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    if starts_with(b"<!doctype") {
+        return true;
+    }
+    // `<html` must be followed by a tag terminator or ANY ASCII whitespace.
+    // Spelling out `<html>` and `<html ` missed `<html\nlang="en">` and the tab
+    // and carriage-return forms, all of which are ordinary formatting — and a
+    // doctype-less document that wraps its opening tag would have been read as
+    // a fragment and gone unprompted.
+    starts_with(b"<html")
+        && head
+            .get(b"<html".len())
+            .is_some_and(|b| *b == b'>' || b.is_ascii_whitespace())
+}
+
+/// Byte offset of the FIRST occurrence of `needle` in `haystack`.
+fn rfind_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// Byte offset of the last case-insensitive (ASCII-only) match of `needle`
@@ -581,14 +1099,16 @@ mod tests {
 
     #[test]
     fn splice_inserts_before_last_body_close_tag() {
-        let out = splice_before_body_close(b"<html><body><main>ok</main></body></html>", "<snip>");
+        let out = splice_before_body_close(b"<html><body><main>ok</main></body></html>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("<snip></body>"));
     }
 
     #[test]
     fn splice_appends_when_no_body_tag_but_html_shell_present() {
-        let out = splice_before_body_close(b"<html><main>ok</main></html>", "<snip>");
+        let out = splice_before_body_close(b"<html><main>ok</main></html>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"));
     }
@@ -601,14 +1121,184 @@ mod tests {
         // valid HTML5 tag omission, e.g. `<!doctype html><main>...</main>`
         // -- is still a real page a browser renders; it must still get the
         // banner appended rather than being silently skipped.
-        let out = splice_before_body_close(b"<!doctype html><main>ok</main>", "<snip>");
+        let out = splice_before_body_close(b"<!doctype html><main>ok</main>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"), "{s}");
     }
 
     #[test]
+    fn splice_refuses_a_fragment_rather_than_appending_to_it() {
+        // The round-one bug: appending to a fragment put a second banner on the
+        // page when htmx swapped it in. A fragment is now recognised by its own
+        // opening — no request header separates it from a whole-document swap.
+        for fragment in [
+            &b"<div id=\"nav-auth\">hi</div>"[..],
+            &b"<li>a row</li>"[..],
+            &b"  <span>leading whitespace</span>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(fragment, "<snip>").is_none(),
+                "a fragment must be left alone: {}",
+                String::from_utf8_lossy(fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn any_html_whitespace_may_follow_the_opening_tag() {
+        // `<html>` and `<html ` were spelled out literally; a document that
+        // wraps its attributes onto the next line is just as valid and was
+        // being read as a fragment.
+        for doc in [
+            &b"<html>\n<body>hi</body></html>"[..],
+            &b"<html lang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\nlang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\tlang=\"en\"><body>hi</body></html>"[..],
+            &b"<html\r\nlang=\"en\"><body>hi</body></html>"[..],
+            &b"<HTML\nLANG=\"en\"><BODY>hi</BODY></HTML>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(doc, "<snip>").is_some(),
+                "a doctype-less document must still be recognised: {}",
+                String::from_utf8_lossy(doc)
+            );
+        }
+
+        // But the tag name must actually end there — `<htmlfoo>` is not one.
+        assert!(splice_before_body_close(b"<htmlfoo><body>x</body>", "<snip>").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_download_is_never_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/export.html",
+                axum::routing::get(|| async {
+                    (
+                        [
+                            (CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (CONTENT_DISPOSITION, "attachment; filename=\"export.html\""),
+                        ],
+                        "<!doctype html><html><body>rows</body></html>",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/export.html")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "<!doctype html><html><body>rows</body></html>",
+            "an exported file must reach the disk exactly as the handler wrote it"
+        );
+    }
+
+    #[test]
+    fn a_body_close_that_is_not_the_document_ending_is_appended_past_not_spliced_into() {
+        // A complete document whose only `</body>` bytes live in a script
+        // string, or whose real closing tag is followed by a comment carrying
+        // the same text. Splicing at the raw match would drop the banner into
+        // JavaScript or a comment: corrupt markup AND no usable prompt.
+        for doc in [
+            &b"<!doctype html><script>const marker = \"</body>\";</script>"[..],
+            &b"<!doctype html><html><body>hi</body></html><!-- </body> -->"[..],
+        ] {
+            let out = splice_before_body_close(doc, "<snip>").expect("still a document");
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(
+                rendered.ends_with("<snip>"),
+                "must append past the false boundary, not splice into it: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<snip>\";</script>") && !rendered.contains("<snip> -->"),
+                "the banner must not land inside the script or the comment: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_document_ending_is_still_spliced_before() {
+        for doc in [
+            &b"<html><body>hi</body></html>"[..],
+            &b"<html><body>hi</body></html>\n"[..],
+            &b"<html><body>hi</body>\n</html>\n\n"[..],
+            &b"<html><body>hi</body>"[..],
+            &b"<HTML><BODY>hi</BODY></HTML>"[..],
+        ] {
+            let rendered =
+                String::from_utf8(splice_before_body_close(doc, "<snip>").expect("document"))
+                    .unwrap();
+            assert!(
+                rendered.to_ascii_lowercase().contains("<snip></body>"),
+                "a genuine ending must still be spliced before: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fragment_that_merely_mentions_body_close_is_still_a_fragment() {
+        // Finding the bytes `</body>` is not a document test. Splicing at that
+        // offset would land the banner inside the script string or the comment
+        // — corrupting the fragment AND rendering no usable controls.
+        for fragment in [
+            &b"<div><script>var end = \"</body>\";</script></div>"[..],
+            &b"<li><!-- closes with </body> in the source --></li>"[..],
+            &b"<pre><code>&lt;/body&gt;</code></pre>"[..],
+        ] {
+            assert!(
+                splice_before_body_close(fragment, "<snip>").is_none(),
+                "not a document: {}",
+                String::from_utf8_lossy(fragment)
+            );
+        }
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_make_a_document_look_like_a_fragment() {
+        for doc in [
+            &b"\xEF\xBB\xBF<!doctype html><html><body>hi</body></html>"[..],
+            &b"\xEF\xBB\xBF<html><body>hi</body></html>"[..],
+            &b"\xEF\xBB\xBF\n  <!-- built -->\n<!doctype html><html><body>hi</body></html>"[..],
+        ] {
+            let out = splice_before_body_close(doc, "<snip>")
+                .expect("a BOM is an encoding artifact, not a fragment marker");
+            assert!(String::from_utf8(out).unwrap().contains("<snip></body>"));
+        }
+
+        // The BOM must not become a way to smuggle a fragment past the gate.
+        assert!(splice_before_body_close(b"\xEF\xBB\xBF<div>row</div>", "<snip>").is_none());
+    }
+
+    #[test]
+    fn a_document_behind_a_generator_comment_is_still_a_document() {
+        let out = splice_before_body_close(
+            b"<!-- built at 2026-01-01 -->\n<!doctype html><html><body>hi</body></html>",
+            "<snip>",
+        )
+        .expect("a comment preamble does not make it a fragment");
+        assert!(String::from_utf8(out).unwrap().contains("<snip></body>"));
+    }
+
+    #[test]
     fn splice_matches_uppercase_and_mixed_case_tags() {
-        let out = splice_before_body_close(b"<HTML><BODY><main>ok</main></BODY></HTML>", "<snip>");
+        let out = splice_before_body_close(b"<HTML><BODY><main>ok</main></BODY></HTML>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(
             s.contains("<snip></BODY>"),
@@ -618,7 +1308,8 @@ mod tests {
 
     #[test]
     fn splice_appends_when_only_uppercase_html_shell_present() {
-        let out = splice_before_body_close(b"<HTML><main>ok</main></HTML>", "<snip>");
+        let out = splice_before_body_close(b"<HTML><main>ok</main></HTML>", "<snip>")
+            .expect("a document must be spliceable");
         let s = String::from_utf8(out).unwrap();
         assert!(s.ends_with("<snip>"), "{s}");
     }
@@ -632,7 +1323,7 @@ mod tests {
         // spliced around, never decoded.
         let mut body = b"<html><body>caf\xE9".to_vec();
         body.extend_from_slice(b"</body></html>");
-        let out = splice_before_body_close(&body, "<snip>");
+        let out = splice_before_body_close(&body, "<snip>").expect("a document must be spliceable");
         let out_str = String::from_utf8_lossy(&out);
         assert!(
             out.windows(4).any(|w| w == b"caf\xE9"),
@@ -749,11 +1440,16 @@ mod tests {
             .unwrap()
     }
 
+    /// A bare router with no `CsrfLayer`, so `None` (CSRF disabled) is the
+    /// honest posture: there is no token to embed and none is wanted. Tests
+    /// that need the *enforced* posture pass `Some(..)` and arrange for a
+    /// token, or assert the skip — see
+    /// `enforced_csrf_without_a_token_skips_the_banner_rather_than_render_it_broken`.
     fn app_with_policy_version(version: u32) -> Router {
         Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, version, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, version, None, "_csrf").await
             }))
     }
 
@@ -784,7 +1480,7 @@ mod tests {
             Router::new()
                 .route("/", get(handler))
                 .layer(axum::middleware::from_fn(move |req, next| async move {
-                    inject_consent_banner(req, next, POLICY_VERSION, "autumn-csrf", "_csrf").await
+                    inject_consent_banner(req, next, POLICY_VERSION, None, "_csrf").await
                 }))
                 .layer(SessionLayer::new(
                     MemoryStore::new(),
@@ -929,7 +1625,7 @@ mod tests {
                 get(|| async { ([(CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#) }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
@@ -956,7 +1652,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1197,7 +1893,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1215,6 +1911,824 @@ mod tests {
             !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
             "an oversized body is served as-is without the banner spliced in \
              (splicing would require buffering arbitrarily more)"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_csrf_without_a_token_skips_the_banner_rather_than_render_it_broken() {
+        // The static-page case: user `.layer()` middleware runs OUTSIDE the
+        // static-first layer (so it can process pre-rendered responses), which
+        // means `CsrfLayer` never ran and set no cookie. Rendering the banner
+        // here would give the visitor two buttons that both POST without the
+        // hidden `_csrf` field and get a 403 — inviting a decision and then
+        // silently refusing it.
+        let app = Router::new()
+            .route("/about", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                // `Some(..)` = the app enforces CSRF, but nothing in this stack
+                // ever issues the cookie.
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            !rendered.contains("autumn-consent-banner"),
+            "a banner that cannot submit must not be rendered at all; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<body>"),
+            "the page itself must still be served intact; got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_csrf_free_app_still_gets_its_banner() {
+        // `None` = the app disabled CSRF entirely, so an absent token is
+        // expected rather than a symptom, and the banner works without one.
+        // This is what keeps the skip above from silently disabling the
+        // feature for such an app.
+        let app = app_with_policy_version(1);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "an app with CSRF disabled must still prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_client_keeps_its_conditional_validators() {
+        // An API client never acquires a consent cookie, so it always "needs
+        // prompting" — if that stripped its validators, its conditional
+        // requests could never answer 304 again and it would refetch full
+        // bodies forever.
+        let app = Router::new()
+            .route(
+                "/api/posts",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!("{{\"saw_if_none_match\":{seen}}}")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/posts")
+                    .header(axum::http::header::ACCEPT, "application/json")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "{\"saw_if_none_match\":true}",
+            "a non-HTML client must keep If-None-Match so its ETag path still 304s"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_html_navigation_still_loses_its_validators_while_prompting() {
+        // The guard above must not have disabled the protection it narrows:
+        // a browser navigation still has to bypass a cached 304, or the
+        // banner-less page replays and the prompt is skipped.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{seen}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        axum::http::header::ACCEPT,
+                        "text/html,application/xhtml+xml",
+                    )
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("false"),
+            "an HTML navigation being prompted must have If-None-Match stripped; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "and it must still be prompted; got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_htmx_fragment_never_receives_a_banner() {
+        // A fragment carries no `</body>`, so the splice would APPEND the
+        // banner — and htmx would swap that copy into the page alongside the
+        // banner the enclosing document already has. An undecided visitor
+        // would see duplicate consent controls on every page that hydrates a
+        // fragment on load.
+        let app = Router::new()
+            .route(
+                "/_partials/nav-auth",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        // A real fragment: no <html>, no <body>.
+                        .body(Body::from("<div id=\"nav\">Log in</div>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        // No consent cookie: this visitor definitely still needs prompting,
+        // so the only thing keeping the banner out is the htmx check.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_partials/nav-auth")
+                    .header("hx-request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            !rendered.contains("autumn-consent-banner"),
+            "an htmx fragment must never carry the banner; got: {rendered}"
+        );
+        assert_eq!(
+            rendered, "<div id=\"nav\">Log in</div>",
+            "the fragment must be passed through byte-for-byte"
+        );
+    }
+
+    /// Every HTML response this middleware passes through must carry
+    /// `Vary: Cookie`, whether or not a banner was injected — its
+    /// representation depends on the consent cookie either way.
+    ///
+    /// Written as a table rather than one test per branch on purpose: the three
+    /// `Vary` bugs found in review (fragments, `Content-Encoding` bodies, and
+    /// the no-CSRF-token skip) were each a *new* pass-through added without
+    /// revisiting the others. A case added here fails until its branch appends
+    /// the header.
+    #[tokio::test]
+    async fn every_html_pass_through_varies_on_cookie() {
+        struct Case {
+            name: &'static str,
+            csrf_cookie_name: Option<&'static str>,
+            request: fn(axum::http::request::Builder) -> axum::http::request::Builder,
+            encoded: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "htmx fragment",
+                csrf_cookie_name: None,
+                request: |b| b.header("hx-request", "true"),
+                encoded: false,
+            },
+            Case {
+                name: "compressed HTML",
+                csrf_cookie_name: None,
+                request: |b| b,
+                encoded: true,
+            },
+            Case {
+                name: "CSRF enforced but no token obtainable (static hit)",
+                csrf_cookie_name: Some("autumn-csrf"),
+                request: |b| b,
+                encoded: false,
+            },
+        ];
+
+        for case in cases {
+            let encoded = case.encoded;
+            let name = case.csrf_cookie_name;
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        let mut builder = Response::builder()
+                            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                            .header(CACHE_CONTROL, "public, max-age=60");
+                        if encoded {
+                            builder = builder.header(CONTENT_ENCODING, "gzip");
+                        }
+                        builder
+                            .body(Body::from("<html><body>hi</body></html>"))
+                            .unwrap()
+                    }),
+                )
+                .layer(axum::middleware::from_fn(move |req, next| async move {
+                    inject_consent_banner(req, next, 1, name, "_csrf").await
+                }));
+
+            let response = app
+                .oneshot(
+                    (case.request)(Request::builder().uri("/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let vary: Vec<_> = response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            assert!(
+                vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+                "{} must vary on Cookie; got: {vary:?}",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compressed_html_page_still_varies_on_cookie() {
+        // `is_html_response` returns false for any `Content-Encoding` body,
+        // because it cannot be spliced into without decoding. But it is still
+        // HTML whose representation depends on the consent cookie — a handler
+        // can gate markup on `Consent::allows` and compress the result — so
+        // treating "cannot splice" as "not HTML" dropped `Vary: Cookie` and let
+        // a shared cache serve one visitor's choice to another.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(CONTENT_ENCODING, "gzip")
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .body(Body::from("<html><body>compressed</body></html>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+            "compressed HTML must still vary on Cookie; got: {vary:?}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "<html><body>compressed</body></html>",
+            "and must be passed through unspliced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_json_response_does_not_gain_a_cookie_vary() {
+        // The widened HTML check must not start stamping `Vary` on every
+        // response — a JSON API's cacheability is not this middleware's business.
+        let app = Router::new()
+            .route(
+                "/api",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().get_all(VARY).iter().next().is_none(),
+            "a JSON response must be left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_htmx_fragment_still_varies_on_cookie() {
+        // No banner, but the handler may have gated markup on
+        // `Consent::allows`. Without `Vary: Cookie` a shared cache could store
+        // a consenting visitor's fragment and replay it to one who rejected.
+        let app = Router::new()
+            .route(
+                "/_partials/nav-auth",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(CACHE_CONTROL, "public, max-age=60")
+                        .body(Body::from("<div>Log in</div>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/_partials/nav-auth")
+                    .header("hx-request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.eq_ignore_ascii_case("Cookie")),
+            "a fragment must still vary on Cookie; got: {vary:?}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "and must still carry no banner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boosted_navigation_loses_its_validators_despite_the_xhr_accept_default() {
+        // htmx issues a boosted navigation over XHR without setting `Accept`,
+        // so it arrives as `*/*` — which `accepts_html` deliberately rejects to
+        // protect API clients' 304s. But a boosted request IS a document this
+        // middleware injects into, so leaving its validators intact would let
+        // an inner EtagLayer answer 304 with no body to inject, and a policy
+        // bump could go unprompted for as long as the cache stays fresh.
+        //
+        // Note the previous test does not cover this: it sends no `Accept` at
+        // all, and a missing `Accept` is already treated as HTML.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(format!("<html><body>{seen}</body></html>")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-boosted", "true")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("false"),
+            "a boosted navigation must have If-None-Match stripped; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "and must still be prompted; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_quality_is_a_refusal_of_html() {
+        let accept = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_str(v).unwrap(),
+            );
+            accepts_html(&h)
+        };
+
+        // `text/*` is a range that includes HTML — a document client.
+        assert!(accept("text/*"));
+        assert!(accept("application/json, text/*;q=0.8"));
+        // ...and the same refusal rule applies to it.
+        assert!(!accept("text/*;q=0"));
+        // `*/*` stays excluded: that carve-out is about the XHR default
+        // specifically, not about wildcards generally.
+        assert!(!accept("*/*"));
+
+        // The finding: named, but refused.
+        assert!(!accept("application/json, text/html;q=0"));
+        assert!(!accept("text/html;q=0.0"));
+        assert!(!accept("text/html; q=0.000"));
+
+        // Still accepted — a zero check must not become a q-ranking.
+        assert!(accept("text/html"));
+        assert!(accept("text/html;q=0.1"));
+        assert!(accept("text/html;q=0.9, application/json"));
+        assert!(accept("application/json, text/html"));
+        // `*/*` remains deliberately excluded: the XHR default must not count
+        // as a browser navigation. See `a_plain_xhr_json_client_...`.
+        assert!(!accept("*/*"));
+    }
+
+    /// A `206` body is a slice of a larger document, and `Content-Range` says
+    /// which bytes. Splicing would insert markup into that slice and rewrite
+    /// `Content-Length` while `Content-Range` still described the original, so
+    /// a range cache or a resumed download would reassemble something corrupt.
+    ///
+    /// The trap is that a first range of an HTML file passes the document test
+    /// perfectly well — it opens `<!doctype html>` — so nothing further down
+    /// would have caught it.
+    #[tokio::test]
+    async fn a_ranged_response_is_never_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/page.html",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::PARTIAL_CONTENT,
+                        [
+                            (CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (CONTENT_RANGE, "bytes 0-31/512"),
+                        ],
+                        "<!doctype html><html><body>part",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/page.html")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .header(axum::http::header::RANGE, "bytes=0-31")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .any(|v| v.as_bytes().eq_ignore_ascii_case(b"Cookie")),
+            "a ranged HTML response still varies on the consent cookie"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            rendered, "<!doctype html><html><body>part",
+            "the advertised byte range must be served byte-for-byte"
+        );
+    }
+
+    /// A pre-rendered `HEAD` hit arrives here already bodyless, and no Axum
+    /// per-route wrapper is left to fix up what we return — so splicing would
+    /// hand a `HEAD` a body and a `Content-Length` of the banner rather than of
+    /// the equivalent `GET`.
+    #[tokio::test]
+    async fn an_already_empty_html_response_is_not_spliced_into() {
+        let app = Router::new()
+            .route(
+                "/",
+                // Stands in for the static-first middleware's `is_head` branch:
+                // `text/html`, empty body, produced without Axum wrapping a
+                // handler whose body it will later empty.
+                axum::routing::get(|| async {
+                    ([(CONTENT_TYPE, "text/html; charset=utf-8")], Body::empty())
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .headers()
+                .get_all(VARY)
+                .iter()
+                .any(|v| v.as_bytes().eq_ignore_ascii_case(b"Cookie")),
+            "it is still a consent-dependent representation"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "an empty HTML response must stay empty; got {} bytes",
+            body.len()
+        );
+    }
+
+    /// htmx 2.0.4 sends this on a history-cache miss with `HX-Request: true` and
+    /// no `HX-Boosted`, then parses the reply as a full document and replaces
+    /// `[hx-history-elt]` — normally the body — from it.
+    #[tokio::test]
+    async fn an_htmx_history_restore_is_a_document_and_is_prompted() {
+        let app = Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    axum::response::Html("<html><body>hi</body></html>")
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-history-restore-request", "true")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+
+        assert!(
+            rendered.contains("autumn-consent-banner"),
+            "a history restore replaces the body from a full document, so the \
+             visitor must still be prompted; got: {rendered}"
+        );
+    }
+
+    /// The three shapes an htmx whole-document swap takes, each named as a
+    /// literal. The third — an ordinary `hx-get` with `hx-target="body"` — is
+    /// why this is no longer decided from request headers: htmx sends
+    /// `HX-Request` and nothing else for it (`HX-Target` is omitted when the
+    /// target has no id), so it is indistinguishable from a fragment on the
+    /// request side. `examples/todo-app` paginates exactly this way.
+    ///
+    /// All three are recognised by their response carrying `</body>`, and all
+    /// three must lose their conditional validators while a prompt is due.
+    #[tokio::test]
+    async fn every_whole_document_htmx_swap_is_prompted_and_loses_its_validators() {
+        for extra in [
+            Some("hx-boosted"),
+            Some("hx-history-restore-request"),
+            None, // plain `hx-get` with `hx-target="body"` — no marker header
+        ] {
+            let app = Router::new()
+                .route(
+                    "/",
+                    axum::routing::get(|req: axum::extract::Request| async move {
+                        let had_validator = req.headers().contains_key(IF_NONE_MATCH);
+                        axum::response::Html(format!(
+                            "<html><body>had_validator={had_validator}</body></html>"
+                        ))
+                    }),
+                )
+                .layer(axum::middleware::from_fn(move |req, next| async move {
+                    inject_consent_banner(req, next, 1, None, "_csrf").await
+                }));
+
+            let mut builder = Request::builder()
+                .uri("/")
+                .header("hx-request", "true")
+                // htmx swaps run over XHR, whose default `Accept` is `*/*`.
+                .header(axum::http::header::ACCEPT, "*/*")
+                .header(IF_NONE_MATCH, "\"abc\"");
+            if let Some(name) = extra {
+                builder = builder.header(name, "true");
+            }
+
+            let response = app
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rendered = String::from_utf8_lossy(&body);
+            let label = extra.unwrap_or("hx-target=body (no marker header)");
+
+            assert!(
+                rendered.contains("had_validator=false"),
+                "`{label}` may replace the document, so its validators must be \
+                 stripped while a prompt is due; got: {rendered}"
+            );
+            assert!(
+                rendered.contains("autumn-consent-banner"),
+                "`{label}` returned a complete document and must be prompted; \
+                 got: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_xhr_json_client_still_keeps_its_validators() {
+        // The boosted carve-out must not extend to an ordinary `*/*` XHR that
+        // is not a boosted navigation — that is the API client whose 304s the
+        // Accept check exists to protect.
+        let app = Router::new()
+            .route(
+                "/api/posts",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let seen = headers.contains_key(IF_NONE_MATCH);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!("{{\"saw\":{seen}}}")))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/posts")
+                    .header(axum::http::header::ACCEPT, "*/*")
+                    .header(IF_NONE_MATCH, "\"abc\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "{\"saw\":true}",
+            "a bare */* XHR that is not boosted must keep its validators"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boosted_navigation_is_a_document_and_still_gets_the_banner() {
+        // `hx-boost` sends BOTH `HX-Request` and `HX-Boosted`, but the response
+        // is a complete page that replaces the current body. Treating it as a
+        // fragment would omit the banner from the new page AND destroy the one
+        // on the old page in the same swap — leaving an undecided visitor
+        // silently unprompted until a non-htmx navigation.
+        let app = Router::new()
+            .route("/", get(|| async { html_page() }))
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("hx-request", "true")
+                    .header("hx-boosted", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "a boosted navigation is a full document and must still be prompted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_document_still_receives_the_banner_without_the_htmx_header() {
+        // The guard above must not have turned the banner off in general.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from("<html><body><h1>Hi</h1></body></html>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("autumn-consent-banner"),
+            "an ordinary page load must still be prompted"
         );
     }
 
@@ -1242,7 +2756,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1274,7 +2788,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1310,7 +2824,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1353,7 +2867,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, None, "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1435,7 +2949,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "my-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("my-csrf"), "_csrf").await
             }));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1476,7 +2990,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "authenticity_token").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "authenticity_token").await
             }));
 
         let request = Request::builder()
@@ -1516,7 +3030,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let response = app
@@ -1557,7 +3071,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let cookie = super::super::accept_all_cookie(&["analytics"], 1);
@@ -1605,7 +3119,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(|| async { html_page() }))
             .layer(axum::middleware::from_fn(move |req, next| async move {
-                inject_consent_banner(req, next, 1, "autumn-csrf", "_csrf").await
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
             }));
 
         let request = Request::builder()
@@ -1622,6 +3136,225 @@ mod tests {
         assert!(
             !html.contains("autumn-consent-banner"),
             "an internal build/ISR render must never have the banner baked in: {html}"
+        );
+    }
+
+    // ── Codex round 24: representation metadata and multi-line Accept ──
+
+    #[tokio::test]
+    async fn a_split_accept_header_still_counts_as_offering_html() {
+        // RFC 9110: a list-valued field may arrive as several field lines that
+        // mean the comma-joined list. `HeaderMap::get` sees only the first, so
+        // this pair used to read as a refusal -- the request kept its
+        // `If-None-Match`, an inner `EtagLayer` could answer `304`, and an
+        // HTML-rendering client silently never got prompted.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        headers.append(axum::http::header::ACCEPT, "text/html".parse().unwrap());
+        assert!(
+            accepts_html(&headers),
+            "HTML offered on the second Accept field line must still count"
+        );
+
+        // The `*/*`-is-not-a-document carve-out must survive the change.
+        let mut api = axum::http::HeaderMap::new();
+        api.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        api.append(axum::http::header::ACCEPT, "*/*".parse().unwrap());
+        assert!(
+            !accepts_html(&api),
+            "an API client splitting its Accept must keep its validators"
+        );
+
+        // And a refusal spread across lines is still a refusal.
+        let mut refused = axum::http::HeaderMap::new();
+        refused.append(
+            axum::http::header::ACCEPT,
+            "application/json".parse().unwrap(),
+        );
+        refused.append(axum::http::header::ACCEPT, "text/html;q=0".parse().unwrap());
+        assert!(
+            !accepts_html(&refused),
+            "`text/html;q=0` on a later line is an explicit refusal"
+        );
+
+        assert!(
+            accepts_html(&axum::http::HeaderMap::new()),
+            "a missing Accept still means yes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_specific_html_refusal_overrides_a_text_wildcard_offer() {
+        // RFC 9110 §12.5.1: the most specific matching media range decides.
+        // `text/*;q=1, text/html;q=0` therefore REFUSES html -- the exact range
+        // overrides the wildcard. Scanning for the first acceptable-looking
+        // range instead accepted the wildcard and never saw the refusal, which
+        // stripped that client's validators and cost it every `304`.
+        let refuse = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.append(axum::http::header::ACCEPT, v.parse().unwrap());
+            accepts_html(&h)
+        };
+
+        assert!(
+            !refuse("text/*;q=1, text/html;q=0"),
+            "an exact `text/html;q=0` must override a `text/*` offer"
+        );
+        assert!(
+            !refuse("text/html;q=0, text/*;q=1"),
+            "order must not matter -- specificity decides, not position"
+        );
+
+        // The precedence must cut the other way too: a specific ACCEPTANCE
+        // overrides a wildcard refusal, or this becomes "any q=0 anywhere wins".
+        assert!(
+            refuse("text/*;q=0, text/html"),
+            "an exact `text/html` offer must override a `text/*;q=0` refusal"
+        );
+
+        // And a wildcard alone still decides when html is never named.
+        assert!(refuse("text/*"), "`text/*` alone still offers html");
+        assert!(!refuse("text/*;q=0"), "`text/*;q=0` alone still refuses");
+
+        // Precedence must survive the split-field-line path as well.
+        let mut split = axum::http::HeaderMap::new();
+        split.append(axum::http::header::ACCEPT, "text/*;q=1".parse().unwrap());
+        split.append(axum::http::header::ACCEPT, "text/html;q=0".parse().unwrap());
+        assert!(
+            !accepts_html(&split),
+            "the specific refusal wins even when it arrives on a later line"
+        );
+    }
+
+    #[tokio::test]
+    async fn splicing_the_banner_drops_a_now_wrong_etag_and_digest() {
+        // The handler stands in for an inner `EtagLayer`: it labels the body it
+        // produced. Once the banner is spliced in, those bytes are not what
+        // ships, so the validator and the digest describe a representation the
+        // client will never see -- a `Content-Digest`-verifying client would
+        // reject the page outright.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(axum::http::header::ETAG, "\"pre-splice\"")
+                        .header("content-digest", "sha-256=:deadbeef:")
+                        .header("digest", "SHA-256=deadbeef")
+                        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+                        .body(Body::from("<html><body>hi</body></html>"))
+                        .unwrap()
+                }),
+            )
+            // `None` for the CSRF cookie name, matching the other
+            // injection tests: with `Some(..)` and no such cookie on the
+            // request there is no token to embed and the middleware
+            // correctly declines to inject at all.
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, None, "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(axum::http::header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("autumn-consent-banner"),
+            "precondition: this request must actually get a banner: {html}"
+        );
+        assert!(
+            !headers.contains_key(axum::http::header::ETAG),
+            "a validator for the pre-splice bytes must not survive the splice"
+        );
+        assert!(
+            !headers.contains_key("content-digest"),
+            "Content-Digest describes bytes that are no longer being sent"
+        );
+        assert!(
+            !headers.contains_key("digest"),
+            "the obsolete Digest spelling must go too"
+        );
+        assert!(
+            !headers.contains_key(axum::http::header::ACCEPT_RANGES),
+            "a range offer over bytes this middleware rewrote must be withdrawn: \
+             a resumed 206 comes from the handler and addresses the original, \
+             bannerless representation"
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok()),
+            Some(html.len()),
+            "Content-Length must match the spliced body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_is_not_rewritten_keeps_its_etag() {
+        // The mirror of the test above: when nothing is spliced, the inner
+        // layer's validator is still accurate and must be left alone. Without
+        // this, "drop the ETag" could quietly become "never revalidate".
+        let app = Router::new()
+            .route(
+                "/data.json",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(axum::http::header::ETAG, "\"kept\"")
+                        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| async move {
+                inject_consent_banner(req, next, 1, Some("autumn-csrf"), "_csrf").await
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/data.json")
+                    .header(axum::http::header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"kept\""),
+            "an untouched body keeps its validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes"),
+            "and keeps its range offer -- those bytes are still what ships"
         );
     }
 }

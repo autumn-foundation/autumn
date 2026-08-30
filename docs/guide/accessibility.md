@@ -616,6 +616,12 @@ infer.
 
 ## Further reading
 
+- [`examples/reddit-clone`](../../examples/reddit-clone) — the submit and edit
+  forms are built entirely from `a11y::TextField` / `TextArea` / `Select` /
+  `Button` / `Link`, with `aria-invalid` + `aria-describedby` error wiring
+  driven by the changeset
+- [Forms, validation and normalization](./forms.md) — where these primitives
+  meet `ChangesetForm`'s per-field errors
 - [WCAG 2.1 Quick Reference](https://www.w3.org/WAI/WCAG21/quickref/)
 - [APG Patterns (ARIA Authoring Practices Guide)](https://www.w3.org/WAI/ARIA/apg/patterns/)
 - [htmx accessibility notes](https://htmx.org/docs/#accessibility)

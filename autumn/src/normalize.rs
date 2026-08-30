@@ -1,5 +1,8 @@
 //! Field normalization primitives (issue #1379).
 //!
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/forms.md)
+//! for where normalization sits relative to validation and hooks.
+//!
 //! Canonicalizes `#[model]` `String` columns declared with the
 //! `#[normalize(...)]` attribute. Normalizers are the small, composable
 //! building blocks the macro chains left-to-right; the traits are the
@@ -20,13 +23,34 @@
 //!
 //! # Ordering (write path)
 //!
-//! `#[model]` runs normalization at the head of the repository save flow —
-//! `save`/`save_many` (insert) normalize the `New*` input, and `update`
-//! normalizes through `UpdateDraft::from_patch` — **before** the
-//! `before_create` / `before_update` hooks (where `#[validate(...)]` and other
-//! user rejection logic run) and before the row is written, so validators and
-//! the database observe the canonical value. Normalizers apply left-to-right in
-//! the order written in the attribute.
+//! `#[model]` runs normalization at the head of the repository save flow, before
+//! the hooks (where `#[validate(...)]` and other user rejection logic run) and
+//! before the row is written. Normalizers apply left-to-right in the order
+//! written in the attribute.
+//!
+//! **Insert** (`save` / `save_many`) normalizes the `New*` input, so validators
+//! *and the database* observe the canonical value.
+//!
+//! **Update is not symmetric with insert, and there are three cases, not two.**
+//!
+//! | Repository | Merged draft | Persisted |
+//! |---|---|---|
+//! | no hooks, no knob (**blind**) | none built — `from_patch` is not emitted | raw patch |
+//! | `validate_on_update = fetch` | built and normalized, **validation only** | raw patch |
+//! | has hooks | built and normalized | the normalized draft |
+//!
+//! The middle row is the one that surprises: `from_patch` normalizes the merged
+//! model so validators see the canonical value, but the generated code keeps
+//! only its 422 and persists `changes.__to_changeset()` unchanged. So on either
+//! of the first two, an `update` that sets a `#[normalize(trim, downcase)]`
+//! column to `"  FOO@X.com "` stores it verbatim, and
+//! [`normalize_lookup_value`]-based finders will not match that row. Only the
+//! hooked path writes the canonical value.
+//!
+//! If a normalized column is ever written through `update`, give the repository
+//! hooks or normalize before building the patch — and consider a `CITEXT`
+//! column or a functional unique index as the durable backstop. See
+//! `docs/guide/forms.md`.
 
 /// Strip leading and trailing whitespace.
 #[must_use]

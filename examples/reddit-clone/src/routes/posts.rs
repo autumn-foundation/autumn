@@ -4,6 +4,21 @@
 //! #[secured] for write operations, htmx for voting and deletion,
 //! Maud templates with Tailwind CSS, and feature-flag fragment gating
 //! via the `Flags` extractor.
+//!
+//! Three UI subsystems are showcased on the submit/show pair:
+//!
+//! * **Forms and validation** (`docs/guide/forms.md`) — the submit route is a
+//!   `ChangesetForm` round-trip, so a rejected submission is re-rendered with
+//!   the author's text still in the fields and one message per field.
+//! * **Typed accessible primitives** (`docs/guide/accessibility.md`) — every
+//!   control on that form is an `autumn_web::a11y` value whose unlabeled form
+//!   does not compile.
+//! * **Rich text** (`docs/guide/rich-text.md`) — post bodies are
+//!   user-submitted Markdown, rendered through `render_user_content`'s
+//!   sanitizing path at display time.
+//!
+//! All three work with JavaScript disabled: the form carries no `hx-*`
+//! attributes and posts normally.
 
 use std::collections::HashMap;
 
@@ -11,7 +26,10 @@ use autumn_web::experiments::Experiments;
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::feature_flags::Flags;
+use autumn_web::form::ChangesetForm;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::http;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
@@ -63,6 +81,10 @@ pub async fn front_page(
     seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
+    // Cookie consent (#1214). The extractor reads the request's `Cookie`
+    // header directly — no layer, no state — and gates this app's one
+    // non-essential script below. See docs/guide/cookie-consent.md.
+    consent: autumn_web::consent::Consent,
     mut db: Db,
     State(state): State<AppState>,
     repo: PgPostRepository,
@@ -165,6 +187,10 @@ pub async fn front_page(
         Some(csrf.token()),
         html! {
             (flash_html)
+            // Non-essential scripts live behind the consent gate, not behind
+            // the banner: showing a prompt and loading the tracker anyway is
+            // the failure mode the feature exists to prevent.
+            (super::layout::analytics_snippet(&consent))
             // Fragment gating: banner visible only to users in the new_ui_preview rollout cohort.
             @if flags.enabled("new_ui_preview") {
                 div class="mb-4 px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg \
@@ -355,85 +381,40 @@ pub async fn submit_form(
     seo: SeoMeta,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
+    let subs = all_subreddits(&mut db).await?;
 
-    let subs: Vec<Subreddit> = subreddits::table
-        .order(subreddits::name.asc())
-        .select(Subreddit::as_select())
-        .load(&mut *db)
-        .await?;
+    // A blank changeset: the same type the POST handler re-renders on failure,
+    // so `new` and `invalid` are one code path with one set of markup.
+    //
+    // A GET route has no submitted body, so it must supply BOTH halves the
+    // extractor would otherwise have captured: the token, and the field name to
+    // put it under. `blank` hardcodes `_csrf`, while `CsrfLayer` scans for the
+    // CONFIGURED name — so without `with_csrf_field` this form 403s on its
+    // first submit in any app that set `security.csrf.form_field`. See
+    // docs/guide/forms.md.
+    let blank = ChangesetForm::blank(SubmitPostForm::default(), csrf.token())
+        .with_csrf_field(csrf_field.0.clone());
 
     Ok(layout_with_seo(
         seo,
         current_user.as_deref(),
         Some(csrf.token()),
-        html! {
-            div class="max-w-2xl mx-auto" {
-                h1 class="text-2xl font-bold mb-6" { "Create a Post" }
-                form action=(paths::submit()) method="post"
-                     class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
-                    div {
-                        label for="subreddit_id" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Community"
-                        }
-                        select id="subreddit_id" name="subreddit_id" required
-                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                      focus:outline-none focus:ring-2 focus:ring-orange-400" {
-                            option value="" disabled selected { "Choose a community..." }
-                            @for sub in &subs {
-                                option value=(sub.id) { "r/" (sub.name) }
-                            }
-                        }
-                    }
-                    div {
-                        label for="title" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Title"
-                        }
-                        input type="text" id="title" name="title" required
-                              maxlength="300"
-                              placeholder="An interesting title"
-                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
-                    }
-                    div {
-                        label for="url" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "URL " span class="text-gray-400" { "(optional)" }
-                        }
-                        input type="url" id="url" name="url"
-                              placeholder="https://example.com"
-                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
-                    }
-                    div {
-                        label for="body" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Text " span class="text-gray-400" { "(optional for link posts)" }
-                        }
-                        textarea id="body" name="body" rows="8"
-                                 placeholder="What's on your mind?"
-                                 class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                        focus:outline-none focus:ring-2 focus:ring-orange-400" {}
-                    }
-                    button type="submit"
-                           class="w-full bg-orange-500 text-white py-2 rounded font-medium \
-                                  hover:bg-orange-600 transition-colors" {
-                        "Post"
-                    }
-                }
-            }
-        },
+        submit_form_markup(&blank, &subs, None),
     ))
 }
 
-/// Submit form for a specific subreddit
+/// Submit form for a specific subreddit.
 #[secured]
 #[get("/r/{slug}/submit")]
 pub async fn submit_to_sub_form(
     Path(slug): Path<String>,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -445,79 +426,286 @@ pub async fn submit_to_sub_form(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("r/{slug} not found")))?;
 
+    // `with_csrf_field` for the same reason as the global submit form above.
+    let blank = ChangesetForm::blank(
+        SubmitPostForm {
+            subreddit_id: sub.id.to_string(),
+            ..SubmitPostForm::default()
+        },
+        csrf.token(),
+    )
+    .with_csrf_field(csrf_field.0.clone());
+
     Ok(layout(
         &format!("Submit to r/{}", sub.name),
         current_user.as_deref(),
         Some(csrf.token()),
-        html! {
-            div class="max-w-2xl mx-auto" {
-                h1 class="text-2xl font-bold mb-6" {
-                    "Post to "
-                    span class="text-orange-600" { "r/" (sub.name) }
-                }
-                form action=(paths::submit()) method="post"
-                     class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
-                    input type="hidden" name="subreddit_id" value=(sub.id);
-                    div {
-                        label for="title" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Title"
-                        }
-                        input type="text" id="title" name="title" required
-                              maxlength="300"
-                              placeholder="An interesting title"
-                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
-                    }
-                    div {
-                        label for="url" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "URL " span class="text-gray-400" { "(optional)" }
-                        }
-                        input type="url" id="url" name="url"
-                              placeholder="https://example.com"
-                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
-                    }
-                    div {
-                        label for="body" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Text"
-                        }
-                        textarea id="body" name="body" rows="8"
-                                 placeholder="What's on your mind?"
-                                 class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                        focus:outline-none focus:ring-2 focus:ring-orange-400" {}
-                    }
-                    button type="submit"
-                           class="w-full bg-orange-500 text-white py-2 rounded font-medium \
-                                  hover:bg-orange-600 transition-colors" {
-                        "Post"
-                    }
-                }
-            }
-        },
+        submit_form_markup(&blank, &[], Some(&sub)),
     ))
 }
 
-#[derive(serde::Deserialize)]
+/// Load every community, for the submit form's community picker.
+async fn all_subreddits(db: &mut Db) -> AutumnResult<Vec<Subreddit>> {
+    Ok(subreddits::table
+        .order(subreddits::name.asc())
+        .select(Subreddit::as_select())
+        .load(&mut **db)
+        .await?)
+}
+
+/// The submit form's markup — rendered by the two GET routes and re-rendered
+/// verbatim by the POST route when validation fails.
+///
+/// Two framework features carry this function, and both are worth reading for:
+///
+/// **Typed accessible primitives (#1706).** Every control is an
+/// `autumn_web::a11y` value rather than raw markup. `TextField`, `TextArea` and
+/// `Select` are typestate: they do **not** implement `maud::Render` until a
+/// label is attached, so the inaccessible version of this form is not merely
+/// discouraged — it does not compile. The error wiring is typed too:
+/// `aria_invalid` plus `described_by` point the field at its own message
+/// element, so a screen-reader user hears the error when focus lands on the
+/// input instead of having to hunt for red text. See
+/// `docs/guide/accessibility.md`.
+///
+/// **The changeset round-trip (#1135).** `form.field_value(..)` and
+/// `form.errors_for(..)` read the submitted values and the per-field errors out
+/// of the same `Changeset`, so a rejected submission comes back with the user's
+/// text still in the boxes. `form_tag` emits the hidden `_csrf` input, which is
+/// what lets this form work with **no JavaScript at all**: nothing here is an
+/// `hx-*` attribute, so a browser with scripting disabled performs an ordinary
+/// POST and gets the same 422 page a fetch would. See `docs/guide/forms.md`.
+///
+/// Pass `fixed_sub` when the community is already chosen (the
+/// `/r/{slug}/submit` entry point); the picker becomes a hidden input and
+/// `subs` is ignored.
+fn submit_form_markup(
+    form: &ChangesetForm<SubmitPostForm>,
+    subs: &[Subreddit],
+    fixed_sub: Option<&Subreddit>,
+) -> Markup {
+    let heading = fixed_sub.map_or_else(
+        || html! { "Create a Post" },
+        |sub| {
+            html! {
+                "Post to " span class="text-orange-600" { "r/" (sub.name) }
+            }
+        },
+    );
+
+    let input_class = "w-full border border-gray-300 rounded px-3 py-2 text-sm \
+                       focus:outline-none focus:ring-2 focus:ring-orange-400";
+    let label_class = "block text-sm font-medium text-gray-700 mb-1";
+
+    html! {
+        div class="max-w-2xl mx-auto" {
+            h1 class="text-2xl font-bold mb-6" { (heading) }
+            (form.form_tag(&paths::submit(), "post", html! {
+                @if let Some(sub) = fixed_sub {
+                    input type="hidden" name="subreddit_id" value=(sub.id);
+                } @else {
+                    div {
+                        (field_errors("subreddit_id", form))
+                        (autumn_web::a11y::Select::new("subreddit_id")
+                            .label("Community")
+                            .label_class(label_class)
+                            .class(input_class)
+                            .required()
+                            // The empty, disabled placeholder is load-bearing,
+                            // not decoration. Without it the browser
+                            // auto-selects the first real option, `required`
+                            // is satisfied without the author choosing
+                            // anything, and the post lands silently in
+                            // whichever community sorts first. An empty value
+                            // is also what makes `required` fire client-side,
+                            // and `validate_subreddit_choice` rejects it
+                            // server-side for a client that ignores both.
+                            .options(
+                                std::iter::once(
+                                    autumn_web::a11y::SelectOption::new(
+                                        "",
+                                        "Choose a community\u{2026}",
+                                    )
+                                    .disabled(),
+                                )
+                                .chain(subs.iter().map(|sub| {
+                                    autumn_web::a11y::SelectOption::new(
+                                        sub.id.to_string(),
+                                        format!("r/{}", sub.name),
+                                    )
+                                })),
+                            )
+                            .selected_value(form.field_value("subreddit_id").unwrap_or_default())
+                            .aria_invalid(!form.errors_for("subreddit_id").is_empty())
+                            .described_by("subreddit_id-error"))
+                    }
+                }
+
+                div {
+                    (field_errors("title", form))
+                    (autumn_web::a11y::TextField::new("title")
+                        .label("Title")
+                        .label_class(label_class)
+                        .class(input_class)
+                        .value(form.field_value("title").unwrap_or_default())
+                        .required()
+                        .maxlength(300)
+                        .aria_invalid(!form.errors_for("title").is_empty())
+                        .described_by("title-error"))
+                }
+
+                div {
+                    (field_errors("url", form))
+                    (autumn_web::a11y::TextField::new("url")
+                        .input_type("url")
+                        .label("Link URL (optional)")
+                        .label_class(label_class)
+                        .class(input_class)
+                        .value(form.field_value("url").unwrap_or_default())
+                        .aria_invalid(!form.errors_for("url").is_empty())
+                        .described_by("url-error"))
+                }
+
+                div {
+                    (field_errors("body", form))
+                    (autumn_web::a11y::TextArea::new("body")
+                        .label("Text (optional for link posts)")
+                        .label_class(label_class)
+                        .class(input_class)
+                        .rows(8)
+                        .value(form.field_value("body").unwrap_or_default())
+                        .aria_invalid(!form.errors_for("body").is_empty())
+                        .described_by("body-hint"))
+                    p id="body-hint" class="text-xs text-gray-400 mt-1" {
+                        "Markdown is supported: **bold**, `code`, > quotes, lists and links. "
+                        "Raw HTML and images are removed when the post is displayed."
+                    }
+                }
+
+                (autumn_web::a11y::Button::new("Post")
+                    .submit()
+                    .class("w-full bg-orange-500 text-white py-2 rounded font-medium \
+                            hover:bg-orange-600 transition-colors"))
+            }))
+        }
+    }
+}
+
+/// Render one field's validation messages, in the element its control points
+/// at with `aria-describedby`.
+///
+/// `role="alert"` makes the message announced when it appears after an htmx
+/// swap; the stable `{field}-error` id is what makes it announced on focus for
+/// a full-page 422 too.
+fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
+    let errors = form.errors_for(field);
+    html! {
+        div id=(format!("{field}-error")) {
+            @for message in errors {
+                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
+            }
+        }
+    }
+}
+
+/// The submit form's shape.
+///
+/// `subreddit_id` is a `String`, not an `i64`, on purpose: this struct is a
+/// *form*, and a form field's job is to round-trip whatever the browser sent so
+/// the page can be re-rendered with it. Typing it as `i64` would make an empty
+/// or garbled select a hard 400 — the user's title and body discarded with it —
+/// instead of the inline "Choose a community" this renders. The conversion to
+/// `i64` happens in `into_new`, after validation.
+#[derive(serde::Deserialize, serde::Serialize, validator::Validate, Clone, Default)]
 pub struct SubmitPostForm {
-    pub subreddit_id: i64,
+    #[serde(default)]
+    #[validate(custom(function = "validate_subreddit_choice"))]
+    pub subreddit_id: String,
+    #[validate(
+        length(min = 1, max = 300, message = "Title must be 1-300 characters"),
+        custom(function = "validate_sluggable_title")
+    )]
     pub title: String,
     #[serde(default)]
+    #[validate(custom(function = "validate_optional_url"))]
     pub url: String,
     #[serde(default)]
     pub body: String,
 }
 
+impl SubmitPostForm {
+    /// The chosen community, once validation has proved the field parses.
+    fn subreddit_id(&self) -> i64 {
+        self.subreddit_id.trim().parse().unwrap_or_default()
+    }
+
+    /// The link URL, or `None` for a text post.
+    fn url(&self) -> Option<String> {
+        let trimmed = self.url.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+}
+
+fn validate_subreddit_choice(value: &str) -> Result<(), validator::ValidationError> {
+    match value.trim().parse::<i64>() {
+        Ok(id) if id > 0 => Ok(()),
+        _ => Err(validator::ValidationError::new("subreddit_id")
+            .with_message("Choose a community".into())),
+    }
+}
+
+/// A title has to survive `slugify` — "***" is 3 characters long and still
+/// produces an empty slug, which would give the post an unreachable URL.
+fn validate_sluggable_title(value: &str) -> Result<(), validator::ValidationError> {
+    if slugify(value).is_empty() {
+        return Err(validator::ValidationError::new("title")
+            .with_message("Title must contain at least one letter or number".into()));
+    }
+    Ok(())
+}
+
+/// The URL field is optional, so "empty" is valid; anything else must be an
+/// absolute http/https URL. Rejecting other schemes here is defence in depth
+/// for the rendered link, which already carries `rel="noopener noreferrer"`.
+fn validate_optional_url(value: &str) -> Result<(), validator::ValidationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(()),
+        _ => Err(validator::ValidationError::new("url")
+            .with_message("Enter a full http:// or https:// URL, or leave this empty".into())),
+    }
+}
+
+/// Create a post.
+///
+/// The changeset round-trip in full (`docs/guide/forms.md`): `into_valid()`
+/// either hands back the validated form or hands back the **form itself**,
+/// still carrying the user's title, body and URL alongside the per-field
+/// errors. The failure arm re-renders `submit_form_markup` with a 422, so a
+/// rejected submission does not cost the author their draft — which is exactly
+/// what the old `AutumnError::unprocessable_msg("Title must be 1-300
+/// characters")` did.
+///
+/// It also works with **no JavaScript**: nothing in that markup is an `hx-*`
+/// attribute, so a scripting-disabled browser posts the form normally and
+/// renders the 422 body as the page.
 #[secured]
 #[post("/submit")]
 pub async fn submit(
     State(state): State<AppState>,
     session: Session,
+    csrf: CsrfToken,
     mut db: Db,
     _repo: PgPostRepository,
     flash: Flash,
-    form: Form<SubmitPostForm>,
-) -> AutumnResult<Redirect> {
+    // The body extractor is last, because it consumes the request body — every
+    // extractor after it would have nothing left to read. See
+    // docs/guide/extractors.md.
+    form: ChangesetForm<SubmitPostForm>,
+) -> AutumnResult<Response> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -529,38 +717,47 @@ pub async fn submit(
         .await
         .unwrap_or_else(|| format!("user-{user_id}"));
 
-    let title = form.0.title.trim().to_string();
-    if title.is_empty() || title.len() > 300 {
-        return Err(AutumnError::unprocessable_msg(
-            "Title must be 1-300 characters",
-        ));
-    }
-
-    let base_slug = slugify(&title);
-    if base_slug.is_empty() {
-        return Err(AutumnError::unprocessable_msg(
-            "Title must contain at least one letter or number",
-        ));
-    }
-    let url = if form.0.url.trim().is_empty() {
-        None
-    } else {
-        Some(form.0.url.trim().to_string())
+    let valid = match form.into_valid() {
+        Ok(valid) => valid,
+        Err(rejected) => {
+            let subs = all_subreddits(&mut db).await?;
+            return Ok((
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                layout(
+                    "Create a Post",
+                    Some(author_username.as_str()),
+                    Some(csrf.token()),
+                    submit_form_markup(&rejected, &subs, None),
+                ),
+            )
+                .into_response());
+        }
     };
 
-    // Look up the subreddit slug for redirect
+    let title = valid.title.trim().to_string();
+    let base_slug = slugify(&title);
+    let url = valid.url();
+    let subreddit_id = valid.subreddit_id();
+
+    // Look up the subreddit slug for redirect. A community that vanished
+    // between rendering the form and submitting it is a 404, not a field
+    // error — nothing the author can fix by editing the form.
     let sub: Subreddit = subreddits::table
-        .find(form.0.subreddit_id)
+        .find(subreddit_id)
         .select(Subreddit::as_select())
         .first(&mut *db)
         .await
         .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
 
     // Ensure unique slug within this subreddit by appending a suffix
-    let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut db).await?;
+    let slug = unique_slug(&base_slug, subreddit_id, &mut db).await?;
 
-    let body = form.0.body.trim().to_string();
-    let subreddit_id = form.0.subreddit_id;
+    // NOT trimmed, unlike the title. The body is Markdown source, and leading
+    // whitespace is syntax: four spaces make a CommonMark code block, and
+    // trailing spaces make a hard line break. Trimming it silently reformats
+    // what the author wrote — and this app stores the source and renders at
+    // display time precisely so the author's original survives editing.
+    let body = valid.body.clone();
     let subreddit_slug = sub.slug.clone();
 
     let new_post = crate::models::NewPost {
@@ -637,11 +834,36 @@ pub async fn submit(
                 &sse_post.render_fragment(),
             );
 
+            // `AfterBegin`, not `BeforeEnd`. The live row is a new-content
+            // affordance shown at the top, NOT the position a reload would
+            // give it — an OOB swap targets a fixed place in the DOM and
+            // cannot compare ranks, so no swap method can insert into a ranked
+            // listing correctly.
+            //
+            // The listing orders by `(hot_rank DESC, id DESC)`, and a new post
+            // has the default `hot_rank` of 0.0 with the highest id. It is
+            // therefore genuinely first only among the 0.0-ranked posts: any
+            // post `calculate_hot_rank` has already scored positive (see
+            // `tasks.rs` — `score / (age_hours + 2)^1.5`, positive for any
+            // positive score) sorts ABOVE it, and a reload will move the new
+            // row down past them. Appending it to the bottom would be wrong in
+            // the other direction, and wrong in every community rather than
+            // just the ones with upvoted posts.
+            //
+            // The same reason this stream is wired on page 1 only: a live
+            // insert cannot maintain an exact page slice either. The list
+            // transiently shows `size + 1` rows until the next load, and the
+            // row pushed past the boundary also appears on page 2. That is
+            // offset pagination's inherent instability under concurrent
+            // inserts (see docs/guide/pagination.md), which a live feed makes
+            // visible rather than causes — a feed that must stay exact in both
+            // order and slice wants cursor pagination over a fixed key, not a
+            // paginated ranked slice.
             let _ = sse_state.broadcast().publish_oob(
                 &format!("posts:r/{}", sse_sub_slug),
                 &sse_post.dom_id(),
                 &autumn_web::htmx::OobSwap::Target(
-                    autumn_web::htmx::OobMethod::BeforeEnd,
+                    autumn_web::htmx::OobMethod::AfterBegin,
                     "#posts-list".to_string(),
                 ),
                 &sse_post.render_fragment(),
@@ -650,9 +872,7 @@ pub async fn submit(
         .await;
 
     flash.success("Post created.").await;
-    Ok(Redirect::to(&super::subreddits::__autumn_path_show(
-        &sub.slug,
-    )))
+    Ok(Redirect::to(&super::subreddits::__autumn_path_show(&sub.slug)).into_response())
 }
 
 // ── Short-form permalink for live-broadcast fragments ──────────
@@ -865,13 +1085,25 @@ pub async fn show(
                                 " \u{2197}"
                             }
                         }
+                        // Rich text (#1255). `post.body` is whatever a
+                        // stranger typed into a <textarea>, so it is rendered
+                        // through `render_user_content` — Markdown with
+                        // raw-HTML passthrough disabled, a curated tag
+                        // allowlist, an http/https/mailto/tel scheme
+                        // allowlist, `rel="noopener noreferrer nofollow"`
+                        // forced on every surviving link, and images dropped
+                        // to their alt text so a post cannot beacon a
+                        // reader's IP to a third-party host.
+                        //
+                        // The sanitizing happens at RENDER time, not at write
+                        // time: the database keeps the author's original
+                        // source so an edit shows them what they typed, and
+                        // tightening the allowlist later protects every post
+                        // already stored rather than only new ones. See
+                        // docs/guide/rich-text.md.
                         @if !post.body.is_empty() {
                             div class="prose max-w-none text-gray-700" {
-                                @for para in post.body.split("\n\n") {
-                                    @if !para.trim().is_empty() {
-                                        p { (para.trim()) }
-                                    }
-                                }
+                                (autumn_web::markdown::render_user_content(&post.body))
                             }
                         }
                         // Preloaded many-to-many tags (#1324): `post.tags()`
@@ -980,6 +1212,7 @@ pub async fn edit_form(
     State(state): State<AppState>,
     session: Session,
     csrf: CsrfToken,
+    csrf_field: CsrfFormField,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -987,52 +1220,87 @@ pub async fn edit_form(
     let post =
         load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
+    // `with_csrf_field` for the same reason as the submit forms above.
+    let existing = ChangesetForm::blank(
+        EditPostForm {
+            title: post.title.clone(),
+            // The stored value is the author's ORIGINAL Markdown source, not
+            // the sanitized HTML the show page renders — which is why the
+            // sanitizing happens at render time. Editing a post shows the
+            // author what they typed.
+            body: post.body.clone(),
+        },
+        csrf.token(),
+    )
+    .with_csrf_field(csrf_field.0.clone());
+
     Ok(layout(
         &format!("Edit: {}", post.title),
         current_user.as_deref(),
         Some(csrf.token()),
-        html! {
-            div class="max-w-2xl mx-auto" {
-                h1 class="text-2xl font-bold mb-6" { "Edit Post" }
-                form action=(paths::update(&sub_slug, &post_slug)) method="post"
-                     class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
-                    div {
-                        label for="title" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Title"
-                        }
-                        input type="text" id="title" name="title" required
-                              value=(post.title)
-                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
-                    }
-                    div {
-                        label for="body" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Text"
-                        }
-                        textarea id="body" name="body" rows="8"
-                                 class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                        focus:outline-none focus:ring-2 focus:ring-orange-400" {
-                            (post.body)
-                        }
-                    }
-                    div class="flex gap-3" {
-                        button type="submit"
-                               class="px-6 py-2 bg-orange-500 text-white rounded font-medium \
-                                      hover:bg-orange-600 transition-colors" {
-                            "Save"
-                        }
-                        a href=(paths::show(&sub_slug, &post_slug))
-                           class="px-6 py-2 text-gray-500 hover:text-gray-700" { "Cancel" }
-                    }
-                }
-            }
-        },
+        edit_form_markup(&existing, &sub_slug, &post_slug),
     ))
 }
 
-#[derive(serde::Deserialize)]
+/// The edit form's markup — shared by the GET route and by `update`'s 422 path,
+/// the same way `submit_form_markup` is. See `docs/guide/forms.md`.
+fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slug: &str) -> Markup {
+    let input_class = "w-full border border-gray-300 rounded px-3 py-2 text-sm \
+                       focus:outline-none focus:ring-2 focus:ring-orange-400";
+    let label_class = "block text-sm font-medium text-gray-700 mb-1";
+
+    html! {
+        div class="max-w-2xl mx-auto" {
+            h1 class="text-2xl font-bold mb-6" { "Edit Post" }
+            (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
+                div {
+                    (field_errors("title", form))
+                    (autumn_web::a11y::TextField::new("title")
+                        .label("Title")
+                        .label_class(label_class)
+                        .class(input_class)
+                        .value(form.field_value("title").unwrap_or_default())
+                        .required()
+                        .maxlength(300)
+                        .aria_invalid(!form.errors_for("title").is_empty())
+                        .described_by("title-error"))
+                }
+                div {
+                    (field_errors("body", form))
+                    (autumn_web::a11y::TextArea::new("body")
+                        .label("Text")
+                        .label_class(label_class)
+                        .class(input_class)
+                        .rows(8)
+                        .value(form.field_value("body").unwrap_or_default())
+                        .aria_invalid(!form.errors_for("body").is_empty())
+                        .described_by("body-hint"))
+                    p id="body-hint" class="text-xs text-gray-400 mt-1" {
+                        "Markdown is supported: **bold**, `code`, > quotes, lists and links. "
+                        "Raw HTML and images are removed when the post is displayed."
+                    }
+                }
+                div class="flex gap-3" {
+                    (autumn_web::a11y::Button::new("Save")
+                        .submit()
+                        .class("px-6 py-2 bg-orange-500 text-white rounded font-medium \
+                                hover:bg-orange-600 transition-colors"))
+                    (autumn_web::a11y::Link::new(
+                        paths::show(sub_slug, post_slug),
+                        "Cancel",
+                    ).class("px-6 py-2 text-gray-500 hover:text-gray-700"))
+                }
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, validator::Validate, Clone, Default)]
 pub struct EditPostForm {
+    #[validate(
+        length(min = 1, max = 300, message = "Title must be 1-300 characters"),
+        custom(function = "validate_sluggable_title")
+    )]
     pub title: String,
     #[serde(default)]
     pub body: String,
@@ -1044,34 +1312,43 @@ pub async fn update(
     Path((sub_slug, post_slug)): Path<(String, String)>,
     State(state): State<AppState>,
     session: Session,
+    csrf: CsrfToken,
     mut db: Db,
     repo: PgPostRepository,
     flash: Flash,
-    form: Form<EditPostForm>,
-) -> AutumnResult<Redirect> {
+    form: ChangesetForm<EditPostForm>,
+) -> AutumnResult<Response> {
     let post =
         load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
+    let current_user = session.get("username").await;
 
-    let title = form.0.title.trim().to_string();
-    if title.is_empty() || title.len() > 300 {
-        return Err(AutumnError::unprocessable_msg(
-            "Title must be 1-300 characters",
-        ));
-    }
+    let valid = match form.into_valid() {
+        Ok(valid) => valid,
+        Err(rejected) => {
+            return Ok((
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                layout(
+                    "Edit Post",
+                    current_user.as_deref(),
+                    Some(csrf.token()),
+                    edit_form_markup(&rejected, &sub_slug, &post_slug),
+                ),
+            )
+                .into_response());
+        }
+    };
 
+    let title = valid.title.trim().to_string();
     let base_slug = slugify(&title);
-    if base_slug.is_empty() {
-        return Err(AutumnError::unprocessable_msg(
-            "Title must contain at least one letter or number",
-        ));
-    }
     // Ensure unique slug within subreddit, excluding the current post
     let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
 
     let changes = crate::models::UpdatePost {
         title: Patch::Set(title),
         slug: Patch::Set(new_slug.clone()),
-        body: Patch::Set(form.0.body.trim().to_string()),
+        // Not trimmed, for the same reason as the create path: this is
+        // Markdown source, where leading and trailing whitespace carry meaning.
+        body: Patch::Set(valid.body.clone()),
         ..Default::default()
     };
     let sub: Subreddit = subreddits::table
@@ -1095,7 +1372,7 @@ pub async fn update(
         .await?;
 
     flash.success("Post updated.").await;
-    Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
+    Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)).into_response())
 }
 
 // ── Manage tags (#1324 many-to-many demo) ───────────────────────
@@ -1346,5 +1623,206 @@ mod tests {
             error.to_string().contains("job runtime is not initialized"),
             "unexpected error: {error}"
         );
+    }
+
+    // ── Typed a11y form primitives (#1706) ─────────────────────────
+
+    fn blank_submit_form() -> ChangesetForm<SubmitPostForm> {
+        ChangesetForm::without_csrf(SubmitPostForm::default())
+    }
+
+    fn rejected_submit_form() -> ChangesetForm<SubmitPostForm> {
+        // A submission that fails every rule: no community, a title that
+        // slugifies to nothing, and a URL that is not http(s).
+        let submitted = SubmitPostForm {
+            subreddit_id: String::new(),
+            title: "***".to_owned(),
+            url: "javascript:alert(1)".to_owned(),
+            body: "kept".to_owned(),
+        };
+        ChangesetForm::from_changeset(submitted.into_changeset())
+    }
+
+    #[test]
+    fn every_submit_control_carries_a_real_label() {
+        let rendered = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+
+        for field in ["subreddit_id", "title", "url", "body"] {
+            assert!(
+                rendered.contains(&format!(r#"for="{field}""#)),
+                "field `{field}` must have an associated <label>; rendered: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_community_picker_does_not_preselect_a_real_community() {
+        // Without an empty placeholder the browser auto-selects the first
+        // option, `required` is satisfied without the author choosing, and the
+        // post lands silently in whichever community sorts first.
+        let subs = vec![Subreddit {
+            id: 7,
+            name: "aardvarks".to_owned(),
+            slug: "aardvarks".to_owned(),
+            description: String::new(),
+            creator_id: 1,
+            subscriber_count: 0,
+            comment_count: 0,
+            created_at: chrono::NaiveDateTime::default(),
+        }];
+        let rendered = submit_form_markup(&blank_submit_form(), &subs, None).into_string();
+
+        assert!(
+            rendered.contains(r#"<option value="" disabled"#)
+                || rendered.contains(r#"<option value="" selected disabled"#),
+            "the picker needs an empty disabled placeholder; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"<option value="7" selected"#),
+            "a real community must not be preselected on a blank form; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_submit_form_works_with_javascript_disabled() {
+        let rendered = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+
+        assert!(
+            !rendered.contains("hx-"),
+            "the submit form must not depend on htmx; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"method="post""#),
+            "an ordinary form POST is the no-JavaScript path; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_submit_form_carries_its_own_csrf_token() {
+        // The load-bearing half of the no-JavaScript path: with scripting on,
+        // the framework's `autumn-htmx-csrf.js` shim can send the token as a
+        // header; with scripting off, this hidden input is the only thing that
+        // gets a plain form POST past `CsrfLayer`. `form_tag` emits it.
+        let with_token = ChangesetForm::blank(SubmitPostForm::default(), "tok-123");
+        let rendered = submit_form_markup(&with_token, &[], None).into_string();
+
+        assert!(
+            rendered.contains(r#"name="_csrf""#) && rendered.contains("tok-123"),
+            "the form must carry a hidden CSRF input; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_submission_keeps_the_authors_input_and_wires_its_errors() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+
+        // The draft survives the 422 — the whole point of the changeset.
+        assert!(
+            rendered.contains("kept"),
+            "the body the author typed must come back; rendered: {rendered}"
+        );
+        // Each invalid control is marked, and points at its own message.
+        for field in ["subreddit_id", "title", "url"] {
+            assert!(
+                rendered.contains(&format!(r#"aria-describedby="{field}-error""#)),
+                "field `{field}` must reference its message element; rendered: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(r#"id="{field}-error""#)),
+                "field `{field}` must render the element it references; rendered: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(r#"aria-invalid="true""#),
+            "an invalid control must say so; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"role="alert""#),
+            "messages must be announced; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_valid_submission_passes_every_rule() {
+        let form = SubmitPostForm {
+            subreddit_id: "7".to_owned(),
+            title: "Ferris arrives".to_owned(),
+            url: "https://example.com/ferris".to_owned(),
+            body: "Hello".to_owned(),
+        };
+        let valid = ChangesetForm::without_csrf(form)
+            .into_valid()
+            .unwrap_or_else(|_| panic!("this submission is valid"));
+
+        assert_eq!(valid.subreddit_id(), 7);
+        assert_eq!(valid.url().as_deref(), Some("https://example.com/ferris"));
+    }
+
+    #[test]
+    fn an_empty_url_field_is_a_text_post_not_an_error() {
+        let form = SubmitPostForm {
+            subreddit_id: "1".to_owned(),
+            title: "A text post".to_owned(),
+            url: "   ".to_owned(),
+            body: "Body".to_owned(),
+        };
+        let valid = ChangesetForm::without_csrf(form)
+            .into_valid()
+            .unwrap_or_else(|_| panic!("an optional URL may be blank"));
+
+        assert!(valid.url().is_none());
+    }
+
+    // ── Rich text (#1255) ──────────────────────────────────────────
+
+    /// Leading whitespace in a Markdown body is syntax, not padding — which is
+    /// why neither write path trims the body the way both trim the title. Four
+    /// spaces make a CommonMark code block; trimming the source turns the
+    /// author's code sample into a paragraph, silently and permanently, since
+    /// this app stores the source rather than the rendered HTML.
+    #[test]
+    fn leading_indentation_is_markdown_syntax_and_must_survive_storage() {
+        let authored = "    let x = 1;";
+
+        let kept = autumn_web::markdown::render_user_content(authored).into_string();
+        assert!(
+            kept.contains("<code>"),
+            "four-space indentation must still render as a code block: {kept}"
+        );
+
+        // What a `.trim()` on the stored body would have produced instead.
+        let trimmed = autumn_web::markdown::render_user_content(authored.trim()).into_string();
+        assert!(
+            !trimmed.contains("<code>"),
+            "this is the regression being guarded against — if trimming stops \
+             changing the output, this test no longer proves anything: {trimmed}"
+        );
+    }
+
+    #[test]
+    fn a_post_body_is_rendered_as_sanitized_markdown() {
+        let rendered =
+            autumn_web::markdown::render_user_content("**bold** and [a link](https://example.com)")
+                .into_string();
+
+        assert!(
+            rendered.contains("<strong>bold</strong>"),
+            "rendered: {rendered}"
+        );
+        // Every surviving link is defanged for a user-content context.
+        assert!(
+            rendered.contains(r#"rel="noopener noreferrer nofollow""#),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_post_body_cannot_smuggle_script_or_beacon_an_image() {
+        let hostile = "<script>alert(1)</script>\n\n![tracker](https://evil.example/pixel.gif)\n\n[x](javascript:alert(1))";
+        let rendered = autumn_web::markdown::render_user_content(hostile).into_string();
+
+        assert!(!rendered.contains("<script"), "rendered: {rendered}");
+        assert!(!rendered.contains("<img"), "rendered: {rendered}");
+        assert!(!rendered.contains("javascript:"), "rendered: {rendered}");
     }
 }

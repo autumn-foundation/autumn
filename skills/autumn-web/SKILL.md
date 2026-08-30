@@ -2762,6 +2762,10 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/resilience.md`
 - `docs/guide/generators.md`
 - `docs/guide/seo.md`
+- `docs/guide/forms.md`
+- `docs/guide/extractors.md`
+- `docs/guide/cookie-consent.md`
+- `docs/guide/middleware.md`
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
 - `docs/guide/maintenance-mode.md`

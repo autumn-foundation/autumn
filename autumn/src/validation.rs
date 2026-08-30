@@ -1,5 +1,8 @@
 //! Validation support via the `validator` crate.
 //!
+//! See the [forms, validation and normalization guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/forms.md)
+//! for when to reach for [`Valid`] versus [`crate::form::ChangesetForm`].
+//!
 //! Provides [`Validated<T>`] — a newtype that proves validation has run —
 //! and [`Valid<T>`] — an extractor that auto-validates request bodies.
 //!

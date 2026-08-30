@@ -604,7 +604,7 @@ pub struct SearchQuery {
 }
 
 /// Escape LIKE/ILIKE wildcards so user input is treated as literal characters.
-/// PostgreSQL's default escape character is `\`, so `%` → `\%`, `_` → `\_`.
+/// `PostgreSQL`'s default escape character is `\`, so `%` → `\%`, `_` → `\_`.
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")

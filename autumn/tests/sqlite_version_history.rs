@@ -91,9 +91,9 @@ pub struct VhTenantNote {
 )]
 pub trait VhTenantNoteRepository {}
 
-/// The SQLite `_autumn_version_history` DDL — the exact fork shipped in
+/// The `SQLite` `_autumn_version_history` DDL — the exact fork shipped in
 /// `autumn/version_history_migrations_sqlite/…/up.sql`. Applied by hand here so
-/// the test proves the SQLite CREATE is valid and the writer/reader work against
+/// the test proves the `SQLite` CREATE is valid and the writer/reader work against
 /// it without booting the full migration harness.
 const VERSION_HISTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS _autumn_version_history (\
         id          INTEGER PRIMARY KEY, \

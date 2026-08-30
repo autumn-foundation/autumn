@@ -21,7 +21,7 @@
 //!    body actually executes (a process-global counter is incremented) and the
 //!    admin backend records exactly one completion.
 //! 2. **Scheduler (acquire → run → release)** — the default `in_process`
-//!    coordinator is built from config against the same SQLite-backed
+//!    coordinator is built from config against the same `SQLite`-backed
 //!    `AppState`, grants a lease for a task tick, the task body runs under the
 //!    lease, and the lease releases cleanly — mirroring what the scheduler
 //!    runtime's `execute_fixed_delay_task` does per tick.
@@ -70,7 +70,7 @@ type SqlitePool = Pool<RuntimeConnection>;
 /// so a process-global counter is the faithful in-band signal).
 static JOB_RAN: AtomicUsize = AtomicUsize::new(0);
 
-/// Build a real, tempfile-backed SQLite pool through the public `create_pool`
+/// Build a real, tempfile-backed `SQLite` pool through the public `create_pool`
 /// entry point — the same path the runtime uses for a `sqlite:` URL.
 fn build_sqlite_pool(tmp: &tempfile::TempDir) -> SqlitePool {
     let db_path = tmp.path().join("jobs_scheduler.db");
@@ -85,7 +85,7 @@ fn build_sqlite_pool(tmp: &tempfile::TempDir) -> SqlitePool {
 }
 
 /// (1) The default in-process (`local`) job backend runs an enqueued job to
-/// completion on a SQLite-backed app — no Postgres queue primitives involved.
+/// completion on a `SQLite`-backed app — no Postgres queue primitives involved.
 #[tokio::test]
 async fn local_job_backend_runs_a_job_end_to_end_on_sqlite() {
     JOB_RAN.store(0, Ordering::SeqCst);
@@ -164,7 +164,7 @@ async fn local_job_backend_runs_a_job_end_to_end_on_sqlite() {
 
 /// (2) The default `in_process` scheduler coordinator grants a lease, the task
 /// body runs under it, and the lease releases — the single-host scheduling
-/// strategy #1907 asks for, on a SQLite-backed app.
+/// strategy #1907 asks for, on a `SQLite`-backed app.
 #[tokio::test]
 async fn in_process_scheduler_coordinator_fires_a_task_on_sqlite() {
     let tmp = tempfile::TempDir::new().expect("temp dir");

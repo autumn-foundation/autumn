@@ -298,7 +298,8 @@ round-trip.
 
 - [`examples/wiki`](../../examples/wiki) — the Collections feature is a complete,
   runnable master–detail form.
-- [Forms & validation](../../autumn/src/form.rs) — the single-record
-  `ChangesetForm<T>` this builds on.
+- [Forms, validation and normalization](./forms.md) — the single-record
+  `ChangesetForm<T>` this builds on, plus `Valid<T>`, model-level
+  `#[validate(...)]`, and `#[normalize(...)]`.
 - [One-time submit tokens](../../autumn/src/security/submit_token.rs) — protect
   the first submit against double-submit.
