@@ -45,6 +45,17 @@ pub struct DataFlowOptions<'a> {
     /// or a boundary behind a non-default feature is simply not compiled in, so
     /// it cannot appear in the manifest.
     pub features: routes::CargoFeatures,
+    /// Build and inspect the release binary rather than the debug one.
+    ///
+    /// The same reasoning as `features`, one level up: the manifest describes
+    /// the binary that produced it, and a debug binary is not the binary that
+    /// ships. `cfg!(debug_assertions)` differs between the two, so a classified
+    /// column or a declassification boundary behind `#[cfg(not(debug_assertions))]`
+    /// exists only in the release build -- and a `--check` run against a
+    /// debug-built manifest would pass while the deployed binary carried
+    /// release-only edges nobody reviewed (#1654 review round 3). CI should
+    /// audit with the profile it deploys.
+    pub release: bool,
 }
 
 /// Render the human report for a manifest.
@@ -139,8 +150,11 @@ pub fn run(opts: &DataFlowOptions<'_>) {
     if !opts.features.is_default() {
         eprintln!("Building with {}\n", opts.features.to_args().join(" "));
     }
-    routes::compile_binary_with(opts.package, opts.bin, &opts.features);
-    let binary = routes::find_binary(opts.package, opts.bin);
+    if opts.release {
+        eprintln!("Building the release profile\n");
+    }
+    routes::compile_binary_with_profile(opts.package, opts.bin, &opts.features, opts.release);
+    let binary = routes::find_binary_in_profile(opts.package, opts.bin, opts.release);
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_DATA_FLOW", "1")

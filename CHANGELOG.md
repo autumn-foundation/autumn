@@ -36,7 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listing every sink it is proven reachable to, where an empty reachable set
   means the column cannot leave the process through a gated sink at all.
   `--check` fails the build when it drifts from the committed copy, so a new
-  release edge has to be reviewed rather than merged silently.
+  release edge has to be reviewed rather than merged silently. Pass `--release`
+  (and the `--features` you ship) to audit the binary you actually deploy: a
+  boundary behind `#[cfg(not(debug_assertions))]` exists only in the release
+  build.
 
   The manifest keys each row on the model's module-qualified path, so two crates
   that each define a `Customer` with a classified `email` cannot merge into one

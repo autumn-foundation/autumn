@@ -182,6 +182,14 @@ pub struct DataFlowArgs {
     /// Build the inspected binary without default Cargo features.
     #[arg(long)]
     no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: a classified column or a declassification
+    /// boundary behind `#[cfg(not(debug_assertions))]` exists only in the
+    /// release build. Run `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
 }
 
 /// Subcommands for `autumn cache`.
@@ -3853,6 +3861,7 @@ fn run_command(command: Commands) {
                 json: args.json,
                 check: args.check.as_deref(),
                 features,
+                release: args.release,
             });
         }
         Commands::Routes {

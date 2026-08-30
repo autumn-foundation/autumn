@@ -219,6 +219,23 @@ release edge has to be approved rather than merged silently:
 autumn data-flow --check data-flow-manifest.json
 ```
 
+**Audit under the profile you deploy.** The manifest describes the binary that
+produced it, and by default that is the debug binary. `cfg!(debug_assertions)`
+differs between profiles, so a classified column or a declassification boundary
+behind `#[cfg(not(debug_assertions))]` exists only in the release build — and a
+`--check` against a debug-built manifest would pass while the shipped binary
+carried release-only edges nobody reviewed. If you deploy `--release`, commit
+and check the release manifest:
+
+```bash
+autumn data-flow --release --manifest data-flow-manifest.json   # to record
+autumn data-flow --release --check data-flow-manifest.json      # in CI
+```
+
+The same applies to `--features`: a column or boundary behind a feature the
+build does not enable is not compiled in, so it cannot appear in the manifest.
+Audit with the feature set you ship.
+
 ```text
 ✗ The data-flow manifest has drifted from the committed copy:
   ~ Customer.email reaches json_response for support_lookup
