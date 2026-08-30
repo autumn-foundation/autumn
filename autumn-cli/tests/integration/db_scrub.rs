@@ -778,11 +778,11 @@ impl ServerGuard {
     /// hid it: a child that already died has reached EOF, so the read returns.
     ///
     /// Killing the child first is not enough either. The app is spawned through
-    /// `cargo run`, so the server is a GRANDchild that inherits these handles:
+    /// `cargo run`, so the server is a grandchild that inherits these handles:
     /// killing `cargo` leaves the server holding the pipe open. Files sidestep
     /// the whole question — no EOF to wait for, no pipe buffer to fill, and the
     /// output survives however the process tree happens to die.
-    fn drain(&mut self) -> String {
+    fn drain(&self) -> String {
         let read = |path: &PathBuf| std::fs::read_to_string(path).unwrap_or_default();
         format!("{}{}", read(&self.stdout), read(&self.stderr))
     }
