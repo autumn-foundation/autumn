@@ -561,16 +561,14 @@ fn accepts_html(headers: &axum::http::HeaderMap) -> bool {
         }
     }
 
-    match (exact, wildcard) {
-        // `text/html` named explicitly: its quality is the answer, either way.
-        (Some(accepted), _) => accepted,
-        // Only `text/*`: it covers HTML, so its quality decides.
-        (None, Some(accepted)) => accepted,
-        // Neither named. No `Accept` at all means yes (the header is optional
-        // and defaulting the other way would skip the prompt for a client that
-        // does render pages); an `Accept` that names neither means no.
-        (None, None) => !offered,
-    }
+    // Precedence in one line: `exact` wins whenever it is present -- either way,
+    // offer or refusal -- and `text/*` decides only when HTML was never named.
+    //
+    // When neither is named the fallback is `!offered`: no `Accept` at all means
+    // yes (the header is optional, and defaulting the other way would skip the
+    // prompt for a client that does render pages), while an `Accept` naming
+    // neither means no.
+    exact.or(wildcard).unwrap_or(!offered)
 }
 
 /// Whether an RFC 9110 quality value is exactly zero (`0`, `0.`, `0.000`).
