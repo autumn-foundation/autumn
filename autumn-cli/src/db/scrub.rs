@@ -2221,12 +2221,23 @@ fn classify_and_apply(
         // RLS makes an `UPDATE` silently apply to policy-visible rows only,
         // which is a fail-OPEN in a fail-closed tool — refuse rather than
         // report a partial scrub as complete.
-        let rls: Vec<String> = plan
+        // Purge targets are framework tables, which are excluded from
+        // `plan.tables` — so without them an RLS-protected job/token/sync table
+        // would have its `DELETE` silently apply to policy-visible rows only,
+        // and still be reported emptied.
+        let mut rls: Vec<String> = plan
             .tables
             .iter()
-            .filter(|t| facts.rls_tables.contains(&t.table))
             .map(|t| t.table.clone())
+            .chain(
+                purge_statements(&facts.framework_tables, &sources.config)
+                    .into_iter()
+                    .map(|(table, _)| table),
+            )
+            .filter(|t| facts.rls_tables.contains(t))
             .collect();
+        rls.sort();
+        rls.dedup();
         if !rls.is_empty() {
             return Err(ScrubError::RowLevelSecurity { tables: rls });
         }
@@ -2589,15 +2600,22 @@ fn probe_database_facts(
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
-    // A unique EXPRESSION index (`CREATE UNIQUE INDEX ON users (left(email, 1))`)
-    // stores `0` in `indkey` for the expression position, so the join above sees
-    // no column at all. Its real inputs come from `pg_depend`. Uniqueness after
-    // an arbitrary expression cannot be preserved by a per-row token — `left(x,1)`
-    // collapses every scrubbed value onto one character — so those columns are
-    // marked unique-constrained and any non-injective strategy on them is
-    // refused. (An injective strategy is refused too, which is the fail-closed
-    // side of the trade: the expression's output is what has to stay distinct,
-    // and only the developer knows whether it does.)
+    // Two kinds of unique index whose real inputs `indkey` does not name:
+    //
+    // - an EXPRESSION index (`ON users (left(email, 1))`) stores `0` for the
+    //   expression position, so the join above sees no column at all — and
+    //   uniqueness after an arbitrary expression cannot be preserved by a
+    //   per-row token, since `left(x, 1)` collapses every scrubbed value onto
+    //   one character;
+    // - a PARTIAL index (`ON events (group_id) WHERE active = false`) is keyed
+    //   on `group_id`, but rewriting `active` changes which rows the index
+    //   COVERS — pulling previously-excluded duplicates into it.
+    //
+    // `pg_depend` records both the expression- and the predicate-referenced
+    // columns, so one query covers them. Marking them unique-constrained is the
+    // fail-closed side of the trade: only the developer knows whether a given
+    // replacement keeps the expression's output (or the predicate's membership)
+    // distinct.
     unique_columns.extend(pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
@@ -2606,7 +2624,8 @@ fn probe_database_facts(
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
              JOIN pg_depend d ON d.objid = i.indexrelid AND d.refobjid = i.indrelid \
              JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = d.refobjsubid \
-             WHERE i.indisunique AND i.indexprs IS NOT NULL AND d.refobjsubid > 0",
+             WHERE i.indisunique AND d.refobjsubid > 0 \
+             AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)",
         )
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
@@ -2675,10 +2694,13 @@ fn probe_database_facts(
     .into_iter()
     .collect();
 
+    // `m` (materialized views) belongs here as much as the table relkinds do: a
+    // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
+    // keeps its own copy of the PII, and the refresh pass only reaches `public`.
     let other_schemas = names(
         "SELECT DISTINCT ns.nspname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
-         WHERE rel.relkind IN ('r', 'p', 'f') \
+         WHERE rel.relkind IN ('r', 'p', 'f', 'm') \
          AND ns.nspname NOT IN ('public', 'information_schema') \
          AND ns.nspname NOT LIKE 'pg\\_%'",
         &mut conn,
@@ -3432,6 +3454,43 @@ mod tests {
         let column = Column::new("token", ColumnType::Uuid);
         let expr = replacement_expr(Strategy::Uuid, &column, "TOK", true).unwrap();
         assert_eq!(expr, "(substr(TOK, 1, 32))::uuid");
+    }
+
+    #[test]
+    fn a_purge_target_under_rls_is_refused_like_any_other_write() {
+        // Framework tables are excluded from `plan.tables`, so without this the
+        // `DELETE` would apply to policy-visible rows only and still report the
+        // table emptied.
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name", "bio"]
+            [framework]
+            purge = ["autumn_jobs"]
+            "#,
+        )
+        .unwrap();
+        let facts = DatabaseFacts {
+            framework_tables: vec!["autumn_jobs".to_owned()],
+            rls_tables: BTreeSet::from(["autumn_jobs".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        // The plan itself is clean — the hazard is entirely in the purge target.
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .unwrap();
+        assert!(plan.tables.is_empty());
+        let purges = purge_statements(&facts.framework_tables, &config);
+        assert_eq!(purges.len(), 1);
+        assert!(
+            facts.rls_tables.contains(&purges[0].0),
+            "a purge target under RLS must reach the refusal"
+        );
     }
 
     #[test]

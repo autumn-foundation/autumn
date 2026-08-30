@@ -286,7 +286,9 @@ apply-time error.
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
   refused on any column covered by a unique index — composite, partial, and the
   input columns of a unique *expression* index (`(lower(email))`), whose
-  uniqueness a per-row token cannot preserve through an arbitrary expression; and a `varchar(n)` bound narrows the generated token or refuses,
+  uniqueness a per-row token cannot preserve through an arbitrary expression,
+  and the *predicate* columns of a partial unique index, where a rewrite changes
+  which rows the index covers; and a `varchar(n)` bound narrows the generated token or refuses,
   rather than truncating into collisions.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
@@ -308,13 +310,16 @@ apply-time error.
 
 - **Postgres only**, and the `public` schema only. A database with base tables
   in another non-system schema is **refused** rather than reported clean over a
-  universe the classifier never looked at. The same applies to a table the
+  universe the classifier never looked at — and a schema holding only a
+  *materialized view* counts, since it keeps its own copy of whatever it
+  selected from `public`. The same applies to a table the
   connecting role cannot see: the scrub compares `pg_class` against what it
   could actually read — tables **and** columns, since privileges are granted per
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused.** A role that does not bypass RLS would update
+- **Row-level security is refused**, for the tables the scrub rewrites *and* the
+  ones `[framework] purge` empties. A role that does not bypass RLS would touch
   only the rows its policies expose and report success — a silent partial scrub.
   Connect as the table owner or a `BYPASSRLS` role.
 - **Triggers are warned about, not disabled.** An audit or history trigger can
