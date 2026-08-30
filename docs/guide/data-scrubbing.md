@@ -296,7 +296,10 @@ apply-time error.
 
 - **Postgres only**, and the `public` schema only. A database with base tables
   in another non-system schema is **refused** rather than reported clean over a
-  universe the classifier never looked at.
+  universe the classifier never looked at. The same applies to a table the
+  connecting role cannot see: the scrub compares `pg_class` against what it
+  could actually read and refuses on any difference, so a privilege gap can
+  never look like a clean bill of health.
 - **Row-level security is refused.** A role that does not bypass RLS would update
   only the rows its policies expose and report success — a silent partial scrub.
   Connect as the table owner or a `BYPASSRLS` role.

@@ -2457,8 +2457,9 @@ on generated columns; `null` is refused on `NOT NULL` and under `NULLS NOT
 DISTINCT`; a constant-valued strategy is refused on any column in a unique index
 (partial and composite included); a `varchar(n)` bound narrows the token or
 refuses. Statements are `public`-qualified with a pinned `search_path` and the
-planned tables are locked; non-`public` schemas and RLS-enabled tables are
-refused rather than silently under-scrubbed; materialized views are refreshed in
+planned tables are locked; non-`public` schemas, tables the role
+cannot see, and RLS-enabled tables are refused rather than silently
+under-scrubbed; materialized views are refreshed in
 dependency order. Every target is classified before any is written, and each
 database's statements run in one transaction.
 

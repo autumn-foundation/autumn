@@ -215,6 +215,12 @@ pub enum ScrubError {
         /// A credential-safe reason.
         detail: String,
     },
+    /// `public` holds base tables the connecting role cannot see, so they never
+    /// reached the classifier.
+    InaccessibleTables {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
     /// The target has base tables outside `public`, which the classification
     /// universe does not cover.
     UnsupportedSchemas {
@@ -407,6 +413,16 @@ impl std::fmt::Display for ScrubError {
                  plaintext replacement would make every later read of that row fail. Provide the \
                  target's `active_record_encryption` credentials (`autumn credentials edit`), or \
                  declare those columns `null` in {SCRUB_CONFIG_FILE} if they are nullable."
+            ),
+            Self::InaccessibleTables { tables } => write!(
+                f,
+                "{} table(s) exist in `public` but could not be read by the connecting \
+                 role:\n{}\n  \
+                 They never reached the classifier, so the scrub cannot claim they carry no \
+                 PII — and it will not rewrite them either. Connect as a role that can see \
+                 every table (the owner, or one with the needed privileges).",
+                tables.len(),
+                bullet_list(tables),
             ),
             Self::UnsupportedSchemas { schemas } => write!(
                 f,
@@ -660,6 +676,8 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     // is a live credential leak, not merely a PII one.
     "api_tokens",
     "autumn_experiment_assignments",
+    // `actor_allowlist` names the individual users a flag is switched on for.
+    "autumn_feature_flags",
     "autumn_job_tracking",
     "autumn_jobs",
     // The indexed text of app records — the search index is a second copy of
@@ -668,6 +686,8 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     "autumn_sync_applied",
     "autumn_sync_pending",
     "autumn_sync_rows",
+    // `actor` records who made each flag change.
+    "feature_flag_changes",
 ];
 
 /// Framework-owned tables whose names do not carry the `autumn_` / `_autumn`
@@ -1227,6 +1247,20 @@ fn check_safe_overrides_encrypted(
     Err(ScrubError::SafeOverridesEncrypted { columns })
 }
 
+/// Base tables the catalog reports in `public` that introspection did not return
+/// and that are not framework-owned — i.e. ones the connecting role cannot see.
+fn unreachable_tables(facts: &DatabaseFacts, introspected: &[Table]) -> Vec<String> {
+    let seen: BTreeSet<&str> = introspected.iter().map(|t| t.name.as_str()).collect();
+    let mut missing: Vec<String> = facts
+        .public_base_tables
+        .iter()
+        .filter(|t| !seen.contains(t.as_str()) && !is_framework_table(t))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
+}
+
 /// Whether a column is structural — a primary key, either side of any foreign
 /// key, or a generated column Postgres will not let an `UPDATE` touch.
 ///
@@ -1489,7 +1523,11 @@ fn replacement_expr(
         Strategy::Null => "NULL".to_owned(),
         Strategy::Uuid => {
             require_type(column, strategy, matches!(column.ty, ColumnType::Uuid))?;
-            format!("({token})::uuid")
+            // A UUID is exactly 128 bits, and Postgres rejects any other width —
+            // so the wider token a unique column gets must be trimmed to its
+            // first 32 hex characters. That is the full entropy a UUID can hold,
+            // so nothing is lost.
+            format!("(substr({token}, 1, 32))::uuid")
         }
         Strategy::Bytes => {
             require_type(column, strategy, matches!(column.ty, ColumnType::Bytes))?;
@@ -2068,6 +2106,15 @@ fn classify_and_apply(
             label: label.clone(),
             detail: e.to_string(),
         })?;
+
+        // A table the connecting role cannot see is absent from the classified
+        // universe, and "not classified" must never read as "clean".
+        let unreachable = unreachable_tables(&facts, &tables);
+        if !unreachable.is_empty() {
+            return Err(ScrubError::InaccessibleTables {
+                tables: unreachable,
+            });
+        }
         let plan = build_plan(&ClassificationInputs {
             tables: &tables,
             config: &sources.config,
@@ -2271,6 +2318,14 @@ pub struct DatabaseFacts {
     pub other_schemas: BTreeSet<String>,
     /// Framework-owned tables present that the classification never sees.
     pub framework_tables: Vec<String>,
+    /// Every base table in `public`, read from `pg_class`.
+    ///
+    /// Introspection enumerates through `information_schema.tables`, which shows
+    /// only what the connecting role has some privilege on — so a table the
+    /// scrub role cannot see would silently drop out of the classified universe
+    /// and be reported clean. `pg_class` shows them all, and the difference is
+    /// a refusal.
+    pub public_base_tables: BTreeSet<String>,
 }
 
 /// A single `name` column.
@@ -2509,6 +2564,15 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
+    let public_base_tables = names(
+        "SELECT rel.relname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE rel.relkind IN ('r', 'p')",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
     Ok(DatabaseFacts {
         foreign_key_columns,
         checked_columns,
@@ -2521,6 +2585,7 @@ fn probe_database_facts(
         materialized_views,
         other_schemas,
         framework_tables,
+        public_base_tables,
     })
 }
 
@@ -3150,6 +3215,55 @@ mod tests {
         // Structural columns are still skipped: the registration says nothing
         // about them and rewriting one would break referential integrity.
         assert!(plan.column("users", "id").is_none());
+    }
+
+    #[test]
+    fn a_table_the_role_cannot_see_is_a_refusal_not_a_clean_report() {
+        // `information_schema.tables` shows only what the connecting role has
+        // privileges on, so a hidden table drops out of the classified universe
+        // entirely — and "not classified" must never read as "clean".
+        let facts = DatabaseFacts {
+            public_base_tables: BTreeSet::from([
+                "users".to_owned(),
+                "secrets".to_owned(),
+                // Framework-owned tables are excluded on purpose, not hidden.
+                "autumn_jobs".to_owned(),
+            ]),
+            ..DatabaseFacts::default()
+        };
+        assert_eq!(
+            unreachable_tables(&facts, &[users_table()]),
+            vec!["secrets".to_owned()]
+        );
+        // Nothing hidden: no refusal.
+        let visible = DatabaseFacts {
+            public_base_tables: BTreeSet::from(["users".to_owned()]),
+            ..DatabaseFacts::default()
+        };
+        assert!(unreachable_tables(&visible, &[users_table()]).is_empty());
+    }
+
+    #[test]
+    fn a_unique_uuid_column_still_gets_a_castable_32_hex_value() {
+        // A UUID is exactly 128 bits; Postgres rejects any other width, so the
+        // wider token a unique column gets has to be trimmed.
+        let column = Column::new("token", ColumnType::Uuid);
+        let expr = replacement_expr(Strategy::Uuid, &column, "TOK", true).unwrap();
+        assert_eq!(expr, "(substr(TOK, 1, 32))::uuid");
+    }
+
+    #[test]
+    fn the_feature_flag_identity_tables_are_payload_carriers() {
+        // `feature_flag_changes.actor` and `autumn_feature_flags.actor_allowlist`
+        // both name individual users, and both are outside the classified
+        // universe.
+        for table in ["feature_flag_changes", "autumn_feature_flags"] {
+            assert!(
+                FRAMEWORK_PAYLOAD_TABLES.contains(&table),
+                "{table} carries actor identities the classification never sees"
+            );
+            assert!(is_framework_table(table));
+        }
     }
 
     #[test]
@@ -4167,7 +4281,7 @@ mod tests {
                 false
             )
             .unwrap(),
-            "(TOK)::uuid"
+            "(substr(TOK, 1, 32))::uuid"
         );
         assert_eq!(
             replacement_expr(
