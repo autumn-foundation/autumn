@@ -202,6 +202,52 @@ pub fn gdpr_registry() -> GdprRegistry {
 "#,
     )
     .unwrap();
+    write_encryption_credentials(dir);
+}
+
+/// Give the fixture app real `active_record_encryption` credentials.
+///
+/// `User::api_token` is `#[encrypted]`, and a scrub REFUSES to rewrite an
+/// encrypted column without the target's key — writing plaintext there would
+/// make every later repository read of that row fail as malformed ciphertext.
+/// So provisioning the key is part of the drill these tests cover, not
+/// incidental setup, and it goes through the same `autumn credentials edit`
+/// an operator would use rather than reaching past the CLI.
+///
+/// Both profiles get a key: the tests that exercise the production-profile
+/// refusal must fail on THAT guard, not on a missing key.
+fn write_encryption_credentials(dir: &Path) {
+    let editor = dir.join("fixture-editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ncat > \"$1\" <<'TOML'\n[active_record_encryption]\n\
+         primary_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         deterministic_key = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n\
+         key_derivation_salt = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+         TOML\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    for profile in ["dev", "production"] {
+        let output = Command::new(autumn_bin())
+            .args(["credentials", "edit", "--env", profile])
+            .current_dir(dir)
+            .env("EDITOR", &editor)
+            .env("VISUAL", &editor)
+            .output()
+            .expect("run `autumn credentials edit`");
+        assert!(
+            output.status.success(),
+            "provisioning {profile} credentials failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
 
 /// Every occurrence of `needle` anywhere in any character-typed column of any
