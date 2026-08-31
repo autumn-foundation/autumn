@@ -580,9 +580,15 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
 
     // `--dry-run` prints the statement and still writes nothing.
     let (_o, dry_err) = run_autumn_ok(dir, &["db", "scrub", "--dry-run"], &envs);
+    // Schema-qualified on purpose — do not "simplify" this to a bare
+    // `UPDATE "users"`. Every catalog read that built the plan is scoped to
+    // `public`, so the writes are too: under a database- or role-level
+    // `search_path` (which Autumn supports for tenant schemas) a bare
+    // identifier would resolve to a DIFFERENT table than the one classified,
+    // leaving the classified rows unscrubbed. This assertion pins that.
     assert!(
-        dry_err.contains("UPDATE \"users\" SET"),
-        "dry run should print the statement: {dry_err}"
+        dry_err.contains("UPDATE \"public\".\"users\" SET"),
+        "dry run should print the schema-qualified statement: {dry_err}"
     );
     assert!(
         !occurrences(&client, "Alice Realname").await.is_empty(),
