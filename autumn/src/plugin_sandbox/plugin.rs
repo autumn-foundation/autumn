@@ -362,14 +362,17 @@ async fn serve(
     // interpreter kept running. `max_concurrency` would then bound nothing: a
     // client that connects and immediately resets, in a loop, would fill the
     // shared blocking pool with interpreters nobody is waiting for.
+    // The permit still moves INTO the closure — a detached `spawn_blocking`
+    // task must not outlive it — but it comes back out so the response body can
+    // keep holding it while hyper delivers the bytes.
     let outcome = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        host.run(&request)
+        let outcome = host.run(&request);
+        (outcome, permit)
     })
     .await;
 
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
+    let (outcome, permit) = match outcome {
+        Ok(pair) => pair,
         Err(err) => {
             tracing::error!(
                 plugin,
@@ -381,7 +384,7 @@ async fn serve(
     };
 
     match outcome.result {
-        Ok(response) => build_response(&plugin, &response),
+        Ok(response) => build_response(&plugin, &response, permit),
         Err(failure) => {
             tracing::warn!(
                 plugin,
@@ -484,7 +487,47 @@ async fn read_request(
 }
 
 /// Turn a sanitized guest answer into an HTTP response.
-fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Response {
+/// A response body that carries the plugin's concurrency permit.
+///
+/// The permit used to be released the moment the interpreter returned, which
+/// bounded interpreters and nothing else: the decoded response is handed to
+/// hyper as a buffer, and a client that reads slowly — or stops reading — keeps
+/// it resident long after. Each finished request could admit another
+/// interpreter while its predecessor's bytes were still held, so
+/// `max_concurrency` multiplied by the response ceiling stopped being a bound
+/// on anything. Holding the permit here ties it to the bytes rather than to the
+/// work that produced them, and it is released when the body is drained or
+/// dropped, whichever comes first.
+struct PermitBody {
+    inner: Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl http_body::Body for PermitBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn build_response(
+    plugin: &str,
+    response: &super::wire::SandboxResponse,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
     let Ok(status) = StatusCode::from_u16(response.status) else {
         // `SandboxResponse::validate` already refused anything outside the HTTP
         // range, so this cannot happen; refusing again is cheaper than trusting.
@@ -511,7 +554,13 @@ fn build_response(plugin: &str, response: &super::wire::SandboxResponse) -> Resp
         // that can return a script.
         out = out.header(http::header::CONTENT_TYPE, "application/octet-stream");
     }
-    let Ok(mut built) = out.body(Body::from(response.body.clone())) else {
+    // The permit rides with the bytes, not with the interpreter that produced
+    // them: hyper may hold this buffer long after `run` returned.
+    let body = Body::new(PermitBody {
+        inner: Body::from(response.body.clone()),
+        _permit: permit,
+    });
+    let Ok(mut built) = out.body(body) else {
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
     };
     stamp_host_headers(&mut built, plugin);

@@ -649,6 +649,13 @@ pub enum SandboxLoadError {
     MissingStart,
     /// The module exports no linear memory named `memory`.
     MissingMemory,
+    /// The module carries a WebAssembly `start` section.
+    ///
+    /// Guest code that runs at instantiation, before any request and outside
+    /// the `_start` the shim calls. If it traps, every instantiation fails and
+    /// the plugin can never answer; and running it at load to find out would
+    /// mean executing an unaudited artifact's code just to inspect it.
+    StartSectionForbidden,
     /// An active data segment does not fit the module's own initial memory.
     ///
     /// Copied in during instantiation, which is per request — so a segment
@@ -721,6 +728,11 @@ impl fmt::Display for SandboxLoadError {
                 f,
                 "the plugin's initial linear memory is {found} bytes, over the manifest's \
                  {max}-byte ceiling; no request could instantiate it"
+            ),
+            Self::StartSectionForbidden => write!(
+                f,
+                "the plugin carries a WebAssembly `start` section; a sandboxed plugin answers \
+                 through its exported `_start` and runs no code at instantiation"
             ),
             Self::SegmentOutOfBounds {
                 what,
@@ -1309,6 +1321,8 @@ struct ModuleShape {
     /// Zero when the module has none, or when the offsets are not constants
     /// this walk can evaluate.
     data_end: u64,
+    /// Whether the module carries a `start` section.
+    has_start: bool,
     /// Bytes of instruction stream in the code section.
     code_bytes: usize,
     /// How many globals the module declares.
@@ -1353,18 +1367,9 @@ fn element_section_overflows(
         }
         let mut offset = None;
         if active {
-            if *wasm.get(at)? == 0x41 {
-                let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
-                at = next;
-                offset = u64::try_from(value).ok();
-            }
-            while *wasm.get(at)? != 0x0b {
-                at = at.checked_add(1)?;
-                if at > section_end {
-                    return None;
-                }
-            }
-            at = at.checked_add(1)?;
+            let (value, next) = const_i32(wasm, at, section_end)?;
+            offset = value;
+            at = next;
         }
         // Every form but 0 and 4 carries an elemkind or reftype byte.
         if !matches!(flags, 0 | 4) {
@@ -1375,13 +1380,7 @@ fn element_section_overflows(
         if flags >= 4 {
             // `vec(expr)`: each element is a constant expression.
             for _ in 0..items {
-                while *wasm.get(at)? != 0x0b {
-                    at = at.checked_add(1)?;
-                    if at > section_end {
-                        return None;
-                    }
-                }
-                at = at.checked_add(1)?;
+                at = skip_const_expr(wasm, at, section_end)?;
             }
         } else {
             // `vec(funcidx)`: each element is one LEB128.
@@ -1402,6 +1401,52 @@ fn element_section_overflows(
         }
     }
     overflow
+}
+
+/// Skip one constant expression, returning the offset just past its `end`.
+///
+/// Scanning for the `0x0b` terminator instead of decoding is wrong, and quietly
+/// so: `ref.func 11` encodes its immediate as `0x0b`, so a scan stops on the
+/// operand and every following byte is read at the wrong offset. That desync
+/// made the walk bail and silently drop the bounds check it exists to perform.
+/// Only the instructions a constant expression may contain are decoded; an
+/// unknown opcode returns `None`, which leaves the module to the engine rather
+/// than to a guess.
+fn skip_const_expr(wasm: &[u8], mut at: usize, limit: usize) -> Option<usize> {
+    loop {
+        if at > limit {
+            return None;
+        }
+        let opcode = *wasm.get(at)?;
+        at = at.checked_add(1)?;
+        match opcode {
+            // end
+            0x0b => return Some(at),
+            // i32.const / i64.const: one signed LEB128
+            0x41 | 0x42 => at = sleb128(wasm, at)?.1,
+            // f32.const / f64.const: raw little-endian bits
+            0x43 => at = at.checked_add(4)?,
+            0x44 => at = at.checked_add(8)?,
+            // ref.null: one heap type byte
+            0xd0 => at = at.checked_add(1)?,
+            // ref.func / global.get: one unsigned LEB128
+            0xd2 | 0x23 => at = leb128(wasm, at)?.1,
+            _ => return None,
+        }
+    }
+}
+
+/// The `i32.const` value a constant expression evaluates to, if it is one.
+///
+/// Returns the offset past the expression either way, so a caller can keep
+/// walking past an expression it cannot evaluate.
+fn const_i32(wasm: &[u8], at: usize, limit: usize) -> Option<(Option<u64>, usize)> {
+    if *wasm.get(at)? == 0x41 {
+        let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
+        let end = skip_const_expr(wasm, next, limit)?;
+        return Some((u64::try_from(value).ok(), end));
+    }
+    Some((None, skip_const_expr(wasm, at, limit)?))
 }
 
 /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
@@ -1466,19 +1511,9 @@ fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<u64
         }
         let mut offset: Option<u64> = None;
         if active {
-            if *wasm.get(at)? == 0x41 {
-                let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
-                at = next;
-                offset = u64::try_from(value).ok();
-            }
-            // Run to the expression's `end` opcode whatever it contained.
-            while *wasm.get(at)? != 0x0b {
-                at = at.checked_add(1)?;
-                if at > section_end {
-                    return None;
-                }
-            }
-            at = at.checked_add(1)?;
+            let (value, next) = const_i32(wasm, at, section_end)?;
+            offset = value;
+            at = next;
         }
         let (len, next) = leb128(wasm, at)?;
         at = next.checked_add(len)?;
@@ -1501,6 +1536,8 @@ const DATA_SECTION: u8 = 11;
 const TABLE_SECTION: u8 = 4;
 /// The global section, whose entries each become per-instance storage.
 const GLOBAL_SECTION: u8 = 6;
+/// The start section: a function the engine runs at instantiation.
+const START_SECTION: u8 = 8;
 /// The code section, whose *size* is the instruction volume the compiler
 /// walks — a thing no entry count reveals.
 const CODE_SECTION: u8 = 10;
@@ -1521,6 +1558,9 @@ fn refuse_unrunnable_shape(
     // request, so one that does not fit the memory the module starts with
     // fails every instantiation the artifact is ever given. Said once here
     // rather than 502 for the life of the plugin.
+    if shape.has_start {
+        return Err(SandboxLoadError::StartSectionForbidden);
+    }
     if shape.data_end > initial_bytes {
         return Err(SandboxLoadError::SegmentOutOfBounds {
             what: "linear memory",
@@ -1571,6 +1611,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut table_count = 0usize;
     let mut global_count = 0usize;
     let mut code_bytes = 0usize;
+    let mut has_start = false;
     let mut data_end = 0u64;
     let mut table_minimums: Vec<u64> = Vec::new();
     let mut element_overflow: Option<(u64, u64)> = None;
@@ -1605,6 +1646,9 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             if let Some(end) = data_section_end(wasm, after_size, end) {
                 data_end = data_end.max(end);
             }
+        }
+        if id == START_SECTION {
+            has_start = true;
         }
         if id == CODE_SECTION {
             code_bytes = code_bytes.saturating_add(size);
@@ -1643,6 +1687,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        has_start,
         element_overflow,
         data_end,
         code_bytes,
@@ -4010,6 +4055,34 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn an_element_expression_whose_operand_is_the_end_opcode_still_bounds_the_segment() {
+        // `ref.func 11` encodes its immediate as 0x0b, the same byte that ends a
+        // constant expression. A walk that scans for the terminator instead of
+        // decoding stops on that operand, reads every later byte at the wrong
+        // offset, bails, and silently drops the bounds check — so a segment past
+        // the end of its table sails through. Twelve functions, so index 11
+        // exists and the expression form is used.
+        use std::fmt::Write as _;
+
+        let mut wat =
+            String::from("(module\n  (memory (export \"memory\") 1)\n  (table 1 funcref)\n");
+        for i in 0..12 {
+            let _ = writeln!(wat, "  (func $f{i} (nop))");
+        }
+        // Past the end of a one-element table, with a `ref.func 11` item.
+        wat.push_str("  (elem (i32.const 1) funcref (ref.func $f11))\n");
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("the operand must not be mistaken for the terminator");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn an_element_segment_past_the_end_of_its_table_is_refused_at_load() {
         // The exact sibling of the data-segment case: an active element segment
         // is written into its table during instantiation, so one that does not
@@ -4028,6 +4101,28 @@ path = "/hello/greet"
             .expect_err("a segment past the end of its table must not load");
         assert!(
             matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_carrying_a_start_section_is_refused() {
+        // The engine runs a `start` function at instantiation, before any
+        // request. If it traps the plugin can never answer, and the only way to
+        // find out at load would be to execute an unaudited artifact's code
+        // while inspecting it. A sandboxed plugin answers through the exported
+        // `_start` the shim calls, so the section has no legitimate use here.
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (func $init (nop))
+             (start $init)
+             (func (export "_start") (nop)))"#;
+        let wasm = wat::parse_str(wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a start section must not load");
+        assert!(
+            matches!(err, SandboxLoadError::StartSectionForbidden),
             "{err:?}"
         );
     }
