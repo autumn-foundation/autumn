@@ -43,11 +43,11 @@ RUN cargo install --locked diesel_cli \
 #     docker run --rm --entrypoint autumn IMAGE sbom --binary /usr/local/bin/{{project_name}}
 #
 # It is wired in via RUSTC_WORKSPACE_WRAPPER rather than by rewriting the build
-# command, so BOTH build paths this template can render (`cargo build --release`
-# and `autumn build --embed`) are instrumented by the one line below. Note
-# WORKSPACE_WRAPPER, not RUSTC_WRAPPER: the wrapper must apply only to this
-# project's own crates — switching it to RUSTC_WRAPPER would invalidate the
-# cargo-chef dependency cache layer on every build.
+# command, so BOTH build paths this template can render (the plain release
+# build and the embedded single-binary one) are instrumented by the single ENV
+# line below. Note WORKSPACE_WRAPPER, not RUSTC_WRAPPER: the wrapper must apply
+# only to this project's own crates — switching it to RUSTC_WRAPPER would
+# invalidate the cargo-chef dependency cache layer on every build.
 RUN cargo install --locked cargo-auditable --version "${CARGO_AUDITABLE_VERSION}"
 ENV RUSTC_WORKSPACE_WRAPPER=cargo-auditable
 
