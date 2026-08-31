@@ -298,21 +298,26 @@ fn tool_component(tool_version: &str) -> Component {
 /// `bomFormat` + `serialNumber` + `specVersion` together, and rejects the
 /// document outright without it. The obvious implementation — a fresh random
 /// UUID per run — would destroy the determinism `--verify` depends on, so
-/// derive it from the document's own content instead: same inventory, same
-/// serial number; one crate different, different serial number.
+/// derive it from the document's own content instead.
+///
+/// Hashes the document's ENTIRE serialized form with the serial itself unset,
+/// rather than a hand-picked subset of fields. Consumers identify a BOM
+/// revision by `(serialNumber, version)`, so anything that changes the emitted
+/// bytes — a dependency's licence or repository, the root's purl, the
+/// generator's version — has to change the serial, or two different documents
+/// claim to be the same revision.
 ///
 /// Formatted as a syntactically valid RFC 4122 v4 UUID (version and variant
 /// bits forced) so tools that parse it are satisfied.
-fn content_serial_number(root: &Component, components: &[Component]) -> String {
+fn content_serial_number(bom: &Bom) -> String {
+    debug_assert!(
+        bom.serial_number.is_none(),
+        "the serial must be hashed over a document that does not yet carry one"
+    );
     let mut hasher = Sha256::new();
-    hasher.update(SPEC_VERSION.as_bytes());
-    hasher.update(root.name.as_bytes());
-    hasher.update(b"@");
-    hasher.update(root.version.as_bytes());
-    for c in components {
-        hasher.update(b"\n");
-        hasher.update(c.bom_ref.as_deref().unwrap_or_default().as_bytes());
-    }
+    // Serialization of our own types cannot realistically fail; an empty digest
+    // input would still be deterministic, which is what matters here.
+    hasher.update(serde_json::to_vec(bom).unwrap_or_default());
     let d = hasher.finalize();
     let mut b = [0u8; 16];
     b.copy_from_slice(&d[..16]);
@@ -361,10 +366,10 @@ fn assemble(root: Component, mut components: Vec<Component>, tool_version: &str)
     // that merely share a name and version are distinct dependencies.
     components.dedup_by(|a, b| a == b);
     disambiguate_bom_refs(&mut components);
-    Bom {
+    let mut bom = Bom {
         bom_format: "CycloneDX".into(),
         spec_version: SPEC_VERSION.into(),
-        serial_number: Some(content_serial_number(&root, &components)),
+        serial_number: None,
         version: 1,
         metadata: BomMetadata {
             tools: Tools {
@@ -373,7 +378,10 @@ fn assemble(root: Component, mut components: Vec<Component>, tool_version: &str)
             component: root,
         },
         components,
-    }
+    };
+    // Seal it last, over the finished document.
+    bom.serial_number = Some(content_serial_number(&bom));
+    bom
 }
 
 /// Identity to fall back on when `cargo metadata` reports no resolve root —
@@ -1110,8 +1118,6 @@ pub struct SbomOptions {
     /// scaffold's image build deliberately does not, so an app with a stale
     /// lockfile still builds).
     pub locked: bool,
-    /// Require the SBOM's root component to describe exactly this version.
-    pub expect_version: Option<String>,
     /// Resolve with every optional feature enabled rather than the default set.
     ///
     /// Off by default on purpose. `--all-features` on this workspace resolves
@@ -1129,13 +1135,29 @@ pub struct SbomOptions {
     /// pulls in, and the documented sidecar-vs-binary cross-check would show
     /// spurious binary-only entries.
     pub features: Option<String>,
+    /// Restrict resolution to one target triple.
+    ///
+    /// An SBOM generated inside the Linux production image otherwise lists
+    /// every target-specific dependency of every platform — the whole
+    /// `windows-*` family, 89 packages in this workspace — none of which can
+    /// be in that image. The generated Dockerfile passes the builder's own
+    /// host triple. Deliberately off by default: autumn's own release is a
+    /// SOURCE release consumed on every platform, so narrowing its SBOM to
+    /// whichever runner built it would understate what was published.
+    pub filter_platform: Option<String>,
+    /// Require the SBOM's root component to describe exactly this version.
+    pub expect_version: Option<String>,
 }
 
-fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError> {
-    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.args(["metadata", "--format-version", "1"]);
+/// The `cargo metadata` argument list `opts` implies.
+///
+/// Split out from the spawn so the resolution switches are unit-testable —
+/// getting one wrong silently changes what the SBOM claims, which is exactly
+/// the class of bug that is invisible until an auditor reads the document.
+fn metadata_args(opts: &SbomOptions) -> Vec<String> {
+    let mut args = vec!["metadata".into(), "--format-version".into(), "1".into()];
     if opts.all_features {
-        cmd.arg("--all-features");
+        args.push("--all-features".into());
     }
     if let Some(features) = opts
         .features
@@ -1143,11 +1165,27 @@ fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError
         .map(str::trim)
         .filter(|f| !f.is_empty())
     {
-        cmd.args(["--features", features]);
+        args.push("--features".into());
+        args.push(features.to_owned());
+    }
+    if let Some(triple) = opts
+        .filter_platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        args.push("--filter-platform".into());
+        args.push(triple.to_owned());
     }
     if opts.locked {
-        cmd.arg("--locked");
+        args.push("--locked".into());
     }
+    args
+}
+
+fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError> {
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.args(metadata_args(opts));
     if let Some(path) = &opts.manifest_path {
         cmd.arg("--manifest-path").arg(path);
     }
@@ -1381,6 +1419,92 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_ne!(serial, other_serial);
+    }
+
+    #[test]
+    fn the_serial_number_covers_everything_the_document_emits() {
+        // The serial is advertised as content-derived, and consumers use
+        // (serialNumber, version) to identify a BOM revision — so any change
+        // that alters the rendered bytes must alter it, not just the component
+        // list. Hashing a hand-picked subset let a licence or purl edit produce
+        // two different documents claiming the same revision.
+        let serial_of = |bom: &Bom| bom.serial_number.clone().expect("serialNumber");
+        let base = bom_of(&[("serde", "1.0.0")]);
+
+        let mut licence_changed = base.clone();
+        licence_changed.components[0].licenses = Some(vec![License {
+            expression: "Proprietary".into(),
+        }]);
+        assert_ne!(
+            serial_of(&base),
+            serial_of(&reseal(licence_changed)),
+            "a changed licence must change the serial"
+        );
+
+        let mut vcs_changed = base.clone();
+        vcs_changed.components[0].external_references = Some(vec![ExternalReference {
+            kind: "vcs".into(),
+            url: "https://evil.invalid/serde".into(),
+        }]);
+        assert_ne!(serial_of(&base), serial_of(&reseal(vcs_changed)));
+
+        let mut root_changed = base.clone();
+        root_changed.metadata.component.purl = Some("pkg:cargo/other@0.7.0".into());
+        assert_ne!(serial_of(&base), serial_of(&reseal(root_changed)));
+
+        let mut tool_changed = base.clone();
+        tool_changed.metadata.tools.components[0].version = "9.9.9".into();
+        assert_ne!(serial_of(&base), serial_of(&reseal(tool_changed)));
+
+        // …and an identical document still hashes identically.
+        assert_eq!(serial_of(&base), serial_of(&reseal(base.clone())));
+    }
+
+    /// Recompute a `Bom`'s serial after mutating it, the way `assemble` does.
+    fn reseal(mut bom: Bom) -> Bom {
+        bom.serial_number = None;
+        bom.serial_number = Some(content_serial_number(&bom));
+        bom
+    }
+
+    #[test]
+    fn a_platform_filter_reaches_cargo_metadata() {
+        // Without it, an SBOM generated inside a Linux image lists the whole
+        // `windows-*` family — 89 packages in this workspace that cannot be in
+        // that image.
+        let args = metadata_args(&SbomOptions {
+            filter_platform: Some("x86_64-unknown-linux-gnu".into()),
+            ..SbomOptions::default()
+        });
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--filter-platform", "x86_64-unknown-linux-gnu"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn no_platform_filter_is_applied_by_default() {
+        // Autumn's own release is a SOURCE release consumed on every platform,
+        // so its SBOM must not be narrowed to whichever runner built it.
+        let args = metadata_args(&SbomOptions::default());
+        assert!(!args.iter().any(|a| a == "--filter-platform"), "{args:?}");
+    }
+
+    #[test]
+    fn metadata_args_carry_the_other_resolution_switches() {
+        let args = metadata_args(&SbomOptions {
+            locked: true,
+            all_features: true,
+            features: Some("embed-assets".into()),
+            ..SbomOptions::default()
+        });
+        assert!(args.iter().any(|a| a == "--locked"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--all-features"), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--features", "embed-assets"]),
+            "{args:?}"
+        );
     }
 
     #[test]

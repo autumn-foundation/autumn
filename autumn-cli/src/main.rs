@@ -633,6 +633,15 @@ enum Commands {
         /// production Dockerfile does this for `embed-assets` builds.
         #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
         features: Option<String>,
+        /// Restrict resolution to one target triple.
+        ///
+        /// Without it the document lists target-specific dependencies for
+        /// every platform — the whole `windows-*` family in a Linux image.
+        /// The generated production Dockerfile passes the builder's host
+        /// triple. Leave unset for a source release consumed on every
+        /// platform, which is why it is not the default.
+        #[arg(long, value_name = "TRIPLE", conflicts_with = "binary")]
+        filter_platform: Option<String>,
         /// Require the SBOM's top-level component to be exactly this version.
         ///
         /// The release gate passes the tag being released, so an SBOM that is
@@ -3983,6 +3992,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            filter_platform,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
             manifest_path,
@@ -3990,9 +4000,10 @@ fn run_command(command: Commands) {
             verify,
             binary,
             locked,
-            expect_version,
             all_features,
             features,
+            filter_platform,
+            expect_version,
         }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
@@ -5580,6 +5591,7 @@ mod tests {
             expect_version,
             all_features,
             features,
+            filter_platform,
         } = cli.command
         else {
             panic!("expected Sbom command");
@@ -5599,6 +5611,31 @@ mod tests {
              what the document describes by default"
         );
         assert!(features.is_none());
+        assert!(
+            filter_platform.is_none(),
+            "a source release is consumed on every platform, so no filter by default"
+        );
+    }
+
+    #[test]
+    fn parse_sbom_filter_platform() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "sbom",
+            "--filter-platform",
+            "aarch64-unknown-linux-gnu",
+        ])
+        .unwrap();
+        let Commands::Sbom {
+            filter_platform, ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(
+            filter_platform.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
     }
 
     #[test]
@@ -5666,6 +5703,7 @@ mod tests {
             vec!["--locked"],
             vec!["--all-features"],
             vec!["--features", "embed-assets"],
+            vec!["--filter-platform", "x86_64-unknown-linux-gnu"],
             vec!["--verify", "sbom.cdx.json"],
         ] {
             let mut args = vec!["autumn", "sbom", "--binary", "app"];

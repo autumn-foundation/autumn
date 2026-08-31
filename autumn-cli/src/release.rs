@@ -72,15 +72,19 @@ const SUPPLY_CHAIN_MIN_CLI_VERSION: &str = "0.7.1";
 /// A raw literal on purpose: these lines land verbatim in a generated
 /// Dockerfile, so any escaping cleverness here shows up as stray indentation
 /// in every scaffolded project.
-const SBOM_GENERATE_STEP: &str = r"
+const SBOM_GENERATE_STEP: &str = r#"
 # Machine-readable inventory of everything compiled into this image, generated
 # from the very source tree that produced the binary above, resolving the same
-# features that build used. Deliberately no `--locked`: a project whose
-# Cargo.lock has drifted still builds (its own build would have updated the
-# lock anyway), and the SBOM records what was actually resolved. Add `--locked`
-# here if you want the stricter posture.
-RUN autumn sbom{{sbom_features}} --output /app/sbom.cdx.json
-";
+# features that build used and filtered to this builder's own target triple.
+# Without that filter the document lists target-specific dependencies for every
+# platform — the whole `windows-*` family — none of which can be in a Linux
+# image. Deliberately no `--locked`: a project whose Cargo.lock has drifted
+# still builds (its own build would have updated the lock anyway), and the SBOM
+# records what was actually resolved. Add `--locked` for the stricter posture.
+RUN autumn sbom{{sbom_features}} \
+    --filter-platform "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" \
+    --output /app/sbom.cdx.json
+"#;
 
 /// Runtime-stage copy that carries the inventory into the shipped image.
 const SBOM_RUNTIME_COPY: &str = r"# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find
@@ -998,6 +1002,22 @@ mod tests {
         }
     }
 
+    /// The rendered `RUN autumn sbom …` instruction as ONE logical command,
+    /// `\`-continuations joined. Assertions must be scoped to it: the
+    /// Dockerfile legitimately carries flags like `--features postgres`
+    /// elsewhere, and a whole-file substring check would read them as this
+    /// command's.
+    fn sbom_command(rendered: &str) -> String {
+        rendered
+            .replace("\\\n", " ")
+            .lines()
+            .find(|l| l.trim_start().starts_with("RUN autumn sbom"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
         // The Dockerfile `cargo install`s the CLI at its own version. Between a
@@ -1038,7 +1058,7 @@ mod tests {
             "0.7.1",
         );
         assert!(
-            rendered.contains("RUN autumn sbom --output /app/sbom.cdx.json"),
+            sbom_command(&rendered).contains("--output /app/sbom.cdx.json"),
             "{rendered}"
         );
         assert!(
@@ -1089,7 +1109,7 @@ mod tests {
             "0.7.1",
         );
         assert!(
-            embed.contains("RUN autumn sbom --features embed-assets --output /app/sbom.cdx.json"),
+            sbom_command(&embed).contains("--features embed-assets"),
             "{embed}"
         );
 
@@ -1100,8 +1120,10 @@ mod tests {
             false,
             "0.7.1",
         );
+        // Scoped to the sbom command: the file legitimately contains
+        // `--features postgres` on the diesel_cli install.
         assert!(
-            plain.contains("RUN autumn sbom --output /app/sbom.cdx.json"),
+            !sbom_command(&plain).contains("--features"),
             "a non-embed build takes the default feature set: {plain}"
         );
     }

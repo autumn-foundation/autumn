@@ -224,8 +224,16 @@ alternate-registry dependencies get a `?vcs_url=` / `?repository_url=`
 qualifier naming where they actually came from.
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
-it covers the whole resolved graph for the default feature set, including
-dev-dependencies, which are resolved but never linked into the release binary.
+it covers the whole resolved graph for the image's own target triple and
+feature set, including dev-dependencies, which are resolved but never linked
+into the release binary.
+
+(The image's SBOM is narrowed with `--filter-platform` to the target that built
+it — without that, it would list every platform's target-specific dependencies,
+the whole `windows-*` family included, none of which can be in a Linux image.
+Autumn's **own** release SBOM is deliberately *not* filtered: that is a source
+release consumed on every platform, so narrowing it to whichever runner built
+it would understate what was published.)
 (`--all-features` widens it further, to crates no single build can contain — it
 is available deliberately, and deliberately not the default.) The embedded list
 is what actually went into the binary. Entries appearing only in
@@ -331,6 +339,7 @@ digest yourself if your threat model requires it.
 | `autumn sbom --all-features` | …with every optional feature on (broader than any single build). |
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
+| `autumn sbom --filter-platform T` | …restricted to one target triple. |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 
 ---
