@@ -238,6 +238,15 @@ async fn run_one_boot(task: AcmeRenewalTask, status: &AcmeStatus, reporter: Repo
         if snap.last_success_unix.is_some() || snap.last_failure.is_some() {
             break;
         }
+        // `run` only returns when `shutdown` fires, so finishing here means it
+        // panicked. Surface THAT rather than waiting out the deadline and
+        // reporting an opaque "never settled" — the panic names the real cause
+        // (a missing process-level rustls CryptoProvider once produced exactly
+        // this masking).
+        if handle.is_finished() {
+            join_renewal_task(handle).await;
+            panic!("the ACME renewal task ended before recording any outcome");
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "ACME boot attempt never settled"
