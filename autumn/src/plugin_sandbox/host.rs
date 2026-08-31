@@ -1208,13 +1208,24 @@ fn finish(
         .map_or(limits.fuel, |left| limits.fuel.saturating_sub(left));
     let mut state = store.into_data();
     let peak_memory_bytes = state.limiter.peak;
-    if state.limiter.refusals > 0 {
+    let (memory_refusals, table_refusals) =
+        (state.limiter.memory_refusals, state.limiter.table_refusals);
+    if memory_refusals > 0 {
         let detail = format!(
-            "{count} allocation(s) over the plugin's {max}-byte memory ceiling were refused",
-            count = state.limiter.refusals,
+            "{memory_refusals} allocation(s) over the plugin's {max}-byte memory ceiling were refused",
             max = limits.memory_bytes,
         );
         state.deny(DeniedCapability::Memory, "memory.grow", &detail);
+    }
+    // Its own operation and its own ceiling. `deny` deduplicates by
+    // `(capability, operation)`, so this is a second entry beside the byte
+    // one rather than a collision with it, and a guest that hit both is
+    // recorded as having hit both.
+    if table_refusals > 0 {
+        let detail = format!(
+            "{table_refusals} table growth(s) over the sandbox's {MAX_TABLE_ELEMENTS}-element table ceiling were refused",
+        );
+        state.deny(DeniedCapability::Memory, "table.grow", &detail);
     }
 
     let result = match result {
@@ -1911,7 +1922,14 @@ impl wasmi::core::HostError for OutputBudgetExhausted {}
 struct MemoryLimiter {
     max: usize,
     peak: usize,
-    refusals: usize,
+    /// Counted apart from `table_refusals`, because the two are refused by
+    /// *different ceilings* and an operator reading the ledger is trying to
+    /// learn which one the guest hit. One shared counter reported every table
+    /// refusal as `memory.grow` over the manifest's byte ceiling — evidence
+    /// that is not merely vague but wrong, naming a limit that was never
+    /// applied.
+    memory_refusals: usize,
+    table_refusals: usize,
     /// Elements held across every table of this instance, so the ceiling is on
     /// the instance rather than on each table separately.
     table_elements: u32,
@@ -1925,7 +1943,7 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
         _maximum: Option<usize>,
     ) -> Result<bool, wasmi::errors::MemoryError> {
         if desired > self.max {
-            self.refusals = self.refusals.saturating_add(1);
+            self.memory_refusals = self.memory_refusals.saturating_add(1);
             // `Ok(false)` makes the guest's `memory.grow` return -1, which is a
             // legal outcome a well-written allocator handles. Returning `Err`
             // would trap instead — a harsher answer that tells a hostile guest
@@ -1950,7 +1968,7 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
             .saturating_sub(current)
             .saturating_add(desired);
         if total > MAX_TABLE_ELEMENTS {
-            self.refusals = self.refusals.saturating_add(1);
+            self.table_refusals = self.table_refusals.saturating_add(1);
             return Ok(false);
         }
         self.table_elements = total;
@@ -2028,7 +2046,8 @@ impl HostState {
             limiter: MemoryLimiter {
                 max: limits.memory_bytes,
                 peak: 0,
-                refusals: 0,
+                memory_refusals: 0,
+                table_refusals: 0,
                 table_elements: 0,
             },
             limits,
@@ -3257,10 +3276,34 @@ path = "/hello/greet"
         assert!(outcome.result.is_err(), "{:?}", outcome.result);
         // Refused, and recorded: an operator has to be able to see that the
         // plugin reached past its ceiling rather than merely that it 5xx'd.
+        let operations = denied(&outcome, DeniedCapability::Memory);
         assert!(
-            !denied(&outcome, DeniedCapability::Memory).is_empty(),
+            !operations.is_empty(),
             "the refusal was not recorded: {:?}",
             outcome.denials
+        );
+        // …and recorded as the ceiling it actually hit. Both hooks used to
+        // share one counter, so this arrived as `memory.grow` over the
+        // manifest's *byte* ceiling — a limit that was never applied. Vague
+        // evidence would be a nuisance; wrong evidence sends an operator to
+        // raise the wrong number in the manifest, which cannot help.
+        assert!(
+            operations.iter().any(|op| op == "table.grow"),
+            "a table refusal was not reported as one: {operations:?}"
+        );
+        assert!(
+            !operations.iter().any(|op| op == "memory.grow"),
+            "a table refusal was reported against the byte ceiling: {operations:?}"
+        );
+        let detail = outcome
+            .denials
+            .iter()
+            .find(|denial| denial.operation == "table.grow")
+            .map(|denial| denial.detail.clone())
+            .expect("the table denial is present");
+        assert!(
+            detail.contains(&MAX_TABLE_ELEMENTS.to_string()),
+            "the detail does not name the ceiling that applied: {detail}"
         );
     }
 

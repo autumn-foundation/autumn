@@ -589,7 +589,20 @@ impl http_body::Body for PermitBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, std::task::Poll::Ready(None)) {
+        // Released when the *inner body* is finished, not only when a later
+        // poll returns `None`. A single-frame body — which is every answer a
+        // guest gives, since the response is a buffer — ends on the very poll
+        // that yields its frame: the consumer that now holds those bytes may
+        // read `is_end_stream`, or the exact `size_hint`, and never poll
+        // again. Waiting for a `None` that a conforming consumer has no reason
+        // to ask for is the same mistake as waiting for a `poll_frame` an
+        // already-ended body never needs, one step further along the stream.
+        let finished = match &polled {
+            std::task::Poll::Ready(None) => true,
+            std::task::Poll::Ready(Some(_)) => self.inner.is_end_stream(),
+            std::task::Poll::Pending => false,
+        };
+        if finished {
             // Delivery is complete; the bytes are the caller's problem now.
             self.permit = None;
         }
@@ -1018,6 +1031,59 @@ sha256 = "{digest}"
         );
         drop(response);
         assert_eq!(permits.available_permits(), 1, "and give it back on drop");
+    }
+
+    #[tokio::test]
+    async fn a_delivered_body_hands_its_permit_back_on_the_poll_that_ended_it() {
+        // The release moved from `poll_frame` to construction for a body that
+        // was *already* ended; this is one step further along the same stream.
+        // A single-frame body — every answer a guest gives, since the response
+        // is a buffer — reaches end-of-stream on the poll that yields its
+        // frame. A consumer holding those bytes may then read `is_end_stream`
+        // or the exact `size_hint` and never poll again, so waiting for a
+        // `None` it has no reason to ask for held the slot until the response
+        // was dropped.
+        use crate::plugin_sandbox::wire::SandboxResponse;
+        use http_body_util::BodyExt as _;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let full = SandboxResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"hi".to_vec(),
+        };
+        let mut response = build_response(
+            "autumn-plugin-hello",
+            &full,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the bytes are still undelivered"
+        );
+
+        // Exactly one poll: the one that yields the only frame. A second would
+        // be the `None` this fix exists to stop depending on.
+        let frame = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("a frame")
+            .expect("not an error");
+        assert!(
+            frame.is_data(),
+            "the fixture must yield its bytes in one frame"
+        );
+
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "the slot is held after the bytes were handed over"
+        );
+        // Dropped after the assertion, so a pass cannot be the destructor's
+        // doing rather than the fix's.
+        drop(response);
     }
 
     #[test]
