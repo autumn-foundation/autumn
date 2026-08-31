@@ -428,22 +428,52 @@ async fn read_request(
     params: &axum::extract::RawPathParams,
     request: axum::extract::Request,
 ) -> Result<SandboxRequest, Box<Response>> {
+    let (parts, body) = request.into_parts();
+    // The nested router rewrote the URI, so the concrete path the caller asked
+    // for comes from the original.
+    let path_str = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| parts.uri.path(), |original| original.0.path());
+    let query_str = parts.uri.query().unwrap_or_default();
+
+    // Everything the frame will carry except the headers, measured on the
+    // borrowed values. Headers got this treatment first; the rest of the
+    // metadata is the same argument and was left cloning unconditionally — an
+    // in-process caller could hand `mounted_router` a megabyte of query string
+    // and have it duplicated, and held for the whole body-read deadline, before
+    // the ceiling that exists to refuse it ever ran.
+    let mut metadata = parts
+        .method
+        .as_str()
+        .len()
+        .saturating_add(path_str.len())
+        .saturating_add(query_str.len())
+        .saturating_add(pattern.len())
+        .saturating_add(
+            params
+                .iter()
+                .map(|(name, value)| super::host::metadata_pair_bytes(name, value))
+                .fold(0usize, usize::saturating_add),
+        );
+    if metadata > super::host::MAX_REQUEST_METADATA_BYTES {
+        tracing::warn!(
+            plugin,
+            max_request_metadata_bytes = super::host::MAX_REQUEST_METADATA_BYTES,
+            "request URI metadata over the sandbox ceiling; refusing before cloning it"
+        );
+        return Err(Box::new(sandbox_error(
+            plugin,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        )));
+    }
+
+    let path = path_str.to_owned();
+    let query = query_str.to_owned();
     let path_params: Vec<(String, String)> = params
         .iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
-
-    let (parts, body) = request.into_parts();
-    // The nested router rewrote the URI, so the concrete path the caller asked
-    // for comes from the original.
-    let path = parts
-        .extensions
-        .get::<axum::extract::OriginalUri>()
-        .map_or_else(
-            || parts.uri.path().to_owned(),
-            |original| original.0.path().to_owned(),
-        );
-    let query = parts.uri.query().unwrap_or_default().to_owned();
     // Charged as they are read, and refused before the next one is cloned. The
     // ceiling used to be applied inside `run`, which is after every header has
     // already been copied into owned strings — so an oversized set forced the
@@ -451,7 +481,6 @@ async fn read_request(
     // the whole body-read deadline before being told no. The cost per pair comes
     // from the same function the ceiling counts with, so the two agree.
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut metadata = 0usize;
     for (name, value) in &parts.headers {
         // Filtered before it is charged, because it is filtered before it is
         // forwarded: `HostFrame::request` drops everything outside this
