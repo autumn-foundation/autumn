@@ -5660,6 +5660,19 @@ fn resolve_acme_ca_root_data(
         };
     }
 
+    // A private root pinned against a publicly-trusted Let's Encrypt endpoint can
+    // only narrow trust and break issuance. Graded BEFORE the bundle case below,
+    // and deliberately: for a Let's Encrypt directory the remedy is to remove
+    // `ca_root_path` entirely, so reporting "trim the bundle down to its root"
+    // would hand the operator a fix that preserves — and, once the file really
+    // does contain only that unrelated root, guarantees — the failure.
+    if matches!(directory_label, "staging" | "production") {
+        return AcmeCaRootData::UnneededForPublicDirectory {
+            path: rendered,
+            directory: directory_label.to_owned(),
+        };
+    }
+
     // Only the first section is ever installed, so warn when the operator has
     // handed us a bundle: the root is conventionally LAST in one.
     let certificates = CertificateDer::pem_file_iter(path).map_or(1, |iter| iter.flatten().count());
@@ -5667,15 +5680,6 @@ fn resolve_acme_ca_root_data(
         return AcmeCaRootData::ExtraCertificatesIgnored {
             path: rendered,
             certificates,
-        };
-    }
-
-    // A private root pinned against a publicly-trusted Let's Encrypt endpoint
-    // can only narrow trust and break issuance.
-    if matches!(directory_label, "staging" | "production") {
-        return AcmeCaRootData::UnneededForPublicDirectory {
-            path: rendered,
-            directory: directory_label.to_owned(),
         };
     }
 
@@ -10414,6 +10418,18 @@ pub struct Vault {
                 ..
             }
         ));
+
+        // A bundle AND a public directory: the public-directory case wins. The
+        // bundle remedy ("trim it to the root alone") would leave ca_root_path
+        // set against Let's Encrypt, which is the actual failure — so the more
+        // actionable "remove ca_root_path" must be what the operator is told.
+        assert!(
+            matches!(
+                resolve_acme_ca_root_data(Some(&bundle), None, "production"),
+                AcmeCaRootData::UnneededForPublicDirectory { .. }
+            ),
+            "a bundle must not mask the public-directory warning"
+        );
     }
 
     /// A self-signed CA certificate PEM, for the `ca_root_path` resolver tests.
