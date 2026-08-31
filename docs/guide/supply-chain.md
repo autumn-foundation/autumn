@@ -179,6 +179,19 @@ autumn sbom --binary /tmp/my-app | jq -r '.components[] | "\(.name) \(.version)"
 If the binary was not built through `cargo-auditable`, the command says so and
 names the fix rather than reporting an empty list.
 
+A macOS **universal** binary is refused rather than guessed at: its
+architecture slices can carry genuinely different dependency lists (a
+`cfg(target_arch)` crate is in one and not another), so describing the whole
+file by one of them would omit crates that are really in it. Split it first:
+
+```bash
+lipo -thin arm64 my-app -output my-app.arm64
+autumn sbom --binary my-app.arm64
+```
+
+(Slices that agree are not a disagreement — a universal binary whose slices
+carry identical lists is read normally.)
+
 > **If the `autumn` inside the image is older than `sbom`.** The image installs
 > the CLI at the version its Dockerfile pins, so an image scaffolded before this
 > feature shipped carries a CLI without the subcommand. The binary is still
@@ -201,6 +214,14 @@ jq -r '.components[] | "\(.name)@\(.version)"' image-sbom.json | sort > from-ima
 
 comm -3 from-binary.txt from-image.txt
 ```
+
+Components that have no crates.io identity — a path dependency, a workspace
+member, a `[patch]`ed git checkout — deliberately carry **no** `purl`, and a
+`bom-ref` that says what they are (`path:my-app@1.0.0`). A bare
+`pkg:cargo/<name>@<version>` asserts a registry package, and emitting one for
+an unpublished crate points a scanner at somebody else's project. Git and
+alternate-registry dependencies get a `?vcs_url=` / `?repository_url=`
+qualifier naming where they actually came from.
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
 it covers the whole resolved graph for the default feature set, including
@@ -309,6 +330,7 @@ digest yourself if your threat model requires it.
 | `autumn sbom --locked` | …with a `Cargo.lock` that matches the manifests. |
 | `autumn sbom --all-features` | …with every optional feature on (broader than any single build). |
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
+| `autumn sbom --features F` | …resolving the features the build used. |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 
 ---

@@ -82,10 +82,16 @@ pub enum SbomError {
     AuditDataTooLarge { limit: usize },
     #[error(
         "no embedded dependency list found: the binary was not built with cargo-auditable \
-         (build it with `cargo auditable build --release`, or set \
-         RUSTC_WORKSPACE_WRAPPER=cargo-auditable)"
+         (rebuild it with `cargo auditable build --release`, or `autumn build --auditable`)"
     )]
     NoAuditData,
+    #[error(
+        "this universal binary carries an embedded dependency list in {slices} architecture \
+         slices, which can legitimately differ (a `cfg(target_arch)` dependency is in one and \
+         not another). Refusing to describe the whole binary by one of them — extract the \
+         architecture you mean first, e.g. `lipo -thin arm64 <binary> -output <binary>.arm64`"
+    )]
+    AmbiguousUniversalBinary { slices: usize },
     #[error("SBOM does not match the source tree:\n{0}")]
     VerifyMismatch(String),
     #[error("SBOM describes version {found}, but {expected} is being released")]
@@ -223,8 +229,50 @@ impl Component {
     }
 }
 
-fn purl(name: &str, version: &str) -> String {
-    format!("pkg:cargo/{name}@{version}")
+/// Canonical crates.io registry source, as `cargo metadata` spells it.
+const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// A package URL, plus the `bom-ref` to use when there is no meaningful one.
+///
+/// `pkg:cargo/<name>@<version>` asserts a **crates.io** identity. Emitting it
+/// for a path dependency points a scanner at a package that either does not
+/// exist or belongs to somebody else — this workspace alone has 27 path
+/// packages, several of which (`blog`, `bookmarks`, …) are not published
+/// anywhere. A git or alternate-registry dependency is not crates.io either,
+/// so it carries a qualifier naming where it actually came from.
+///
+/// Returns `(purl, bom_ref)`; `purl` is `None` when the component has no
+/// registry identity to claim, and `bom_ref` then uses a scheme that says so.
+fn package_url(name: &str, version: &str, source: Option<&str>) -> (Option<String>, String) {
+    let bare = format!("pkg:cargo/{name}@{version}");
+    match source {
+        // Unpublished: a workspace member or path dependency.
+        None => (None, format!("path:{name}@{version}")),
+        Some(CRATES_IO_SOURCE) => (Some(bare.clone()), bare),
+        Some(src) if src.starts_with("git+") => {
+            let qualified = format!(
+                "{bare}?vcs_url={}",
+                percent_encoding::utf8_percent_encode(
+                    src.trim_start_matches("git+"),
+                    percent_encoding::NON_ALPHANUMERIC
+                )
+            );
+            (Some(qualified.clone()), qualified)
+        }
+        Some(src) if src.starts_with("registry+") || src.starts_with("sparse+") => {
+            let qualified = format!(
+                "{bare}?repository_url={}",
+                percent_encoding::utf8_percent_encode(
+                    src.split_once('+').map_or(src, |(_, url)| url),
+                    percent_encoding::NON_ALPHANUMERIC
+                )
+            );
+            (Some(qualified.clone()), qualified)
+        }
+        // Something cargo grew since this was written: record it without
+        // claiming it is crates.io.
+        Some(_) => (None, format!("other:{name}@{version}")),
+    }
 }
 
 fn tool_component(tool_version: &str) -> Component {
@@ -352,13 +400,13 @@ fn component_from_package(pkg: &serde_json::Value) -> Result<Component, SbomErro
         .ok_or_else(|| SbomError::Metadata("a package has no `name`".into()))?;
     let version = str_field(pkg, "version")
         .ok_or_else(|| SbomError::Metadata(format!("package `{name}` has no `version`")))?;
-    let p = purl(name, version);
+    let (purl, bom_ref) = package_url(name, version, str_field(pkg, "source"));
     Ok(Component {
         kind: "library".into(),
-        bom_ref: Some(p.clone()),
+        bom_ref: Some(bom_ref),
         name: name.to_owned(),
         version: version.to_owned(),
-        purl: Some(p),
+        purl,
         licenses: str_field(pkg, "license").map(|l| {
             vec![License {
                 expression: l.to_owned(),
@@ -602,7 +650,20 @@ struct AuditData {
 }
 
 fn component_from_audit(pkg: &AuditPackage) -> Component {
-    let p = purl(&pkg.name, &pkg.version);
+    // cargo-auditable records a vocabulary of its own ("crates.io", "registry",
+    // "git", "local", …) rather than a cargo source URL, so translate it to the
+    // same "only claim a crates.io identity when it IS one" rule.
+    let (purl, bom_ref) = package_url(
+        &pkg.name,
+        &pkg.version,
+        match pkg.source.as_deref() {
+            Some("crates.io" | "registry") => Some(CRATES_IO_SOURCE),
+            // No URL is recorded, so there is nothing to qualify with; say it
+            // is not a registry package rather than claiming it is.
+            Some("git") => Some("git+"),
+            _ => None,
+        },
+    );
     let kind = pkg.kind.as_deref().unwrap_or("runtime");
     let mut properties = Vec::new();
     // Only annotate the non-default kind, so a runtime-only BOM stays clean.
@@ -620,10 +681,10 @@ fn component_from_audit(pkg: &AuditPackage) -> Component {
     }
     Component {
         kind: "library".into(),
-        bom_ref: Some(p.clone()),
+        bom_ref: Some(bom_ref),
         name: pkg.name.clone(),
         version: pkg.version.clone(),
-        purl: Some(p),
+        purl,
         licenses: None,
         external_references: None,
         properties: (!properties.is_empty()).then_some(properties),
@@ -927,7 +988,15 @@ fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError>
     let r = Reader::new(bytes, true);
     let narch = r.u32(4)? as usize;
     let entry = if fat64 { 32usize } else { 20 };
-    let mut last = Err(SbomError::NoAuditData);
+
+    // Collect EVERY slice that carries audit data rather than returning the
+    // first. Architecture slices can legitimately disagree — a
+    // `cfg(target_arch)` dependency is in one and not another — so describing
+    // the whole binary by whichever came first would silently omit crates that
+    // are really in it. A slice that fails to parse is skipped: an unreadable
+    // one must not mask a readable one, and if none are readable the caller
+    // still gets `NoAuditData`.
+    let mut found: Vec<&[u8]> = Vec::new();
     for i in 0..narch {
         let base = i
             .checked_mul(entry)
@@ -938,12 +1007,19 @@ fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError>
         } else {
             r.u32(base + 8)? as usize
         };
-        match extract_from_macho_thin(bytes, off) {
-            Ok(found) => return Ok(found),
-            Err(e) => last = Err(e),
+        if let Ok(section) = extract_from_macho_thin(bytes, off) {
+            found.push(section);
         }
     }
-    last
+
+    match found.len() {
+        0 => Err(SbomError::NoAuditData),
+        1 => Ok(found[0]),
+        // Identical payloads across slices are not a disagreement — that is
+        // just the same dependency list compiled twice.
+        _ if found.iter().all(|s| *s == found[0]) => Ok(found[0]),
+        slices => Err(SbomError::AmbiguousUniversalBinary { slices }),
+    }
 }
 
 fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
@@ -1237,11 +1313,15 @@ mod tests {
         })
     }
 
+    /// A registry package as `cargo metadata` really reports one — `source`
+    /// included, since that is what decides whether a crates.io identity may
+    /// be claimed.
     fn pkg(name: &str, version: &str) -> serde_json::Value {
         json!({
             "id": format!("registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"),
             "name": name,
             "version": version,
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
             "license": "MIT OR Apache-2.0",
             "repository": format!("https://example.invalid/{name}"),
         })
@@ -1362,6 +1442,78 @@ mod tests {
         assert_eq!(
             c["externalReferences"][0]["url"],
             "https://example.invalid/serde"
+        );
+    }
+
+    #[test]
+    fn a_path_package_claims_no_crates_io_identity() {
+        // `pkg:cargo/blog@0.1.0` tells a scanner to look up a crates.io crate
+        // that either does not exist or belongs to somebody else. A path
+        // dependency has no registry identity to assert.
+        let md = metadata_with(
+            &json!([{
+                "id": "path+file:///ws/blog#blog@0.1.0",
+                "name": "blog", "version": "0.1.0", "source": serde_json::Value::Null,
+            }]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let c = &v["components"][0];
+        assert!(c.get("purl").is_none(), "{c}");
+        assert_eq!(c["bom-ref"], "path:blog@0.1.0");
+    }
+
+    #[test]
+    fn a_git_package_qualifies_its_purl_with_the_repository() {
+        let md = metadata_with(
+            &json!([{
+                "id": "git+https://example.invalid/x#patched@1.0.0",
+                "name": "patched", "version": "1.0.0",
+                "source": "git+https://example.invalid/x?rev=abc123",
+            }]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let purl = v["components"][0]["purl"].as_str().unwrap();
+        assert!(
+            purl.starts_with("pkg:cargo/patched@1.0.0?vcs_url="),
+            "a git dependency must not read as a crates.io package: {purl}"
+        );
+    }
+
+    #[test]
+    fn a_crates_io_package_keeps_the_canonical_purl() {
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["components"][0]["purl"], "pkg:cargo/serde@1.0.0");
+    }
+
+    #[test]
+    fn audit_data_marks_a_locally_built_package_as_unpublished() {
+        let bom = bom_from_audit_data(
+            r#"{"packages":[{"name":"my-app","version":"1.0.0","source":"local","root":true},
+                            {"name":"vendored","version":"2.0.0","source":"local"}]}"#,
+            "0.7.0",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert!(v["components"][0].get("purl").is_none());
+        assert_eq!(v["components"][0]["bom-ref"], "path:vendored@2.0.0");
+    }
+
+    #[test]
+    fn the_no_audit_data_error_does_not_recommend_a_broken_remedy() {
+        // A bare RUSTC_WORKSPACE_WRAPPER=cargo-auditable fails the very next
+        // build — this crate's own `build.rs` documents why. Telling a user to
+        // try it is worse than saying nothing.
+        let msg = SbomError::NoAuditData.to_string();
+        assert!(msg.contains("cargo auditable build"), "{msg}");
+        assert!(
+            !msg.contains("RUSTC_WORKSPACE_WRAPPER"),
+            "the error must not suggest a remedy that breaks the build: {msg}"
         );
     }
 
@@ -2051,6 +2203,71 @@ mod tests {
     fn extracts_dep_v0_from_mach_o_with_an_underscore_prefixed_name() {
         let macho = synth_macho("__dep_v0", b"payload-bytes");
         assert_eq!(extract_dep_section(&macho).unwrap(), b"payload-bytes");
+    }
+
+    /// Wrap `slices` into a fat/universal Mach-O container.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn synth_fat_macho(slices: &[Vec<u8>]) -> Vec<u8> {
+        let header = 8 + slices.len() * 20;
+        let mut offsets = Vec::new();
+        let mut off = header;
+        for s in slices {
+            // Each slice is page-aligned in a real fat binary; alignment is
+            // irrelevant here, only that the offsets are correct.
+            offsets.push(off);
+            off += s.len();
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xcafe_babeu32.to_be_bytes());
+        out.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        for (i, s) in slices.iter().enumerate() {
+            out.extend_from_slice(&(0x0100_0007i32).to_be_bytes()); // cputype
+            out.extend_from_slice(&(i as i32).to_be_bytes()); // cpusubtype
+            out.extend_from_slice(&(offsets[i] as u32).to_be_bytes());
+            out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        assert_eq!(out.len(), header);
+        for s in slices {
+            out.extend_from_slice(s);
+        }
+        out
+    }
+
+    #[test]
+    fn a_universal_binary_with_one_auditable_slice_is_read() {
+        let fat = synth_fat_macho(&[
+            synth_macho("__text", b"no-audit-data-here"),
+            synth_macho("dep-v0", b"payload-bytes"),
+        ]);
+        assert_eq!(extract_dep_section(&fat).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn a_universal_binary_with_several_auditable_slices_is_refused() {
+        // Slices can carry different `cfg(target_arch)` dependencies, so
+        // silently describing the binary by whichever one comes first would
+        // omit crates that are genuinely in it.
+        let fat = synth_fat_macho(&[
+            synth_macho("dep-v0", b"x86-payload"),
+            synth_macho("dep-v0", b"arm-payload"),
+        ]);
+        let err = extract_dep_section(&fat).unwrap_err();
+        assert!(
+            matches!(err, SbomError::AmbiguousUniversalBinary { slices: 2 }),
+            "expected an ambiguity refusal, got: {err}"
+        );
+        assert!(err.to_string().contains("lipo"), "{err}");
+    }
+
+    #[test]
+    fn a_universal_binary_with_no_audit_data_reports_that() {
+        let fat = synth_fat_macho(&[synth_macho("__text", b"a"), synth_macho("__text", b"b")]);
+        assert!(matches!(
+            extract_dep_section(&fat),
+            Err(SbomError::NoAuditData)
+        ));
     }
 
     #[test]
