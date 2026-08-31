@@ -105,17 +105,21 @@ EXPOSE 3000
 # hostname, so it could never validate as `localhost`. Point the override at
 # any other host and the probe validates the certificate normally.
 #
-# The host is parsed out and matched EXACTLY, never by prefix: a glob like
-# `https://localhost*` would also accept `https://localhost.example.com`, which
-# leaves the container — and would skip verification for it.
+# The host is parsed out the way curl parses it, and matched EXACTLY:
+#   - never by prefix — a glob like `https://localhost*` would also accept
+#     `https://localhost.example.com`, which leaves the container;
+#   - userinfo is stripped first — in `https://localhost:3000@remote.example/`
+#     curl connects to `remote.example`, so the host is what follows the `@`.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD url="${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}"; \
         rest="${url#https://}"; \
         if [ "$rest" = "$url" ]; then host=""; \
-        else case "$rest" in \
-          "["*) host="${rest%%]*}]" ;; \
-          *) host="${rest%%[/:?]*}" ;; \
-        esac; fi; \
+        else authority="${rest%%[/?]*}"; \
+          hostport="${authority##*@}"; \
+          case "$hostport" in \
+            "["*) host="${hostport%%]*}]" ;; \
+            *) host="${hostport%%:*}" ;; \
+          esac; fi; \
         case "$host" in \
           localhost|127.0.0.1|"[::1]") tls_opt=--insecure ;; \
           *) tls_opt= ;; \

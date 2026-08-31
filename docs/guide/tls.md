@@ -164,7 +164,30 @@ HEALTHCHECK at `https://`:
 
 ```bash
 docker run -d \
-  -v /etc/letsencrypt/live/app.example.com:/etc/autumn/tls:ro \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
+  -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -p 443:3000 \
+  my-app
+```
+
+**Mount the whole `/etc/letsencrypt` tree, at the same path**, not just the
+`live/<domain>` directory. certbot's `live/*.pem` are *relative symlinks* into
+`../../archive/<domain>/`, so a bind mount of `live/<domain>` alone leaves every
+target outside the mount: the container resolves them under `/etc/archive`,
+finds nothing, and the app fails fast on an unreadable certificate instead of
+serving HTTPS. Mounting the tree at the identical path keeps the symlinks valid
+and lets a renewal — which writes a new `archive/` file and re-points the
+symlink — be picked up by the poller, since the mtime it stats is the
+symlink's target.
+
+With a certificate that is *not* symlinked (a corporate or vendor PEM), any
+directory works:
+
+```bash
+docker run -d \
+  -v /srv/tls:/etc/autumn/tls:ro \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
   -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
@@ -183,10 +206,13 @@ validate as `localhost`. Point the override at any other host and the probe
 validates the certificate normally.
 
 Mount the key read-only and keep it `0600` on the host, owned by a user the
-container's `autumn` user (uid 10001) can read. Because the certificate lives on
-a bind mount, a host-side `certbot renew` rewrites the same files the container
-polls — the hot reload works exactly as it does outside a container, with no
-image rebuild and no restart.
+container's `autumn` user (uid 10001) can read. (certbot's `archive/` is
+`0700 root` by default, so either run the container as a user that can read it
+or relax the group permission for the app's user — a certificate the app cannot
+open is a fail-fast boot error naming the path, not a silent fallback.) Because
+the certificate lives on a bind mount, a host-side `certbot renew` rewrites the
+files the container polls — the hot reload works exactly as it does outside a
+container, with no image rebuild and no restart.
 
 CI exercises this path on every change to the deployment scaffold: the
 `https-target` job in `.github/workflows/release-image-boot.yml` builds the

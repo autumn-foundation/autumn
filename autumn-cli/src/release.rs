@@ -991,15 +991,21 @@ mod tests {
         // (stdout is redirected to /dev/null by the probe itself).
         let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
 
-        let cases: [(&str, bool); 8] = [
+        let cases: [(&str, bool); 11] = [
             ("", false),
             ("http://localhost:3000/health", false),
             ("https://localhost:3000/health", true),
+            ("https://localhost/health", true),
             ("https://127.0.0.1:3000/health", true),
             ("https://[::1]:3000/health", true),
             ("https://localhost.example.com/health", false),
             ("https://127.0.0.1.attacker.example/health", false),
             ("https://internal.example.com/health", false),
+            // curl reads `localhost:3000` here as URL userinfo and connects to
+            // `remote.example` — so the loopback-looking prefix must not count.
+            ("https://localhost:3000@remote.example/health", false),
+            // …while real userinfo in front of a loopback host still is one.
+            ("https://user:pass@localhost:3000/health", true),
         ];
 
         for (url, expect_insecure) in cases {
