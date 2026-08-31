@@ -7,101 +7,34 @@
 //! same connect-info and graceful-shutdown wiring `app.rs` uses. A rustls
 //! client that trusts the test certificate then drives it over TLS.
 //!
-//! No tokio-rustls is needed on the client side: like `pg_tls.rs`, the client
-//! speaks rustls synchronously over a `std::net::TcpStream` on a blocking
-//! thread, so the only test dependencies are `rustls` + `rustls-pki-types`.
+//! Scope: the *listener* — the handshake, the accept loop under hostile
+//! clients, and connect-info. The rest of the app surface under TLS (probes,
+//! the request timeout, SSE, `wss://`, draining an in-flight request, and
+//! certificate renewal) lives in `tls_app_surface.rs`.
 //!
-//! The certificate fixture is a self-signed `CN=localhost` (SAN `localhost` +
-//! `127.0.0.1`) valid until 2126 — shared with the `tls` module's unit tests.
+//! The client here speaks rustls synchronously over a `std::net::TcpStream` on
+//! a blocking thread, deliberately: several of these tests need a client that
+//! holds a raw socket open, and a blocking client makes "this request did not
+//! wait behind that stalled handshake" a direct assertion.
 
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_web::tls::{
-    ReloadableCertResolver, TlsListener, build_server_config, crypto_provider, load_certified_key,
-};
 use axum::Router;
 use axum::routing::get;
-use axum::serve::ListenerExt as _;
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_util::sync::CancellationToken;
+use rustls_pki_types::ServerName;
 
-/// A client-side verifier that accepts any server certificate. The fixture is
-/// a self-signed CA cert (so rustls' path validation would reject it as a leaf,
-/// `CaUsedAsEndEntity`); these tests exercise the TLS *transport*, not identity
-/// verification, so danger-accepting the cert is the documented approach.
-#[derive(Debug)]
-struct AcceptAnyServerCert;
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-const CERT_PEM: &str = include_str!("../fixtures/tls/localhost.cert.pem");
-const KEY_PEM: &str = include_str!("../fixtures/tls/localhost.key.pem");
-
-fn now_unix() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap()
-}
-
-/// Write the cert + key fixtures to a tempdir and return their paths (kept
-/// alive by the returned `TempDir`).
-fn write_fixtures() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let cert = dir.path().join("cert.pem");
-    let key = dir.path().join("key.pem");
-    std::fs::write(&cert, CERT_PEM).unwrap();
-    std::fs::write(&key, KEY_PEM).unwrap();
-    (dir, cert, key)
-}
+use super::tls_support::{CertFixture, RecordingVerifier, serve_tls_router};
 
 /// A running HTTPS test server plus the knobs to talk to and stop it.
 struct TestServer {
     addr: SocketAddr,
-    shutdown: CancellationToken,
+    shutdown: tokio_util::sync::CancellationToken,
     handle: tokio::task::JoinHandle<std::io::Result<()>>,
-    _dir: tempfile::TempDir,
+    /// Holds the certificate tempdir open for the server's lifetime.
+    _fixture: CertFixture,
 }
 
 /// Boot the real `TlsListener` on an ephemeral port, serving a minimal router
@@ -114,25 +47,7 @@ async fn serve_tls() -> TestServer {
 /// Like [`serve_tls`] but with a caller-chosen per-handshake timeout, so a test
 /// can prove a stalled handshake is shed rather than parking the accept loop.
 async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestServer {
-    let (dir, cert, key) = write_fixtures();
-    let provider = crypto_provider();
-    let certified = load_certified_key(&cert, &key, &provider, now_unix()).expect("load cert/key");
-    let resolver = Arc::new(ReloadableCertResolver::new(certified));
-    let server_config =
-        build_server_config(Arc::clone(&provider), resolver).expect("build server config");
-
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = tcp.local_addr().expect("local_addr");
-    let shutdown = CancellationToken::new();
-    let listener = TlsListener::new(
-        tcp,
-        server_config,
-        handshake_timeout,
-        shutdown.child_token(),
-    );
-
+    let fixture = CertFixture::write();
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(
@@ -146,31 +61,13 @@ async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestSe
             ),
         );
 
-    // Mirror the app.rs HTTPS serve arm: no-op tap_io wrapper so axum supplies
-    // ConnectInfo<SocketAddr>, plus into_make_service_with_connect_info.
-    let listener = listener.tap_io(|_io| {});
-    let make_service =
-        axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<SocketAddr>(
-            router,
-        );
-
-    let shutdown_wait = shutdown.clone();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, make_service)
-            .with_graceful_shutdown(async move {
-                shutdown_wait.cancelled().await;
-            })
-            .await
-    });
-
-    // Give the listener a moment to start accepting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (server, _resolver) = serve_tls_router(router, &fixture, handshake_timeout).await;
 
     TestServer {
-        addr,
-        shutdown,
-        handle,
-        _dir: dir,
+        addr: server.addr,
+        shutdown: server.shutdown,
+        handle: server.handle,
+        _fixture: fixture,
     }
 }
 
@@ -183,7 +80,7 @@ fn https_get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_custom_certificate_verifier(Arc::new(RecordingVerifier::default()))
         .with_no_client_auth();
 
     // SNI/verification uses the certificate's `localhost` SAN even though we
@@ -400,9 +297,3 @@ async fn concurrent_handshakes_do_not_serialize_accept() {
     server.shutdown.cancel();
     let _ = server.handle.await;
 }
-
-// TODO(#1603 follow-up): wss (WebSocket-over-TLS) integration coverage. The
-// listener yields the same `ConnectInfo<SocketAddr>` stream as the plain-TCP
-// path, so a `ws` upgrade rides the identical service; wiring a full
-// tokio-tungstenite-over-rustls client here is disproportionate for this first
-// slice and is tracked as a follow-up.

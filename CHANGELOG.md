@@ -187,6 +187,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused connections and 100% carry-over under sustained load across the
   cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
 
+- **Direct HTTPS is now proven end-to-end, not just at the listener:** serving
+  TLS in-process (`[server.tls]`) had coverage for the listener itself, but
+  nothing exercised the rest of the app surface through it — so "everything
+  behaves the same under TLS" was a claim rather than a test.
+  `tls_app_surface.rs` now serves the **same** router twice, once over the real
+  `TlsListener` and once over plain TCP, and requires the framework probes
+  (`/health`, `/live`, `/ready`, `/startup`) and `/actuator/health` to match on
+  status, body, and content type; it drives the inbound
+  request timeout (a slow handler still 503s, a fast one still doesn't), an SSE
+  stream (events arrive incrementally and outlive the request deadline), a
+  `wss://` WebSocket echo, and a graceful shutdown that drains an in-flight
+  HTTPS request. A new blocking CI lane runs the whole `tls` suite, which the
+  workspace `cargo test` — where `tls` is off by default — never compiled.
+  Renewal is covered the same way: the mtime-polling reloader moved out of
+  `app.rs` into `autumn_web::tls::CertReloader`, so a test can rewrite the cert
+  and key on disk and watch the served certificate change with the site up and
+  no restart. `autumn/src/tls.rs` also joins the determinism seam gate, so its
+  one deliberate wall-clock read (certificate validity) stays the only one in
+  that module.
+  Issue #1603.
+
+- **The release-image boot gate now covers an HTTPS boot** (a new
+  `https-target` job): it builds the generated image with the `tls` feature on,
+  boots it with a self-signed test certificate supplied through
+  `AUTUMN_SERVER__TLS__*`, and requires an HTTPS `/health` + `/actuator/health`
+  200 validated with `--cacert` (not `-k`), that plain HTTP on the same port
+  does *not* answer, and that the container's own HEALTHCHECK reaches
+  `healthy`. `docs/guide/tls.md` gains the matching "Serving HTTPS from the
+  release image" walkthrough — including that the `tls` feature must be a
+  default feature for the image's `cargo build --release` to link it — and a
+  "What behaves the same under TLS" section naming the two things that
+  deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
+  #1603.
+
 ### Changed
 
 - **The `Listening` log line now reports the address actually bound** rather
@@ -315,6 +349,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
 ### Fixed
+
+- **A container that terminates TLS itself is no longer permanently
+  `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
+  `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app
+  serves direct HTTPS (`[server.tls]`) failed every probe — Docker marked it
+  unhealthy forever, and in the generated `docker-compose.yml` anything waiting
+  on `condition: service_healthy` never started. The probe URL is now
+  `${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}`, so the default is
+  byte-for-byte today's plain-HTTP check and an HTTPS deployment sets one env
+  var. It passes `--insecure` because the probe is a loopback call to the
+  container's own listener: a certificate issued to the app's public hostname
+  cannot validate as `localhost`, and hostname validation buys nothing on a
+  call that never leaves the container. Issue #1603.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every

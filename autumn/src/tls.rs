@@ -2,25 +2,50 @@
 //!
 //! This module lets an Autumn app terminate HTTPS in-process, without a
 //! sidecar reverse proxy, when `[server.tls]` names a certificate + key.
-//! It provides three things:
+//! It provides five things:
 //!
-//! 1. **Fail-fast loading** — [`load_certified_key`] reads the PEM cert chain
-//!    and private key from disk, verifies they parse and that the private key
-//!    matches the leaf certificate (rustls' [`CertifiedKey::from_der`] compares
+//! (`lib.rs` carries an outer doc comment on `pub mod tls`, which is merged
+//! with this block, so every link below is fully qualified — a bare item name
+//! would resolve in the crate root instead of here.)
+//!
+//! 1. **Fail-fast loading** — [`load_certified_key`](crate::tls::load_certified_key)
+//!    reads the PEM cert chain and private key from disk, verifies they parse
+//!    and that the private key matches the leaf certificate (rustls'
+//!    [`CertifiedKey::from_der`](rustls::sign::CertifiedKey::from_der) compares
 //!    `SubjectPublicKeyInfo`), and rejects an already-expired leaf certificate.
 //!    Every error names the offending path so a misconfiguration is actionable.
-//! 2. **A reloadable resolver** — [`ReloadableCertResolver`] holds the current
-//!    [`CertifiedKey`] behind an `RwLock` and implements
-//!    [`ResolvesServerCert`], so the certificate can be swapped atomically at
-//!    runtime (e.g. after an ACME/`certbot` renewal) without dropping the
-//!    listener or restarting the process.
-//! 3. **Expiry inspection** — [`inspect_leaf`] returns the leaf certificate's
-//!    `notAfter` so `autumn doctor` can warn on near-expiry and fail on an
-//!    expired certificate, offline (no server boot, no network).
+//! 2. **A reloadable resolver** —
+//!    [`ReloadableCertResolver`](crate::tls::ReloadableCertResolver) holds the
+//!    current [`CertifiedKey`](rustls::sign::CertifiedKey) behind an `RwLock`
+//!    and implements [`ResolvesServerCert`](rustls::server::ResolvesServerCert),
+//!    so the certificate can be swapped atomically at runtime (e.g. after an
+//!    ACME/`certbot` renewal) without dropping the listener or restarting the
+//!    process.
+//! 3. **Expiry inspection** — [`inspect_leaf`](crate::tls::inspect_leaf)
+//!    returns the leaf certificate's `notAfter` so `autumn doctor` can warn on
+//!    near-expiry and fail on an expired certificate, offline (no server boot,
+//!    no network).
+//! 4. **The listener** — [`TlsListener`](crate::tls::TlsListener) is the
+//!    `axum::serve::Listener` the app binds when `[server.tls]` is set: it
+//!    drives each rustls handshake off the accept loop, under a per-connection
+//!    timeout, so neither a failed nor a stalled handshake can wedge the
+//!    server.
+//! 5. **Renewal** — [`CertReloader`](crate::tls::CertReloader) polls the
+//!    cert/key mtimes and swaps the resolver's certificate when they change, so
+//!    a `certbot`/ACME renewal is picked up without a restart.
 //!
 //! The crypto backend is `ring`, the SAME backend the outbound Postgres TLS
 //! path already uses — the workspace deliberately forbids a second TLS backend
 //! (no aws-lc-rs / native-tls / openssl).
+
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). The one exception is `now_unix` below: certificate validity
+// is judged against real wall time by design, and it carries a per-site
+// #[allow(clippy::disallowed_methods, reason = "…")].
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -472,7 +497,8 @@ const READY_CONN_CHANNEL_CAPACITY: usize = 1024;
 ///
 /// TCP-accept and the rustls handshake are **decoupled**: a background acceptor
 /// task drains `tcp.accept()` and, for each connection, spawns a bounded
-/// handshake task (see [`MAX_CONCURRENT_HANDSHAKES`]) that performs the rustls
+/// handshake task (bounded by this module's `MAX_CONCURRENT_HANDSHAKES`, which
+/// is private) that performs the rustls
 /// handshake and forwards the finished stream over a channel to `accept`. This
 /// means a flood of silent or stalled clients cannot serialize the accept loop:
 /// a client that opens TCP but never completes (or even starts) the handshake
@@ -790,6 +816,172 @@ pub fn leaf_not_after_from_pem(chain_pem: &[u8]) -> Result<i64, String> {
     leaf_validity_unix(Path::new("<memory>"), &leaf)
         .map(|(_, not_after)| not_after)
         .map_err(|e| e.to_string())
+}
+
+/// Wall-clock seconds since the epoch — the reference instant certificate
+/// validity is judged against, and the one deliberate real-time read in this
+/// module.
+///
+/// Deliberately **real** time, not the injected clock: a certificate's
+/// `notBefore`/`notAfter` are facts about the real world, so a test or
+/// simulation clock pinned to the sim epoch must never be able to declare a
+/// live certificate not-yet-valid (or an expired one fine).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "TLS certificate validity is judged against real wall time by \
+              design — see this function's doc comment. Injecting a virtual \
+              clock here would let a simulation misjudge a real certificate."
+)]
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Modification times of the cert and key files, `None` for a file that could
+/// not be stat'd. Reloads trigger on any change to this pair.
+fn file_mtimes(
+    cert: &Path,
+    key: &Path,
+) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    (mtime(cert), mtime(key))
+}
+
+/// The background certificate hot-reloader (issue #1603).
+///
+/// Polls the cert/key file mtimes and swaps the served certificate in place
+/// when either changes, so a `certbot` / ACME renewal is picked up **without a
+/// restart and without dropping the site**.
+///
+/// Never breaks the listener: a failed reload logs an error, keeps the
+/// previously loaded certificate, and retries on the next tick. The baseline
+/// mtimes only advance on a *successful* load, so a partial write observed
+/// mid-renewal is retried rather than skipped.
+///
+/// `app.rs` constructs one of these when `[server.tls]` names a static cert and
+/// spawns [`run`](Self::run) as a child of the server's shutdown token.
+pub struct CertReloader {
+    resolver: Arc<ReloadableCertResolver>,
+    provider: Arc<CryptoProvider>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    interval: std::time::Duration,
+    /// Mtimes of the cert/key as of construction — i.e. as of the load whose
+    /// certificate the resolver is currently serving. Captured here rather than
+    /// on the loop's first tick so a renewal that lands between the bind and
+    /// the task's first poll is still seen as a change.
+    baseline: (Option<std::time::SystemTime>, Option<std::time::SystemTime>),
+}
+
+impl CertReloader {
+    /// Build a reloader for the certificate the given resolver serves.
+    ///
+    /// `interval` is the mtime poll period (see
+    /// [`DEFAULT_RELOAD_INTERVAL_SECS`]). A zero interval would busy-loop, so
+    /// [`run`](Self::run) substitutes the default for it rather than spinning.
+    ///
+    /// Stats both files once, synchronously, to record the baseline the poll
+    /// loop compares against. Construct this at the same point the certificate
+    /// is loaded: a baseline taken later — on the spawned task's first tick —
+    /// would absorb a renewal that landed in between, and the loop would then
+    /// serve the superseded certificate until the *next* renewal.
+    #[must_use]
+    pub fn new(
+        resolver: Arc<ReloadableCertResolver>,
+        provider: Arc<CryptoProvider>,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        interval: std::time::Duration,
+    ) -> Self {
+        let baseline = file_mtimes(&cert_path, &key_path);
+        Self {
+            resolver,
+            provider,
+            cert_path,
+            key_path,
+            interval,
+            baseline,
+        }
+    }
+
+    /// Run the poll loop until `shutdown` is cancelled.
+    pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) {
+        // A zero interval would spin the loop (and its two `spawn_blocking`
+        // stats per tick) as fast as the runtime allows. `app.rs` clamps
+        // `reload_interval_secs` before constructing this, but the type is
+        // public, so enforce the invariant where it belongs instead of trusting
+        // every caller to know it.
+        let interval = if self.interval.is_zero() {
+            std::time::Duration::from_secs(DEFAULT_RELOAD_INTERVAL_SECS)
+        } else {
+            self.interval
+        };
+        // Stat and PEM-read the cert/key on a blocking thread — both touch the
+        // filesystem and must not run on a tokio worker. On a `JoinError` (the
+        // blocking pool shutting down) just skip the tick and retry next time.
+        let stat_mtimes = |cert: PathBuf, key: PathBuf| {
+            tokio::task::spawn_blocking(move || file_mtimes(&cert, &key))
+        };
+
+        // The baseline was taken when the served certificate was loaded, so a
+        // renewal between then and the first tick below is a change, not the
+        // status quo.
+        let mut last = self.baseline;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = shutdown.cancelled() => break,
+            }
+
+            let current = match stat_mtimes(self.cert_path.clone(), self.key_path.clone()).await {
+                Ok(mtimes) => mtimes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TLS reload: mtime read task failed; skipping tick");
+                    continue;
+                }
+            };
+            if current == last {
+                continue;
+            }
+
+            let cert_path = self.cert_path.clone();
+            let key_path = self.key_path.clone();
+            let provider = Arc::clone(&self.provider);
+            let loaded = tokio::task::spawn_blocking(move || {
+                load_certified_key(&cert_path, &key_path, &provider, now_unix())
+            })
+            .await;
+            let loaded = match loaded {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TLS reload: load task failed; skipping tick");
+                    continue;
+                }
+            };
+
+            match loaded {
+                Ok(next) => {
+                    self.resolver.store(next);
+                    // Only advance the baseline on a successful load, so a
+                    // partial write observed mid-renewal is retried on the
+                    // next tick.
+                    last = current;
+                    tracing::info!(
+                        cert = %self.cert_path.display(),
+                        "Reloaded TLS certificate after detecting a change on disk"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        cert = %self.cert_path.display(),
+                        "TLS certificate reload failed; keeping the previously loaded certificate"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

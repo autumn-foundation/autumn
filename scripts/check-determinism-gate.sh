@@ -125,10 +125,18 @@ GATED_MODULES=(
   # window on the injected `ClockSource`, so an upgrade's timing is as
   # reproducible under a virtual clock as the drain it replaces.
   autumn/src/upgrade.rs:default
+  # Direct HTTPS termination (#1603). `tls.rs::now_unix` is the module's one
+  # deliberate real-wall-time read — certificate validity is a fact about the
+  # real world, not about the injected clock — and the gate is what keeps a
+  # later off-seam read added beside it (in the bind path or the `CertReloader`
+  # poll loop) from shipping unlinted. NOTE: `autumn/src/acme/renewal.rs` has
+  # its own ungated `default_now_unix`; gating it needs an `--features acme`
+  # enforcing clippy lane, which does not exist yet.
+  autumn/src/tls.rs:tls
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=16
+MODULE_COUNT_FLOOR=17
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

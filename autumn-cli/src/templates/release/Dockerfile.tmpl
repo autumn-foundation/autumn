@@ -95,8 +95,22 @@ COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /a
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000
 
+# Container health probe. Override AUTUMN_HEALTHCHECK_URL when the app
+# terminates TLS itself ([server.tls], issue #1603) — e.g.
+# `https://localhost:3000/health` — otherwise an HTTPS-serving container would
+# be marked unhealthy forever by a plain-HTTP probe.
+#
+# Certificate validation is skipped ONLY for an https loopback probe: that call
+# never leaves the container, and the certificate is issued to the app's PUBLIC
+# hostname, so it could never validate as `localhost`. Point the override at
+# any other host and the probe validates the certificate normally.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD url="${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}"; \
+        case "$url" in \
+          https://localhost*|https://127.0.0.1*|"https://[::1]"*) tls_opt=--insecure ;; \
+          *) tls_opt= ;; \
+        esac; \
+        curl -fsS ${tls_opt} "$url" >/dev/null || exit 1
 
 USER autumn
 

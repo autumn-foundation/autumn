@@ -926,6 +926,54 @@ mod tests {
         );
     }
 
+    /// Issue #1603 AC6: an image whose app terminates TLS itself
+    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// hardcoded to `http://` marks that container permanently unhealthy —
+    /// and in compose, `depends_on: condition: service_healthy` never
+    /// releases. The probe URL must therefore be overridable at runtime.
+    #[test]
+    fn dockerfile_healthcheck_url_is_overridable_for_direct_tls() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        // The HEALTHCHECK is a multi-line continuation; take it whole.
+        let healthcheck = content
+            .lines()
+            .skip_while(|line| !line.starts_with("HEALTHCHECK"))
+            .take_while(|line| line.ends_with('\\') || line.starts_with("HEALTHCHECK"))
+            .chain(
+                content
+                    .lines()
+                    .skip_while(|line| !line.starts_with("HEALTHCHECK"))
+                    .skip_while(|line| line.ends_with('\\'))
+                    .take(1),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_URL"),
+            "HEALTHCHECK must honor $AUTUMN_HEALTHCHECK_URL so an HTTPS-terminating \
+             image can be probed over https://, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("http://localhost:3000/health"),
+            "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("--insecure"),
+            "an https loopback probe must not fail on a certificate issued to the app's \
+             public hostname, got: {healthcheck}"
+        );
+        // …and that skip must be scoped to the loopback probe: an override
+        // pointing somewhere else has to validate the certificate normally.
+        assert!(
+            healthcheck.contains("https://localhost*") && healthcheck.contains("case "),
+            "--insecure must be scoped to an https loopback URL, not applied to whatever \
+             AUTUMN_HEALTHCHECK_URL names, got: {healthcheck}"
+        );
+    }
+
     #[test]
     fn dockerfile_exposes_port_3000() {
         let tmp = TempDir::new().unwrap();
