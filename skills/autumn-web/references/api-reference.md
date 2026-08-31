@@ -1444,7 +1444,22 @@ In-process HTTPS termination on the same host:port (off by default).
 - `reload_interval_secs` (default `60`) — certs hot-reload by polling file
   mtimes.
 - `handshake_timeout_secs` (default `10`).
-- Fail-fast at startup on bad / missing / mismatched / expired PEM.
+- Fail-fast at startup on bad / missing / mismatched / expired PEM, on
+  `[server.tls]` without the `tls` feature compiled in, and on `[server.tls]`
+  combined with `server.unix_socket`.
+- Everything else behaves as it does over plain HTTP: the `/health`, `/live`,
+  `/ready`, `/startup` probes and `/actuator/health`, the `[server.timeouts]`
+  request deadline, SSE streaming, `wss://` WebSockets, and graceful shutdown.
+- `autumn_web::tls::CertReloader` is the public reload task (mtime polling)
+  the app spawns; `CertReloader::load` builds the resolver and its reloader
+  together so a renewal during startup cannot be missed.
+- **In a container:** the image builder runs a bare `cargo build --release`, so
+  `tls` must be a *default* feature of the app; mount the PEMs and set
+  `AUTUMN_SERVER__TLS__CERT_PATH` / `__KEY_PATH`; set
+  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health` plus
+  `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
+  probes its own loopback listener over TLS instead of failing forever. See
+  `docs/guide/tls.md`.
 
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 
