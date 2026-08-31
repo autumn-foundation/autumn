@@ -1063,7 +1063,7 @@ double-submits and replays.
 | `mail_previews(...)` | Dev mail previews |
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
-| `plugin(plugin)`, `plugins(tuple)` | Plugin install |
+| `plugin(plugin)`, `plugins(tuple)` | Plugin install (`autumn plugin add <crate>` writes the call for first-party plugins, #1606) |
 | `listeners(listeners![...])` | Event listeners (**0.6.0**) |
 | `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**0.6.0**) |
 | `with_shard_router(router)` | Sharding router (**0.6.0**) |

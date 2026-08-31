@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-command plugin install — `autumn plugin add` / `autumn plugin list`
+  (#1606):** Autumn had a real plugin seam (the `Plugin` trait, first-party
+  plugin crates, a crates.io naming convention, an author-facing
+  `autumn plugin-check`) and no consumer-facing tooling at all: using a shipped
+  capability meant finding the crate, hand-editing `Cargo.toml`, hand-writing
+  the `.plugin(...)` mount, and reading config docs — four places to pick an
+  incompatible version or misconfigure the mount. `autumn plugin list` now shows
+  every installable plugin with a one-line description and the version
+  compatible with the app's `autumn-web` — the five first-party crates plus
+  community crates discovered on crates.io through the documented
+  `autumn-plugin-<name>` convention (`--json` for machine-readable output,
+  `--offline` to skip the lookup). `autumn plugin add <name>` performs the whole
+  install: the dependency at a compatible version, the mount spliced into the
+  `autumn_web::app()` builder chain, and the post-install steps (config keys,
+  follow-up generators like `autumn generate admin`) printed.
+
+  Every refusal is total rather than partial. The version gate runs before a
+  single filesystem action exists, so installing a plugin whose supported
+  `autumn-web` range excludes the app fails naming both versions with the app
+  byte-identical. A second `add` of the same plugin reports it as already
+  installed and changes nothing — no duplicate dependency, no duplicate mount.
+  And when the builder chain cannot be edited confidently (a heavily customized
+  `main.rs`, or a one-line chain with nowhere to splice a call) the command
+  writes **nothing** and prints the exact dependency line and mount snippet to
+  apply by hand, so it can never leave an app in a non-compiling state. Community
+  crates get their dependency written but never an automatic mount: the
+  `<Name>Plugin` is derived from the naming convention and printed, because
+  nothing outside that crate can verify it. A CI gate installs every first-party
+  plugin into a fresh `autumn new` scaffold and requires a green `cargo check`.
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted

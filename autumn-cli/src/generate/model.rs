@@ -1143,7 +1143,7 @@ pub(super) const TEMPLATE_SHIPPED_CARGO_DEPS: &[&str] =
 /// section, skipping entries already present. Pure string transformation —
 /// preserves the rest of the file as-is. If the file has no `[dependencies]`
 /// section yet, appends a new one with the requested entries.
-pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
+pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
 
     // Locate the `[dependencies]` table header. Tolerate trailing whitespace

@@ -18,6 +18,9 @@ on:
     paths:
       - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
+      - "autumn-cli/src/plugin/**"
+      # The comment-aware scanner `autumn plugin add` anchors its mount on.
+      - "autumn-cli/src/rust_source.rs"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
@@ -38,12 +41,23 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The `autumn plugin add` install gate (#1606) compiles each
+      # first-party plugin into a fresh scaffold, so a change to any of
+      # them can break the mount this workflow is the only proof of.
+      - "autumn-admin-plugin/**"
+      - "autumn-cache-redis/**"
+      - "autumn-media-plugin/**"
+      - "autumn-search/**"
+      - "autumn-storage-s3/**"
       - "Cargo.toml"
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
       - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
+      - "autumn-cli/src/plugin/**"
+      # The comment-aware scanner `autumn plugin add` anchors its mount on.
+      - "autumn-cli/src/rust_source.rs"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
@@ -64,6 +78,14 @@ on:
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
+      # The `autumn plugin add` install gate (#1606) compiles each
+      # first-party plugin into a fresh scaffold, so a change to any of
+      # them can break the mount this workflow is the only proof of.
+      - "autumn-admin-plugin/**"
+      - "autumn-cache-redis/**"
+      - "autumn-media-plugin/**"
+      - "autumn-search/**"
+      - "autumn-storage-s3/**"
       - "Cargo.toml"
   schedule:
     # Weekly on Monday at 04:00 UTC — catches rot from transitive dep updates
@@ -565,3 +587,41 @@ jobs:
           cargo test -p autumn-cli --test cli_tests \
             integration::db_scrub::scrubbed_database_migrates_clean_and_boots_the_app \
             -- --ignored --exact
+
+  # ── `autumn plugin add` install gate (#1606) ────────────────────────────────
+  #
+  # The Success Metric for issue #1606: installing every first-party plugin
+  # into a fresh `autumn new` scaffold must produce a project that compiles on
+  # the first try. `plugin_add_first_party_scaffolds_cargo_check` runs
+  # `autumn plugin add` for each of the five plugin crates against its own
+  # scaffold, asserts the second `add` is a no-op, and then `cargo check`s the
+  # result — the only place the generated mount snippets are compiled against
+  # the real crates.
+  #
+  # It lives in its own job (not the compile-and-serve matrix) because it
+  # builds the aws-sdk-s3 / redis / media dependency graphs, which nothing else
+  # in this workflow pulls in. The five projects share one CARGO_TARGET_DIR
+  # inside the test, so the framework is compiled once.
+  plugin-install:
+    name: autumn plugin add install gate
+    needs: meta
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: plugin_add_first_party_scaffolds_cargo_check
+        run: |
+          cargo test -p autumn-cli --test generate \
+            plugin_add_first_party_scaffolds_cargo_check -- --ignored --exact
