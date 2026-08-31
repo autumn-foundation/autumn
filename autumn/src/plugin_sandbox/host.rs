@@ -908,21 +908,9 @@ impl SandboxHost {
             return Err(SandboxLoadError::ForbiddenImports(forbidden));
         }
 
+        // Both ceilings are enforced by `refuse_unbounded_shape` above, before
+        // `Module::new` rather than after it.
         let (segments, init_bytes) = (shape.segments, shape.init_bytes);
-        if segments > MAX_INIT_SEGMENTS {
-            return Err(SandboxLoadError::InstantiationTooExpensive {
-                what: "data and element segments",
-                found: segments,
-                max: MAX_INIT_SEGMENTS,
-            });
-        }
-        if init_bytes > MAX_INIT_SECTION_BYTES {
-            return Err(SandboxLoadError::InstantiationTooExpensive {
-                what: "bytes of data and element sections",
-                found: init_bytes,
-                max: MAX_INIT_SECTION_BYTES,
-            });
-        }
         // A budget that cannot cover instantiation is a manifest whose every
         // route is already broken: the charge is unavoidable and paid before
         // `_start`, so the guest never executes an instruction. Refusing at
@@ -1807,6 +1795,27 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             "the module's section stream could not be walked".to_owned(),
         ));
     };
+    // Before `Module::new`, with the rest of them. These two used to be
+    // checked in `from_module` *after* compiling — so a module declaring half
+    // a million empty segments, under the aggregate entry ceiling and thus
+    // never refused for that, had a representation built for every one of them
+    // before the ceiling that exists to prevent exactly that work ran. Moving
+    // the per-segment walk earlier last round bounded the walking and left the
+    // compiling; this is the other half.
+    if shape.segments > MAX_INIT_SEGMENTS {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "data and element segments",
+            found: shape.segments,
+            max: MAX_INIT_SEGMENTS,
+        });
+    }
+    if shape.init_bytes > MAX_INIT_SECTION_BYTES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "bytes of data and element sections",
+            found: shape.init_bytes,
+            max: MAX_INIT_SECTION_BYTES,
+        });
+    }
     if shape.code_bytes > MAX_CODE_BYTES {
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "code section bytes",
@@ -4305,6 +4314,52 @@ path = "/hello/greet"
         assert!(
             matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_segment_ceiling_is_enforced_by_the_pre_compilation_gate() {
+        // Not merely "the module is refused" — *where* it is refused is the
+        // whole point. `from_module` calls `refuse_unbounded_shape` before
+        // `Module::new` precisely because compiling is what builds a
+        // representation of every declaration; a ceiling checked after it is a
+        // ceiling checked too late. These two ceilings were checked after it,
+        // under a comment saying they must not be.
+        //
+        // A module can sit over `MAX_INIT_SEGMENTS` (4,096) and still be far
+        // under `MAX_DECLARED_ENTRIES` (1,000,000), so nothing else refused it
+        // first and wasmi expanded every segment before the answer came back.
+        //
+        // Asserting through `refuse_unbounded_shape` directly is what makes
+        // this about ordering: the gate that runs first has to be the one that
+        // says no.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for offset in 0..=MAX_INIT_SEGMENTS {
+            let _ = writeln!(wat, "  (data (i32.const {offset}) \"x\")");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("the pre-compilation gate must refuse the segment count");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "data and element segments",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // And the fixture really is under the aggregate ceiling, so it is this
+        // check refusing it and not the entry one standing in.
+        let shape = module_shape(&wasm).expect("the fixture walks");
+        assert!(
+            shape.declared_entries <= MAX_DECLARED_ENTRIES,
+            "the fixture would have been refused for its entry count anyway"
         );
     }
 

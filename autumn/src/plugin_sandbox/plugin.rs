@@ -558,63 +558,35 @@ async fn read_request(
 }
 
 /// Turn a sanitized guest answer into an HTTP response.
-/// A response body that carries the plugin's concurrency permit.
+/// The plugin's answer, owning the concurrency permit alongside its bytes.
 ///
-/// The permit used to be released the moment the interpreter returned, which
-/// bounded interpreters and nothing else: the decoded response is handed to
-/// hyper as a buffer, and a client that reads slowly — or stops reading — keeps
-/// it resident long after. Each finished request could admit another
-/// interpreter while its predecessor's bytes were still held, so
-/// `max_concurrency` multiplied by the response ceiling stopped being a bound
-/// on anything. Holding the permit here ties it to the bytes rather than to the
-/// work that produced them, and it is released when the body is drained or
-/// dropped, whichever comes first.
-struct PermitBody {
-    inner: Body,
-    /// Taken at EOF rather than only on drop. "Drained or dropped" has to mean
-    /// drained *or* dropped: a consumer that polls the body to its end and then
-    /// keeps the exhausted value — middleware that inspects responses, an
-    /// embedder that stores them — has finished with the plugin's memory, and
-    /// holding its permit until that value happens to be destroyed would keep
-    /// the plugin at capacity for as long as someone kept a receipt.
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+/// The permit exists to bound what one plugin can keep resident: the decoded
+/// response is handed to hyper as a buffer, and a client that reads slowly — or
+/// stops reading — keeps it alive long after the interpreter returned. So the
+/// permit must be released exactly when *the bytes* are freed.
+///
+/// It took three tries to learn that "exactly when the bytes are freed" is not
+/// a moment any `poll_frame` can name. Releasing on drop of the body missed a
+/// consumer that drained and kept the value; releasing at end-of-stream missed
+/// a body that was already ended and never polled; releasing on the poll that
+/// ends the stream missed the fact that the same poll *hands the buffer away* —
+/// the body keeps nothing, so tying the permit to the body's state released it
+/// while the consumer still held every byte.
+///
+/// Each fix moved the release to a different point in the body's life, and the
+/// bytes do not live in the body for all of it. Owning the permit here, beneath
+/// the `Bytes`, is what makes the question answerable: the permit is dropped
+/// when the last handle to the buffer is, whether that is inside hyper, inside
+/// middleware, or in the response nobody ever polled.
+struct PermitBuf {
+    data: Vec<u8>,
+    /// Never read: it is held so that dropping this buffer returns the slot.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl http_body::Body for PermitBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        // Released when the *inner body* is finished, not only when a later
-        // poll returns `None`. A single-frame body — which is every answer a
-        // guest gives, since the response is a buffer — ends on the very poll
-        // that yields its frame: the consumer that now holds those bytes may
-        // read `is_end_stream`, or the exact `size_hint`, and never poll
-        // again. Waiting for a `None` that a conforming consumer has no reason
-        // to ask for is the same mistake as waiting for a `poll_frame` an
-        // already-ended body never needs, one step further along the stream.
-        let finished = match &polled {
-            std::task::Poll::Ready(None) => true,
-            std::task::Poll::Ready(Some(_)) => self.inner.is_end_stream(),
-            std::task::Poll::Pending => false,
-        };
-        if finished {
-            // Delivery is complete; the bytes are the caller's problem now.
-            self.permit = None;
-        }
-        polled
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
+impl AsRef<[u8]> for PermitBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -649,20 +621,17 @@ fn build_response(
         // that can return a script.
         out = out.header(http::header::CONTENT_TYPE, "application/octet-stream");
     }
-    // The permit rides with the bytes, not with the interpreter that produced
-    // them: hyper may hold this buffer long after `run` returned.
-    let inner = Body::from(response.body.clone());
-    // An empty body is already at end-of-stream, and a conforming consumer is
-    // entitled to read `is_end_stream` and never poll a frame at all — so the
-    // release at EOF would never run and the slot would be held until the
-    // response value happened to be dropped. There are no plugin bytes left
-    // resident to bound, so hand the slot back here instead of tying it to
-    // someone else's destructor.
-    let already_delivered = http_body::Body::is_end_stream(&inner);
-    let body = Body::new(PermitBody {
-        inner,
-        permit: (!already_delivered).then_some(permit),
-    });
+    // The permit rides *inside* the buffer, not alongside the body that carries
+    // it: hyper may hold these bytes long after `run` returned, and it holds
+    // them by `Bytes` rather than by the body they came out of.
+    //
+    // An empty answer costs nothing here either, and needs no special case:
+    // `Full` drops an empty buffer at construction, which drops the permit with
+    // it. The slot comes back before the response is even returned.
+    let body = Body::from(bytes::Bytes::from_owner(PermitBuf {
+        data: response.body.clone(),
+        _permit: permit,
+    }));
     let Ok(mut built) = out.body(body) else {
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
     };
@@ -1034,15 +1003,15 @@ sha256 = "{digest}"
     }
 
     #[tokio::test]
-    async fn a_delivered_body_hands_its_permit_back_on_the_poll_that_ended_it() {
-        // The release moved from `poll_frame` to construction for a body that
-        // was *already* ended; this is one step further along the same stream.
-        // A single-frame body — every answer a guest gives, since the response
-        // is a buffer — reaches end-of-stream on the poll that yields its
-        // frame. A consumer holding those bytes may then read `is_end_stream`
-        // or the exact `size_hint` and never poll again, so waiting for a
-        // `None` it has no reason to ask for held the slot until the response
-        // was dropped.
+    async fn the_permit_outlives_the_body_and_dies_with_the_bytes() {
+        // The release point moved three times before it moved to the right
+        // *place*. This is the case that showed the place was wrong: the poll
+        // that ends the stream also hands the buffer away, so a permit tied to
+        // the body's state came back while the consumer still held every byte —
+        // admitting another full-sized response outside `max_concurrency`.
+        //
+        // Now the permit lives under the `Bytes`, so this test follows the
+        // bytes rather than the body.
         use crate::plugin_sandbox::wire::SandboxResponse;
         use http_body_util::BodyExt as _;
 
@@ -1057,33 +1026,35 @@ sha256 = "{digest}"
             &full,
             Arc::clone(&permits).acquire_owned().await.expect("permit"),
         );
-        assert_eq!(
-            permits.available_permits(),
-            0,
-            "the bytes are still undelivered"
-        );
+        assert_eq!(permits.available_permits(), 0, "the bytes are undelivered");
 
-        // Exactly one poll: the one that yields the only frame. A second would
-        // be the `None` this fix exists to stop depending on.
         let frame = response
             .body_mut()
             .frame()
             .await
             .expect("a frame")
             .expect("not an error");
-        assert!(
-            frame.is_data(),
-            "the fixture must yield its bytes in one frame"
+        let data = frame.into_data().expect("a data frame");
+        assert_eq!(data.as_ref(), b"hi");
+
+        // The body is exhausted and holds nothing…
+        assert!(http_body::Body::is_end_stream(response.body()));
+        // …and dropping it must not return the slot, because the bytes are
+        // still here, in `data`.
+        drop(response);
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the slot came back while the response bytes were still held"
         );
 
+        // Only the last handle to the buffer returns it.
+        drop(data);
         assert_eq!(
             permits.available_permits(),
             1,
-            "the slot is held after the bytes were handed over"
+            "the slot did not come back when the bytes were freed"
         );
-        // Dropped after the assertion, so a pass cannot be the destructor's
-        // doing rather than the fix's.
-        drop(response);
     }
 
     #[test]

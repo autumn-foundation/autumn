@@ -254,7 +254,9 @@ wasmi = { version = "0.40", optional = true }
 # time by ~90% on the no-DB onboarding path (issue #2309).
 autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
 axum.workspace = true
-bytes = "1"
+# 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
+# sandbox concurrency permit and release it exactly when the last handle drops.
+bytes = "1.9"
 # Best-effort ASCII folding for `slug::slugify` (issue #1260, e.g. "café" ->
 # "cafe"). Already resolved transitively (via `stringprep`, the Postgres
 # SCRAM-auth crate), so this adds no new entry to the dependency graph.
