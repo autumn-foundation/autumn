@@ -49,6 +49,29 @@ pub enum PluginError {
     )]
     UnknownPlugin(String),
 
+    /// The app already declares this plugin at an incompatible version.
+    #[error(
+        "`{crate_name}` is already declared as `{declared}`, which is not compatible with the `{installing}` this CLI installs — no files were changed.\nUpdate that line to `{crate_name} = \"{installing}\"` (or run `autumn upgrade`) and try again: leaving it would mount a {declared}-series plugin into a {installing}-series builder, which does not compile."
+    )]
+    DependencyVersionMismatch {
+        /// The plugin crate.
+        crate_name: String,
+        /// The requirement the manifest already carries.
+        declared: String,
+        /// The version this CLI would install.
+        installing: String,
+    },
+
+    /// `autumn-web` comes from a path/git checkout that no `[patch.crates-io]`
+    /// redirects, so a registry plugin would link a *second* framework copy.
+    #[error(
+        "this app depends on `autumn-web` from a local path or git checkout with no `[patch.crates-io]` entry redirecting it — no files were changed.\nA plugin installed from crates.io would pull its own copy of `autumn-web`, so Cargo would build two different framework crates and the mount would not satisfy the local `AppBuilder`'s traits.\nAdd to your workspace Cargo.toml:\n\n    [patch.crates-io]\n    autumn-web = {{ path = \"<your autumn-web checkout>\" }}\n\nor depend on `{crate_name}` by path from the same checkout."
+    )]
+    UnpatchedLocalFramework {
+        /// The plugin that could not be installed.
+        crate_name: String,
+    },
+
     /// crates.io returned something that is not a usable version string.
     #[error(
         "crates.io reported version `{version}` for `{crate_name}`, which is not a usable version requirement — no files were changed"
@@ -295,6 +318,74 @@ pub fn dependency_present(manifest: &str, crate_name: &str) -> bool {
         .is_some_and(|deps| deps.contains_key(crate_name))
 }
 
+/// The version requirement `manifest` already declares for `crate_name` under
+/// `[dependencies]`, if any.
+///
+/// A path/git entry has no requirement to compare, so it reads as `None`.
+#[must_use]
+pub fn declared_dependency_version(manifest: &str, crate_name: &str) -> Option<String> {
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    let entry = table.get("dependencies")?.as_table()?.get(crate_name)?;
+    match entry {
+        toml::Value::String(version) => Some(version.clone()),
+        toml::Value::Table(table) => table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map(std::borrow::ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+/// Whether the app's `autumn-web` comes from a path or git checkout that no
+/// `[patch.crates-io]` entry redirects.
+///
+/// This is fatal for an install from crates.io: the plugin would depend on the
+/// *registry* `autumn-web`, Cargo would build two distinct framework crates,
+/// and the generated mount would not satisfy the local `AppBuilder`'s traits.
+/// A `[patch.crates-io] autumn-web` entry collapses the two back into one,
+/// which is exactly what this repo's own conformance gate does — so the check
+/// is for a local source that is *not* patched, not for a local source.
+///
+/// Manifests are read from `root` upward, because both the dependency and the
+/// patch table commonly live in an enclosing workspace manifest.
+#[must_use]
+pub fn unpatched_local_framework(root: &Path) -> bool {
+    let mut local = false;
+    let mut patched = false;
+    let mut dir = Some(root);
+    while let Some(current) = dir {
+        if let Ok(content) = std::fs::read_to_string(current.join("Cargo.toml"))
+            && let Ok(table) = toml::from_str::<toml::Table>(&content)
+        {
+            for kind in ["dependencies", "workspace"] {
+                let deps = if kind == "workspace" {
+                    table.get(kind).and_then(|w| w.get("dependencies"))
+                } else {
+                    table.get(kind)
+                };
+                if let Some(entry) = deps
+                    .and_then(toml::Value::as_table)
+                    .and_then(|deps| deps.get("autumn-web"))
+                    .and_then(toml::Value::as_table)
+                    && (entry.contains_key("path") || entry.contains_key("git"))
+                {
+                    local = true;
+                }
+            }
+            if table
+                .get("patch")
+                .and_then(|patch| patch.get("crates-io"))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|patched_crates| patched_crates.contains_key("autumn-web"))
+            {
+                patched = true;
+            }
+        }
+        dir = current.parent();
+    }
+    local && !patched
+}
+
 /// Whether `main_rs` already mounts `entry` **in code**.
 ///
 /// Two independent kinds of evidence, because a single substring test is wrong
@@ -455,10 +546,29 @@ pub fn plan_add(
         });
     }
 
+    if unpatched_local_framework(root) {
+        return Err(PluginError::UnpatchedLocalFramework {
+            crate_name: entry.crate_name.to_owned(),
+        });
+    }
+
     let manifest = manifest_path(root);
     let manifest_src = std::fs::read_to_string(&manifest)?;
     let main_path = root.join("src").join("main.rs");
     let main_src = std::fs::read_to_string(&main_path).unwrap_or_default();
+
+    // An existing entry at another series is not "already installed": the key
+    // is there, so `ensure_cargo_dependencies` would leave the old pin in
+    // place while the mount written below is this series' shape.
+    if let Some(declared) = declared_dependency_version(&manifest_src, entry.crate_name)
+        && check_compat(&declared, version) == Compat::Incompatible
+    {
+        return Err(PluginError::DependencyVersionMismatch {
+            crate_name: entry.crate_name.to_owned(),
+            declared,
+            installing: version.to_owned(),
+        });
+    }
 
     let dependency_installed = dependency_present(&manifest_src, entry.crate_name);
     let already_mounted = mount_present(&main_src, entry);
@@ -706,6 +816,100 @@ maud = { version = "0.27", features = ["axum"] }
             std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap(),
             before_main
         );
+    }
+
+    /// A plugin already pinned to another framework series is not "already
+    /// installed": `ensure_cargo_dependencies` leaves an existing key alone,
+    /// so the old pin would stay while this series' mount was written in.
+    #[test]
+    fn an_incompatible_existing_pin_is_refused_without_editing() {
+        let cargo = format!("{SCAFFOLD_CARGO}autumn-admin-plugin = \"0.6.0\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        let before = std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("0.6.0"), "{message}");
+        assert!(message.contains("0.7.0"), "{message}");
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            cargo
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_matching_existing_pin_is_not_refused() {
+        let cargo = format!("{SCAFFOLD_CARGO}autumn-admin-plugin = \"0.7.0\"\n");
+        let tmp = fake_project(SCAFFOLD_MAIN, &cargo);
+        assert!(plan_add(tmp.path(), admin(), "0.7.0").is_ok());
+    }
+
+    #[test]
+    fn declared_dependency_version_reads_both_spellings() {
+        assert_eq!(
+            declared_dependency_version("[dependencies]\nfoo = \"1.2\"\n", "foo").as_deref(),
+            Some("1.2")
+        );
+        assert_eq!(
+            declared_dependency_version(
+                "[dependencies]\nfoo = { version = \"1.2\", features = [] }\n",
+                "foo"
+            )
+            .as_deref(),
+            Some("1.2")
+        );
+        assert_eq!(
+            declared_dependency_version("[dependencies]\nfoo = { path = \"../foo\" }\n", "foo"),
+            None
+        );
+        assert_eq!(declared_dependency_version("[dependencies]\n", "foo"), None);
+    }
+
+    /// A crates.io plugin against an unpatched local `autumn-web` links a
+    /// SECOND framework copy, so the mount cannot satisfy the local
+    /// `AppBuilder`'s traits. Refuse, and say how to fix it.
+    #[test]
+    fn an_unpatched_local_framework_is_refused() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = { path = \"../autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        assert!(unpatched_local_framework(tmp.path()));
+
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::UnpatchedLocalFramework { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("patch.crates-io"), "{err}");
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            cargo
+        );
+    }
+
+    /// …but a `[patch.crates-io]` entry collapses the two copies back into
+    /// one, which is exactly what this repo's own conformance gate does.
+    #[test]
+    fn a_patched_local_framework_is_allowed() {
+        let cargo = "[package]\nname = \"demo\"\n\n\
+                     [dependencies]\nautumn-web = { path = \"../autumn\" }\n\n\
+                     [patch.crates-io]\nautumn-web = { path = \"../autumn\" }\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, cargo);
+        assert!(!unpatched_local_framework(tmp.path()));
+        assert!(plan_add(tmp.path(), admin(), "0.7.0").is_ok());
+    }
+
+    /// A plain registry dependency is not a local checkout.
+    #[test]
+    fn a_registry_framework_is_not_a_local_checkout() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        assert!(!unpatched_local_framework(tmp.path()));
     }
 
     // ── AC #2: dependency + mount ────────────────────────────────────────────
