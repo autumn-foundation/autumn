@@ -473,7 +473,13 @@ pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, ArtifactError> {
     let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0).min(max));
     let read = file
         .by_ref()
-        .take(max as u64 + 1)
+        // Reading one past the cap is how "larger than the cap" is detected.
+        // At `usize::MAX` there is nothing past it to detect and the addition
+        // itself overflows: a debug build panics, and a release build wraps the
+        // limit to zero and returns an empty read that looks like a success.
+        // Saturating is the honest answer — at the top of the range the cap
+        // cannot be exceeded, so the read is simply unbounded.
+        .take((max as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|err| io(&err))?;
     if read > max {
@@ -567,6 +573,20 @@ path = "/hello/greet"
             artifact.manifest().sha256,
             SandboxArtifact::digest(EMPTY_MODULE)
         );
+    }
+
+    #[test]
+    fn an_unlimited_read_cap_reads_the_file_rather_than_nothing() {
+        // `usize::MAX` is how a caller says "no limit". The cap is applied by
+        // reading one byte past it, and that addition used to overflow: debug
+        // panicked, release wrapped the limit to zero and handed back an empty
+        // `Ok` — the worst of the three outcomes, because it looks like data.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.autumn-plugin");
+        std::fs::write(&path, b"some bytes").expect("writes");
+
+        let bytes = read_bounded(&path, usize::MAX).expect("an unlimited cap must read the file");
+        assert_eq!(bytes, b"some bytes", "the read came back empty or short");
     }
 
     #[test]

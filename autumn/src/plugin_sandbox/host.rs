@@ -655,10 +655,12 @@ pub enum SandboxLoadError {
     /// past the end compiles clean and then fails every instantiation the
     /// artifact is ever given.
     SegmentOutOfBounds {
-        /// The byte just past the segment's end.
+        /// Which store the segment writes into, for the message.
+        what: &'static str,
+        /// One past the segment's furthest write.
         end: u64,
-        /// The initial memory the module declares, in bytes.
-        memory_bytes: u64,
+        /// What the module starts that store with.
+        capacity: u64,
     },
     /// The module's *initial* linear memory is already over the manifest's
     /// ceiling, so no request could ever instantiate it.
@@ -720,10 +722,14 @@ impl fmt::Display for SandboxLoadError {
                 "the plugin's initial linear memory is {found} bytes, over the manifest's \
                  {max}-byte ceiling; no request could instantiate it"
             ),
-            Self::SegmentOutOfBounds { end, memory_bytes } => write!(
+            Self::SegmentOutOfBounds {
+                what,
+                end,
+                capacity,
+            } => write!(
                 f,
-                "an active data segment ends at byte {end}, past the {memory_bytes} bytes of \
-                 memory the module starts with; every instantiation would fail on it"
+                "an active segment writes up to {end} of the plugin's {what}, past the \
+                 {capacity} it starts with; every instantiation would fail on it"
             ),
             Self::Engine(detail) => write!(f, "the sandbox engine could not be built: {detail}"),
         }
@@ -944,37 +950,7 @@ impl SandboxHost {
             });
         }
 
-        // An active segment is copied in during instantiation, which is per
-        // request, so one that does not fit the memory the module starts with
-        // fails every instantiation the artifact is ever given. Said once here
-        // rather than 502 for the life of the plugin.
-        if shape.data_end > initial_bytes {
-            return Err(SandboxLoadError::SegmentOutOfBounds {
-                end: shape.data_end,
-                memory_bytes: initial_bytes,
-            });
-        }
-
-        // The same argument as the memory ceiling above, for the other
-        // per-instance store the limiter guards. `table_growing` refuses a
-        // total past `MAX_TABLE_ELEMENTS` at instantiation — which is per
-        // request — so a module whose tables are *already* over it at rest
-        // loads cleanly and then fails every request it is ever given. Said
-        // once here, it is a verdict `autumn plugin inspect` can be trusted on.
-        if shape.table_count > MAX_TABLES {
-            return Err(SandboxLoadError::InstantiationTooExpensive {
-                what: "tables",
-                found: shape.table_count,
-                max: MAX_TABLES,
-            });
-        }
-        if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
-            return Err(SandboxLoadError::InstantiationTooExpensive {
-                what: "initial table elements",
-                found: usize::try_from(shape.table_elements).unwrap_or(usize::MAX),
-                max: MAX_TABLE_ELEMENTS as usize,
-            });
-        }
+        refuse_unrunnable_shape(&shape, initial_bytes)?;
 
         Ok(Self {
             engine,
@@ -1325,6 +1301,9 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// The first active element segment that writes past its table, as
+    /// (one past its furthest write, what the table starts with).
+    element_overflow: Option<(u64, u64)>,
     /// The furthest byte any active data segment writes to.
     ///
     /// Zero when the module has none, or when the offsets are not constants
@@ -1345,6 +1324,84 @@ struct ModuleShape {
     /// per request; knowing the declared total at load is what turns "every
     /// request fails" into "this artifact does not load".
     table_elements: u64,
+}
+
+/// Whether any *active* element segment writes past the table it targets.
+///
+/// `None` when the section cannot be read — the same restraint the data walk
+/// uses: an offset this cannot evaluate is left to the engine rather than
+/// guessed at.
+fn element_section_overflows(
+    wasm: &[u8],
+    start: usize,
+    section_end: usize,
+    table_minimums: &[u64],
+) -> Option<(u64, u64)> {
+    let (count, mut at) = leb128(wasm, start)?;
+    let mut overflow = None;
+    for _ in 0..count {
+        let (flags, next) = leb128(wasm, at)?;
+        at = next;
+        // Only an active segment is written at instantiation; passive (1, 5)
+        // and declarative (3, 7) ones are not.
+        let active = matches!(flags, 0 | 2 | 4 | 6);
+        let mut table_index = 0usize;
+        if flags == 2 || flags == 6 {
+            let (index, next) = leb128(wasm, at)?;
+            table_index = index;
+            at = next;
+        }
+        let mut offset = None;
+        if active {
+            if *wasm.get(at)? == 0x41 {
+                let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
+                at = next;
+                offset = u64::try_from(value).ok();
+            }
+            while *wasm.get(at)? != 0x0b {
+                at = at.checked_add(1)?;
+                if at > section_end {
+                    return None;
+                }
+            }
+            at = at.checked_add(1)?;
+        }
+        // Every form but 0 and 4 carries an elemkind or reftype byte.
+        if !matches!(flags, 0 | 4) {
+            at = at.checked_add(1)?;
+        }
+        let (items, next) = leb128(wasm, at)?;
+        at = next;
+        if flags >= 4 {
+            // `vec(expr)`: each element is a constant expression.
+            for _ in 0..items {
+                while *wasm.get(at)? != 0x0b {
+                    at = at.checked_add(1)?;
+                    if at > section_end {
+                        return None;
+                    }
+                }
+                at = at.checked_add(1)?;
+            }
+        } else {
+            // `vec(funcidx)`: each element is one LEB128.
+            for _ in 0..items {
+                let (_, next) = leb128(wasm, at)?;
+                at = next;
+            }
+        }
+        if at > section_end {
+            return None;
+        }
+        if let Some(offset) = offset {
+            let end = offset.checked_add(items as u64)?;
+            let capacity = table_minimums.get(table_index).copied().unwrap_or(0);
+            if end > capacity && overflow.is_none() {
+                overflow = Some((end, capacity));
+            }
+        }
+    }
+    overflow
 }
 
 /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
@@ -1450,6 +1507,61 @@ const CODE_SECTION: u8 = 10;
 /// The custom section is the one whose payload is not a counted vector.
 const CUSTOM_SECTION: u8 = 0;
 
+/// The gates that prove an artifact can actually be instantiated.
+///
+/// Distinct from the ceilings in `refuse_unbounded_shape`, which bound what
+/// loading may *cost*: these say the module can be built at all. Each one
+/// stands for a defect where the artifact loaded clean, inspected clean, and
+/// then failed every single request it was ever given.
+fn refuse_unrunnable_shape(
+    shape: &ModuleShape,
+    initial_bytes: u64,
+) -> Result<(), SandboxLoadError> {
+    // An active segment is copied in during instantiation, which is per
+    // request, so one that does not fit the memory the module starts with
+    // fails every instantiation the artifact is ever given. Said once here
+    // rather than 502 for the life of the plugin.
+    if shape.data_end > initial_bytes {
+        return Err(SandboxLoadError::SegmentOutOfBounds {
+            what: "linear memory",
+            end: shape.data_end,
+            capacity: initial_bytes,
+        });
+    }
+
+    // And the same for a segment written into a table rather than into
+    // memory: fixing one without the other would leave half the defect.
+    if let Some((end, capacity)) = shape.element_overflow {
+        return Err(SandboxLoadError::SegmentOutOfBounds {
+            what: "table elements",
+            end,
+            capacity,
+        });
+    }
+
+    // The same argument as the memory ceiling above, for the other
+    // per-instance store the limiter guards. `table_growing` refuses a
+    // total past `MAX_TABLE_ELEMENTS` at instantiation — which is per
+    // request — so a module whose tables are *already* over it at rest
+    // loads cleanly and then fails every request it is ever given. Said
+    // once here, it is a verdict `autumn plugin inspect` can be trusted on.
+    if shape.table_count > MAX_TABLES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "tables",
+            found: shape.table_count,
+            max: MAX_TABLES,
+        });
+    }
+    if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "initial table elements",
+            found: usize::try_from(shape.table_elements).unwrap_or(usize::MAX),
+            max: MAX_TABLE_ELEMENTS as usize,
+        });
+    }
+    Ok(())
+}
+
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut cursor = 8usize; // magic + version
     let mut segments = 0usize;
@@ -1460,6 +1572,8 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut global_count = 0usize;
     let mut code_bytes = 0usize;
     let mut data_end = 0u64;
+    let mut table_minimums: Vec<u64> = Vec::new();
+    let mut element_overflow: Option<(u64, u64)> = None;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1470,6 +1584,11 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         if id != CUSTOM_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
             declared_entries = declared_entries.saturating_add(count);
+        }
+        if id == ELEMENT_SECTION {
+            // The table section precedes this one in a well-formed module, so
+            // the minimums are known by the time the segments are read.
+            element_overflow = element_section_overflows(wasm, after_size, end, &table_minimums);
         }
         if id == ELEMENT_SECTION || id == DATA_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
@@ -1508,6 +1627,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
                 let (minimum, next) = leb128(wasm, at)?;
                 at = next;
                 table_elements = table_elements.saturating_add(minimum as u64);
+                table_minimums.push(minimum as u64);
                 if flag == 0x01 {
                     let (_, after_max) = leb128(wasm, at)?;
                     at = after_max;
@@ -1523,6 +1643,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        element_overflow,
         data_end,
         code_bytes,
         global_count,
@@ -3884,6 +4005,29 @@ path = "/hello/greet"
                     ..
                 }
             ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_element_segment_past_the_end_of_its_table_is_refused_at_load() {
+        // The exact sibling of the data-segment case: an active element segment
+        // is written into its table during instantiation, so one that does not
+        // fit compiles clean and fails every request. Fixing segments into
+        // memory without fixing segments into tables would have left half the
+        // defect in place.
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (table 1 funcref)
+             (func $f (nop))
+             (elem (i32.const 1) $f)
+             (func (export "_start") (nop)))"#;
+        let wasm = wat::parse_str(wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a segment past the end of its table must not load");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
             "{err:?}"
         );
     }
