@@ -37,6 +37,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod plugin;
 mod plugin_check;
 mod process;
 mod release;
@@ -44,6 +45,7 @@ mod replay;
 mod retention;
 mod routes;
 mod routes_audit;
+mod rust_source;
 mod scaling_driver;
 mod schema;
 mod search;
@@ -333,6 +335,36 @@ pub enum SearchSubcommands {
 }
 
 /// Subcommands for `autumn jobs`.
+/// `autumn plugin ...` — consumer-facing plugin discovery and install
+/// (issue #1606). The author-facing conformance gate stays at
+/// `autumn plugin-check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PluginSubcommands {
+    /// List installable plugins with the version compatible with this app.
+    ///
+    /// Covers every first-party plugin plus community crates discoverable on
+    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Skip the crates.io lookup (first-party plugins only).
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    Add {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the crates.io lookup (first-party plugins only).
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum JobsSubcommands {
     /// Emit the effective drained-queue manifest the running app declares.
@@ -1238,6 +1270,25 @@ enum Commands {
     Search {
         #[command(subcommand)]
         action: SearchSubcommands,
+    },
+
+    /// Discover and install Autumn plugins.
+    ///
+    /// `list` shows every installable plugin with the version compatible with
+    /// this app; `add` writes the dependency, mounts the plugin in the
+    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin list
+    ///   autumn plugin list --json --offline
+    ///   autumn plugin add autumn-admin-plugin
+    ///   autumn plugin add autumn-cache-redis --dry-run
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// The plugin subcommand to run.
+        #[command(subcommand)]
+        action: PluginSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -4181,6 +4232,31 @@ fn run_command(command: Commands) {
                 });
             }
         },
+        Commands::Plugin { action } => {
+            let root = std::path::Path::new(".");
+            let code = match action {
+                PluginSubcommands::List { json, offline } => {
+                    plugin::run_list(&plugin::ListOptions {
+                        root,
+                        json,
+                        offline,
+                    })
+                }
+                PluginSubcommands::Add {
+                    name,
+                    dry_run,
+                    offline,
+                } => plugin::run_add(&plugin::AddOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    offline,
+                }),
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::PluginCheck {
             package,
             bin,
@@ -7607,6 +7683,71 @@ mod tests {
     #[test]
     fn parse_token_revoke_without_token_is_error() {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
+    }
+
+    // ── autumn plugin (list/add) tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_list_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(!json);
+                assert!(!offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_json_and_offline() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list", "--json", "--offline"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(json);
+                assert!(offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["autumn", "plugin", "add"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_add_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Add { name, dry_run, .. },
+            } => {
+                assert_eq!(name, "autumn-admin-plugin");
+                assert!(dry_run);
+            }
+            _ => panic!("expected plugin add"),
+        }
+    }
+
+    /// `autumn plugin-check` predates `autumn plugin` and must keep working
+    /// as its own top-level command.
+    #[test]
+    fn plugin_and_plugin_check_are_distinct_commands() {
+        let check =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        assert!(matches!(check.command, Commands::PluginCheck { .. }));
     }
 
     // ── autumn plugin-check tests ──────────────────────────────────────────

@@ -27,6 +27,57 @@ autumn_web::app()
     .await;
 ```
 
+## Installing a plugin
+
+One command adds the dependency, mounts the plugin in your `autumn_web::app()`
+builder chain, and prints whatever configuration the plugin still needs:
+
+```bash
+autumn plugin list                      # what can I install, at what version?
+autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
+```
+
+`autumn plugin list` shows every first-party plugin with the version compatible
+with your app's `autumn-web`, plus community crates it finds on crates.io under
+the `autumn-plugin-` naming convention below. Add `--json` for machine-readable
+output, or `--offline` to skip the crates.io lookup.
+
+`autumn plugin add` is safe to re-run: a second `add` of the same plugin
+reports that it is already installed and changes nothing. It refuses — before
+touching any file — to install a plugin whose supported `autumn-web` range
+excludes your app's version, naming both versions. Pass `--dry-run` to see the
+edits without applying them.
+
+### Community plugins
+
+A crate following the third-party `autumn-plugin-<name>` convention gets its
+dependency written for you, but **not** its mount: nothing outside that crate
+can verify it really exposes `<Name>Plugin`, and a wrong guess would leave your
+app not compiling. The command prints the convention-derived
+`.plugin(...)` line to paste into your builder chain — check the crate's README
+first.
+
+### The manual path
+
+`autumn plugin add` never leaves an app in a non-compiling state. If it cannot
+find your `autumn_web::app()` builder chain — a heavily customized `main.rs`, or
+a one-line chain with nowhere to splice a call — it changes **nothing** and
+prints the exact dependency line and mount snippet to apply by hand instead.
+That is also the path to follow when you would rather wire a plugin yourself:
+
+```toml
+# Cargo.toml
+[dependencies]
+autumn-admin-plugin = "0.7.0"
+```
+
+```rust,ignore
+autumn_web::app()
+    .plugin(autumn_admin_plugin::AdminPlugin::new())
+    .run()
+    .await;
+```
+
 ## First-party plugin crates
 
 | Crate | What it adds | Guide |
