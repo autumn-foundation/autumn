@@ -382,7 +382,10 @@ mod tests {
         );
         // Still legible enough to act on — an operator has to recognise which
         // import the refusal is about.
-        assert!(rendered.starts_with("wasi_snapshot_preview1::"), "{rendered}");
+        assert!(
+            rendered.starts_with("wasi_snapshot_preview1::"),
+            "{rendered}"
+        );
     }
 
     fn manifest_toml() -> String {
