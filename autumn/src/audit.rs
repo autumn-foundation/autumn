@@ -311,6 +311,21 @@ pub struct TracingAuditSink;
 impl AuditSink for TracingAuditSink {
     fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
+            // `metadata` is emitted as a field too (#1605): a SIEM
+            // consuming this target is exactly who the map is for, and
+            // dropping it would strip a retention record of its cutoff and
+            // row count — the only two facts that make the record useful.
+            // Serialized as JSON rather than `?event.metadata` so consumers
+            // get a parseable object instead of Rust `Debug` syntax; an
+            // empty map is omitted so ordinary events are unchanged.
+            let metadata = if event.metadata.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&event.metadata)
+                        .unwrap_or_else(|_| format!("{:?}", event.metadata)),
+                )
+            };
             tracing::info!(
                 target: "autumn.audit",
                 timestamp = %event.timestamp,
@@ -319,6 +334,7 @@ impl AuditSink for TracingAuditSink {
                 target_resource_id = %event.target_resource_id,
                 ip_address = ?event.ip_address,
                 status = ?event.status,
+                metadata = metadata.as_deref(),
                 "audit_event"
             );
             Ok(())
@@ -697,6 +713,65 @@ mod tests {
 
         assert!(outcome.supported);
         assert_eq!(outcome.entries_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn tracing_sink_emits_the_metadata_map() {
+        // Regression (#1605 Codex round 2): the tracing target is what a SIEM
+        // consumes, so silently dropping `metadata` would strip a retention
+        // record of its cutoff and row count.
+        use std::sync::Mutex as StdMutex;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        let event = AuditEvent::new(
+            "autumn:retention",
+            "retention.sweep",
+            "job_history",
+            None,
+            AuditStatus::Success,
+        )
+        .with_metadata("cutoff", "2026-06-01T00:00:00Z")
+        .with_metadata("rows_removed", "17");
+
+        with_default(subscriber, || {
+            futures::executor::block_on(TracingAuditSink.write(event)).expect("write");
+        });
+
+        let output =
+            String::from_utf8_lossy(&captured.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .into_owned();
+        assert!(output.contains("rows_removed"), "{output}");
+        assert!(output.contains("2026-06-01T00:00:00Z"), "{output}");
     }
 
     #[tokio::test]

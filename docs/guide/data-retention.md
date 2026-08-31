@@ -108,9 +108,10 @@ rather than pretending they all work the same way.
 **`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres
 table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
 run, so one run never holds a long lock or spikes replication lag; a first
-sweep of a years-old table finishes over several ticks, and a run that stops
-at that cap is reported (and audited) as `truncated` rather than looking like
-a clean sweep. The cutoff is resolved by the database itself (`NOW() -
+sweep of a years-old table finishes over several ticks. Completeness is
+established by re-counting the stale rows at the end of the run, not inferred
+from the last batch's size, and a run that left rows behind is reported (and
+audited) as `truncated` rather than looking like a clean sweep. The cutoff is resolved by the database itself (`NOW() -
 <window>`), not by the app process, so a replica with a fast clock cannot
 delete rows younger than the window.
 
@@ -157,14 +158,31 @@ TTL the record is written with*: because the cap is a `min`, it can only ever
 shorten a lifetime. `webhook_replay` needs no cap — boot validation (below)
 already guarantees the marker's own window is within the retention window.
 
-> Two caveats worth knowing before you set these:
+> Four caveats worth knowing before you set these:
 >
+> - **A write-time cap cannot reach a record that already exists.** After you
+>   shorten one of these windows, records written under the *previous* TTL
+>   keep it and age out under it. Enforcement is therefore complete only once
+>   the old TTL has elapsed — at most the previous window. The report says so
+>   in the dataset's note rather than claiming a bound the data does not yet
+>   satisfy. If you need the old records gone sooner, flush the relevant Redis
+>   key prefix (`idempotency.redis.key_prefix`, `session.redis.key_prefix`)
+>   deliberately, knowing that dropping idempotency records lets an in-flight
+>   client retry re-execute.
 > - **`sessions` is a login lifetime.** `session.max_age_secs` is the session
 >   cookie's `Max-Age` as well as the server-side record's TTL, so
 >   `retention.sessions = "1h"` signs every user out after an hour.
+> - **A custom `SessionStore` must apply the window itself.** A store
+>   installed with `AppBuilder::with_session_store` receives no TTL from the
+>   framework — `SessionStore::save` has no TTL parameter — so capping
+>   `session.max_age_secs` shortens only the client cookie. A database-backed
+>   custom store keeps its server-side rows until *it* expires them. The
+>   report's `sessions` note states this; treat the window as a cookie bound
+>   plus a contract your store has to honour.
 > - **The in-memory session and idempotency stores are development backends.**
 >   The in-memory session store has no expiry at all; run Redis (or a custom
->   `SessionStore`) in production, as the session guide already recommends.
+>   `SessionStore` that honours the window) in production, as the session
+>   guide already recommends.
 
 **`archive rewrite`** — the JSONL audit archive is rewritten without the stale
 entries: filtered into a sibling temp file that inherits the archive's
@@ -357,7 +375,9 @@ the `Source`/notes rather than silently claiming an enforced window.
 
 The same information is emitted as a structured `retention_sweep` line on the
 `autumn.audit` tracing target, so it lands in your log pipeline even with no
-`AuditLogger` installed.
+`AuditLogger` installed. `TracingAuditSink` also emits the `metadata` map (as
+a JSON object field) for every event that carries one, so a SIEM consuming
+that target sees the cutoff and row count too.
 
 ## Configuration Reference
 

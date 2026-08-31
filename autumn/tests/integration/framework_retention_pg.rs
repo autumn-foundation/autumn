@@ -930,3 +930,82 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
     assert_eq!(failure.status, AuditStatus::Failure);
     assert!(failure.metadata.contains_key("error"), "{failure:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_short_batch_does_not_end_the_sweep_while_rows_remain() {
+    // Regression (#1605 Codex round 2): the loop used to stop on any batch
+    // smaller than the batch size, and reported `truncated = false` from it.
+    // A batch is short whenever rows stopped qualifying between the
+    // sub-select and the re-checked outer delete, so that inferred both the
+    // stop and the completeness wrongly. Completion is now a fresh count.
+    let (pool, _url, _container) = start_pg().await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO autumn_jobs (id, name, status, enqueued_at, finished_at) \
+             SELECT 'job-' || g, 'demo', 'completed', NOW() - INTERVAL '90 days', \
+                    NOW() - INTERVAL '90 days' \
+             FROM generate_series(1, 1700) AS g",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("bulk insert");
+    }
+
+    let state = state_with(&pool, config_with_windows());
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(reports[0].rows_removed, 1_700);
+    assert!(
+        !reports[0].truncated,
+        "a fully drained table must never be reported as truncated: {:?}",
+        reports[0]
+    );
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) AS count FROM autumn_jobs").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_completed_sweep_reports_truncated_false_and_audits_it() {
+    let (pool, _url, _container) = start_pg().await;
+    insert_job(&pool, "old", "completed", 90).await;
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let state = state_with(&pool, config_with_windows());
+    state.insert_extension(AuditLogger::new().with_sink(Arc::new(RecordingAuditSink {
+        events: events.clone(),
+    })));
+
+    run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    let recorded = events.lock().await.clone();
+    let event = recorded
+        .iter()
+        .find(|event| event.target_resource_id == "job_history")
+        .expect("audited");
+    assert_eq!(
+        event.metadata.get("truncated").map(String::as_str),
+        Some("false"),
+        "a drained sweep must record completeness honestly: {event:?}"
+    );
+}

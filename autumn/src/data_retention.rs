@@ -552,10 +552,24 @@ async fn run_one_dataset(
             // by capping its TTL (`AutumnConfig::apply_retention_caps`).
             // There is nothing here to count or delete — and saying so beats
             // reporting a fake zero.
+            //
+            // The caveat is stated rather than glossed: a write-time cap
+            // cannot reach a record that already exists. Records written
+            // before the window was shortened keep the TTL they were stored
+            // with and age out under it, so enforcement is complete only once
+            // the previous TTL has elapsed. Claiming otherwise would make the
+            // report assert a bound the data does not yet satisfy.
             report.skipped = Some(format!(
                 "enforced at write time: records are stored with a TTL capped at {}s by the \
-                 backend, not deleted by this sweep",
-                effective.window.map_or(0, |window| window.as_secs())
+                 backend, not deleted by this sweep. Records written before this window was \
+                 set keep their original TTL until it elapses{}",
+                effective.window.map_or(0, |window| window.as_secs()),
+                if dataset == RetentionDataset::Sessions {
+                    ", and a custom SessionStore installed with \
+                     AppBuilder::with_session_store must apply the window itself"
+                } else {
+                    ""
+                }
             ));
         }
         RetentionEnforcement::ArchiveRewrite => {
@@ -824,7 +838,6 @@ async fn sweep_postgres(
     // be deleted while live. Repeating the predicate makes the row's
     // re-checked qual under READ COMMITTED include its current state.
     let mut removed: u64 = 0;
-    let mut truncated = true;
     for _ in 0..SWEEP_MAX_BATCHES {
         let affected = diesel::sql_query(format!(
             "DELETE FROM {table} WHERE {predicate} AND {key} IN \
@@ -840,12 +853,38 @@ async fn sweep_postgres(
             ))
         })?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
-        if affected < usize::try_from(SWEEP_BATCH_ROWS).unwrap_or(usize::MAX) {
-            truncated = false;
+        // Stop only on a batch that deleted *nothing*, not merely fewer than
+        // `SWEEP_BATCH_ROWS`. A short batch does not mean the table is
+        // drained: the outer predicate is re-checked at delete time, so rows
+        // that stopped qualifying between the sub-select and the delete (a
+        // dead letter replayed back to `enqueued`, a refreshed tracking row)
+        // make the batch short while thousands of stale rows remain.
+        if affected == 0 {
             break;
         }
     }
-    Ok((cutoff, eligible, removed, truncated))
+
+    // Ask the database what is left rather than inferring it from the last
+    // batch size. Inferring gets it wrong in both directions: a short batch
+    // reports a complete sweep that isn't, and an exact multiple of
+    // `SWEEP_BATCH_ROWS * SWEEP_MAX_BATCHES` reports a truncated sweep that
+    // is actually done. `truncated` ends up in the audit record, so a wrong
+    // answer here is a compliance trail claiming enforcement that did not
+    // happen.
+    let remaining: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
+    ))
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .get_result::<CountRow>(&mut *conn)
+    .await
+    .map(|row| row.count)
+    .map_err(|e| {
+        crate::AutumnError::internal_server_error_msg(format!(
+            "retention completeness check for {table} failed: {e}"
+        ))
+    })?;
+
+    Ok((cutoff, eligible, removed, remaining > 0))
 }
 
 // ── Audit record (AC #6) ─────────────────────────────────────────────────
