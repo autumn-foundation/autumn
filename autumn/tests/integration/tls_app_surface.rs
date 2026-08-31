@@ -116,7 +116,7 @@ fn with_request_timeout(ms: u64) -> AutumnConfig {
 async fn framework_probes_are_identical_over_tls_and_plain_http() {
     let fixture = CertFixture::write();
     let verifier = Arc::new(RecordingVerifier::default());
-    let (tls, _resolver) = serve_tls_router(
+    let (tls, _reloader) = serve_tls_router(
         app_router(AutumnConfig::default()),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
@@ -168,7 +168,7 @@ async fn framework_probes_are_identical_over_tls_and_plain_http() {
 async fn inbound_request_timeout_behaves_identically_under_tls() {
     let fixture = CertFixture::write();
     let verifier = Arc::new(RecordingVerifier::default());
-    let (tls, _resolver) = serve_tls_router(
+    let (tls, _reloader) = serve_tls_router(
         app_router(with_request_timeout(REQUEST_DEADLINE_MS)),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
@@ -212,7 +212,7 @@ async fn sse_streams_incrementally_over_tls() {
     let verifier = Arc::new(RecordingVerifier::default());
     // The deadline is far shorter than the gap between the two events: an SSE
     // response must be exempt from it under TLS exactly as it is over HTTP.
-    let (tls, _resolver) = serve_tls_router(
+    let (tls, _reloader) = serve_tls_router(
         app_router(with_request_timeout(REQUEST_DEADLINE_MS)),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
@@ -322,7 +322,7 @@ mod websocket {
         let fixture = CertFixture::write();
         let verifier = Arc::new(RecordingVerifier::default());
         let router = TestApp::new().routes(routes![echo]).build().into_router();
-        let (tls, _resolver) =
+        let (tls, _reloader) =
             serve_tls_router(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
 
         let stream = tls_connect(tls.addr, Arc::clone(&verifier))
@@ -364,7 +364,7 @@ mod websocket {
 async fn graceful_shutdown_drains_an_in_flight_https_request() {
     let fixture = CertFixture::write();
     let verifier = Arc::new(RecordingVerifier::default());
-    let (tls, _resolver) = serve_tls_router(
+    let (tls, _reloader) = serve_tls_router(
         app_router(AutumnConfig::default()),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
@@ -416,23 +416,15 @@ async fn graceful_shutdown_drains_an_in_flight_https_request() {
     );
 }
 
-/// Spawn the real reload task at a test-friendly poll interval, returning its
-/// shutdown token and join handle.
+/// Spawn the reload task the serve helper built alongside the resolver — the
+/// same one `app.rs` spawns, at the suite's test-friendly poll interval.
 fn spawn_reloader(
-    resolver: &Arc<autumn_web::tls::ReloadableCertResolver>,
-    fixture: &CertFixture,
+    reloader: autumn_web::tls::CertReloader,
 ) -> (
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let reloader = autumn_web::tls::CertReloader::new(
-        Arc::clone(resolver),
-        autumn_web::tls::crypto_provider(),
-        fixture.cert.clone(),
-        fixture.key.clone(),
-        Duration::from_millis(50),
-    );
     let task = tokio::spawn({
         let shutdown = shutdown.clone();
         async move { reloader.run(shutdown).await }
@@ -446,7 +438,7 @@ fn spawn_reloader(
 async fn renewed_certificate_is_served_without_a_restart() {
     let fixture = CertFixture::write();
     let verifier = Arc::new(RecordingVerifier::default());
-    let (tls, resolver) = serve_tls_router(
+    let (tls, reloader) = serve_tls_router(
         app_router(AutumnConfig::default()),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
@@ -454,7 +446,7 @@ async fn renewed_certificate_is_served_without_a_restart() {
     .await;
 
     // The same reload task `app.rs` spawns, at a test-friendly poll interval.
-    let (reload_shutdown, reload_task) = spawn_reloader(&resolver, &fixture);
+    let (reload_shutdown, reload_task) = spawn_reloader(reloader);
 
     let before = https_get(tls.addr, "/health", Arc::clone(&verifier))
         .await
@@ -504,13 +496,13 @@ async fn renewed_certificate_is_served_without_a_restart() {
 async fn a_corrupt_certificate_on_disk_keeps_the_previous_one_serving() {
     let fixture = CertFixture::write();
     let verifier = Arc::new(RecordingVerifier::default());
-    let (tls, resolver) = serve_tls_router(
+    let (tls, reloader) = serve_tls_router(
         app_router(AutumnConfig::default()),
         &fixture,
         RECORDING_HANDSHAKE_TIMEOUT,
     )
     .await;
-    let (reload_shutdown, reload_task) = spawn_reloader(&resolver, &fixture);
+    let (reload_shutdown, reload_task) = spawn_reloader(reloader);
 
     let before = https_get(tls.addr, "/health", Arc::clone(&verifier))
         .await

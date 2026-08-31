@@ -30,6 +30,10 @@ use tokio_util::sync::CancellationToken;
 /// `tls_serving.rs`).
 pub const RECORDING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Certificate reload poll interval for the suites that spawn the reloader.
+/// Short enough to keep a renewal test quick, long enough not to spin.
+pub const TEST_RELOAD_INTERVAL: Duration = Duration::from_millis(50);
+
 pub const CERT_PEM: &str = include_str!("../fixtures/tls/localhost.cert.pem");
 pub const KEY_PEM: &str = include_str!("../fixtures/tls/localhost.key.pem");
 pub const RENEWED_CERT_PEM: &str = include_str!("../fixtures/tls/localhost-renewed.cert.pem");
@@ -200,12 +204,19 @@ pub async fn serve_tls_router(
     router: Router,
     fixture: &CertFixture,
     handshake_timeout: Duration,
-) -> (TestServer, Arc<autumn_web::tls::ReloadableCertResolver>) {
+) -> (TestServer, autumn_web::tls::CertReloader) {
     let provider = autumn_web::tls::crypto_provider();
-    let certified =
-        autumn_web::tls::load_certified_key(&fixture.cert, &fixture.key, &provider, now_unix())
-            .expect("load cert/key");
-    let resolver = Arc::new(autumn_web::tls::ReloadableCertResolver::new(certified));
+    // The same one-call load `app.rs` uses, so the reload baseline is captured
+    // exactly as it is in production. The reloader is returned unspawned: only
+    // the renewal tests start it, at the test-friendly interval below.
+    let (resolver, reloader) = autumn_web::tls::CertReloader::load(
+        fixture.cert.clone(),
+        fixture.key.clone(),
+        Arc::clone(&provider),
+        now_unix(),
+        TEST_RELOAD_INTERVAL,
+    )
+    .expect("load cert/key");
     let server_config =
         autumn_web::tls::build_server_config(Arc::clone(&provider), Arc::clone(&resolver))
             .expect("build server config");
@@ -245,7 +256,7 @@ pub async fn serve_tls_router(
             shutdown,
             handle,
         },
-        resolver,
+        reloader,
     )
 }
 

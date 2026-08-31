@@ -7976,25 +7976,26 @@ fn build_tls_listener(
         .key_path
         .as_deref()
         .expect("validated: static [server.tls] sets key_path");
-    let certified =
-        crate::tls::load_certified_key(cert_path, key_path, &provider, crate::tls::now_unix())?;
-    let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(certified));
+    // One call, so the reload baseline is stat'd before the certificate is
+    // loaded: a renewal landing in that gap must read as a change on the next
+    // poll, not as the baseline (which would serve the superseded certificate
+    // until the following renewal).
+    let (resolver, reload) = crate::tls::CertReloader::load(
+        cert_path.to_path_buf(),
+        key_path.to_path_buf(),
+        std::sync::Arc::clone(&provider),
+        crate::tls::now_unix(),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
+    )?;
     let server_config = crate::tls::build_server_config(
         std::sync::Arc::clone(&provider),
         std::sync::Arc::clone(&resolver),
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
-    // at least one second, mirroring the reload-interval clamp below.
+    // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    let reload = crate::tls::CertReloader::new(
-        resolver,
-        provider,
-        cert_path.to_path_buf(),
-        key_path.to_path_buf(),
-        // A zero interval would busy-loop; clamp to at least one second.
-        std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
-    );
     Ok((listener, reload))
 }
 

@@ -926,6 +926,27 @@ mod tests {
         );
     }
 
+    /// Extract the generated `HEALTHCHECK`'s shell command (everything after
+    /// `CMD`), with the Dockerfile line continuations left intact — `sh`
+    /// accepts them verbatim, so the string can be executed as-is.
+    fn healthcheck_command(dockerfile: &str) -> String {
+        let mut lines = dockerfile
+            .lines()
+            .skip_while(|line| !line.starts_with("HEALTHCHECK"));
+        let mut instruction = String::new();
+        for line in &mut lines {
+            instruction.push_str(line);
+            instruction.push('\n');
+            if !line.trim_end().ends_with('\\') {
+                break;
+            }
+        }
+        let cmd_at = instruction
+            .find("CMD ")
+            .unwrap_or_else(|| panic!("HEALTHCHECK has no CMD: {instruction}"));
+        instruction[cmd_at + 4..].to_owned()
+    }
+
     /// Issue #1603 AC6: an image whose app terminates TLS itself
     /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
     /// hardcoded to `http://` marks that container permanently unhealthy —
@@ -937,20 +958,7 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        // The HEALTHCHECK is a multi-line continuation; take it whole.
-        let healthcheck = content
-            .lines()
-            .skip_while(|line| !line.starts_with("HEALTHCHECK"))
-            .take_while(|line| line.ends_with('\\') || line.starts_with("HEALTHCHECK"))
-            .chain(
-                content
-                    .lines()
-                    .skip_while(|line| !line.starts_with("HEALTHCHECK"))
-                    .skip_while(|line| line.ends_with('\\'))
-                    .take(1),
-            )
-            .collect::<Vec<_>>()
-            .join("\n");
+        let healthcheck = healthcheck_command(&content);
         assert!(
             healthcheck.contains("AUTUMN_HEALTHCHECK_URL"),
             "HEALTHCHECK must honor $AUTUMN_HEALTHCHECK_URL so an HTTPS-terminating \
@@ -960,18 +968,67 @@ mod tests {
             healthcheck.contains("http://localhost:3000/health"),
             "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
         );
-        assert!(
-            healthcheck.contains("--insecure"),
-            "an https loopback probe must not fail on a certificate issued to the app's \
-             public hostname, got: {healthcheck}"
-        );
-        // …and that skip must be scoped to the loopback probe: an override
-        // pointing somewhere else has to validate the certificate normally.
-        assert!(
-            healthcheck.contains("https://localhost*") && healthcheck.contains("case "),
-            "--insecure must be scoped to an https loopback URL, not applied to whatever \
-             AUTUMN_HEALTHCHECK_URL names, got: {healthcheck}"
-        );
+    }
+
+    /// The probe skips certificate verification only for an https **loopback**
+    /// URL, and matches the host exactly: a prefix glob would also accept
+    /// `https://localhost.example.com`, which leaves the container — so an
+    /// override pointing at a remote endpoint would silently stop validating
+    /// certificates.
+    ///
+    /// Runs the generated command under `sh` with `curl` stubbed out, so this
+    /// asserts the shell's real behavior rather than the template's text.
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_healthcheck_skips_verification_only_for_exact_loopback_hosts() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+
+        // `curl` becomes a shell function that echoes its arguments to stderr
+        // (stdout is redirected to /dev/null by the probe itself).
+        let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
+
+        let cases: [(&str, bool); 8] = [
+            ("", false),
+            ("http://localhost:3000/health", false),
+            ("https://localhost:3000/health", true),
+            ("https://127.0.0.1:3000/health", true),
+            ("https://[::1]:3000/health", true),
+            ("https://localhost.example.com/health", false),
+            ("https://127.0.0.1.attacker.example/health", false),
+            ("https://internal.example.com/health", false),
+        ];
+
+        for (url, expect_insecure) in cases {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&harness);
+            if url.is_empty() {
+                command.env_remove("AUTUMN_HEALTHCHECK_URL");
+            } else {
+                command.env("AUTUMN_HEALTHCHECK_URL", url);
+            }
+            let output = command.output().expect("run the probe under sh");
+            let invocation = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "the probe should exit 0 for {url:?}, got {:?}: {invocation}",
+                output.status
+            );
+            assert_eq!(
+                invocation.contains("--insecure"),
+                expect_insecure,
+                "certificate verification for {} must {} be skipped; curl was called as: {invocation}",
+                if url.is_empty() {
+                    "the default URL"
+                } else {
+                    url
+                },
+                if expect_insecure { "" } else { "NOT" }
+            );
+        }
     }
 
     #[test]

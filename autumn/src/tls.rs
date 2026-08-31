@@ -867,42 +867,54 @@ pub struct CertReloader {
     cert_path: PathBuf,
     key_path: PathBuf,
     interval: std::time::Duration,
-    /// Mtimes of the cert/key as of construction — i.e. as of the load whose
-    /// certificate the resolver is currently serving. Captured here rather than
-    /// on the loop's first tick so a renewal that lands between the bind and
-    /// the task's first poll is still seen as a change.
+    /// Mtimes of the cert/key as of just *before* the load whose certificate
+    /// the resolver serves (see [`load`](Self::load)). Captured there rather
+    /// than on the loop's first tick so a renewal landing anywhere between the
+    /// load and the first poll is still seen as a change.
     baseline: (Option<std::time::SystemTime>, Option<std::time::SystemTime>),
 }
 
 impl CertReloader {
-    /// Build a reloader for the certificate the given resolver serves.
+    /// Load the certificate and key, build the resolver that will serve them,
+    /// and build the reloader that watches them — deliberately one operation,
+    /// in that order.
+    ///
+    /// The baseline mtimes are stat'd **before** the load. Any other ordering
+    /// loses a renewal: stat after loading and a renewal that lands in the gap
+    /// is recorded as the baseline while the resolver still holds the
+    /// superseded certificate, so every later poll sees "no change" and the old
+    /// certificate is served until the *next* renewal. Stat-first can only ever
+    /// cost a redundant reload of a certificate already in hand.
     ///
     /// `interval` is the mtime poll period (see
     /// [`DEFAULT_RELOAD_INTERVAL_SECS`]). A zero interval would busy-loop, so
     /// [`run`](Self::run) substitutes the default for it rather than spinning.
     ///
-    /// Stats both files once, synchronously, to record the baseline the poll
-    /// loop compares against. Construct this at the same point the certificate
-    /// is loaded: a baseline taken later — on the spawned task's first tick —
-    /// would absorb a renewal that landed in between, and the loop would then
-    /// serve the superseded certificate until the *next* renewal.
-    #[must_use]
-    pub fn new(
-        resolver: Arc<ReloadableCertResolver>,
-        provider: Arc<CryptoProvider>,
+    /// # Errors
+    ///
+    /// Returns the same [`TlsError`] as
+    /// [`load_certified_key`](crate::tls::load_certified_key): a missing or
+    /// unreadable file, unparseable or empty PEM, a key that does not match the
+    /// leaf, or an expired / not-yet-valid certificate in the chain.
+    pub fn load(
         cert_path: PathBuf,
         key_path: PathBuf,
+        provider: Arc<CryptoProvider>,
+        now_unix_secs: i64,
         interval: std::time::Duration,
-    ) -> Self {
+    ) -> Result<(Arc<ReloadableCertResolver>, Self), TlsError> {
         let baseline = file_mtimes(&cert_path, &key_path);
-        Self {
-            resolver,
+        let certified = load_certified_key(&cert_path, &key_path, &provider, now_unix_secs)?;
+        let resolver = Arc::new(ReloadableCertResolver::new(certified));
+        let reloader = Self {
+            resolver: Arc::clone(&resolver),
             provider,
             cert_path,
             key_path,
             interval,
             baseline,
-        }
+        };
+        Ok((resolver, reloader))
     }
 
     /// Run the poll loop until `shutdown` is cancelled.

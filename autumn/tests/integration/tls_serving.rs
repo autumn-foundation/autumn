@@ -61,7 +61,7 @@ async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestSe
             ),
         );
 
-    let (server, _resolver) = serve_tls_router(router, &fixture, handshake_timeout).await;
+    let (server, _reloader) = serve_tls_router(router, &fixture, handshake_timeout).await;
 
     TestServer {
         addr: server.addr,
