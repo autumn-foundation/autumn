@@ -362,6 +362,10 @@ async fn serve(
     // interpreter kept running. `max_concurrency` would then bound nothing: a
     // client that connects and immediately resets, in a loop, would fill the
     // shared blocking pool with interpreters nobody is waiting for.
+    // Captured before the request is handed to the interpreter: the response
+    // path needs to know a HEAD was asked for, and `request` moves.
+    let request_method_is_head = request.method.eq_ignore_ascii_case("HEAD");
+
     // The permit still moves INTO the closure — a detached `spawn_blocking`
     // task must not outlive it — but it comes back out so the response body can
     // keep holding it while hyper delivers the bytes.
@@ -384,7 +388,20 @@ async fn serve(
     };
 
     match outcome.result {
-        Ok(response) => build_response(&plugin, &response, permit),
+        Ok(response) => {
+            let built = build_response(&plugin, &response, permit);
+            // Naming HEAD in the method filter is deliberate (see
+            // `method_filter`), but it costs axum's GET-to-HEAD fallback, and
+            // that fallback is what discards the body. Without this, a HEAD
+            // gets the whole GET payload — against both the documented
+            // behaviour and HTTP itself.
+            if request_method_is_head {
+                let (parts, _body) = built.into_parts();
+                Response::from_parts(parts, Body::empty())
+            } else {
+                built
+            }
+        }
         Err(failure) => {
             tracing::warn!(
                 plugin,
@@ -436,6 +453,15 @@ async fn read_request(
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut metadata = 0usize;
     for (name, value) in &parts.headers {
+        // Filtered before it is charged, because it is filtered before it is
+        // forwarded: `HostFrame::request` drops everything outside this
+        // allowlist, so counting the rest measured bytes no guest will ever
+        // see. A request carrying 256 KiB of `Cookie` — headers this sandbox
+        // promises to withhold silently — would otherwise be refused outright,
+        // turning a confidentiality guarantee into an availability one.
+        if !super::wire::request_header_allowed(name.as_str()) {
+            continue;
+        }
         let Ok(value) = value.to_str() else {
             continue;
         };

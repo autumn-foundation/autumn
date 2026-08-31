@@ -224,6 +224,38 @@ path = "{path}"
     );
 }
 
+/// Headers the sandbox promises to withhold must not be able to refuse the
+/// request instead.
+///
+/// `HostFrame::request` drops everything outside the allowlist, so charging the
+/// dropped ones against the metadata ceiling measured bytes no guest would see
+/// — and a large `Cookie` could turn a confidentiality guarantee into a 413.
+#[tokio::test]
+async fn oversized_forbidden_headers_do_not_refuse_the_request() {
+    let plugin = plugin(guests::HELLO, ResourceLimits::default());
+    let app = app(&plugin);
+
+    // Comfortably past the 256 KiB metadata ceiling, entirely in a header the
+    // guest is never allowed to see.
+    let cookie = "x".repeat(300 * 1024);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/hello/greet")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a withheld header must not make the route unavailable"
+    );
+}
+
 /// An application route whose locale clone is `/en/greet` — the path the
 /// manifest below claims. Without the clone there is no collision to find.
 #[cfg(feature = "i18n")]
