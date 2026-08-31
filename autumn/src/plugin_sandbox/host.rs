@@ -128,6 +128,15 @@ const MAX_IOVECS: i32 = 64;
 /// indirect-call table.
 pub const MAX_TABLE_ELEMENTS: u32 = 16_384;
 
+/// The most tables one instance may have.
+///
+/// The store limiter refuses the fifth at instantiation, which is per request,
+/// so the count has to be a load-time verdict too — a module with five empty
+/// tables clears the *element* ceiling for free. Defined once and read by both,
+/// so the number the limiter enforces and the number the loader admits cannot
+/// drift apart.
+pub const MAX_TABLES: usize = 4;
+
 /// The largest total data + element section a module may carry (16 MiB).
 ///
 /// Every request instantiates a **fresh** module — that is what makes "no state
@@ -902,6 +911,13 @@ impl SandboxHost {
         // request — so a module whose tables are *already* over it at rest
         // loads cleanly and then fails every request it is ever given. Said
         // once here, it is a verdict `autumn plugin inspect` can be trusted on.
+        if shape.table_count > MAX_TABLES {
+            return Err(SandboxLoadError::InstantiationTooExpensive {
+                what: "tables",
+                found: shape.table_count,
+                max: MAX_TABLES,
+            });
+        }
         if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
             return Err(SandboxLoadError::InstantiationTooExpensive {
                 what: "initial table elements",
@@ -1259,6 +1275,11 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// How many tables the module declares.
+    ///
+    /// Sizes and count are separate ceilings: five empty tables cost no
+    /// elements at all and still exceed what the store will build.
+    table_count: usize,
     /// Elements the module's own tables declare as their *initial* size.
     ///
     /// The limiter enforces `MAX_TABLE_ELEMENTS` at instantiation, which is
@@ -1301,6 +1322,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut bytes = 0usize;
     let mut declared_entries = 0usize;
     let mut table_elements = 0u64;
+    let mut table_count = 0usize;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1323,6 +1345,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             // so. Only the minimum matters here — it is what the instance
             // allocates before the guest runs.
             let (count, mut at) = leb128(wasm, after_size)?;
+            table_count = table_count.saturating_add(count);
             for _ in 0..count {
                 at = at.checked_add(1)?; // reftype
                 let flag = *wasm.get(at)?;
@@ -1345,6 +1368,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        table_count,
         table_elements,
     })
 }
@@ -1504,7 +1528,7 @@ impl wasmi::ResourceLimiter for MemoryLimiter {
     }
 
     fn tables(&self) -> usize {
-        4
+        MAX_TABLES
     }
 
     fn memories(&self) -> usize {
@@ -3685,6 +3709,32 @@ path = "/hello/greet"
                     what: "initial table elements",
                     ..
                 }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_with_more_tables_than_the_store_will_build_is_refused_at_load() {
+        // Sizes and count are separate ceilings, and the element sum says
+        // nothing about the second: five *empty* tables cost no elements at all
+        // and still exceed what the limiter will build, so the artifact loaded,
+        // inspected clean, and failed every request at instantiation.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..=MAX_TABLES {
+            let _ = writeln!(wat, "  (table 0 funcref)");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the table-count ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive { what: "tables", .. }
             ),
             "{err:?}"
         );
