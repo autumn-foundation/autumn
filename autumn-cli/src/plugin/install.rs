@@ -1,9 +1,10 @@
 //! Install planning for `autumn plugin add` — pure functions plus one
-//! [`emit::Plan`] builder, so `--dry-run` and the Created/Modified output match
+//! [`crate::generate::emit::Plan`] builder, so `--dry-run` and the Created/Modified output match
 //! every other code-touching Autumn command.
 //!
 //! Every decision that can refuse the install (version gate, missing project,
-//! unreadable builder chain) is made *before* a single [`emit::Action`] is
+//! unreadable builder chain) is made *before* a single
+//! [`crate::generate::emit::Action`] is
 //! queued, which is what makes issue #1606's "fails before any file is
 //! modified" and "never leaves the app in a non-compiling state" true by
 //! construction rather than by careful ordering.
