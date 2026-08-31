@@ -988,6 +988,82 @@ pub fn method_input(method: &str) -> maud::Markup {
     }
 }
 
+/// Pre-escape a field value or error message the same way `maud::html!`
+/// would, so it can be handed to `maud::PreEscaped` instead.
+///
+/// `maud::escape::escape_to_string` scans one byte at a time and calls
+/// `String::push`/`push_str` per byte even when nothing needs escaping —
+/// on a scaffolded form's field values (mostly clean prose/numbers, no
+/// `&<>"`) that per-byte dispatch dominated `benches/form_render.rs`'s
+/// profile. This does the same 4-character escape (identical output —
+/// see `fast_escape_matches_maud` for a proptest-style equivalence check
+/// against `maud::escape::escape_to_string`) but copies each clean run in
+/// one `push_str` instead of one call per byte, and returns the input
+/// completely unallocated (`Cow::Borrowed`) when it contains no character
+/// that needs escaping — the common case for values like `"19.99"` or
+/// `"ART-1042"`. Slicing at the positions found below is always on a
+/// UTF-8 char boundary: `&`, `<`, `>`, and `"` are single-byte ASCII code
+/// points, so they can never be a continuation byte of a multi-byte
+/// sequence, and no multi-byte sequence can contain one of those bytes
+/// either. Verified for arbitrary input (not just this reasoning) by the
+/// `fast_escape_matches_naive_reference` proptest.
+#[cfg(feature = "maud")]
+#[allow(
+    clippy::string_slice,
+    reason = "every slice index below comes from a position() match on a single-byte ASCII \
+              value (&, <, >, \"), which can never land inside a multi-byte UTF-8 sequence — \
+              always a char boundary. Proven for arbitrary input by the \
+              fast_escape_matches_naive_reference proptest."
+)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`i + 1` where `i` is a byte index already `< input.len()` (from `bytes.iter().\
+              enumerate()`), and `input.len() <= isize::MAX` is a `str` invariant — cannot \
+              overflow `usize`."
+)]
+fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let Some(first) = bytes
+        .iter()
+        .position(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+    else {
+        return std::borrow::Cow::Borrowed(input);
+    };
+    let mut out = String::with_capacity(input.len() + 8);
+    out.push_str(&input[..first]);
+    let mut start = first;
+    for (i, &b) in bytes.iter().enumerate().skip(first) {
+        let replacement = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        out.push_str(&input[start..i]);
+        out.push_str(replacement);
+        start = i + 1;
+    }
+    out.push_str(&input[start..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// `maud::PreEscaped(fast_escape(s))`, spelled short.
+///
+/// `maud::html!`'s compile-time output-buffer size hint is the *source
+/// token length* of the macro invocation (`input.to_string().len()` in
+/// `maud_macros`), not anything about runtime content. Spelling this out
+/// as `maud::PreEscaped(fast_escape(value))` at every interpolation site
+/// inflates that source text enough to noticeably over-reserve the
+/// buffer's initial capacity (more bytes reported by `dhat`, though not
+/// more allocations — the ceiling below is never actually re-grown). A
+/// one-letter-shorter call keeps the estimate close to what the plain,
+/// unescaped `(value)` it replaces already cost.
+#[cfg(feature = "maud")]
+fn esc(s: &str) -> maud::PreEscaped<std::borrow::Cow<'_, str>> {
+    maud::PreEscaped(fast_escape(s))
+}
+
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
 /// - Sets `name` and `id` to `field`
@@ -1007,24 +1083,28 @@ pub fn text_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="text"
-                id=(field)
-                name=(field)
-                value=(value)
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1294,23 +1374,27 @@ pub fn password_input<T: Serialize>(
 ) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="password"
-                id=(field)
-                name=(field)
+                id=(field_pe)
+                name=(field_pe)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1333,23 +1417,27 @@ pub fn textarea_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             textarea
-                id=(field)
-                name=(field)
+                id=(field_pe)
+                name=(field_pe)
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""))
-                { (value) }
+                aria-describedby=(aria_pe)
+                { (esc(&value)) }
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1794,25 +1882,29 @@ pub fn checkbox_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let checked = changeset.field_value(field).as_deref() == Some("true");
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="checkbox"
-                id=(field)
-                name=(field)
+                id=(field_pe)
+                name=(field_pe)
                 value="true"
                 checked[checked]
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -1839,25 +1931,29 @@ pub fn number_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="number"
-                id=(field)
-                name=(field)
-                value=(value)
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
                 step=[step]
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -2268,24 +2364,28 @@ pub fn date_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
-    let error_id = has_errors.then(|| format!("{field}-error"));
-    let wrapper_id = format!("{field}-field");
+    let field_html = fast_escape(field);
+    let error_id = has_errors.then(|| format!("{field_html}-error"));
+    let wrapper_id = format!("{field_html}-field");
+    let field_pe = maud::PreEscaped(field_html.as_ref());
+    let wrapper_pe = maud::PreEscaped(&wrapper_id);
+    let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
 
     maud::html! {
-        div id=(wrapper_id) class="autumn-field" {
-            label for=(field) class="autumn-field__label" { (label) }
+        div id=(wrapper_pe) class="autumn-field" {
+            label for=(field_pe) class="autumn-field__label" { (esc(label)) }
             input
                 type="date"
-                id=(field)
-                name=(field)
-                value=(value)
+                id=(field_pe)
+                name=(field_pe)
+                value=(esc(&value))
                 class=(if has_errors { maud::PreEscaped("autumn-field__input autumn-field__input--invalid") } else { maud::PreEscaped("autumn-field__input") })
                 aria-invalid=(if has_errors { maud::PreEscaped("true") } else { maud::PreEscaped("false") })
-                aria-describedby=(error_id.as_deref().unwrap_or(""));
+                aria-describedby=(aria_pe);
             @if has_errors {
-                div id=(error_id.as_deref().unwrap_or_default()) role="alert" class="autumn-field__errors" {
+                div id=(maud::PreEscaped(error_id.as_deref().unwrap_or_default())) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p class="autumn-field__error" { (error) }
+                        p class="autumn-field__error" { (esc(error)) }
                     }
                 }
             }
@@ -3255,6 +3355,78 @@ fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fast_escape ─────────────────────────────────────────────────
+
+    #[test]
+    fn fast_escape_no_special_chars_borrows() {
+        let input = "ART-1042";
+        match fast_escape(input) {
+            std::borrow::Cow::Borrowed(s) => assert_eq!(s, input),
+            std::borrow::Cow::Owned(_) => panic!("expected a borrow, no allocation needed"),
+        }
+    }
+
+    #[test]
+    fn fast_escape_empty_string_borrows() {
+        assert!(matches!(fast_escape(""), std::borrow::Cow::Borrowed("")));
+    }
+
+    #[test]
+    fn fast_escape_escapes_all_four_chars() {
+        assert_eq!(fast_escape(r#"&<>""#), "&amp;&lt;&gt;&quot;");
+    }
+
+    #[test]
+    fn fast_escape_leading_trailing_and_adjacent_specials() {
+        assert_eq!(fast_escape("&start"), "&amp;start");
+        assert_eq!(fast_escape("end&"), "end&amp;");
+        assert_eq!(fast_escape("a&&b"), "a&amp;&amp;b");
+        assert_eq!(
+            fast_escape("<script>alert('x')</script>"),
+            "&lt;script&gt;alert('x')&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn fast_escape_preserves_multibyte_utf8() {
+        assert_eq!(fast_escape("café <3"), "café &lt;3");
+        assert_eq!(fast_escape("日本語"), "日本語");
+    }
+
+    /// Naive per-byte reference matching `maud::escape::escape_to_string`'s
+    /// documented behavior verbatim (that module is private to the `maud`
+    /// crate, so it can't be called directly from here). `fast_escape` is
+    /// checked against this obviously-correct-by-inspection reference
+    /// rather than against its own bulk-copy logic.
+    fn naive_escape_reference(input: &str) -> String {
+        // Builds on raw bytes (like `maud`'s own implementation does) rather
+        // than `char`, since casting a UTF-8 continuation/lead byte to `char`
+        // and pushing it would re-encode it as a *different* multi-byte
+        // sequence instead of preserving the original bytes.
+        let mut out = Vec::with_capacity(input.len());
+        for b in input.bytes() {
+            match b {
+                b'&' => out.extend_from_slice(b"&amp;"),
+                b'<' => out.extend_from_slice(b"&lt;"),
+                b'>' => out.extend_from_slice(b"&gt;"),
+                b'"' => out.extend_from_slice(b"&quot;"),
+                _ => out.push(b),
+            }
+        }
+        String::from_utf8(out).expect("escaping ASCII-only replacements preserves valid UTF-8")
+    }
+
+    proptest::proptest! {
+        /// `fast_escape` must be byte-for-byte identical to the naive
+        /// reference for arbitrary input, including strings that mix the
+        /// four special ASCII bytes with arbitrary (possibly multi-byte)
+        /// Unicode text.
+        #[test]
+        fn fast_escape_matches_naive_reference(s in ".*") {
+            proptest::prop_assert_eq!(fast_escape(&s).into_owned(), naive_escape_reference(&s));
+        }
+    }
 
     // ── Changeset::new ─────────────────────────────────────────────
 

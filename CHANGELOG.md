@@ -1038,6 +1038,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~22KB/render budget dominated by larger buffers — but the block-count and
   instruction-count deltas both clear the impact floor on their own.
 
+- **scaffolded form helpers pre-escape their own field values, labels, and
+  error text instead of letting `maud::html!` re-scan them byte by byte:**
+  `text_input`, `password_input`, `textarea_input`, `number_input`,
+  `checkbox_input`, `date_input` built every dynamic string — the field's
+  current value, its label, its `id`/`name`, and any validation-error text —
+  through `maud::html!`'s ordinary `(expr)` splice, which calls
+  `maud::escape::escape_to_string`: a loop that matches and pushes one byte
+  at a time even when nothing needs escaping. Profiling the committed
+  `autumn/benches/form_render.rs` workload showed that loop was 26% of the
+  release-build instruction count on a realistic 12-field form. A new
+  `autumn_web::form::fast_escape` does the identical 4-character escape
+  (`&`, `<`, `>`, `"`; checked byte-for-byte against a naive reference by a
+  proptest over arbitrary strings) but copies each clean run with one bulk
+  `push_str` instead of one call per byte, and returns the input completely
+  unallocated (`Cow::Borrowed`) when nothing needs escaping — the common
+  case for values like `"19.99"` — before handing the result to
+  `maud::PreEscaped` so `html!` doesn't re-scan it. Output is byte-for-byte
+  unchanged (verified by the unchanged 209 `form`/`nested_form` lib tests
+  plus the new proptest).
+
+  Measured with the committed `autumn/benches/form_render.rs` harness and
+  the existing `autumn/tests/form_render_alloc_gate.rs` allocation gate
+  (both the same 12-field workload), `valgrind --tool=callgrind`/`--tool=dhat`,
+  before and after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 185,711,127 | 155,624,223 | **-16.20%** |
+  | `maud::escape::escape_to_string` instructions | 48,339,450 (26.0%) | 0 (eliminated) | **-100%** |
+  | Allocation blocks (200 renders) | 20,800 | 20,800 | unchanged |
+  | Allocation bytes (200 renders) | 4,495,800 | 4,604,600 | +2.4% |
+
+  Allocation *count* is unchanged — escaping never allocates for this
+  fixture's clean values, matching `fast_escape`'s `Cow::Borrowed` fast
+  path. Bytes rose slightly: `maud_macros` sizes each `html!` block's output
+  buffer from the *source token length* of the macro invocation, not
+  runtime content, and the longer `PreEscaped`-wrapped interpolations read
+  as "expect more output." That reservation is never grown again (the
+  unchanged block count proves it), so it's unused slack, not extra
+  allocator work — see `form_render_alloc_gate.rs` for the full explanation
+  and its updated ceiling.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the
