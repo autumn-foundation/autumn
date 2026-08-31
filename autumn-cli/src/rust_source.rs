@@ -73,7 +73,7 @@ pub fn mask_non_code(source: &str) -> String {
 }
 
 /// Blank one byte unless it is the newline that keeps lines aligned.
-fn blank(out: &mut [u8], at: usize) {
+const fn blank(out: &mut [u8], at: usize) {
     if out[at] != b'\n' {
         out[at] = b' ';
     }
@@ -112,7 +112,7 @@ fn step_code(bytes: &[u8], i: usize, out: &mut [u8]) -> (Scan, usize) {
 }
 
 /// One step inside a `//` comment: it ends at the newline.
-fn step_line_comment(bytes: &[u8], i: usize, out: &mut [u8]) -> (Scan, usize) {
+const fn step_line_comment(bytes: &[u8], i: usize, out: &mut [u8]) -> (Scan, usize) {
     if bytes[i] == b'\n' {
         (Scan::Code, 1)
     } else {

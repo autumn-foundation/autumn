@@ -285,16 +285,15 @@ pub fn dependency_present(manifest: &str, crate_name: &str) -> bool {
     // the application target, so counting one as installed would report a
     // complete install for an app that cannot compile — and would stop the
     // command adding the `[dependencies]` entry that fixes it.
-    let mut tables: Vec<&toml::Value> = table.get("dependencies").into_iter().collect();
-    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
-        tables.extend(
+    let targets = table.get("target").and_then(toml::Value::as_table);
+    table
+        .get("dependencies")
+        .into_iter()
+        .chain(targets.into_iter().flat_map(|targets| {
             targets
                 .values()
-                .filter_map(|target| target.get("dependencies")),
-        );
-    }
-    tables
-        .into_iter()
+                .filter_map(|target| target.get("dependencies"))
+        }))
         .filter_map(toml::Value::as_table)
         .any(|deps| deps.contains_key(crate_name))
 }
