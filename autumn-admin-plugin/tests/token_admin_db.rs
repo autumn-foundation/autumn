@@ -422,6 +422,29 @@ mod bulk_delete_profile {
             .expect("reset pg_stat_statements");
     }
 
+    #[derive(QueryableByName, Debug, Clone, Copy)]
+    struct HotUpdateRow {
+        #[diesel(sql_type = BigInt)]
+        n_tup_upd: i64,
+        #[diesel(sql_type = BigInt)]
+        n_tup_hot_upd: i64,
+    }
+
+    /// `pg_stat_user_tables.n_tup_upd`/`n_tup_hot_upd` for `api_tokens` —
+    /// cumulative cluster-wide counters, not reset by
+    /// [`reset_stats`]. Diff two snapshots to see how many of a window's
+    /// updates were HOT (no index touch, same page) vs. non-HOT.
+    fn hot_update_snapshot(conn: &mut PgConnection) -> HotUpdateRow {
+        use diesel::RunQueryDsl;
+        diesel::sql_query(
+            "SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables \
+             WHERE relname = 'api_tokens'",
+        )
+        .load::<HotUpdateRow>(conn)
+        .expect("query pg_stat_user_tables")
+        .remove(0)
+    }
+
     #[derive(QueryableByName, Debug)]
     struct StatementRow {
         #[diesel(sql_type = Text)]
@@ -537,8 +560,34 @@ mod bulk_delete_profile {
         .map_or(0, |r| r.n)
     }
 
+    fn count_all(conn: &mut PgConnection) -> i64 {
+        use diesel::RunQueryDsl;
+        diesel::sql_query("SELECT COUNT(*) AS n FROM api_tokens")
+            .load::<CountRow>(conn)
+            .expect("count all")
+            .remove(0)
+            .n
+    }
+
+    #[derive(QueryableByName)]
+    struct TextRow {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+
+    fn revoked_at_text(conn: &mut PgConnection, id: i64) -> String {
+        use diesel::RunQueryDsl;
+        diesel::sql_query("SELECT revoked_at::text AS v FROM api_tokens WHERE id = $1")
+            .bind::<BigInt, _>(id)
+            .load::<TextRow>(conn)
+            .expect("read revoked_at")
+            .remove(0)
+            .v
+    }
+
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
+    #[allow(clippy::too_many_lines)]
     async fn token_bulk_delete_batch_profile() {
         let (mut conn, pool, _container) = setup_profiling_env().await;
         let model = TokenAdminModel;
@@ -558,9 +607,11 @@ mod bulk_delete_profile {
             );
 
             reset_stats(&mut conn);
+            let hot_before = hot_update_snapshot(&mut conn);
             for &id in &ids {
                 model.delete(&pool, id).await.expect("delete");
             }
+            let hot_after = hot_update_snapshot(&mut conn);
             let (calls, buffers, wal_bytes) =
                 print_profile(&mut conn, &format!("BEFORE tier={label} ({size} ids)"));
             assert_eq!(
@@ -572,16 +623,23 @@ mod bulk_delete_profile {
                 size,
                 "tier {label}: every targeted id must end up revoked"
             );
-            baseline_results.push((label, size, calls, buffers, wal_bytes));
+            let hot = hot_after.n_tup_hot_upd - hot_before.n_tup_hot_upd;
+            let non_hot = (hot_after.n_tup_upd - hot_before.n_tup_upd) - hot;
+            println!("-- HOT updates: {hot} non-HOT updates: {non_hot} (of {size} total) --");
+            baseline_results.push((label, size, calls, buffers, wal_bytes, hot, non_hot));
         }
 
-        println!("\n=== BEFORE: statement-count / buffer / WAL scaling across tiers ===");
         println!(
-            "{:<8} {:>8} {:>10} {:>12} {:>12}",
-            "tier", "ids", "calls", "buffers", "wal_bytes"
+            "\n=== BEFORE: statement-count / buffer / WAL / HOT-update scaling across tiers ==="
         );
-        for (label, size, calls, buffers, wal_bytes) in &baseline_results {
-            println!("{label:<8} {size:>8} {calls:>10} {buffers:>12} {wal_bytes:>12}");
+        println!(
+            "{:<8} {:>8} {:>10} {:>12} {:>12} {:>6} {:>10}",
+            "tier", "ids", "calls", "buffers", "wal_bytes", "hot", "non-hot"
+        );
+        for (label, size, calls, buffers, wal_bytes, hot, non_hot) in &baseline_results {
+            println!(
+                "{label:<8} {size:>8} {calls:>10} {buffers:>12} {wal_bytes:>12} {hot:>6} {non_hot:>10}"
+            );
         }
 
         // Representative plan for the per-id statement (nonexistent id, so
@@ -592,6 +650,191 @@ mod bulk_delete_profile {
             "single-row revoke UPDATE issued once per id (the pre-fix shape)",
             "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
              WHERE id = 999999999 AND revoked_at IS NULL",
+        );
+
+        // ── AFTER: `TokenAdminModel::delete_many` — the fix. Same tier
+        // sizes, a disjoint slice of active ids (continuing `offset` so
+        // nothing here overlaps a row the BEFORE loop already touched). ──
+        let mut after_results = Vec::new();
+        for (label, size) in TIERS {
+            let ids = active_ids(&mut conn, size, offset);
+            offset += size;
+            assert_eq!(
+                i64::try_from(ids.len()).expect("tier size fits in i64"),
+                size,
+                "tier {label}: fixture must have enough active ids"
+            );
+
+            reset_stats(&mut conn);
+            let hot_before = hot_update_snapshot(&mut conn);
+            let count = model
+                .delete_many(&pool, ids.clone())
+                .await
+                .expect("delete_many");
+            let hot_after = hot_update_snapshot(&mut conn);
+            assert_eq!(
+                count,
+                u64::try_from(size).expect("tier size fits in u64"),
+                "tier {label}: delete_many's returned count matches the id count \
+                 (same contract the old per-id loop had)"
+            );
+            let (calls, buffers, wal_bytes) =
+                print_profile(&mut conn, &format!("AFTER tier={label} ({size} ids)"));
+            assert_eq!(
+                calls, 1,
+                "tier {label}: one UPDATE call for the whole batch (the fix)"
+            );
+            assert_eq!(
+                revoked_count(&mut conn, &ids),
+                size,
+                "tier {label}: every targeted id must end up revoked, same as BEFORE"
+            );
+            let hot = hot_after.n_tup_hot_upd - hot_before.n_tup_hot_upd;
+            let non_hot = (hot_after.n_tup_upd - hot_before.n_tup_upd) - hot;
+            println!("-- HOT updates: {hot} non-HOT updates: {non_hot} (of {size} total) --");
+            after_results.push((label, size, calls, buffers, wal_bytes, hot, non_hot));
+        }
+
+        println!(
+            "\n=== AFTER: statement-count / buffer / WAL / HOT-update scaling across tiers ==="
+        );
+        println!(
+            "{:<8} {:>8} {:>10} {:>12} {:>12} {:>6} {:>10}",
+            "tier", "ids", "calls", "buffers", "wal_bytes", "hot", "non-hot"
+        );
+        for (label, size, calls, buffers, wal_bytes, hot, non_hot) in &after_results {
+            println!(
+                "{label:<8} {size:>8} {calls:>10} {buffers:>12} {wal_bytes:>12} {hot:>6} {non_hot:>10}"
+            );
+        }
+
+        println!("\n=== BEFORE vs AFTER ===");
+        println!(
+            "{:<8} {:>8} {:>14} {:>14} {:>16} {:>16} {:>14} {:>14} {:>12} {:>12}",
+            "tier",
+            "ids",
+            "calls before",
+            "calls after",
+            "buffers before",
+            "buffers after",
+            "wal before",
+            "wal after",
+            "non-hot before",
+            "non-hot after"
+        );
+        for (
+            (label, size, b_calls, b_buffers, b_wal, _b_hot, b_non_hot),
+            (_, _, a_calls, a_buffers, a_wal, _a_hot, a_non_hot),
+        ) in baseline_results.iter().zip(after_results.iter())
+        {
+            println!(
+                "{label:<8} {size:>8} {b_calls:>14} {a_calls:>14} {b_buffers:>16} \
+                 {a_buffers:>16} {b_wal:>14} {a_wal:>14} {b_non_hot:>12} {a_non_hot:>12}"
+            );
+        }
+
+        // Representative plan for the batched statement — same access
+        // method (Index Scan via the primary key, now driven by
+        // `= ANY($1)` instead of `= $1`), issued once for the whole batch.
+        explain(
+            &mut conn,
+            "batched revoke UPDATE, 2-element array, both nonexistent \
+             (plan shape only — see the 500-id EXPLAIN below for the buffer \
+             cost at the scale the tiers above actually measured)",
+            "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+             WHERE id = ANY(ARRAY[999999998,999999999]) AND revoked_at IS NULL",
+        );
+
+        // The 2-element EXPLAIN above only shows the access method, not the
+        // real per-row buffer cost at the scale the tiers were measured at —
+        // a small `ANY()` array and a 500-element one can pick different
+        // plans. Explain a REAL 500-id batch (fresh, still-active ids) so
+        // the reported buffer/WAL shape in the README is read off an actual
+        // representative plan, not extrapolated from a 2-row toy.
+        let representative_ids = active_ids(&mut conn, 500, offset);
+        let array_literal = representative_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        explain(
+            &mut conn,
+            "batched revoke UPDATE, 500 real active ids (representative scale)",
+            &format!(
+                "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                 WHERE id = ANY(ARRAY[{array_literal}]) AND revoked_at IS NULL"
+            ),
+        );
+    }
+
+    /// Result-equivalence edge cases the scale claim above doesn't exercise:
+    /// an empty id list, duplicate ids, an already-revoked id, and a
+    /// nonexistent id, all in the same call — the exact shapes an admin's
+    /// "select all on this page" bulk action can produce. `delete_many` must
+    /// match the old per-id loop's behavior on every one of them: never
+    /// error, never touch a row twice, and count every id it was asked for
+    /// (not just the ones that changed).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn token_bulk_delete_batch_result_equivalence() {
+        let (mut conn, pool, _container) = setup_profiling_env().await;
+        let model = TokenAdminModel;
+
+        // Empty list: a no-op, not an error.
+        let count = model
+            .delete_many(&pool, vec![])
+            .await
+            .expect("delete_many on an empty list must not error");
+        assert_eq!(count, 0);
+
+        let active = active_ids(&mut conn, 2, 0);
+        let (active_a, active_b) = (active[0], active[1]);
+        let already_revoked = active_ids(&mut conn, 1, 4_600); // untouched by the scale tiers above
+        {
+            use diesel::RunQueryDsl;
+            diesel::sql_query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind::<BigInt, _>(already_revoked[0])
+                .execute(&mut conn)
+                .expect("pre-revoke");
+        }
+        let before_revoked_at = revoked_at_text(&mut conn, already_revoked[0]);
+
+        let nonexistent = 987_654_321i64;
+        // duplicates: `active_a` appears twice.
+        let ids = vec![
+            active_a,
+            active_a,
+            active_b,
+            already_revoked[0],
+            nonexistent,
+        ];
+        let expected_count = u64::try_from(ids.len()).expect("id count fits in u64");
+        let count = model
+            .delete_many(&pool, ids.clone())
+            .await
+            .expect("delete_many with duplicates/already-revoked/nonexistent ids");
+        assert_eq!(
+            count, expected_count,
+            "count is the number of ids asked for, duplicates included — matches the \
+             old per-id loop's `count += 1` per iteration"
+        );
+
+        assert_eq!(
+            revoked_count(&mut conn, &[active_a, active_b]),
+            2,
+            "both real, previously-active ids must now be revoked"
+        );
+
+        let after_revoked_at = revoked_at_text(&mut conn, already_revoked[0]);
+        assert_eq!(
+            before_revoked_at, after_revoked_at,
+            "an already-revoked id must not be touched again (idempotent, same as delete())"
+        );
+
+        assert_eq!(
+            count_all(&mut conn),
+            PROFILE_TOTAL_TOKENS,
+            "a nonexistent id in the batch must not insert or otherwise change row count"
         );
     }
 }

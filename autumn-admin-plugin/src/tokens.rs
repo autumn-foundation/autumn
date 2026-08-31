@@ -298,6 +298,46 @@ impl AdminModel for TokenAdminModel {
             Ok(())
         })
     }
+
+    /// Revoke every id in `ids` with one statement instead of `ids.len()`
+    /// (issue: `docs/reports/2026-08-30-ledger-token-admin-bulk-delete-batch/README.md`).
+    ///
+    /// Same `WHERE ... AND revoked_at IS NULL` predicate as [`delete`](Self::delete),
+    /// applied to the whole id set at once via `= ANY($1)`: a nonexistent or
+    /// already-revoked id is silently skipped either way, so this is not a
+    /// behavior change, only fewer round trips. The returned count is
+    /// `ids.len()`, matching the default `execute_action`/`delete_many`
+    /// contract (the number of ids the caller asked for, not the number of
+    /// rows actually flipped) — the admin bulk-action flash message this
+    /// feeds ("Applied 'delete' to N record(s)") is unchanged either way.
+    fn delete_many<'a>(
+        &'a self,
+        pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'a, u64> {
+        use diesel_async::RunQueryDsl;
+
+        let pool = pool.clone();
+        Box::pin(async move {
+            let count = ids.len() as u64;
+            if ids.is_empty() {
+                return Ok(0);
+            }
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+            diesel::sql_query(
+                "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                 WHERE id = ANY($1) AND revoked_at IS NULL",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(ids)
+            .execute(&mut conn)
+            .await
+            .map_err(|e| AdminError::Database(e.to_string()))?;
+            Ok(count)
+        })
+    }
 }
 
 /// Parse the `scopes` form value (JSON-array text or a JSON array) into a flat

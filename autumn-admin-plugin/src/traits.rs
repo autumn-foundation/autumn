@@ -523,6 +523,35 @@ pub trait AdminModel: Send + Sync + 'static {
         })
     }
 
+    /// Delete every id in `ids`, in one logical operation.
+    ///
+    /// The default loops over [`delete`](Self::delete) one id at a time —
+    /// byte-identical to what [`execute_action`](Self::execute_action)'s
+    /// `"delete"` branch used to do inline, so every existing implementor
+    /// keeps its exact current behavior (including abort-on-first-failure:
+    /// ids before the failing one stay deleted, the rest are never
+    /// attempted) unless it overrides this method.
+    ///
+    /// A model backed by a single table should override this with one
+    /// batched statement (`WHERE id = ANY($1)`) instead of `ids.len()`
+    /// separate round trips — see `TokenAdminModel::delete_many` for an
+    /// example. See
+    /// `docs/reports/2026-08-30-ledger-token-admin-bulk-delete-batch/README.md`.
+    fn delete_many<'a>(
+        &'a self,
+        pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'a, u64> {
+        Box::pin(async move {
+            let mut count: u64 = 0;
+            for id in ids {
+                self.delete(pool, id).await?;
+                count += 1;
+            }
+            Ok(count)
+        })
+    }
+
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
@@ -543,14 +572,7 @@ pub trait AdminModel: Send + Sync + 'static {
         let pool = pool.clone();
         Box::pin(async move {
             match action.as_str() {
-                "delete" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.delete(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
+                "delete" => self.delete_many(&pool, ids).await,
                 "restore" => {
                     let mut count: u64 = 0;
                     for id in ids {
