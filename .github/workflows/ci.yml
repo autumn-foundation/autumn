@@ -223,6 +223,27 @@ jobs:
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+      - name: Run tls/acme-gated tests (in-process HTTPS + ACME provisioning)
+        # Neither `tls` (#1603) nor `acme` (#1608) is a default feature, so
+        # `cargo test --workspace` above compiles neither the `tls`/`acme` module
+        # suites nor their integration modules (`tls_serving`,
+        # `acme_end_to_end`). Until now nothing in a merge-blocking lane built
+        # them at all: the only workflow lines naming those features target
+        # `--test feature_flags_pg_integration` and the (non-blocking, Codecov)
+        # coverage job. That left the whole HTTPS-serving and certificate-
+        # provisioning path — the thing an operator's site depends on staying up
+        # — merge-gated by nothing.
+        #
+        # `acme_end_to_end` runs a real `instant-acme` client over real TLS
+        # against an in-process fake CA (`acme_fake_ca`): no Docker, no network,
+        # no Let's Encrypt rate limits, so it belongs in this fast lane rather
+        # than the Docker sweep below. `acme` implies `tls`, so one build covers
+        # both.
+        run: |
+          cargo test -p autumn-web --features acme --lib tls::
+          cargo test -p autumn-web --features acme --lib acme::
+          cargo test -p autumn-web --features acme --test integration_tests tls_serving
+          cargo test -p autumn-web --features acme --test integration_tests acme_
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends

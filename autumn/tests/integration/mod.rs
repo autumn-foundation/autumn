@@ -1,6 +1,10 @@
 #[cfg(feature = "maud")]
 mod a11y;
 mod access_log;
+#[cfg(feature = "acme")]
+mod acme_end_to_end;
+#[cfg(feature = "acme")]
+mod acme_fake_ca;
 mod acting_as_integration;
 mod after_commit_integration;
 mod alerts;

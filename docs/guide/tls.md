@@ -239,6 +239,7 @@ Fields:
 | `cache_dir` | `config/acme` | Where the account key and issued certificate are cached. |
 | `http_challenge_port` | `80` | Port the HTTP-01 challenge (and HTTP→HTTPS redirect) listens on. |
 | `renew_before_days` | `30` | Renew this many days before expiry (must be `< 90`). |
+| `ca_root_path` | unset | PEM root that signs the **ACME directory's own HTTPS certificate**. Only needed for a private CA / Pebble; see below. |
 
 > **Staging is the default — switch to production deliberately.** When
 > `directory` is unset the app uses the **Let's Encrypt staging** environment,
@@ -266,6 +267,28 @@ Fields:
 >
 > A bare URL string (`directory = "https://pebble.test/dir"`) is **not** a valid
 > value and makes the config fail to load at startup — use the inline-table form.
+>
+> A custom directory almost always also needs **`ca_root_path`**. The ACME client
+> speaks HTTPS to the directory and, by default, trusts only the public webpki
+> roots — right for Let's Encrypt (both its staging and production API endpoints
+> carry publicly-trusted certificates) and wrong for a private CA or a Pebble
+> test server, whose API certificate chains to a root nothing knows about.
+> Without it the TLS handshake to the directory fails and **every** order dies
+> before an authorization is even created:
+>
+> ```toml
+> [server.tls.acme]
+> domains = ["app.example.com"]
+> contact_email = "admin@example.com"
+> directory = { custom = { url = "https://pebble.test/dir" } }
+> ca_root_path = "config/pebble-root.pem"
+> ```
+>
+> `ca_root_path` replaces the client's trust anchors *for the ACME control plane
+> only* — it has no bearing on which certificates browsers accept from your site.
+> `autumn doctor` grades it (`acme_ca_root`) and **fails** on a path that is
+> missing or holds no certificate, since that state can only ever produce failed
+> orders.
 
 ### How issuance and renewal work
 

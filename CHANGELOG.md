@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ACME provisioning against a private CA, and an end-to-end proof of the whole
+  flow (#1608):** `[server.tls.acme] directory = { custom = { url = "..." } }`
+  was documented for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+  test server, but the ACME client trusted only the public webpki roots, so the
+  TLS handshake to any such directory failed and every order died before an
+  authorization was created. A new `ca_root_path` names the PEM root that signs
+  the ACME directory's *own* HTTPS certificate; it replaces the client's trust
+  anchors for the ACME control plane only (never for what browsers accept from
+  your site) and is unnecessary for Let's Encrypt, whose staging and production
+  API endpoints are both publicly trusted. `autumn doctor` grades it as
+  `acme_ca_root` and **fails** on a path that is missing or holds no
+  certificate, because that state can only ever produce failed orders.
+
+  This closes the gap that kept the order flow itself untested: with a reachable
+  private directory, `autumn/tests/integration/acme_end_to_end.rs` now drives a
+  real `instant-acme` client over real TLS against an in-process fake CA
+  (`acme_fake_ca.rs` — no Docker, no network), which validates HTTP-01 against
+  the app's own challenge listener, checks the finalize CSR's SANs against the
+  order's identifiers, and issues from its own root with a caller-chosen
+  validity window. The suite covers first-boot issuance and the HTTP→HTTPS
+  redirect, a **forced near-expiry certificate rotating with no restart while a
+  connection opened before the swap keeps serving**, a restart reusing the
+  stored account and certificate instead of re-registering or re-ordering, and a
+  failed order landing in both `/actuator/health` and the error-reporting seam.
+  A new CI lane runs it (and the #1603 `tls_serving` suite, which no blocking
+  lane compiled before) on every push.
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted
