@@ -1010,8 +1010,16 @@ mod tests {
             (Some("https://localhost:3000/health"), Some(""), false),
             // URLs that a parser would have mistaken for loopback stay verified
             // unless the operator opted in — curl resolves both remotely.
-            (Some("https://localhost:3000@remote.example/health"), None, false),
-            (Some("https://remote.example#@localhost/health"), None, false),
+            (
+                Some("https://localhost:3000@remote.example/health"),
+                None,
+                false,
+            ),
+            (
+                Some("https://remote.example#@localhost/health"),
+                None,
+                false,
+            ),
         ];
 
         for (url, insecure, expect_insecure) in cases {
