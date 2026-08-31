@@ -1471,7 +1471,16 @@ fn const_i32(wasm: &[u8], at: usize, limit: usize) -> Option<(Option<u64>, usize
     if *wasm.get(at)? == 0x41 {
         let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
         let end = skip_const_expr(wasm, next, limit)?;
-        return Some((u64::try_from(value).ok(), end));
+        let Ok(narrow) = i32::try_from(value) else {
+            // Not a well-formed `i32.const`; leave it to the engine.
+            return Some((None, end));
+        };
+        // A wasm offset is a `u32`, so `i32.const -1` addresses 4294967295 —
+        // past the end of any memory or table the sandbox will admit. Dropping
+        // a negative as "unevaluable" was a fail-open: the one class of offset
+        // that is *certainly* out of bounds was the one recorded as unknown.
+        let unsigned = u64::from(u32::from_ne_bytes(narrow.to_ne_bytes()));
+        return Some((Some(unsigned), end));
     }
     Some((None, skip_const_expr(wasm, at, limit)?))
 }
@@ -4193,6 +4202,27 @@ path = "/hello/greet"
             .expect_err("a start section must not load");
         assert!(
             matches!(err, SandboxLoadError::StartSectionForbidden),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_segment_offset_is_refused_rather_than_ignored() {
+        // A wasm offset is unsigned: `i32.const -1` means 4294967295, which is
+        // out of bounds for anything this sandbox admits. Reading it as a
+        // *signed* value and dropping it when the conversion failed meant the
+        // one offset guaranteed to be invalid was the one the walk called
+        // unevaluable — a fail-open in the check meant to catch exactly this.
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (data (i32.const -1) "x")
+             (func (export "_start") (nop)))"#;
+        let wasm = wat::parse_str(wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a negative offset must not load");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
             "{err:?}"
         );
     }

@@ -760,6 +760,23 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
 /// A prefix must be a plain, absolute path with at least one real segment and
 /// no routing syntax: it is a containment boundary, and a boundary that can
 /// match dynamically is not one.
+/// Characters whose whole purpose is to change how the text around them is
+/// displayed, rather than what it says.
+///
+/// Bidi overrides and isolates reorder a run; the zero-width and invisible
+/// characters hide a boundary. `char::is_control` catches neither, because
+/// these are formatting characters rather than control codes.
+const fn is_display_reordering(ch: char) -> bool {
+    matches!(ch,
+        '\u{061C}'                          // Arabic letter mark
+        | '\u{200B}'..='\u{200F}'            // zero-width, LRM/RLM
+        | '\u{202A}'..='\u{202E}'            // bidi embedding and override
+        | '\u{2060}'..='\u{2064}'            // word joiner and invisibles
+        | '\u{2066}'..='\u{2069}'            // bidi isolates
+        | '\u{FEFF}'                         // zero-width no-break space
+    )
+}
+
 fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &'static str| {
         Err(ManifestError::InvalidPrefix {
@@ -838,6 +855,19 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         // consent screen, where it can rewrite what the operator reads.
         if segment.chars().any(char::is_control) {
             return refuse("a route path must not contain control characters");
+        }
+        // `is_control` covers the C0/C1 categories and stops there, so it lets
+        // through the Unicode formatting characters, which do the same job by
+        // other means: U+202E reverses the run that follows it, so a path can
+        // be made to *display* on the consent screen as something other than
+        // what the manifest contains and the router mounts. The operator reads
+        // that screen to decide whether to trust the artifact, so a character
+        // whose only effect is on rendering is exactly the wrong thing to admit.
+        if segment.chars().any(is_display_reordering) {
+            return refuse(
+                "a route path must not contain Unicode formatting characters; they change what \
+                 the consent screen displays without changing what is mounted",
+            );
         }
         // axum 0.8 spells captures `{name}` / `{*rest}` and *panics* on a
         // segment starting with the 0.7 spelling, before matchit ever sees it.
@@ -985,6 +1015,17 @@ max_concurrency = 8
             .replace(r#"path = "/hello/greet""#, r#"path = "/greet""#);
         let err = SandboxManifest::parse(&src).expect_err("root prefix must fail");
         assert!(matches!(err, ManifestError::InvalidPrefix { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_route_path_that_reorders_its_own_display_is_refused() {
+        // U+202E makes the rendered path read differently from the mounted one.
+        // The consent screen is where an operator decides whether to trust the
+        // artifact, so a path that lies to it is refused outright.
+        let toml =
+            valid_toml().replace(r#"path = "/hello/greet""#, "path = \"/hello/\u{202E}terg\"");
+        let err = SandboxManifest::parse(&toml).expect_err("must be refused");
+        assert!(format!("{err}").contains("formatting characters"), "{err}");
     }
 
     #[test]
