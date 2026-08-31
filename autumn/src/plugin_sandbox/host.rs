@@ -2492,15 +2492,35 @@ path = "/hello/greet"
         let charged = host(guests::HELLO).instantiation_fuel();
         assert!(charged > 1, "the fixture carries data segments");
 
-        // A budget that cannot even cover instantiation is refused before the
-        // module is instantiated at all.
-        let starved = ResourceLimits {
-            fuel: charged / 2,
-            ..ResourceLimits::default()
-        };
-        let outcome = try_host_with(guests::HELLO, starved)
-            .expect("loads")
-            .run(&get("/hello/greet"));
+        // A budget that cannot even cover instantiation is refused at *load*
+        // now: the artifact could never answer a request, so it never mounts.
+        let err = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                fuel: charged / 2,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect_err("a budget below the fixed charge must not produce a host");
+        assert!(
+            matches!(err, SandboxLoadError::FuelBelowFixedCharges { .. }),
+            "{err:?}"
+        );
+
+        // The per-request refusal still matters, and is still reached: the load
+        // floor compares against instantiation alone, but the frame encoding is
+        // subtracted *first*, so a budget that clears the floor can still be
+        // spent before `_start`. That is the case no load-time check can catch,
+        // and it must still refuse before instantiating rather than after.
+        let outcome = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                fuel: charged + 1,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect("a budget above the fixed charge loads")
+        .run(&get("/hello/greet"));
         assert!(
             matches!(outcome.result, Err(SandboxFailure::FuelExhausted { .. })),
             "{:?}",
@@ -3191,10 +3211,12 @@ path = "/hello/greet"
         let mut request = get("/hello/greet");
         request.body = vec![b'x'; 200_000];
 
+        // Just above the load-time floor, so the host exists — and far below
+        // what encoding this body costs, which is the point.
         let starved = try_host_with(
             guests::HELLO,
             ResourceLimits {
-                fuel: 16,
+                fuel: host.instantiation_fuel() + 1,
                 ..ResourceLimits::default()
             },
         )
