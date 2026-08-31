@@ -59,11 +59,21 @@ happy path:
 
 ```toml
 # autumn.toml
+[server]
+host = "0.0.0.0"           # the default, 127.0.0.1, is loopback-only
+port = 443                 # ACME wraps THIS listener in TLS; the default is 3000
+
 [server.tls.acme]
 domains = ["app.example.com"]
 contact_email = "ops@example.com"
 directory = "production"   # default is Let's Encrypt STAGING — validate there first
 ```
+
+The `[server]` block is not optional here. ACME terminates TLS on the listener
+`server.host`/`server.port` already binds, and only the challenge listener binds
+`:80` on its own — so at the defaults you would serve HTTPS on `127.0.0.1:3000`,
+where neither Let's Encrypt nor your visitors can reach it, and the HTTP→HTTPS
+redirect would point at that unreachable port.
 
 On first boot the app answers the ACME HTTP-01 challenge on `:80` (which also
 redirects plain HTTP to HTTPS), serves the issued certificate on `:443`, caches
