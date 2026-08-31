@@ -2864,6 +2864,30 @@ step. Recommended before production deploys.
 
 ---
 
+## Refreshing staging from production
+
+Copying a production database into staging or onto a laptop is the fastest way
+to reproduce a bug — and the fastest way to leak customer PII. Autumn ships the
+whole loop:
+
+```sh
+AUTUMN_ENV=prod    autumn db backup --keep 7                       # 1. dump
+#                  ... move the run directory to the staging host ...
+AUTUMN_ENV=staging autumn db scrub --artifact backups/prod/<run> --force
+```
+
+The scrub restores the artifact into the staging database and rewrites every
+PII-classified column with constraint-valid fake values. Classification is
+fail-closed — a column that is neither classified nor explicitly declared safe
+aborts the scrub — so a newly added column can never silently carry real data
+into staging. Add `autumn db scrub --check` to CI to keep the declaration
+honest.
+
+See the [Data Scrubbing guide](data-scrubbing.md) for the classification
+workflow, the replacement strategies, and the full drill.
+
+---
+
 ## Next steps
 
 Once the container is running:

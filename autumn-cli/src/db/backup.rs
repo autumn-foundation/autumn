@@ -325,7 +325,7 @@ pub fn run_restore(args: &RestoreArgs) {
 
 // ─── Backup ─────────────────────────────────────────────────────────────────
 
-fn backup(args: &BackupArgs) -> Result<(), BackupError> {
+pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
     // Include the managed cluster's bundled tools (daemon/cron path, where
     // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
@@ -896,7 +896,7 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
 
 // ─── Restore ────────────────────────────────────────────────────────────────
 
-fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
+pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     // Production guard — identical to `autumn db drop` (AC #4). This guards the
     // RESTORE-TARGET profile (`--profile`), independent of any offsite source.
     let profile = migrate::effective_profile(args.profile.as_deref());
@@ -1192,6 +1192,35 @@ where
 
 /// Resolve the databases a backup run should capture, reusing the SAME
 /// resolution `autumn migrate` uses so the set matches the running app exactly.
+/// Every database a scrub must visit under `profile` — control plus each
+/// configured shard — as `(label, url)` pairs, resolved through the **same**
+/// path `backup`/`restore` use so a scrub can never miss a database a backup
+/// captured (issue #1602).
+///
+/// # Errors
+///
+/// Returns [`BackupError::NoUrl`] when no control URL can be resolved.
+pub(super) fn resolve_all_target_urls(
+    profile: Option<&str>,
+) -> Result<Vec<(String, String)>, BackupError> {
+    Ok(resolve_targets(profile, &TargetSelector::All)?
+        .into_iter()
+        .map(|t| (t.label, t.url))
+        .collect())
+}
+
+/// The profile a backup run directory was taken under, read from its
+/// `manifest.json`. `None` for a bare single-file artifact (which carries no
+/// manifest) or an unreadable/invalid manifest — callers treat absence as
+/// "unknown provenance", never as "safe".
+pub(super) fn artifact_source_profile(artifact: &Path) -> Option<String> {
+    artifact
+        .is_dir()
+        .then(|| read_manifest(artifact).ok())
+        .flatten()
+        .map(|m| m.profile)
+}
+
 fn resolve_targets(
     profile: Option<&str>,
     selector: &TargetSelector,

@@ -1699,6 +1699,57 @@ enum DbCommands {
         #[arg(long)]
         offsite: bool,
     },
+    /// Anonymize a database (or a backup artifact) for non-production use.
+    ///
+    /// Rewrites every PII-classified column with deterministic, constraint-valid
+    /// fake values so a production copy is safe on a laptop or a shared staging
+    /// box. Classification is fail-closed: `#[encrypted]` model columns and
+    /// tables registered with the GDPR anonymize strategy are classified
+    /// automatically, everything else must be declared in `scrub.toml`, and a
+    /// column that is neither PII nor explicitly `safe` aborts the scrub — so a
+    /// newly added column can never silently pass through with real data.
+    ///
+    /// Refuses to run outside the `dev`/`test` profile without `--force`, the
+    /// same guard as `autumn db drop`.
+    ///
+    /// # Examples
+    ///
+    ///   # Refresh staging from a production backup:
+    ///   `AUTUMN_ENV=staging` autumn db scrub --artifact backups/prod/latest-run --force
+    ///
+    ///   # Prove the classification is complete (CI):
+    ///   autumn db scrub --check
+    #[command(verbatim_doc_comment)]
+    Scrub {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore this backup run directory (or artifact file) into the
+        /// resolved database(s) before scrubbing.
+        #[arg(long, value_name = "ARTIFACT")]
+        artifact: Option<std::path::PathBuf>,
+        /// After a successful scrub, write a fresh (scrubbed) backup run here.
+        #[arg(long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+        /// Path to the PII declaration file (default: `./scrub.toml`).
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
+        /// Classify only: report the plan (or the unclassified columns) and
+        /// write nothing. Exits non-zero when any column is unclassified.
+        #[arg(long, conflicts_with_all = ["artifact", "output", "dry_run"])]
+        check: bool,
+        /// Print the exact SQL the scrub would run and write nothing.
+        #[arg(long, conflicts_with_all = ["artifact", "output"])]
+        dry_run: bool,
+        /// Allow the scrub against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Allow writing over the database an artifact's own (non-dev/test)
+        /// profile config file declares. Separate from `--force`, which the
+        /// staging drill always passes.
+        #[arg(long)]
+        allow_source_overwrite: bool,
+    },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
@@ -1718,15 +1769,21 @@ enum OffsiteCommands {
 impl DbCommands {
     /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
     /// module's command and the optional profile override the connection should
-    /// be resolved under. `pull`/`backup`/`restore` are dispatched separately
-    /// (they do not map onto [`db::DbCommand`]).
+    /// be resolved under. `pull`/`backup`/`restore`/`scrub` are dispatched
+    /// separately (they do not map onto [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } | Self::Offsite(_) => {
-                unreachable!("db pull/backup/restore/offsite are dispatched before into_command")
+            Self::Pull { .. }
+            | Self::Backup { .. }
+            | Self::Restore { .. }
+            | Self::Scrub { .. }
+            | Self::Offsite(_) => {
+                unreachable!(
+                    "db pull/backup/restore/scrub/offsite are dispatched before into_command"
+                )
             }
         }
     }
@@ -3514,6 +3571,25 @@ fn run_command(command: Commands) {
                 force,
                 shard,
                 offsite,
+            }),
+            DbCommands::Scrub {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
+            } => db::scrub::run(&db::scrub::ScrubArgs {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
             }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
@@ -6273,6 +6349,88 @@ mod tests {
             panic!("expected db offsite list");
         };
         assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    // ── autumn db scrub tests (issue #1602) ────────────────────────────────
+
+    #[test]
+    fn parse_db_scrub_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "scrub"]).unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert!(profile.is_none());
+        assert!(artifact.is_none());
+        assert!(output.is_none());
+        assert!(config.is_none());
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_db_scrub_with_artifact_output_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--profile",
+            "staging",
+            "--artifact",
+            "backups/prod/20260101T000000Z",
+            "--output",
+            "scrubbed",
+            "--config",
+            "config/scrub.toml",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(
+            artifact.as_deref(),
+            Some(std::path::Path::new("backups/prod/20260101T000000Z"))
+        );
+        assert_eq!(output.as_deref(), Some(std::path::Path::new("scrubbed")));
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("config/scrub.toml"))
+        );
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_db_scrub_check_conflicts_with_dry_run() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--check", "--dry-run"]).is_err(),
+            "--check and --dry-run are two different no-write modes; asking for both is a mistake"
+        );
     }
 
     // ── autumn console tests (issue #1039) ─────────────────────────────────

@@ -28,6 +28,11 @@ pub mod backup;
 /// Minimal synchronous S3 SigV4 client for offsite backup transfer (issue #1619).
 pub mod s3;
 
+/// `autumn db scrub` — anonymize a database (or a backup artifact) for
+/// non-production use (issue #1602). A submodule so it can reuse this module's
+/// production guard ([`guard_destructive`]) and identifier-quoting verbatim.
+pub mod scrub;
+
 /// The lifecycle subcommands of `autumn db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbCommand {

@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn db scrub` turns a production copy into an anonymized one, and
+  refuses to guess (#1602):** the moment `autumn db backup` shipped, a
+  production database was one command away from a laptop or a shared staging
+  box — PII and all — and the only remedy was hand-rolled `UPDATE` scripts that
+  rot the first time someone adds an `email` column. `autumn db scrub` takes
+  either a backup artifact (`--artifact`) or the resolved database URL and
+  rewrites every PII-classified column with deterministic, constraint-valid
+  fake values. Classification comes from the schema, not from a config file
+  alone: `#[encrypted]` model columns and tables registered with the GDPR
+  anonymize strategy are classified automatically, everything else is declared
+  in a checked-in `scrub.toml` — and because the column universe is read by
+  introspecting the live database, a column that is neither PII-classified nor
+  explicitly marked safe **aborts the scrub** and is listed by name, with a
+  paste-ready declaration stanza. That makes "we think staging is clean" a
+  CI-verified invariant: `autumn db scrub --check` writes nothing and exits
+  non-zero on any unclassified column. Replacements are derived from an `md5`
+  over the row's primary key salted with the column name, so a `UNIQUE` column
+  stays unique, `NULL`s stay `NULL`, and two columns of one row never collide;
+  PII on a primary- or foreign-key column is refused outright, so referential
+  integrity survives. Writing refuses outside `dev`/`test` without `--force`,
+  the same guard as `autumn db drop`, and every statement for one database runs
+  in a single transaction. `--output` re-dumps the scrubbed database as a fresh
+  artifact, closing the backup → scrub → restore loop.
+
+  The safety work is where most of the substance is. `#[encrypted]` columns are
+  **re-encrypted** under the target's own key rather than overwritten with a
+  plain string (which would make every later read of that row fail as malformed
+  ciphertext). PII is refused on either side of any foreign key — composite keys
+  included — so a natural key another table references is protected, not just
+  the referencing column; on `CHECK`-constrained columns, where no fabricated
+  value can satisfy the predicate; and on generated columns, which Postgres
+  refuses to update at all. Uniqueness is read from every unique index, partial
+  and composite included, and a unique column gets a wider `sha256` token so a
+  narrow `varchar(n)` cannot truncate into collisions. Statements are
+  `public`-qualified with a pinned `search_path` (a tenant `search_path` cannot
+  redirect a write), the planned tables are locked for the transaction, row-level
+  security and non-`public` schemas are refused rather than silently
+  under-scrubbed, materialized views are refreshed in dependency order, and the
+  framework-owned tables that keep verbatim copies of app rows — the ledger, the
+  version history, the search index, `api_tokens` — are reported and can be
+  emptied with `[framework] purge`. See the new
+  [Data Scrubbing guide](docs/guide/data-scrubbing.md).
+
 - **`autumn upgrade` now reconciles framework-owned scaffold files, not just
   app code (#1593):** `autumn new` writes about a dozen framework-owned files
   into every project — `Dockerfile`, `.dockerignore`, `build.rs`, `autumn.toml`,
