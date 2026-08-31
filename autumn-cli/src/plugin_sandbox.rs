@@ -174,10 +174,20 @@ impl Report {
         // sandbox will run it — and it is *most* interesting when the sandbox
         // will not. Reporting "(none)" for a module that was refused for what
         // it imports would make the consent screen contradict itself.
-        let imports = SandboxHost::imports_of(artifact.module()).unwrap_or_default();
+        // Excerpted *here*, not where they are rendered. Both strings come out
+        // of an artifact nobody has audited, and `to_json` serializes the
+        // report's own fields — so a bound applied in `to_text` leaves the JSON
+        // path carrying a name that fills most of the module allowance, which
+        // `serde_json` then expands again escaping it. Capping at construction
+        // is what makes every renderer safe rather than the one that remembered.
+        let imports = SandboxHost::imports_of(artifact.module())
+            .unwrap_or_default()
+            .iter()
+            .map(|import| excerpt(import))
+            .collect();
         let (loads, load_error) = match SandboxHost::load(artifact) {
             Ok(_) => (true, None),
-            Err(err) => (false, Some(err.to_string())),
+            Err(err) => (false, Some(excerpt(&err.to_string()))),
         };
         Self {
             name: manifest.name.clone(),
@@ -227,14 +237,15 @@ impl Report {
             // verdict — which is an attack on the decision this screen exists
             // to inform.
             out.push_str("    ");
-            out.push_str(&excerpt(import));
+            // Already excerpted in `of`; escaping twice would render `\n` as `\\n`.
+            out.push_str(import);
             out.push('\n');
         }
         out.push('\n');
         match &self.load_error {
             Some(error) => {
                 out.push_str("\u{2717} this artifact does not load in this build's sandbox:\n  ");
-                out.push_str(&excerpt(error));
+                out.push_str(error);
                 out.push('\n');
             }
             None => out.push_str("\u{2713} loads into this build's sandbox\n"),
@@ -585,6 +596,46 @@ path = "/hello/greet"
         assert_eq!(value["routes"][0]["path"], "/hello/greet");
         assert_eq!(value["loads"], true);
         assert!(value["denied"].as_array().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[test]
+    fn the_json_report_bounds_artifact_strings_the_way_the_text_one_does() {
+        // The text renderer excerpted; `to_json` serialized the report's own
+        // fields, so the bound stopped at whichever renderer remembered it.
+        //
+        // The wasm parser caps one name near 100 KiB, so a single import cannot
+        // fill the module allowance — but the reported list holds up to 256 of
+        // them, and `serde_json` expands every control character again escaping
+        // it. The bound belongs on the report either way: which renderer is
+        // safe should not depend on which one remembered to call `excerpt`.
+        let name = format!("\\1b[2K{}", "a".repeat(50_000));
+        let module = wat::parse_str(format!(
+            r#"(module
+                 (import "env" "{name}" (func))
+                 (memory (export "memory") 1)
+                 (func (export "_start") (nop)))"#
+        ))
+        .expect("valid WAT");
+        let artifact = SandboxArtifact::seal(
+            SandboxManifest::parse(&manifest_toml()).expect("valid manifest"),
+            module,
+        )
+        .expect("seals");
+
+        let built = Report::of(&artifact);
+        let json = built.to_json().expect("serializes");
+        assert!(
+            json.len() < 64 * 1024,
+            "the whole name reached the JSON: {} bytes",
+            json.len()
+        );
+        // Bounded, and still an honest report: the reader must be able to see
+        // that it was cut rather than that the artifact was small.
+        assert!(json.contains("truncated"), "the cut is not disclosed");
+        assert!(
+            !json.contains('\u{1b}'),
+            "a raw escape reached a consumer that may render it"
+        );
     }
 
     #[test]

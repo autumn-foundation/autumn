@@ -213,15 +213,58 @@ fn guest_text(text: &str) -> String {
 /// manifest whose fuel is small relative to its body ceiling; a generous fuel
 /// budget buys an arbitrarily large host-side copy. So the ceiling is checked
 /// first, before the request is priced or walked at all.
-fn refuse_oversized_body(
+pub const MAX_REQUEST_METADATA_BYTES: usize = 256 * 1024;
+
+/// Every byte of a request that is not its body, summed.
+///
+/// One definition, used by both the ceiling below and [`encoding_fuel`], so the
+/// bytes that are refused and the bytes that are charged for cannot drift apart
+/// as fields are added to the frame.
+fn request_metadata_bytes(request: &SandboxRequest) -> usize {
+    let pairs = |list: &[(String, String)]| {
+        list.iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>()
+    };
+    request
+        .method
+        .len()
+        .saturating_add(request.path.len())
+        .saturating_add(request.query.len())
+        .saturating_add(request.route.len())
+        .saturating_add(pairs(&request.headers))
+        .saturating_add(pairs(&request.path_params))
+}
+
+fn refuse_oversized_request(
     request: &SandboxRequest,
     limits: ResourceLimits,
 ) -> Option<SandboxOutcome> {
-    (request.body.len() > limits.max_request_body_bytes).then(|| {
-        SandboxOutcome::refused(
+    if request.body.len() > limits.max_request_body_bytes {
+        return Some(SandboxOutcome::refused(
             SandboxFailure::RequestBudget {
                 max: limits.max_request_body_bytes,
                 len: request.body.len(),
+            },
+            0,
+        ));
+    }
+    // The body ceiling is the manifest's; this one is the host's, because no
+    // manifest declares a query or header budget. `run` is public and the
+    // adapter's own limits do not reach it, so an embedder building a
+    // `SandboxRequest` by hand could otherwise hand over a gigabyte of query
+    // string: cloned into the frame and serialised into the NDJSON line before
+    // the guest starts, against a footprint that budgets for the *body* alone.
+    //
+    // The encoding charge prices those bytes, but pricing is not a bound — at
+    // the manifest's maximum fuel it permits more than a terabyte of them — so
+    // the ceiling is what keeps `request_footprint_bytes` honest.
+    let metadata = request_metadata_bytes(request);
+    (metadata > MAX_REQUEST_METADATA_BYTES).then(|| {
+        SandboxOutcome::refused(
+            SandboxFailure::RequestMetadataBudget {
+                max: MAX_REQUEST_METADATA_BYTES,
+                len: metadata,
             },
             0,
         )
@@ -296,23 +339,7 @@ fn encoding_fuel(request: &SandboxRequest) -> u64 {
     let bytes = request
         .body
         .len()
-        .saturating_add(request.path.len())
-        .saturating_add(request.query.len())
-        .saturating_add(request.route.len())
-        .saturating_add(
-            request
-                .headers
-                .iter()
-                .map(|(name, value)| name.len().saturating_add(value.len()))
-                .sum::<usize>(),
-        )
-        .saturating_add(
-            request
-                .path_params
-                .iter()
-                .map(|(name, value)| name.len().saturating_add(value.len()))
-                .sum::<usize>(),
-        );
+        .saturating_add(request_metadata_bytes(request));
 
     u64::try_from(bytes)
         .unwrap_or(u64::MAX)
@@ -408,9 +435,10 @@ impl fmt::Display for CapabilityDenial {
 ///
 /// Almost every variant is a *plugin* failure — none of those is a host
 /// failure, and none can be anything other than a 5xx on the plugin's own
-/// prefix. [`RequestBudget`](Self::RequestBudget) is the one exception: it is
-/// the *caller's* request that was refused, before the plugin was asked
-/// anything, so it answers 413 the way the ceiling does everywhere else.
+/// prefix. [`RequestBudget`](Self::RequestBudget) and
+/// [`RequestMetadataBudget`](Self::RequestMetadataBudget) are the exceptions:
+/// it is the *caller's* request that was refused, before the plugin was asked
+/// anything, so they answer 413 the way the ceiling does everywhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SandboxFailure {
@@ -455,6 +483,15 @@ pub enum SandboxFailure {
         /// What the caller actually handed over.
         len: usize,
     },
+    /// The request handed to [`SandboxHost::run`] carried more metadata — path,
+    /// query, route, headers, path parameters — than the host's ceiling allows.
+    /// The guest was never started.
+    RequestMetadataBudget {
+        /// The ceiling it blew through.
+        max: usize,
+        /// What the caller actually handed over.
+        len: usize,
+    },
 }
 
 impl SandboxFailure {
@@ -472,7 +509,9 @@ impl SandboxFailure {
             Self::FuelExhausted { .. } | Self::OutputBudget { .. } => {
                 http::StatusCode::GATEWAY_TIMEOUT
             }
-            Self::RequestBudget { .. } => http::StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestBudget { .. } | Self::RequestMetadataBudget { .. } => {
+                http::StatusCode::PAYLOAD_TOO_LARGE
+            }
             Self::AtCapacity { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             _ => http::StatusCode::BAD_GATEWAY,
         }
@@ -515,6 +554,11 @@ impl fmt::Display for SandboxFailure {
             Self::RequestBudget { max, len } => write!(
                 f,
                 "the request body is {len} bytes, over the plugin's {max}-byte request ceiling"
+            ),
+            Self::RequestMetadataBudget { max, len } => write!(
+                f,
+                "the request's path, query, headers and parameters are {len} bytes, over the \
+                 host's {max}-byte ceiling"
             ),
         }
     }
@@ -892,7 +936,7 @@ impl SandboxHost {
         // Bounds where the response may redirect a client; see `sanitize`.
         let prefix = self.manifest.prefix.as_str();
 
-        if let Some(refusal) = refuse_oversized_body(request, limits) {
+        if let Some(refusal) = refuse_oversized_request(request, limits) {
             return refusal;
         }
 
@@ -3467,6 +3511,52 @@ path = "/hello/greet"
             dear,
             cheap + 32,
             "each admitted import must cost a unit: {cheap} then {dear}"
+        );
+    }
+
+    #[test]
+    fn request_metadata_over_the_ceiling_is_refused_before_the_frame_is_built() {
+        // The body ceiling was the manifest's and only ever covered the body.
+        // Everything else on a `SandboxRequest` — query, headers, path params —
+        // is cloned into the frame and serialised into the NDJSON line just the
+        // same, and `request_footprint_bytes` budgets for none of it. The
+        // encoding charge prices those bytes, but a manifest may declare fuel
+        // enough to buy more than a terabyte of them, so pricing is not a bound.
+        let host = host(guests::HELLO);
+        let mut request = get("/hello/greet");
+        request.query = "x=".repeat(MAX_REQUEST_METADATA_BYTES);
+
+        let outcome = host.run(&request);
+        let err = outcome
+            .result
+            .expect_err("oversized metadata must be refused");
+        assert!(
+            matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
+            "{err:?}"
+        );
+        // The caller's request was refused, not the plugin's answer: 413, the
+        // same door the body ceiling answers through.
+        assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            outcome.fuel_used, 0,
+            "nothing was built, so nothing was spent"
+        );
+    }
+
+    #[test]
+    fn the_metadata_ceiling_leaves_an_ordinary_request_alone() {
+        // A ceiling that a real request could reach would be a bug of its own:
+        // every HTTP server in front of this caps a URI and a header block far
+        // below it.
+        let host = host(guests::HELLO);
+        let mut request = get("/hello/greet");
+        request.query = "x=1&".repeat(64);
+        request
+            .headers
+            .push(("x-trace".to_owned(), "a".repeat(1024)));
+        assert!(
+            host.run(&request).result.is_ok(),
+            "an ordinary request must not be caught by the metadata ceiling"
         );
     }
 
