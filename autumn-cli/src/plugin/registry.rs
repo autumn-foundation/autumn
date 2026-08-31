@@ -135,12 +135,10 @@ pub fn search() -> Option<Vec<CommunityPlugin>> {
 pub fn latest_version(crate_name: &str) -> Option<String> {
     let body = get(&format!("https://crates.io/api/v1/crates/{crate_name}"))?;
     let value = serde_json::from_str::<serde_json::Value>(&body).ok()?;
-    let krate = value.get("crate")?;
-    krate
-        .get("newest_version")
-        .or_else(|| krate.get("max_version"))
-        .and_then(serde_json::Value::as_str)
-        .map(std::borrow::ToOwned::to_owned)
+    // The SAME field preference as the search path. Diverging here let
+    // `plugin add` pin a back-ported or pre-release version while
+    // `plugin list` had shown the stable one the user picked.
+    pick_version(value.get("crate")?)
 }
 
 /// Largest response body this module will read into memory.

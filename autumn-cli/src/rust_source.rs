@@ -226,6 +226,33 @@ fn is_char_literal(bytes: &[u8], i: usize) -> bool {
     }
 }
 
+/// The index of the `)` that closes the `(` at `open`, or `None` if the
+/// source ends first.
+///
+/// Only meaningful on a masked source: a paren inside a string or comment
+/// would otherwise unbalance the count.
+#[must_use]
+pub fn balanced_close_paren(masked: &str, open: usize) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Every line of `source` with comments and string contents blanked, paired
 /// with its byte offset in the **original** source.
 ///
@@ -259,9 +286,31 @@ pub fn for_each_code_line<T>(
         .find_map(|(line, offset)| f(&line, offset))
 }
 
+/// Whether `line` declares `async fn main` — the entry point, not a helper
+/// whose name merely starts with it (`async fn main_loop`).
+#[must_use]
+pub fn declares_async_main(line: &str) -> bool {
+    const NEEDLE: &str = "async fn main";
+    let mut rest = line;
+    while let Some(at) = rest.find(NEEDLE) {
+        let after = &rest[at + NEEDLE.len()..];
+        if after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{code_lines, for_each_code_line, mask_non_code};
+    use super::{
+        balanced_close_paren, code_lines, declares_async_main, for_each_code_line, mask_non_code,
+    };
 
     /// The mask must be a byte-for-byte overlay: offsets computed on it index
     /// the original exactly.
@@ -405,6 +454,23 @@ mod tests {
         assert_eq!(lines[0].1, 0);
         assert_eq!(lines[1].1, 2);
         assert_eq!(lines[2].1, 5);
+    }
+
+    #[test]
+    fn a_helper_whose_name_starts_with_main_is_not_the_entry_point() {
+        assert!(declares_async_main("async fn main() {"));
+        assert!(declares_async_main("pub async fn main() {"));
+        assert!(!declares_async_main("async fn main_loop() {"));
+        assert!(!declares_async_main("async fn mainly() {"));
+        assert!(!declares_async_main("fn main() {"));
+    }
+
+    #[test]
+    fn balanced_close_paren_spans_nested_calls() {
+        let src = "f(a, g(b, c), d) tail";
+        assert_eq!(balanced_close_paren(src, 1), Some(15));
+        assert_eq!(balanced_close_paren(src, 0), None, "index 0 is not a paren");
+        assert_eq!(balanced_close_paren("f(a", 1), None, "unterminated");
     }
 
     #[test]

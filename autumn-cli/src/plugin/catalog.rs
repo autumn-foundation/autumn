@@ -28,13 +28,20 @@ pub struct CatalogEntry {
     /// under the builder-opening `autumn_web::app()` line. Its first line is
     /// the `// added by ...` marker.
     pub mount: &'static str,
-    /// The fully-qualified path this command's own mount writes. Matched
-    /// against *code* lines only, so a mention in a comment never counts.
-    pub probe: &'static str,
-    /// The same mount as a hand-written call after a `use` import
-    /// (`AdminPlugin::new(`). Detected too, so `add` never splices a second,
-    /// default-constructed mount over a user's configured one.
-    pub probe_bare: &'static str,
+    /// The builder call this plugin mounts through: `.plugin(` for a
+    /// `Plugin`, `.with_blob_store(` for `autumn-storage-s3`.
+    pub mount_call: &'static str,
+    /// The fully-qualified path this command's own mount writes. Trusted only
+    /// *inside* a [`Self::mount_call`] argument: on its own it is just a type
+    /// name, so `fn configure(_: autumn_admin_plugin::AdminPlugin) {}` would
+    /// otherwise read as a mount and suppress the real one.
+    pub mount_arg: &'static str,
+    /// The constructor call a mount must contain (`AdminPlugin::new(`).
+    /// Trusted anywhere in code, because a plugin built into a variable and
+    /// mounted as `.plugin(configured)` is still a mount — and splicing a
+    /// second, default-constructed one over it would win the duplicate check
+    /// and silently discard the user's configuration.
+    pub constructor: &'static str,
     /// Config keys the plugin needs before the app can serve it.
     pub config_keys: &'static [&'static str],
     /// Follow-up steps printed after a successful install.
@@ -65,8 +72,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        // added by `autumn plugin add autumn-admin-plugin`\n",
             "        .plugin(autumn_admin_plugin::AdminPlugin::new())\n",
         ),
-        probe: "autumn_admin_plugin::AdminPlugin",
-        probe_bare: "AdminPlugin::new(",
+        mount_call: ".plugin(",
+        mount_arg: "autumn_admin_plugin::AdminPlugin",
+        constructor: "AdminPlugin::new(",
         config_keys: &["[database]\nprimary_url = \"postgres://localhost/my_app\""],
         post_install: &[
             "Register a model with `autumn generate admin <Model>` — the panel mounts at /admin but starts with no models.",
@@ -81,8 +89,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        // added by `autumn plugin add autumn-cache-redis`\n",
             "        .plugin(autumn_cache_redis::RedisCachePlugin::new())\n",
         ),
-        probe: "autumn_cache_redis::RedisCachePlugin",
-        probe_bare: "RedisCachePlugin::new(",
+        mount_call: ".plugin(",
+        mount_arg: "autumn_cache_redis::RedisCachePlugin",
+        constructor: "RedisCachePlugin::new(",
         config_keys: &[
             "[cache]\nbackend = \"redis\"\n\n[cache.redis]\nurl = \"redis://127.0.0.1:6379\"",
         ],
@@ -97,8 +106,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        // added by `autumn plugin add autumn-media-plugin`\n",
             "        .plugin(autumn_media_plugin::MediaPlugin::new())\n",
         ),
-        probe: "autumn_media_plugin::MediaPlugin",
-        probe_bare: "MediaPlugin::new(",
+        mount_call: ".plugin(",
+        mount_arg: "autumn_media_plugin::MediaPlugin",
+        constructor: "MediaPlugin::new(",
         config_keys: &[
             "[media]\nroom_max_participants = 6\n\n[media.mediamtx]\napi_base = \"http://127.0.0.1:9997\"",
         ],
@@ -114,8 +124,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        // added by `autumn plugin add autumn-search`\n",
             "        .plugin(autumn_search::SearchPlugin::new())\n",
         ),
-        probe: "autumn_search::SearchPlugin",
-        probe_bare: "SearchPlugin::new(",
+        mount_call: ".plugin(",
+        mount_arg: "autumn_search::SearchPlugin",
+        constructor: "SearchPlugin::new(",
         config_keys: &["[search]\nengine = \"postgres\""],
         post_install: &[
             "Mark a model with `#[searchable]`, then register it: `SearchPlugin::new().postgres().index::<Model>()`.",
@@ -139,8 +150,9 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "                .expect(\"`[storage.s3]` must set `bucket` and `region`\")\n",
             "        })\n",
         ),
-        probe: "autumn_storage_s3::S3BlobStore",
-        probe_bare: "S3BlobStore::from_config(",
+        mount_call: ".with_blob_store(",
+        mount_arg: "autumn_storage_s3::S3BlobStore",
+        constructor: "S3BlobStore::from_config(",
         config_keys: &[
             "[storage]\nbackend = \"s3\"\n\n[storage.s3]\nbucket = \"my-bucket\"\nregion = \"us-east-1\"",
         ],
@@ -150,15 +162,6 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         ],
     },
 ];
-
-impl CatalogEntry {
-    /// Both spellings a mount of this plugin can take, for
-    /// [`crate::plugin::install::mount_present`].
-    #[must_use]
-    pub const fn probes(&self) -> [&'static str; 2] {
-        [self.probe, self.probe_bare]
-    }
-}
 
 /// The first-party entry named `name`, if there is one.
 #[must_use]
@@ -316,18 +319,23 @@ mod tests {
         }
     }
 
-    /// Idempotency (AC #4) is decided by the probe, so a probe that does not
-    /// occur in its own mount snippet could never detect the mount it just
-    /// wrote. Every mount must also carry the `added by` marker.
+    /// Idempotency (AC #4) is decided by these three fields, so a mount that
+    /// does not contain its own call, type path and constructor could never
+    /// detect the mount it just wrote.
     #[test]
-    fn every_mount_contains_its_probe_and_marker() {
+    fn every_mount_contains_its_own_detection_markers() {
         for entry in FIRST_PARTY {
-            assert!(
-                entry.mount.contains(entry.probe),
-                "{}: probe {:?} not in its own mount",
-                entry.crate_name,
-                entry.probe
-            );
+            for (label, needle) in [
+                ("mount_call", entry.mount_call),
+                ("mount_arg", entry.mount_arg),
+                ("constructor", entry.constructor),
+            ] {
+                assert!(
+                    entry.mount.contains(needle),
+                    "{}: {label} {needle:?} not in its own mount",
+                    entry.crate_name
+                );
+            }
             assert!(
                 entry
                     .mount
@@ -338,18 +346,26 @@ mod tests {
         }
     }
 
-    /// The probe must be a *code* substring: matching on a comment would let a
-    /// pasted README snippet suppress a real install.
+    /// The type path is only trusted inside a mount call, and the constructor
+    /// anywhere — so each must be the shape the other is not.
     #[test]
-    fn every_probe_is_a_module_path_not_a_comment() {
+    fn detection_markers_have_the_right_shapes() {
         for entry in FIRST_PARTY {
             assert!(
-                entry.probe.contains("::"),
-                "{}: probe {:?} should be a module path",
-                entry.crate_name,
-                entry.probe
+                entry.mount_arg.contains("::") && !entry.mount_arg.contains('('),
+                "{}: mount_arg should be a bare type path",
+                entry.crate_name
             );
-            assert!(!entry.probe.contains("//"), "{}", entry.crate_name);
+            assert!(
+                entry.constructor.ends_with('('),
+                "{}: constructor should be a call",
+                entry.crate_name
+            );
+            assert!(
+                entry.mount_call.starts_with('.') && entry.mount_call.ends_with('('),
+                "{}: mount_call should be a builder call",
+                entry.crate_name
+            );
         }
     }
 

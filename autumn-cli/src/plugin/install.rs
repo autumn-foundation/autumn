@@ -270,59 +270,70 @@ pub fn dependency_line(crate_name: &str, version: &str) -> String {
     format!("{crate_name} = \"{version}\"")
 }
 
-/// Whether `manifest` already declares `crate_name` as a **normal** dependency
-/// of the application target.
+/// Whether `manifest` already declares `crate_name` as an unconditional
+/// `[dependencies]` entry.
 ///
 /// Parsed rather than substring-matched: a commented-out line or a mention in
 /// a `description` must not make an install look done.
+///
+/// `[dependencies]` **only** — not `[dev-dependencies]`, not
+/// `[build-dependencies]`, and not `[target.'cfg(…)'.dependencies]`. The mount
+/// this command writes is unconditional, so anything that does not make the
+/// crate available to every application build cannot count as installed:
+/// a dev-dependency is invisible to the binary, and a `cfg(windows)`
+/// dependency is absent on the Linux build. Counting either would report a
+/// complete install for an app that does not compile, *and* would stop the
+/// command adding the entry that fixes it.
 #[must_use]
 pub fn dependency_present(manifest: &str, crate_name: &str) -> bool {
     let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
         return false;
     };
-    // `[dependencies]` and the per-target normal tables ONLY. A crate declared
-    // under `[dev-dependencies]` or `[build-dependencies]` is not available to
-    // the application target, so counting one as installed would report a
-    // complete install for an app that cannot compile — and would stop the
-    // command adding the `[dependencies]` entry that fixes it.
-    let targets = table.get("target").and_then(toml::Value::as_table);
     table
         .get("dependencies")
-        .into_iter()
-        .chain(targets.into_iter().flat_map(|targets| {
-            targets
-                .values()
-                .filter_map(|target| target.get("dependencies"))
-        }))
-        .filter_map(toml::Value::as_table)
-        .any(|deps| deps.contains_key(crate_name))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|deps| deps.contains_key(crate_name))
 }
 
-/// Whether `main_rs` already mounts the plugin **in code**.
+/// Whether `main_rs` already mounts `entry` **in code**.
 ///
-/// `probes` are the spellings a mount can take: the fully-qualified path this
-/// command writes (`autumn_search::SearchPlugin`) and the bare call a
-/// hand-written mount uses after a `use` import (`SearchPlugin::new(`). Both
-/// are needed, in both directions: without the bare form a hand-configured
-/// `.plugin(SearchPlugin::new().index::<Post>())` is not detected and `add`
-/// splices a *second*, default-constructed mount — which `AppBuilder::plugin`
-/// then keeps in preference to the user's, silently discarding their
-/// configuration.
+/// Two independent kinds of evidence, because a single substring test is wrong
+/// in both directions:
 ///
-/// `use` lines are excluded for the mirror-image reason: a bare
-/// `use autumn_search::SearchPlugin;` import is not a mount, and treating it
-/// as one made `add` report "already installed" for an app that mounts
-/// nothing.
+/// - The plugin's **type path** inside a [`CatalogEntry::mount_call`]
+///   argument (`.plugin(…)` / `.with_blob_store(…)`), located by a
+///   balanced-paren scan so a mount split across lines still matches. The type
+///   path is only trusted *there*: on its own it is just a name, and
+///   `fn configure(_: autumn_admin_plugin::AdminPlugin) {}` would otherwise
+///   read as a mount and suppress the real one.
+/// - The plugin's **constructor call** (`AdminPlugin::new(`) anywhere in code.
+///   A plugin built into a variable and mounted as `.plugin(configured)` is
+///   still a mount, and the mount call alone cannot see that. Splicing a
+///   second, default-constructed mount over it would take priority in
+///   `AppBuilder::plugin`'s duplicate check and silently discard the user's
+///   configuration — the worse of the two failures.
 ///
-/// Sharing [`crate::rust_source::code_lines`] with the anchor scan is
-/// deliberate: if the two disagreed about what a comment is, a doc-comment
-/// mention could suppress both the mount and the warning about it.
+/// Both run against [`crate::rust_source::mask_non_code`] output, so neither a
+/// comment nor a string literal can spoof either one.
 #[must_use]
-pub fn mount_present(main_rs: &str, probes: &[&str]) -> bool {
-    crate::rust_source::code_lines(main_rs)
-        .into_iter()
-        .filter(|(line, _)| !line.trim_start().starts_with("use "))
-        .any(|(line, _)| probes.iter().any(|probe| line.contains(probe)))
+pub fn mount_present(main_rs: &str, entry: &CatalogEntry) -> bool {
+    let masked = crate::rust_source::mask_non_code(main_rs);
+    if masked.contains(entry.constructor) {
+        return true;
+    }
+    let mut from = 0usize;
+    while let Some(found) = masked[from..].find(entry.mount_call) {
+        // The `(` the call opens with is the last byte of `mount_call`.
+        let open = from + found + entry.mount_call.len() - 1;
+        let Some(close) = crate::rust_source::balanced_close_paren(&masked, open) else {
+            return false;
+        };
+        if masked[open + 1..close].contains(entry.mount_arg) {
+            return true;
+        }
+        from = close;
+    }
+    false
 }
 
 /// Byte offset just past the builder-opening `autumn_web::app()` **inside the
@@ -351,7 +362,7 @@ fn builder_anchor(main_rs: &str) -> Option<usize> {
     let lines = crate::rust_source::code_lines(main_rs);
     let main_at = lines
         .iter()
-        .position(|(line, _)| line.trim().contains("async fn main"))?;
+        .position(|(line, _)| crate::rust_source::declares_async_main(line))?;
     // The body ends at the first code line that closes a brace at column 0 —
     // the closing brace of a top-level `async fn main`.
     let body_end = lines
@@ -450,7 +461,7 @@ pub fn plan_add(
     let main_src = std::fs::read_to_string(&main_path).unwrap_or_default();
 
     let dependency_installed = dependency_present(&manifest_src, entry.crate_name);
-    let already_mounted = mount_present(&main_src, &entry.probes());
+    let already_mounted = mount_present(&main_src, entry);
     if dependency_installed && already_mounted {
         return Ok(AddOutcome::AlreadyInstalled);
     }
@@ -737,7 +748,7 @@ maud = { version = "0.27", features = ["axum"] }
     fn mount_lands_inside_the_builder_chain() {
         let updated = insert_mount(SCAFFOLD_MAIN, admin().mount).expect("anchor");
         let app_at = updated.find("autumn_web::app()").unwrap();
-        let mount_at = updated.find(admin().probe).unwrap();
+        let mount_at = updated.find(admin().mount_arg).unwrap();
         let routes_at = updated.find(".routes(").unwrap();
         assert!(app_at < mount_at && mount_at < routes_at, "{updated}");
     }
@@ -755,11 +766,11 @@ maud = { version = "0.27", features = ["axum"] }
     #[test]
     fn mount_present_ignores_comment_mentions() {
         let commented = "// autumn_admin_plugin::AdminPlugin::new()\nfn main() {}\n";
-        assert!(!mount_present(commented, &admin().probes()));
+        assert!(!mount_present(commented, admin()));
         let block = "/*\nautumn_admin_plugin::AdminPlugin::new()\n*/\nfn main() {}\n";
-        assert!(!mount_present(block, &admin().probes()));
+        assert!(!mount_present(block, admin()));
         let real = "fn main() { app.plugin(autumn_admin_plugin::AdminPlugin::new()); }\n";
-        assert!(mount_present(real, &admin().probes()));
+        assert!(mount_present(real, admin()));
     }
 
     /// A bare `use` import is not a mount. Counting it as one made `add`
@@ -768,7 +779,7 @@ maud = { version = "0.27", features = ["axum"] }
     #[test]
     fn an_import_alone_is_not_a_mount() {
         let imported = "use autumn_admin_plugin::AdminPlugin;\n\nfn main() {}\n";
-        assert!(!mount_present(imported, &admin().probes()));
+        assert!(!mount_present(imported, admin()));
     }
 
     /// A hand-written mount through an import carries only the bare call, so
@@ -779,7 +790,7 @@ maud = { version = "0.27", features = ["axum"] }
     fn a_hand_written_mount_behind_an_import_is_detected() {
         let src = "use autumn_admin_plugin::AdminPlugin;\n\nfn main() {\n    \
                    app.plugin(AdminPlugin::new().require_role(\"staff\"));\n}\n";
-        assert!(mount_present(src, &admin().probes()));
+        assert!(mount_present(src, admin()));
     }
 
     #[test]
@@ -824,7 +835,7 @@ maud = { version = "0.27", features = ["axum"] }
         };
         plan.execute(crate::generate::Flags::default()).unwrap();
         let main_rs = std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
-        assert!(main_rs.contains(admin().probe), "{main_rs}");
+        assert!(main_rs.contains(admin().mount_arg), "{main_rs}");
         let cargo_after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert_eq!(
             cargo_after.matches("autumn-admin-plugin =").count(),
@@ -841,7 +852,7 @@ maud = { version = "0.27", features = ["axum"] }
         let src = "#[autumn_web::main]\nasync fn main() {\n    \
                    let help = \"paste AdminPlugin::new( into your builder\";\n    \
                    let app = autumn_web::app()\n        .routes(routes![index]);\n}\n";
-        assert!(!mount_present(src, &admin().probes()));
+        assert!(!mount_present(src, admin()));
 
         let tmp = fake_project(src, SCAFFOLD_CARGO);
         let AddOutcome::Installed { plan, .. } = plan_add(tmp.path(), admin(), "0.7.0").unwrap()
@@ -885,12 +896,61 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
+    /// A target-gated dependency cannot back the unconditional mount this
+    /// command writes: on any build where the predicate is false the crate is
+    /// absent, so counting it as installed would report success for an app
+    /// that does not compile — and would decline to add the entry that fixes
+    /// it.
     #[test]
-    fn a_target_specific_normal_dependency_counts_as_installed() {
+    fn a_target_gated_dependency_does_not_count_as_installed() {
         let cargo = format!(
-            "{SCAFFOLD_CARGO}\n[target.'cfg(unix)'.dependencies]\nautumn-admin-plugin = \"0.7.0\"\n"
+            "{SCAFFOLD_CARGO}\n[target.'cfg(windows)'.dependencies]\nautumn-admin-plugin = \"0.7.0\"\n"
         );
-        assert!(dependency_present(&cargo, "autumn-admin-plugin"));
+        assert!(!dependency_present(&cargo, "autumn-admin-plugin"));
+    }
+
+    /// A plugin type in a signature is not a mount. Reading one as a mount
+    /// suppressed the real insertion while the command reported success.
+    #[test]
+    fn a_type_annotation_is_not_a_mount() {
+        let src = "fn configure(_: autumn_admin_plugin::AdminPlugin) {}\n\
+                   #[autumn_web::main]\nasync fn main() {\n    \
+                   let app = autumn_web::app()\n        .routes(routes![index]);\n}\n";
+        assert!(!mount_present(src, admin()));
+    }
+
+    /// …but a plugin built into a variable and mounted through it IS a mount:
+    /// splicing a second, default-constructed one would win the duplicate
+    /// check and discard the user's configuration.
+    #[test]
+    fn a_constructor_bound_to_a_variable_is_a_mount() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    \
+                   let configured = AdminPlugin::new().require_role(\"staff\");\n    \
+                   let app = autumn_web::app().plugin(configured);\n}\n";
+        assert!(mount_present(src, admin()));
+    }
+
+    /// A mount split across lines — the shape rustfmt produces, and the shape
+    /// this command writes for `autumn-storage-s3` — must still be detected.
+    #[test]
+    fn a_multi_line_mount_is_detected() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    \
+                   let app = autumn_web::app()\n        .plugin(\n            \
+                   autumn_search::SearchPlugin::new()\n                \
+                   .postgres(),\n        );\n}\n";
+        let search = catalog::lookup("autumn-search").expect("search entry");
+        assert!(mount_present(src, search));
+    }
+
+    /// A helper whose name merely starts with `main` is not the entry point:
+    /// splicing into it mounts the plugin where the binary never runs it.
+    #[test]
+    fn a_helper_named_like_main_is_not_the_entry_point() {
+        let src = "async fn main_loop() {\n    let a = autumn_web::app()\n        \
+                   .routes(routes![index]);\n}\n\n\
+                   #[autumn_web::main]\nasync fn main() {\n    \
+                   main_loop().await;\n}\n";
+        assert!(insert_mount(src, admin().mount).is_none());
     }
 
     /// A community crate never gets its mount written, so a re-run stays
@@ -1021,7 +1081,7 @@ maud = { version = "0.27", features = ["axum"] }
         let updated = insert_mount(src, admin().mount).expect("the real chain");
         // Spliced after the REAL builder line, not the one in the string.
         let doc_at = updated.find("let doc").unwrap();
-        let mount_at = updated.find(admin().probe).unwrap();
+        let mount_at = updated.find(admin().mount_arg).unwrap();
         let real_at = updated.find("let app = autumn_web::app()").unwrap();
         assert!(doc_at < real_at, "{updated}");
         assert!(real_at < mount_at, "{updated}");
@@ -1144,7 +1204,7 @@ maud = { version = "0.27", features = ["axum"] }
             let updated = insert_mount(SCAFFOLD_MAIN, entry.mount)
                 .unwrap_or_else(|| panic!("{}: no anchor", entry.crate_name));
             assert!(
-                mount_present(&updated, &entry.probes()),
+                mount_present(&updated, entry),
                 "{}: mount not detected after insertion",
                 entry.crate_name
             );
