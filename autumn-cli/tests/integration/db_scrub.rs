@@ -381,7 +381,7 @@ async fn scrub_round_trip_leaves_zero_original_values() {
 
     // ── Fail-closed: with no declaration the scrub refuses ──────────────────
     let staging_envs = [("AUTUMN_DATABASE__URL", staging_url.as_str())];
-    let (_o, refusal) = run_autumn_fail(
+    let (stanza, refusal) = run_autumn_fail(
         dir,
         &["db", "scrub", "--artifact", run_dir.to_str().unwrap()],
         &staging_envs,
@@ -394,9 +394,13 @@ async fn scrub_round_trip_leaves_zero_original_values() {
         refusal.contains("users.bio") && refusal.contains("users.role"),
         "the refusal must list the unclassified columns: {refusal}"
     );
+    // On STDOUT, not stderr: `run()` prints the stanza with `println!` so that
+    // `autumn db scrub --check 2>/dev/null >> scrub.toml` appends a valid
+    // fragment rather than a wall of interleaved prose. Asserting it on stderr
+    // asserted against the one stream it is deliberately kept out of.
     assert!(
-        refusal.contains("[tables.users.pii]"),
-        "the refusal must print a paste-ready stanza: {refusal}"
+        stanza.contains("[tables.users.pii]"),
+        "the refusal must print a paste-ready stanza on stdout: {stanza}"
     );
     // The restore has already run by the time classification can see the schema,
     // so the refusal must say — loudly — that the target now holds raw data.
@@ -560,7 +564,7 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
     // `--check` proves the classification is complete and writes nothing.
     let (_o, check_err) = run_autumn_ok(dir, &["db", "scrub", "--check"], &envs);
     assert!(
-        check_err.contains("Every column is classified"),
+        check_err.contains("Every column in `public` is classified"),
         "check should confirm a complete classification: {check_err}"
     );
     assert!(
