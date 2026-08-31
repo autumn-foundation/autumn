@@ -137,6 +137,16 @@ pub const MAX_TABLE_ELEMENTS: u32 = 16_384;
 /// drift apart.
 pub const MAX_TABLES: usize = 4;
 
+/// The most globals a module may declare.
+///
+/// Every instance allocates and initialises its own copy of each, and an
+/// instance is per request — so globals are per-request storage and per-request
+/// work in exactly the way tables and segments are. The aggregate declared-entry
+/// ceiling is far too generous to bound them on its own: a module can sit well
+/// under a million total entries and still carry hundreds of thousands of
+/// globals, which no fuel charge priced and no footprint counted.
+pub const MAX_GLOBALS: usize = 4096;
+
 /// The largest total data + element section a module may carry (16 MiB).
 ///
 /// Every request instantiates a **fresh** module — that is what makes "no state
@@ -861,7 +871,8 @@ impl SandboxHost {
         // cost: the frame encoding varies with the request, so there is no
         // single number to check it against here, while this charge is fixed by
         // the module and known now.
-        let instantiation = instantiation_fuel(segments, init_bytes, import_count);
+        let instantiation =
+            instantiation_fuel(segments, init_bytes, import_count, shape.global_count);
         if manifest.limits.fuel <= instantiation {
             return Err(SandboxLoadError::FuelBelowFixedCharges {
                 fuel: manifest.limits.fuel,
@@ -1275,6 +1286,8 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// How many globals the module declares.
+    global_count: usize,
     /// How many tables the module declares.
     ///
     /// Sizes and count are separate ceilings: five empty tables cost no
@@ -1314,6 +1327,8 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     /// The table section, whose entries carry the initial sizes the limiter
     /// will be asked to admit.
     const TABLE_SECTION: u8 = 4;
+    /// The global section, whose entries each become per-instance storage.
+    const GLOBAL_SECTION: u8 = 6;
     /// The custom section is the one whose payload is not a counted vector.
     const CUSTOM_SECTION: u8 = 0;
 
@@ -1323,6 +1338,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut declared_entries = 0usize;
     let mut table_elements = 0u64;
     let mut table_count = 0usize;
+    let mut global_count = 0usize;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1338,6 +1354,10 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             let (count, _) = leb128(wasm, after_size)?;
             segments = segments.saturating_add(count);
             bytes = bytes.saturating_add(size);
+        }
+        if id == GLOBAL_SECTION {
+            let (count, _) = leb128(wasm, after_size)?;
+            global_count = global_count.saturating_add(count);
         }
         if id == TABLE_SECTION {
             // `vec(tabletype)`, and a `tabletype` is a reftype byte then
@@ -1368,6 +1388,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        global_count,
         table_count,
         table_elements,
     })
@@ -1390,6 +1411,13 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             "the module's section stream could not be walked".to_owned(),
         ));
     };
+    if shape.global_count > MAX_GLOBALS {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "globals",
+            found: shape.global_count,
+            max: MAX_GLOBALS,
+        });
+    }
     if shape.declared_entries > MAX_DECLARED_ENTRIES {
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "declared section entries",
@@ -2019,15 +2047,17 @@ fn signature_type(params: &str, results: &str) -> Option<wasmi::FuncType> {
 /// per-instance work the guest does not execute but every request pays for, so
 /// leaving it unpriced is a way to buy host CPU with no fuel. `MAX_IMPORTS`
 /// bounds the count; this makes the admitted ones cost something.
-fn instantiation_fuel(segments: usize, init_bytes: usize, imports: usize) -> u64 {
+fn instantiation_fuel(segments: usize, init_bytes: usize, imports: usize, globals: usize) -> u64 {
     let bytes = u64::try_from(init_bytes).unwrap_or(u64::MAX);
     let segments = u64::try_from(segments).unwrap_or(u64::MAX);
     let imports = u64::try_from(imports).unwrap_or(u64::MAX);
+    let globals = u64::try_from(globals).unwrap_or(u64::MAX);
     bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(segments)
         .saturating_add(imports)
+        .saturating_add(globals)
         .saturating_add(1)
 }
 
@@ -3711,6 +3741,67 @@ path = "/hello/greet"
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_more_globals_than_the_ceiling_is_refused_at_load() {
+        // Every instance allocates and initialises its own copy of each global,
+        // and an instance is per request. The aggregate declared-entry ceiling
+        // is far too generous to bound them: a module can sit well under a
+        // million total entries and still carry hundreds of thousands of
+        // globals, which no fuel charge priced and no footprint counted.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..=MAX_GLOBALS {
+            let _ = writeln!(wat, "  (global i32 (i32.const 0))");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the globals ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "globals",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn globals_are_priced_into_the_instantiation_charge() {
+        // Per-instance work the guest never executes but every request pays
+        // for — the same reason segments and imports are charged.
+        use std::fmt::Write as _;
+
+        let bare = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..64 {
+            let _ = writeln!(wat, "  (global i32 (i32.const 0))");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let with_globals = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let cheap = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &bare)
+            .expect("loads")
+            .instantiation_fuel();
+        let dear =
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &with_globals)
+                .expect("loads")
+                .instantiation_fuel();
+        assert_eq!(
+            dear,
+            cheap + 64,
+            "each admitted global must cost a unit: {cheap} then {dear}"
         );
     }
 

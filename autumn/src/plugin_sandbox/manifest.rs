@@ -256,6 +256,10 @@ impl ResourceLimits {
             // the same: leaving it out is what made this product understate a
             // near-maximum-concurrency plugin by hundreds of megabytes.
             .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4)
+            // The instance's globals, at a generous 16 bytes each. Per-instance
+            // storage the footprint would otherwise not know about at all — the
+            // same omission the tables term above exists to correct.
+            .saturating_add(crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16)
             .saturating_add(4096)
     }
 
@@ -1219,9 +1223,10 @@ max_concurrency = 8
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
         let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + 4096
+            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + globals + 4096
         );
     }
 
@@ -1240,9 +1245,10 @@ max_concurrency = 8
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
         let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         assert_eq!(
             limits.request_footprint_bytes(),
-            5 * 1_000_000 + tables + metadata + 4096,
+            5 * 1_000_000 + tables + metadata + globals + 4096,
             "the response term must cover the line, the base64 copy and the decode at once"
         );
     }

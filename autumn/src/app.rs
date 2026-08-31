@@ -4012,7 +4012,18 @@ impl AppBuilder {
                 // Yielding matches what this site already does for a custom
                 // `#[static_get("/robots.txt")]`, and the operator has seen the
                 // prefix on the consent screen before installing it.
-                || declared_routes.iter().any(|r| is_seo_path(&r.path));
+                || declared_routes.iter().any(|r| {
+                    // Only a GET can clash with the generated GETs: a declared
+                    // POST or HEAD merges cleanly into the same `MethodRouter`
+                    // (verified against axum 0.8.9, the same finding
+                    // `reject_declared_framework_collisions` is written on), and
+                    // a `WS` upgrade mounts as a GET. Yielding to a disjoint
+                    // verb would hand an untrusted plugin a way to suppress
+                    // robots.txt and sitemap.xml without even serving them.
+                    (r.method.eq_ignore_ascii_case("GET")
+                        || r.method.eq_ignore_ascii_case("WS"))
+                        && is_seo_path(&r.path)
+                });
             if seo_collision {
                 tracing::warn!(
                     "seo: /robots.txt or /sitemap.xml is already registered by the application; \
