@@ -6343,6 +6343,12 @@ pub struct AcmeConfig {
     /// Unset by default, and unnecessary for `directory = "staging"` /
     /// `"production"`. This changes trust for the **ACME control plane only**;
     /// it has no bearing on which certificates browsers accept from your site.
+    ///
+    /// Like every other `[server.tls.acme]` key, this has no
+    /// `AUTUMN_SERVER__TLS__ACME__*` environment override: the section is
+    /// configured in `autumn.toml` as a unit. Deliberate, and worth knowing if
+    /// the root arrives as a container mount — the path still has to be named in
+    /// the config file.
     #[serde(default)]
     pub ca_root_path: Option<PathBuf>,
 }

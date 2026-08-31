@@ -5173,7 +5173,12 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 /// config that (a) has a `directory` value that fails to deserialize as
 /// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
 /// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
-/// DNS-01, tracked in #1620) — the server exits at boot. Doctor previously turned
+/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
+/// rule, a blank `ca_root_path`, is graded by
+/// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
+/// non-string, unreadable, unusable, a bundle, or redundant against a public
+/// directory) belongs in one check with one name, rather than splitting the
+/// blank case away from its siblings. Doctor previously turned
 /// a missing/empty `domains` into an empty list and reported `acme_stored_cert`
 /// as Pass with no probes, and silently defaulted a malformed `directory` to
 /// staging, so `doctor --strict` blessed a deployment that immediately exits.
