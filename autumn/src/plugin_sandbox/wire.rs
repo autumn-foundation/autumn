@@ -130,6 +130,37 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
     "vary",
 ];
 
+/// May a guest redirect a client to `target`?
+///
+/// Only to a path inside its own declared prefix. Everything else is refused:
+/// an absolute URL (`https://evil.example/`), a protocol-relative one
+/// (`//evil.example/`), a path elsewhere in the host's origin (`/admin`), and a
+/// path that *starts* inside the prefix but climbs out of it
+/// (`/hello/../admin`) — the last is why this walks segments rather than
+/// checking a string prefix, and why a prefix match alone would have been a
+/// hole rather than a fix.
+///
+/// A bare prefix match would also accept `/hellofoo` for prefix `/hello`, so
+/// the character after the prefix has to be a separator or nothing at all.
+fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
+    // A backslash is a path separator to some clients but not to this check,
+    // so a target carrying one is refused rather than guessed at.
+    if target.contains('\\') {
+        return false;
+    }
+    let Some(rest) = target.strip_prefix(prefix) else {
+        return false;
+    };
+    if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#'))
+    {
+        return false;
+    }
+    // No segment may climb out of the prefix. The query and fragment are not
+    // path, so stop before them.
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    !path.split('/').any(|segment| segment == "..")
+}
+
 /// Content types a sandboxed plugin's response may declare.
 ///
 /// The sandbox withholds the host application's origin. A response served from
@@ -323,16 +354,29 @@ impl SandboxResponse {
     /// reaching for `Set-Cookie` is a thing an operator wants in their log,
     /// not something to silently drop.
     #[must_use]
-    pub fn sanitize(mut self) -> (Self, Vec<String>) {
+    pub fn sanitize(mut self, prefix: &str) -> (Self, Vec<String>) {
         let mut denied = Vec::new();
-        self.headers.retain(|(name, _)| {
+        self.headers.retain(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if response_header_allowed(&lower) {
-                true
-            } else {
+            if !response_header_allowed(&lower) {
                 denied.push(lower);
-                false
+                return false;
             }
+            // `Location` is the one allowed header that makes the *client* act,
+            // and a client acts with the user's credentials. A guest answering
+            // `307` or `308` with `Location: /admin/...` has a conforming
+            // browser re-issue the request to the host's own origin with the
+            // method, the body and the cookies intact — so a plugin holding no
+            // session capability induces an authenticated request outside its
+            // mount. Confining the target to the plugin's own prefix keeps the
+            // redirect a plugin genuinely needs (its own routes) and takes away
+            // the one it must not have. An absolute URL is refused by the same
+            // rule, which closes the open-redirect half as well.
+            if lower == "location" && !redirect_target_allowed(value, prefix) {
+                denied.push(lower);
+                return false;
+            }
+            true
         });
         (self, denied)
     }
@@ -524,6 +568,63 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_redirect_may_not_leave_the_plugin_s_own_prefix() {
+        // `Location` is the one allowed header that makes the *client* act, and
+        // it acts with the user's credentials. A 307/308 preserves the method,
+        // the body and the cookies, so a guest with no session capability could
+        // induce an authenticated request to the host's own admin surface.
+        for target in [
+            "/admin",                     // elsewhere in the host's origin
+            "https://evil.example/admin", // another origin entirely
+            "//evil.example/admin",       // protocol-relative, same effect
+            "/hello/../admin",            // starts inside, climbs out
+            "/helloworld",                // prefix match that is not a segment
+            "/hello\\..\\admin",          // backslash as a separator
+        ] {
+            let response = SandboxResponse {
+                status: 307,
+                headers: vec![("location".to_owned(), target.to_owned())],
+                body: Vec::new(),
+            };
+            let (clean, denied) = response.sanitize("/hello");
+            assert!(
+                !clean
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("location")),
+                "{target} survived sanitation"
+            );
+            assert!(
+                denied.iter().any(|name| name == "location"),
+                "{target} was dropped without being recorded as a denial"
+            );
+        }
+
+        // And a redirect to its own routes still works — the plugin needs that,
+        // and it can already serve whatever it points at.
+        for target in [
+            "/hello",
+            "/hello/greet",
+            "/hello/greet?page=2",
+            "/hello#top",
+        ] {
+            let response = SandboxResponse {
+                status: 303,
+                headers: vec![("location".to_owned(), target.to_owned())],
+                body: Vec::new(),
+            };
+            let (clean, _) = response.sanitize("/hello");
+            assert!(
+                clean
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("location")),
+                "{target} is inside the prefix and must be allowed"
+            );
+        }
+    }
     use super::*;
 
     fn request() -> SandboxRequest {
@@ -690,7 +791,7 @@ mod tests {
             ],
             body: vec![],
         };
-        let (clean, denied) = response.sanitize();
+        let (clean, denied) = response.sanitize("/hello");
         assert_eq!(denied, vec!["set-cookie".to_owned()]);
         assert_eq!(
             clean.headers,
@@ -716,7 +817,7 @@ mod tests {
                 headers: vec![(name.to_owned(), "x".to_owned())],
                 body: vec![],
             };
-            let (clean, denied) = response.sanitize();
+            let (clean, denied) = response.sanitize("/hello");
             assert_eq!(denied, vec![name.to_owned()], "{name} must be stripped");
             assert!(clean.headers.is_empty());
         }

@@ -1756,6 +1756,31 @@ fn reject_duplicate_nest_prefixes(
     Ok(())
 }
 
+/// Does a declared route clash with a framework mount, as axum would see it?
+///
+/// The two halves are not symmetric, and conflating them is what this check
+/// kept getting wrong in both directions:
+///
+/// * **The same exact path** merges across methods. `GET /health` and a
+///   declared `POST /health` land in one `MethodRouter` and coexist, so this is
+///   a clash only when the methods are the same.
+/// * **A different template at the same shape** — `/_stories/{slug}` against a
+///   declared `/_stories/{id}` — is a *matchit* conflict, and matchit sits
+///   above method routing: axum refuses the second template whatever method it
+///   carries. Gating this on GET let a declared `POST /_stories/{id}` through
+///   to a startup panic.
+fn framework_route_clashes(
+    framework_path: &str,
+    framework_method: &str,
+    declared_path: &str,
+    declared_method: &str,
+) -> bool {
+    if framework_path == declared_path {
+        return declared_method.eq_ignore_ascii_case(framework_method);
+    }
+    paths_conflict_under_matchit(framework_path, declared_path)
+}
+
 /// Fail-fast preflight for issue #1012: reject two user- or plugin-registered
 /// routes that resolve to the same `(method, path)` before
 /// [`group_and_mount_routes`] hands overlapping method routes to
@@ -2009,28 +2034,35 @@ fn reject_declared_framework_collisions(
                 incoming: declared.handler.clone(),
             });
         }
+        // A `WS` upgrade is a GET as far as axum's method router is concerned,
+        // so it clashes wherever a declared GET would.
+        let effective_method = if declared.method.eq_ignore_ascii_case("GET")
+            || declared.method.eq_ignore_ascii_case("WS")
+        {
+            "GET"
+        } else {
+            declared.method.as_str()
+        };
         // The framework mounts non-GET routes too, and only GET was ever
         // compared — so a manifest declaring `PUT {prefix}/loggers/{name}`
         // passed this check and panicked at the nest, because the actuator
         // mounts exactly that. These carry their real method, so the
         // comparison is method-aware rather than GET-shaped.
         for (framework_method, framework_path) in &actuator_mutating_routes {
-            if !declared.method.eq_ignore_ascii_case(framework_method) {
-                continue;
-            }
-            if framework_path == &declared.path
-                || paths_conflict_under_matchit(framework_path, &declared.path)
-            {
+            if framework_route_clashes(
+                framework_path,
+                framework_method,
+                &declared.path,
+                effective_method,
+            ) {
                 return Err(RouterBuildError::DuplicateUserRoute {
-                    method: (*framework_method).to_owned(),
+                    method: declared.method.clone(),
                     path: declared.path.clone(),
                     existing: format!("autumn framework route {framework_path}"),
                     incoming: declared.handler.clone(),
                 });
             }
         }
-        let is_get = declared.method.eq_ignore_ascii_case("GET")
-            || declared.method.eq_ignore_ascii_case("WS");
         // Compare through matchit, not by string equality: a framework path
         // that carries a capture conflicts with a DIFFERENTLY-NAMED capture at
         // the same position, and axum refuses that shape regardless of method.
@@ -2038,14 +2070,9 @@ fn reject_declared_framework_collisions(
         // `/_stories/{id}` is an exact-string miss and a startup panic. The
         // configurable paths (probes, actuator prefix, dev inspector, job
         // status) can carry captures too, since an operator sets them.
-        let collision = is_get
-            .then(|| {
-                framework_get_paths.iter().find(|framework_path| {
-                    *framework_path == &declared.path
-                        || paths_conflict_under_matchit(framework_path, &declared.path)
-                })
-            })
-            .flatten();
+        let collision = framework_get_paths.iter().find(|framework_path| {
+            framework_route_clashes(framework_path, "GET", &declared.path, effective_method)
+        });
         if let Some(framework_path) = collision {
             // `FrameworkRouteOverlap` would read better, but its `existing` and
             // `incoming` are `&'static str` and a plugin's handler name is
@@ -2054,7 +2081,7 @@ fn reject_declared_framework_collisions(
             // method, the path and both sides, which is what an operator needs
             // to act.
             return Err(RouterBuildError::DuplicateUserRoute {
-                method: "GET".to_owned(),
+                method: declared.method.clone(),
                 path: declared.path.clone(),
                 // Name the framework template, not just the label: when the
                 // clash is a shape conflict the two paths are not the same
@@ -10073,6 +10100,54 @@ enabled = true
             }
             other => panic!("expected the framework-path refusal, got {other:?}"),
         }
+    }
+
+    /// A shape clash is method-independent, so the check must be too.
+    ///
+    /// matchit sits *above* method routing: two different templates at the same
+    /// shape (`/_stories/{slug}` against `/_stories/{id}`) are a route conflict
+    /// axum refuses whatever method the second carries. Gating the shape check
+    /// on GET let a declared POST through to a startup panic — the same class
+    /// the GET case already covered, reached by choosing a different verb.
+    ///
+    /// The exact-path half stays method-aware: `GET /health` and a declared
+    /// `POST /health` merge into one `MethodRouter` and must keep working.
+    #[tokio::test]
+    async fn try_build_router_rejects_a_non_get_declared_route_that_shape_clashes_with_a_framework_path()
+     {
+        let mut config = AutumnConfig::default();
+        config.health.path = "/probe/{id}".to_owned();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("POST", "/probe/{slug}", "evil-plugin")];
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("a shape clash must be refused whatever the method");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref existing,
+                ..
+            } => {
+                assert_eq!(method, "POST", "the refusal must name the declared method");
+                assert!(
+                    existing.contains("/probe/{id}"),
+                    "the refusal must name the framework template; got: {existing}"
+                );
+            }
+            other => panic!("expected the framework shape refusal, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule: an EXACT path match across methods
+    /// merges cleanly, so a declared POST at a framework GET path is allowed.
+    #[tokio::test]
+    async fn try_build_router_allows_a_non_get_declared_route_at_a_framework_get_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.declared_routes = vec![declared_route("POST", &config.health.path, "honest-plugin")];
+        assert!(
+            super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).is_ok(),
+            "a POST at a framework GET path merges into one MethodRouter and must be allowed"
+        );
     }
 
     /// The framework mounts non-GET routes too, and only GET was compared.

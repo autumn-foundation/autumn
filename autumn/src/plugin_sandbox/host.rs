@@ -885,6 +885,7 @@ impl SandboxHost {
                 return finish(
                     store,
                     limits,
+                    &self.manifest.prefix,
                     Err(SandboxFailure::FuelExhausted {
                         budget: limits.fuel,
                     }),
@@ -905,14 +906,26 @@ impl SandboxHost {
             .and_then(|pre| pre.start(&mut store));
         let instance = match started {
             Ok(instance) => instance,
-            Err(err) => return finish(store, limits, Err(instantiation_failure(&err, limits))),
+            Err(err) => {
+                return finish(
+                    store,
+                    limits,
+                    &self.manifest.prefix,
+                    Err(instantiation_failure(&err, limits)),
+                );
+            }
         };
 
         let Ok(start) = instance.get_typed_func::<(), ()>(&store, "_start") else {
             // `from_module` already refused a module without `_start`; reaching
             // here would mean the export changed shape, which is still the
             // plugin's problem and not the host's.
-            return finish(store, limits, Err(SandboxFailure::NoAnswer));
+            return finish(
+                store,
+                limits,
+                &self.manifest.prefix,
+                Err(SandboxFailure::NoAnswer),
+            );
         };
 
         let trap = start.call(&mut store, ()).err();
@@ -926,7 +939,7 @@ impl SandboxHost {
             (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        finish(store, limits, result)
+        finish(store, limits, &self.manifest.prefix, result)
     }
 }
 
@@ -935,6 +948,9 @@ impl SandboxHost {
 fn finish(
     store: Store<HostState>,
     limits: ResourceLimits,
+    // The plugin's declared prefix, which bounds where its response may
+    // redirect a client. See `SandboxResponse::sanitize`.
+    prefix: &str,
     result: Result<SandboxResponse, SandboxFailure>,
 ) -> SandboxOutcome {
     let fuel_used = store
@@ -953,7 +969,7 @@ fn finish(
 
     let result = match result {
         Ok(response) => {
-            let (response, denied) = response.sanitize();
+            let (response, denied) = response.sanitize(prefix);
             for name in denied {
                 // The name is the guest's, so it is as long and as hostile as
                 // the guest cares to make it — bounded only by the stdout line
