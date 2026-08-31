@@ -113,8 +113,15 @@ pub struct Report {
     pub denied: Vec<String>,
     /// The routes it serves.
     pub routes: Vec<ReportRoute>,
-    /// Every host function the module imports.
-    pub imports: Vec<String>,
+    /// Every host function the module imports, or `None` when they could not
+    /// be read at all.
+    ///
+    /// An empty list and an unreadable one are different facts, and collapsing
+    /// them printed `(none)` — "this artifact asks for no host authority" — for
+    /// a module whose shape was refused before its imports could be enumerated.
+    /// That is the consent screen stating the opposite of the truth about
+    /// exactly the artifacts whose authority matters most.
+    pub imports: Option<Vec<String>>,
     /// Whether the module loads into this build's sandbox.
     pub loads: bool,
     /// Why it did not load, when it did not.
@@ -181,10 +188,8 @@ impl Report {
         // `serde_json` then expands again escaping it. Capping at construction
         // is what makes every renderer safe rather than the one that remembered.
         let imports = SandboxHost::imports_of(artifact.module())
-            .unwrap_or_default()
-            .iter()
-            .map(|import| excerpt(import))
-            .collect();
+            .ok()
+            .map(|imports| imports.iter().map(|import| excerpt(import)).collect());
         let (loads, load_error) = match SandboxHost::load(artifact) {
             Ok(_) => (true, None),
             Err(err) => (false, Some(excerpt(&err.to_string()))),
@@ -227,19 +232,28 @@ impl Report {
     pub fn to_text(&self) -> String {
         let mut out = self.consent.clone();
         out.push_str("  host functions it imports:\n");
-        if self.imports.is_empty() {
-            out.push_str("    (none)\n");
-        }
-        for import in &self.imports {
-            // Import names are arbitrary UTF-8 lifted straight out of a module
-            // an operator has explicitly not audited. A terminal escape here
-            // could rewrite the lines above it — the routes, the grant, the
-            // verdict — which is an attack on the decision this screen exists
-            // to inform.
-            out.push_str("    ");
-            // Already excerpted in `of`; escaping twice would render `\n` as `\\n`.
-            out.push_str(import);
-            out.push('\n');
+        match self.imports.as_ref() {
+            // Not the same as none, and saying so matters: the artifacts whose
+            // imports cannot be read are the ones already refused for their
+            // shape, which is when an operator most needs the screen not to
+            // claim they ask for nothing.
+            None => out
+                .push_str("    (could not be read; the module was refused before they could be)\n"),
+            Some(imports) if imports.is_empty() => out.push_str("    (none)\n"),
+            Some(imports) => {
+                for import in imports {
+                    // Import names are arbitrary UTF-8 lifted straight out of a
+                    // module an operator has explicitly not audited. A terminal
+                    // escape here could rewrite the lines above it — the routes,
+                    // the grant, the verdict — which is an attack on the
+                    // decision this screen exists to inform.
+                    out.push_str("    ");
+                    // Already excerpted in `of`; escaping twice would render
+                    // `\n` as `\\n`.
+                    out.push_str(import);
+                    out.push('\n');
+                }
+            }
         }
         out.push('\n');
         match &self.load_error {
@@ -677,5 +691,53 @@ path = "/hello/greet"
             "{}",
             report.to_text()
         );
+    }
+
+    #[test]
+    fn a_module_refused_for_its_shape_reports_unread_imports_not_no_imports() {
+        // The consent screen exists to answer "what authority does this ask
+        // for?", and the artifacts where that answer matters most are the ones
+        // the sandbox already refuses. Enumeration is refused with them — the
+        // shape ceiling fires before the module is compiled — and reporting
+        // that as an empty list made the screen answer "none" for an artifact
+        // refused *for how much it imports*.
+        let imports = (0..=autumn_web::plugin_sandbox::host::MAX_IMPORTS)
+            .map(|_| {
+                r#"  (import "wasi_snapshot_preview1" "fd_write"
+                       (func (param i32 i32 i32 i32) (result i32)))"#
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let module = wat::parse_str(format!(
+            "(module\n{imports}\n  (memory (export \"memory\") 1)\n  (func (export \"_start\") (nop)))"
+        ))
+        .expect("valid WAT");
+        let artifact = SandboxArtifact::seal(
+            SandboxManifest::parse(&manifest_toml()).expect("valid manifest"),
+            module,
+        )
+        .expect("seals");
+
+        let report = Report::of(&artifact);
+        assert!(!report.loads, "the fixture must be refused to be the case");
+        assert!(
+            report.imports.is_none(),
+            "an unreadable list must not be recorded as an empty one: {:?}",
+            report.imports
+        );
+
+        let text = report.to_text();
+        assert!(
+            !text.contains("(none)"),
+            "the screen still claims it asks for nothing:\n{text}"
+        );
+        assert!(text.contains("could not be read"), "{text}");
+
+        // …and the JSON surface agrees, since a reviewer diffing reports reads
+        // that one instead. `null` is distinguishable from `[]`; `[]` is not
+        // distinguishable from the truth.
+        let json = report.to_json().expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert!(value["imports"].is_null(), "{}", value["imports"]);
     }
 }

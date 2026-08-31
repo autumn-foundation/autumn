@@ -638,9 +638,17 @@ fn build_response(
     }
     // The permit rides with the bytes, not with the interpreter that produced
     // them: hyper may hold this buffer long after `run` returned.
+    let inner = Body::from(response.body.clone());
+    // An empty body is already at end-of-stream, and a conforming consumer is
+    // entitled to read `is_end_stream` and never poll a frame at all — so the
+    // release at EOF would never run and the slot would be held until the
+    // response value happened to be dropped. There are no plugin bytes left
+    // resident to bound, so hand the slot back here instead of tying it to
+    // someone else's destructor.
+    let already_delivered = http_body::Body::is_end_stream(&inner);
     let body = Body::new(PermitBody {
-        inner: Body::from(response.body.clone()),
-        permit: Some(permit),
+        inner,
+        permit: (!already_delivered).then_some(permit),
     });
     let Ok(mut built) = out.body(body) else {
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
@@ -958,6 +966,58 @@ sha256 = "{digest}"
         let (status, _) =
             send_with_body(app(&plugin), "POST", "/hello/greet", Body::from("hi")).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_hands_its_permit_back_without_being_polled() {
+        // The release rides on `poll_frame` reaching the end of the stream, but
+        // a body that is *already* ended need never be polled at all — a
+        // consumer is entitled to read `is_end_stream` and stop there. Every
+        // 204, and every empty error page a guest returns, takes that path, so
+        // a permit tied to one would come back only when the response value
+        // happened to be dropped, somewhere well outside this plugin.
+        use crate::plugin_sandbox::wire::SandboxResponse;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let empty = SandboxResponse {
+            status: 204,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = build_response(
+            "autumn-plugin-hello",
+            &empty,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "an empty answer holds no slot"
+        );
+        // Dropped only after the assertion, so the slot cannot have come back
+        // by way of the destructor the fix exists to stop relying on.
+        drop(response);
+
+        // The converse, so the assertion above is about emptiness and not about
+        // the permit having been dropped on the floor: bytes still resident do
+        // hold a slot, until they are.
+        let full = SandboxResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"hi".to_vec(),
+        };
+        let response = build_response(
+            "autumn-plugin-hello",
+            &full,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "undelivered bytes keep their slot"
+        );
+        drop(response);
+        assert_eq!(permits.available_permits(), 1, "and give it back on drop");
     }
 
     #[test]
