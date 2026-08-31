@@ -626,7 +626,8 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
 }
 
 /// The Dockerfile/deploy-workflow renderer, with the pinned CLI version
-/// injectable so both sides of the [`cli_supports_sbom`] gate are testable.
+/// injectable so both sides of the [`cli_supports_supply_chain_flags`] gate are
+/// testable.
 fn render_for_cli(
     template: &str,
     project_name: &str,
