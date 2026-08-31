@@ -228,6 +228,42 @@ fn refuse_oversized_body(
     })
 }
 
+/// Imports listed on a review surface before it stops enumerating them.
+///
+/// The names themselves are excerpted where they are rendered, but the *count*
+/// is a separate amplification: a legal 64 MiB module can carry millions of
+/// tiny import entries, and formatting each into its own `String` turns the
+/// artifact into hundreds of megabytes in the process that is trying to refuse
+/// it. A review surface needs enough to recognise what a module reaches for,
+/// not every repetition of it.
+const MAX_REPORTED_IMPORTS: usize = 256;
+
+/// Format a module's imports for review, bounded in number.
+///
+/// The total is still reported honestly — an operator must not read a truncated
+/// list as the whole of what an artifact imports — but only the first
+/// [`MAX_REPORTED_IMPORTS`] are allocated. Counting the rest costs nothing: the
+/// import table is already parsed, and walking it without formatting allocates
+/// nothing per entry.
+///
+/// This bounds the *review* surface only. The load gate checks every import
+/// against the shim's allowlist with no cap, because a module that hides a
+/// forbidden import behind a million decoys must still be refused.
+fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    for import in imports {
+        total = total.saturating_add(1);
+        if names.len() < MAX_REPORTED_IMPORTS {
+            names.push(format!("{}::{}", import.module(), import.name()));
+        }
+    }
+    if let Some(hidden) = total.checked_sub(names.len()).filter(|more| *more > 0) {
+        names.push(format!("… and {hidden} more (truncated)"));
+    }
+    names
+}
+
 /// What encoding one request's frame costs, in fuel.
 ///
 /// Priced off the request's own bytes at [`BYTES_PER_FUEL`], the rate every
@@ -480,6 +516,14 @@ pub enum SandboxLoadError {
     Wasm(String),
     /// The module imports something no host function defines.
     ForbiddenImports(Vec<CapabilityDenial>),
+    /// The manifest's fuel budget cannot cover what every request must spend
+    /// before the guest runs at all, so no route it declares could ever answer.
+    FuelBelowFixedCharges {
+        /// The budget the manifest declares.
+        fuel: u64,
+        /// What instantiating this module costs, every request, before `_start`.
+        instantiation: u64,
+    },
     /// The module's data or element segments would make every request's
     /// instantiation expensive, in host work no fuel budget prices.
     InstantiationTooExpensive {
@@ -523,6 +567,15 @@ impl fmt::Display for SandboxLoadError {
                     .map(|denial| denial.operation.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Self::FuelBelowFixedCharges {
+                fuel,
+                instantiation,
+            } => write!(
+                f,
+                "the plugin's {fuel}-unit fuel budget cannot cover the {instantiation} units \
+                 instantiating this module costs before `_start` runs, so every request would \
+                 exhaust the budget without the guest executing an instruction"
             ),
             Self::InstantiationTooExpensive { what, found, max } => write!(
                 f,
@@ -698,6 +751,25 @@ impl SandboxHost {
                 max: MAX_INIT_SECTION_BYTES,
             });
         }
+        // A budget that cannot cover instantiation is a manifest whose every
+        // route is already broken: the charge is unavoidable and paid before
+        // `_start`, so the guest never executes an instruction. Refusing at
+        // load is what makes `autumn plugin inspect` mean something — a passing
+        // verdict on an artifact that can only ever answer 504 is worse than no
+        // verdict, because an operator installs on the strength of it.
+        //
+        // Compared against instantiation alone rather than the whole per-request
+        // cost: the frame encoding varies with the request, so there is no
+        // single number to check it against here, while this charge is fixed by
+        // the module and known now.
+        let instantiation = instantiation_fuel(segments, init_bytes);
+        if manifest.limits.fuel <= instantiation {
+            return Err(SandboxLoadError::FuelBelowFixedCharges {
+                fuel: manifest.limits.fuel,
+                instantiation,
+            });
+        }
+
         // Not merely "some function called `_start`": the host looks it up as
         // `() -> ()`, so a `_start` with parameters or results is a module that
         // loads and then fails on every request.
@@ -738,7 +810,7 @@ impl SandboxHost {
             engine,
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
-            instantiation_fuel: instantiation_fuel(segments, init_bytes),
+            instantiation_fuel: instantiation,
             manifest,
         })
     }
@@ -762,10 +834,7 @@ impl SandboxHost {
         let engine = Engine::default();
         let module =
             Module::new(&engine, wasm).map_err(|err| SandboxLoadError::Wasm(err.to_string()))?;
-        Ok(module
-            .imports()
-            .map(|import| format!("{}::{}", import.module(), import.name()))
-            .collect())
+        Ok(reported_imports(module.imports()))
     }
 
     /// What one request pays, in fuel, just to instantiate this module.
@@ -780,10 +849,7 @@ impl SandboxHost {
     /// Every import the module declares, as `module::name`, for review.
     #[must_use]
     pub fn imports(&self) -> Vec<String> {
-        self.module
-            .imports()
-            .map(|import| format!("{}::{}", import.module(), import.name()))
-            .collect()
+        reported_imports(self.module.imports())
     }
 
     /// Serve one request.
@@ -3184,6 +3250,73 @@ path = "/hello/greet"
             host.run(&get("/hello/greet")).result.is_ok(),
             "the permit was not returned when the run finished"
         );
+    }
+
+    #[test]
+    fn a_fuel_budget_that_cannot_reach_start_is_refused_at_load() {
+        // `fuel = 1` passes the manifest's own range check, and every request
+        // then spends the instantiation charge before `_start` — so every route
+        // the manifest declares answers 504, always. `inspect` reporting that
+        // artifact as loadable is worse than reporting nothing, because an
+        // operator installs on the strength of the verdict.
+        let err = try_host_with(
+            guests::HELLO,
+            ResourceLimits {
+                fuel: 1,
+                ..ResourceLimits::default()
+            },
+        )
+        .expect_err("a budget below the fixed charges must not produce a host");
+        let SandboxLoadError::FuelBelowFixedCharges {
+            fuel,
+            instantiation,
+        } = err
+        else {
+            panic!("expected the fuel refusal, got {err:?}");
+        };
+        assert_eq!(fuel, 1);
+        assert!(
+            instantiation >= 1,
+            "the charge must be real to refuse against"
+        );
+
+        // And a budget that clears the charge still loads: this is a floor, not
+        // a demand for the default.
+        assert!(
+            try_host_with(
+                guests::HELLO,
+                ResourceLimits {
+                    fuel: instantiation + 1,
+                    ..ResourceLimits::default()
+                },
+            )
+            .is_ok(),
+            "a budget just above the fixed charge is legal"
+        );
+    }
+
+    #[test]
+    fn the_import_list_a_review_surface_shows_is_bounded() {
+        // Each name is excerpted where it is rendered, but the *count* is a
+        // separate amplification: a legal module can carry far more imports
+        // than a person will read, and formatting each into its own `String`
+        // turns the artifact into memory in the process refusing it.
+        let imports = (0..MAX_REPORTED_IMPORTS + 50)
+            .map(|n| format!(r#"  (import "env" "f{n}" (func))"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wat = format!("(module\n{imports}\n  (func (export \"_start\") (nop)))");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let listed = SandboxHost::imports_of(&wasm).expect("a module's imports can be read");
+        assert!(
+            listed.len() <= MAX_REPORTED_IMPORTS + 1,
+            "the list is unbounded: {} entries",
+            listed.len()
+        );
+        // The operator must not read a truncated list as the whole of it.
+        let last = listed.last().expect("a non-empty list");
+        assert!(last.contains("truncated") && last.contains("50"), "{last}");
     }
 
     #[test]
