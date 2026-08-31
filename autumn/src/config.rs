@@ -4604,10 +4604,24 @@ impl AutumnConfig {
     /// Called on the loaded config during boot; apps do not call this
     /// directly.
     pub fn apply_retention_caps(&mut self) {
-        for (key, target) in [
+        // `job_tracking` is capped only when its records do NOT live in
+        // `autumn_job_tracking`. Under `jobs.backend = "postgres"` the sweep
+        // enforces the window and a GDPR legal hold can stop it, so capping
+        // the TTL there would let the job runner's independent `expires_at`
+        // cleanup delete held rows on exactly the retention schedule. Under
+        // any other backend (redis, or the in-memory fallback) there is no
+        // table to sweep and the record's TTL is the only bound there is —
+        // leaving it uncapped would claim a window nothing enforces.
+        let cap_job_tracking = self.jobs.backend != "postgres";
+        let caps: [(&str, &mut u64); 3] = [
             ("idempotency", &mut self.idempotency.ttl_secs),
             ("sessions", &mut self.session.max_age_secs),
-        ] {
+            ("job_tracking", &mut self.jobs.tracking.ttl_secs),
+        ];
+        for (key, target) in caps {
+            if key == "job_tracking" && !cap_job_tracking {
+                continue;
+            }
             if let Some(window) = self.retention.window(key) {
                 *target = (*target).min(window.as_secs());
             }

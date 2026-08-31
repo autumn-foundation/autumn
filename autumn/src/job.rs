@@ -16518,6 +16518,14 @@ mod tests {
             clear_global_job_client();
         }
 
+        /// Row type for the raw tracking-row count in
+        /// [`pg_tracking_cleanup_deletes_expired_rows_and_keeps_live_ones`].
+        #[derive(diesel::QueryableByName)]
+        struct HeldCount {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
         #[tokio::test]
         #[ignore = "requires Docker (testcontainers)"]
         async fn pg_tracking_cleanup_deletes_expired_rows_and_keeps_live_ones() {
@@ -16578,11 +16586,6 @@ mod tests {
             // Counted in raw SQL: `PgJobTrackingStore::get` filters on
             // `expires_at` lazily, so it reports an expired-but-present row
             // as absent — exactly the distinction under test here.
-            #[derive(diesel::QueryableByName)]
-            struct HeldCount {
-                #[diesel(sql_type = diesel::sql_types::BigInt)]
-                count: i64,
-            }
             let mut conn = pool.get().await.unwrap();
             let remaining = diesel::sql_query(
                 "SELECT COUNT(*) AS count FROM autumn_job_tracking WHERE key = 'expired-key'",

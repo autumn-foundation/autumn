@@ -321,6 +321,7 @@ fn retention_caps_leave_job_tracking_ttl_alone() {
     // on exactly the retention schedule, the rows the retention report says
     // are being preserved under hold.
     let mut config = AutumnConfig::default();
+    config.jobs.backend = "postgres".to_owned();
     config.jobs.tracking.ttl_secs = 86_400;
     config.retention.job_tracking = Some("1h".to_owned());
 
@@ -328,7 +329,7 @@ fn retention_caps_leave_job_tracking_ttl_alone() {
 
     assert_eq!(
         config.jobs.tracking.ttl_secs, 86_400,
-        "the sweep, not the TTL, enforces job_tracking retention"
+        "the sweep, not the TTL, enforces job_tracking retention on postgres"
     );
 }
 
@@ -718,5 +719,79 @@ async fn a_partial_archive_purge_reports_both_the_removals_and_the_failure() {
             .is_some_and(|error| error.contains("sink offline")),
         "the failure must be reported too: {:?}",
         reports[0]
+    );
+}
+
+// ── job_tracking follows the configured jobs backend (Codex round 3) ─────
+
+#[test]
+fn job_tracking_is_swept_only_when_its_records_live_in_postgres() {
+    // Tracked-job records live wherever `jobs.backend` puts them. Reporting
+    // `sweep` for a Redis deployment would name a Postgres table that holds
+    // none of them, and claim a policy nothing enforces.
+    let mut config = AutumnConfig::default();
+
+    config.jobs.backend = "postgres".to_owned();
+    assert_eq!(
+        RetentionDataset::JobTracking.enforcement_for(&config),
+        RetentionEnforcement::Sweep
+    );
+
+    for backend in ["redis", "local"] {
+        config.jobs.backend = backend.to_owned();
+        assert_eq!(
+            RetentionDataset::JobTracking.enforcement_for(&config),
+            RetentionEnforcement::BackendTtl,
+            "{backend} keeps tracking records outside autumn_job_tracking"
+        );
+    }
+}
+
+#[test]
+fn every_other_dataset_ignores_the_jobs_backend() {
+    let mut postgres = AutumnConfig::default();
+    postgres.jobs.backend = "postgres".to_owned();
+    let mut redis = AutumnConfig::default();
+    redis.jobs.backend = "redis".to_owned();
+
+    for dataset in RETENTION_DATASETS {
+        if dataset == RetentionDataset::JobTracking {
+            continue;
+        }
+        assert_eq!(
+            dataset.enforcement_for(&postgres),
+            dataset.enforcement_for(&redis),
+            "{} must not depend on jobs.backend",
+            dataset.key()
+        );
+        assert_eq!(dataset.enforcement_for(&postgres), dataset.enforcement());
+    }
+}
+
+#[test]
+fn job_tracking_ttl_is_capped_only_when_no_sweep_will_enforce_it() {
+    // Under `postgres` the sweep enforces the window and a legal hold can
+    // stop it, so capping `jobs.tracking.ttl_secs` would let the job runner's
+    // independent `expires_at` cleanup delete held rows anyway. Under any
+    // other backend the record's TTL is the only bound there is, so leaving
+    // it uncapped would claim a window nothing enforces.
+    let mut pg = AutumnConfig::default();
+    pg.jobs.backend = "postgres".to_owned();
+    pg.jobs.tracking.ttl_secs = 86_400;
+    pg.retention.job_tracking = Some("1h".to_owned());
+    pg.apply_retention_caps();
+    assert_eq!(
+        pg.jobs.tracking.ttl_secs, 86_400,
+        "the sweep, not the TTL, enforces job_tracking on postgres"
+    );
+
+    let mut redis = AutumnConfig::default();
+    redis.jobs.backend = "redis".to_owned();
+    redis.jobs.tracking.ttl_secs = 86_400;
+    redis.retention.job_tracking = Some("1h".to_owned());
+    redis.apply_retention_caps();
+    assert_eq!(
+        redis.jobs.tracking.ttl_secs, 3_600,
+        "with no table to sweep, the TTL is the only bound and must be capped"
     );
 }

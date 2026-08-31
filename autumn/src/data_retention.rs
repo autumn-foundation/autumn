@@ -188,7 +188,28 @@ impl RetentionDataset {
         }
     }
 
-    /// How this dataset's window is enforced.
+    /// How this dataset's window is enforced *for a given configuration*.
+    ///
+    /// Only `job_tracking` varies: tracked-job records live wherever
+    /// `jobs.backend` puts them. Under `postgres` they are rows in
+    /// `autumn_job_tracking` and a sweep deletes them (which is also what
+    /// lets a GDPR legal hold stop the deletion). Under `redis` — or the
+    /// in-memory fallback — there is no table to sweep and the record's own
+    /// TTL is the only bound, so the window is applied by capping that TTL at
+    /// write time instead. Reporting `sweep` for a Redis deployment would
+    /// claim a policy nothing enforces.
+    #[must_use]
+    pub fn enforcement_for(self, config: &AutumnConfig) -> RetentionEnforcement {
+        if self == Self::JobTracking && config.jobs.backend != "postgres" {
+            return RetentionEnforcement::BackendTtl;
+        }
+        self.enforcement()
+    }
+
+    /// How this dataset's window is enforced in the common case.
+    ///
+    /// Configuration-independent; see [`Self::enforcement_for`], which is
+    /// what the engine and the report actually use.
     #[must_use]
     pub const fn enforcement(self) -> RetentionEnforcement {
         match self {
@@ -515,7 +536,7 @@ async fn run_one_dataset(
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
         description: dataset.description().to_owned(),
-        enforcement: dataset.enforcement().to_string(),
+        enforcement: dataset.enforcement_for(config).to_string(),
         window_secs: effective.window.map(|w| w.as_secs()),
         source: effective.source.to_string(),
         cutoff: cutoff.map(|c| c.to_rfc3339()),
@@ -543,7 +564,7 @@ async fn run_one_dataset(
         return report;
     }
 
-    match dataset.enforcement() {
+    match dataset.enforcement_for(config) {
         RetentionEnforcement::Sweep => {
             apply_sweep(state, dataset, window, dry_run, &mut report).await;
         }
@@ -702,16 +723,24 @@ async fn apply_sweep(
         return;
     };
     match sweep_postgres(&pool, dataset, window, dry_run).await {
-        Ok((cutoff, eligible, removed, truncated)) => {
+        Ok(swept) => {
             // Overwrite the provisional app-clock cutoff with the instant the
             // database actually applied, so the report and the audit record
             // state the real one.
-            report.cutoff = Some(cutoff.to_rfc3339());
-            report.eligible_rows = Some(eligible);
-            report.rows_removed = removed;
-            report.truncated = truncated;
+            report.cutoff = Some(swept.cutoff.to_rfc3339());
+            report.eligible_rows = Some(swept.eligible);
+            report.rows_removed = swept.removed;
+            report.truncated = swept.truncated;
         }
-        Err(error) => report.error = Some(error.to_string()),
+        Err((removed, error)) => {
+            // Batches are separate autocommit statements, so whatever earlier
+            // ones deleted is permanently gone. Report it alongside the
+            // failure rather than auditing a real deletion as zero, and mark
+            // the pass truncated — it certainly did not drain the table.
+            report.rows_removed = removed;
+            report.truncated = true;
+            report.error = Some(error.to_string());
+        }
     }
 }
 
@@ -753,9 +782,12 @@ async fn apply_sweep(
 /// direction. The resolved instant is returned so the report and the audit
 /// record state the cutoff that was actually applied.
 ///
-/// Returns `(cutoff, eligible_before, removed, truncated)`. `truncated` is
-/// `true` when the run hit [`SWEEP_MAX_BATCHES`] with rows still stale — the
-/// policy was only partially enforced this tick and resumes on the next one.
+/// Returns what the pass achieved, including when a batch fails partway:
+/// each batch is its own autocommit statement, so rows deleted before the
+/// failure are permanently gone and the count has to survive alongside the
+/// error — the same reasoning as [`crate::audit::AuditLogger::purge_before`].
+/// Auditing `rows_removed = 0` after a partial sweep would understate a
+/// deletion that really happened.
 /// The pooled Postgres handle `AppState::pool()` hands out. Aliased locally
 /// (as `job.rs` does) rather than imported, so a build without Postgres never
 /// names a diesel type.
@@ -768,7 +800,7 @@ async fn sweep_postgres(
     dataset: RetentionDataset,
     window: Duration,
     dry_run: bool,
-) -> AutumnResult<(DateTime<Utc>, u64, u64, bool)> {
+) -> Result<SweptDataset, (u64, crate::AutumnError)> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -783,16 +815,27 @@ async fn sweep_postgres(
         cutoff: DateTime<Utc>,
     }
 
-    let (table, predicate) = stale_row_predicate(dataset).ok_or_else(|| {
-        crate::AutumnError::internal_server_error_msg(format!(
-            "{dataset} is not a sweep-enforced dataset"
-        ))
-    })?;
+    /// Pair an error with the rows this pass had already deleted when it hit
+    /// that error, so no failure path can silently drop the count.
+    fn failed(removed: u64, message: String) -> (u64, crate::AutumnError) {
+        (
+            removed,
+            crate::AutumnError::internal_server_error_msg(message),
+        )
+    }
+
+    let Some((table, predicate)) = stale_row_predicate(dataset) else {
+        return Err(failed(
+            0,
+            format!("{dataset} is not a sweep-enforced dataset"),
+        ));
+    };
     let key = sweep_key_column(dataset);
     let mut conn = pool.get().await.map_err(|e| {
-        crate::AutumnError::internal_server_error_msg(format!(
-            "retention sweep could not acquire a connection: {e}"
-        ))
+        failed(
+            0,
+            format!("retention sweep could not acquire a connection: {e}"),
+        )
     })?;
 
     // Seconds rather than a formatted interval literal: `make_interval` takes
@@ -806,9 +849,10 @@ async fn sweep_postgres(
         .await
         .map(|row| row.cutoff)
         .map_err(|e| {
-            crate::AutumnError::internal_server_error_msg(format!(
-                "retention could not resolve the cutoff for {table}: {e}"
-            ))
+            failed(
+                0,
+                format!("retention could not resolve the cutoff for {table}: {e}"),
+            )
         })?;
 
     let eligible: i64 = diesel::sql_query(format!(
@@ -818,15 +862,16 @@ async fn sweep_postgres(
     .get_result::<CountRow>(&mut *conn)
     .await
     .map(|row| row.count)
-    .map_err(|e| {
-        crate::AutumnError::internal_server_error_msg(format!(
-            "retention count for {table} failed: {e}"
-        ))
-    })?;
+    .map_err(|e| failed(0, format!("retention count for {table} failed: {e}")))?;
     let eligible = u64::try_from(eligible).unwrap_or(0);
 
     if dry_run || eligible == 0 {
-        return Ok((cutoff, eligible, 0, false));
+        return Ok(SweptDataset {
+            cutoff,
+            eligible,
+            removed: 0,
+            truncated: false,
+        });
     }
 
     // Batched deletes: never one unbounded DELETE over a hot table.
@@ -847,11 +892,10 @@ async fn sweep_postgres(
         .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
         .execute(&mut *conn)
         .await
-        .map_err(|e| {
-            crate::AutumnError::internal_server_error_msg(format!(
-                "retention sweep of {table} failed: {e}"
-            ))
-        })?;
+        // `removed`, not 0: each batch is its own autocommit statement, so
+        // everything earlier batches deleted is permanently gone even though
+        // this one failed.
+        .map_err(|e| failed(removed, format!("retention sweep of {table} failed: {e}")))?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
         // Stop only on a batch that deleted *nothing*, not merely fewer than
         // `SWEEP_BATCH_ROWS`. A short batch does not mean the table is
@@ -879,12 +923,31 @@ async fn sweep_postgres(
     .await
     .map(|row| row.count)
     .map_err(|e| {
-        crate::AutumnError::internal_server_error_msg(format!(
-            "retention completeness check for {table} failed: {e}"
-        ))
+        failed(
+            removed,
+            format!("retention completeness check for {table} failed: {e}"),
+        )
     })?;
 
-    Ok((cutoff, eligible, removed, remaining > 0))
+    Ok(SweptDataset {
+        cutoff,
+        eligible,
+        removed,
+        truncated: remaining > 0,
+    })
+}
+
+/// What one Postgres sweep pass achieved.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+struct SweptDataset {
+    /// The instant the database itself resolved for the window.
+    cutoff: DateTime<Utc>,
+    /// Rows matching the predicate before the pass ran.
+    eligible: u64,
+    /// Rows actually deleted.
+    removed: u64,
+    /// `true` when stale rows are still present after the pass.
+    truncated: bool,
 }
 
 // ── Audit record (AC #6) ─────────────────────────────────────────────────

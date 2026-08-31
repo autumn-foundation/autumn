@@ -65,7 +65,7 @@ before setting those three.
 |---|---|---|---|---|
 | `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
 | `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
-| `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking` | jobs.tracking.ttl_secs (24h by default) | sweep |
+| `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking`, or Redis — follows `jobs.backend` | jobs.tracking.ttl_secs (24h by default) | sweep on `postgres`, backend TTL otherwise |
 | `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
 | `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
@@ -150,6 +150,14 @@ one guards an invariant another subsystem depends on:
   terminal hook row is history. `commit_hooks` covers `after_hook_failed`
   alongside `completed`/`failed` — it is terminal and records `finished_at`,
   and a re-enqueue of the same hook id inserts cleanly once the row is gone.
+
+  `job_tracking` is the one dataset whose *mechanism* follows your config:
+  tracked-job records live wherever `jobs.backend` puts them. Under
+  `postgres` they are rows in `autumn_job_tracking` and a sweep deletes them
+  — which is also what lets a legal hold stop the deletion. Under `redis`
+  (or the in-memory fallback) there is no table to sweep, so the window is
+  applied by capping the record's TTL instead. The report names whichever
+  applies rather than claiming a sweep that would find nothing.
 
 **`backend ttl`** — the storage backend expires the record itself, so there is
 nothing for a sweep to delete and the report shows `—` rather than a fake

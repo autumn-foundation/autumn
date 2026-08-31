@@ -471,27 +471,41 @@ impl AuditSink for JsonlFileAuditSink {
             let mut temp = tokio::fs::File::create(&temp_path).await.map_err(|error| {
                 AuditError::new(format!("failed to create audit purge temp file: {error}"))
             })?;
+            // Every failure after the file exists must remove it. Each sweep
+            // picks a fresh name, so leaking one per failed run would
+            // accumulate partial archives next to the archive itself —
+            // compounding exactly the quota or filesystem problem that is the
+            // likeliest cause of the failure.
+            macro_rules! cleanup_on_error {
+                ($result:expr, $context:literal) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            return Err(AuditError::new(format!("{}: {error}", $context)));
+                        }
+                    }
+                };
+            }
             // Carry the archive's own permissions across the rename. Best
             // effort: a platform or filesystem that cannot report or apply
             // them must not fail the purge.
             if let Ok(metadata) = tokio::fs::metadata(&self.path).await {
                 let _ = tokio::fs::set_permissions(&temp_path, metadata.permissions()).await;
             }
-            temp.write_all(kept.as_bytes()).await.map_err(|error| {
-                AuditError::new(format!("failed to write audit purge temp file: {error}"))
-            })?;
-            temp.sync_data().await.map_err(|error| {
-                AuditError::new(format!("failed to sync audit purge temp file: {error}"))
-            })?;
+            cleanup_on_error!(
+                temp.write_all(kept.as_bytes()).await,
+                "failed to write audit purge temp file"
+            );
+            cleanup_on_error!(
+                temp.sync_data().await,
+                "failed to sync audit purge temp file"
+            );
             drop(temp);
-            if let Err(error) = tokio::fs::rename(&temp_path, &self.path).await {
-                // Leaving the temp file behind would accumulate one orphan per
-                // failed sweep in the archive's own directory.
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(AuditError::new(format!(
-                    "failed to replace audit log file: {error}"
-                )));
-            }
+            cleanup_on_error!(
+                tokio::fs::rename(&temp_path, &self.path).await,
+                "failed to replace audit log file"
+            );
             Ok(AuditPurgeOutcome::purged(removed))
         })
     }
@@ -731,7 +745,7 @@ mod tests {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 self.0
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(buf);
                 Ok(buf.len())
             }
@@ -767,9 +781,12 @@ mod tests {
             futures::executor::block_on(TracingAuditSink.write(event)).expect("write");
         });
 
-        let output =
-            String::from_utf8_lossy(&captured.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .into_owned();
+        let captured_bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let output = String::from_utf8_lossy(&captured_bytes).into_owned();
         assert!(output.contains("rows_removed"), "{output}");
         assert!(output.contains("2026-06-01T00:00:00Z"), "{output}");
     }
