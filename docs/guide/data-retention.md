@@ -207,7 +207,10 @@ instead of implying an empty archive.
 
 > Two limits of the archive rewrite: it reads the archive into memory (peak
 > roughly twice its size), so keep a very large archive rotated by external
-> tooling; and its lock is per-process, so running `autumn db retention
+> tooling; the rewritten file must be able to keep the archive's own
+> permissions, so a purge refuses rather than renaming a default-mode file
+> over an archive you hardened to `0600`; and its lock is per-process, so
+> running `autumn db retention
 > --purge --dataset audit_archives` *against a live server writing the same
 > file* can drop events appended during the rewrite. Let the in-process
 > scheduled sweep handle this dataset in a live deployment.
@@ -412,9 +415,10 @@ column of `autumn db retention` to see which setting is actually governing.
 Durations use the same syntax as `#[scheduled(every = ...)]`: `s`, `m`, `h`,
 `d`, optionally compound (`"1h 30m"`). A window that is not a valid, non-zero
 duration fails boot rather than being silently ignored — a policy you believe
-is enforced but is not is worse than no policy. (Zero is refused because it
-would purge a dataset as soon as it was written; to restore today's behavior,
-remove the key entirely.)
+is enforced but is not is worse than no policy. Zero is refused because it
+would purge a dataset as soon as it was written, and anything beyond ~136
+years is refused because the sweep could not apply it faithfully; in both
+cases, remove the key entirely to restore today's behavior.
 
 Every key has an environment override:
 

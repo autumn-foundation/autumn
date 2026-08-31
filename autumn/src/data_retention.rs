@@ -803,67 +803,22 @@ async fn sweep_postgres(
 ) -> Result<SweptDataset, (u64, crate::AutumnError)> {
     use diesel_async::RunQueryDsl as _;
 
-    #[derive(diesel::QueryableByName)]
-    struct CountRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct CutoffRow {
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        cutoff: DateTime<Utc>,
-    }
-
-    /// Pair an error with the rows this pass had already deleted when it hit
-    /// that error, so no failure path can silently drop the count.
-    fn failed(removed: u64, message: String) -> (u64, crate::AutumnError) {
-        (
-            removed,
-            crate::AutumnError::internal_server_error_msg(message),
-        )
-    }
-
     let Some((table, predicate)) = stale_row_predicate(dataset) else {
-        return Err(failed(
+        return Err(sweep_failed(
             0,
             format!("{dataset} is not a sweep-enforced dataset"),
         ));
     };
     let key = sweep_key_column(dataset);
     let mut conn = pool.get().await.map_err(|e| {
-        failed(
+        sweep_failed(
             0,
             format!("retention sweep could not acquire a connection: {e}"),
         )
     })?;
 
-    // Seconds rather than a formatted interval literal: `make_interval` takes
-    // a bound parameter, so nothing about the window is ever interpolated
-    // into SQL text.
-    let window_secs =
-        f64::from(u32::try_from(window.as_secs().min(u64::from(u32::MAX))).unwrap_or(u32::MAX));
-    let cutoff = diesel::sql_query("SELECT NOW() - make_interval(secs => $1) AS cutoff")
-        .bind::<diesel::sql_types::Double, _>(window_secs)
-        .get_result::<CutoffRow>(&mut *conn)
-        .await
-        .map(|row| row.cutoff)
-        .map_err(|e| {
-            failed(
-                0,
-                format!("retention could not resolve the cutoff for {table}: {e}"),
-            )
-        })?;
-
-    let eligible: i64 = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
-    ))
-    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-    .get_result::<CountRow>(&mut *conn)
-    .await
-    .map(|row| row.count)
-    .map_err(|e| failed(0, format!("retention count for {table} failed: {e}")))?;
-    let eligible = u64::try_from(eligible).unwrap_or(0);
+    let cutoff = resolve_cutoff(&mut conn, table, window).await?;
+    let eligible = count_stale(&mut conn, table, predicate, cutoff, 0).await?;
 
     if dry_run || eligible == 0 {
         return Ok(SweptDataset {
@@ -895,7 +850,7 @@ async fn sweep_postgres(
         // `removed`, not 0: each batch is its own autocommit statement, so
         // everything earlier batches deleted is permanently gone even though
         // this one failed.
-        .map_err(|e| failed(removed, format!("retention sweep of {table} failed: {e}")))?;
+        .map_err(|e| sweep_failed(removed, format!("retention sweep of {table} failed: {e}")))?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
         // Stop only on a batch that deleted *nothing*, not merely fewer than
         // `SWEEP_BATCH_ROWS`. A short batch does not mean the table is
@@ -915,25 +870,105 @@ async fn sweep_postgres(
     // is actually done. `truncated` ends up in the audit record, so a wrong
     // answer here is a compliance trail claiming enforcement that did not
     // happen.
-    let remaining: i64 = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
-    ))
-    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
-    .get_result::<CountRow>(&mut *conn)
-    .await
-    .map(|row| row.count)
-    .map_err(|e| {
-        failed(
-            removed,
-            format!("retention completeness check for {table} failed: {e}"),
-        )
-    })?;
+    let remaining = count_stale(&mut conn, table, predicate, cutoff, removed).await?;
 
     Ok(SweptDataset {
         cutoff,
         eligible,
         removed,
         truncated: remaining > 0,
+    })
+}
+
+/// Pair an error with the rows the pass had already deleted when it hit that
+/// error, so no failure path can silently drop the count.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+fn sweep_failed(removed: u64, message: String) -> (u64, crate::AutumnError) {
+    (
+        removed,
+        crate::AutumnError::internal_server_error_msg(message),
+    )
+}
+
+/// Resolve `NOW() - window` **on the database server**.
+///
+/// An out-of-range window is an error, never a silent clamp: clamping would
+/// compute a cutoff *closer* to now than the configured window while the
+/// report still advertised the configured value, deleting rows the report
+/// claimed were inside the policy. `RetentionConfig::validate` rejects such a
+/// window at boot, so this is a defensive backstop.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn resolve_cutoff(
+    conn: &mut diesel_async::AsyncPgConnection,
+    table: &str,
+    window: Duration,
+) -> Result<DateTime<Utc>, (u64, crate::AutumnError)> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct CutoffRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        cutoff: DateTime<Utc>,
+    }
+
+    let Ok(window_secs) = u32::try_from(window.as_secs()) else {
+        return Err(sweep_failed(
+            0,
+            format!(
+                "retention window for {table} ({}s) exceeds the maximum the sweep can \
+                 apply; refusing rather than silently sweeping a shorter window",
+                window.as_secs()
+            ),
+        ));
+    };
+
+    // Seconds bound as a parameter rather than a formatted interval literal,
+    // so nothing about the window is ever interpolated into SQL text.
+    diesel::sql_query("SELECT NOW() - make_interval(secs => $1) AS cutoff")
+        .bind::<diesel::sql_types::Double, _>(f64::from(window_secs))
+        .get_result::<CutoffRow>(conn)
+        .await
+        .map(|row| row.cutoff)
+        .map_err(|e| {
+            sweep_failed(
+                0,
+                format!("retention could not resolve the cutoff for {table}: {e}"),
+            )
+        })
+}
+
+/// Count the rows `predicate` currently matches.
+///
+/// `removed_so_far` rides along so a failure here still reports the rows an
+/// earlier batch loop already deleted.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn count_stale(
+    conn: &mut diesel_async::AsyncPgConnection,
+    table: &str,
+    predicate: &str,
+    cutoff: DateTime<Utc>,
+    removed_so_far: u64,
+) -> Result<u64, (u64, crate::AutumnError)> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
+    ))
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .get_result::<CountRow>(conn)
+    .await
+    .map(|row| u64::try_from(row.count).unwrap_or(0))
+    .map_err(|e| {
+        sweep_failed(
+            removed_so_far,
+            format!("retention count for {table} failed: {e}"),
+        )
     })
 }
 

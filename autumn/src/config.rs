@@ -2818,12 +2818,27 @@ impl RetentionConfig {
             // for a syntactically valid but zero total ("0s"), so a separate
             // "resolves to zero" branch would be unreachable. State what is
             // required — valid *and* non-zero — and why zero is refused.
-            if crate::task::parse_duration(raw).is_none() {
+            let Some(parsed) = crate::task::parse_duration(raw) else {
                 return Err(ConfigError::Validation(format!(
                     "retention.{key} = {raw:?} is not a valid non-zero duration: use a \
                      string like \"90d\", \"12h\", or \"1h 30m\". A zero window would \
                      purge the dataset as soon as it is written; remove the key entirely \
                      to keep today's behavior (see docs/guide/data-retention.md)"
+                )));
+            };
+            // The sweep binds its cutoff as `NOW() - make_interval(secs => $1)`
+            // with a `u32`-representable value. Rejecting anything larger here
+            // keeps the configured window and the window the database actually
+            // applies identical — silently clamping would delete rows the
+            // report claimed were still inside the policy. 136 years is far
+            // past any real retention policy, so this only ever catches a typo.
+            if parsed.as_secs() > u64::from(u32::MAX) {
+                return Err(ConfigError::Validation(format!(
+                    "retention.{key} = {raw:?} is longer than the maximum supported \
+                     retention window ({} years). Remove the key entirely to keep the \
+                     data forever, which is what a window that long means in practice \
+                     (see docs/guide/data-retention.md)",
+                    u64::from(u32::MAX) / (365 * 86_400)
                 )));
             }
         }

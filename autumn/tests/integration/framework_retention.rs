@@ -795,3 +795,38 @@ fn job_tracking_ttl_is_capped_only_when_no_sweep_will_enforce_it() {
         "with no table to sweep, the TTL is the only bound and must be capped"
     );
 }
+
+// ── Windows the sweep cannot faithfully apply are rejected (Codex round 4) ──
+
+#[test]
+fn a_window_longer_than_the_sweep_can_apply_is_rejected() {
+    // The cutoff is bound as `NOW() - make_interval(secs => $1)` with a
+    // u32-representable value. Accepting a longer window and clamping it
+    // would compute a cutoff *closer* to now than configured, deleting rows
+    // the report claimed were still inside the policy.
+    let mut config = AutumnConfig::default();
+    config.retention.job_history = Some("100000d".to_owned());
+
+    let error = config
+        .validate()
+        .expect_err("a window past the supported maximum must fail boot");
+    let message = error.to_string();
+    assert!(message.contains("retention.job_history"), "{message}");
+    assert!(
+        message.contains("maximum supported retention window"),
+        "the error must say why, not just that it is invalid: {message}"
+    );
+}
+
+#[test]
+fn a_window_at_the_supported_maximum_is_accepted() {
+    // u32::MAX seconds is ~136 years; the boundary itself must still work.
+    let mut config = AutumnConfig::default();
+    config.retention.job_history = Some(format!("{}s", u64::from(u32::MAX)));
+    config.validate().expect("the boundary window is supported");
+
+    config.retention.job_history = Some(format!("{}s", u64::from(u32::MAX) + 1));
+    config
+        .validate()
+        .expect_err("one second past the boundary is not");
+}

@@ -487,12 +487,21 @@ impl AuditSink for JsonlFileAuditSink {
                     }
                 };
             }
-            // Carry the archive's own permissions across the rename. Best
-            // effort: a platform or filesystem that cannot report or apply
-            // them must not fail the purge.
-            if let Ok(metadata) = tokio::fs::metadata(&self.path).await {
-                let _ = tokio::fs::set_permissions(&temp_path, metadata.permissions()).await;
-            }
+            // Carry the archive's own permissions across the rename — and
+            // fail if that cannot be done. An audit archive carries
+            // `actor_id` and `ip_address`, so an operator who hardened it to
+            // `0600` must not get a default-mode `0644` file renamed over it
+            // by a retention sweep. Refusing to replace the archive keeps the
+            // stale entries, which is strictly better than widening access to
+            // every entry that remains.
+            let metadata = cleanup_on_error!(
+                tokio::fs::metadata(&self.path).await,
+                "failed to read audit log permissions before purge"
+            );
+            cleanup_on_error!(
+                tokio::fs::set_permissions(&temp_path, metadata.permissions()).await,
+                "failed to preserve audit log permissions on the purge temp file"
+            );
             cleanup_on_error!(
                 temp.write_all(kept.as_bytes()).await,
                 "failed to write audit purge temp file"
@@ -715,6 +724,40 @@ mod tests {
         assert!(
             content.contains("not json at all"),
             "unparseable lines must survive: {content}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_purge_preserves_the_archive_permissions() {
+        // An audit archive carries `actor_id` and `ip_address`. An operator
+        // who hardened it to 0600 must not get a default-mode file renamed
+        // over it by a retention sweep.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.jsonl");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let sink = archive_with_timestamps(&path, &[old, old, Utc::now()]).await;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .expect("harden the archive");
+
+        let outcome = sink
+            .purge_before(Utc::now() - chrono::Duration::days(30), false)
+            .await
+            .expect("purge");
+
+        assert_eq!(outcome.entries_removed, 2);
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .expect("archive still exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the rewritten archive must keep the mode the operator set"
         );
     }
 
