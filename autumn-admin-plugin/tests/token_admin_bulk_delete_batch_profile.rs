@@ -25,11 +25,16 @@
 //!   -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! CI runs it in the Docker-dependent sweep (`-- --ignored`, see CLAUDE.md):
-//! this is a plain `#[ignore]`d test compiled into its own binary (this
-//! crate has no consolidated `tests/integration/mod.rs`, unlike
-//! `autumn`/`autumn-cli`), so the sweep's bare `--ignored` run over the
-//! workspace picks it up with no workflow edit.
+//! This crate has no consolidated `tests/integration/mod.rs` (unlike
+//! `autumn`/`autumn-cli`, see CLAUDE.md) and CI does not run a bare
+//! `--ignored` sweep over this package either — `token_admin_db` (the
+//! other Docker-backed suite in this crate) is invoked by an explicit
+//! `--test token_admin_db` line in `.github/workflows/ci.yml`'s
+//! "Run Docker-dependent tests" step (and again in the coverage step), so
+//! this binary needs, and has, the same explicit
+//! `--test token_admin_bulk_delete_batch_profile -- --ignored` line right
+//! next to it in both places — a bare sweep would silently never compile
+//! or run it.
 //!
 //! ## Fixture
 //!
@@ -46,9 +51,14 @@
 //! The bulk-delete selection is 2,000 ids — a plausible one-shift "revoke
 //! every stale service token" operator action — scattered every 25th id
 //! across the table (not a contiguous head block, so this isn't just
-//! measuring one sequential index range), deliberately including 200 ids
-//! that are already revoked (must no-op, not double-count) and 50 ids past
-//! `TOTAL_ROWS` that don't exist at all (must no-op, not error).
+//! measuring one sequential index range), plus 50 ids past `TOTAL_ROWS`
+//! that don't exist at all (must no-op, not error). Some of the 2,000 are
+//! already revoked before the action runs — both the seed's own 12%
+//! baseline rate landing on this specific selection (every 25th id
+//! includes every 100th id, which the seed always revokes) and 200 more
+//! deliberately forced on top, disjoint from the seed's share — so the
+//! "must no-op, not double-count" edge case is exercised on a known,
+//! measured count rather than an assumed one (see `select_bulk_delete_ids`).
 
 // Row/statement counts here top out in the low hundred-thousands, nowhere
 // near f64's 52-bit mantissa limit -- every `as f64` below is a display
@@ -134,20 +144,41 @@ struct IdRow {
     id: i64,
 }
 
-/// 2,000 ids: every 25th id in range (scattered across the table), with
-/// `PRE_REVOKED_SELECTED` of them forced to already-revoked and
-/// `NONEXISTENT_SELECTED` extra ids past `TOTAL_ROWS` appended.
-fn select_bulk_delete_ids(conn: &mut PgConnection) -> Vec<i64> {
+#[derive(QueryableByName, Debug)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// 2,000 ids: every 25th id in range (scattered across the table), plus
+/// `NONEXISTENT_SELECTED` extra ids past `TOTAL_ROWS` appended. Returns
+/// `(ids, pre_revoked_before_action)` — the actual, measured number of the
+/// 2,000 that are already revoked before the bulk action runs.
+///
+/// A review caught that this count is NOT simply `PRE_REVOKED_SELECTED`: the
+/// stride (every 25th id) is not independent of the seed's own `id % 100 <
+/// 12` revocation rule — multiples of 25 include multiples of 100, so 1 in 4
+/// of the 2,000 selected ids (`id % 100 = 0`) are already revoked by the
+/// seed regardless of anything forced here. To keep `PRE_REVOKED_SELECTED`
+/// meaning exactly what its name says, the forced `UPDATE` below is
+/// restricted to ids the seed did NOT already revoke (`id % 100 >= 12`),
+/// making the two sources disjoint by construction; the count returned here
+/// is measured with a `COUNT(*)`, not assumed, so the report can't drift
+/// from reality again.
+fn select_bulk_delete_ids(conn: &mut PgConnection) -> (Vec<i64>, i64) {
     use diesel::RunQueryDsl;
-    // Force a known prefix of the scattered selection to already be revoked,
-    // so the "must no-op, not double-count" edge case is exercised
-    // deterministically rather than depending on which ids the 12%-revoked
-    // seed happened to land on.
     conn.batch_execute(&format!(
         "UPDATE api_tokens SET revoked_at = TIMESTAMP '2025-07-01 00:00:00' \
-         WHERE id IN (SELECT gs * {BULK_IDS_STEP} FROM generate_series(1, {PRE_REVOKED_SELECTED}) AS gs)"
+         WHERE id IN ( \
+           SELECT (gs * {BULK_IDS_STEP})::bigint AS id \
+           FROM generate_series(1, {}) AS gs \
+           WHERE (gs * {BULK_IDS_STEP})::bigint % 100 >= 12 \
+           ORDER BY gs \
+           LIMIT {PRE_REVOKED_SELECTED} \
+         )",
+        TOTAL_ROWS / BULK_IDS_STEP
     ))
-    .expect("force pre-revoked subset of the selection");
+    .expect("force pre-revoked subset of the selection, disjoint from the seed's own revocations");
     conn.batch_execute("ANALYZE api_tokens").expect("analyze");
 
     let rows = diesel::sql_query(format!(
@@ -158,8 +189,17 @@ fn select_bulk_delete_ids(conn: &mut PgConnection) -> Vec<i64> {
     .load::<IdRow>(conn)
     .expect("select scattered ids");
     let mut ids: Vec<i64> = rows.into_iter().map(|r| r.id).collect();
+
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let pre_revoked_before_action = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS n FROM api_tokens WHERE id IN ({list}) AND revoked_at IS NOT NULL"
+    ))
+    .get_result::<CountRow>(conn)
+    .expect("count pre-revoked ids")
+    .n;
+
     ids.extend((TOTAL_ROWS + 1)..=(TOTAL_ROWS + NONEXISTENT_SELECTED));
-    ids
+    (ids, pre_revoked_before_action)
 }
 
 fn reset_stats(conn: &mut PgConnection) {
@@ -285,11 +325,12 @@ async fn token_admin_bulk_delete_batch_profile() {
         .expect("create api_tokens");
 
     seed_fixture(&mut conn);
-    let ids = select_bulk_delete_ids(&mut conn);
+    let (ids, pre_revoked_before_action) = select_bulk_delete_ids(&mut conn);
     let expected_ids_len = ids.len();
     println!(
-        "\n-- bulk-delete selection: {expected_ids_len} ids ({PRE_REVOKED_SELECTED} pre-revoked, \
-         {NONEXISTENT_SELECTED} nonexistent) --"
+        "\n-- bulk-delete selection: {expected_ids_len} ids ({pre_revoked_before_action} \
+         pre-revoked [{PRE_REVOKED_SELECTED} forced + the seed's own baseline rate landing on \
+         this selection], {NONEXISTENT_SELECTED} nonexistent) --"
     );
 
     let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);

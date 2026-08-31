@@ -41,10 +41,14 @@ principals), 12% pre-revoked, 35% NULL `last_used_at`, and real dead tuples
 from a follow-up `UPDATE` before `ANALYZE`. The bulk-delete selection is
 2,000 ids — a plausible one-shift "revoke every stale service token"
 operator action — scattered every 25th id across the table (not a
-contiguous head block), deliberately including 200 ids that are already
-revoked (must stay a no-op, not double-count) and 50 ids past the table's
-range that don't exist at all (must stay a no-op, not error) — 2,050 ids
-submitted in total.
+contiguous head block), plus 50 ids past the table's range that don't exist
+at all (must stay a no-op, not error) — 2,050 ids submitted in total. 700
+of the 2,000 are already revoked before the action runs: the seed's own 12%
+baseline rate lands on 500 of them (every 25th id includes every 100th id,
+which the seed always revokes — a review caught that this overlap makes the
+pre-revoked count *not* simply the number forced on top), plus 200 more
+forced deliberately, chosen disjoint from the seed's share so the total is
+exact and measured at runtime rather than assumed.
 
 **Reproduce**:
 ```bash
@@ -53,9 +57,12 @@ cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile \
 ```
 Requires Docker (spins up a `postgres:16-alpine` testcontainer with
 `pg_stat_statements` preloaded). This crate has no consolidated
-`tests/integration/mod.rs` (unlike `autumn`/`autumn-cli`), so this is a
-plain `#[ignore]`d test in its own binary — CI's Docker sweep
-(`-- --ignored`, see `CLAUDE.md`) picks it up with no workflow edit.
+`tests/integration/mod.rs` (unlike `autumn`/`autumn-cli`), and CI does not
+run a bare `--ignored` sweep over this package either — this binary is
+invoked by an explicit `--test token_admin_bulk_delete_batch_profile` line
+in `.github/workflows/ci.yml`, next to the existing `token_admin_db` line
+(a review caught that the PR's first commit shipped the test without this
+CI wiring, so it would have silently never run).
 
 ## 📈 Profile
 
@@ -139,13 +146,13 @@ reset before the run. Full statement dumps in `baseline/output.txt`
 | | before | after |
 |---|---:|---:|
 | revoke statement calls | 2,050 | **1** |
-| revoke statement buffers | 11,970 | 15,236 |
+| revoke statement buffers | 11,413 | 14,530 |
 | ids submitted (for reference) | 2,050 | 2,050 |
 
 Statement count drops from **one per id to one per bulk action** — the
 admissible-on-its-own N+1 floor ("statement count per request drops from
 O(n) to O(1)... needs no other justification"). Buffers touched are **not**
-reduced (in fact higher, 11,970 → 15,236) — folding 2,050 single-row
+reduced (in fact higher, 11,413 → 14,530) — folding 2,050 single-row
 point-UPDATEs into one `id = ANY($1)` array-match does the same
 index-lookup-and-heap-update work per id, plus the array itself has to be
 read and matched against, so the total work touched by Postgres is not
@@ -166,10 +173,11 @@ submitted ids, sorted by `id` (no ties), at the end of both the baseline and
 after runs. **The two dumps are byte-for-byte identical**
 (`diff <(sed baseline dump) <(sed after dump)` — empty). This covers:
 
-- the 1,800 ids that were NULL (`revoked_at`) before the action and must
+- the 1,300 ids that were NULL (`revoked_at`) before the action and must
   transition to non-NULL
-- the 200 ids forced already-revoked before the action, which must stay
-  revoked and not error or get touched twice
+- the 700 ids already revoked before the action (500 from the seed's own
+  baseline rate, 200 forced deliberately), which must stay revoked and not
+  error or get touched twice
 - the 50 nonexistent ids past the table's range, which must not appear in
   the dump and must not error the whole batch
 - the returned `count` from `execute_action`, asserted equal to
