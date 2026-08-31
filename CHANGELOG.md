@@ -1047,38 +1047,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `maud::escape::escape_to_string`: a loop that matches and pushes one byte
   at a time even when nothing needs escaping. Profiling the committed
   `autumn/benches/form_render.rs` workload showed that loop was 26% of the
-  release-build instruction count on a realistic 12-field form. A new
-  `autumn_web::form::fast_escape` does the identical 4-character escape
-  (`&`, `<`, `>`, `"`; checked byte-for-byte against a naive reference by a
-  proptest over arbitrary strings) but copies each clean run with one bulk
-  `push_str` instead of one call per byte, and returns the input completely
-  unallocated (`Cow::Borrowed`) when nothing needs escaping — the common
-  case for values like `"19.99"` — before handing the result to
-  `maud::PreEscaped` so `html!` doesn't re-scan it. Output is byte-for-byte
-  unchanged (verified by the unchanged 209 `form`/`nested_form` lib tests
-  plus the new proptest).
+  release-build instruction count on a realistic 12-field form.
+
+  A new `Esc` type implements `maud::Render` directly (`autumn_web::form`)
+  and writes the escaped bytes straight into `html!`'s own output buffer
+  via one bulk `push_str` per clean run instead of one call per byte — an
+  earlier version of this fix pre-built an owned, escaped `String` and
+  handed it to `maud::PreEscaped`, which a reviewer (Codex) correctly
+  flagged as a second, avoidable copy for any value that actually needs
+  escaping; writing straight into `html!`'s buffer needs only the one copy
+  `escape_to_string` was already doing, in every case. `fast_escape` (used
+  only to build `id`/`name`-derived strings like `"{field}-error"` ahead of
+  a `html!` block, where the result has to be a concatenatable `str` rather
+  than something written into a buffer) still returns the input completely
+  unallocated when nothing needs escaping. Output is byte-for-byte
+  unchanged — checked against a naive reference by a proptest over
+  arbitrary strings (including multi-byte UTF-8), and by the unchanged 209
+  `form`/`nested_form` lib tests.
 
   Measured with the committed `autumn/benches/form_render.rs` harness and
   the existing `autumn/tests/form_render_alloc_gate.rs` allocation gate
-  (both the same 12-field workload), `valgrind --tool=callgrind`/`--tool=dhat`,
-  before and after on the same machine:
+  (both the same 12-field workload), `valgrind --tool=callgrind`, before
+  and after on the same machine:
 
   | | before | after | delta |
   | --- | ---: | ---: | ---: |
-  | Instructions (3,000-iteration run) | 185,711,127 | 155,624,223 | **-16.20%** |
+  | Instructions (3,000-iteration run) | 185,711,127 | 159,908,641 | **-13.90%** |
   | `maud::escape::escape_to_string` instructions | 48,339,450 (26.0%) | 0 (eliminated) | **-100%** |
   | Allocation blocks (200 renders) | 20,800 | 20,800 | unchanged |
   | Allocation bytes (200 renders) | 4,495,800 | 4,604,600 | +2.4% |
 
   Allocation *count* is unchanged — escaping never allocates for this
-  fixture's clean values, matching `fast_escape`'s `Cow::Borrowed` fast
-  path. Bytes rose slightly: `maud_macros` sizes each `html!` block's output
+  fixture's clean values (and, with the direct-`Render` design, never
+  allocates a temporary buffer even when a value *does* need escaping).
+  Bytes rose slightly: `maud_macros` sizes each `html!` block's output
   buffer from the *source token length* of the macro invocation, not
-  runtime content, and the longer `PreEscaped`-wrapped interpolations read
-  as "expect more output." That reservation is never grown again (the
-  unchanged block count proves it), so it's unused slack, not extra
-  allocator work — see `form_render_alloc_gate.rs` for the full explanation
-  and its updated ceiling.
+  runtime content, and the interpolations calling into `Esc`/`fast_escape`
+  read as "expect more output" than the plain, unescaped splices they
+  replaced. That reservation is never grown again (the unchanged block
+  count proves it), so it's unused slack, not extra allocator work — see
+  `form_render_alloc_gate.rs` for the full explanation and its updated
+  ceiling.
 
 ## [0.7.0] - 2026-08-23
 

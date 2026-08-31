@@ -988,25 +988,21 @@ pub fn method_input(method: &str) -> maud::Markup {
     }
 }
 
-/// Pre-escape a field value or error message the same way `maud::html!`
-/// would, so it can be handed to `maud::PreEscaped` instead.
+/// HTML-escapes `input` (the same 4 characters `maud::escape::escape_to_string`
+/// does: `&`, `<`, `>`, `"`) by appending to `out`.
 ///
 /// `maud::escape::escape_to_string` scans one byte at a time and calls
 /// `String::push`/`push_str` per byte even when nothing needs escaping —
 /// on a scaffolded form's field values (mostly clean prose/numbers, no
 /// `&<>"`) that per-byte dispatch dominated `benches/form_render.rs`'s
-/// profile. This does the same 4-character escape (identical output —
-/// see `fast_escape_matches_maud` for a proptest-style equivalence check
-/// against `maud::escape::escape_to_string`) but copies each clean run in
-/// one `push_str` instead of one call per byte, and returns the input
-/// completely unallocated (`Cow::Borrowed`) when it contains no character
-/// that needs escaping — the common case for values like `"19.99"` or
-/// `"ART-1042"`. Slicing at the positions found below is always on a
+/// profile. This does the identical escape (output verified byte-for-byte
+/// against a naive reference by the `fast_escape_matches_naive_reference`
+/// proptest) but copies each clean run in one `push_str` instead of one
+/// call per byte. Slicing at the positions found below is always on a
 /// UTF-8 char boundary: `&`, `<`, `>`, and `"` are single-byte ASCII code
 /// points, so they can never be a continuation byte of a multi-byte
 /// sequence, and no multi-byte sequence can contain one of those bytes
-/// either. Verified for arbitrary input (not just this reasoning) by the
-/// `fast_escape_matches_naive_reference` proptest.
+/// either.
 #[cfg(feature = "maud")]
 #[allow(
     clippy::string_slice,
@@ -1021,18 +1017,10 @@ pub fn method_input(method: &str) -> maud::Markup {
               enumerate()`), and `input.len() <= isize::MAX` is a `str` invariant — cannot \
               overflow `usize`."
 )]
-fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
+fn write_escaped(input: &str, out: &mut String) {
     let bytes = input.as_bytes();
-    let Some(first) = bytes
-        .iter()
-        .position(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
-    else {
-        return std::borrow::Cow::Borrowed(input);
-    };
-    let mut out = String::with_capacity(input.len() + 8);
-    out.push_str(&input[..first]);
-    let mut start = first;
-    for (i, &b) in bytes.iter().enumerate().skip(first) {
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
         let replacement = match b {
             b'&' => "&amp;",
             b'<' => "&lt;",
@@ -1045,23 +1033,71 @@ fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
         start = i + 1;
     }
     out.push_str(&input[start..]);
-    std::borrow::Cow::Owned(out)
 }
 
-/// `maud::PreEscaped(fast_escape(s))`, spelled short.
+/// A field value, label, or error message, escaped for direct
+/// interpolation into a `maud::html!` buffer.
 ///
-/// `maud::html!`'s compile-time output-buffer size hint is the *source
-/// token length* of the macro invocation (`input.to_string().len()` in
-/// `maud_macros`), not anything about runtime content. Spelling this out
-/// as `maud::PreEscaped(fast_escape(value))` at every interpolation site
-/// inflates that source text enough to noticeably over-reserve the
-/// buffer's initial capacity (more bytes reported by `dhat`, though not
-/// more allocations — the ceiling below is never actually re-grown). A
-/// one-letter-shorter call keeps the estimate close to what the plain,
-/// unescaped `(value)` it replaces already cost.
+/// Implements [`maud::Render`] itself — rather than pre-building an owned,
+/// escaped `String` and handing it to `maud::PreEscaped` — so the escaped
+/// bytes are written straight into `html!`'s own growing output buffer.
+/// Building a separate `String` first (an earlier version of this code
+/// did that, via a `Cow`-returning `fast_escape`) means a *second* copy
+/// for any value that actually needs escaping: once into the temporary
+/// `String`, then again when `PreEscaped` hands it off. This way there is
+/// only ever the one copy `maud::escape::escape_to_string` was already
+/// doing — a `Render` impl is documented as receiving "no further
+/// escaping" from `html!`, so this fully replaces it rather than skipping
+/// it.
+///
+/// Named `esc`, not `Escaped`/`escape`: `maud_macros` sizes a `html!`
+/// block's output buffer from the *source token length* of the macro
+/// invocation, not runtime content, so a longer call spelled out at every
+/// interpolation site measurably over-reserves that buffer's initial
+/// capacity even though it's never actually grown again. A short call
+/// keeps the estimate close to what the plain, unescaped `(value)` it
+/// replaces already cost.
 #[cfg(feature = "maud")]
-fn esc(s: &str) -> maud::PreEscaped<std::borrow::Cow<'_, str>> {
-    maud::PreEscaped(fast_escape(s))
+struct Esc<'a>(&'a str);
+
+#[cfg(feature = "maud")]
+impl maud::Render for Esc<'_> {
+    fn render_to(&self, w: &mut String) {
+        write_escaped(self.0, w);
+    }
+}
+
+#[cfg(feature = "maud")]
+const fn esc(s: &str) -> Esc<'_> {
+    Esc(s)
+}
+
+/// Pre-escape a field name the same way `maud::html!` would, for building
+/// an `id`/`name`-derived string (`format!("{field_html}-error")`) ahead
+/// of a `maud::html!` block rather than inside one.
+///
+/// Unlike [`esc`]/[`Esc`], this has to produce an owned-or-borrowed `str`
+/// rather than write into a buffer, since the result gets concatenated via
+/// `format!` before it's ever interpolated — so it keeps the `Cow`
+/// interface and, when there's nothing to escape (the overwhelmingly
+/// common case for a field name), returns the input completely
+/// unallocated. Escaping first and concatenating after is equivalent to
+/// concatenating first and escaping after here, since the literal
+/// `"-error"`/`"-field"` suffixes contain no characters that need
+/// escaping — see `fast_escape_matches_naive_reference` for the
+/// byte-for-byte equivalence check against a naive reference.
+#[cfg(feature = "maud")]
+fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+    {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    write_escaped(input, &mut out);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Render a labeled `<input type="text">` tied to a changeset field.
