@@ -3999,7 +3999,20 @@ impl AppBuilder {
                     g.routes
                         .iter()
                         .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
-                });
+                })
+                // Declared plugin routes belong in this check for the same
+                // reason the others do. A sandboxed manifest may take
+                // `/robots.txt` as its prefix — a `.` is legal inside a prefix
+                // segment — and its routes are nested *after* this router is
+                // merged, so without this the two overlap and axum panics at
+                // startup. The declared-route preflight cannot catch it either:
+                // that compares against a claim set built from config alone,
+                // and SEO also mounts when a source is registered in code.
+                //
+                // Yielding matches what this site already does for a custom
+                // `#[static_get("/robots.txt")]`, and the operator has seen the
+                // prefix on the consent screen before installing it.
+                || declared_routes.iter().any(|r| is_seo_path(&r.path));
             if seo_collision {
                 tracing::warn!(
                     "seo: /robots.txt or /sitemap.xml is already registered by the application; \

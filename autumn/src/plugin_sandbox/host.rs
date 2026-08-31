@@ -896,6 +896,20 @@ impl SandboxHost {
             });
         }
 
+        // The same argument as the memory ceiling above, for the other
+        // per-instance store the limiter guards. `table_growing` refuses a
+        // total past `MAX_TABLE_ELEMENTS` at instantiation — which is per
+        // request — so a module whose tables are *already* over it at rest
+        // loads cleanly and then fails every request it is ever given. Said
+        // once here, it is a verdict `autumn plugin inspect` can be trusted on.
+        if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
+            return Err(SandboxLoadError::InstantiationTooExpensive {
+                what: "initial table elements",
+                found: usize::try_from(shape.table_elements).unwrap_or(usize::MAX),
+                max: MAX_TABLE_ELEMENTS as usize,
+            });
+        }
+
         Ok(Self {
             engine,
             module,
@@ -1245,6 +1259,12 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// Elements the module's own tables declare as their *initial* size.
+    ///
+    /// The limiter enforces `MAX_TABLE_ELEMENTS` at instantiation, which is
+    /// per request; knowing the declared total at load is what turns "every
+    /// request fails" into "this artifact does not load".
+    table_elements: u64,
 }
 
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
@@ -1270,6 +1290,9 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     /// Section ids for the element and data sections.
     const ELEMENT_SECTION: u8 = 9;
     const DATA_SECTION: u8 = 11;
+    /// The table section, whose entries carry the initial sizes the limiter
+    /// will be asked to admit.
+    const TABLE_SECTION: u8 = 4;
     /// The custom section is the one whose payload is not a counted vector.
     const CUSTOM_SECTION: u8 = 0;
 
@@ -1277,6 +1300,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut segments = 0usize;
     let mut bytes = 0usize;
     let mut declared_entries = 0usize;
+    let mut table_elements = 0u64;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1293,12 +1317,35 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             segments = segments.saturating_add(count);
             bytes = bytes.saturating_add(size);
         }
+        if id == TABLE_SECTION {
+            // `vec(tabletype)`, and a `tabletype` is a reftype byte then
+            // `limits`: a flag, the minimum, and a maximum when the flag says
+            // so. Only the minimum matters here — it is what the instance
+            // allocates before the guest runs.
+            let (count, mut at) = leb128(wasm, after_size)?;
+            for _ in 0..count {
+                at = at.checked_add(1)?; // reftype
+                let flag = *wasm.get(at)?;
+                at = at.checked_add(1)?;
+                let (minimum, next) = leb128(wasm, at)?;
+                at = next;
+                table_elements = table_elements.saturating_add(minimum as u64);
+                if flag == 0x01 {
+                    let (_, after_max) = leb128(wasm, at)?;
+                    at = after_max;
+                }
+                if at > end {
+                    return None;
+                }
+            }
+        }
         cursor = end;
     }
     Some(ModuleShape {
         segments,
         init_bytes: bytes,
         declared_entries,
+        table_elements,
     })
 }
 
@@ -2733,20 +2780,28 @@ path = "/hello/greet"
     }
 
     #[test]
-    fn table_storage_is_bounded_across_the_whole_instance() {
-        // Four tables each under a per-table ceiling would still be four times
-        // that ceiling of per-instance host storage the footprint never counted.
-        use std::fmt::Write as _;
-
-        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
-        for _ in 0..4 {
-            let _ = writeln!(wat, "  (table {MAX_TABLE_ELEMENTS} funcref)");
-        }
-        wat.push_str("  (func (export \"_start\") (nop))\n)");
-        // Refused by the limiter at instantiation: the instance's total is four
-        // times the ceiling, so the plugin's prefix 5xxs and the host is fine.
+    fn table_growth_past_the_ceiling_is_refused_while_the_guest_runs() {
+        // A module already over the ceiling at rest is now refused at load,
+        // summed across its tables. The limiter is still what holds the line
+        // here, and this is the case it alone can: a guest that starts *under*
+        // the ceiling and reaches for more with `table.grow` while running,
+        // which no load-time check can see.
+        let wat = format!(
+            r#"(module
+                 (memory (export "memory") 1)
+                 (table 1 funcref)
+                 (func (export "_start")
+                   (drop (table.grow 0 (ref.null func) (i32.const {MAX_TABLE_ELEMENTS})))))"#
+        );
         let outcome = host(&wat).run(&get("/hello/greet"));
         assert!(outcome.result.is_err(), "{:?}", outcome.result);
+        // Refused, and recorded: an operator has to be able to see that the
+        // plugin reached past its ceiling rather than merely that it 5xx'd.
+        assert!(
+            !denied(&outcome, DeniedCapability::Memory).is_empty(),
+            "the refusal was not recorded: {:?}",
+            outcome.denials
+        );
     }
 
     #[test]
@@ -3606,6 +3661,47 @@ path = "/hello/greet"
         assert!(
             matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_whose_tables_start_over_the_ceiling_is_refused_at_load() {
+        // The limiter enforces the table ceiling at instantiation, which is per
+        // request — so a module already over it at rest loaded cleanly and then
+        // failed every request. Same defect as a fuel budget below the fixed
+        // charges: a passing verdict on an artifact that can never answer.
+        let over = MAX_TABLE_ELEMENTS + 1;
+        let wasm = wat::parse_str(format!(
+            "(module (table {over} funcref) (memory (export \"memory\") 1) (func (export \"_start\") (nop)))"
+        ))
+        .expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module over the table ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "initial table elements",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tables_within_the_ceiling_still_load() {
+        // The ceiling is a ceiling, not a ban: a module with real tables must
+        // still mount, and the sum is across the module rather than per table.
+        let half = MAX_TABLE_ELEMENTS / 4;
+        let wasm = wat::parse_str(format!(
+            "(module (table {half} funcref) (table {half} funcref) (memory (export \"memory\") 1) (func (export \"_start\") (nop)))"
+        ))
+        .expect("the fixture is valid WAT");
+        assert!(
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm).is_ok(),
+            "tables under the ceiling must load"
         );
     }
 
