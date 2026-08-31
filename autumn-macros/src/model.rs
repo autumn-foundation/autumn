@@ -2928,6 +2928,10 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("lock_version")
                 && !a.path().is_ident("searchable")
                 && !a.path().is_ident("encrypted")
+                // #1654: `#[classified]` is a marker the model macro reads; the
+                // behaviour lives in the field's `Classified<T, Marker>` type, so
+                // the attribute itself must never reach the Diesel derives.
+                && !a.path().is_ident("classified")
                 && !a.path().is_ident("private")
                 && !a.path().is_ident("normalize")
                 && !a.path().is_ident("state_machine")
@@ -3076,6 +3080,201 @@ fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> 
     Ok(parse_field_encrypted(field)?.mode)
 }
 
+// ── #1654: `#[classified]` field attribute ───────────────────────────────────
+
+/// Whether a field is marked `#[classified]` (issue #1654): its value carries a
+/// data classification on the *type*, so it cannot reach a gated sink without
+/// passing a declared declassification boundary.
+fn field_is_classified(field: &syn::Field) -> bool {
+    has_attr(field, "classified")
+}
+
+/// Parse `#[classified]` / `#[classified(personal_data)]`.
+///
+/// The first slice supports exactly one tier, so the only accepted spelling
+/// beyond the bare marker is the tier's own name -- written out so a second tier
+/// is additive rather than a breaking respelling.
+fn validate_classified_tier(field: &syn::Field) -> syn::Result<()> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("classified") {
+            continue;
+        }
+        // `continue`, not `return`: a bare marker validates itself, but a field
+        // can carry more than one `#[classified]` attribute and every one of
+        // them has to be checked. Returning here let
+        // `#[classified] #[classified(top_secret)]` through, recording the
+        // column as `personal_data` while silently ignoring the tier the author
+        // actually asked for.
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("personal_data") {
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unsupported `#[classified]` tier; the first slice supports \
+                     `personal_data` only (issue #1654). Write `#[classified]` or \
+                     `#[classified(personal_data)]`.",
+                ))
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// The generated zero-sized marker naming one classified column, e.g.
+/// `Customer::email` -> `CustomerEmailClassified`.
+///
+/// The name is load bearing twice over: it is what the compiler prints when a
+/// leak is attempted (so it has to read as the field it guards), and it is what
+/// `declassify!` names to tie a boundary to exactly one column.
+fn classified_marker_ident(model: &syn::Ident, field: &syn::Ident) -> syn::Ident {
+    let mut camel = String::new();
+    let mut upper_next = true;
+    for ch in unraw_ident(field).chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            camel.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            camel.push(ch);
+        }
+    }
+    // `Classified`, not `Field`: `{Model}Field` is already the generated
+    // field enum, so `Customer::email` -> `CustomerEmailClassified` would collide
+    // with a sibling `#[model] struct CustomerEmail`'s field enum. No column
+    // name can be empty, so `{Model}{Column}Classified` cannot collide with
+    // another model's marker either.
+    format_ident!(
+        "{}{}Classified",
+        unraw_ident(model),
+        camel,
+        span = field.span()
+    )
+}
+
+/// Validate a `#[classified]` field.
+///
+/// v1 classifies non-null `String` columns, mirroring `#[encrypted]`: those are
+/// the realistic personal-data columns (email, phone, address), and restricting
+/// the shape keeps one Diesel column representation instead of a generic one.
+/// Every rejected combination below is a pair whose two halves disagree about
+/// whether the value may be read back out in the clear.
+fn validate_classified_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_classified(field) {
+        return Ok(());
+    }
+    validate_classified_tier(field)?;
+
+    for (marker, why) in [
+        (
+            "encrypted",
+            "an encrypted column already routes through its own Diesel wrapper, and \
+             the two wrappers cannot both own the column's representation. \
+             `#[encrypted]` protects the value at rest; `#[classified]` proves where \
+             it may go. Combining them lands in a later slice",
+        ),
+        (
+            "searchable",
+            "full-text search indexes the stored column, which would put the personal \
+             data in a search vector the classification cannot gate",
+        ),
+        (
+            "normalize",
+            "normalizers rewrite the column in place, which needs the plaintext out of \
+             the classification with no boundary to record it",
+        ),
+        (
+            "translatable",
+            "a per-locale container is a JSON document, not the single value a \
+             classification tier applies to",
+        ),
+        (
+            "id",
+            "a primary key is echoed back in URLs, ETags and pagination cursors, none \
+             of which is a gated sink",
+        ),
+        (
+            "lock_version",
+            "the optimistic-lock column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "position",
+            "the position column is framework-managed and must stay a plain integer",
+        ),
+        (
+            "state_machine",
+            "a state column must hold one state name, which the state-machine codegen \
+             reads and writes directly",
+        ),
+    ] {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("`#[classified]` cannot be combined with `#[{marker}]`: {why}."),
+            ));
+        }
+    }
+
+    // The `String`-only rule is checked *after* the conflicting-marker loop on
+    // purpose: several of those markers (`#[translatable]`, `#[lock_version]`,
+    // `#[position]`, `#[id]`) imply a non-`String` column, and the reason that
+    // names the conflict is the one that tells the author what to do.
+    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+    if !is_string {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[classified]` is only supported on non-null `String` fields in v1 \
+             (issue #1654). Model the column as a `String`, or classify a \
+             neighbouring string column that holds the personal data.",
+        ));
+    }
+
+    // `tenant_id` is read directly by the tenancy codegen (preload scoping,
+    // `ModelTenantIdMeta`, the search-text projection), all of which expect the
+    // declared type. It is also an isolation key, not personal data.
+    if field
+        .ident
+        .as_ref()
+        .is_some_and(|i| unraw_ident(i) == "tenant_id")
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` cannot be applied to `tenant_id`: the tenancy codegen reads \
+             the column directly as its isolation key, and a tenant identifier is not the \
+             personal data this tier describes.",
+        ));
+    }
+    // A custom serde adapter is written against the declared type and would be
+    // handed the taint wrapper instead -- and a `serialize_with` is a serializer
+    // for the very value the classification is withholding.
+    if has_hook_serde_adapter(field, SerdeAdapterMode::Serialize)
+        || has_hook_serde_adapter(field, SerdeAdapterMode::Deserialize)
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` cannot be combined with `#[serde(with = ...)]`, \
+             `#[serde(serialize_with = ...)]` or `#[serde(deserialize_with = ...)]`: the \
+             adapter is written against the declared type, and a `serialize_with` is a \
+             serializer for the value the classification withholds.",
+        ));
+    }
+    // The classified column is registered in the data-flow manifest under its
+    // Rust field name. A `#[serde(rename)]` would desync the manifest row from
+    // the wire name a reviewer reads it against.
+    if field_has_serde_rename(field) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`#[classified]` fields cannot use `#[serde(rename = ...)]` in v1: the \
+             column is registered in the data-flow manifest under its Rust name, \
+             which must match the name the manifest is reviewed against.",
+        ));
+    }
+    Ok(())
+}
+
 /// Build a manual `Debug` impl that redacts encrypted fields, so plaintext
 /// (held in memory as a `String` for ergonomics) never appears in `Debug`
 /// output, panic backtraces, or framework error messages. The development-only
@@ -3084,10 +3283,17 @@ fn redacting_debug_impl(
     struct_name: &syn::Ident,
     field_idents: &[&syn::Ident],
     encrypted_names: &[&str],
+    classified_names: &[&str],
 ) -> TokenStream {
     let stmts = field_idents.iter().map(|ident| {
         let nm = ident.to_string();
-        if encrypted_names.contains(&nm.as_str()) {
+        if classified_names.contains(&nm.as_str()) {
+            // #1654: the read model's column is already a `Classified<..>` with a
+            // redacting `Debug`, but `New*`/`Update*`/`Changeset` hold the plain
+            // `String` (the write path is not a gated sink), and their `Debug`
+            // reaches panic output and error pages just the same.
+            quote! { s.field(#nm, &::core::format_args!("<classified>")); }
+        } else if encrypted_names.contains(&nm.as_str()) {
             quote! {
                 if ::autumn_web::encryption::debug_plaintext_enabled() {
                     s.field(#nm, &self.#ident);
@@ -5669,6 +5875,41 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Collect `#[classified]` columns (issue #1654, validated to be non-null
+    // `String`). Each entry: (field ident, column name, generated field marker).
+    let mut classified_columns: Vec<(&syn::Ident, String, syn::Ident)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_classified_field(f) {
+            return err.to_compile_error();
+        }
+        if !field_is_classified(f) {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        classified_columns.push((
+            ident,
+            unraw_ident(ident),
+            classified_marker_ident(name, ident),
+        ));
+    }
+    let has_classified = !classified_columns.is_empty();
+    // A struct-level `#[serde(rename_all = ...)]` desyncs the manifest row (Rust
+    // name) from the wire name it is reviewed against, exactly as it does for
+    // encrypted columns.
+    if has_classified && attrs_have_serde_rename_all(outer_attrs) {
+        return syn::Error::new_spanned(
+            name,
+            "`#[serde(rename_all = ...)]` cannot be combined with `#[classified]` fields in \
+             v1: classified columns are registered in the data-flow manifest under their \
+             Rust names, which must match the names the manifest is reviewed against.",
+        )
+        .to_compile_error();
+    }
+    let classified_column_names: Vec<&str> = classified_columns
+        .iter()
+        .map(|(_, col, _)| col.as_str())
+        .collect();
+
     // Collect `#[translatable]` columns (issue #1384, validated to be
     // non-null `Translated`). Each entry is the field ident; the column name is
     // the Rust field name, which is also the key the field-name-driven
@@ -5748,7 +5989,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // the model's module scope when `serialize_as` is present, which needs
     // `ExpressionMethods` in scope. Bring it in anonymously (only for models with
     // encrypted columns) so app authors don't have to add the import themselves.
-    let encrypted_use = if encrypted_columns.is_empty() {
+    let encrypted_use = if encrypted_columns.is_empty() && classified_columns.is_empty() {
         quote! {}
     } else {
         quote! {
@@ -5786,6 +6027,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // manual impl so values never leak through `Debug`/panic output — including
     // update payloads whose `Patch<String>` would otherwise print `Set("secret")`
     // (#805 AC, composes with #697).
+    // (`factory_name` is bound here rather than beside the factory builder so
+    // the redacting Debug impl below can name it, mirroring `changeset_name`.)
+    let factory_name = format_ident!("{name}Factory");
     let lock_version_ident: Option<&syn::Ident> = lock_version_field.and_then(|f| f.ident.as_ref());
     let mutable_idents: Vec<&syn::Ident> = fields_for_new
         .iter()
@@ -5801,8 +6045,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         update_debug_impl,
         changeset_debug_derive,
         changeset_debug_impl,
-    ) = if encrypted_columns.is_empty() {
+        factory_debug_derive,
+        factory_debug_impl,
+    ) = if encrypted_columns.is_empty() && classified_columns.is_empty() {
         (
+            quote! { Debug, },
+            quote! {},
             quote! { Debug, },
             quote! {},
             quote! { Debug, },
@@ -5823,15 +6071,108 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect();
         (
             quote! {},
-            redacting_debug_impl(name, &all_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                name,
+                &all_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&new_name, &new_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &new_name,
+                &new_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&update_name, &mutable_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &update_name,
+                &mutable_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
             quote! {},
-            redacting_debug_impl(&changeset_name, &mutable_idents, &encrypted_column_names),
+            redacting_debug_impl(
+                &changeset_name,
+                &mutable_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
+            // #2373: the factory holds the same plaintext-bearing columns and is
+            // the struct most likely to be printed while debugging a test, so it
+            // gets the same redacting `Debug` as the other four rather than a
+            // derived one.
+            quote! {},
+            redacting_debug_impl(
+                &factory_name,
+                &new_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
         )
     };
+    // #1654: a model holding a classified column does not implement `Serialize`.
+    // That is the whole guarantee at the model level: every sink autumn gates is
+    // reached through `Serialize`, so withholding it makes `Json(model)` a build
+    // failure instead of a leak. `Deserialize` is untouched -- taking the data in
+    // is not a release.
+    let query_serde_derive = if has_classified {
+        quote! { #[derive(::serde::Deserialize)] }
+    } else {
+        quote! { #[derive(::serde::Serialize, ::serde::Deserialize)] }
+    };
+    // One zero-sized marker per classified column. It names the field inside the
+    // compiler diagnostic when a leak is attempted, keys a `declassify!` boundary
+    // to exactly one column, and publishes the manifest row.
+    let classified_items: Vec<TokenStream> = classified_columns
+        .iter()
+        .map(|(ident, col, marker)| {
+            let doc = format!(
+                "Field marker for the `#[classified]` column `{}::{}` (issue #1654).\n\n\
+                 Name it in [`declassify!`](autumn_web::declassify) to declare a boundary \
+                 that releases this column, and nothing else.",
+                unraw_ident(name),
+                col,
+            );
+            quote! {
+                #[doc = #doc]
+                #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+                #vis struct #marker;
+
+                impl ::autumn_web::classify::ClassifiedField for #marker {
+                    const MODEL: &'static str = stringify!(#name);
+                    // Module-qualified, because the manifest keys on this: two
+                    // linked crates can each define a `Customer` with a
+                    // classified `email`, and the bare name would merge them
+                    // into one row.
+                    const MODEL_PATH: &'static str =
+                        concat!(module_path!(), "::", stringify!(#name));
+                    const FIELD: &'static str = #col;
+                    const CLASSIFICATION: ::autumn_web::classify::Classification =
+                        ::autumn_web::classify::Classification::PersonalData;
+                }
+
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
+                        model: stringify!(#name),
+                        model_path: concat!(module_path!(), "::", stringify!(#name)),
+                        field: #col,
+                        classification: ::autumn_web::classify::Classification::PersonalData,
+                    }
+                }
+
+                // Keep the field ident referenced so a marker can never outlive a
+                // renamed column without the rename being noticed here.
+                const _: () = {
+                    #[allow(dead_code)]
+                    fn __autumn_classified_column_exists(m: &#name) -> &::autumn_web::classify::Classified<::std::string::String, #marker> {
+                        &m.#ident
+                    }
+                };
+            }
+        })
+        .collect();
+
     let encrypted_inventory: Vec<TokenStream> = encrypted_columns
         .iter()
         .map(
@@ -5859,6 +6200,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
 
     // Build query struct fields (strip #[id], #[indexed], #[validate])
+    // #1654: the field marker for a `#[classified]` column, or `None`. Every
+    // generated struct that carries the column -- the read struct, `NewX`,
+    // `UpdateX` and the changeset -- looks it up through here so they cannot
+    // drift apart on whether the column is classified.
+    let classified_marker_for = |f: &Field| -> Option<&syn::Ident> {
+        let ident = f.ident.as_ref()?;
+        classified_columns
+            .iter()
+            .find(|(cid, ..)| *cid == ident)
+            .map(|(_, _, marker)| marker)
+    };
+    // The Diesel column mapping for a classified field. Write-only structs
+    // (`NewX`, the changeset) need `serialize_as` alone; the read struct also
+    // needs `deserialize_as`.
+    let classified_serialize_as = |marker: &syn::Ident| {
+        quote! {
+            #[diesel(serialize_as = ::autumn_web::classify::ClassifiedText<#marker>)]
+        }
+    };
+
     let query_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -5891,7 +6252,31 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `skip`) keeps `Deserialize` intact.
             let private = (field_hidden_from_json(f) && !field_already_skips_serialization(f))
                 .then(|| quote! { #[serde(skip_serializing)] });
-            quote! { #(#val_attrs)* #(#attrs)* #enc #private pub #ident: #ty }
+            // #1654: a `#[classified]` column is generated as the taint wrapper
+            // rather than a bare `String`, so the classification is a property of
+            // the type. Diesel round-trips through the opaque `ClassifiedText`
+            // column wrapper, which is the only conversion out of `Classified`
+            // that is not a declassification -- and it dead-ends in the database.
+            // The Diesel wrapper carries the same marker as the field: an
+            // `F`-erasing column type would let a value be converted in as one
+            // column and back out as another, releasing it through the wrong
+            // boundary and recording it against the wrong column.
+            let classified_marker = classified_marker_for(f);
+            let (ident_ty, classified_diesel) = classified_marker.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        quote! {
+                            #[diesel(
+                                serialize_as = ::autumn_web::classify::ClassifiedText<#marker>,
+                                deserialize_as = ::autumn_web::classify::ClassifiedText<#marker>
+                            )]
+                        },
+                    )
+                },
+            );
+            quote! { #(#val_attrs)* #(#attrs)* #enc #classified_diesel #private pub #ident: #ident_ty }
         })
         .collect();
 
@@ -5923,7 +6308,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // deserializer (which also still accepts RFC 3339 JSON bodies);
             // see `datetime_local_serde_attr`.
             let datetime_local = datetime_local_serde_attr(ty);
-            quote! { #(#val_attrs)* #enc #bool_default #datetime_local pub #ident: #ty }
+            // #1654 (review round 2): the write structs carry the taint wrapper
+            // too. Taking personal data *in* is not a release -- `Classified`
+            // keeps its `Deserialize`, and the declarative validators see
+            // through it (see `autumn/src/classify/validate.rs`), so the form
+            // and validation paths are unaffected. What must not happen is the
+            // plaintext being moved back *out*: these fields are `pub`, so a
+            // bare `String` here let a handler write
+            // `Json(View { email: input.email })` and release the value with no
+            // boundary and no audit record. `skip_serializing` alone could not
+            // stop that -- it only governs serializing the write struct itself.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some()
+                && !field_already_skips_serialization(f))
+            .then(|| quote! { #[serde(skip_serializing)] });
+            let (new_ty, classified_diesel) = classified.map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #(#val_attrs)* #enc #classified_diesel #bool_default #datetime_local #classified_skip pub #ident: #new_ty }
         })
         .collect();
 
@@ -5953,10 +6361,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // (`custom`, `must_match`, `nested`, …) must be stripped here or the
             // `UpdateModel` would fail to compile. `NewModel` keeps them all.
             let val_attrs = validate_attrs_for_patch(f);
+            // #1654: see the `NewX` comment -- the patch carries the wrapper for
+            // the same reason. `Patch<T>` forwards `Deserialize` and every
+            // declarative validator to `T`, so `Patch<Classified<T, F>>` keeps
+            // both.
+            let classified = classified_marker_for(f);
+            let classified_skip = (classified.is_some() && !field_already_skips_serialization(f))
+                .then(|| quote! { #[serde(skip_serializing)] });
+            let patch_ty = classified.map_or_else(
+                || quote! { #ty },
+                |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+            );
             quote! {
                 #(#val_attrs)*
                 #[serde(default)]
-                pub #ident: ::autumn_web::hooks::Patch<#ty>
+                #classified_skip
+                pub #ident: ::autumn_web::hooks::Patch<#patch_ty>
             }
         })
         .collect();
@@ -6010,6 +6430,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // #1654: a field's generated type -- the taint wrapper for a
+    // `#[classified]` column, the declared type otherwise. Everything that
+    // touches the field has to agree with the struct definition, so it goes
+    // through this.
+    let model_field_ty = |f: &Field| -> TokenStream {
+        let ty = &f.ty;
+        classified_marker_for(f).map_or_else(
+            || quote! { #ty },
+            |marker| quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+        )
+    };
+
     // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
     let mut merge_arms: Vec<TokenStream> = fields_for_new
         .iter()
@@ -6055,7 +6487,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            let ty = &f.ty;
+            let ty = model_field_ty(f);
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty>;
             }
@@ -6067,7 +6499,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            let ty = &f.ty;
+            let ty = model_field_ty(f);
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty> {
                     ::autumn_web::hooks::DraftField::new(&self.before.#ident, &mut self.after.#ident)
@@ -6488,6 +6920,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Field-by-field equality, shared by `__autumn_correlate_model` (two models)
+    // and `__autumn_correlate_new` (a `New*` input against a persisted model).
+    // #1654: one expression serves both because the write struct carries the
+    // same taint wrapper as the model, so the two sides always have the same
+    // field types. Comparing `Classified` to `Classified` also keeps the
+    // correlation off the release path -- unwrapping either side to compare
+    // would be an unrecorded release.
     let compare_fields = fields_for_new.iter().map(|f| {
         let ident = &f.ident;
         quote! { input.#ident == record.#ident }
@@ -6515,7 +6954,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #enc pub #ident: Option<#ty> }
+            // #1654: the changeset is built from `UpdateX`'s `Patch` values, so
+            // it holds the wrapper too and writes through the opaque Diesel
+            // column type -- the same round trip the read struct uses, and the
+            // only conversion out of `Classified` that is not a declassification.
+            let (changeset_ty, classified_diesel) = classified_marker_for(f).map_or_else(
+                || (quote! { #ty }, quote! {}),
+                |marker| {
+                    (
+                        quote! { ::autumn_web::classify::Classified<#ty, #marker> },
+                        classified_serialize_as(marker),
+                    )
+                },
+            );
+            quote! { #enc #classified_diesel pub #ident: Option<#changeset_ty> }
         })
         .collect();
     // The lock_version column must be in the changeset so the UPDATE can
@@ -6564,8 +7016,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // ── Factory builder ────────────────────────────────────────
-    let factory_name = format_ident!("{name}Factory");
-
     // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
     // no PK can be detected (the factory will fail to compile at the call site,
     // which is a better diagnostic than a macro panic).
@@ -6600,7 +7050,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             if factory_assoc_type(f).is_some() {
                 quote! { pub #ident: ::core::option::Option<#ty> }
             } else {
-                quote! { pub #ident: #ty }
+                // #2373: the factory field is `pub` and lives for the whole
+                // builder chain, so a bare `String` here was a way around the
+                // guarantee entirely -- `Customer::factory().email` could be
+                // moved into a serializable view with no boundary and no audit
+                // record. Classifying only at `build()` time was too late. The
+                // factory is emitted in every build, not just test ones.
+                let field_ty = model_field_ty(f);
+                quote! { pub #ident: #field_ty }
             }
         })
         .collect();
@@ -6638,10 +7095,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             factory_assoc_type(f).map_or_else(
                 // Normal field: a single setter that assigns directly.
                 || {
+                    // #2373: the setter keeps its `impl Into<#ty>` bound over the
+                    // *declared* type and classifies inside. Binding it to the
+                    // wrapper instead would break every `.email("ada@example.com")`
+                    // call, because `Classified<String, F>` only converts from
+                    // `String` -- not from `&str` -- and a blanket
+                    // `From<U: Into<T>>` would overlap the existing `From<T>`.
+                    // Taking plaintext *in* is not a release, so the setter is
+                    // the right place to wrap: the value is classified from the
+                    // moment it is stored, and callers are unaffected.
+                    let store = if classified_marker_for(f).is_some() {
+                        quote! { ::autumn_web::classify::Classified::new(val.into()) }
+                    } else {
+                        quote! { val.into() }
+                    };
                     vec![quote! {
                         #[must_use]
                         pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
-                            self.#ident = val.into();
+                            self.#ident = #store;
                             self.__autumn_set.insert(#field_lit);
                             self
                         }
@@ -6698,6 +7169,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let field_lit = ident.to_string();
+            // #2373: the stored field is now the wrapper, but `fake_expr_for_field`
+            // yields a plain value, so the generated side is classified to match.
+            let fake_wrap = |expr: TokenStream| -> TokenStream {
+                if classified_marker_for(f).is_some() {
+                    quote! { ::autumn_web::classify::Classified::new(#expr) }
+                } else {
+                    expr
+                }
+            };
             fake_expr_for_field(ident, &f.ty).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
@@ -6707,6 +7187,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
                 |fake_expr| {
+                    let fake_expr = fake_wrap(fake_expr);
                     quote! {
                         let #ident = if self.__autumn_fake
                             && !self.__autumn_set.contains(#field_lit)
@@ -6758,6 +7239,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Struct-shorthand field list for `NewX { … }` (local bindings named to match).
+    // #2373: the factory now stores the wrapper, so the binding already has the
+    // write struct's field type and no conversion is needed here.
     let new_construct_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
@@ -6929,8 +7412,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let schema_rename_all_rule = serde_rename_all_serialize_rule(outer_attrs);
     let schema_rename_all_rule = schema_rename_all_rule.as_deref();
     let all_field_refs: Vec<&&Field> = all_fields.iter().collect();
+    // #1654: a classified column has no `Serialize` impl, so it can never appear
+    // in a JSON body. Advertising it in the read schema would document a property
+    // no response can carry. The write schemas keep it: a client still *sets* it.
+    let serializable_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| !field_is_classified(f))
+        .copied()
+        .collect();
     let query_struct_schema_body =
-        emit_schema_fn_body(&all_field_refs, false, schema_rename_all_rule);
+        emit_schema_fn_body(&serializable_field_refs, false, schema_rename_all_rule);
     let new_struct_schema_body =
         emit_schema_fn_body(&fields_for_new, false, schema_rename_all_rule);
     let update_struct_schema_body = {
@@ -7059,6 +7550,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         })?
                 }
             };
+            // #1654: the local binding feeds `Self { #ident: #ident }`, so it has
+            // to be the *model's* field type -- the taint wrapper for a
+            // classified column, which deserializes transparently. A
+            // `#[serde(default = "path")]` fallback returns the *declared* type,
+            // so it is classified on the way into the binding.
+            let ty = model_field_ty(f);
+            let missing_default = if classified_marker_for(f).is_some() {
+                missing_default
+                    .map(|d| quote! { ::autumn_web::classify::Classified::new(#d) })
+            } else {
+                missing_default
+            };
             missing_default.map_or_else(
                 || {
                     quote! {
@@ -7097,6 +7600,46 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #ident: #ident }
         })
         .collect();
+    // #1654: the durable commit-hook / ledger payload is a second copy of the
+    // record, assembled by serializing every column into JSON. A classified
+    // column has no `Serialize` impl -- that is the guarantee -- so the payload
+    // cannot be built, and building it through a back door would put the value
+    // in a `serde_json::Value` that anything could then hand to a sink. Gating
+    // the durable-payload sink is a follow-up slice; until then the combination
+    // fails loudly at the point it is used, naming the column and what to do.
+    // Both callers (`commit_hooks = true` and `ledgered = true`) are opt-in, so
+    // an ordinary repository over a classified model is unaffected.
+    let commit_hook_serialize_body = if has_classified {
+        let cols = classified_column_names.join("`, `");
+        let message = format!(
+            "`{}` has `#[classified]` column(s) `{cols}`, so it cannot be written into the \
+             durable commit-hook payload: that payload is a second, unclassified copy of the \
+             record. Gating it is a follow-up slice of issue #1654 -- until then, use \
+             non-durable `after_commit` hooks on this model, or drop `#[classified]` from the \
+             column. (`versioned = true` and `ledgered = true` take the same snapshot and are \
+             rejected earlier, at compile time.)",
+            unraw_ident(name),
+        );
+        quote! {
+            let _ = &self;
+            return ::core::result::Result::Err(
+                ::autumn_web::AutumnError::internal_server_error_msg(#message),
+            );
+        }
+    } else {
+        quote! {
+            let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
+            #(#commit_hook_serialize_fields)*
+            let mut __autumn_value =
+                ::autumn_web::reexports::serde_json::Value::Object(__autumn_object);
+            // Encrypted columns must not be persisted in plaintext into the
+            // durable `autumn_repository_commit_hooks` table (#805). Rewrite
+            // them as recoverable ciphertext in their declared mode.
+            #commit_hook_encrypt_stmt
+            ::core::result::Result::Ok(__autumn_value)
+        }
+    };
+
     let commit_hook_serialize_bounds: Vec<TokenStream> = all_fields
         .iter()
         .filter(|f| !has_hook_serde_adapter(f, SerdeAdapterMode::Serialize))
@@ -7238,6 +7781,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let Some(ident) = field.ident.as_ref() else {
             continue;
         };
+        // #1654: `?filter[col]=` and `?sort=col` are client-controlled, so a
+        // classified column in either allowlist is a leak that compiles: the
+        // filter is an unauthenticated equality oracle over the personal data,
+        // and the sort orders the whole result set by it. Neither goes through a
+        // declassification boundary, so neither can appear in the manifest.
+        // Look it up by name explicitly rather than by trusting the DB column,
+        // then leave it out of both allowlists.
+        if classified_columns.iter().any(|(cid, ..)| *cid == ident) {
+            continue;
+        }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
         let is_option = option_inner_type(&field.ty).is_some();
@@ -7373,10 +7926,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #encrypted_use
 
+        #(#classified_items)*
+
         #list_query_helpers
 
         #[derive(#name_debug_derive Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
-        #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #query_serde_derive
         // #1778: derive `validator::Validate` on the read model (gated on
         // `has_validation`, symmetric with New*/Update*) so the merged model
         // built by `from_patch` can be validated on the update path. See the
@@ -7432,6 +7987,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_ENCRYPTED_COLUMNS: &'static [&'static str] =
                 &[#(#encrypted_column_names),*];
+
+            /// Column names on this model marked `#[classified]` (#1654).
+            ///
+            /// Emitted for every model (empty when none are classified). The
+            /// compile-time guarantee is carried by the columns' types, not by
+            /// this list -- it exists so a surface without a compile-time view
+            /// of the model (the admin plugin, an operator report) can ask which
+            /// columns hold personal data, and so the `Json` sink diagnostic can
+            /// point somewhere when it can only name the model.
+            #[doc(hidden)]
+            pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
+                &[#(#classified_column_names),*];
 
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
@@ -7656,7 +8223,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// Produced by [`#name::factory()`]. All fields are pre-filled with
         /// `Default::default()` so callers only need to specify the fields that
         /// matter for their scenario.
-        #[derive(Debug, Clone)]
+        #[derive(#factory_debug_derive Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
             /// Names of fields the caller explicitly set via a setter. `.fake()`
@@ -7668,6 +8235,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub __autumn_fake: bool,
         }
+
+        #factory_debug_impl
 
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
@@ -7777,15 +8346,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::serde_json::Value>
             #commit_hook_serialize_where
             {
-                let mut __autumn_object = ::autumn_web::reexports::serde_json::Map::new();
-                #(#commit_hook_serialize_fields)*
-                let mut __autumn_value =
-                    ::autumn_web::reexports::serde_json::Value::Object(__autumn_object);
-                // Encrypted columns must not be persisted in plaintext into the
-                // durable `autumn_repository_commit_hooks` table (#805). Rewrite
-                // them as recoverable ciphertext in their declared mode.
-                #commit_hook_encrypt_stmt
-                Ok(__autumn_value)
+                #commit_hook_serialize_body
             }
 
             #[doc(hidden)]
@@ -10516,6 +11077,471 @@ mod tests {
         assert!(
             expanded.contains("requires the model to be marked"),
             "{expanded}"
+        );
+    }
+
+    // ── #1654: compile-time data classification ─────────────────────────
+
+    fn classified_model() -> String {
+        model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                    #[classified]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn a_classified_column_is_generated_as_the_taint_wrapper() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "the read struct must carry the classification on the type: {generated}"
+        );
+        assert!(
+            generated.contains("serialize_as = :: autumn_web :: classify :: ClassifiedText"),
+            "the column must round-trip through the opaque Diesel wrapper: {generated}"
+        );
+    }
+
+    #[test]
+    fn the_write_structs_carry_the_classification_too() {
+        // #1654 review round 2 (P1): `NewCustomer`/`UpdateCustomer` are the
+        // primary way an application *receives* a classified value, and their
+        // fields are `pub`. Leaving them as a bare `String` meant a handler
+        // could move the plaintext straight into a serializable view --
+        // `Json(View { email: input.email })` -- releasing personal data with
+        // no boundary and no audit record. `skip_serializing` only stops the
+        // write struct itself from being serialized; it does nothing about the
+        // value being moved out of it.
+        let generated = classified_model();
+        let write_structs = generated
+            .split("pub struct NewCustomer")
+            .nth(1)
+            .expect("the generated write structs");
+        assert!(
+            write_structs.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "NewCustomer must carry the classification on the field type: {write_structs}"
+        );
+        assert!(
+            write_structs.contains(
+                "Patch < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "UpdateCustomer's patch field must carry it too: {write_structs}"
+        );
+        // The unclassified column is untouched, so this is not a blanket rewrite.
+        assert!(
+            write_structs.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {write_structs}"
+        );
+    }
+
+    #[test]
+    fn a_classified_model_does_not_derive_serialize() {
+        let generated = classified_model();
+        // `Deserialize` stays: taking personal data in is not a release.
+        assert!(
+            generated.contains("derive (:: serde :: Deserialize)"),
+            "{generated}"
+        );
+        assert!(
+            !generated
+                .contains("derive (:: serde :: Serialize , :: serde :: Deserialize) ] # [ doc"),
+            "{generated}"
+        );
+        let query_struct = generated
+            .split("pub struct Customer")
+            .next()
+            .expect("query struct preamble");
+        assert!(
+            !query_struct.contains(":: serde :: Serialize"),
+            "the read struct must not implement Serialize: {query_struct}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_publishes_its_field_marker_and_manifest_row() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("struct CustomerEmailClassified"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("classify :: ClassifiedField for CustomerEmailClassified"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("ClassifiedFieldDescriptor"),
+            "the column must reach the data-flow manifest: {generated}"
+        );
+        assert!(
+            generated.contains("module_path !"),
+            "the manifest identity must be module-qualified so two `Customer`s \
+             in different crates cannot share a row: {generated}"
+        );
+        assert!(
+            generated.contains("Classification :: PersonalData"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn the_factory_carries_the_classification_too() {
+        // #2373. The generated factory was the last struct of the family still
+        // holding plaintext: `Customer::factory().email` was a public `String`,
+        // so it could be moved into a serializable view with no boundary and no
+        // audit record, and the factory's derived `Debug` printed the real
+        // value. Classifying only at `build()` time is too late -- the
+        // plaintext is readable on the factory for its whole lifetime. The
+        // factory is emitted in every build, not just tests.
+        let generated = classified_model();
+        // Scope to the struct body: everything after the header up to its
+        // closing brace. Splitting alone would match the whole rest of the
+        // expansion and pass on any other struct's classified field.
+        let after = generated
+            .split("pub struct CustomerFactory")
+            .nth(1)
+            .expect("the generated factory struct");
+        let factory = &after[..after.find('}').expect("struct body ends")];
+        assert!(
+            factory.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "the factory field must carry the classification: {factory}"
+        );
+        assert!(
+            factory.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {factory}"
+        );
+    }
+
+    #[test]
+    fn the_factory_debug_redacts_a_classified_column() {
+        let generated = classified_model();
+        let factory_debug = generated
+            .split("impl :: core :: fmt :: Debug for CustomerFactory")
+            .nth(1)
+            .expect("the factory must get a redacting Debug, not a derived one");
+        let body = &factory_debug[..factory_debug.len().min(400)];
+        assert!(
+            body.contains("<classified>"),
+            "the factory's Debug must redact the classified column: {body}"
+        );
+    }
+
+    #[test]
+    fn the_write_structs_never_serialize_a_classified_column() {
+        // The companion to `the_write_structs_carry_the_classification_too`:
+        // the wrapper stops the value being moved out, and `skip_serializing`
+        // stops the write struct itself from carrying it into a response body.
+        // `skip_serializing` (not `skip`) keeps `Deserialize` intact, which is
+        // what makes the create/PATCH bodies decode at all.
+        let generated = classified_model();
+        assert!(
+            generated.contains("serde (skip_serializing)"),
+            "the write structs must not serialize a classified column: {generated}"
+        );
+    }
+
+    #[test]
+    fn the_changeset_writes_a_classified_column_through_the_opaque_column_type() {
+        let generated = classified_model();
+        let changeset = generated
+            .split("pub struct __CustomerChangeset")
+            .nth(1)
+            .expect("the generated changeset");
+        assert!(
+            changeset.contains("ClassifiedText < CustomerEmailClassified >"),
+            "the changeset must write through the opaque Diesel type: {changeset}"
+        );
+        assert!(
+            changeset.contains(
+                "Option < :: autumn_web :: classify :: Classified < String , \
+                 CustomerEmailClassified > >"
+            ),
+            "and hold the wrapper, not the plaintext: {changeset}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_is_redacted_from_debug() {
+        let generated = classified_model();
+        assert!(generated.contains("<classified>"), "{generated}");
+    }
+
+    #[test]
+    fn a_classified_model_refuses_the_durable_commit_hook_payload() {
+        let generated = classified_model();
+        assert!(
+            generated.contains("durable commit-hook payload"),
+            "the second, unclassified copy of the record must be refused: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_classified_column_is_not_client_filterable_or_sortable() {
+        // `?filter[email]=` and `?sort=email` are client-controlled. A
+        // classified column in either allowlist is an equality oracle and an
+        // ordering leak that compiles, with no boundary and no manifest row.
+        let generated = classified_model();
+        let filters_start = generated
+            .find("fn __autumn_list_apply_filters")
+            .expect("filter helper must be generated");
+        let orders_start = generated
+            .find("fn __autumn_list_apply_order")
+            .expect("order helper must be generated");
+        let filters = &generated[filters_start..orders_start];
+        assert!(filters.contains("\"name\""), "{filters}");
+        assert!(!filters.contains("\"email\""), "{filters}");
+        // The order helper is the last item in its `impl` block; bound the slice
+        // so the rest of the expansion (which legitimately names the column)
+        // cannot satisfy the assertion.
+        let orders_end = generated[orders_start..]
+            .find("} impl ")
+            .map_or(generated.len(), |o| orders_start + o);
+        let orders = &generated[orders_start..orders_end];
+        assert!(orders.contains("\"name\""), "{orders}");
+        assert!(!orders.contains("\"email\""), "{orders}");
+    }
+
+    #[test]
+    fn every_model_publishes_its_classified_column_list() {
+        assert!(
+            classified_model().contains("__AUTUMN_CLASSIFIED_COLUMNS"),
+            "the column list is what a surface with no compile-time view of the model reads"
+        );
+    }
+
+    #[test]
+    fn classified_is_rejected_on_the_tenant_isolation_key() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub tenant_id: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be applied to `tenant_id`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn an_unclassified_model_is_completely_unchanged() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Widget {
+                    #[id]
+                    pub id: i64,
+                    pub label: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("derive (:: serde :: Serialize , :: serde :: Deserialize)"),
+            "{generated}"
+        );
+        assert!(!generated.contains("Classified"), "{generated}");
+        assert!(!generated.contains("<classified>"), "{generated}");
+    }
+
+    #[test]
+    fn classified_is_rejected_on_a_non_string_column() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub age: i32,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("only supported on non-null `String` fields"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_an_unknown_tier() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified(top_secret)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_conflicting_column_markers() {
+        for marker in ["encrypted", "searchable", "normalize", "state_machine"] {
+            let marker_ident = format_ident!("{marker}");
+            let extra = if marker == "normalize" {
+                quote! { #[#marker_ident(trim)] }
+            } else if marker == "state_machine" {
+                quote! { #[#marker_ident(transitions(a -> b))] }
+            } else {
+                quote! { #[#marker_ident] }
+            };
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    pub struct Customer {
+                        #[id]
+                        pub id: i64,
+                        #[classified]
+                        #extra
+                        pub email: String,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot be combined with"),
+                "`#[classified]` + `#[{marker}]` must be rejected: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn classified_rejects_an_unknown_tier_behind_a_bare_marker() {
+        // The bare marker must not short-circuit validation of the attributes
+        // after it, or the column is recorded as `personal_data` while the tier
+        // the author asked for is silently dropped.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[classified(top_secret)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("unsupported `#[classified]` tier"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_a_custom_serde_adapter() {
+        for adapter in [
+            quote! { #[serde(with = "my_codec")] },
+            quote! { #[serde(serialize_with = "my_ser")] },
+            quote! { #[serde(deserialize_with = "my_de")] },
+        ] {
+            let generated = model_macro(
+                quote! {},
+                quote! {
+                    pub struct Customer {
+                        #[id]
+                        pub id: i64,
+                        #[classified]
+                        #adapter
+                        pub email: String,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot be combined with `#[serde(with"),
+                "{generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicting_marker_reports_the_conflict_not_the_string_rule() {
+        // `#[translatable]` implies a non-`String` column, so checking the type
+        // first would bury the reason that tells the author what to do.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[translatable]
+                    pub bio: Translated,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot be combined with `#[translatable]`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn classified_rejects_a_serde_rename() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    #[serde(rename = "e_mail")]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot use `#[serde(rename"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn the_field_marker_camel_cases_a_multi_word_column() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[classified]
+                    pub home_address_line: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("struct CustomerHomeAddressLineClassified"),
+            "{generated}"
         );
     }
 

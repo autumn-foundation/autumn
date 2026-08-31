@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Personal data that cannot reach a JSON response by accident (#1654):**
+  Autumn's protections for sensitive data were all *name*-based and ran at
+  runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted
+  three header names, `gdpr.rs` keyed erasure off table-name strings — so
+  renaming a column, adding an endpoint, or routing personal data through a
+  differently-named field silently reopened the hole. A `#[model]` column can
+  now be annotated `#[classified]`, and the classification is carried by the
+  *type*: the field is generated as `Classified<String, CustomerEmailClassified>`,
+  a wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`,
+  and the model itself loses its `Serialize` derive. There is no expression that
+  puts the value where a serializer can reach it, so `Json(customer)` and
+  `Json(View { email: customer.email })` are both build failures — with a
+  diagnostic that names the offending field and the `Json` sink and says what to
+  do about it.
+
+  Releasing the value is declared, not incidental. `autumn_web::declassify!`
+  names the column, the sink, a purpose and a non-blank reason, and yields a
+  boundary typed to exactly that column — so one field's approved purpose cannot
+  release another's. `value.declassify(&BOUNDARY)` takes the value by move (a
+  release is a single event, not a permanent widening) and emits an auditable
+  record on the `autumn::declassification` tracing target carrying the model,
+  field, tier, purpose, sink and reason — never the released value itself.
+
+  `autumn data-flow` emits the diffable manifest: one row per classified column
+  listing every sink it is proven reachable to, where an empty reachable set
+  means the column cannot leave the process through a gated sink at all.
+  `--check` fails the build when it drifts from the committed copy, so a new
+  release edge has to be reviewed rather than merged silently. Pass `--release`
+  (and the `--features` you ship) to audit the binary you actually deploy: a
+  boundary behind `#[cfg(not(debug_assertions))]` exists only in the release
+  build.
+
+  The manifest keys each row on the model's module-qualified path, so two crates
+  that each define a `Customer` with a classified `email` cannot merge into one
+  row, and the Diesel column wrapper carries the column's field marker, so a
+  value cannot be converted in as one classified column and back out as another.
+
+  The first slice deliberately stops at one tier and one sink. Name-based log
+  and header redaction are untouched and still run; the write structs and the
+  generated factory still accept the value (taking personal data *in* is not a
+  release) but carry the wrapper too, so the plaintext cannot be moved out of a
+  `pub` field into a response view; `Debug` renders `<classified>` everywhere.
+  See
+  `docs/guide/data-classification.md`.
 - **`autumn db scrub` turns a production copy into an anonymized one, and
   refuses to guess (#1602):** the moment `autumn db backup` shipped, a
   production database was one command away from a laptop or a shared staging

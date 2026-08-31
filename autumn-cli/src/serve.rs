@@ -615,6 +615,12 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // leave the daemon recorded as managed-PG while it never starts/stops a
     // cluster (and `stop()` no-ops because `attached` is set).
     cmd.env_remove(MANAGED_PG_ATTACH_URL_ENV);
+    // `AUTUMN_DUMP_DATA_FLOW=1` is dispatched in `AppBuilder::run` *before* the
+    // server ever binds a listener, and `Command` inherits this process's
+    // environment. One left over in the launching shell would make the child
+    // print the data-flow manifest and exit 0 -- a `serve` that reports success
+    // and serves nothing (#1654 review round 5).
+    cmd.env_remove(crate::data_flow::DUMP_ENV);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -2055,6 +2061,26 @@ mod tests {
                 .then(|| v.map(|v| v.to_string_lossy().into_owned()))
                 .flatten()
         })
+    }
+
+    #[test]
+    fn base_command_clears_an_inherited_data_flow_dump_flag() {
+        // #1654 review round 5. `AppBuilder::run` dispatches the data-flow dump
+        // before the server binds a listener, and `Command` inherits this
+        // process's environment, so an `AUTUMN_DUMP_DATA_FLOW=1` left in the
+        // launching shell made the child print a manifest and exit 0 --
+        // `autumn serve` reporting success while serving nothing.
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        let entry = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(crate::data_flow::DUMP_ENV));
+        assert_eq!(
+            entry,
+            Some((std::ffi::OsStr::new(crate::data_flow::DUMP_ENV), None)),
+            "the flag must be explicitly removed (present with a None value), not \
+             merely absent from the overrides -- absent means inherited: {entry:?}"
+        );
     }
 
     #[test]

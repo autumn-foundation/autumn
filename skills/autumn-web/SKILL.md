@@ -2215,6 +2215,9 @@ autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever
 autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
 autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
+autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
+autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
+autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
 ```
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)

@@ -256,6 +256,18 @@ pub fn print_json(routes: &[RouteInfo]) {
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
 
 pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
+    find_binary_in_profile(package, bin, false)
+}
+
+/// Locate the app binary under an explicit Cargo profile.
+///
+/// A one-shot dump command runs the binary it just built, so the profile it
+/// looks in has to be the profile it compiled. `cfg!(debug_assertions)` and
+/// profile-gated `#[cfg]` code mean a debug binary can register a genuinely
+/// different set of inventory items than the release one that ships -- which
+/// is exactly what `autumn data-flow --check` must not be blind to (#1654
+/// review round 3).
+pub fn find_binary_in_profile(package: Option<&str>, bin: Option<&str>, release: bool) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -270,17 +282,18 @@ pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, package, &cwd, bin).unwrap_or_else(|error| {
+    resolve_binary_in_profile(&metadata, package, &cwd, bin, release).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     })
 }
 
-fn resolve_binary_from_metadata(
+fn resolve_binary_in_profile(
     metadata: &serde_json::Value,
     package: Option<&str>,
     cwd: &Path,
     bin: Option<&str>,
+    release: bool,
 ) -> Result<PathBuf, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
@@ -381,7 +394,7 @@ fn resolve_binary_from_metadata(
     })?;
 
     let mut path = PathBuf::from(target_dir);
-    path.push("debug");
+    path.push(if release { "release" } else { "debug" });
     path.push(bin_name);
 
     if cfg!(windows) {
@@ -443,8 +456,24 @@ impl CargoFeatures {
 
 /// Compile the app under an explicit Cargo feature selection.
 pub fn compile_binary_with(package: Option<&str>, bin: Option<&str>, features: &CargoFeatures) {
+    compile_binary_with_profile(package, bin, features, false);
+}
+
+/// Compile the app under an explicit Cargo feature selection and profile.
+///
+/// Pairs with [`find_binary_in_profile`]: a command that builds and then runs
+/// the binary must agree with itself about which profile it means.
+pub fn compile_binary_with_profile(
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: &CargoFeatures,
+    release: bool,
+) {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
+    if release {
+        cargo.arg("--release");
+    }
     if let Some(pkg) = package {
         cargo.args(["-p", pkg]);
     }
@@ -693,6 +722,50 @@ mod tests {
     // ── resolve_binary_from_metadata ──────────────────────────────────────
 
     #[test]
+    fn resolve_binary_honors_the_requested_profile() {
+        // #1654 review round 3: a command that builds and then runs the binary
+        // must look in the profile it just compiled. Resolving `target/debug`
+        // after a `--release` build ran the wrong binary (or none), so
+        // `autumn data-flow --check` could certify a manifest that omitted
+        // every `#[cfg(not(debug_assertions))]` classified column and
+        // declassification boundary in the binary that actually ships.
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "hello",
+                "manifest_path": "/projects/hello/Cargo.toml",
+                "targets": [{
+                    "name": "hello",
+                    "kind": ["bin"],
+                    "src_path": "/projects/hello/src/main.rs"
+                }]
+            }]
+        });
+        let cwd = Path::new("/projects/hello");
+
+        let debug = resolve_binary_in_profile(&metadata, None, cwd, None, false)
+            .expect("the debug binary resolves");
+        let release = resolve_binary_in_profile(&metadata, None, cwd, None, true)
+            .expect("the release binary resolves");
+
+        assert!(
+            debug.starts_with("/tmp/target/debug"),
+            "debug must resolve under target/debug: {}",
+            debug.display()
+        );
+        assert!(
+            release.starts_with("/tmp/target/release"),
+            "release must resolve under target/release: {}",
+            release.display()
+        );
+        assert_eq!(
+            debug.file_name(),
+            release.file_name(),
+            "only the profile directory differs"
+        );
+    }
+
+    #[test]
     fn resolve_binary_by_package_name() {
         let metadata = serde_json::json!({
             "target_directory": "/tmp/target",
@@ -706,8 +779,13 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            Some("hello"),
+            Path::new("/projects"),
+            None,
+            false,
+        );
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -731,7 +809,7 @@ mod tests {
             }]
         });
         let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"), None);
+            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, false);
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -750,8 +828,13 @@ mod tests {
                 "targets": [{"name": "hello", "kind": ["bin"]}]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, Some("missing"), Path::new("/projects"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            Some("missing"),
+            Path::new("/projects"),
+            None,
+            false,
+        );
         assert!(result.unwrap_err().contains("package 'missing'"));
     }
 
@@ -772,7 +855,7 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None);
+        let result = resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, false);
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary packages"),
@@ -803,7 +886,8 @@ mod tests {
         });
         // Narrowing cwd to /ws/alpha means only "alpha" matches.
         let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/alpha"), None).unwrap();
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/alpha"), None, false)
+                .unwrap();
         assert!(result.to_string_lossy().contains("alpha"));
     }
 
@@ -824,7 +908,8 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None).unwrap();
+        let result =
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, false).unwrap();
         assert!(result.to_string_lossy().contains("myapp"));
     }
 
@@ -838,7 +923,8 @@ mod tests {
                 "targets": [{"name": "mylib", "kind": ["lib"]}]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"), None);
+        let result =
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/mylib"), None, false);
         assert!(result.unwrap_err().contains("no binary target"));
     }
 
@@ -853,8 +939,13 @@ mod tests {
             }]
         });
         // Running from a subdirectory of the package root should still find it.
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello/src"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/projects/hello/src"),
+            None,
+            false,
+        );
         assert!(
             result.unwrap().to_string_lossy().contains("hello"),
             "should resolve binary from subdirectory"
@@ -874,7 +965,8 @@ mod tests {
                 ]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), None);
+        let result =
+            resolve_binary_in_profile(&metadata, None, Path::new("/ws/myapp"), None, false);
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary targets"),
@@ -899,9 +991,14 @@ mod tests {
                 ]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("migrate"))
-                .unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            Some("migrate"),
+            false,
+        )
+        .unwrap();
         assert!(
             result.to_string_lossy().contains("migrate"),
             "should resolve to the named binary"
@@ -918,8 +1015,13 @@ mod tests {
                 "targets": [{"name": "server", "kind": ["bin"]}]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("missing"));
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            Some("missing"),
+            false,
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("no binary named 'missing'"),

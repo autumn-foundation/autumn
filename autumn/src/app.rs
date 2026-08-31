@@ -3191,6 +3191,18 @@ impl AppBuilder {
             return;
         }
 
+        // ── Data-flow manifest dump mode ───────────────────────────────
+        // When AUTUMN_DUMP_DATA_FLOW=1, print the classified-data flow manifest
+        // (#1654) and exit. Triggered by `autumn data-flow`, which needs the
+        // whole binary's registrations -- every `#[classified]` column and every
+        // declared declassification boundary, across the app AND its plugins --
+        // and link-time `inventory` collection is the only place they all exist
+        // together. Runs before any database or port is touched.
+        if crate::classify::manifest::is_dump_mode() {
+            crate::classify::manifest::print_manifest_dump(&crate::classify::manifest::audit());
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`

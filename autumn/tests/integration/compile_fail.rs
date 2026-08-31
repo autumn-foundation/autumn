@@ -162,6 +162,29 @@ fn compile_fail_tests() {
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/story_captures_environment.rs");
 
+    // #1654: compile-time data classification. A classified column cannot reach
+    // the `Json` response sink -- not as a whole model, not lifted into a DTO --
+    // and a boundary declared for one field cannot release another's data. The
+    // `.stderr` goldens pin that the diagnostic names the field and the sink.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_json_model_leak.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_json_field_leak.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_wrong_boundary.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_non_string.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_with_encrypted.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_released_for_sink_is_sealed.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_column_wrapper_cannot_retype.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_write_struct_leak.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
+
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
     #[cfg(feature = "maud")]
@@ -455,6 +478,11 @@ fn compile_pass_tests() {
     // Sharded repository: self-routing FromRequestParts (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_sharded.rs");
+
+    // #1654: a `#[classified]` column released at a declared declassification
+    // boundary is a plain value again and reaches the `Json` sink.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/classified_declassify.rs");
 }
 
 #[cfg(feature = "db")]

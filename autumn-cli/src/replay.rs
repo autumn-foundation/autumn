@@ -22,6 +22,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
     for var in [
         "AUTUMN_BUILD_STATIC",
         "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_DATA_FLOW",
         "AUTUMN_DUMP_JOBS",
         "AUTUMN_LIST_TASKS",
         "AUTUMN_RUN_TASK",
@@ -367,6 +368,7 @@ mod tests {
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_DUMP_DATA_FLOW",
             "AUTUMN_DUMP_JOBS",
             "AUTUMN_LIST_TASKS",
             "AUTUMN_RUN_TASK",

@@ -13,6 +13,7 @@ mod config;
 mod console;
 mod credentials;
 mod data;
+mod data_flow;
 mod db;
 mod db_pull;
 mod deploy;
@@ -142,6 +143,53 @@ pub struct CacheAuditArgs {
     /// Build the audited binary without default Cargo features.
     #[arg(long)]
     no_default_features: bool,
+}
+
+/// Arguments for `autumn data-flow`.
+///
+/// A separate `Args` struct for the same reason as [`CacheAuditArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct DataFlowArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON data-flow manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// new release edge has to be reviewed rather than merged silently.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A `#[classified]` column or a
+    /// declassification boundary behind a feature the build does not enable is
+    /// not compiled in, so it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: a classified column or a declassification
+    /// boundary behind `#[cfg(not(debug_assertions))]` exists only in the
+    /// release build. Run `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
 }
 
 /// Subcommands for `autumn cache`.
@@ -1313,6 +1361,17 @@ enum Commands {
     ///   autumn cache audit --strict -p blog
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
+    /// Emit the classified-data flow manifest (#1654).
+    ///
+    /// Compiles the app and reads back the manifest the framework assembles from
+    /// every `#[classified]` column and every declared declassification
+    /// boundary: one row per classified column, listing every sink it is proven
+    /// reachable to. An empty reachable set means the column cannot leave the
+    /// process through a gated sink. The compiler is the gate; this is the
+    /// diffable record, and `--check` fails when it drifts from the committed
+    /// copy.
+    #[command(name = "data-flow")]
+    DataFlow(DataFlowArgs),
 
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
@@ -3863,6 +3922,22 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+            });
+        }
+        Commands::DataFlow(args) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            data_flow::run(&data_flow::DataFlowOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
             });
         }
         Commands::Routes {
