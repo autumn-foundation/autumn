@@ -247,6 +247,16 @@ resilience.circuit_breaker.defaults.minimum_sample_count
 resilience.circuit_breaker.defaults.open_duration_secs
 resilience.circuit_breaker.defaults.sample_window_secs
 resilience.circuit_breaker.hosts
+retention
+retention.audit_archives
+retention.commit_hooks
+retention.experiment_assignments
+retention.idempotency
+retention.job_history
+retention.job_tracking
+retention.sessions
+retention.sweep_interval
+retention.webhook_replay
 role
 scheduler
 scheduler.backend

@@ -189,6 +189,22 @@ and how long you keep them:
   normal log-rotation tooling, or set `retention.audit_archives` and let Autumn
   prune stale entries in place — see
   [Data Retention for Framework-Owned Data](data-retention.md).
+
+> **Writing a custom `AuditSink`?** Two things arrived with
+> [framework data retention](data-retention.md):
+>
+> - `AuditEvent` carries a `metadata: BTreeMap<String, String>` map of
+>   action-specific detail, set with `AuditEvent::new(..).with_metadata(k, v)`.
+>   It is empty for most events; a retention sweep uses it to record the
+>   dataset, the cutoff, and the rows removed. Persist it if your sink has
+>   somewhere to put it — it is `#[serde(default)]`, so a sink that ignores it
+>   still round-trips older archives.
+> - `AuditSink::purge_before(cutoff, dry_run)` is a *provided* method that
+>   defaults to reporting `unsupported`, so your existing sink keeps compiling
+>   and `autumn db retention` honestly says the destination cannot be pruned
+>   from here. Override it if your sink stores events somewhere prunable (a
+>   database table, a rotated file set) and you want `retention.audit_archives`
+>   to reach it. A purge must never drop a record it merely failed to parse.
 - **Custom DB sink** → query with SQL. Keep audit rows immutable by default:
   grant the app `INSERT`-only on the audit table, and never `UPDATE`/`DELETE`
   an existing event from request-handling code. If you also want automatic

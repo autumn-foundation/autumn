@@ -33,11 +33,23 @@ const JOB_TRACKING_DDL: &str =
     include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
 const EXPERIMENTS_DDL: &str =
     include_str!("../../migrations/20260530300000_create_experiments/up.sql");
+const COMMIT_HOOKS_DDL: &str =
+    include_str!("../../migrations/20260515000000_create_repository_commit_hook_queue/up.sql");
+const UNIQUENESS_DDL: &str =
+    include_str!("../../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
+const RETENTION_INDEX_DDL: &str =
+    include_str!("../../migrations/20260831000000_retention_sweep_indexes/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct TimestampRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    value: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -81,7 +93,14 @@ async fn start_pg() -> (
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     let mut sync_conn = PgConnection::establish(&url).expect("db connection");
-    for ddl in [JOBS_DDL, JOB_TRACKING_DDL, EXPERIMENTS_DDL] {
+    for ddl in [
+        JOBS_DDL,
+        UNIQUENESS_DDL,
+        JOB_TRACKING_DDL,
+        EXPERIMENTS_DDL,
+        COMMIT_HOOKS_DDL,
+        RETENTION_INDEX_DDL,
+    ] {
         sync_conn.batch_execute(ddl).expect("migration");
     }
 
@@ -123,16 +142,72 @@ async fn insert_tracking(pool: &Pool<AsyncPgConnection>, key: &str, age_days: i6
     .expect("insert tracking");
 }
 
+/// Insert an assignment for experiment `exp`, which by default has no
+/// `autumn_experiments` row at all — the "the experiment is gone" case.
 async fn insert_assignment(pool: &Pool<AsyncPgConnection>, actor: &str, age_days: i64) {
+    insert_assignment_for(pool, "exp", actor, age_days).await;
+}
+
+async fn insert_assignment_for(
+    pool: &Pool<AsyncPgConnection>,
+    experiment: &str,
+    actor: &str,
+    age_days: i64,
+) {
     let mut conn = pool.get().await.expect("conn");
     diesel::sql_query(format!(
         "INSERT INTO autumn_experiment_assignments (experiment, actor, variant, assigned_at) \
-         VALUES ('exp', $1, 'control', NOW() - INTERVAL '{age_days} days')"
+         VALUES ($1, $2, 'control', NOW() - INTERVAL '{age_days} days')"
     ))
+    .bind::<diesel::sql_types::Text, _>(experiment)
     .bind::<diesel::sql_types::Text, _>(actor)
     .execute(&mut conn)
     .await
     .expect("insert assignment");
+}
+
+/// Create an experiment row in the given state.
+async fn insert_experiment(pool: &Pool<AsyncPgConnection>, name: &str, state: &str) {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(format!(
+        "INSERT INTO autumn_experiments (name, state) \
+         VALUES ($1, '{state}'::autumn_experiment_state)"
+    ))
+    .bind::<diesel::sql_types::Text, _>(name)
+    .execute(&mut conn)
+    .await
+    .expect("insert experiment");
+}
+
+/// Insert a terminal `#[after_commit]` hook row.
+async fn insert_commit_hook(pool: &Pool<AsyncPgConnection>, id: &str, status: &str, age_days: i64) {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(format!(
+        "INSERT INTO autumn_repository_commit_hooks \
+             (id, handler_key, hook_name, status, enqueued_at, finished_at) \
+         VALUES ($1, 'h', 'after_save', $2, NOW() - INTERVAL '{age_days} days', \
+                 NOW() - INTERVAL '{age_days} days')"
+    ))
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(status)
+    .execute(&mut conn)
+    .await
+    .expect("insert commit hook");
+}
+
+/// Insert a terminal job row that still holds a TTL-window dedup key.
+async fn insert_ttl_unique_job(pool: &Pool<AsyncPgConnection>, id: &str, age_days: i64) {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(format!(
+        "INSERT INTO autumn_jobs \
+             (id, name, status, enqueued_at, finished_at, unique_key, unique_window) \
+         VALUES ($1, 'welcome_email', 'completed', NOW() - INTERVAL '{age_days} days', \
+                 NOW() - INTERVAL '{age_days} days', $1, 'ttl')"
+    ))
+    .bind::<diesel::sql_types::Text, _>(id)
+    .execute(&mut conn)
+    .await
+    .expect("insert ttl-unique job");
 }
 
 async fn count(pool: &Pool<AsyncPgConnection>, sql: &str) -> i64 {
@@ -279,8 +354,11 @@ async fn a_dry_run_counts_without_deleting() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn no_configured_window_sweeps_nothing() {
-    // AC #1: unset preserves today's behavior exactly, right down to not
-    // issuing a query.
+    // AC #1: a dataset nothing bounds is left entirely alone. (The
+    // "not even a query is issued" half of that guarantee belongs to
+    // `framework_retention_task` returning `None`, which is asserted in
+    // `framework_retention.rs` — a `run_retention` call, as here, still
+    // *counts* any dataset that has a bound from a subsystem knob.)
     let (pool, _url, _container) = start_pg().await;
     insert_job(&pool, "ancient", "completed", 4_000).await;
 
@@ -449,7 +527,9 @@ async fn every_sweep_emits_an_audit_record_with_dataset_cutoff_and_rows() {
     .await
     .expect("sweep");
 
-    let recorded = events.lock().await;
+    // Cloned out of the guard so the lock is not held across the
+    // assertions below (clippy::significant_drop_tightening).
+    let recorded = events.lock().await.clone();
     let event = recorded
         .iter()
         .find(|event| event.action == "retention.sweep")
@@ -498,7 +578,9 @@ async fn a_dataset_held_back_by_a_legal_hold_is_still_audited() {
     .await
     .expect("run");
 
-    let recorded = events.lock().await;
+    // Cloned out of the guard so the lock is not held across the
+    // assertions below (clippy::significant_drop_tightening).
+    let recorded = events.lock().await.clone();
     let event = recorded
         .iter()
         .find(|event| event.action == "retention.sweep")
@@ -517,9 +599,10 @@ async fn a_dataset_held_back_by_a_legal_hold_is_still_audited() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn only_datasets_that_are_actually_bounded_are_audited() {
     // An audit trail that records "did nothing" for every unbounded dataset
-    // buries the entries that matter. With a default config only
-    // `job_tracking` has a bound at all (from the pre-existing
-    // `jobs.tracking.ttl_secs`), so exactly one record should appear.
+    // buries the entries that matter. A default config bounds three datasets
+    // — `job_tracking` (jobs.tracking.ttl_secs), `idempotency` and `sessions`
+    // (both 24h) — but only `job_tracking` is *sweep*-enforced, and only a
+    // sweep is a deletion worth auditing.
     let (pool, _url, _container) = start_pg().await;
     let events = Arc::new(Mutex::new(Vec::new()));
     let state = state_with(&pool, AutumnConfig::default());
@@ -531,7 +614,9 @@ async fn only_datasets_that_are_actually_bounded_are_audited() {
         .await
         .expect("run");
 
-    let recorded = events.lock().await;
+    // Cloned out of the guard so the lock is not held across the
+    // assertions below (clippy::significant_drop_tightening).
+    let recorded = events.lock().await.clone();
     let datasets: Vec<&str> = recorded
         .iter()
         .map(|event| event.target_resource_id.as_str())
@@ -594,7 +679,9 @@ async fn a_sweep_that_removed_nothing_is_still_audited() {
     .await
     .expect("sweep");
 
-    let recorded = events.lock().await;
+    // Cloned out of the guard so the lock is not held across the
+    // assertions below (clippy::significant_drop_tightening).
+    let recorded = events.lock().await.clone();
     let event = recorded
         .iter()
         .find(|event| event.target_resource_id == "job_history")
@@ -607,4 +694,239 @@ async fn a_sweep_that_removed_nothing_is_still_audited() {
         event.metadata.get("eligible_rows").map(String::as_str),
         Some("0")
     );
+}
+
+// ── Predicates that guard other subsystems' invariants ───────────────────
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_sweep_removes_discarded_jobs_too() {
+    // `discarded` is a terminal status set by an operator cancel or discard,
+    // with `finished_at` recorded. Excluding it would leave every cancelled
+    // job accumulating forever despite a declared window — the exact
+    // unbounded growth the policy exists to stop.
+    let (pool, _url, _container) = start_pg().await;
+    insert_job(&pool, "old-discarded", "discarded", 90).await;
+    insert_job(&pool, "recent-discarded", "discarded", 1).await;
+
+    let state = state_with(&pool, config_with_windows());
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(reports[0].rows_removed, 1);
+    assert_eq!(
+        ids(&pool, "SELECT id AS value FROM autumn_jobs ORDER BY id").await,
+        vec!["recent-discarded".to_owned()]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_sweep_never_deletes_a_live_ttl_uniqueness_token() {
+    // `#[job(unique, unique_for_ms = N)]` enforces its window purely by the
+    // historical row's continued existence — a completed twin is what
+    // suppresses a duplicate enqueue. Deleting it would silently run the job
+    // a second time.
+    let (pool, _url, _container) = start_pg().await;
+    insert_ttl_unique_job(&pool, "welcome-user-42", 400).await;
+    insert_job(&pool, "ordinary-completed", "completed", 400).await;
+
+    let state = state_with(&pool, config_with_windows());
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(reports[0].rows_removed, 1);
+    assert_eq!(
+        ids(&pool, "SELECT id AS value FROM autumn_jobs ORDER BY id").await,
+        vec!["welcome-user-42".to_owned()],
+        "the dedup token must survive; only the ordinary row is swept"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_sweep_keeps_assignments_for_a_running_experiment() {
+    // A sticky assignment is what keeps an actor on one variant while an
+    // experiment runs. Deleting it re-buckets that actor through the current
+    // weights, contaminating the results, and can admit them into a sibling
+    // experiment in the same exclusion group.
+    let (pool, _url, _container) = start_pg().await;
+    insert_experiment(&pool, "live", "running").await;
+    insert_experiment(&pool, "finished", "concluded").await;
+    insert_assignment_for(&pool, "live", "actor-live", 400).await;
+    insert_assignment_for(&pool, "finished", "actor-finished", 400).await;
+    // No `autumn_experiments` row at all — the experiment is gone.
+    insert_assignment_for(&pool, "orphan", "actor-orphan", 400).await;
+
+    let state = state_with(&pool, config_with_windows());
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("experiment_assignments"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(reports[0].rows_removed, 2);
+    assert_eq!(
+        ids(
+            &pool,
+            "SELECT actor AS value FROM autumn_experiment_assignments ORDER BY actor"
+        )
+        .await,
+        vec!["actor-live".to_owned()],
+        "only a running experiment's assignments survive"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_commit_hook_queue_is_swept_like_job_history() {
+    let (pool, _url, _container) = start_pg().await;
+    insert_commit_hook(&pool, "old-hook", "completed", 90).await;
+    insert_commit_hook(&pool, "recent-hook", "completed", 1).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO autumn_repository_commit_hooks (id, handler_key, hook_name, status) \
+             VALUES ('live-hook', 'h', 'after_save', 'enqueued')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("insert live hook");
+    }
+
+    let mut config = AutumnConfig::default();
+    config.retention.commit_hooks = Some("30d".to_owned());
+    let state = state_with(&pool, config);
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("commit_hooks"),
+        },
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(reports[0].rows_removed, 1);
+    assert_eq!(
+        ids(
+            &pool,
+            "SELECT id AS value FROM autumn_repository_commit_hooks ORDER BY id"
+        )
+        .await,
+        vec!["live-hook".to_owned(), "recent-hook".to_owned()],
+        "an unfinished hook is never swept, however old"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_cutoff_comes_from_the_database_clock() {
+    // The columns the predicates compare against are all written with the
+    // database's `NOW()`, so the cutoff has to come from the same clock —
+    // otherwise a replica running fast deletes rows younger than the window.
+    // Asserting it against the database's own `NOW() - INTERVAL` is the only
+    // check that can tell the two clocks apart.
+    let (pool, _url, _container) = start_pg().await;
+    insert_job(&pool, "old", "completed", 90).await;
+
+    let state = state_with(&pool, config_with_windows());
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("dry run");
+
+    let reported = reports[0].cutoff.as_deref().expect("a cutoff is reported");
+    let reported = chrono::DateTime::parse_from_rfc3339(reported).expect("an RFC-3339 cutoff");
+
+    let mut conn = pool.get().await.expect("conn");
+    let expected = diesel::sql_query("SELECT NOW() - INTERVAL '30 days' AS value")
+        .get_result::<TimestampRow>(&mut conn)
+        .await
+        .expect("db cutoff")
+        .value;
+
+    let drift = (expected - reported.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .abs();
+    assert!(
+        drift < 60,
+        "the reported cutoff must be the database's NOW() minus the window \
+         (expected≈{expected}, reported={reported}, drift={drift}s)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failing_dataset_is_reported_without_aborting_the_run() {
+    // One dataset erroring must never stop another table from being bounded,
+    // and the failure has to reach the report (and the audit trail) rather
+    // than looking like a clean sweep of zero rows.
+    let (pool, _url, _container) = start_pg().await;
+    insert_assignment(&pool, "old-actor", 400).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("DROP TABLE autumn_jobs")
+            .execute(&mut conn)
+            .await
+            .expect("drop autumn_jobs");
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let state = state_with(&pool, config_with_windows());
+    state.insert_extension(AuditLogger::new().with_sink(Arc::new(RecordingAuditSink {
+        events: events.clone(),
+    })));
+
+    let reports = run_retention(&state, &RetentionRunOptions::default())
+        .await
+        .expect("the run itself must not fail");
+
+    let job_history = reports
+        .iter()
+        .find(|r| r.dataset == "job_history")
+        .expect("reported");
+    assert!(job_history.error.is_some(), "{job_history:?}");
+    let assignments = reports
+        .iter()
+        .find(|r| r.dataset == "experiment_assignments")
+        .expect("reported");
+    assert_eq!(assignments.error, None);
+    assert_eq!(
+        assignments.rows_removed, 1,
+        "a sibling dataset must still be swept"
+    );
+
+    // Cloned out of the guard so the lock is not held across the
+    // assertions below (clippy::significant_drop_tightening).
+    let recorded = events.lock().await.clone();
+    let failure = recorded
+        .iter()
+        .find(|event| event.target_resource_id == "job_history")
+        .expect("a failed sweep must still be audited");
+    assert_eq!(failure.status, AuditStatus::Failure);
+    assert!(failure.metadata.contains_key("error"), "{failure:?}");
 }

@@ -95,8 +95,11 @@ impl std::fmt::Display for RetentionEnforcement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionDataset {
-    /// Terminal (`completed`/`failed`) rows in `autumn_jobs`.
+    /// Terminal (`completed`/`failed`/`discarded`) rows in `autumn_jobs`.
     JobHistory,
+    /// Terminal rows in the `#[after_commit]` hook queue,
+    /// `autumn_repository_commit_hooks`.
+    CommitHooks,
     /// Progress/result records in `autumn_job_tracking`.
     JobTracking,
     /// Stored idempotency-key responses.
@@ -115,8 +118,9 @@ pub enum RetentionDataset {
 ///
 /// The single list the config surface, the sweeps, the CLI report and the
 /// docs table all derive from.
-pub const RETENTION_DATASETS: [RetentionDataset; 7] = [
+pub const RETENTION_DATASETS: [RetentionDataset; 8] = [
     RetentionDataset::JobHistory,
+    RetentionDataset::CommitHooks,
     RetentionDataset::JobTracking,
     RetentionDataset::Idempotency,
     RetentionDataset::ExperimentAssignments,
@@ -131,6 +135,7 @@ impl RetentionDataset {
     pub const fn key(self) -> &'static str {
         match self {
             Self::JobHistory => "job_history",
+            Self::CommitHooks => "commit_hooks",
             Self::JobTracking => "job_tracking",
             Self::Idempotency => "idempotency",
             Self::ExperimentAssignments => "experiment_assignments",
@@ -153,7 +158,10 @@ impl RetentionDataset {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::JobHistory => "Finished job rows (completed/failed) in autumn_jobs",
+            Self::JobHistory => "Finished job rows (completed/failed/discarded) in autumn_jobs",
+            Self::CommitHooks => {
+                "Finished #[after_commit] hook rows in autumn_repository_commit_hooks"
+            }
             Self::JobTracking => "Tracked-job progress/result records in autumn_job_tracking",
             Self::Idempotency => "Stored Idempotency-Key responses",
             Self::ExperimentAssignments => {
@@ -173,6 +181,7 @@ impl RetentionDataset {
     pub const fn table(self) -> Option<&'static str> {
         match self {
             Self::JobHistory => Some("autumn_jobs"),
+            Self::CommitHooks => Some("autumn_repository_commit_hooks"),
             Self::JobTracking => Some("autumn_job_tracking"),
             Self::ExperimentAssignments => Some("autumn_experiment_assignments"),
             Self::Idempotency | Self::WebhookReplay | Self::Sessions | Self::AuditArchives => None,
@@ -183,9 +192,10 @@ impl RetentionDataset {
     #[must_use]
     pub const fn enforcement(self) -> RetentionEnforcement {
         match self {
-            Self::JobHistory | Self::JobTracking | Self::ExperimentAssignments => {
-                RetentionEnforcement::Sweep
-            }
+            Self::JobHistory
+            | Self::CommitHooks
+            | Self::JobTracking
+            | Self::ExperimentAssignments => RetentionEnforcement::Sweep,
             Self::Idempotency | Self::WebhookReplay | Self::Sessions => {
                 RetentionEnforcement::BackendTtl
             }
@@ -198,7 +208,10 @@ impl RetentionDataset {
     #[must_use]
     pub const fn default_behavior(self) -> &'static str {
         match self {
-            Self::JobHistory | Self::ExperimentAssignments | Self::AuditArchives => "forever",
+            Self::JobHistory
+            | Self::CommitHooks
+            | Self::ExperimentAssignments
+            | Self::AuditArchives => "forever",
             Self::JobTracking => "jobs.tracking.ttl_secs (24h by default)",
             Self::Idempotency => "idempotency.ttl_secs (24h by default)",
             Self::WebhookReplay => "the endpoint's replay_window_secs (24h by default)",
@@ -227,11 +240,16 @@ impl RetentionDataset {
                 // Replay windows are declared per endpoint; the longest one
                 // is the bound that actually governs how long any marker can
                 // survive, so that is what the unified window competes with.
+                // Only endpoints that actually write markers count, matching
+                // `AutumnConfig::validate_retention_against_replay_protection`
+                // — an endpoint with replay protection off stores nothing, so
+                // its window must not set this dataset's reported bound.
                 let longest = config
                     .security
                     .webhooks
                     .endpoints
                     .iter()
+                    .filter(|endpoint| endpoint.replay_protection)
                     .map(|endpoint| endpoint.replay_window_secs)
                     .max();
                 longest.map(|secs| {
@@ -241,7 +259,10 @@ impl RetentionDataset {
                     )
                 })
             }
-            Self::JobHistory | Self::ExperimentAssignments | Self::AuditArchives => None,
+            Self::JobHistory
+            | Self::CommitHooks
+            | Self::ExperimentAssignments
+            | Self::AuditArchives => None,
         }
     }
 }
@@ -384,6 +405,15 @@ pub struct RetentionDatasetReport {
     pub eligible_rows: Option<u64>,
     /// Rows/entries actually removed by this run (always `0` for a dry run).
     pub rows_removed: u64,
+    /// `true` when the run stopped at its per-run batch cap with rows still
+    /// stale — the policy was only *partially* enforced this tick and resumes
+    /// on the next one.
+    ///
+    /// Reported (and audited) rather than left implicit: a truncated run that
+    /// looked clean in the audit trail would let a reviewer conclude a policy
+    /// was enforced when millions of rows past the window were still there.
+    #[serde(default)]
+    pub truncated: bool,
     /// `true` when nothing was deleted.
     pub dry_run: bool,
     /// Why this dataset was not swept, when it was not: a legal hold, a
@@ -474,6 +504,9 @@ async fn run_one_dataset(
 ) -> RetentionDatasetReport {
     let started = std::time::Instant::now();
     let effective = effective_retention(config, dataset);
+    // A provisional cutoff, so a dataset with no database still reports one.
+    // The sweep path replaces it with the instant Postgres itself resolved —
+    // see `sweep_postgres`.
     let cutoff = effective
         .window
         .and_then(|window| chrono::Duration::from_std(window).ok())
@@ -488,13 +521,14 @@ async fn run_one_dataset(
         cutoff: cutoff.map(|c| c.to_rfc3339()),
         eligible_rows: None,
         rows_removed: 0,
+        truncated: false,
         dry_run,
         skipped: None,
         duration_ms: 0,
         error: None,
     };
 
-    let Some(cutoff) = cutoff else {
+    let (Some(window), Some(cutoff)) = (effective.window, cutoff) else {
         report.skipped = Some("no retention window configured".to_owned());
         report.duration_ms = elapsed_ms(started);
         return report;
@@ -511,7 +545,7 @@ async fn run_one_dataset(
 
     match dataset.enforcement() {
         RetentionEnforcement::Sweep => {
-            apply_sweep(state, dataset, cutoff, dry_run, &mut report).await;
+            apply_sweep(state, dataset, window, dry_run, &mut report).await;
         }
         RetentionEnforcement::BackendTtl => {
             // Not a sweep: the window is applied when the record is written,
@@ -548,26 +582,21 @@ async fn apply_archive_purge(
         report.skipped = Some("no audit logger is installed".to_owned());
         return;
     };
-    // Count first so a real run can still report what was eligible — the
-    // rewrite itself reports only what it removed.
-    match logger.purge_before(cutoff, true).await {
+    // One pass, not two: on a real run `entries_removed` *is* what was
+    // eligible, and the archive can be large enough that reading it twice per
+    // sweep is a cost worth not paying.
+    match logger.purge_before(cutoff, dry_run).await {
         Ok(outcome) if !outcome.supported => {
             report.skipped = Some(
                 "no installed audit sink supports purging (see AuditSink::purge_before)".to_owned(),
             );
-            return;
         }
-        Ok(outcome) => report.eligible_rows = Some(outcome.entries_removed),
-        Err(error) => {
-            report.error = Some(error.to_string());
-            return;
+        Ok(outcome) => {
+            report.eligible_rows = Some(outcome.entries_removed);
+            if !dry_run {
+                report.rows_removed = outcome.entries_removed;
+            }
         }
-    }
-    if dry_run {
-        return;
-    }
-    match logger.purge_before(cutoff, false).await {
-        Ok(outcome) => report.rows_removed = outcome.entries_removed,
         Err(error) => report.error = Some(error.to_string()),
     }
 }
@@ -577,22 +606,51 @@ async fn apply_archive_purge(
 /// The `WHERE` clause selecting stale rows for a sweep-enforced dataset,
 /// with `$1` bound to the cutoff timestamp.
 ///
-/// Every predicate is deliberately conservative about what "stale" means:
-/// `job_history` only ever matches rows in a **terminal** state with a
-/// recorded `finished_at`, so a job that is enqueued, running, or waiting on
-/// a retry is untouchable no matter how old its row is.
+/// Every predicate is deliberately conservative about what "stale" means. In
+/// each case the extra conditions are not defensive padding — each one guards
+/// a specific invariant another subsystem depends on:
+///
+/// - **`job_history`** matches only rows in a **terminal** state
+///   (`completed`/`failed`/`discarded`) with a recorded `finished_at`, so a
+///   job that is enqueued, running, or waiting on a retry is untouchable no
+///   matter how old its row is (a retry goes back to `status = 'enqueued'`
+///   with `finished_at = NULL`, see `job.rs`'s `pg_recover_stale_claims`).
+///
+///   It additionally never touches a row that still carries a **TTL-window
+///   dedup key**. `#[job(unique, unique_for_ms = N)]` enforces its window
+///   purely by the continued existence of the historical row — `job.rs`'s
+///   `DEDUP_GUARD` matches `dup.enqueued_at > NOW() - N` with *no* status
+///   filter, deliberately, so a completed twin still suppresses a duplicate
+///   enqueue. Deleting that row would silently run the job twice. The row
+///   itself does not record `N` (it is a compile-time `#[job]` attribute, not
+///   a column), so there is no cutoff at which the sweep could safely take it;
+///   it is retained until the key is cleared. See
+///   `docs/guide/data-retention.md`.
+///
+/// - **`experiment_assignments`** matches only assignments belonging to an
+///   experiment that has been `concluded` or `archived`, or whose experiment
+///   row is gone. A sticky assignment is what keeps an actor on one variant
+///   while an experiment runs: deleting it re-buckets the actor through the
+///   *current* weights, which silently contaminates a running experiment's
+///   results and can also admit the actor into a sibling experiment in the
+///   same exclusion group.
 #[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
 #[must_use]
 const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str, &'static str)> {
     match dataset {
         RetentionDataset::JobHistory => Some((
             "autumn_jobs",
+            "status IN ('completed', 'failed', 'discarded') AND finished_at IS NOT NULL              AND finished_at < $1              AND NOT (unique_key IS NOT NULL AND unique_window = 'ttl')",
+        )),
+        RetentionDataset::CommitHooks => Some((
+            "autumn_repository_commit_hooks",
             "status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < $1",
         )),
         RetentionDataset::JobTracking => Some(("autumn_job_tracking", "updated_at < $1")),
-        RetentionDataset::ExperimentAssignments => {
-            Some(("autumn_experiment_assignments", "assigned_at < $1"))
-        }
+        RetentionDataset::ExperimentAssignments => Some((
+            "autumn_experiment_assignments",
+            "assigned_at < $1 AND NOT EXISTS (                  SELECT 1 FROM autumn_experiments e                  WHERE e.name = autumn_experiment_assignments.experiment                    AND e.state IN ('draft', 'running')              )",
+        )),
         RetentionDataset::Idempotency
         | RetentionDataset::WebhookReplay
         | RetentionDataset::Sessions
@@ -613,7 +671,7 @@ const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
 async fn apply_sweep(
     state: &AppState,
     dataset: RetentionDataset,
-    cutoff: DateTime<Utc>,
+    window: Duration,
     dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -622,10 +680,15 @@ async fn apply_sweep(
             Some("no database is configured, so this dataset has no rows here".to_owned());
         return;
     };
-    match sweep_postgres(&pool, dataset, cutoff, dry_run).await {
-        Ok((eligible, removed)) => {
+    match sweep_postgres(&pool, dataset, window, dry_run).await {
+        Ok((cutoff, eligible, removed, truncated)) => {
+            // Overwrite the provisional app-clock cutoff with the instant the
+            // database actually applied, so the report and the audit record
+            // state the real one.
+            report.cutoff = Some(cutoff.to_rfc3339());
             report.eligible_rows = Some(eligible);
             report.rows_removed = removed;
+            report.truncated = truncated;
         }
         Err(error) => report.error = Some(error.to_string()),
     }
@@ -642,7 +705,7 @@ async fn apply_sweep(
 async fn apply_sweep(
     _state: &AppState,
     _dataset: RetentionDataset,
-    _cutoff: DateTime<Utc>,
+    _window: Duration,
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -657,9 +720,21 @@ async fn apply_sweep(
     );
 }
 
-/// Count stale rows and, unless `dry_run`, delete them in bounded batches.
+/// Resolve the sweep cutoff **on the database server** and count/delete
+/// against it.
 ///
-/// Returns `(eligible_before, removed)`.
+/// The cutoff is `NOW() - <window>` evaluated by Postgres, not
+/// `Utc::now() - window` in the app. Every column these predicates compare
+/// against is written with the database's `NOW()` (`finished_at`,
+/// `updated_at`, `assigned_at`), so using the app's clock would compare two
+/// different clocks: a worker replica running fast by δ would delete rows δ
+/// younger than the declared window — over-deleting, the compliance-relevant
+/// direction. The resolved instant is returned so the report and the audit
+/// record state the cutoff that was actually applied.
+///
+/// Returns `(cutoff, eligible_before, removed, truncated)`. `truncated` is
+/// `true` when the run hit [`SWEEP_MAX_BATCHES`] with rows still stale — the
+/// policy was only partially enforced this tick and resumes on the next one.
 /// The pooled Postgres handle `AppState::pool()` hands out. Aliased locally
 /// (as `job.rs` does) rather than imported, so a build without Postgres never
 /// names a diesel type.
@@ -670,9 +745,9 @@ type PgPool = diesel_async::pooled_connection::deadpool::Pool<diesel_async::Asyn
 async fn sweep_postgres(
     pool: &PgPool,
     dataset: RetentionDataset,
-    cutoff: DateTime<Utc>,
+    window: Duration,
     dry_run: bool,
-) -> AutumnResult<(u64, u64)> {
+) -> AutumnResult<(DateTime<Utc>, u64, u64, bool)> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -681,15 +756,39 @@ async fn sweep_postgres(
         count: i64,
     }
 
-    let Some((table, predicate)) = stale_row_predicate(dataset) else {
-        return Ok((0, 0));
-    };
+    #[derive(diesel::QueryableByName)]
+    struct CutoffRow {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        cutoff: DateTime<Utc>,
+    }
+
+    let (table, predicate) = stale_row_predicate(dataset).ok_or_else(|| {
+        crate::AutumnError::internal_server_error_msg(format!(
+            "{dataset} is not a sweep-enforced dataset"
+        ))
+    })?;
     let key = sweep_key_column(dataset);
     let mut conn = pool.get().await.map_err(|e| {
         crate::AutumnError::internal_server_error_msg(format!(
             "retention sweep could not acquire a connection: {e}"
         ))
     })?;
+
+    // Seconds rather than a formatted interval literal: `make_interval` takes
+    // a bound parameter, so nothing about the window is ever interpolated
+    // into SQL text.
+    let window_secs =
+        f64::from(u32::try_from(window.as_secs().min(u64::from(u32::MAX))).unwrap_or(u32::MAX));
+    let cutoff = diesel::sql_query("SELECT NOW() - make_interval(secs => $1) AS cutoff")
+        .bind::<diesel::sql_types::Double, _>(window_secs)
+        .get_result::<CutoffRow>(&mut *conn)
+        .await
+        .map(|row| row.cutoff)
+        .map_err(|e| {
+            crate::AutumnError::internal_server_error_msg(format!(
+                "retention could not resolve the cutoff for {table}: {e}"
+            ))
+        })?;
 
     let eligible: i64 = diesel::sql_query(format!(
         "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
@@ -706,16 +805,22 @@ async fn sweep_postgres(
     let eligible = u64::try_from(eligible).unwrap_or(0);
 
     if dry_run || eligible == 0 {
-        return Ok((eligible, 0));
+        return Ok((cutoff, eligible, 0, false));
     }
 
-    // Batched deletes: never one unbounded DELETE over a hot table. The
-    // sub-select is re-evaluated per batch, so rows that stop qualifying
-    // between batches are simply not picked up.
+    // Batched deletes: never one unbounded DELETE over a hot table.
+    //
+    // The predicate is repeated on the OUTER delete, not only in the
+    // id sub-select. Without it the delete's only qual is `id IN {…}`, so a
+    // row that stops qualifying between the sub-select and the delete — an
+    // operator replaying a dead letter back to `enqueued` mid-sweep — would
+    // be deleted while live. Repeating the predicate makes the row's
+    // re-checked qual under READ COMMITTED include its current state.
     let mut removed: u64 = 0;
+    let mut truncated = true;
     for _ in 0..SWEEP_MAX_BATCHES {
         let affected = diesel::sql_query(format!(
-            "DELETE FROM {table} WHERE {key} IN \
+            "DELETE FROM {table} WHERE {predicate} AND {key} IN \
              (SELECT {key} FROM {table} WHERE {predicate} LIMIT $2)"
         ))
         .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
@@ -729,10 +834,11 @@ async fn sweep_postgres(
         })?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
         if affected < usize::try_from(SWEEP_BATCH_ROWS).unwrap_or(usize::MAX) {
+            truncated = false;
             break;
         }
     }
-    Ok((eligible, removed))
+    Ok((cutoff, eligible, removed, truncated))
 }
 
 // ── Audit record (AC #6) ─────────────────────────────────────────────────
@@ -760,8 +866,8 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
         .skipped
         .as_deref()
         .is_some_and(|reason| reason.starts_with("legal hold:"));
-    let swept = !report.dry_run && (report.eligible_rows.is_some() || report.error.is_some());
-    if !swept && !is_legal_hold {
+    let swept = report.eligible_rows.is_some() || report.error.is_some();
+    if report.dry_run || (!swept && !is_legal_hold) {
         return;
     }
 
@@ -771,7 +877,7 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
         cutoff = report.cutoff.as_deref().unwrap_or("-"),
         eligible_rows = report.eligible_rows.unwrap_or(0),
         rows_removed = report.rows_removed,
-        dry_run = report.dry_run,
+        truncated = report.truncated,
         skipped = report.skipped.as_deref().unwrap_or(""),
         error = report.error.as_deref().unwrap_or(""),
         "retention_sweep"
@@ -792,7 +898,7 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
     .with_metadata("dataset", report.dataset.clone())
     .with_metadata("cutoff", report.cutoff.clone().unwrap_or_default())
     .with_metadata("rows_removed", report.rows_removed.to_string())
-    .with_metadata("dry_run", report.dry_run.to_string());
+    .with_metadata("truncated", report.truncated.to_string());
     if let Some(eligible) = report.eligible_rows {
         event = event.with_metadata("eligible_rows", eligible.to_string());
     }
@@ -851,64 +957,9 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
     })
 }
 
-// ── TTL capping for backend-expired datasets ─────────────────────────────
-
-/// Cap `ttl` at the dataset's effective retention window.
-///
-/// The TTL-native datasets (`idempotency`, `webhook_replay`, `sessions`) are
-/// expired by their own backend, so their retention window is enforced by
-/// writing records with a shorter TTL rather than by deleting them later.
-/// Because the cap is a `min`, this can only shorten a record's life — a
-/// window longer than the subsystem TTL is a no-op, exactly as
-/// [`effective_retention`] reports.
-#[must_use]
-pub fn capped_ttl(config: &AutumnConfig, dataset: RetentionDataset, ttl: Duration) -> Duration {
-    config
-        .retention
-        .window(dataset.key())
-        .map_or(ttl, |window| ttl.min(window))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capped_ttl_is_a_no_op_without_a_window() {
-        let config = AutumnConfig::default();
-        assert_eq!(
-            capped_ttl(
-                &config,
-                RetentionDataset::Idempotency,
-                Duration::from_secs(86_400)
-            ),
-            Duration::from_secs(86_400)
-        );
-    }
-
-    #[test]
-    fn capped_ttl_shortens_but_never_extends() {
-        let mut config = AutumnConfig::default();
-        config.retention.idempotency = Some("1h".to_owned());
-        assert_eq!(
-            capped_ttl(
-                &config,
-                RetentionDataset::Idempotency,
-                Duration::from_secs(86_400)
-            ),
-            Duration::from_secs(3_600),
-            "a shorter window must win"
-        );
-        assert_eq!(
-            capped_ttl(
-                &config,
-                RetentionDataset::Idempotency,
-                Duration::from_secs(60)
-            ),
-            Duration::from_secs(60),
-            "a longer window must never extend an already-shorter TTL"
-        );
-    }
 
     #[test]
     fn resolve_datasets_defaults_to_every_dataset() {

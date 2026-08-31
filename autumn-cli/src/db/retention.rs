@@ -4,7 +4,7 @@
 //! Every number this command prints comes from the application binary, not
 //! from the CLI: it compiles and runs the app with
 //! `AUTUMN_DB_RETENTION=report|purge` and reads the JSON report from the one
-//! line of stdout starting with [`RETENTION_JSON_PREFIX`]. That is deliberate
+//! line of stdout starting with `AUTUMN_DB_RETENTION_REPORT=`. That is deliberate
 //! rather than convenient — the policy depends on the app's own resolved
 //! config, its GDPR legal-hold registrations, and its installed audit sinks,
 //! none of which the standalone CLI can see. Running it in-app means the
@@ -68,6 +68,8 @@ pub struct RetentionOptions<'a> {
     pub mode: RetentionMode,
     /// Restrict to one dataset key (`job_history`, `sessions`, …).
     pub dataset: Option<&'a str>,
+    /// Allow `--purge` against a non-dev/test profile.
+    pub force: bool,
     /// Print the app's JSON verbatim instead of a table.
     pub json: bool,
 }
@@ -84,6 +86,10 @@ pub struct RetentionDatasetReport {
     pub cutoff: Option<String>,
     pub eligible_rows: Option<u64>,
     pub rows_removed: u64,
+    /// `true` when the run stopped at its per-run batch cap with rows still
+    /// stale — the policy was only partially enforced this tick.
+    #[serde(default)]
+    pub truncated: bool,
     pub dry_run: bool,
     pub skipped: Option<String>,
     pub duration_ms: u64,
@@ -93,6 +99,10 @@ pub struct RetentionDatasetReport {
 /// Run `autumn db retention`.
 pub fn run(opts: &RetentionOptions<'_>) {
     eprintln!("\u{1F342} autumn db retention\n");
+    if let Some(refusal) = production_refusal(opts) {
+        eprintln!("\u{2717} {refusal}");
+        std::process::exit(1);
+    }
     crate::routes::compile_binary(opts.package, opts.bin);
     let binary = crate::routes::find_binary(opts.package, opts.bin);
 
@@ -115,8 +125,16 @@ pub fn run(opts: &RetentionOptions<'_>) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Some(json) = extract_report_json(&stdout) else {
         eprintln!("Failed to find the retention report in the binary's output.");
-        eprintln!("Raw output: {stdout}");
-        std::process::exit(output.status.code().unwrap_or(1));
+        eprintln!(
+            "Last output from the app:\n{}",
+            tail_for_diagnostics(&stdout)
+        );
+        // Never inherit a zero exit here: a binary that exits 0 without
+        // emitting the report line (one whose `main` short-circuits before
+        // `AppBuilder::run`'s dispatch, or one built against an autumn-web
+        // that predates this mode) would otherwise make a scripted purge look
+        // successful when nothing ran.
+        std::process::exit(output.status.code().filter(|code| *code != 0).unwrap_or(1));
     };
 
     if opts.json {
@@ -136,6 +154,28 @@ pub fn run(opts: &RetentionOptions<'_>) {
     if !output.status.success() {
         std::process::exit(output.status.code().unwrap_or(1));
     }
+}
+
+/// Why an on-demand `--purge` is being refused, if it is.
+///
+/// `--purge` deletes immediately and irreversibly. Against a non-dev/test
+/// profile it requires `--force`, the same guard `autumn db drop` and
+/// `autumn db scrub` apply — the scheduled in-process sweep is the intended
+/// way to enforce a policy in production, and it needs no flag at all.
+/// Read-only modes are never refused.
+fn production_refusal(opts: &RetentionOptions<'_>) -> Option<String> {
+    if opts.mode != RetentionMode::Purge || opts.force {
+        return None;
+    }
+    let profile = crate::migrate::effective_profile(Some(opts.profile));
+    if matches!(profile.as_str(), "dev" | "test") {
+        return None;
+    }
+    Some(format!(
+        "Refusing to purge framework data against the {profile:?} profile.\n  \
+         The configured [retention] policy already runs automatically inside the app; \
+         re-run with --force if you really mean to purge now."
+    ))
 }
 
 /// Clear the other internal one-shot mode env vars `AppBuilder::run` checks
@@ -189,6 +229,18 @@ fn extract_report_json(stdout: &str) -> Option<&str> {
         .find_map(|line| line.strip_prefix(RETENTION_JSON_PREFIX))
 }
 
+/// The last few lines of the child's stdout, for a diagnostic message.
+///
+/// Not the whole stream: under the default `dev` profile the app initializes
+/// a stdout tracing subscriber, so echoing everything would bury the actual
+/// problem in startup logging (and dump it into a CI log).
+fn tail_for_diagnostics(stdout: &str) -> String {
+    const LINES: usize = 20;
+    let lines: Vec<&str> = stdout.lines().collect();
+    let start = lines.len().saturating_sub(LINES);
+    lines[start..].join("\n")
+}
+
 /// Render a window in seconds as the most readable whole unit.
 fn format_window(secs: Option<u64>) -> String {
     let Some(secs) = secs else {
@@ -209,6 +261,12 @@ fn format_rows(report: &RetentionDatasetReport, mode: RetentionMode) -> String {
         return format!("error: {error}");
     }
     if mode == RetentionMode::Purge && !report.dry_run {
+        // A truncated run left rows behind; saying only "removed N" would read
+        // as "the policy is now enforced", which it is not until a later tick
+        // drains the rest.
+        if report.truncated {
+            return format!("removed {} (more remain)", report.rows_removed);
+        }
         return format!("removed {}", report.rows_removed);
     }
     report
@@ -324,11 +382,49 @@ mod tests {
             cutoff: Some("2026-06-01T00:00:00Z".to_owned()),
             eligible_rows: Some(42),
             rows_removed: 0,
+            truncated: false,
             dry_run: true,
             skipped: None,
             duration_ms: 3,
             error: None,
         }
+    }
+
+    #[test]
+    fn the_engines_report_deserializes_into_this_crates_mirror() {
+        // `RetentionDatasetReport` here is a hand-written mirror of
+        // `autumn_web::data_retention::RetentionDatasetReport`; the two are
+        // joined only by a JSON line on the child's stdout, so a renamed or
+        // dropped field in `autumn-web` would break `autumn db retention` at
+        // runtime with no compile error anywhere. Round-trip a real engine
+        // report through the wire format to catch that at build time.
+        let engine = autumn_web::data_retention::RetentionDatasetReport {
+            dataset: "job_history".to_owned(),
+            description: "Finished job rows".to_owned(),
+            enforcement: "sweep".to_owned(),
+            window_secs: Some(7_776_000),
+            source: "[retention]".to_owned(),
+            cutoff: Some("2026-06-01T00:00:00Z".to_owned()),
+            eligible_rows: Some(9),
+            rows_removed: 9,
+            truncated: false,
+            dry_run: false,
+            skipped: None,
+            duration_ms: 4,
+            error: None,
+        };
+        let json = serde_json::to_string(&[&engine]).expect("serialize");
+
+        let decoded: Vec<RetentionDatasetReport> =
+            serde_json::from_str(&json).expect("the CLI mirror must decode the engine's report");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].dataset, "job_history");
+        assert_eq!(decoded[0].window_secs, Some(7_776_000));
+        assert_eq!(decoded[0].eligible_rows, Some(9));
+        assert_eq!(decoded[0].rows_removed, 9);
+        assert!(!decoded[0].truncated);
+        assert_eq!(decoded[0].cutoff.as_deref(), Some("2026-06-01T00:00:00Z"));
     }
 
     #[test]
@@ -478,6 +574,21 @@ mod tests {
 
         assert!(table.contains("removed 17"), "{table}");
         assert!(table.contains("Result"), "{table}");
+    }
+
+    #[test]
+    fn format_report_flags_a_truncated_purge() {
+        let mut partial = report("job_history");
+        partial.dry_run = false;
+        partial.rows_removed = 500_000;
+        partial.truncated = true;
+
+        let table = format_report(&[partial], RetentionMode::Purge);
+
+        assert!(
+            table.contains("more remain"),
+            "a run that hit its batch cap must not read as fully enforced: {table}"
+        );
     }
 
     #[test]

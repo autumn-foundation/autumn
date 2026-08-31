@@ -47,9 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the report and the enforcement come from one code path. A
   `retention.webhook_replay` window shorter than a configured endpoint's
   `replay_window_secs` fails boot rather than silently weakening replay
-  protection. `AuditEvent` gains a `metadata` map and `AuditSink` a defaulted
-  `purge_before`. See
+  protection. See
   [Data Retention for Framework-Owned Data](docs/guide/data-retention.md).
+
+  **Breaking:** `autumn_web::audit::AuditEvent` gains a `metadata:
+  BTreeMap<String, String>` field so a sweep record can carry its dataset,
+  cutoff and row count. Only code that constructs or destructures `AuditEvent`
+  *by struct literal* is affected — `AuditEvent::new(...)` is unchanged, the
+  field is `#[serde(default)]`, and archives written before this release still
+  deserialize. `AuditSink::purge_before` is a *provided* method, so existing
+  sinks keep compiling untouched. See the
+  [migration guide](docs/migrations/next.md).
 
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at

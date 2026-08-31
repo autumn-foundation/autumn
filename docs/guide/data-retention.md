@@ -23,7 +23,7 @@ the policy is and what it is about to delete.
 # autumn.toml
 [retention]
 job_history            = "90d"
-job_tracking           = "7d"
+commit_hooks           = "30d"
 experiment_assignments = "365d"
 audit_archives         = "400d"
 ```
@@ -38,27 +38,38 @@ autumn db retention --dry-run
 ```
 
 ```
-Dataset                 Retention  Source                 Enforced by      Would remove
-----------------------  ---------  ---------------------  ---------------  ------------
-job_history             90d        [retention]            sweep            12483
-job_tracking            7d         [retention]            sweep            902
-idempotency             1d         idempotency.ttl_secs   backend ttl      —
-experiment_assignments  365d       [retention]            sweep            0
-webhook_replay          forever    unset                  backend ttl      —
-sessions                1d         session.max_age_secs   backend ttl      —
-audit_archives          400d       [retention]            archive rewrite  38
+Dataset                 Retention  Source                Enforced by      Would remove
+----------------------  ---------  --------------------  ---------------  ------------
+job_history             90d        [retention]           sweep            12483
+commit_hooks            30d        [retention]           sweep            51
+job_tracking            1d         jobs.tracking.ttl_secs  sweep          902
+idempotency             1d         idempotency.ttl_secs  backend ttl      —
+experiment_assignments  365d       [retention]           sweep            0
+webhook_replay          forever    unset                 backend ttl      —
+sessions                1d         session.max_age_secs  backend ttl      —
+audit_archives          400d       [retention]           archive rewrite  38
+
+  ℹ idempotency: enforced at write time: records are stored with a TTL capped at 86400s by the backend, not deleted by this sweep
+  ℹ webhook_replay: no retention window configured
+  ℹ sessions: enforced at write time: records are stored with a TTL capped at 86400s by the backend, not deleted by this sweep
 ```
+
+Note the `Source` column: `job_tracking`, `idempotency` and `sessions` already
+had a 24-hour bound before you wrote anything, so a *longer* `[retention]`
+window for them changes nothing. Read [Precedence](#precedence-the-shorter-bound-wins)
+before setting those three.
 
 ## Every Framework-Owned Dataset
 
 | Dataset | What it is | Where it lives | Default (unset) | Enforced by |
 |---|---|---|---|---|
-| `job_history` | Finished job rows (`completed`/`failed`) | `autumn_jobs` | **forever** | sweep |
-| `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking` | `jobs.tracking.ttl_secs` (24h) | sweep |
-| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | `idempotency.ttl_secs` (24h) | backend TTL |
+| `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
+| `commit_hooks` | Finished `#[after_commit]` hook rows | `autumn_repository_commit_hooks` | **forever** | sweep |
+| `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking` | jobs.tracking.ttl_secs (24h by default) | sweep |
+| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
-| `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's `replay_window_secs` (24h) | backend TTL |
-| `sessions` | Server-side session records | memory / Redis | `session.max_age_secs` (24h) | backend TTL |
+| `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
+| `sessions` | Server-side session records | memory / Redis | session.max_age_secs (the session cookie's lifetime) | backend TTL |
 | `audit_archives` | Entries in the JSONL audit archive | the sink's file | **forever** | archive rewrite |
 
 **Leaving a dataset unset preserves today's behavior exactly.** With no
@@ -80,6 +91,7 @@ correctness rather than bound growth, so they have no retention window:
 | `autumn_experiments`, `autumn_experiment_overrides` | Current configuration, not history. |
 | `autumn_runtime_config_values`, `autumn_feature_flags` | Current values. |
 | `autumn_sync_*` | Offline-sync state with its own tombstone GC. |
+| `mail_suppressions`, `mail_unsubscribes` | Compliance records: a suppression you expire is a bounce or an unsubscribe you are about to violate. |
 | `api_tokens` | Live credentials; revoke, do not expire silently. |
 
 The `*_changes` audit tables (`autumn_experiment_changes`,
@@ -96,35 +108,81 @@ rather than pretending they all work the same way.
 **`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres
 table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
 run, so one run never holds a long lock or spikes replication lag; a first
-sweep of a years-old table finishes over several ticks. The cutoff is computed
-against the database's clock, not the app's, so a skewed replica cannot widen
-a window.
+sweep of a years-old table finishes over several ticks, and a run that stops
+at that cap is reported (and audited) as `truncated` rather than looking like
+a clean sweep. The cutoff is resolved by the database itself (`NOW() -
+<window>`), not by the app process, so a replica with a fast clock cannot
+delete rows younger than the window.
 
-`job_history` only ever matches rows in a **terminal** state with a recorded
-`finished_at`. A job that is enqueued, running, or waiting on a retry is
-never touched, no matter how old its row is.
+Each sweep predicate is deliberately narrower than "old enough", because each
+one guards an invariant another subsystem depends on:
 
-**`backend ttl`** — the storage backend expires the record itself. Setting a
-window here does not schedule a delete; it *caps the TTL the record is written
-with*, so nothing older than the window can exist to purge. Because the cap is
-a `min`, it can only ever shorten a lifetime.
+- **`job_history`** matches only **terminal** rows (`completed`, `failed`,
+  `discarded`) that have a `finished_at`. A job that is enqueued, running, or
+  waiting on a retry is never touched, no matter how old its row is — a retry
+  goes back to `enqueued` with `finished_at` cleared.
 
-> The in-memory session and idempotency stores are development backends. The
-> in-memory session store has no expiry at all; run Redis (or a custom
-> `SessionStore`) in production, as the session guide already recommends.
+  It also never deletes a row still holding a `#[job(unique, unique_for_ms =
+  N)]` dedup key. That uniqueness window is enforced *by the historical row's
+  continued existence* — a completed twin is what suppresses a duplicate
+  enqueue — so deleting it would silently run the job a second time. The row
+  does not record `N` (it is a compile-time attribute, not a column), so there
+  is no cutoff at which the sweep could safely take it. **Consequence:** rows
+  for TTL-unique jobs are retained regardless of your window. If that matters
+  for volume, lower the job's `unique_for_ms`.
+
+  **`failed` is also the dead-letter state.** A `job_history` window therefore
+  bounds how long a dead-lettered job stays replayable with `autumn jobs
+  retry`. If you triage dead letters by hand, set the window longer than your
+  triage window, or leave it unset.
+
+- **`experiment_assignments`** matches only assignments belonging to an
+  experiment that has been **concluded or archived**, or whose experiment row
+  is gone. A sticky assignment is what keeps an actor on one variant while an
+  experiment runs: deleting it re-buckets that actor through the *current*
+  weights, which contaminates a running experiment's results and can also
+  admit them into a sibling experiment in the same exclusion group. So a
+  window here trims finished experiments and never disturbs a live one.
+
+- **`job_tracking`** and **`commit_hooks`** have no such entanglement:
+  tracking records are already invisible to reads past their expiry, and a
+  terminal hook row is history.
+
+**`backend ttl`** — the storage backend expires the record itself, so there is
+nothing for a sweep to delete and the report shows `—` rather than a fake
+zero. For `idempotency` and `sessions` the window is applied by *capping the
+TTL the record is written with*: because the cap is a `min`, it can only ever
+shorten a lifetime. `webhook_replay` needs no cap — boot validation (below)
+already guarantees the marker's own window is within the retention window.
+
+> Two caveats worth knowing before you set these:
+>
+> - **`sessions` is a login lifetime.** `session.max_age_secs` is the session
+>   cookie's `Max-Age` as well as the server-side record's TTL, so
+>   `retention.sessions = "1h"` signs every user out after an hour.
+> - **The in-memory session and idempotency stores are development backends.**
+>   The in-memory session store has no expiry at all; run Redis (or a custom
+>   `SessionStore`) in production, as the session guide already recommends.
 
 **`archive rewrite`** — the JSONL audit archive is rewritten without the stale
-entries: streamed to a sibling temp file, `fsync`ed, then atomically renamed
-over the original, all under the sink's write lock. A crash mid-purge leaves
-the original intact. A line that cannot be decoded as an audit event is
-**kept**, never discarded — a retention sweep must not be the thing that
-silently drops a record it merely failed to parse.
+entries: filtered into a sibling temp file that inherits the archive's
+permissions, `fsync`ed, then atomically renamed over the original. A crash
+mid-purge leaves the original intact. A line that cannot be decoded as an
+audit event is **kept**, never discarded — a retention sweep must not be the
+thing that silently drops a record it merely failed to parse.
 
 Append-only is the *write* contract for audit sinks; retention is a separate,
 operator-declared bound that GDPR's storage-limitation principle can require.
 Custom `AuditSink` implementations inherit a default `purge_before` that
 reports "unsupported", so a sink that forwards to a SIEM says so in the report
 instead of implying an empty archive.
+
+> Two limits of the archive rewrite: it reads the archive into memory (peak
+> roughly twice its size), so keep a very large archive rotated by external
+> tooling; and its lock is per-process, so running `autumn db retention
+> --purge --dataset audit_archives` *against a live server writing the same
+> file* can drop events appended during the rewrite. Let the in-process
+> scheduled sweep handle this dataset in a live deployment.
 
 ## Precedence: the Shorter Bound Wins
 
@@ -152,6 +210,13 @@ adding `[retention]` causes data to be kept longer than it is today.** The
 governs, so a window that is being overridden is visible rather than silently
 ineffective.
 
+The same table applies to `idempotency.ttl_secs` / `retention.idempotency` and
+to `session.max_age_secs` / `retention.sessions`. For those two the tighter
+bound is applied by shortening the record's TTL at write time; for
+`job_tracking` it is applied by the sweep, so `jobs.tracking.ttl_secs` keeps
+the literal value you configured (a legal hold can then stop the sweep — the
+independent `expires_at` cleanup could not have been stopped).
+
 ### One exception: webhook replay protection
 
 A replay marker's lifetime *is* the replay-rejection window — once the marker
@@ -159,26 +224,37 @@ is gone, a captured request replayed after that point is accepted again.
 Letting a compliance knob silently shorten it would weaken a security control
 through a door nobody would think to look behind.
 
-So `retention.webhook_replay` shorter than any configured endpoint's
+So `retention.webhook_replay` shorter than any replay-protected endpoint's
 `replay_window_secs` **fails boot** with an error naming both keys. Lower
-`replay_window_secs` if you really want a shorter window. (Endpoints
-registered in code rather than in `autumn.toml` are not visible to that check;
-the same rule applies to them by convention.)
+`replay_window_secs` if you really want a shorter window.
+
+The practical consequence: because the retention window can only ever be
+*wider* than the marker's own lifetime, `min()` always resolves to
+`replay_window_secs`, and setting `retention.webhook_replay` never changes how
+long a marker lives. It is a declaration, checked at boot, that your replay
+windows are inside your stated retention policy — not a second enforcement
+mechanism. The report shows this by naming `replay_window_secs` as the
+`Source`.
 
 ## Legal Hold
 
 Data covered by a GDPR legal-hold registration is **never** removed by a
 retention sweep:
 
-```rust
+```rust,no_run
 use autumn_web::gdpr::{GdprRegistry, ModelRegistration};
 
-let registry = GdprRegistry::new()
-    .register(ModelRegistration::retain(
-        "autumn_jobs",
-        "litigation hold 2026-CV-1",
-    ));
+autumn_web::app()
+    .state_initializer(|state| {
+        state.insert_extension(GdprRegistry::new().register(ModelRegistration::retain(
+            "autumn_jobs",
+            "litigation hold 2026-CV-1",
+        )));
+    });
 ```
+
+The registry has to be installed into application state — a `GdprRegistry`
+built and dropped on the floor holds nothing.
 
 That is the same registration that already exempts a table from a GDPR erasure
 request. Holding data is a legal obligation that outranks a retention window,
@@ -202,7 +278,7 @@ autumn db retention
 # What a sweep would remove, without removing it:
 autumn db retention --dry-run
 
-# Enforce the policy now:
+# Enforce the policy now (dev/test; see below for other profiles):
 autumn db retention --purge
 
 # One dataset at a time, with detail:
@@ -212,15 +288,30 @@ autumn db retention --dry-run --dataset job_history
 autumn db retention --json
 ```
 
+It takes `--profile` plus `--package`/`--bin` for a workspace with more than
+one binary. Unlike `autumn db backup`, `--profile` here **defaults to `dev`**
+rather than reading `AUTUMN_ENV` — it is forwarded *into* the app binary as
+`AUTUMN_ENV`, matching `autumn retention` and `autumn task`. Always pass it
+explicitly for anything but development:
+
+```bash
+autumn db retention --profile prod
+```
+
 The command compiles and runs your application binary. That is deliberate: the
 policy depends on your app's resolved config, its GDPR registrations, and its
 audit sinks, none of which a standalone CLI can see. Running it in-app means
 the report and the enforcement come from one code path and cannot drift.
 
-`--purge` runs the policy you already declared — it deletes nothing a
-scheduled sweep would not have deleted an hour later — so it has no separate
-production guard. The exit status is non-zero if any dataset failed, so a
-scripted purge cannot look successful after a partial failure.
+`--dataset` only accepts a registered dataset key, so a typo is rejected
+before anything is compiled. The exit status is non-zero if any dataset
+failed, so a scripted purge cannot look successful after a partial failure.
+
+**`--purge` against a non-dev/test profile additionally requires `--force`**,
+the same guard `autumn db drop` and `autumn db scrub` apply. Nothing about
+production needs an on-demand purge — the configured policy already runs
+inside the app on its own schedule — so the flag exists for the deliberate
+case, not the routine one.
 
 ## Observability and the Audit Trail
 
@@ -238,13 +329,19 @@ a claim a reviewer needs evidence for:
 | `metadata.cutoff` | the RFC-3339 cutoff timestamp |
 | `metadata.rows_removed` | rows actually deleted |
 | `metadata.eligible_rows` | rows that matched |
+| `metadata.truncated` | `true` when the run stopped at its per-run batch cap with rows still stale |
 | `metadata.skipped` | present when a legal hold blocked the sweep |
 | `metadata.error` | present when the sweep failed |
 
 A dataset held back by a legal hold is recorded even though nothing was
 deleted — "the policy wanted to delete this and did not" is exactly what a
-compliance reviewer needs to see. Dry runs write no record; they delete
-nothing, so they are not sweeps.
+compliance reviewer needs to see. Dry runs (including the default read-only
+`autumn db retention`) write no record at all; they delete nothing, so they
+are not sweeps. A dataset with no window, and one whose backend expires its
+own records, are likewise not audited — there is no deletion to attribute.
+
+If no purge-capable `AuditSink` is installed, `audit_archives` reports that in
+the `Source`/notes rather than silently claiming an enforced window.
 
 The same information is emitted as a structured `retention_sweep` line on the
 `autumn.audit` tracing target, so it lands in your log pipeline even with no
@@ -256,6 +353,7 @@ The same information is emitted as a structured `retention_sweep` line on the
 [retention]
 sweep_interval         = "1h"    # how often the sweep runs (default "1h")
 job_history            = "90d"
+commit_hooks           = "30d"
 job_tracking           = "7d"
 idempotency            = "2d"
 experiment_assignments = "365d"
@@ -264,10 +362,19 @@ sessions               = "30d"
 audit_archives         = "400d"
 ```
 
+Four of these keys have a pre-existing 24-hour default bound
+(`job_tracking`, `idempotency`, `sessions`) or are validated to be no tighter
+than the security control they describe (`webhook_replay`). A value *longer*
+than that bound is accepted and has no effect — see
+[Precedence](#precedence-the-shorter-bound-wins), and check the `Source`
+column of `autumn db retention` to see which setting is actually governing.
+
 Durations use the same syntax as `#[scheduled(every = ...)]`: `s`, `m`, `h`,
-`d`, optionally compound (`"1h 30m"`). An unparseable or zero window fails
-boot rather than being silently ignored — a policy you believe is enforced but
-is not is worse than no policy.
+`d`, optionally compound (`"1h 30m"`). A window that is not a valid, non-zero
+duration fails boot rather than being silently ignored — a policy you believe
+is enforced but is not is worse than no policy. (Zero is refused because it
+would purge a dataset as soon as it was written; to restore today's behavior,
+remove the key entirely.)
 
 Every key has an environment override:
 
@@ -275,6 +382,7 @@ Every key has an environment override:
 |---|---|
 | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` |
 | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` |
+| `AUTUMN_RETENTION__COMMIT_HOOKS` | `retention.commit_hooks` |
 | `AUTUMN_RETENTION__JOB_TRACKING` | `retention.job_tracking` |
 | `AUTUMN_RETENTION__IDEMPOTENCY` | `retention.idempotency` |
 | `AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS` | `retention.experiment_assignments` |

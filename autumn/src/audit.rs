@@ -356,16 +356,32 @@ impl AuditSink for JsonlFileAuditSink {
 
     /// Rewrite the archive without entries older than `cutoff`.
     ///
-    /// Streams the existing file line by line into a sibling temp file,
-    /// `fsync`s it, then atomically renames it over the archive — so a crash
+    /// Reads the archive, filters it into a sibling temp file, `fsync`s that
+    /// file, then atomically renames it over the archive — so a crash
     /// mid-purge leaves the original intact rather than a truncated archive.
-    /// The whole operation holds the sink's write lock, so a concurrent
-    /// [`AuditSink::write`] cannot append into the copy being replaced.
+    /// The temp file inherits the archive's permissions before the rename, so
+    /// a hardened archive (`chmod 600` on a file carrying `actor_id` and
+    /// `ip_address`) does not come back world-readable.
     ///
     /// A line that does not decode as an [`AuditEvent`] is **kept**: a
     /// retention sweep must never be the thing that silently discards a
     /// record it merely failed to parse (a future schema, or a partial line
     /// left by an earlier crash).
+    ///
+    /// # Concurrency and memory limits
+    ///
+    /// The sink's write lock serializes this against [`AuditSink::write`]
+    /// **within one process only**. It is not a file lock: a second process
+    /// appending to the same path (notably `autumn db retention --purge`,
+    /// which boots a second copy of the app, run against a live server) can
+    /// append between this read and this rename, and those events are lost.
+    /// Prefer the in-process scheduled sweep for a live deployment; see
+    /// `docs/guide/data-retention.md`.
+    ///
+    /// The archive is read into memory in full, and the kept lines are
+    /// buffered alongside it — peak usage is roughly twice the archive size.
+    /// Keep the JSONL archive rotated by external tooling if it can grow to a
+    /// size that matters on your host.
     fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
         Box::pin(async move {
             let _guard = self.write_lock.lock().await;
@@ -403,10 +419,32 @@ impl AuditSink for JsonlFileAuditSink {
                 return Ok(AuditPurgeOutcome::purged(removed));
             }
 
-            let temp_path = self.path.with_extension("autumn-retention.tmp");
+            // A unique temp name per process and per call. A fixed one (e.g.
+            // `with_extension("…tmp")`) collides between two processes purging
+            // the same archive — and, because `with_extension` replaces the
+            // extension, between `audit.log` and `audit.jsonl` in one
+            // directory — and `File::create` truncates, so the loser's
+            // partial write gets renamed over the archive.
+            let temp_path = self.path.with_file_name(format!(
+                "{}.{}.{}.autumn-retention.tmp",
+                self.path.file_name().map_or_else(
+                    || "audit".to_owned(),
+                    |name| name.to_string_lossy().into_owned()
+                ),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos()),
+            ));
             let mut temp = tokio::fs::File::create(&temp_path).await.map_err(|error| {
                 AuditError::new(format!("failed to create audit purge temp file: {error}"))
             })?;
+            // Carry the archive's own permissions across the rename. Best
+            // effort: a platform or filesystem that cannot report or apply
+            // them must not fail the purge.
+            if let Ok(metadata) = tokio::fs::metadata(&self.path).await {
+                let _ = tokio::fs::set_permissions(&temp_path, metadata.permissions()).await;
+            }
             temp.write_all(kept.as_bytes()).await.map_err(|error| {
                 AuditError::new(format!("failed to write audit purge temp file: {error}"))
             })?;
@@ -414,11 +452,14 @@ impl AuditSink for JsonlFileAuditSink {
                 AuditError::new(format!("failed to sync audit purge temp file: {error}"))
             })?;
             drop(temp);
-            tokio::fs::rename(&temp_path, &self.path)
-                .await
-                .map_err(|error| {
-                    AuditError::new(format!("failed to replace audit log file: {error}"))
-                })?;
+            if let Err(error) = tokio::fs::rename(&temp_path, &self.path).await {
+                // Leaving the temp file behind would accumulate one orphan per
+                // failed sweep in the archive's own directory.
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(AuditError::new(format!(
+                    "failed to replace audit log file: {error}"
+                )));
+            }
             Ok(AuditPurgeOutcome::purged(removed))
         })
     }

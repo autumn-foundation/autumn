@@ -1836,7 +1836,7 @@ enum DbCommands {
     ///   autumn db retention --dry-run
     ///
     ///   # Enforce the policy now, for one dataset:
-    ///   autumn db retention --purge --dataset job_history
+    ///   autumn db retention --purge --dataset `job_history`
     #[command(verbatim_doc_comment)]
     Retention {
         /// Package to run (for workspaces).
@@ -1848,17 +1848,24 @@ enum DbCommands {
         /// Profile forwarded to the app binary via `AUTUMN_ENV`.
         #[arg(long, default_value = "dev")]
         profile: String,
-        /// Restrict to one dataset (`job_history`, `job_tracking`,
-        /// `idempotency`, `experiment_assignments`, `webhook_replay`,
-        /// `sessions`, `audit_archives`).
-        #[arg(long, value_name = "DATASET")]
+        /// Restrict to one dataset. Rejected up front if it is not one of the
+        /// framework-owned dataset keys, so a typo cannot silently sweep
+        /// nothing.
+        #[arg(long, value_name = "DATASET", value_parser = RETENTION_DATASET_KEYS)]
         dataset: Option<String>,
         /// Report what a sweep would remove, without removing anything.
         #[arg(long, conflicts_with = "purge")]
         dry_run: bool,
         /// Enforce the configured policy immediately.
+        ///
+        /// Deletes data. Against a non-dev/test profile this additionally
+        /// requires `--force`, the same guard `autumn db drop` and
+        /// `autumn db scrub` apply.
         #[arg(long)]
         purge: bool,
+        /// Allow `--purge` against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
         /// Print the raw JSON report instead of a table.
         #[arg(long)]
         json: bool,
@@ -3713,6 +3720,7 @@ fn run_command(command: Commands) {
                 dataset,
                 dry_run,
                 purge,
+                force,
                 json,
             } => db::retention::run(&db::retention::RetentionOptions {
                 package: package.as_deref(),
@@ -3720,6 +3728,7 @@ fn run_command(command: Commands) {
                 profile: &profile,
                 mode: db_retention_mode(dry_run, purge),
                 dataset: dataset.as_deref(),
+                force,
                 json,
             }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
@@ -4451,6 +4460,22 @@ fn run_replay_command(
 /// rejects passing both, but the ordering here makes the safe direction the
 /// fallback rather than a coincidence — a future flag-handling change can only
 /// ever fail towards *not* deleting.
+/// The valid `autumn db retention --dataset` values, mirroring
+/// `autumn_web::data_retention::RETENTION_DATASETS` (issue #1605).
+///
+/// A clap `value_parser` so a typo is rejected before the app binary is even
+/// compiled, rather than after a full build-and-boot round trip.
+const RETENTION_DATASET_KEYS: [&str; 8] = [
+    "job_history",
+    "commit_hooks",
+    "job_tracking",
+    "idempotency",
+    "experiment_assignments",
+    "webhook_replay",
+    "sessions",
+    "audit_archives",
+];
+
 const fn db_retention_mode(dry_run: bool, purge: bool) -> db::retention::RetentionMode {
     if purge {
         db::retention::RetentionMode::Purge

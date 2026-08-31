@@ -6196,6 +6196,7 @@ impl AppBuilder {
     async fn run_framework_retention_mode(self, mode: FrameworkRetentionMode) {
         let Self {
             state_initializers,
+            audit_logger,
             config_loader_factory,
             telemetry_provider,
             plugin_config_roots,
@@ -6268,11 +6269,17 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        // `AppBuilder::with_audit_sink(...)` installs its logger here, not via
+        // a state initializer. Skipping it would leave an on-demand purge with
+        // no audit record at all, and would make
+        // `--dataset audit_archives` a silent no-op for exactly the apps that
+        // use the first-class builder.
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
         // The app's own state initializers are what install the GDPR registry
-        // (legal holds) and the audit logger (where the sweep record lands).
-        // Skipping them here would make `autumn db retention` report a sweep
-        // the running app would actually refuse, and would silently drop the
-        // audit record for an on-demand purge.
+        // a legal hold lives in. Skipping them would make `autumn db
+        // retention` report a sweep the running app would actually refuse.
         run_state_initializers(state_initializers, &state);
 
         let options = crate::data_retention::RetentionRunOptions {
@@ -7087,10 +7094,16 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
         "report" => Some(FrameworkRetentionMode::Report),
         "purge" => Some(FrameworkRetentionMode::Purge),
         other => {
+            // Warn and fall through to a normal boot rather than exiting.
+            // This var is read on *every* start, so exiting here would let a
+            // stray value in a wrapping script or a shared environment take a
+            // production app down at boot. Mirrors `AUTUMN_ROLE`'s handling
+            // of an unrecognized value.
             eprintln!(
-                "{FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" or \"purge\")"
+                "Warning: {FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" \
+                 or \"purge\"), ignoring"
             );
-            std::process::exit(2);
+            None
         }
     }
 }

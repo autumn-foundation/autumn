@@ -31,6 +31,10 @@ fn every_dataset_named_by_the_issue_is_registered() {
         "webhook_replay",
         "sessions",
         "audit_archives",
+        // Beyond the issue's "at minimum" list: the `#[after_commit]` hook
+        // queue is structurally identical to job history and accumulates the
+        // same way.
+        "commit_hooks",
     ] {
         assert!(
             keys.contains(&expected),
@@ -296,33 +300,48 @@ fn retention_caps_shorten_subsystem_ttls_in_place() {
     // The TTL-native datasets are enforced by writing records with a shorter
     // TTL, so the cap is applied once to the loaded config and then flows
     // into every derived lifetime (the idempotency layer's TTL, the session
-    // cookie's Max-Age and the Redis session TTL, the job-tracking
-    // `expires_at`).
+    // cookie's Max-Age, the Redis session TTL).
     let mut config = AutumnConfig::default();
-    config.jobs.tracking.ttl_secs = 86_400;
     config.idempotency.ttl_secs = 86_400;
     config.session.max_age_secs = 86_400;
-    config.retention.job_tracking = Some("1h".to_owned());
     config.retention.idempotency = Some("2h".to_owned());
     config.retention.sessions = Some("3h".to_owned());
 
     config.apply_retention_caps();
 
-    assert_eq!(config.jobs.tracking.ttl_secs, 3_600);
     assert_eq!(config.idempotency.ttl_secs, 7_200);
     assert_eq!(config.session.max_age_secs, 10_800);
 }
 
 #[test]
-fn retention_caps_never_extend_a_shorter_subsystem_ttl() {
+fn retention_caps_leave_job_tracking_ttl_alone() {
+    // `job_tracking` is sweep-enforced, and the sweep honours a legal hold on
+    // `autumn_job_tracking` while `job.rs`'s independent `expires_at` cleanup
+    // cannot. Capping `jobs.tracking.ttl_secs` would let that cleanup delete,
+    // on exactly the retention schedule, the rows the retention report says
+    // are being preserved under hold.
     let mut config = AutumnConfig::default();
-    config.jobs.tracking.ttl_secs = 600;
-    config.retention.job_tracking = Some("30d".to_owned());
+    config.jobs.tracking.ttl_secs = 86_400;
+    config.retention.job_tracking = Some("1h".to_owned());
 
     config.apply_retention_caps();
 
     assert_eq!(
-        config.jobs.tracking.ttl_secs, 600,
+        config.jobs.tracking.ttl_secs, 86_400,
+        "the sweep, not the TTL, enforces job_tracking retention"
+    );
+}
+
+#[test]
+fn retention_caps_never_extend_a_shorter_subsystem_ttl() {
+    let mut config = AutumnConfig::default();
+    config.idempotency.ttl_secs = 600;
+    config.retention.idempotency = Some("30d".to_owned());
+
+    config.apply_retention_caps();
+
+    assert_eq!(
+        config.idempotency.ttl_secs, 600,
         "a longer policy window must not extend a tighter subsystem TTL"
     );
 }
@@ -353,6 +372,30 @@ fn retention_caps_are_idempotent() {
     config.apply_retention_caps();
 
     assert_eq!(config.idempotency.ttl_secs, 7_200);
+}
+
+// ── The docs page must list every dataset (AC #7) ────────────────────────
+
+#[test]
+fn the_docs_page_enumerates_every_registered_dataset() {
+    // AC #7 asks the guide to enumerate *every* framework-owned dataset. The
+    // table is hand-written prose, so without this guard adding a dataset
+    // silently leaves the page — the thing an operator actually reads to
+    // answer "how long do you keep this?" — incomplete.
+    let guide = include_str!("../../../docs/guide/data-retention.md");
+    for dataset in RETENTION_DATASETS {
+        assert!(
+            guide.contains(dataset.key()),
+            "docs/guide/data-retention.md must document the {:?} dataset",
+            dataset.key()
+        );
+        assert!(
+            guide.contains(dataset.default_behavior()),
+            "docs/guide/data-retention.md must state {:?}'s default retention ({:?})",
+            dataset.key(),
+            dataset.default_behavior()
+        );
+    }
 }
 
 #[test]
@@ -401,4 +444,197 @@ fn a_webhook_replay_window_at_or_above_replay_protection_is_accepted() {
     )
     .expect("well-formed");
     config.validate().expect("a wider window is fine");
+}
+
+// ── The scheduled handler actually sweeps (AC #2) ────────────────────────
+
+#[tokio::test]
+async fn the_registered_task_handler_runs_a_real_sweep() {
+    // `framework_retention_task` is the whole of "automatically on a
+    // recurring schedule inside the running app". Asserting only its name and
+    // cadence would leave the handler itself — the part that does the work —
+    // never executed by any test.
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("1h".to_owned());
+
+    let task = framework_retention_task(&config.retention).expect("a window registers the task");
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+
+    (task.handler)(state)
+        .await
+        .expect("the sweep handler must run to completion with no database configured");
+}
+
+#[tokio::test]
+async fn a_sweep_with_no_database_reports_the_reason_instead_of_failing() {
+    // A `db`-less app (or one that simply has no pool) must report why a
+    // sweep-enforced dataset was skipped, not error the whole run.
+    let mut config = AutumnConfig::default();
+    config.retention.job_history = Some("30d".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("a pool-less run is not an error");
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].rows_removed, 0);
+    assert!(
+        reports[0].skipped.is_some(),
+        "the operator must be told why nothing was swept: {:?}",
+        reports[0]
+    );
+    assert_eq!(reports[0].error, None);
+}
+
+#[tokio::test]
+async fn an_unknown_dataset_filter_is_rejected_rather_than_sweeping_nothing() {
+    let state = autumn_web::AppState::for_test();
+    let error = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("jobs"),
+        },
+    )
+    .await
+    .expect_err("a typo must fail loudly");
+    assert!(error.to_string().contains("job_history"), "{error}");
+}
+
+// ── audit_archives end to end through the engine (AC #1/#2/#6) ───────────
+
+/// Write a JSONL audit archive whose entries carry the given ages in days.
+async fn seed_archive(path: &std::path::Path, ages_in_days: &[i64]) {
+    let sink = autumn_web::audit::JsonlFileAuditSink::new(path);
+    for (index, age) in ages_in_days.iter().enumerate() {
+        let mut event = autumn_web::audit::AuditEvent::new(
+            format!("actor-{index}"),
+            "auth.login",
+            format!("session-{index}"),
+            None,
+            autumn_web::audit::AuditStatus::Success,
+        );
+        event.timestamp = chrono::Utc::now() - chrono::Duration::days(*age);
+        autumn_web::audit::AuditSink::write(&sink, event)
+            .await
+            .expect("seed archive line");
+    }
+}
+
+fn archive_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .expect("read archive")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+#[tokio::test]
+async fn the_audit_archives_dataset_purges_through_the_engine() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("audit.jsonl");
+    seed_archive(&path, &[400, 400, 1]).await;
+
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("30d".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+    state.insert_extension(
+        autumn_web::audit::AuditLogger::new().with_sink(std::sync::Arc::new(
+            autumn_web::audit::JsonlFileAuditSink::new(&path),
+        )),
+    );
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("audit_archives"),
+        },
+    )
+    .await
+    .expect("archive purge");
+
+    assert_eq!(reports[0].rows_removed, 2, "{:?}", reports[0]);
+    assert_eq!(reports[0].eligible_rows, Some(2));
+    assert_eq!(reports[0].error, None);
+    assert_eq!(reports[0].skipped, None);
+    // The surviving entry, plus the sweep's own audit record, which lands in
+    // this same archive.
+    assert_eq!(archive_lines(&path), 2);
+}
+
+#[tokio::test]
+async fn an_audit_archives_dry_run_counts_without_rewriting() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("audit.jsonl");
+    seed_archive(&path, &[400, 400]).await;
+
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("30d".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+    state.insert_extension(
+        autumn_web::audit::AuditLogger::new().with_sink(std::sync::Arc::new(
+            autumn_web::audit::JsonlFileAuditSink::new(&path),
+        )),
+    );
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("audit_archives"),
+        },
+    )
+    .await
+    .expect("dry run");
+
+    assert_eq!(reports[0].eligible_rows, Some(2));
+    assert_eq!(reports[0].rows_removed, 0);
+    assert_eq!(
+        archive_lines(&path),
+        2,
+        "a dry run must neither delete an entry nor append an audit record"
+    );
+}
+
+#[tokio::test]
+async fn audit_archives_without_a_purgeable_sink_says_so() {
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("30d".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+    state.insert_extension(
+        autumn_web::audit::AuditLogger::new()
+            .with_sink(std::sync::Arc::new(autumn_web::audit::TracingAuditSink)),
+    );
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("audit_archives"),
+        },
+    )
+    .await
+    .expect("run");
+
+    assert!(
+        reports[0]
+            .skipped
+            .as_deref()
+            .is_some_and(|reason| reason.contains("supports purging")),
+        "a forwarding-only sink must say so rather than imply an empty archive: {:?}",
+        reports[0]
+    );
 }
