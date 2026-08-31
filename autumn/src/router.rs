@@ -2848,41 +2848,81 @@ fn mount_raw_routers(
     router
 }
 
-/// The `compress_when` predicate shared by both compression call sites (this
+/// Content-type prefixes `CompressionPredicate` skips beyond what
+/// `tower_http`'s own `DefaultPredicate` already excludes (images, gRPC,
+/// SSE, small bodies): binary media and already-compressed formats waste CPU
+/// to (re)compress, inflate archive transfer size, or can confuse media
+/// players.
+const COMPRESSION_EXCLUDED_CONTENT_TYPES: &[&str] = &[
+    // Binary media — already-encoded by codec, not compressible by gzip/br.
+    "audio/",
+    "video/",
+    "application/octet-stream",
+    // Compressed archive formats — re-compressing wastes CPU.
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/zstd",
+    "application/x-bzip2",
+    "application/x-bzip",
+    "application/x-rar-compressed",
+    "application/vnd.rar",
+    "application/x-7z-compressed",
+    // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression, so
+    // gzip/br only wastes CPU and can inflate them. Raw fonts (`font/ttf`,
+    // `font/otf`) are NOT excluded: they are uncompressed SFNT data that
+    // genuinely benefits from transfer compression.
+    "font/woff",
+    "font/woff2",
+];
+
+/// `compress_when` predicate shared by both compression call sites (this
 /// function's SSG/ISG path and `apply_middleware`'s inline fully-dynamic
-/// path, #2371): extends the default predicate (skips images, gRPC, SSE,
-/// small bodies) to also skip binary media and already-compressed formats —
-/// compressing these wastes CPU, increases transfer size for archives, and
-/// can confuse media players.
+/// path, #2371).
 ///
-/// Returns `impl Predicate`, not a generic constructor: the two call sites
-/// each use the single concrete opaque type this resolves to, so — unlike
-/// the concern `NormalizeBodyLayer`'s doc comment raises about a type
-/// parameter left as an inference variable inside a merged tuple — nothing
-/// here leaves rustc a variable to solve for at the tuple-typechecking site.
-fn compression_predicate() -> impl tower_http::compression::predicate::Predicate {
-    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-    DefaultPredicate::new()
-        // Binary media — already-encoded by codec, not compressible by gzip/br.
-        .and(NotForContentType::const_new("audio/"))
-        .and(NotForContentType::const_new("video/"))
-        .and(NotForContentType::const_new("application/octet-stream"))
-        // Compressed archive formats — re-compressing wastes CPU.
-        .and(NotForContentType::const_new("application/zip"))
-        .and(NotForContentType::const_new("application/gzip"))
-        .and(NotForContentType::const_new("application/x-gzip"))
-        .and(NotForContentType::const_new("application/zstd"))
-        .and(NotForContentType::const_new("application/x-bzip2"))
-        .and(NotForContentType::const_new("application/x-bzip"))
-        .and(NotForContentType::const_new("application/x-rar-compressed"))
-        .and(NotForContentType::const_new("application/vnd.rar"))
-        .and(NotForContentType::const_new("application/x-7z-compressed"))
-        // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
-        // so gzip/br only wastes CPU and can inflate them. Raw fonts
-        // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
-        // SFNT data that genuinely benefits from transfer compression.
-        .and(NotForContentType::const_new("font/woff"))
-        .and(NotForContentType::const_new("font/woff2"))
+/// A hand-rolled `Predicate` wrapping `DefaultPredicate`, rather than
+/// `DefaultPredicate` extended with 13 chained
+/// `.and(NotForContentType::const_new(...))` calls (the form this replaces):
+/// each `NotForContentType` embeds a ~24-byte `Str` enum, so 13 of them
+/// nested via `tower_http`'s `And<Lhs, Rhs>` inflated `CompressionLayer`'s
+/// own static SIZE by several hundred bytes — harmless while that size only
+/// affected `apply_compression_middleware`'s own local, but #2371 also made
+/// this predicate a member of `apply_middleware`'s `option_layer` `Either`,
+/// whose size is fixed by its larger (`Some`) branch even in the `None`
+/// (compression-off, the default) case. That inflated the per-request byte
+/// count `config_alloc_gate.rs` gates for every app, not just ones with
+/// compression on — caught by CI, not by this repo's `middleware_stack_depth.rs`
+/// probe, which only counts clone *events*, not their size (see that file's
+/// own "What this gate is blind to" section). A `&'static [&'static str]`
+/// slice checked in a loop costs 16 bytes regardless of how many entries it
+/// lists.
+#[derive(Clone)]
+struct CompressionPredicate {
+    default: tower_http::compression::predicate::DefaultPredicate,
+}
+
+impl tower_http::compression::predicate::Predicate for CompressionPredicate {
+    fn should_compress<B>(&self, response: &http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        self.default.should_compress(response)
+            && response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_none_or(|content_type| {
+                    !COMPRESSION_EXCLUDED_CONTENT_TYPES
+                        .iter()
+                        .any(|excluded| content_type.starts_with(excluded))
+                })
+    }
+}
+
+fn compression_predicate() -> CompressionPredicate {
+    CompressionPredicate {
+        default: tower_http::compression::predicate::DefaultPredicate::new(),
+    }
 }
 
 /// Apply response compression, when enabled.
