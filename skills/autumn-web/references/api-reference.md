@@ -262,8 +262,10 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   single event) and emits an auditable `tracing` record on
   `autumn::declassification` carrying model/field/tier/purpose/sink/reason —
   never the value. Purpose and reason must be non-blank literals. The write
-  structs (`NewX`/`UpdateX`/`Changeset`) still accept the value — taking
-  personal data *in* is not a release — but carry the wrapper too
+  structs (`NewX`/`UpdateX`/`Changeset`) and the generated `XFactory` still
+  accept the value — taking personal data *in* is not a release — but carry the
+  wrapper too (the factory's setter still takes the plain type, so
+  `.email("a@b.c")` is unchanged)
   (`Classified<String, F>`, `Patch<Classified<String, F>>` on the patch, so
   building one by hand costs an `.into()`) and get `#[serde(skip_serializing)]`;
   their fields are `pub`, so a bare `String` would have let a handler move the

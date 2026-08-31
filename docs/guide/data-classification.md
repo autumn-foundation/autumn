@@ -271,6 +271,12 @@ Audit with the feature set you ship.
 
   Decoding a request body needs no change at all — `Json<NewCustomer>` and
   `Form<NewCustomer>` deserialize exactly as before.
+
+  The generated factory carries it too, for the same reason: its fields are
+  `pub`, so `Customer::factory().email` would otherwise be a way straight out.
+  Its setter is unaffected — it still takes the plain type, so
+  `.email("ada@example.com")` with a bare `&str` works as before, and the value
+  is classified from the moment it is stored.
 - **`Debug` is redacted** on the model and on the write structs — the value
   renders as `<classified>`, so it cannot reach a panic message or an error page.
 - **`#[validate]` still runs** on the classified column. The wrapper forwards

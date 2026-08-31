@@ -47,10 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value cannot be converted in as one classified column and back out as another.
 
   The first slice deliberately stops at one tier and one sink. Name-based log
-  and header redaction are untouched and still run; the write structs still
-  accept the value (taking personal data *in* is not a release) but carry the
-  wrapper too, so the plaintext cannot be moved out of a `pub` field into a
-  response view; `Debug` renders `<classified>` everywhere. See
+  and header redaction are untouched and still run; the write structs and the
+  generated factory still accept the value (taking personal data *in* is not a
+  release) but carry the wrapper too, so the plaintext cannot be moved out of a
+  `pub` field into a response view; `Debug` renders `<classified>` everywhere.
+  See
   `docs/guide/data-classification.md`.
 
 - **`autumn upgrade` now reconciles framework-owned scaffold files, not just

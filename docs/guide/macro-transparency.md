@@ -587,7 +587,8 @@ autumn_web::declassify! {
 }
 ```
 
-The write structs (`New*` / `Update*` / changeset) still *accept* the value —
+The write structs (`New*` / `Update*` / changeset) and the generated factory
+still *accept* the value —
 a client sets it, and deserialization, `#[validate]` and form rendering are
 unchanged — but they carry the wrapper too (`Classified<String, F>`, or
 `Patch<Classified<String, F>>` on the patch) and get
