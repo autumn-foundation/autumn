@@ -55,6 +55,9 @@ const DAY: i64 = 86_400;
 /// test can prove the CA's window is what lands on the leaf rather than a
 /// hard-coded default.
 const RENEWED_CERT_DAYS: i64 = 60;
+/// `"ok"` repeated this many times is the `/health` body: 8 KiB, comfortably
+/// past the client's 1 KiB read buffer.
+const HEALTH_BODY_REPEATS: usize = 4096;
 
 fn now_unix() -> i64 {
     i64::try_from(
@@ -113,7 +116,14 @@ async fn boot_app(initial: &StoredCert) -> AcmeApp {
         Duration::from_secs(10),
         shutdown.child_token(),
     );
-    let app_router = Router::new().route("/health", get(|| async { "ok" }));
+    // A body deliberately larger than the client's 1 KiB read buffer, so every
+    // response spans several reads and the keep-alive drain in
+    // `LiveConnection::request` is exercised on every run rather than only when
+    // TLS happens to split a short body.
+    let app_router = Router::new().route(
+        "/health",
+        get(|| async { "ok".repeat(HEALTH_BODY_REPEATS) }),
+    );
     let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app_router)
@@ -355,17 +365,72 @@ impl LiveConnection {
         Ok(this)
     }
 
-    /// Issue one keep-alive request on the already-established connection.
+    /// Issue one keep-alive request on the already-established connection, and
+    /// read the response *to completion*.
+    ///
+    /// Draining matters because the connection is reused: a `read` may return
+    /// only part of the response (TCP and TLS both split at record boundaries),
+    /// and any bytes left queued would be picked up as the head of the NEXT
+    /// response — so the post-rotation request would see the tail of the
+    /// pre-rotation one and this test would flake in a merge-blocking lane.
     fn request(&mut self) -> std::io::Result<String> {
         write!(
             self.tls,
             "GET /health HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: keep-alive\r\n\r\n"
         )?;
         self.tls.flush()?;
+
+        let mut raw = Vec::new();
         let mut buf = [0_u8; 1024];
-        let read = self.tls.read(&mut buf)?;
-        Ok(String::from_utf8_lossy(&buf[..read]).into_owned())
+
+        // Phase 1: read until the header block is terminated.
+        let header_end = loop {
+            if let Some(at) = find_subslice(&raw, b"\r\n\r\n") {
+                break at + 4;
+            }
+            let read = self.tls.read(&mut buf)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before the response headers were complete",
+                ));
+            }
+            raw.extend_from_slice(&buf[..read]);
+        };
+
+        // Phase 2: read exactly the body the headers announce. These responses
+        // are always `Content-Length`-framed (axum sets it for a sized body); a
+        // response without one has no body to drain.
+        let headers = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while raw.len() - header_end < content_length {
+            let read = self.tls.read(&mut buf)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-body",
+                ));
+            }
+            raw.extend_from_slice(&buf[..read]);
+        }
+
+        Ok(String::from_utf8_lossy(&raw).into_owned())
     }
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Open a fresh connection and return the leaf DER the server presents now.
@@ -578,7 +643,14 @@ async fn near_expiry_certificate_rotates_without_restart_or_dropped_connections(
     .expect("in-flight connection survived the rotation");
     assert!(
         response.starts_with("HTTP/1.1 200"),
-        "in-flight request after rotation failed: {response}"
+        "in-flight request after rotation failed: {}",
+        &response[..response.len().min(200)]
+    );
+    // The whole body came back, so nothing was left queued to corrupt a
+    // subsequent request on this connection.
+    assert!(
+        response.ends_with(&"ok".repeat(HEALTH_BODY_REPEATS)),
+        "the response was not drained to completion"
     );
 
     // The rotated certificate replaced the stored one.

@@ -5662,9 +5662,7 @@ fn resolve_acme_ca_root_data(
 
     // Only the first section is ever installed, so warn when the operator has
     // handed us a bundle: the root is conventionally LAST in one.
-    let certificates = CertificateDer::pem_file_iter(path)
-        .map(|iter| iter.flatten().count())
-        .unwrap_or(1);
+    let certificates = CertificateDer::pem_file_iter(path).map_or(1, |iter| iter.flatten().count());
     if certificates > 1 {
         return AcmeCaRootData::ExtraCertificatesIgnored {
             path: rendered,
