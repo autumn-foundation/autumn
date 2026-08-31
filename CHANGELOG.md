@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One retention policy for every table Autumn creates (#1605):** every
+  deployed Autumn app accumulated framework-owned data forever by default —
+  job history, tracking records, idempotency responses, experiment
+  assignments, webhook replay markers, sessions, audit archives. Retention
+  existed only piecemeal (`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`),
+  so "keep operational data 90 days" meant discovering each subsystem's
+  private knob, finding there often wasn't one, and hand-writing cron jobs
+  against undocumented tables. A new `[retention]` section in `autumn.toml`
+  declares a window per dataset, and Autumn enforces it on a recurring,
+  fleet-coordinated in-process sweep — no external cron:
+
+  ```toml
+  [retention]
+  job_history            = "90d"
+  job_tracking           = "7d"
+  experiment_assignments = "365d"
+  audit_archives         = "400d"
+  ```
+
+  Postgres-backed datasets are swept in bounded batches against the database's
+  own clock; TTL-native stores (idempotency, webhook replay, sessions) have
+  their record TTL *capped* at the window; the JSONL audit archive is rewritten
+  atomically without the stale entries, keeping any line it cannot parse. The
+  pre-existing `jobs.tracking.ttl_secs` / `idempotency.ttl_secs` knobs keep
+  working unchanged: the documented rule is that the **shorter** bound wins, so
+  adding `[retention]` can never cause data to be kept longer than it is today.
+  Leaving a dataset unset registers no sweep task at all.
+
+  Data under a GDPR legal hold (`ModelRegistration::retain`) is never removed —
+  the hold vetoes the whole dataset rather than filtering rows — and every real
+  sweep writes an audit record carrying the dataset, the cutoff timestamp and
+  the rows removed, including one that removed nothing and one a hold blocked.
+  `autumn db retention [--dry-run|--purge] [--dataset X] [--json]` reports the
+  effective window per dataset, which setting produced it, how it is enforced,
+  and how many rows are eligible right now; it runs inside your app binary so
+  the report and the enforcement come from one code path. A
+  `retention.webhook_replay` window shorter than a configured endpoint's
+  `replay_window_secs` fails boot rather than silently weakening replay
+  protection. `AuditEvent` gains a `metadata` map and `AuditSink` a defaulted
+  `purge_before`. See
+  [Data Retention for Framework-Owned Data](docs/guide/data-retention.md).
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted

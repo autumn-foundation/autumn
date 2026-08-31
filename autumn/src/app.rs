@@ -3246,6 +3246,19 @@ impl AppBuilder {
             return;
         }
 
+        // ── Framework data-retention mode ───────────────────────────────
+        // When AUTUMN_DB_RETENTION=report|purge is set, report (or enforce)
+        // the unified `[retention]` policy over every framework-owned dataset
+        // and exit — never starting the HTTP server. Triggered by
+        // `autumn db retention` (issue #1605). Runs inside the app, not from
+        // the standalone CLI, so the report reflects the app's own resolved
+        // config, GDPR legal-hold registrations, and audit sinks — the same
+        // inputs the scheduled sweep uses.
+        if let Some(mode) = framework_retention_mode_from_env() {
+            self.run_framework_retention_mode(mode).await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -3408,6 +3421,27 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
+
+        // #1605: the unified framework-owned data-retention sweep. Registered
+        // here rather than alongside the `#[repository(..., retention(...))]`
+        // policies above because it is config-driven, and the config is only
+        // loaded now. `framework_retention_task` returns `None` unless at
+        // least one `[retention]` window is set, so an app that never
+        // mentions the section gets no extra scheduler loop — the structural
+        // form of "leaving a dataset unset preserves today's behavior
+        // exactly".
+        if let Some(retention_task) =
+            crate::data_retention::framework_retention_task(&config.retention)
+        {
+            tasks.push(retention_task);
+            // Re-validate: the merged-name check above ran before this task
+            // existed, and an app is free to declare a `#[scheduled]` fn
+            // named `autumn-retention-sweep`, which would otherwise spawn two
+            // loops competing for one coordination lock.
+            if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
+                panic!("{error}");
+            }
+        }
 
         // Process role selects which slice of the runtime this replica runs. A
         // split role (web/worker) requires a durable jobs backend the separate
@@ -6143,6 +6177,140 @@ impl AppBuilder {
         }
     }
 
+    /// Report or enforce the unified `[retention]` policy over every
+    /// framework-owned dataset, print the report as JSON, and exit
+    /// (issue #1605).
+    ///
+    /// Triggered by `AUTUMN_DB_RETENTION=report|purge` from `autumn db
+    /// retention`. Boots just enough context to answer honestly — the
+    /// resolved config, the database, and the app's own state initializers,
+    /// which is what installs the [`crate::gdpr::GdprRegistry`] a legal hold
+    /// lives in and the [`crate::audit::AuditLogger`] the sweep records
+    /// through — but no HTTP listener and no job/scheduler machinery.
+    ///
+    /// Running inside the app rather than from the standalone CLI is what
+    /// makes the report trustworthy: it calls the *same*
+    /// [`crate::data_retention::run_retention`] the scheduled sweep calls, so
+    /// what the CLI prints and what the app enforces cannot drift.
+    #[allow(clippy::too_many_lines)]
+    async fn run_framework_retention_mode(self, mode: FrameworkRetentionMode) {
+        let Self {
+            state_initializers,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            ..
+        } = self;
+
+        let dataset_filter = framework_retention_dataset_from_env();
+        // Reject a mistyped `--dataset` before opening a connection: the
+        // registry is compile-time, so this needs no database at all.
+        if let Some(filter) = dataset_filter.as_deref()
+            && crate::data_retention::RetentionDataset::from_key(filter).is_none()
+        {
+            let known: Vec<&str> = crate::data_retention::RETENTION_DATASETS
+                .iter()
+                .map(|dataset| dataset.key())
+                .collect();
+            eprintln!(
+                "autumn db retention: unknown dataset {filter:?}; known datasets: {}",
+                known.join(", ")
+            );
+            std::process::exit(1);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+
+        #[cfg(feature = "db")]
+        let database = match setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("{error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            database.topology.as_ref(),
+            #[cfg(feature = "db")]
+            database.shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        // The app's own state initializers are what install the GDPR registry
+        // (legal holds) and the audit logger (where the sweep record lands).
+        // Skipping them here would make `autumn db retention` report a sweep
+        // the running app would actually refuse, and would silently drop the
+        // audit record for an on-demand purge.
+        run_state_initializers(state_initializers, &state);
+
+        let options = crate::data_retention::RetentionRunOptions {
+            dry_run: mode == FrameworkRetentionMode::Report,
+            dataset: dataset_filter.as_deref(),
+        };
+        // `process::exit` skips `on_shutdown`, so a managed-Postgres
+        // postmaster `setup_database` may have started must be stopped
+        // explicitly before every exit below.
+        match crate::data_retention::run_retention(&state, &options).await {
+            Ok(reports) => match serde_json::to_string(&reports) {
+                Ok(json) => {
+                    println!("{FRAMEWORK_RETENTION_JSON_PREFIX}{json}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    // A dataset that failed is reported in its own row rather
+                    // than aborting the run, but the command as a whole must
+                    // still exit non-zero so a scripted purge doesn't look
+                    // successful.
+                    let exit_code = i32::from(reports.iter().any(|r| r.error.is_some()));
+                    std::process::exit(exit_code);
+                }
+                Err(error) => {
+                    eprintln!("autumn db retention: failed to serialize report: {error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("autumn db retention: {error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        }
+    }
+
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
@@ -6903,6 +7071,57 @@ pub(crate) fn is_list_one_off_tasks_mode() -> bool {
 /// traffic is flipped to the new release.
 pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
+}
+
+/// The `autumn db retention` one-shot mode requested by
+/// `AUTUMN_DB_RETENTION`, if any (issue #1605).
+///
+/// `report` counts what is eligible and deletes nothing; `purge` enforces the
+/// policy immediately. Any other value is rejected loudly rather than
+/// defaulting to either — guessing wrong in one direction deletes data the
+/// operator did not ask to delete.
+pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMode> {
+    let raw = std::env::var(FRAMEWORK_RETENTION_ENV).ok()?;
+    match raw.trim() {
+        "" => None,
+        "report" => Some(FrameworkRetentionMode::Report),
+        "purge" => Some(FrameworkRetentionMode::Purge),
+        other => {
+            eprintln!(
+                "{FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" or \"purge\")"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// The env var `autumn db retention` sets to select the one-shot mode.
+pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
+
+/// The env var `autumn db retention --dataset <key>` sets to narrow the run.
+pub(crate) const FRAMEWORK_RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
+
+/// Line prefix framing the framework retention report on stdout, matched
+/// verbatim by `autumn-cli/src/db/retention.rs`.
+pub(crate) const FRAMEWORK_RETENTION_JSON_PREFIX: &str = "AUTUMN_DB_RETENTION_REPORT=";
+
+/// What `autumn db retention` asked the app to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameworkRetentionMode {
+    /// Count what is eligible; delete nothing.
+    Report,
+    /// Enforce the policy now.
+    Purge,
+}
+
+/// The `--dataset` filter, if one was passed. Blank is treated as absent so a
+/// wrapping script exporting an empty value cannot turn into a not-found
+/// error.
+pub(crate) fn framework_retention_dataset_from_env() -> Option<String> {
+    std::env::var(FRAMEWORK_RETENTION_DATASET_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Whether `AUTUMN_RETENTION_DRY_RUN=1` requests the retention dry-run
@@ -8891,6 +9110,14 @@ async fn load_config_and_telemetry(
     {
         config.server.unix_socket = Some(forced);
     }
+
+    // #1605: tighten every TTL-native subsystem knob to its `[retention]`
+    // window before anything is built from the config, so the cap flows into
+    // the idempotency layer's TTL, the session cookie's Max-Age and Redis
+    // TTL, and `autumn_job_tracking.expires_at` without each of those sites
+    // having to know the policy exists. A pure `min`, so a config with no
+    // `[retention]` section is untouched.
+    config.apply_retention_caps();
 
     // 2. Initialize logging/telemetry via the installed provider, falling
     //    back to the default `tracing-subscriber + OTLP` initializer.

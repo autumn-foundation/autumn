@@ -1,0 +1,960 @@
+//! Unified data-retention policy for framework-owned data (issue #1605).
+//!
+//! Autumn creates and fills persistent stores the application never asked
+//! for — the job queue and its tracking records, idempotency replay records,
+//! sticky experiment assignments, webhook replay markers, sessions, audit
+//! archives. Being batteries-included means owning their lifecycle, so this
+//! module is the one place that:
+//!
+//! 1. enumerates every framework-owned dataset ([`RETENTION_DATASETS`]),
+//! 2. resolves the window each one is actually kept for
+//!    ([`effective_retention`]), reconciling the `[retention]` policy with
+//!    the pre-existing per-subsystem TTL knobs,
+//! 3. refuses to touch anything under a GDPR legal hold ([`legal_hold_for`]),
+//! 4. runs the sweep ([`run_retention`]) — on a recurring in-process schedule
+//!    ([`framework_retention_task`]) and on demand from
+//!    `autumn db retention`, through the *same* code path so the report and
+//!    the enforcement can never disagree, and
+//! 5. writes an audit record for every run.
+//!
+//! Not to be confused with [`crate::retention`], which sweeps **app-defined**
+//! models declared with `#[repository(..., retention(...))]` (issue #1342).
+//! That module owns your tables; this one owns Autumn's.
+//!
+//! See `docs/guide/data-retention.md`.
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::AutumnResult;
+use crate::config::{AutumnConfig, RetentionConfig};
+use crate::gdpr::{ErasureStrategy, GdprRegistry};
+use crate::state::AppState;
+use crate::task::{Schedule, TaskCoordination, TaskInfo};
+
+/// The scheduled-task name the framework sweep registers under.
+///
+/// Shares one namespace with every `#[scheduled(name = "...")]` fn and with
+/// `#[repository(..., retention(...))]`'s generated `retention-sweep-<table>`
+/// names, so it is deliberately prefixed to stay out of the way.
+pub const RETENTION_SWEEP_TASK_NAME: &str = "autumn-retention-sweep";
+
+/// The audit action recorded for every sweep of every dataset.
+pub const RETENTION_AUDIT_ACTION: &str = "retention.sweep";
+
+/// The actor recorded on retention audit events — the framework itself,
+/// never a user.
+pub const RETENTION_AUDIT_ACTOR: &str = "autumn:retention";
+
+/// How many rows one `DELETE` removes. A sweep never issues one unbounded
+/// delete: it walks the stale rows in batches so a single run cannot hold a
+/// long lock or spike replication lag on a hot table.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SWEEP_BATCH_ROWS: i64 = 500;
+
+/// Upper bound on batches per dataset per run. A run that hits this stops and
+/// resumes on the next tick, so a first sweep of a years-old table is spread
+/// over several ticks instead of one very long transaction storm.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SWEEP_MAX_BATCHES: usize = 1_000;
+
+// ── Dataset registry ─────────────────────────────────────────────────────
+
+/// How a dataset's retention window is actually enforced.
+///
+/// The datasets are genuinely heterogeneous — three Postgres tables, three
+/// TTL-native stores, one file archive — and pretending otherwise would mean
+/// a "sweep" that always reports zero for half of them. Reporting the
+/// mechanism per dataset makes that legible instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionEnforcement {
+    /// A scheduled batched `DELETE` against a framework-owned Postgres table.
+    Sweep,
+    /// The storage backend expires the record itself; the retention window is
+    /// enforced by *capping* the TTL the record is written with, so it can
+    /// only ever shorten the lifetime, never extend it.
+    BackendTtl,
+    /// The audit archive is rewritten in place without the stale entries.
+    ArchiveRewrite,
+}
+
+impl std::fmt::Display for RetentionEnforcement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Sweep => "sweep",
+            Self::BackendTtl => "backend ttl",
+            Self::ArchiveRewrite => "archive rewrite",
+        })
+    }
+}
+
+/// One framework-owned persistent dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionDataset {
+    /// Terminal (`completed`/`failed`) rows in `autumn_jobs`.
+    JobHistory,
+    /// Progress/result records in `autumn_job_tracking`.
+    JobTracking,
+    /// Stored idempotency-key responses.
+    Idempotency,
+    /// Sticky rows in `autumn_experiment_assignments`.
+    ExperimentAssignments,
+    /// Inbound webhook replay markers.
+    WebhookReplay,
+    /// Server-side session records.
+    Sessions,
+    /// Entries in the JSONL audit archive.
+    AuditArchives,
+}
+
+/// Every framework-owned dataset, in the order the CLI reports them.
+///
+/// The single list the config surface, the sweeps, the CLI report and the
+/// docs table all derive from.
+pub const RETENTION_DATASETS: [RetentionDataset; 7] = [
+    RetentionDataset::JobHistory,
+    RetentionDataset::JobTracking,
+    RetentionDataset::Idempotency,
+    RetentionDataset::ExperimentAssignments,
+    RetentionDataset::WebhookReplay,
+    RetentionDataset::Sessions,
+    RetentionDataset::AuditArchives,
+];
+
+impl RetentionDataset {
+    /// The `[retention]` config key and CLI `--dataset` value.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::JobHistory => "job_history",
+            Self::JobTracking => "job_tracking",
+            Self::Idempotency => "idempotency",
+            Self::ExperimentAssignments => "experiment_assignments",
+            Self::WebhookReplay => "webhook_replay",
+            Self::Sessions => "sessions",
+            Self::AuditArchives => "audit_archives",
+        }
+    }
+
+    /// Resolve a dataset from its config key. `None` for anything unknown, so
+    /// a mistyped `--dataset` errors rather than silently sweeping nothing.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        RETENTION_DATASETS
+            .into_iter()
+            .find(|dataset| dataset.key() == key)
+    }
+
+    /// One-line description shown in the CLI report and the docs table.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::JobHistory => "Finished job rows (completed/failed) in autumn_jobs",
+            Self::JobTracking => "Tracked-job progress/result records in autumn_job_tracking",
+            Self::Idempotency => "Stored Idempotency-Key responses",
+            Self::ExperimentAssignments => {
+                "Sticky experiment assignments in autumn_experiment_assignments"
+            }
+            Self::WebhookReplay => "Inbound webhook replay markers",
+            Self::Sessions => "Server-side session records",
+            Self::AuditArchives => "Entries in the JSONL audit archive",
+        }
+    }
+
+    /// The Postgres table this dataset lives in, when it lives in one.
+    ///
+    /// Also the key a GDPR legal hold is registered against — see
+    /// [`legal_hold_for`].
+    #[must_use]
+    pub const fn table(self) -> Option<&'static str> {
+        match self {
+            Self::JobHistory => Some("autumn_jobs"),
+            Self::JobTracking => Some("autumn_job_tracking"),
+            Self::ExperimentAssignments => Some("autumn_experiment_assignments"),
+            Self::Idempotency | Self::WebhookReplay | Self::Sessions | Self::AuditArchives => None,
+        }
+    }
+
+    /// How this dataset's window is enforced.
+    #[must_use]
+    pub const fn enforcement(self) -> RetentionEnforcement {
+        match self {
+            Self::JobHistory | Self::JobTracking | Self::ExperimentAssignments => {
+                RetentionEnforcement::Sweep
+            }
+            Self::Idempotency | Self::WebhookReplay | Self::Sessions => {
+                RetentionEnforcement::BackendTtl
+            }
+            Self::AuditArchives => RetentionEnforcement::ArchiveRewrite,
+        }
+    }
+
+    /// What happens with no `[retention]` window set — the documented
+    /// default, "forever" where applicable (AC #7).
+    #[must_use]
+    pub const fn default_behavior(self) -> &'static str {
+        match self {
+            Self::JobHistory | Self::ExperimentAssignments | Self::AuditArchives => "forever",
+            Self::JobTracking => "jobs.tracking.ttl_secs (24h by default)",
+            Self::Idempotency => "idempotency.ttl_secs (24h by default)",
+            Self::WebhookReplay => "the endpoint's replay_window_secs (24h by default)",
+            Self::Sessions => "session.max_age_secs (the session cookie's lifetime)",
+        }
+    }
+
+    /// The pre-existing per-subsystem knob that already bounds this dataset,
+    /// as `(config key, window)` — the other half of the precedence rule in
+    /// [`effective_retention`].
+    fn subsystem_ttl(self, config: &AutumnConfig) -> Option<(&'static str, Duration)> {
+        match self {
+            Self::JobTracking => Some((
+                "jobs.tracking.ttl_secs",
+                Duration::from_secs(config.jobs.tracking.ttl_secs),
+            )),
+            Self::Idempotency => Some((
+                "idempotency.ttl_secs",
+                Duration::from_secs(config.idempotency.ttl_secs),
+            )),
+            Self::Sessions => Some((
+                "session.max_age_secs",
+                Duration::from_secs(config.session.max_age_secs),
+            )),
+            Self::WebhookReplay => {
+                // Replay windows are declared per endpoint; the longest one
+                // is the bound that actually governs how long any marker can
+                // survive, so that is what the unified window competes with.
+                let longest = config
+                    .security
+                    .webhooks
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.replay_window_secs)
+                    .max();
+                longest.map(|secs| {
+                    (
+                        "security.webhooks.endpoints[].replay_window_secs",
+                        Duration::from_secs(secs),
+                    )
+                })
+            }
+            Self::JobHistory | Self::ExperimentAssignments | Self::AuditArchives => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RetentionDataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.key())
+    }
+}
+
+// ── Effective window ─────────────────────────────────────────────────────
+
+/// Where a dataset's effective retention window came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionSource {
+    /// Nothing bounds this dataset: it is kept forever.
+    Unset,
+    /// The `[retention]` policy window is what actually applies.
+    Policy,
+    /// A pre-existing per-subsystem knob is what actually applies, named
+    /// here by its config key.
+    SubsystemTtl(&'static str),
+}
+
+impl std::fmt::Display for RetentionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unset => f.write_str("unset"),
+            Self::Policy => f.write_str("[retention]"),
+            Self::SubsystemTtl(key) => write!(f, "{key}"),
+        }
+    }
+}
+
+/// A dataset's resolved retention window and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveRetention {
+    /// The dataset this describes.
+    pub dataset: RetentionDataset,
+    /// How long records are kept. `None` means forever.
+    pub window: Option<Duration>,
+    /// Which setting produced [`Self::window`].
+    pub source: RetentionSource,
+}
+
+/// Resolve how long `dataset` is actually kept for.
+///
+/// **Precedence (AC #3): the shorter bound wins.** The pre-existing
+/// per-subsystem knobs (`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`,
+/// `session.max_age_secs`, a webhook endpoint's `replay_window_secs`) keep
+/// their exact meaning and keep working with no `[retention]` section at all.
+/// A `[retention]` window is an *additional, independent ceiling*: with both
+/// set, records live for `min(subsystem ttl, policy window)`.
+///
+/// That rule is chosen so the unified section can only ever tighten
+/// retention, never silently extend a bound the operator already set
+/// elsewhere — there is no configuration in which adding `[retention]` causes
+/// data to be kept *longer* than it is today.
+#[must_use]
+pub fn effective_retention(config: &AutumnConfig, dataset: RetentionDataset) -> EffectiveRetention {
+    let policy = config.retention.window(dataset.key());
+    let subsystem = dataset.subsystem_ttl(config);
+    let (window, source) = match (policy, subsystem) {
+        (None, None) => (None, RetentionSource::Unset),
+        (Some(policy), None) => (Some(policy), RetentionSource::Policy),
+        (None, Some((key, ttl))) => (Some(ttl), RetentionSource::SubsystemTtl(key)),
+        (Some(policy), Some((key, ttl))) => {
+            if policy <= ttl {
+                (Some(policy), RetentionSource::Policy)
+            } else {
+                (Some(ttl), RetentionSource::SubsystemTtl(key))
+            }
+        }
+    };
+    EffectiveRetention {
+        dataset,
+        window,
+        source,
+    }
+}
+
+// ── Legal hold ───────────────────────────────────────────────────────────
+
+/// The legal-hold reason blocking `dataset` from ever being swept, if any
+/// (AC #5).
+///
+/// A dataset is on hold when its backing table is registered in the
+/// application's [`GdprRegistry`] with [`ErasureStrategy::Retain`] — the same
+/// registration that already exempts a table from a GDPR erasure request.
+/// Holding data is a legal obligation that outranks a retention window, so
+/// this is a **veto over the whole dataset**, not a row filter: a sweep that
+/// cannot tell held rows from unheld ones must not delete any of them.
+///
+/// Datasets with no backing table (`idempotency`, `webhook_replay`,
+/// `sessions`, `audit_archives`) can never be placed on hold this way, since
+/// a GDPR registration names a table.
+#[must_use]
+pub fn legal_hold_for(
+    dataset: RetentionDataset,
+    registry: Option<&GdprRegistry>,
+) -> Option<String> {
+    let table = dataset.table()?;
+    let registration = registry?.get(table)?;
+    if registration.erasure_strategy != ErasureStrategy::Retain {
+        return None;
+    }
+    Some(
+        registration
+            .retain_reason
+            .clone()
+            .unwrap_or_else(|| format!("{table} is registered under GDPR legal hold")),
+    )
+}
+
+// ── Report ───────────────────────────────────────────────────────────────
+
+/// What one dataset's retention looks like, and what a run did to it.
+///
+/// The same struct backs the scheduler's log line, the audit record, and the
+/// `autumn db retention` report, so those three can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionDatasetReport {
+    /// The dataset's config key (`job_history`, …).
+    pub dataset: String,
+    /// One-line human-readable description.
+    pub description: String,
+    /// How the window is enforced (`sweep` / `backend ttl` / `archive rewrite`).
+    pub enforcement: String,
+    /// The effective window in seconds. `None` means "kept forever".
+    pub window_secs: Option<u64>,
+    /// Which setting produced the window (`[retention]`, a subsystem key, or
+    /// `unset`).
+    pub source: String,
+    /// The instant records older than which are eligible, RFC-3339. `None`
+    /// when nothing bounds the dataset.
+    pub cutoff: Option<String>,
+    /// Rows/entries currently older than the cutoff. `None` when the dataset
+    /// cannot be counted from here (a TTL-native store the backend expires
+    /// on its own).
+    pub eligible_rows: Option<u64>,
+    /// Rows/entries actually removed by this run (always `0` for a dry run).
+    pub rows_removed: u64,
+    /// `true` when nothing was deleted.
+    pub dry_run: bool,
+    /// Why this dataset was not swept, when it was not: a legal hold, a
+    /// missing database, or a backend that expires records itself.
+    pub skipped: Option<String>,
+    /// Wall-clock time this dataset's pass took, in milliseconds.
+    pub duration_ms: u64,
+    /// The error this dataset's pass failed with, if it did. One dataset
+    /// failing never aborts the others.
+    pub error: Option<String>,
+}
+
+/// Options for one [`run_retention`] pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RetentionRunOptions<'a> {
+    /// Count what would be removed and delete nothing.
+    pub dry_run: bool,
+    /// Restrict the run to one dataset key. `None` runs every dataset.
+    pub dataset: Option<&'a str>,
+}
+
+// ── Engine ───────────────────────────────────────────────────────────────
+
+/// Run the retention policy over every configured dataset (or the one named
+/// by [`RetentionRunOptions::dataset`]).
+///
+/// This is the single engine behind both the recurring in-process sweep and
+/// `autumn db retention` — the CLI never re-implements the policy, so the
+/// numbers it reports are the numbers the app enforces.
+///
+/// A dataset that errors is reported in its own
+/// [`RetentionDatasetReport::error`] and never aborts the rest of the run: a
+/// transient pool timeout on one table must not stop another table from being
+/// bounded.
+///
+/// Every dataset that was actually eligible to be swept emits an audit record
+/// carrying the dataset, the cutoff, and the number of rows removed (AC #6).
+///
+/// # Errors
+///
+/// Returns an error only when [`RetentionRunOptions::dataset`] names a
+/// dataset that does not exist — a mistyped `--dataset` must fail loudly
+/// rather than silently sweep nothing.
+pub async fn run_retention(
+    state: &AppState,
+    options: &RetentionRunOptions<'_>,
+) -> AutumnResult<Vec<RetentionDatasetReport>> {
+    let datasets = resolve_datasets(options.dataset)?;
+    let config = state.config_arc();
+    let mut reports = Vec::with_capacity(datasets.len());
+    for dataset in datasets {
+        let report = run_one_dataset(state, &config, dataset, options.dry_run).await;
+        audit_sweep(state, &report).await;
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+/// Resolve a `--dataset` filter to the datasets a run should cover.
+///
+/// # Errors
+///
+/// Returns a not-found error naming the valid keys when `filter` matches no
+/// registered dataset.
+fn resolve_datasets(filter: Option<&str>) -> AutumnResult<Vec<RetentionDataset>> {
+    let Some(filter) = filter else {
+        return Ok(RETENTION_DATASETS.to_vec());
+    };
+    RetentionDataset::from_key(filter).map_or_else(
+        || {
+            let known: Vec<&str> = RETENTION_DATASETS.iter().map(|d| d.key()).collect();
+            Err(crate::AutumnError::not_found_msg(format!(
+                "unknown retention dataset {filter:?}; known datasets: {}",
+                known.join(", ")
+            )))
+        },
+        |dataset| Ok(vec![dataset]),
+    )
+}
+
+/// Run (or dry-run) one dataset's pass, capturing every outcome into a
+/// report rather than propagating it.
+async fn run_one_dataset(
+    state: &AppState,
+    config: &AutumnConfig,
+    dataset: RetentionDataset,
+    dry_run: bool,
+) -> RetentionDatasetReport {
+    let started = std::time::Instant::now();
+    let effective = effective_retention(config, dataset);
+    let cutoff = effective
+        .window
+        .and_then(|window| chrono::Duration::from_std(window).ok())
+        .map(|window| Utc::now() - window);
+
+    let mut report = RetentionDatasetReport {
+        dataset: dataset.key().to_owned(),
+        description: dataset.description().to_owned(),
+        enforcement: dataset.enforcement().to_string(),
+        window_secs: effective.window.map(|w| w.as_secs()),
+        source: effective.source.to_string(),
+        cutoff: cutoff.map(|c| c.to_rfc3339()),
+        eligible_rows: None,
+        rows_removed: 0,
+        dry_run,
+        skipped: None,
+        duration_ms: 0,
+        error: None,
+    };
+
+    let Some(cutoff) = cutoff else {
+        report.skipped = Some("no retention window configured".to_owned());
+        report.duration_ms = elapsed_ms(started);
+        return report;
+    };
+
+    // A legal hold outranks the window: check it before doing any counting,
+    // so a held dataset never even reads the rows it must not delete.
+    let registry = state.extension::<GdprRegistry>();
+    if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
+        report.skipped = Some(format!("legal hold: {reason}"));
+        report.duration_ms = elapsed_ms(started);
+        return report;
+    }
+
+    match dataset.enforcement() {
+        RetentionEnforcement::Sweep => {
+            apply_sweep(state, dataset, cutoff, dry_run, &mut report).await;
+        }
+        RetentionEnforcement::BackendTtl => {
+            // Not a sweep: the window is applied when the record is written,
+            // by capping its TTL (`AutumnConfig::apply_retention_caps`).
+            // There is nothing here to count or delete — and saying so beats
+            // reporting a fake zero.
+            report.skipped = Some(format!(
+                "enforced at write time: records are stored with a TTL capped at {}s by the \
+                 backend, not deleted by this sweep",
+                effective.window.map_or(0, |window| window.as_secs())
+            ));
+        }
+        RetentionEnforcement::ArchiveRewrite => {
+            apply_archive_purge(state, cutoff, dry_run, &mut report).await;
+        }
+    }
+
+    report.duration_ms = elapsed_ms(started);
+    report
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Purge stale audit-archive entries through the installed [`AuditLogger`].
+async fn apply_archive_purge(
+    state: &AppState,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+    report: &mut RetentionDatasetReport,
+) {
+    let Some(logger) = state.extension::<crate::audit::AuditLogger>() else {
+        report.skipped = Some("no audit logger is installed".to_owned());
+        return;
+    };
+    // Count first so a real run can still report what was eligible — the
+    // rewrite itself reports only what it removed.
+    match logger.purge_before(cutoff, true).await {
+        Ok(outcome) if !outcome.supported => {
+            report.skipped = Some(
+                "no installed audit sink supports purging (see AuditSink::purge_before)".to_owned(),
+            );
+            return;
+        }
+        Ok(outcome) => report.eligible_rows = Some(outcome.entries_removed),
+        Err(error) => {
+            report.error = Some(error.to_string());
+            return;
+        }
+    }
+    if dry_run {
+        return;
+    }
+    match logger.purge_before(cutoff, false).await {
+        Ok(outcome) => report.rows_removed = outcome.entries_removed,
+        Err(error) => report.error = Some(error.to_string()),
+    }
+}
+
+// ── Postgres sweeps ──────────────────────────────────────────────────────
+
+/// The `WHERE` clause selecting stale rows for a sweep-enforced dataset,
+/// with `$1` bound to the cutoff timestamp.
+///
+/// Every predicate is deliberately conservative about what "stale" means:
+/// `job_history` only ever matches rows in a **terminal** state with a
+/// recorded `finished_at`, so a job that is enqueued, running, or waiting on
+/// a retry is untouchable no matter how old its row is.
+#[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
+#[must_use]
+const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str, &'static str)> {
+    match dataset {
+        RetentionDataset::JobHistory => Some((
+            "autumn_jobs",
+            "status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < $1",
+        )),
+        RetentionDataset::JobTracking => Some(("autumn_job_tracking", "updated_at < $1")),
+        RetentionDataset::ExperimentAssignments => {
+            Some(("autumn_experiment_assignments", "assigned_at < $1"))
+        }
+        RetentionDataset::Idempotency
+        | RetentionDataset::WebhookReplay
+        | RetentionDataset::Sessions
+        | RetentionDataset::AuditArchives => None,
+    }
+}
+
+/// The primary-key column each sweepable table batches by.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
+    match dataset {
+        RetentionDataset::JobTracking => "key",
+        _ => "id",
+    }
+}
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn apply_sweep(
+    state: &AppState,
+    dataset: RetentionDataset,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+    report: &mut RetentionDatasetReport,
+) {
+    let Some(pool) = state.pool().cloned() else {
+        report.skipped =
+            Some("no database is configured, so this dataset has no rows here".to_owned());
+        return;
+    };
+    match sweep_postgres(&pool, dataset, cutoff, dry_run).await {
+        Ok((eligible, removed)) => {
+            report.eligible_rows = Some(eligible);
+            report.rows_removed = removed;
+        }
+        Err(error) => report.error = Some(error.to_string()),
+    }
+}
+
+/// The sweep-enforced datasets are Postgres-only: `autumn_jobs`,
+/// `autumn_job_tracking` and `autumn_experiment_assignments` are created by
+/// Postgres-specific migrations (`TIMESTAMPTZ`, `BIGSERIAL`, a `plpgsql`
+/// notify trigger), and the Postgres job backend is itself unsupported under
+/// the `sqlite` feature. Report that rather than pretending a sweep ran —
+/// mirrors `job.rs`'s own `sqlite`-feature fallback.
+#[cfg(any(not(feature = "db"), feature = "sqlite"))]
+#[allow(clippy::unused_async)]
+async fn apply_sweep(
+    _state: &AppState,
+    _dataset: RetentionDataset,
+    _cutoff: DateTime<Utc>,
+    _dry_run: bool,
+    report: &mut RetentionDatasetReport,
+) {
+    report.skipped = Some(
+        if cfg!(feature = "sqlite") {
+            "this dataset lives in a Postgres-only framework table, which the sqlite feature \
+             does not create"
+        } else {
+            "this build has no database support (`db` feature off)"
+        }
+        .to_owned(),
+    );
+}
+
+/// Count stale rows and, unless `dry_run`, delete them in bounded batches.
+///
+/// Returns `(eligible_before, removed)`.
+/// The pooled Postgres handle `AppState::pool()` hands out. Aliased locally
+/// (as `job.rs` does) rather than imported, so a build without Postgres never
+/// names a diesel type.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+type PgPool = diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn sweep_postgres(
+    pool: &PgPool,
+    dataset: RetentionDataset,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+) -> AutumnResult<(u64, u64)> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    let Some((table, predicate)) = stale_row_predicate(dataset) else {
+        return Ok((0, 0));
+    };
+    let key = sweep_key_column(dataset);
+    let mut conn = pool.get().await.map_err(|e| {
+        crate::AutumnError::internal_server_error_msg(format!(
+            "retention sweep could not acquire a connection: {e}"
+        ))
+    })?;
+
+    let eligible: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
+    ))
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .get_result::<CountRow>(&mut *conn)
+    .await
+    .map(|row| row.count)
+    .map_err(|e| {
+        crate::AutumnError::internal_server_error_msg(format!(
+            "retention count for {table} failed: {e}"
+        ))
+    })?;
+    let eligible = u64::try_from(eligible).unwrap_or(0);
+
+    if dry_run || eligible == 0 {
+        return Ok((eligible, 0));
+    }
+
+    // Batched deletes: never one unbounded DELETE over a hot table. The
+    // sub-select is re-evaluated per batch, so rows that stop qualifying
+    // between batches are simply not picked up.
+    let mut removed: u64 = 0;
+    for _ in 0..SWEEP_MAX_BATCHES {
+        let affected = diesel::sql_query(format!(
+            "DELETE FROM {table} WHERE {key} IN \
+             (SELECT {key} FROM {table} WHERE {predicate} LIMIT $2)"
+        ))
+        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+        .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            crate::AutumnError::internal_server_error_msg(format!(
+                "retention sweep of {table} failed: {e}"
+            ))
+        })?;
+        removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
+        if affected < usize::try_from(SWEEP_BATCH_ROWS).unwrap_or(usize::MAX) {
+            break;
+        }
+    }
+    Ok((eligible, removed))
+}
+
+// ── Audit record (AC #6) ─────────────────────────────────────────────────
+
+/// Write the auditable record for one dataset's pass: dataset, cutoff, and
+/// rows removed (AC #6).
+///
+/// Recorded for every real sweep of a bounded dataset, including one that
+/// removed zero rows — "we enforced the policy and there was nothing to
+/// delete" is a claim a compliance reviewer needs evidence for, and the
+/// volume is bounded by the number of configured datasets times the sweep
+/// interval.
+///
+/// Deliberately *not* recorded for:
+///
+/// - a dry run, which deletes nothing and so is not a sweep;
+/// - a dataset with no window, or one whose backend expires records itself —
+///   there is no deletion to attribute;
+///
+/// but a dataset held back by a **legal hold** *is* recorded even though
+/// nothing was deleted: "the policy wanted to delete this and did not" is
+/// exactly what a reviewer needs to see.
+async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
+    let is_legal_hold = report
+        .skipped
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("legal hold:"));
+    let swept = !report.dry_run && (report.eligible_rows.is_some() || report.error.is_some());
+    if !swept && !is_legal_hold {
+        return;
+    }
+
+    tracing::info!(
+        target: "autumn.audit",
+        dataset = %report.dataset,
+        cutoff = report.cutoff.as_deref().unwrap_or("-"),
+        eligible_rows = report.eligible_rows.unwrap_or(0),
+        rows_removed = report.rows_removed,
+        dry_run = report.dry_run,
+        skipped = report.skipped.as_deref().unwrap_or(""),
+        error = report.error.as_deref().unwrap_or(""),
+        "retention_sweep"
+    );
+
+    let status = if report.error.is_some() {
+        crate::audit::AuditStatus::Failure
+    } else {
+        crate::audit::AuditStatus::Success
+    };
+    let mut event = crate::audit::AuditEvent::new(
+        RETENTION_AUDIT_ACTOR,
+        RETENTION_AUDIT_ACTION,
+        report.dataset.clone(),
+        None,
+        status,
+    )
+    .with_metadata("dataset", report.dataset.clone())
+    .with_metadata("cutoff", report.cutoff.clone().unwrap_or_default())
+    .with_metadata("rows_removed", report.rows_removed.to_string())
+    .with_metadata("dry_run", report.dry_run.to_string());
+    if let Some(eligible) = report.eligible_rows {
+        event = event.with_metadata("eligible_rows", eligible.to_string());
+    }
+    if let Some(skipped) = report.skipped.as_deref() {
+        event = event.with_metadata("skipped", skipped);
+    }
+    if let Some(error) = report.error.as_deref() {
+        event = event.with_metadata("error", error);
+    }
+
+    if let Err(error) = crate::audit::write_from_state(state, event).await {
+        tracing::warn!(
+            error = %error,
+            dataset = %report.dataset,
+            "retention sweep audit record could not be written"
+        );
+    }
+}
+
+// ── Scheduled task (AC #2) ───────────────────────────────────────────────
+
+/// The recurring in-process sweep, or `None` when no dataset declares a
+/// window.
+///
+/// Returning `None` is what makes AC #1's "leaving a dataset unset preserves
+/// today's behavior exactly" structural rather than a promise each sweeper
+/// has to keep: with nothing configured, no task is registered, no scheduler
+/// loop is spawned, and no query is ever issued.
+///
+/// Registered as a [`TaskCoordination::Fleet`] task so a multi-replica
+/// deployment runs the sweep once per tick, not once per replica.
+#[must_use]
+pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
+    if !config.any_window_configured() {
+        return None;
+    }
+    Some(TaskInfo {
+        name: RETENTION_SWEEP_TASK_NAME.to_owned(),
+        schedule: Schedule::FixedDelay(config.sweep_interval_duration()),
+        coordination: TaskCoordination::Fleet,
+        handler: |state| {
+            Box::pin(async move {
+                let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
+                for report in &reports {
+                    if let Some(error) = report.error.as_deref() {
+                        tracing::warn!(
+                            dataset = %report.dataset,
+                            error,
+                            "framework retention sweep failed for one dataset"
+                        );
+                    }
+                }
+                Ok(())
+            })
+        },
+    })
+}
+
+// ── TTL capping for backend-expired datasets ─────────────────────────────
+
+/// Cap `ttl` at the dataset's effective retention window.
+///
+/// The TTL-native datasets (`idempotency`, `webhook_replay`, `sessions`) are
+/// expired by their own backend, so their retention window is enforced by
+/// writing records with a shorter TTL rather than by deleting them later.
+/// Because the cap is a `min`, this can only shorten a record's life — a
+/// window longer than the subsystem TTL is a no-op, exactly as
+/// [`effective_retention`] reports.
+#[must_use]
+pub fn capped_ttl(config: &AutumnConfig, dataset: RetentionDataset, ttl: Duration) -> Duration {
+    config
+        .retention
+        .window(dataset.key())
+        .map_or(ttl, |window| ttl.min(window))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_ttl_is_a_no_op_without_a_window() {
+        let config = AutumnConfig::default();
+        assert_eq!(
+            capped_ttl(
+                &config,
+                RetentionDataset::Idempotency,
+                Duration::from_secs(86_400)
+            ),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn capped_ttl_shortens_but_never_extends() {
+        let mut config = AutumnConfig::default();
+        config.retention.idempotency = Some("1h".to_owned());
+        assert_eq!(
+            capped_ttl(
+                &config,
+                RetentionDataset::Idempotency,
+                Duration::from_secs(86_400)
+            ),
+            Duration::from_secs(3_600),
+            "a shorter window must win"
+        );
+        assert_eq!(
+            capped_ttl(
+                &config,
+                RetentionDataset::Idempotency,
+                Duration::from_secs(60)
+            ),
+            Duration::from_secs(60),
+            "a longer window must never extend an already-shorter TTL"
+        );
+    }
+
+    #[test]
+    fn resolve_datasets_defaults_to_every_dataset() {
+        assert_eq!(
+            resolve_datasets(None).expect("no filter always resolves"),
+            RETENTION_DATASETS.to_vec()
+        );
+    }
+
+    #[test]
+    fn resolve_datasets_rejects_an_unknown_key_and_lists_the_valid_ones() {
+        let error = resolve_datasets(Some("jobs")).expect_err("a typo must fail loudly");
+        let message = error.to_string();
+        assert!(message.contains("jobs"), "{message}");
+        assert!(
+            message.contains("job_history"),
+            "the error must list the valid keys: {message}"
+        );
+    }
+
+    #[test]
+    fn job_history_never_matches_a_live_job_row() {
+        // Regression guard for the single most dangerous thing this module
+        // could get wrong: a predicate that reaches an enqueued, running, or
+        // retry-scheduled job.
+        let (table, predicate) =
+            stale_row_predicate(RetentionDataset::JobHistory).expect("job_history is sweepable");
+        assert_eq!(table, "autumn_jobs");
+        assert!(
+            predicate.contains("status IN ('completed', 'failed')"),
+            "{predicate}"
+        );
+        assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
+    }
+
+    #[test]
+    fn ttl_enforced_datasets_have_no_sweep_predicate() {
+        for dataset in RETENTION_DATASETS {
+            if dataset.enforcement() == RetentionEnforcement::Sweep {
+                assert!(stale_row_predicate(dataset).is_some(), "{dataset}");
+            } else {
+                assert!(
+                    stale_row_predicate(dataset).is_none(),
+                    "{dataset} is not sweep-enforced but has a sweep predicate"
+                );
+            }
+        }
+    }
+}

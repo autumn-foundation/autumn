@@ -33,6 +33,12 @@ pub mod s3;
 /// production guard ([`guard_destructive`]) and identifier-quoting verbatim.
 pub mod scrub;
 
+/// `autumn db retention` — report, dry-run, and on-demand purge of the
+/// unified data-retention policy for framework-owned data (issue #1605).
+/// A submodule for namespacing only: it drives the app binary rather than
+/// connecting to Postgres itself, so it shares no helpers with this module.
+pub mod retention;
+
 /// The lifecycle subcommands of `autumn db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbCommand {

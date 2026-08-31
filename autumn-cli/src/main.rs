@@ -1809,6 +1809,60 @@ enum DbCommands {
         #[arg(long)]
         allow_source_overwrite: bool,
     },
+    /// Report, dry-run, or enforce the retention policy for framework-owned data.
+    ///
+    /// Autumn creates and fills persistent stores your app never asked for —
+    /// the job queue and its tracking records, idempotency replay records,
+    /// sticky experiment assignments, webhook replay markers, sessions, audit
+    /// archives. This reports every one of them: the retention window in
+    /// effect, which setting produced it, how it is enforced, and how many
+    /// rows are eligible for purge right now.
+    ///
+    /// Windows are declared in the `[retention]` section of `autumn.toml` and
+    /// are enforced automatically on a recurring in-process sweep — this
+    /// command is for inspecting the policy and for running it on demand, not
+    /// a cron replacement.
+    ///
+    /// Runs your application binary (compiling it first if needed) so the
+    /// report reflects the app's own resolved config, GDPR legal holds, and
+    /// audit sinks.
+    ///
+    /// # Examples
+    ///
+    ///   # What is kept, and how much is eligible right now:
+    ///   autumn db retention
+    ///
+    ///   # What a sweep would delete, without deleting it:
+    ///   autumn db retention --dry-run
+    ///
+    ///   # Enforce the policy now, for one dataset:
+    ///   autumn db retention --purge --dataset job_history
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Restrict to one dataset (`job_history`, `job_tracking`,
+        /// `idempotency`, `experiment_assignments`, `webhook_replay`,
+        /// `sessions`, `audit_archives`).
+        #[arg(long, value_name = "DATASET")]
+        dataset: Option<String>,
+        /// Report what a sweep would remove, without removing anything.
+        #[arg(long, conflicts_with = "purge")]
+        dry_run: bool,
+        /// Enforce the configured policy immediately.
+        #[arg(long)]
+        purge: bool,
+        /// Print the raw JSON report instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
@@ -1839,9 +1893,11 @@ impl DbCommands {
             | Self::Backup { .. }
             | Self::Restore { .. }
             | Self::Scrub { .. }
+            | Self::Retention { .. }
             | Self::Offsite(_) => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/offsite are dispatched before into_command"
+                    "db pull/backup/restore/scrub/retention/offsite are dispatched before \
+                     into_command"
                 )
             }
         }
@@ -3650,6 +3706,22 @@ fn run_command(command: Commands) {
                 force,
                 allow_source_overwrite,
             }),
+            DbCommands::Retention {
+                package,
+                bin,
+                profile,
+                dataset,
+                dry_run,
+                purge,
+                json,
+            } => db::retention::run(&db::retention::RetentionOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                profile: &profile,
+                mode: db_retention_mode(dry_run, purge),
+                dataset: dataset.as_deref(),
+                json,
+            }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
             }
@@ -4370,6 +4442,23 @@ fn run_replay_command(
         features,
         no_default_features,
     });
+}
+
+/// Map the `--dry-run` / `--purge` flags onto a [`db::retention::RetentionMode`]
+/// (issue #1605).
+///
+/// Neither flag means "report": the default is always read-only. Clap already
+/// rejects passing both, but the ordering here makes the safe direction the
+/// fallback rather than a coincidence — a future flag-handling change can only
+/// ever fail towards *not* deleting.
+const fn db_retention_mode(dry_run: bool, purge: bool) -> db::retention::RetentionMode {
+    if purge {
+        db::retention::RetentionMode::Purge
+    } else if dry_run {
+        db::retention::RetentionMode::DryRun
+    } else {
+        db::retention::RetentionMode::Report
+    }
 }
 
 fn run_task_command(
@@ -6424,6 +6513,89 @@ mod tests {
             panic!("expected db offsite list");
         };
         assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    // ── autumn db retention tests (issue #1605) ────────────────────────────
+
+    #[test]
+    fn parse_db_retention_defaults_to_a_read_only_report() {
+        let cli = Cli::try_parse_from(["autumn", "db", "retention"]).unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "dev");
+        assert_eq!(dataset, None);
+        assert!(!dry_run);
+        assert!(!purge, "the bare command must never delete anything");
+        assert!(!json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Report
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_with_dataset_and_purge() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "retention",
+            "--purge",
+            "--dataset",
+            "job_history",
+            "--profile",
+            "prod",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "prod");
+        assert_eq!(dataset.as_deref(), Some("job_history"));
+        assert!(!dry_run);
+        assert!(purge);
+        assert!(json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Purge
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_dry_run_conflicts_with_purge() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "retention", "--dry-run", "--purge"]).is_err(),
+            "--dry-run and --purge are contradictory and must not both be accepted"
+        );
+    }
+
+    #[test]
+    fn db_retention_mode_falls_back_to_report() {
+        assert_eq!(
+            db_retention_mode(false, false),
+            db::retention::RetentionMode::Report
+        );
+        assert_eq!(
+            db_retention_mode(true, false),
+            db::retention::RetentionMode::DryRun
+        );
     }
 
     // ── autumn db scrub tests (issue #1602) ────────────────────────────────

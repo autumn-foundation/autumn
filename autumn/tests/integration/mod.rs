@@ -114,6 +114,9 @@ mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
+mod framework_retention;
+#[cfg(feature = "db")]
+mod framework_retention_pg;
 mod graceful_shutdown_contract;
 mod health_indicator_integration;
 mod hooks_lifecycle;

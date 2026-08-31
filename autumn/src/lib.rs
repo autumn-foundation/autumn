@@ -324,8 +324,15 @@ pub mod repository;
 pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
-#[cfg(feature = "db")]
 pub mod retention;
+
+/// Unified retention policy for framework-owned data (issue #1605).
+///
+/// Not gated on `db`: three of the seven datasets (idempotency, webhook
+/// replay, sessions) and the audit archive exist in database-free builds too,
+/// and the policy surface — the dataset registry, the effective-window rules,
+/// the CLI report — must be answerable either way.
+pub mod data_retention;
 
 /// Read-your-own-writes routing support.
 ///

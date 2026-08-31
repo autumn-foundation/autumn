@@ -186,7 +186,9 @@ and how long you keep them:
   your log store's retention.
 - **JSONL file** → each line is a self-describing JSON object, so `jq`, `grep`,
   or bulk-loading into a warehouse all work; rotate/retain the file with your
-  normal log-rotation tooling.
+  normal log-rotation tooling, or set `retention.audit_archives` and let Autumn
+  prune stale entries in place — see
+  [Data Retention for Framework-Owned Data](data-retention.md).
 - **Custom DB sink** → query with SQL. Keep audit rows immutable by default:
   grant the app `INSERT`-only on the audit table, and never `UPDATE`/`DELETE`
   an existing event from request-handling code. If you also want automatic
