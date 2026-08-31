@@ -6027,6 +6027,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // manual impl so values never leak through `Debug`/panic output — including
     // update payloads whose `Patch<String>` would otherwise print `Set("secret")`
     // (#805 AC, composes with #697).
+    // (`factory_name` is bound here rather than beside the factory builder so
+    // the redacting Debug impl below can name it, mirroring `changeset_name`.)
+    let factory_name = format_ident!("{name}Factory");
     let lock_version_ident: Option<&syn::Ident> = lock_version_field.and_then(|f| f.ident.as_ref());
     let mutable_idents: Vec<&syn::Ident> = fields_for_new
         .iter()
@@ -6042,8 +6045,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         update_debug_impl,
         changeset_debug_derive,
         changeset_debug_impl,
+        factory_debug_derive,
+        factory_debug_impl,
     ) = if encrypted_columns.is_empty() && classified_columns.is_empty() {
         (
+            quote! { Debug, },
+            quote! {},
             quote! { Debug, },
             quote! {},
             quote! { Debug, },
@@ -6088,6 +6095,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             redacting_debug_impl(
                 &changeset_name,
                 &mutable_idents,
+                &encrypted_column_names,
+                &classified_column_names,
+            ),
+            // #2373: the factory holds the same plaintext-bearing columns and is
+            // the struct most likely to be printed while debugging a test, so it
+            // gets the same redacting `Debug` as the other four rather than a
+            // derived one.
+            quote! {},
+            redacting_debug_impl(
+                &factory_name,
+                &new_idents,
                 &encrypted_column_names,
                 &classified_column_names,
             ),
@@ -6998,8 +7016,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // ── Factory builder ────────────────────────────────────────
-    let factory_name = format_ident!("{name}Factory");
-
     // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
     // no PK can be detected (the factory will fail to compile at the call site,
     // which is a better diagnostic than a macro panic).
@@ -7034,7 +7050,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             if factory_assoc_type(f).is_some() {
                 quote! { pub #ident: ::core::option::Option<#ty> }
             } else {
-                quote! { pub #ident: #ty }
+                // #2373: the factory field is `pub` and lives for the whole
+                // builder chain, so a bare `String` here was a way around the
+                // guarantee entirely -- `Customer::factory().email` could be
+                // moved into a serializable view with no boundary and no audit
+                // record. Classifying only at `build()` time was too late. The
+                // factory is emitted in every build, not just test ones.
+                let field_ty = model_field_ty(f);
+                quote! { pub #ident: #field_ty }
             }
         })
         .collect();
@@ -7072,10 +7095,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             factory_assoc_type(f).map_or_else(
                 // Normal field: a single setter that assigns directly.
                 || {
+                    // #2373: the setter keeps its `impl Into<#ty>` bound over the
+                    // *declared* type and classifies inside. Binding it to the
+                    // wrapper instead would break every `.email("ada@example.com")`
+                    // call, because `Classified<String, F>` only converts from
+                    // `String` -- not from `&str` -- and a blanket
+                    // `From<U: Into<T>>` would overlap the existing `From<T>`.
+                    // Taking plaintext *in* is not a release, so the setter is
+                    // the right place to wrap: the value is classified from the
+                    // moment it is stored, and callers are unaffected.
+                    let store = if classified_marker_for(f).is_some() {
+                        quote! { ::autumn_web::classify::Classified::new(val.into()) }
+                    } else {
+                        quote! { val.into() }
+                    };
                     vec![quote! {
                         #[must_use]
                         pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
-                            self.#ident = val.into();
+                            self.#ident = #store;
                             self.__autumn_set.insert(#field_lit);
                             self
                         }
@@ -7132,6 +7169,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let field_lit = ident.to_string();
+            // #2373: the stored field is now the wrapper, but `fake_expr_for_field`
+            // yields a plain value, so the generated side is classified to match.
+            let fake_wrap = |expr: TokenStream| -> TokenStream {
+                if classified_marker_for(f).is_some() {
+                    quote! { ::autumn_web::classify::Classified::new(#expr) }
+                } else {
+                    expr
+                }
+            };
             fake_expr_for_field(ident, &f.ty).map_or_else(
                 // No fake expression available for this type: leave the value
                 // as-is (its Default when `.fake()` was requested).
@@ -7141,6 +7187,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 },
                 |fake_expr| {
+                    let fake_expr = fake_wrap(fake_expr);
                     quote! {
                         let #ident = if self.__autumn_fake
                             && !self.__autumn_set.contains(#field_lit)
@@ -7192,17 +7239,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Struct-shorthand field list for `NewX { … }` (local bindings named to match).
-    // #1654: a classified column's binding is a plain value from the factory's
-    // fake/default data, so it is classified here rather than at every producer.
+    // #2373: the factory now stores the wrapper, so the binding already has the
+    // write struct's field type and no conversion is needed here.
     let new_construct_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            if classified_marker_for(f).is_some() {
-                quote! { #ident: ::autumn_web::classify::Classified::new(#ident) }
-            } else {
-                quote! { #ident }
-            }
+            quote! { #ident }
         })
         .collect();
 
@@ -8180,7 +8223,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// Produced by [`#name::factory()`]. All fields are pre-filled with
         /// `Default::default()` so callers only need to specify the fields that
         /// matter for their scenario.
-        #[derive(Debug, Clone)]
+        #[derive(#factory_debug_derive Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
             /// Names of fields the caller explicitly set via a setter. `.fake()`
@@ -8192,6 +8235,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub __autumn_fake: bool,
         }
+
+        #factory_debug_impl
 
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
@@ -11145,6 +11190,48 @@ mod tests {
         assert!(
             generated.contains("Classification :: PersonalData"),
             "{generated}"
+        );
+    }
+
+    #[test]
+    fn the_factory_carries_the_classification_too() {
+        // #2373. The generated factory was the last struct of the family still
+        // holding plaintext: `Customer::factory().email` was a public `String`,
+        // so it could be moved into a serializable view with no boundary and no
+        // audit record, and the factory's derived `Debug` printed the real
+        // value. Classifying only at `build()` time is too late -- the
+        // plaintext is readable on the factory for its whole lifetime. The
+        // factory is emitted in every build, not just tests.
+        let generated = classified_model();
+        // Scope to the struct body: everything after the header up to its
+        // closing brace. Splitting alone would match the whole rest of the
+        // expansion and pass on any other struct's classified field.
+        let after = generated
+            .split("pub struct CustomerFactory")
+            .nth(1)
+            .expect("the generated factory struct");
+        let factory = &after[..after.find('}').expect("struct body ends")];
+        assert!(
+            factory.contains("classify :: Classified < String , CustomerEmailClassified >"),
+            "the factory field must carry the classification: {factory}"
+        );
+        assert!(
+            factory.contains("pub name : String"),
+            "an unclassified column must stay exactly as declared: {factory}"
+        );
+    }
+
+    #[test]
+    fn the_factory_debug_redacts_a_classified_column() {
+        let generated = classified_model();
+        let factory_debug = generated
+            .split("impl :: core :: fmt :: Debug for CustomerFactory")
+            .nth(1)
+            .expect("the factory must get a redacting Debug, not a derived one");
+        let body = &factory_debug[..factory_debug.len().min(400)];
+        assert!(
+            body.contains("<classified>"),
+            "the factory's Debug must redact the classified column: {body}"
         );
     }
 

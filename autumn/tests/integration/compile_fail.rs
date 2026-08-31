@@ -182,6 +182,8 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/classified_column_wrapper_cannot_retype.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_write_struct_leak.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
 
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.

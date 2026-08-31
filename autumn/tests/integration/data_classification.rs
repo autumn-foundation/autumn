@@ -300,6 +300,31 @@ fn a_classified_model_still_accepts_personal_data_on_the_write_path() {
 }
 
 #[test]
+fn the_factory_accepts_plaintext_but_will_not_hand_it_back() {
+    // #2373. The factory field carries the wrapper, so the plaintext cannot be
+    // moved out of it into a response view (the compile-fail half of this pair
+    // is `tests/compile-fail/classified_factory_leak.rs`). What must NOT change
+    // is the ergonomics of putting data in: `.email("ada@example.com")` with a
+    // bare `&str` is how every factory call in every test is written, and
+    // binding the setter to the wrapper would have broken all of them.
+    let built = Customer::factory()
+        .name("Ada")
+        .email("ada@example.com")
+        .build();
+
+    // The value really did land in the record, through the wrapper.
+    assert_eq!(built.email, "ada@example.com".to_string().into());
+    assert_eq!(built.name, "Ada");
+
+    // And the factory itself redacts in Debug, like every other generated struct.
+    let factory = Customer::factory().email("ada@example.com");
+    assert!(
+        !format!("{factory:?}").contains("ada@example.com"),
+        "the factory's Debug must redact the classified column"
+    );
+}
+
+#[test]
 fn the_write_structs_cannot_hand_the_plaintext_back_out() {
     // Review round 2 of #1654 (P1). `NewCustomer`/`UpdateCustomer` are how an
     // application *receives* a classified value and their fields are `pub`, so
