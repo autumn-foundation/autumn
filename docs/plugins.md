@@ -48,6 +48,25 @@ touching any file — to install a plugin whose supported `autumn-web` range
 excludes your app's version, naming both versions. Pass `--dry-run` to see the
 edits without applying them.
 
+### Versions
+
+First-party plugins are released in lockstep with `autumn-web` and with the
+CLI, so the version `autumn plugin add` installs is the CLI's own. That makes
+the version gate a statement about your toolchain: if your app is on an older
+`autumn-web`, the listing marks each first-party plugin `[needs autumn-web
+<series>]` and `add` refuses rather than writing a dependency that will not
+resolve. Install the matching CLI for that series
+(`cargo install autumn-cli --version <series>`), or bring the app forward with
+`autumn upgrade`.
+
+The command does **not** add feature flags to your `autumn-web` dependency.
+Each plugin crate already depends on `autumn-web` with the features it needs
+(`autumn-storage-s3` on `storage`, `autumn-cache-redis` on `redis`,
+`autumn-admin-plugin` on `db`/`maud`/`htmx`/`flash`/`multipart`), and Cargo
+unifies features across the graph — so the mount compiles without touching your
+manifest beyond the one dependency line. The manual path below spells the
+features out because a hand-written install may want them stated explicitly.
+
 ### Community plugins
 
 A crate following the third-party `autumn-plugin-<name>` convention gets its

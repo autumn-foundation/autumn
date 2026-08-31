@@ -43,6 +43,14 @@ pub struct CatalogEntry {
 
 /// Every first-party plugin in this workspace, in `plugin list` order.
 ///
+/// No entry adds `features = [...]` to the app's own `autumn-web` dependency.
+/// Each plugin crate already depends on `autumn-web` with the features its
+/// mount needs, and Cargo unifies features across the graph — so one dependency
+/// line is genuinely enough, and writing features into the user's manifest
+/// would duplicate a fact the plugin crate already owns. The `plugin-install`
+/// CI gate compiles every one of these mounts into a fresh scaffold, so if a
+/// plugin ever drops a feature its mount needs, that gate is what fails.
+///
 /// Four of the five implement `Plugin` and mount with `.plugin(...)`.
 /// `autumn-storage-s3` is the exception: it exposes a `BlobStore`, not a
 /// `Plugin`, and `S3BlobStore::from_config` is `async` — but `.await` is legal
