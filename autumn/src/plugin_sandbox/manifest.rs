@@ -242,6 +242,17 @@ impl ResourceLimits {
     /// Multiplied by `max_concurrency`, this is what the plugin can cost the
     /// host at any instant — the number a reviewer should actually look at, so
     /// it is the number the validator checks.
+    ///
+    /// It bounds what the *sandbox* holds while serving: the guest instance,
+    /// the buffers on either side of the wire, and the response for as long as
+    /// the framework is delivering it — on that last one the permit rides
+    /// inside the response buffer, so a slow client extends the slot exactly as
+    /// long as it extends the bytes. It does not bound what an embedder chooses
+    /// to keep. [`SandboxHost::run`](crate::plugin_sandbox::host::SandboxHost::run)
+    /// hands back a `SandboxOutcome` that owns its response, and a caller that
+    /// stores a thousand of those has a thousand response bodies resident —
+    /// which is a property of that caller's code, not of the plugin's ceiling,
+    /// the same as for any other owned value an API returns.
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)

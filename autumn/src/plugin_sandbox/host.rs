@@ -908,44 +908,6 @@ impl SandboxHost {
             return Err(SandboxLoadError::ForbiddenImports(forbidden));
         }
 
-        // Both ceilings are enforced by `refuse_unbounded_shape` above, before
-        // `Module::new` rather than after it.
-        let (segments, init_bytes) = (shape.segments, shape.init_bytes);
-        // A budget that cannot cover instantiation is a manifest whose every
-        // route is already broken: the charge is unavoidable and paid before
-        // `_start`, so the guest never executes an instruction. Refusing at
-        // load is what makes `autumn plugin inspect` mean something — a passing
-        // verdict on an artifact that can only ever answer 504 is worse than no
-        // verdict, because an operator installs on the strength of it.
-        //
-        // Compared against instantiation alone rather than the whole per-request
-        // cost: the frame encoding varies with the request, so there is no
-        // single number to check it against here, while this charge is fixed by
-        // the module and known now.
-        let instantiation =
-            instantiation_fuel(segments, init_bytes, import_count, shape.global_count)
-                .saturating_add(u64::try_from(shape.function_count).unwrap_or(u64::MAX));
-        if manifest.limits.fuel <= instantiation {
-            return Err(SandboxLoadError::FuelBelowFixedCharges {
-                fuel: manifest.limits.fuel,
-                instantiation,
-            });
-        }
-
-        // Not merely "some function called `_start`": the host looks it up as
-        // `() -> ()`, so a `_start` with parameters or results is a module that
-        // loads and then fails on every request.
-        let start_is_callable = module.exports().any(|export| {
-            export.name() == "_start"
-                && export
-                    .ty()
-                    .func()
-                    .is_some_and(|ty| ty.params().is_empty() && ty.results().is_empty())
-        });
-        if !start_is_callable {
-            return Err(SandboxLoadError::MissingStart);
-        }
-
         // Every shim function reads and writes through an export named
         // `memory`; without one they all answer `EINVAL` and the plugin can
         // never serve a request. And a module whose *initial* memory is already
@@ -966,6 +928,49 @@ impl SandboxHost {
                 found: initial_bytes,
                 max: manifest.limits.memory_bytes,
             });
+        }
+
+        // Both ceilings are enforced by `refuse_unbounded_shape` above, before
+        // `Module::new` rather than after it.
+        let (segments, init_bytes) = (shape.segments, shape.init_bytes);
+        // A budget that cannot cover instantiation is a manifest whose every
+        // route is already broken: the charge is unavoidable and paid before
+        // `_start`, so the guest never executes an instruction. Refusing at
+        // load is what makes `autumn plugin inspect` mean something — a passing
+        // verdict on an artifact that can only ever answer 504 is worse than no
+        // verdict, because an operator installs on the strength of it.
+        //
+        // Compared against instantiation alone rather than the whole per-request
+        // cost: the frame encoding varies with the request, so there is no
+        // single number to check it against here, while this charge is fixed by
+        // the module and known now.
+        let instantiation = instantiation_fuel(
+            segments,
+            init_bytes,
+            import_count,
+            shape.global_count,
+            initial_bytes,
+        )
+        .saturating_add(u64::try_from(shape.function_count).unwrap_or(u64::MAX));
+        if manifest.limits.fuel <= instantiation {
+            return Err(SandboxLoadError::FuelBelowFixedCharges {
+                fuel: manifest.limits.fuel,
+                instantiation,
+            });
+        }
+
+        // Not merely "some function called `_start`": the host looks it up as
+        // `() -> ()`, so a `_start` with parameters or results is a module that
+        // loads and then fails on every request.
+        let start_is_callable = module.exports().any(|export| {
+            export.name() == "_start"
+                && export
+                    .ty()
+                    .func()
+                    .is_some_and(|ty| ty.params().is_empty() && ty.results().is_empty())
+        });
+        if !start_is_callable {
+            return Err(SandboxLoadError::MissingStart);
         }
 
         refuse_unrunnable_shape(&shape, initial_bytes)?;
@@ -2481,14 +2486,33 @@ fn signature_type(params: &str, results: &str) -> Option<wasmi::FuncType> {
 /// per-instance work the guest does not execute but every request pays for, so
 /// leaving it unpriced is a way to buy host CPU with no fuel. `MAX_IMPORTS`
 /// bounds the count; this makes the admitted ones cost something.
-fn instantiation_fuel(segments: usize, init_bytes: usize, imports: usize, globals: usize) -> u64 {
+fn instantiation_fuel(
+    segments: usize,
+    init_bytes: usize,
+    imports: usize,
+    globals: usize,
+    initial_memory_bytes: u64,
+) -> u64 {
     let bytes = u64::try_from(init_bytes).unwrap_or(u64::MAX);
     let segments = u64::try_from(segments).unwrap_or(u64::MAX);
     let imports = u64::try_from(imports).unwrap_or(u64::MAX);
     let globals = u64::try_from(globals).unwrap_or(u64::MAX);
+    // The instance's linear memory, at the same rate as every other host-side
+    // byte. A module can declare its initial size and no data segments at all,
+    // so the init-section terms above price none of it — and yet the host
+    // allocates and zero-fills the whole thing on every request, before the
+    // guest runs an instruction. Near the manifest's ceiling that is hundreds
+    // of megabytes of memset a client can ask for repeatedly, for one fuel
+    // unit, which is the same "buy host CPU with no fuel" the copying charge
+    // exists to stop. The limiter bounds how *much* memory; only this bounds
+    // how often it can be paid for.
+    let memory = initial_memory_bytes
+        .checked_div(BYTES_PER_FUEL)
+        .unwrap_or(u64::MAX);
     bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
+        .saturating_add(memory)
         .saturating_add(segments)
         .saturating_add(imports)
         .saturating_add(globals)
@@ -4153,6 +4177,52 @@ path = "/hello/greet"
             dear,
             cheap + 32,
             "each admitted import must cost a unit: {cheap} then {dear}"
+        );
+    }
+
+    #[test]
+    fn a_module_pays_instantiation_fuel_for_the_memory_it_starts_with() {
+        // A module can declare a large *initial* linear memory and no data
+        // segments at all, so every init-section term prices none of it — and
+        // the host still allocates and zero-fills the whole thing on each
+        // request, before the guest runs an instruction. That is host work
+        // proportional to a guest-declared quantity, which is exactly what the
+        // copying charge exists to make cost something.
+        //
+        // The limiter already bounds how much memory. It cannot bound how often
+        // a client asks for it to be zeroed.
+        let limits = ResourceLimits {
+            memory_bytes: 64 * 1024 * 1024,
+            ..ResourceLimits::default()
+        };
+        let one_page = wat::parse_str(
+            r#"(module (memory (export "memory") 1) (func (export "_start") (nop)))"#,
+        )
+        .expect("the fixture is valid WAT");
+        // 512 pages = 32 MiB, under the ceiling above and carrying no segments.
+        let many_pages = wat::parse_str(
+            r#"(module (memory (export "memory") 512) (func (export "_start") (nop)))"#,
+        )
+        .expect("the fixture is valid WAT");
+
+        let small = SandboxHost::from_module(manifest_with(limits), &one_page)
+            .expect("loads")
+            .instantiation_fuel();
+        let large = SandboxHost::from_module(manifest_with(limits), &many_pages)
+            .expect("loads")
+            .instantiation_fuel();
+
+        // 511 extra pages of memory to zero, at the same rate as every other
+        // host-side byte.
+        let extra = (511 * WASM_PAGE_BYTES) / BYTES_PER_FUEL;
+        assert_eq!(
+            large,
+            small + extra,
+            "initial memory is not charged: {small} then {large}"
+        );
+        assert!(
+            extra > 0,
+            "the fixture must differ by something the charge can see"
         );
     }
 
