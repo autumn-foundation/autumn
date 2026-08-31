@@ -12,10 +12,11 @@ autumn plugin add autumn-storage-s3
 ```
 
 One command adds the dependency at a version compatible with your app's
-`autumn-web`, mounts the plugin in your `autumn_web::app()` builder chain, and
+`autumn-web`, wires the S3 blob store into your `autumn_web::app()` builder chain
+with `.with_blob_store(...)`, and
 prints any configuration still needed. It is safe to re-run, and it refuses —
 before touching any file — to install into an app on an incompatible
-`autumn-web` version. See [docs/plugins.md](../docs/plugins.md#installing-a-plugin).
+`autumn-web` version. See [docs/plugins.md](https://github.com/autumn-foundation/autumn/blob/main/docs/plugins.md#installing-a-plugin).
 
 ### Manual install
 
@@ -24,8 +25,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.4", features = ["storage"] }
-autumn-storage-s3 = "0.4"
+autumn-web        = { version = "0.7", features = ["storage"] }
+autumn-storage-s3 = "0.7"
 ```
 
 ## Quick Start

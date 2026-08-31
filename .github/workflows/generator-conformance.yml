@@ -19,6 +19,8 @@ on:
       - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/plugin/**"
+      # The comment-aware scanner `autumn plugin add` anchors its mount on.
+      - "autumn-cli/src/rust_source.rs"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
@@ -54,6 +56,8 @@ on:
       - ".github/workflows/generator-conformance.yml"
       - "autumn-cli/src/generate/**"
       - "autumn-cli/src/plugin/**"
+      # The comment-aware scanner `autumn plugin add` anchors its mount on.
+      - "autumn-cli/src/rust_source.rs"
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"

@@ -28,9 +28,13 @@ pub struct CatalogEntry {
     /// under the builder-opening `autumn_web::app()` line. Its first line is
     /// the `// added by ...` marker.
     pub mount: &'static str,
-    /// A code substring that proves this plugin is already mounted. Matched
+    /// The fully-qualified path this command's own mount writes. Matched
     /// against *code* lines only, so a mention in a comment never counts.
     pub probe: &'static str,
+    /// The same mount as a hand-written call after a `use` import
+    /// (`AdminPlugin::new(`). Detected too, so `add` never splices a second,
+    /// default-constructed mount over a user's configured one.
+    pub probe_bare: &'static str,
     /// Config keys the plugin needs before the app can serve it.
     pub config_keys: &'static [&'static str],
     /// Follow-up steps printed after a successful install.
@@ -54,6 +58,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        .plugin(autumn_admin_plugin::AdminPlugin::new())\n",
         ),
         probe: "autumn_admin_plugin::AdminPlugin",
+        probe_bare: "AdminPlugin::new(",
         config_keys: &["[database]\nprimary_url = \"postgres://localhost/my_app\""],
         post_install: &[
             "Register a model with `autumn generate admin <Model>` — the panel mounts at /admin but starts with no models.",
@@ -69,6 +74,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        .plugin(autumn_cache_redis::RedisCachePlugin::new())\n",
         ),
         probe: "autumn_cache_redis::RedisCachePlugin",
+        probe_bare: "RedisCachePlugin::new(",
         config_keys: &[
             "[cache]\nbackend = \"redis\"\n\n[cache.redis]\nurl = \"redis://127.0.0.1:6379\"",
         ],
@@ -84,6 +90,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        .plugin(autumn_media_plugin::MediaPlugin::new())\n",
         ),
         probe: "autumn_media_plugin::MediaPlugin",
+        probe_bare: "MediaPlugin::new(",
         config_keys: &[
             "[media]\nroom_max_participants = 6\n\n[media.mediamtx]\napi_base = \"http://127.0.0.1:9997\"",
         ],
@@ -100,6 +107,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        .plugin(autumn_search::SearchPlugin::new())\n",
         ),
         probe: "autumn_search::SearchPlugin",
+        probe_bare: "SearchPlugin::new(",
         config_keys: &["[search]\nengine = \"postgres\""],
         post_install: &[
             "Mark a model with `#[searchable]`, then register it: `SearchPlugin::new().postgres().index::<Model>()`.",
@@ -113,7 +121,10 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount: concat!(
             "        // added by `autumn plugin add autumn-storage-s3`\n",
             "        .with_blob_store({\n",
-            "            let config = autumn_web::config::AutumnConfig::load()\n",
+            "            // `load_lenient_unknown_roots` (not `load`) so a config section\n",
+            "            // belonging to another plugin — `[media]`, `[search]` — is a warning\n",
+            "            // here rather than a hard failure: this load only needs `[storage]`.\n",
+            "            let config = autumn_web::config::AutumnConfig::load_lenient_unknown_roots()\n",
             "                .expect(\"autumn.toml must load before the S3 blob store can be built\");\n",
             "            autumn_storage_s3::S3BlobStore::from_config(&config.storage.s3)\n",
             "                .await\n",
@@ -121,6 +132,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "        })\n",
         ),
         probe: "autumn_storage_s3::S3BlobStore",
+        probe_bare: "S3BlobStore::from_config(",
         config_keys: &[
             "[storage]\nbackend = \"s3\"\n\n[storage.s3]\nbucket = \"my-bucket\"\nregion = \"us-east-1\"",
         ],
@@ -131,6 +143,15 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
     },
 ];
 
+impl CatalogEntry {
+    /// Both spellings a mount of this plugin can take, for
+    /// [`crate::plugin::install::mount_present`].
+    #[must_use]
+    pub const fn probes(&self) -> [&'static str; 2] {
+        [self.probe, self.probe_bare]
+    }
+}
+
 /// The first-party entry named `name`, if there is one.
 #[must_use]
 pub fn lookup(name: &str) -> Option<&'static CatalogEntry> {
@@ -140,15 +161,25 @@ pub fn lookup(name: &str) -> Option<&'static CatalogEntry> {
 /// The documented third-party crate-name prefix (`docs/plugins.md`).
 pub const COMMUNITY_PREFIX: &str = "autumn-plugin-";
 
-/// Whether `name` follows the documented third-party naming convention.
+/// Whether `name` follows the documented third-party naming convention **and**
+/// is a legal crates.io crate name.
 ///
-/// The bare prefix with nothing after it is not a crate name, so it does not
-/// count — otherwise `plugin add autumn-plugin-` would resolve to a crate that
-/// cannot exist.
+/// The charset check is load-bearing, not cosmetic: this predicate is the only
+/// gate on a name that is then interpolated into a crates.io URL *and* written
+/// as a bare TOML key. `autumn-plugin-x/../../crates/serde` would otherwise be
+/// URL-normalised into a request for a different crate and then written as a
+/// key containing `/` and `.`, which no longer parses — the one outcome
+/// `plugin add` promises is impossible.
+///
+/// The bare prefix with nothing after it is not a crate name either.
 #[must_use]
 pub fn is_community_name(name: &str) -> bool {
-    name.strip_prefix(COMMUNITY_PREFIX)
-        .is_some_and(|rest| !rest.is_empty())
+    name.strip_prefix(COMMUNITY_PREFIX).is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
 }
 
 /// The `<Name>Plugin` struct a community crate is expected to expose, derived
@@ -201,19 +232,54 @@ pub fn community_mount_snippet(crate_name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Workspace members that are not plugin crates: the framework itself,
+    /// its macros, this CLI, the schema core, and the edge runtime (none of
+    /// which appear in `docs/plugins.md`'s first-party plugin table).
+    const NON_PLUGIN_MEMBERS: &[&str] = &[
+        "autumn",
+        "autumn-macros",
+        "autumn-cli",
+        "autumn-schema-core",
+        "autumn-edge",
+    ];
+
     /// AC #1: the listing covers **all** first-party plugins in this
     /// workspace, not just the three `plugin add` is spelled out for.
+    ///
+    /// The expected set is ENUMERATED from the workspace manifest rather than
+    /// hardcoded, so a sixth first-party plugin crate added later fails this
+    /// test instead of quietly never appearing in `autumn plugin list`.
     #[test]
     fn catalog_covers_every_first_party_plugin_in_the_workspace() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).expect("manifest");
+        let table: toml::Table = toml::from_str(&manifest).expect("parse workspace manifest");
+        let members = table["workspace"]["members"]
+            .as_array()
+            .expect("members array");
+
+        let expected: Vec<String> = members
+            .iter()
+            .filter_map(toml::Value::as_str)
+            // Top-level crates only: `examples/*`, `benchmarks/*` and
+            // `example-e2e` are apps, not plugin crates.
+            .filter(|member| !member.contains('/') && *member != "example-e2e")
+            .filter(|member| !NON_PLUGIN_MEMBERS.contains(member))
+            .map(std::borrow::ToOwned::to_owned)
+            .collect();
+        assert!(
+            expected.len() >= 5,
+            "the workspace enumeration found too few plugin crates: {expected:?}"
+        );
+
         let names: Vec<&str> = FIRST_PARTY.iter().map(|e| e.crate_name).collect();
-        for expected in [
-            "autumn-admin-plugin",
-            "autumn-cache-redis",
-            "autumn-media-plugin",
-            "autumn-search",
-            "autumn-storage-s3",
-        ] {
-            assert!(names.contains(&expected), "catalog is missing {expected}");
+        for member in &expected {
+            assert!(
+                names.contains(&member.as_str()),
+                "catalog is missing the first-party plugin crate {member}"
+            );
         }
     }
 
@@ -296,9 +362,29 @@ mod tests {
     #[test]
     fn community_names_follow_the_documented_prefix() {
         assert!(is_community_name("autumn-plugin-live-feed"));
+        assert!(is_community_name("autumn-plugin-audit_log2"));
         assert!(!is_community_name("autumn-admin-plugin"));
         assert!(!is_community_name("autumn-plugin-"));
         assert!(!is_community_name("serde"));
+    }
+
+    /// The prefix check is the ONLY gate on a name that is interpolated into
+    /// a crates.io URL and written as a bare TOML key, so it must also reject
+    /// anything that is not a legal crate name. `autumn-plugin-x/../../crates/
+    /// serde` would otherwise be URL-normalised into a request for a
+    /// different crate and then written as a key that no longer parses.
+    #[test]
+    fn community_names_reject_anything_that_is_not_a_crate_name() {
+        for hostile in [
+            "autumn-plugin-x/../../crates/serde",
+            "autumn-plugin-x?q=1",
+            "autumn-plugin-x y",
+            "autumn-plugin-x\"\n[dependencies]\nevil = \"1",
+            "autumn-plugin-../serde",
+        ] {
+            assert!(!is_community_name(hostile), "{hostile:?} must be rejected");
+            assert!(community_mount_snippet(hostile).is_none(), "{hostile:?}");
+        }
     }
 
     /// `docs/plugins.md`: third-party crates are `autumn-plugin-<name>` and

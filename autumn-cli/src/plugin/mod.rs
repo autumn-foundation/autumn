@@ -74,6 +74,10 @@ pub enum Resolved {
     Community(String),
 }
 
+/// Exit code for the manual-fallback outcome: nothing was written, and the
+/// dependency line plus mount snippet were printed for the user to apply.
+pub const MANUAL_FALLBACK_EXIT_CODE: i32 = 2;
+
 /// The version of every first-party plugin: they are released in lockstep
 /// with `autumn-web` and with this CLI, so the CLI's own version is the one to
 /// install.
@@ -169,10 +173,16 @@ pub fn render_list(rows: &[ListRow], app_version: Option<&str>, note: Option<&st
                 version = row.version,
                 summary = elide(&row.summary, SUMMARY_WIDTH),
                 compat = match row.compat {
-                    Compat::Incompatible => "  [incompatible with this app]",
+                    // Name the series that WOULD work, rather than only saying
+                    // this one will not: on an older app the bare word
+                    // "incompatible" leaves the reader with no next step.
+                    Compat::Incompatible => format!(
+                        "  [needs autumn-web {}]",
+                        install::supported_range(&row.version)
+                    ),
                     Compat::Unknown if row.origin == Origin::FirstParty =>
-                        "  [compatibility unknown]",
-                    Compat::Compatible | Compat::Unknown => "",
+                        "  [compatibility unknown]".to_owned(),
+                    Compat::Compatible | Compat::Unknown => String::new(),
                 },
             );
         }
@@ -412,7 +422,17 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         }
         AddOutcome::AlreadyInstalled | AddOutcome::Manual { .. } => {}
     }
-    println!("{}", render_add(opts.name, &outcome, opts.dry_run));
+
+    let report = render_add(opts.name, &outcome, opts.dry_run);
+    if matches!(outcome, AddOutcome::Manual { .. }) {
+        // A refusal, not a result: it goes to stderr and exits non-zero so
+        // `autumn plugin add … && cargo build` cannot read "I changed nothing,
+        // do it yourself" as a successful install. `2` rather than `1` so a
+        // script can tell "apply this by hand" apart from a hard error.
+        eprintln!("{report}");
+        return MANUAL_FALLBACK_EXIT_CODE;
+    }
+    println!("{report}");
     0
 }
 
@@ -536,7 +556,8 @@ mod tests {
     #[test]
     fn the_table_flags_incompatible_rows() {
         let out = render_list(&list_rows(Some("0.5.0"), &[]), Some("0.5.0"), None);
-        assert!(out.contains("incompatible"), "{out}");
+        // Naming the series that would work is the actionable half.
+        assert!(out.contains("needs autumn-web 0.7"), "{out}");
     }
 
     #[test]

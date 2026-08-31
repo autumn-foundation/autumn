@@ -8846,19 +8846,43 @@ fn plugin_add_degrades_on_a_customized_main() {
     fs::write(&main_path, custom).unwrap();
     let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
 
-    let (stdout, _) = run_autumn(
+    // A refusal, not a result: it goes to stderr and exits 2 so a script
+    // cannot read "I changed nothing" as a successful install.
+    let (_stdout, stderr, code) = run_autumn_failing(
         &project,
         &["plugin", "add", "autumn-admin-plugin", "--offline"],
     );
-    assert!(stdout.contains("No files were changed"), "{stdout}");
-    assert!(stdout.contains("autumn-admin-plugin = \""), "{stdout}");
-    assert!(stdout.contains("AdminPlugin::new()"), "{stdout}");
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("autumn-admin-plugin = \""), "{stderr}");
+    assert!(stderr.contains("AdminPlugin::new()"), "{stderr}");
 
     assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
     assert_eq!(
         fs::read_to_string(project.join("Cargo.toml")).unwrap(),
         cargo_before
     );
+}
+
+/// AC #5, the shape that used to slip through: a `main.rs` that factors its
+/// builder into a helper. Splicing there mounts the plugin into a function the
+/// binary never calls — and for `autumn-storage-s3`, whose mount awaits, into a
+/// synchronous fn, which does not compile.
+#[test]
+fn plugin_add_degrades_when_the_builder_lives_in_a_helper() {
+    let (_tmp, project) = fresh_project("plugin-add-helper");
+    let main_path = project.join("src/main.rs");
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    build_app().run().await;\n}\n\n\
+                  fn build_app() -> autumn_web::app::AppBuilder {\n    autumn_web::app()\n        \
+                  .routes(routes![index])\n}\n";
+    fs::write(&main_path, custom).unwrap();
+
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-storage-s3", "--offline"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
 }
 
 /// An unknown name is refused with a pointer at `plugin list`.

@@ -334,7 +334,6 @@ pub enum SearchSubcommands {
     },
 }
 
-/// Subcommands for `autumn jobs`.
 /// `autumn plugin ...` — consumer-facing plugin discovery and install
 /// (issue #1606). The author-facing conformance gate stays at
 /// `autumn plugin-check`.
@@ -348,7 +347,7 @@ pub enum PluginSubcommands {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
-        /// Skip the crates.io lookup (first-party plugins only).
+        /// Do not query crates.io; list the first-party catalog only.
         #[arg(long)]
         offline: bool,
     },
@@ -359,12 +358,14 @@ pub enum PluginSubcommands {
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Skip the crates.io lookup (first-party plugins only).
+        /// Do not query crates.io. First-party plugins install normally;
+        /// a community crate cannot have its version resolved and is refused.
         #[arg(long)]
         offline: bool,
     },
 }
 
+/// Subcommands for `autumn jobs`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum JobsSubcommands {
     /// Emit the effective drained-queue manifest the running app declares.
@@ -1275,8 +1276,12 @@ enum Commands {
     /// Discover and install Autumn plugins.
     ///
     /// `list` shows every installable plugin with the version compatible with
-    /// this app; `add` writes the dependency, mounts the plugin in the
+    /// this app (querying crates.io for community crates unless `--offline`);
+    /// `add` writes the dependency, mounts the plugin in the
     /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// Writing a plugin instead? `autumn generate plugin`. Auditing one you
+    /// wrote? `autumn plugin-check`.
     ///
     /// # Examples
     ///
@@ -1297,6 +1302,9 @@ enum Commands {
     /// and verifies that the named plugin satisfies five checks: installability,
     /// route attribution, route prefix, route collision, and sensitive-surface
     /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// This is the AUTHOR-facing gate. To discover and install a plugin as a
+    /// consumer, use `autumn plugin list` / `autumn plugin add`.
     ///
     /// # Examples
     ///

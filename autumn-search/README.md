@@ -19,9 +19,12 @@ One command adds the dependency at a version compatible with your app's
 and prints the follow-up steps (mark a model `#[searchable]`, register the
 index, backfill). It is safe to re-run, and it refuses — before touching any
 file — to install into an app on an incompatible `autumn-web` version. See
-[docs/plugins.md](../docs/plugins.md#installing-a-plugin).
+[docs/plugins.md](https://github.com/autumn-foundation/autumn/blob/main/docs/plugins.md#installing-a-plugin).
 
 ### Manual install
+
+If you would rather wire it yourself (or `autumn plugin add` could not find your
+builder chain and printed these lines for you):
 
 ```toml
 [dependencies]

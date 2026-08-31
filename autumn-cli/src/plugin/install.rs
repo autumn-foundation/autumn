@@ -48,6 +48,17 @@ pub enum PluginError {
     )]
     UnknownPlugin(String),
 
+    /// crates.io returned something that is not a usable version string.
+    #[error(
+        "crates.io reported version `{version}` for `{crate_name}`, which is not a usable version requirement — no files were changed"
+    )]
+    ImplausibleVersion {
+        /// The crate whose version could not be used.
+        crate_name: String,
+        /// The rejected version string.
+        version: String,
+    },
+
     /// Filesystem error while reading the project.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -147,13 +158,26 @@ pub fn supported_range(version: &str) -> String {
     }
 }
 
-/// Parse `MAJOR.MINOR[.PATCH]`, tolerating a leading requirement operator and
-/// a pre-release/build suffix. Mirrors `doctor::check_version_compat`'s parser
-/// so the two commands can never disagree about what a version means.
+/// Parse `MAJOR.MINOR[.PATCH]` from a Cargo version requirement, or `None`
+/// when the requirement does not pin one.
+///
+/// `=`, `^` and `~` are stripped: all three name a single version whose
+/// compatibility is the version's own. Comparison and range requirements
+/// (`>=0.6`, `>=0.7, <0.9`, `*`, `0.6 || 0.7`) are deliberately **not**
+/// parsed — stripping their operator would read `>=0.6` as *exactly* 0.6 and
+/// refuse an install into an app that resolves to 0.7 perfectly well. `None`
+/// becomes [`Compat::Unknown`], which lets the install proceed rather than
+/// refusing on a version this code cannot actually evaluate.
+///
+/// (`doctor::check_version_compat` strips operators instead. It is comparing
+/// two *concrete* versions for a diagnostic, where a false warning costs
+/// nothing; here a false negative blocks a command outright.)
 fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
-    let version = version
-        .trim()
-        .trim_start_matches(['=', '^', '~', '>', '<', ' ']);
+    let version = version.trim();
+    if version.contains(['<', '>', ',', '*', '|']) {
+        return None;
+    }
+    let version = version.trim_start_matches(['=', '^', '~', ' ']);
     let mut parts = version.split('.');
     let major: u64 = parts.next()?.trim().parse().ok()?;
     let minor: u64 = parts.next()?.trim().parse().ok()?;
@@ -165,6 +189,20 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
             .unwrap_or(0)
     });
     Some((major, minor, patch))
+}
+
+/// Whether `version` is safe to write into a `Cargo.toml` dependency line.
+///
+/// Belt-and-braces on the crates.io response: a version string is written
+/// verbatim into the manifest, so anything that is not plausibly a semver
+/// version is refused rather than emitted into a file the user then has to
+/// repair.
+#[must_use]
+pub fn is_plausible_version(version: &str) -> bool {
+    version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
 /// Read how the project at `root` declares `autumn-web`.
@@ -187,9 +225,14 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
             crate::doctor::AutumnWebDependency::WithoutVersion => declared = true,
             // `Inherited` comes back for ANY `{ workspace = true }` entry, not
             // just this crate's — the scan cannot tell them apart by itself —
-            // so only the entry actually keyed `autumn-web` counts here.
+            // so resolve it against the enclosing workspace, exactly as
+            // `autumn upgrade` does. Without this a member crate's version gate
+            // silently never runs, which is the whole guarantee of AC #3.
             crate::doctor::AutumnWebDependency::Inherited(key) => {
-                declared |= key == "autumn-web";
+                match workspace_version_for(root, key) {
+                    Some(version) => return Ok(AppAutumnWeb::Version(version)),
+                    None => declared |= key == "autumn-web",
+                }
             }
             crate::doctor::AutumnWebDependency::Absent
             | crate::doctor::AutumnWebDependency::Unreadable => {}
@@ -200,6 +243,21 @@ pub fn app_autumn_web(root: &Path) -> Result<AppAutumnWeb, PluginError> {
     } else {
         Err(PluginError::NoAutumnWeb)
     }
+}
+
+/// The version a `{ workspace = true }` entry named `key` resolves to, found
+/// by walking up from `root` the way Cargo does.
+fn workspace_version_for(root: &Path, key: &str) -> Option<String> {
+    let mut dir = Some(root);
+    while let Some(current) = dir {
+        if let Some(crate::doctor::AutumnWebDependency::Version(version)) =
+            crate::doctor::workspace_dependency_for(current, key)
+        {
+            return Some(version);
+        }
+        dir = current.parent();
+    }
+    None
 }
 
 /// The `[dependencies]` line `plugin add` writes (and prints).
@@ -224,36 +282,77 @@ pub fn dependency_present(manifest: &str, crate_name: &str) -> bool {
         .any(|deps| deps.contains_key(crate_name))
 }
 
-/// Whether `main_rs` already mounts the plugin **in code** — a mention inside
-/// a comment (a README snippet pasted into the file) does not count.
+/// Whether `main_rs` already mounts the plugin **in code**.
 ///
-/// Sharing [`crate::rust_source::for_each_code_line`] with the anchor scan is
+/// `probes` are the spellings a mount can take: the fully-qualified path this
+/// command writes (`autumn_search::SearchPlugin`) and the bare call a
+/// hand-written mount uses after a `use` import (`SearchPlugin::new(`). Both
+/// are needed, in both directions: without the bare form a hand-configured
+/// `.plugin(SearchPlugin::new().index::<Post>())` is not detected and `add`
+/// splices a *second*, default-constructed mount — which `AppBuilder::plugin`
+/// then keeps in preference to the user's, silently discarding their
+/// configuration.
+///
+/// `use` lines are excluded for the mirror-image reason: a bare
+/// `use autumn_search::SearchPlugin;` import is not a mount, and treating it
+/// as one made `add` report "already installed" for an app that mounts
+/// nothing.
+///
+/// Sharing [`crate::rust_source::code_lines`] with the anchor scan is
 /// deliberate: if the two disagreed about what a comment is, a doc-comment
 /// mention could suppress both the mount and the warning about it.
 #[must_use]
-pub fn mount_present(main_rs: &str, probe: &str) -> bool {
-    crate::rust_source::for_each_code_line(main_rs, |line, _offset| {
-        line.contains(probe).then_some(())
-    })
-    .is_some()
+pub fn mount_present(main_rs: &str, probes: &[&str]) -> bool {
+    crate::rust_source::code_lines(main_rs)
+        .into_iter()
+        .filter(|(line, _)| !line.trim_start().starts_with("use "))
+        .any(|(line, _)| probes.iter().any(|probe| line.contains(probe)))
 }
 
-/// Byte offset just past the builder-opening `autumn_web::app()` inside
-/// `main()`, or `None` when there is no unambiguous anchor.
+/// Byte offset just past the builder-opening `autumn_web::app()` **inside the
+/// body of `async fn main`**, or `None` when there is no unambiguous anchor.
 ///
-/// Only a line that *ends* with the opener is an anchor. A one-line chain
-/// (`autumn_web::app().routes(…).run().await;`) has no place to splice a call
-/// into, and a mention inside a comment is not code at all — in both cases the
-/// caller degrades to printed instructions rather than guessing (AC #5).
+/// Three rules, each of which exists because breaking it produces a wrong
+/// edit rather than no edit:
+///
+/// 1. **Scoped to `main`'s body.** A sticky "have I seen `async fn main` yet"
+///    flag is not enough: an app that factors its builder into a helper
+///    (`fn build_app() -> AppBuilder { autumn_web::app()… }`) or that keeps a
+///    `#[cfg(test)] mod tests` harness would otherwise be spliced *there* —
+///    mounting the plugin into a function the binary never calls, or (for the
+///    `autumn-storage-s3` mount, which awaits) into a synchronous fn, which
+///    does not compile. The body runs from the `async fn main` line to the
+///    first line that closes a brace at column 0.
+/// 2. **Exactly one candidate.** [`crate::rust_source::code_lines`] skips
+///    comments but not string literals, so a quick-start snippet inside a raw
+///    string can look like an anchor. Refusing when there is more than one
+///    candidate turns that from a silent mis-splice into the documented
+///    manual fallback.
+/// 3. **The line must END with the opener.** A one-line chain
+///    (`autumn_web::app().routes(…).run().await;`) has nowhere to splice a
+///    call into.
 fn builder_anchor(main_rs: &str) -> Option<usize> {
-    let mut seen_main = false;
-    crate::rust_source::for_each_code_line(main_rs, |line, offset| {
-        if line.trim().contains("async fn main") {
-            seen_main = true;
-        }
-        (seen_main && line.trim_end().ends_with("autumn_web::app()"))
-            .then(|| offset + line.trim_end().len())
-    })
+    let lines = crate::rust_source::code_lines(main_rs);
+    let main_at = lines
+        .iter()
+        .position(|(line, _)| line.trim().contains("async fn main"))?;
+    // The body ends at the first code line that closes a brace at column 0 —
+    // the closing brace of a top-level `async fn main`.
+    let body_end = lines
+        .iter()
+        .skip(main_at + 1)
+        .position(|(line, _)| line.starts_with('}'))
+        .map_or(lines.len(), |offset| main_at + 1 + offset);
+
+    let mut candidates = lines[main_at..body_end]
+        .iter()
+        .filter(|(line, _)| line.trim_end().ends_with("autumn_web::app()"));
+    let (line, offset) = candidates.next()?;
+    if candidates.next().is_some() {
+        // Ambiguous: refuse rather than guess (rule 2).
+        return None;
+    }
+    Some(offset + line.trim_end().len())
 }
 
 /// Splice `mount` into the `AppBuilder` chain, or `None` when the chain has no
@@ -301,11 +400,13 @@ fn indent(text: &str, prefix: &str) -> String {
 
 /// Plan the install of `entry` at `version` into the project at `root`.
 ///
-/// Ordering is the contract: the project check and the version gate run before
-/// a single [`crate::generate::emit::Action`] exists, and the builder-chain
-/// edit is computed (not applied) before the manifest edit is queued — so
-/// every refusal leaves the app byte-identical, and no outcome can add a
-/// dependency whose mount never landed.
+/// Ordering is the contract. The project check and the version gate run before
+/// a single [`crate::generate::emit::Action`] exists, so every refusal leaves
+/// the app byte-identical. The builder-chain edit is computed (not applied)
+/// before the manifest edit is queued, so no outcome can add a dependency whose
+/// mount was never even computed — and the two writes are queued mount-first,
+/// so a mid-execute I/O failure fails loudly at `rustc` instead of looking like
+/// a completed install.
 ///
 /// # Errors
 ///
@@ -333,7 +434,7 @@ pub fn plan_add(
     let main_src = std::fs::read_to_string(&main_path).unwrap_or_default();
 
     let dependency_installed = dependency_present(&manifest_src, entry.crate_name);
-    let already_mounted = mount_present(&main_src, entry.probe);
+    let already_mounted = mount_present(&main_src, &entry.probes());
     if dependency_installed && already_mounted {
         return Ok(AddOutcome::AlreadyInstalled);
     }
@@ -357,7 +458,15 @@ pub fn plan_add(
         }
     };
 
+    // `src/main.rs` is queued BEFORE `Cargo.toml`. `Plan::execute` writes
+    // actions in order with no rollback, so if the second write fails (a
+    // read-only file, ENOSPC) this ordering leaves a mount with no dependency
+    // — which rustc rejects immediately — rather than a dependency with no
+    // mount, which looks exactly like a completed install.
     let mut plan = Plan::new(root);
+    if let Some(updated_main) = mounted_src {
+        plan.modify(main_path, updated_main);
+    }
     let spec = format!("\"{version}\"");
     let updated_manifest = crate::generate::model::ensure_cargo_dependencies(
         &manifest_src,
@@ -365,9 +474,6 @@ pub fn plan_add(
     );
     if updated_manifest != manifest_src {
         plan.modify(manifest, updated_manifest);
-    }
-    if let Some(updated_main) = mounted_src {
-        plan.modify(main_path, updated_main);
     }
     Ok(AddOutcome::Installed {
         plan: Box::new(plan),
@@ -384,14 +490,20 @@ pub fn plan_add(
 ///
 /// # Errors
 ///
-/// [`PluginError::NotInProject`], [`PluginError::NoAutumnWeb`], or an I/O
-/// error reading the manifest.
+/// [`PluginError::NotInProject`], [`PluginError::NoAutumnWeb`],
+/// [`PluginError::ImplausibleVersion`], or an I/O error reading the manifest.
 pub fn plan_add_community(
     root: &Path,
     crate_name: &str,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
     app_autumn_web(root)?;
+    if !is_plausible_version(version) {
+        return Err(PluginError::ImplausibleVersion {
+            crate_name: crate_name.to_owned(),
+            version: version.to_owned(),
+        });
+    }
     let manifest = manifest_path(root);
     let manifest_src = std::fs::read_to_string(&manifest)?;
     let snippet = super::catalog::community_mount_snippet(crate_name)
@@ -621,11 +733,31 @@ maud = { version = "0.27", features = ["axum"] }
     #[test]
     fn mount_present_ignores_comment_mentions() {
         let commented = "// autumn_admin_plugin::AdminPlugin::new()\nfn main() {}\n";
-        assert!(!mount_present(commented, admin().probe));
+        assert!(!mount_present(commented, &admin().probes()));
         let block = "/*\nautumn_admin_plugin::AdminPlugin::new()\n*/\nfn main() {}\n";
-        assert!(!mount_present(block, admin().probe));
+        assert!(!mount_present(block, &admin().probes()));
         let real = "fn main() { app.plugin(autumn_admin_plugin::AdminPlugin::new()); }\n";
-        assert!(mount_present(real, admin().probe));
+        assert!(mount_present(real, &admin().probes()));
+    }
+
+    /// A bare `use` import is not a mount. Counting it as one made `add`
+    /// report "already installed" for an app that mounts nothing, with no way
+    /// for the user to make the command work.
+    #[test]
+    fn an_import_alone_is_not_a_mount() {
+        let imported = "use autumn_admin_plugin::AdminPlugin;\n\nfn main() {}\n";
+        assert!(!mount_present(imported, &admin().probes()));
+    }
+
+    /// A hand-written mount through an import carries only the bare call, so
+    /// the bare probe has to catch it — otherwise `add` splices a SECOND,
+    /// default-constructed mount, and `AppBuilder::plugin` keeps that one in
+    /// preference to the user's configured instance.
+    #[test]
+    fn a_hand_written_mount_behind_an_import_is_detected() {
+        let src = "use autumn_admin_plugin::AdminPlugin;\n\nfn main() {\n    \
+                   app.plugin(AdminPlugin::new().require_role(\"staff\"));\n}\n";
+        assert!(mount_present(src, &admin().probes()));
     }
 
     #[test]
@@ -731,6 +863,131 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
+    /// The builder must be found inside `main`'s own body. A `main.rs` that
+    /// factors the builder into a helper would otherwise be spliced there —
+    /// and for the `autumn-storage-s3` mount, which awaits, splicing into a
+    /// synchronous fn does not compile at all.
+    #[test]
+    fn a_builder_in_a_helper_function_is_not_an_anchor() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    build_app().run().await;\n}\n\n\
+                   fn build_app() -> autumn_web::app::AppBuilder {\n    autumn_web::app()\n        \
+                   .routes(routes![index])\n}\n";
+        assert!(insert_mount(src, admin().mount).is_none());
+    }
+
+    /// Same rule, the test-harness shape: splicing into `#[cfg(test)] mod
+    /// tests` compiles but never mounts anything in the real binary, and the
+    /// probe it leaves behind makes the next `add` report "already installed".
+    #[test]
+    fn a_builder_in_a_test_module_is_not_an_anchor() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    \
+                   autumn_web::app().routes(routes![]).run().await;\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    fn harness() {\n        \
+                   let b = autumn_web::app()\n            .routes(routes![]);\n    }\n}\n";
+        assert!(insert_mount(src, admin().mount).is_none());
+    }
+
+    /// The scanner skips comments but not string literals, so a quick-start
+    /// snippet in a raw string inside `main` looks like an anchor. Two
+    /// candidates must mean "no anchor", not "pick the first".
+    #[test]
+    fn an_ambiguous_builder_is_not_an_anchor() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    let doc = r\"\n    \
+                   autumn_web::app()\n        .run()\n\";\n    \
+                   let app = autumn_web::app()\n        .routes(routes![index]);\n    \
+                   app.run().await;\n}\n";
+        assert!(insert_mount(src, admin().mount).is_none());
+    }
+
+    /// A comparison or range requirement pins no single version, so it must
+    /// not be read as an exact one: `>=0.6` resolves to 0.7 perfectly well and
+    /// refusing the install would be a false negative.
+    #[test]
+    fn range_requirements_are_unknown_not_incompatible() {
+        for requirement in [">=0.6", ">=0.7, <0.9", "*", "0.6 || 0.7", "<0.8"] {
+            assert_eq!(
+                check_compat(requirement, "0.7.0"),
+                Compat::Unknown,
+                "{requirement}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_and_caret_requirements_still_compare() {
+        assert_eq!(check_compat("=0.7.1", "0.7.0"), Compat::Compatible);
+        assert_eq!(check_compat("~0.6.0", "0.7.0"), Compat::Incompatible);
+    }
+
+    /// AC #3 must hold for a workspace member too: `{ workspace = true }`
+    /// resolves against the enclosing workspace rather than silently skipping
+    /// the gate.
+    #[test]
+    fn a_workspace_inherited_dependency_still_gates() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let member = workspace.path().join("app");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\nautumn-web = { workspace = true }\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/main.rs"), SCAFFOLD_MAIN).unwrap();
+
+        assert_eq!(
+            app_autumn_web(&member).unwrap(),
+            AppAutumnWeb::Version("0.5.0".to_owned())
+        );
+        let err = plan_add(&member, admin(), "0.7.0").unwrap_err();
+        assert!(err.to_string().contains("0.5.0"), "{err}");
+    }
+
+    #[test]
+    fn implausible_versions_are_never_written_to_a_manifest() {
+        assert!(is_plausible_version("0.7.0"));
+        assert!(is_plausible_version("1.0.0-rc.1+build.5"));
+        assert!(!is_plausible_version("\" }\n[dependencies]\nevil = \"1"));
+        assert!(!is_plausible_version(""));
+        assert!(!is_plausible_version("latest"));
+
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        let before = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "not a version").unwrap_err();
+        assert!(
+            matches!(err, PluginError::ImplausibleVersion { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            before
+        );
+    }
+
+    /// The mount is queued before the manifest edit, so a mid-execute I/O
+    /// failure cannot leave a dependency whose mount never landed.
+    #[test]
+    fn the_mount_is_queued_before_the_manifest() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        let AddOutcome::Installed { plan, .. } = plan_add(tmp.path(), admin(), "0.7.0").unwrap()
+        else {
+            panic!("expected an installable plan");
+        };
+        let paths: Vec<_> = plan
+            .actions
+            .iter()
+            .map(|action| action.path().to_path_buf())
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].ends_with("main.rs"), "{paths:?}");
+        assert!(paths[1].ends_with("Cargo.toml"), "{paths:?}");
+    }
+
     #[test]
     fn plan_add_outside_a_project_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -748,7 +1005,7 @@ maud = { version = "0.27", features = ["axum"] }
             let updated = insert_mount(SCAFFOLD_MAIN, entry.mount)
                 .unwrap_or_else(|| panic!("{}: no anchor", entry.crate_name));
             assert!(
-                mount_present(&updated, entry.probe),
+                mount_present(&updated, &entry.probes()),
                 "{}: mount not detected after insertion",
                 entry.crate_name
             );

@@ -11,23 +11,20 @@
 //! One scanner, shared, so an anchor scan and its "is it already there?"
 //! companion can never disagree about what a comment is.
 
-/// Walk `source`'s lines that are **code**, skipping comments, and return the
-/// first non-`None` result of `f`.
+/// Every line of `source` that is **code**, paired with its byte offset.
 ///
-/// `f` receives the raw line and its byte offset in `source`. The offset is
-/// tracked as the walk proceeds rather than recovered afterwards with
-/// `source.find(line)`, which would re-locate an identical earlier line and
-/// splice at the wrong place.
+/// `//`, `///`, `//!` and `/* … */` are skipped. The offset is tracked as the
+/// walk proceeds rather than recovered afterwards with `source.find(line)`,
+/// which would re-locate an identical earlier line and hand back the wrong
+/// splice point.
 ///
-/// Every caller that edits a user-owned `main.rs` shares this one scanner so
-/// they can never disagree about what counts as a comment — a disagreement
-/// there is exactly what lets a doc-comment mention both suppress an edit and
-/// suppress the warning about it. Callers today: `autumn generate pwa`'s push-
-/// router injection and `autumn plugin add`'s builder-chain scan.
-pub fn for_each_code_line<T>(
-    source: &str,
-    mut f: impl FnMut(&str, usize) -> Option<T>,
-) -> Option<T> {
+/// String literals are **not** tracked: a line inside a raw string still reads
+/// as code here. Callers that splice must therefore treat an ambiguous match
+/// (more than one candidate) as "no anchor" rather than picking one — see
+/// `plugin::install::builder_anchor`.
+#[must_use]
+pub fn code_lines(source: &str) -> Vec<(&str, usize)> {
+    let mut out = Vec::new();
     let mut offset = 0_usize;
     let mut in_block_comment = false;
 
@@ -53,11 +50,25 @@ pub fn for_each_code_line<T>(
             continue;
         }
 
-        if let Some(found) = f(line, line_start) {
-            return Some(found);
-        }
+        out.push((line, line_start));
     }
-    None
+    out
+}
+
+/// Walk `source`'s code lines and return the first non-`None` result of `f`.
+///
+/// Every caller that edits a user-owned `main.rs` shares this one scanner so
+/// they can never disagree about what counts as a comment — a disagreement
+/// there is exactly what lets a doc-comment mention both suppress an edit and
+/// suppress the warning about it. Callers today: `autumn generate pwa`'s push-
+/// router injection and `autumn plugin add`'s builder-chain scan.
+pub fn for_each_code_line<T>(
+    source: &str,
+    mut f: impl FnMut(&str, usize) -> Option<T>,
+) -> Option<T> {
+    code_lines(source)
+        .into_iter()
+        .find_map(|(line, offset)| f(line, offset))
 }
 
 #[cfg(test)]
