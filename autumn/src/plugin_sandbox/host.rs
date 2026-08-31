@@ -147,6 +147,18 @@ pub const MAX_TABLES: usize = 4;
 /// globals, which no fuel charge priced and no footprint counted.
 pub const MAX_GLOBALS: usize = 4096;
 
+/// The most bytes a module's code section may occupy.
+///
+/// The declaration counts bound how many *things* a module names; they say
+/// nothing about how much instruction stream sits inside one of them. A single
+/// function whose body fills the file allowance declares exactly one entry and
+/// still hands `Module::new` tens of megabytes to translate into wasmi's larger
+/// internal representation, which is the allocation amplification the file
+/// ceiling was never a bound on. Generous against real output — a whole Rust
+/// web application compiles to a few megabytes of code — and far under what a
+/// 64 MiB artifact can carry.
+pub const MAX_CODE_BYTES: usize = 16 * 1024 * 1024;
+
 /// The largest total data + element section a module may carry (16 MiB).
 ///
 /// Every request instantiates a **fresh** module — that is what makes "no state
@@ -1286,6 +1298,8 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// Bytes of instruction stream in the code section.
+    code_bytes: usize,
     /// How many globals the module declares.
     global_count: usize,
     /// How many tables the module declares.
@@ -1329,6 +1343,9 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     const TABLE_SECTION: u8 = 4;
     /// The global section, whose entries each become per-instance storage.
     const GLOBAL_SECTION: u8 = 6;
+    /// The code section, whose *size* is the instruction volume the compiler
+    /// walks — a thing no entry count reveals.
+    const CODE_SECTION: u8 = 10;
     /// The custom section is the one whose payload is not a counted vector.
     const CUSTOM_SECTION: u8 = 0;
 
@@ -1339,6 +1356,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut table_elements = 0u64;
     let mut table_count = 0usize;
     let mut global_count = 0usize;
+    let mut code_bytes = 0usize;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1354,6 +1372,9 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             let (count, _) = leb128(wasm, after_size)?;
             segments = segments.saturating_add(count);
             bytes = bytes.saturating_add(size);
+        }
+        if id == CODE_SECTION {
+            code_bytes = code_bytes.saturating_add(size);
         }
         if id == GLOBAL_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
@@ -1388,6 +1409,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        code_bytes,
         global_count,
         table_count,
         table_elements,
@@ -1411,6 +1433,13 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             "the module's section stream could not be walked".to_owned(),
         ));
     };
+    if shape.code_bytes > MAX_CODE_BYTES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "code section bytes",
+            found: shape.code_bytes,
+            max: MAX_CODE_BYTES,
+        });
+    }
     if shape.global_count > MAX_GLOBALS {
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "globals",
@@ -3737,6 +3766,55 @@ path = "/hello/greet"
                 err,
                 SandboxLoadError::InstantiationTooExpensive {
                     what: "initial table elements",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_whose_code_section_is_too_large_is_refused_before_compilation() {
+        // One function declares one entry however long its body is, so the
+        // declaration ceilings never saw this: a single body filling the file
+        // allowance still hands the compiler tens of megabytes to translate.
+        // The section header carries the size, so the refusal costs one LEB128
+        // and never touches the instruction stream.
+        let mut wasm = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+
+        // Rewrite the code section's declared size to just over the ceiling
+        // rather than building a module that large: the check reads the header,
+        // and a fixture of real instructions would cost the test minutes.
+        let over = u32::try_from(MAX_CODE_BYTES + 1).expect("fits");
+        let mut header = vec![10u8]; // the code section id
+        let mut size = over;
+        loop {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            header.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        // The bytes have to actually be there: a header claiming a length the
+        // file does not carry is refused as malformed, which is a correct
+        // refusal but a different one from the ceiling under test.
+        header.extend(std::iter::repeat_n(0u8, over as usize));
+        wasm.extend_from_slice(&header);
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("an oversized code section must not reach the compiler");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "code section bytes",
                     ..
                 }
             ),

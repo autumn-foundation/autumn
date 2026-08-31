@@ -352,8 +352,14 @@ impl SandboxArtifact {
             std::str::from_utf8(manifest_bytes).map_err(|_| ArtifactError::ManifestNotUtf8)?;
         let manifest = SandboxManifest::parse(manifest_src)?;
 
-        let module = body.get(manifest_len..).unwrap_or_default().to_vec();
-        check_module(&module)?;
+        // Checked on the borrowed slice, *then* cloned: `to_vec` first would
+        // copy a multi-gigabyte payload into a second allocation before the
+        // ceiling that exists to refuse it ever ran, so the refusal itself was
+        // the expensive part. The caller already holds these bytes; the point
+        // of the ceiling is not to hold them twice.
+        let module = body.get(manifest_len..).unwrap_or_default();
+        check_module(module)?;
+        let module = module.to_vec();
 
         let actual = Self::digest(&module);
         if actual != manifest.sha256 {
