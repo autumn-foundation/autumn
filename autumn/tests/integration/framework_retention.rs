@@ -638,3 +638,85 @@ async fn audit_archives_without_a_purgeable_sink_says_so() {
         reports[0]
     );
 }
+
+#[tokio::test]
+async fn a_partial_archive_purge_reports_both_the_removals_and_the_failure() {
+    // Regression (#1605 Codex round 1): a purge across several sinks can
+    // partly succeed. The entries the working sink deleted are gone, so the
+    // report must carry that count *alongside* the error rather than
+    // recording `rows_removed = 0` for data that is genuinely deleted.
+    struct UnpurgeableSink;
+
+    impl autumn_web::audit::AuditSink for UnpurgeableSink {
+        fn write(
+            &self,
+            _event: autumn_web::audit::AuditEvent,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), autumn_web::audit::AuditError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn purge_before(
+            &self,
+            _cutoff: chrono::DateTime<chrono::Utc>,
+            _dry_run: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            autumn_web::audit::AuditPurgeOutcome,
+                            autumn_web::audit::AuditError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(autumn_web::audit::AuditError::new("sink offline")) })
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("audit.jsonl");
+    seed_archive(&path, &[400, 400]).await;
+
+    let mut config = AutumnConfig::default();
+    config.retention.audit_archives = Some("30d".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+    state.insert_extension(
+        autumn_web::audit::AuditLogger::new()
+            .with_sink(std::sync::Arc::new(
+                autumn_web::audit::JsonlFileAuditSink::new(&path),
+            ))
+            .with_sink(std::sync::Arc::new(UnpurgeableSink)),
+    );
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("audit_archives"),
+        },
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(
+        reports[0].rows_removed, 2,
+        "removals that really happened must be reported: {:?}",
+        reports[0]
+    );
+    assert!(
+        reports[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sink offline")),
+        "the failure must be reported too: {:?}",
+        reports[0]
+    );
+}

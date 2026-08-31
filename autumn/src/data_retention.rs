@@ -585,20 +585,21 @@ async fn apply_archive_purge(
     // One pass, not two: on a real run `entries_removed` *is* what was
     // eligible, and the archive can be large enough that reading it twice per
     // sweep is a cost worth not paying.
-    match logger.purge_before(cutoff, dry_run).await {
-        Ok(outcome) if !outcome.supported => {
-            report.skipped = Some(
-                "no installed audit sink supports purging (see AuditSink::purge_before)".to_owned(),
-            );
+    let summary = logger.purge_before(cutoff, dry_run).await;
+    // Record what was removed even when a sink failed. A partial purge has
+    // already deleted those entries; reporting `rows_removed = 0` alongside
+    // the error would understate a deletion that really happened.
+    if summary.supported {
+        report.eligible_rows = Some(summary.entries_removed);
+        if !dry_run {
+            report.rows_removed = summary.entries_removed;
         }
-        Ok(outcome) => {
-            report.eligible_rows = Some(outcome.entries_removed);
-            if !dry_run {
-                report.rows_removed = outcome.entries_removed;
-            }
-        }
-        Err(error) => report.error = Some(error.to_string()),
+    } else if summary.errors.is_empty() {
+        report.skipped = Some(
+            "no installed audit sink supports purging (see AuditSink::purge_before)".to_owned(),
+        );
     }
+    report.error = summary.error_message();
 }
 
 // ── Postgres sweeps ──────────────────────────────────────────────────────
@@ -644,7 +645,13 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
         )),
         RetentionDataset::CommitHooks => Some((
             "autumn_repository_commit_hooks",
-            "status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < $1",
+            // `after_hook_failed` is terminal too: it records `finished_at`
+            // and the row is only ever revived by an `ON CONFLICT (id)`
+            // upsert, which inserts cleanly if the row is gone. Omitting it
+            // would leave every permanently-failed after-hook accumulating
+            // forever despite a configured window.
+            "status IN ('completed', 'failed', 'after_hook_failed') \
+             AND finished_at IS NOT NULL AND finished_at < $1",
         )),
         RetentionDataset::JobTracking => Some(("autumn_job_tracking", "updated_at < $1")),
         RetentionDataset::ExperimentAssignments => Some((
@@ -985,14 +992,61 @@ mod tests {
         // Regression guard for the single most dangerous thing this module
         // could get wrong: a predicate that reaches an enqueued, running, or
         // retry-scheduled job.
+        //
+        // Asserts on the *set* of statuses rather than a substring of the
+        // rendered SQL: a substring match breaks the moment a new terminal
+        // status is added (as `discarded` was), which tells you nothing about
+        // whether the predicate is still safe.
         let (table, predicate) =
             stale_row_predicate(RetentionDataset::JobHistory).expect("job_history is sweepable");
         assert_eq!(table, "autumn_jobs");
+        let statuses = statuses_in(predicate);
+        assert_eq!(
+            statuses,
+            vec!["completed", "discarded", "failed"],
+            "job_history must match every terminal status and no live one: {predicate}"
+        );
+        for live in ["enqueued", "running"] {
+            assert!(
+                !statuses.contains(&live.to_owned()),
+                "{live:?} is a live status and must never be swept: {predicate}"
+            );
+        }
+        assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
         assert!(
-            predicate.contains("status IN ('completed', 'failed')"),
-            "{predicate}"
+            predicate.contains("unique_window = 'ttl'"),
+            "a TTL-window dedup token must be excluded: {predicate}"
+        );
+    }
+
+    #[test]
+    fn commit_hooks_sweeps_every_terminal_hook_status() {
+        let (table, predicate) =
+            stale_row_predicate(RetentionDataset::CommitHooks).expect("commit_hooks is sweepable");
+        assert_eq!(table, "autumn_repository_commit_hooks");
+        assert_eq!(
+            statuses_in(predicate),
+            vec!["after_hook_failed", "completed", "failed"],
+            "every status that sets finished_at must be swept, or those rows \
+             grow forever despite a configured window: {predicate}"
         );
         assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
+    }
+
+    /// The sorted set of `'quoted'` status literals named by a predicate's
+    /// `status IN (...)` clause.
+    fn statuses_in(predicate: &str) -> Vec<String> {
+        let start = predicate
+            .find("status IN (")
+            .map(|at| at + "status IN (".len())
+            .expect("predicate names a status set");
+        let end = start + predicate[start..].find(')').expect("closing paren");
+        let mut statuses: Vec<String> = predicate[start..end]
+            .split(',')
+            .map(|status| status.trim().trim_matches('\'').to_owned())
+            .collect();
+        statuses.sort();
+        statuses
     }
 
     #[test]

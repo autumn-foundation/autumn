@@ -64,7 +64,7 @@ before setting those three.
 | Dataset | What it is | Where it lives | Default (unset) | Enforced by |
 |---|---|---|---|---|
 | `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
-| `commit_hooks` | Finished `#[after_commit]` hook rows | `autumn_repository_commit_hooks` | **forever** | sweep |
+| `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
 | `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking` | jobs.tracking.ttl_secs (24h by default) | sweep |
 | `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
@@ -146,7 +146,9 @@ one guards an invariant another subsystem depends on:
 
 - **`job_tracking`** and **`commit_hooks`** have no such entanglement:
   tracking records are already invisible to reads past their expiry, and a
-  terminal hook row is history.
+  terminal hook row is history. `commit_hooks` covers `after_hook_failed`
+  alongside `completed`/`failed` — it is terminal and records `finished_at`,
+  and a re-enqueue of the same hook id inserts cleanly once the row is gone.
 
 **`backend ttl`** — the storage backend expires the record itself, so there is
 nothing for a sweep to delete and the report shows `—` rather than a fake
@@ -183,6 +185,10 @@ instead of implying an empty archive.
 > --purge --dataset audit_archives` *against a live server writing the same
 > file* can drop events appended during the rewrite. Let the in-process
 > scheduled sweep handle this dataset in a live deployment.
+
+With several sinks installed, a purge can partly succeed. Entries a working
+sink removed stay removed, so the report carries that count *and* the failing
+sink's error — `rows_removed` never understates a deletion that happened.
 
 ## Precedence: the Shorter Bound Wins
 
@@ -268,6 +274,12 @@ and its reason appear in the report:
 
 Only sweep-enforced datasets have a backing table a hold can name; the
 TTL-native ones cannot be held this way.
+
+A hold on `autumn_job_tracking` also suppresses the job runner's own
+independent `expires_at` cleanup, which predates this policy and is not part
+of it. Without that, a hold would be honoured by `autumn db retention` and
+quietly violated five minutes later by the maintenance loop — worse than
+having no hold at all.
 
 ## The CLI
 

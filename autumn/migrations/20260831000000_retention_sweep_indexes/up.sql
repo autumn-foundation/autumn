@@ -18,4 +18,4 @@ CREATE INDEX IF NOT EXISTS idx_autumn_exp_assignments_assigned_at
 
 CREATE INDEX IF NOT EXISTS idx_autumn_commit_hooks_finished
     ON autumn_repository_commit_hooks (finished_at)
-    WHERE status IN ('completed', 'failed');
+    WHERE status IN ('completed', 'failed', 'after_hook_failed');

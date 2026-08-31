@@ -144,6 +144,39 @@ impl AuditPurgeOutcome {
     }
 }
 
+/// What a purge across *every* sink of an [`AuditLogger`] did (issue #1605).
+///
+/// Separate from the per-sink [`AuditPurgeOutcome`] because a fan-out can
+/// partly succeed: entries removed by one sink stay removed even when a later
+/// sink fails, so both facts have to reach the caller together.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditPurgeSummary {
+    /// Entries removed across all sinks — or, for a dry run, that *would* be
+    /// removed. Counts work that really happened, even alongside
+    /// [`Self::errors`].
+    pub entries_removed: u64,
+    /// `true` when at least one sink could purge at all.
+    pub supported: bool,
+    /// One message per sink that failed. Empty on a fully successful purge.
+    pub errors: Vec<String>,
+}
+
+impl AuditPurgeSummary {
+    /// The failures joined into one human-readable message, or `None` when
+    /// every sink succeeded.
+    #[must_use]
+    pub fn error_message(&self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} audit sink(s) failed to purge: {}",
+            self.errors.len(),
+            self.errors.join(" | ")
+        ))
+    }
+}
+
 type AuditPurgeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AuditPurgeOutcome, AuditError>> + Send + 'a>>;
 
@@ -241,50 +274,33 @@ impl AuditLogger {
     /// Purge every sink of entries older than `cutoff`, summing what each one
     /// removed (issue #1605).
     ///
-    /// `supported` in the returned outcome is `true` when *at least one* sink
-    /// could purge; a logger whose sinks all forward elsewhere reports
-    /// unsupported so the retention report can say so instead of implying an
-    /// empty archive.
+    /// Infallible by design, unlike [`Self::write`]: a purge that partly
+    /// succeeded has *already deleted rows*, and returning only an error
+    /// would throw that count away — the retention report would then record
+    /// `rows_removed = 0` for entries that are genuinely gone, which is
+    /// exactly the kind of understatement a compliance trail must not
+    /// contain. The summary therefore carries both what was removed and what
+    /// failed, and the caller decides how to present them.
     ///
-    /// Every sink is attempted even after one fails, matching
-    /// [`Self::write`]; failures are aggregated into one error and the
-    /// successful sinks' work still stands.
+    /// `supported` is `true` when *at least one* sink could purge; a logger
+    /// whose sinks all forward elsewhere reports unsupported so the retention
+    /// report can say so instead of implying an empty archive.
     ///
-    /// # Errors
-    ///
-    /// Returns [`AuditError`] when one or more purgeable sinks fail.
-    pub async fn purge_before(
-        &self,
-        cutoff: DateTime<Utc>,
-        dry_run: bool,
-    ) -> Result<AuditPurgeOutcome, AuditError> {
-        let mut total = AuditPurgeOutcome::default();
-        let mut errors = Vec::new();
+    /// Every sink is attempted even after one fails, matching [`Self::write`].
+    pub async fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeSummary {
+        let mut summary = AuditPurgeSummary::default();
         for sink in &self.sinks {
             match sink.purge_before(cutoff, dry_run).await {
                 Ok(outcome) => {
-                    total.entries_removed = total
+                    summary.entries_removed = summary
                         .entries_removed
                         .saturating_add(outcome.entries_removed);
-                    total.supported |= outcome.supported;
+                    summary.supported |= outcome.supported;
                 }
-                Err(error) => errors.push(error),
+                Err(error) => summary.errors.push(error.message().to_owned()),
             }
         }
-        if errors.is_empty() {
-            return Ok(total);
-        }
-        let mut details = String::with_capacity(errors.len() * 64);
-        for (index, error) in errors.iter().enumerate() {
-            if index > 0 {
-                details.push_str(" | ");
-            }
-            details.push_str(error.message());
-        }
-        Err(AuditError::new(format!(
-            "{} audit sink(s) failed to purge: {details}",
-            errors.len()
-        )))
+        summary
     }
 }
 
@@ -707,24 +723,65 @@ mod tests {
             .with_sink(Arc::new(JsonlFileAuditSink::new(&first)))
             .with_sink(Arc::new(JsonlFileAuditSink::new(&second)));
 
-        let outcome = logger
-            .purge_before(Utc::now(), false)
-            .await
-            .expect("logger purge");
+        let summary = logger.purge_before(Utc::now(), false).await;
 
-        assert_eq!(outcome.entries_removed, 3);
+        assert_eq!(summary.entries_removed, 3);
         assert!(
-            outcome.supported,
+            summary.supported,
             "at least one sink supports purging, so the logger reports support"
         );
+        assert!(summary.errors.is_empty());
+        assert_eq!(summary.error_message(), None);
     }
 
     #[tokio::test]
     async fn logger_purge_with_no_purgeable_sinks_reports_unsupported() {
         let logger = AuditLogger::new().with_sink(Arc::new(TracingAuditSink));
-        let outcome = logger.purge_before(Utc::now(), false).await.expect("purge");
-        assert!(!outcome.supported);
-        assert_eq!(outcome.entries_removed, 0);
+        let summary = logger.purge_before(Utc::now(), false).await;
+        assert!(!summary.supported);
+        assert_eq!(summary.entries_removed, 0);
+        assert!(summary.errors.is_empty());
+    }
+
+    /// A sink that always fails to purge (but accepts writes).
+    struct UnpurgeableSink;
+
+    impl AuditSink for UnpurgeableSink {
+        fn write(&self, _event: AuditEvent) -> AuditWriteFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn purge_before(&self, _cutoff: DateTime<Utc>, _dry_run: bool) -> AuditPurgeFuture<'_> {
+            Box::pin(async { Err(AuditError::new("sink offline")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn logger_purge_keeps_what_succeeded_when_another_sink_fails() {
+        // A partial purge has already deleted those entries. Throwing the
+        // count away with the error would make the retention report record
+        // `rows_removed = 0` for entries that are genuinely gone — an
+        // understatement a compliance trail must not contain.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let path = tmp.path().join("a.log");
+        archive_with_timestamps(&path, &[old, old]).await;
+
+        let logger = AuditLogger::new()
+            .with_sink(Arc::new(JsonlFileAuditSink::new(&path)))
+            .with_sink(Arc::new(UnpurgeableSink));
+
+        let summary = logger.purge_before(Utc::now(), false).await;
+
+        assert_eq!(
+            summary.entries_removed, 2,
+            "the successful sink's removals must survive the aggregated failure"
+        );
+        assert!(summary.supported);
+        assert_eq!(summary.errors.len(), 1);
+        let message = summary.error_message().expect("a failure is reported");
+        assert!(message.contains("sink offline"), "{message}");
+        assert!(message.contains("1 audit sink(s) failed"), "{message}");
     }
 
     #[tokio::test]

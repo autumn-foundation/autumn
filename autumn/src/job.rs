@@ -9193,7 +9193,7 @@ async fn pg_maintenance_loop(
                 }
             }
             _ = tracking_cleanup_interval.tick() => {
-                pg_cleanup_expired_tracking_rows(&pool).await;
+                pg_cleanup_expired_tracking_rows(&pool, &state).await;
             }
             () = shutdown.cancelled() => break,
         }
@@ -9234,9 +9234,28 @@ async fn pg_queue_depth_survey_loop(
 /// table's growth for high-volume tracked-job usage — every enqueue writes
 /// a row here, and without a sweep those rows would otherwise accumulate
 /// forever.
+///
+/// Skipped entirely while `autumn_job_tracking` is under a GDPR legal hold
+/// (#1605). This cleanup predates the unified retention policy and is not
+/// part of it, but it deletes from a table a hold can name — so without this
+/// check a `ModelRegistration::retain("autumn_job_tracking", ...)` would be
+/// honoured by `autumn db retention` and quietly violated here five minutes
+/// later, which is worse than having no hold at all.
 #[cfg(feature = "db")]
-async fn pg_cleanup_expired_tracking_rows(pool: &PgPool) {
+async fn pg_cleanup_expired_tracking_rows(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
+
+    let registry = state.extension::<crate::gdpr::GdprRegistry>();
+    if let Some(reason) = crate::data_retention::legal_hold_for(
+        crate::data_retention::RetentionDataset::JobTracking,
+        registry.as_deref(),
+    ) {
+        tracing::debug!(
+            reason = %reason,
+            "job tracking cleanup skipped: autumn_job_tracking is under legal hold"
+        );
+        return;
+    }
 
     let Ok(mut conn) = pool.get().await else {
         tracing::warn!("job tracking cleanup could not acquire connection");
@@ -16544,7 +16563,41 @@ mod tests {
                 .await
                 .unwrap();
 
-            pg_cleanup_expired_tracking_rows(&pool).await;
+            // Under a GDPR legal hold on this table, the cleanup must not
+            // run at all (#1605): the retention report claims the rows are
+            // being preserved, so this path quietly deleting them five
+            // minutes later is worse than having no hold.
+            let held = AppState::for_test();
+            held.insert_extension(crate::gdpr::GdprRegistry::new().register(
+                crate::gdpr::ModelRegistration::retain(
+                    "autumn_job_tracking",
+                    "litigation hold 2026-CV-1",
+                ),
+            ));
+            pg_cleanup_expired_tracking_rows(&pool, &held).await;
+            // Counted in raw SQL: `PgJobTrackingStore::get` filters on
+            // `expires_at` lazily, so it reports an expired-but-present row
+            // as absent — exactly the distinction under test here.
+            #[derive(diesel::QueryableByName)]
+            struct HeldCount {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                count: i64,
+            }
+            let mut conn = pool.get().await.unwrap();
+            let remaining = diesel::sql_query(
+                "SELECT COUNT(*) AS count FROM autumn_job_tracking WHERE key = 'expired-key'",
+            )
+            .get_result::<HeldCount>(&mut *conn)
+            .await
+            .unwrap()
+            .count;
+            drop(conn);
+            assert_eq!(
+                remaining, 1,
+                "a legal hold on autumn_job_tracking must suppress this cleanup entirely"
+            );
+
+            pg_cleanup_expired_tracking_rows(&pool, &AppState::for_test()).await;
 
             let verify_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 86_400);
             assert!(
