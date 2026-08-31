@@ -1339,6 +1339,13 @@ struct ModuleShape {
     /// Zero when the module has none, or when the offsets are not constants
     /// this walk can evaluate.
     data_end: u64,
+    /// How many imports the module declares.
+    ///
+    /// `MAX_IMPORTS` was enforced from `module.imports().count()`, which is
+    /// only available *after* `Module::new` has already built a representation
+    /// of every one of them — the ceiling ran after the allocation it exists to
+    /// prevent. Read from the section header here, so it can run before.
+    import_count: usize,
     /// How many functions the module defines.
     function_count: usize,
     /// Whether the module carries a `start` section.
@@ -1556,6 +1563,8 @@ const DATA_SECTION: u8 = 11;
 const TABLE_SECTION: u8 = 4;
 /// The global section, whose entries each become per-instance storage.
 const GLOBAL_SECTION: u8 = 6;
+/// The import section: entries the compiler builds a representation for.
+const IMPORT_SECTION: u8 = 2;
 /// The function section: one type index per function the module defines.
 const FUNCTION_SECTION: u8 = 3;
 /// The start section: a function the engine runs at instantiation.
@@ -1635,6 +1644,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut code_bytes = 0usize;
     let mut has_start = false;
     let mut function_count = 0usize;
+    let mut import_count = 0usize;
     let mut data_end = 0u64;
     let mut table_minimums = [0u64; MAX_TABLES];
     let mut table_count_seen = 0usize;
@@ -1676,19 +1686,21 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
                 data_end = data_end.max(end);
             }
         }
-        if id == FUNCTION_SECTION {
-            let (count, _) = leb128(wasm, after_size)?;
-            function_count = function_count.saturating_add(count);
-        }
-        if id == START_SECTION {
-            has_start = true;
-        }
-        if id == CODE_SECTION {
-            code_bytes = code_bytes.saturating_add(size);
-        }
-        if id == GLOBAL_SECTION {
-            let (count, _) = leb128(wasm, after_size)?;
-            global_count = global_count.saturating_add(count);
+        // The sections whose leading count (or size) is the whole answer. The
+        // rest need their entries walked and are handled above.
+        match id {
+            IMPORT_SECTION => {
+                import_count = import_count.saturating_add(leb128(wasm, after_size)?.0);
+            }
+            FUNCTION_SECTION => {
+                function_count = function_count.saturating_add(leb128(wasm, after_size)?.0);
+            }
+            GLOBAL_SECTION => {
+                global_count = global_count.saturating_add(leb128(wasm, after_size)?.0);
+            }
+            CODE_SECTION => code_bytes = code_bytes.saturating_add(size),
+            START_SECTION => has_start = true,
+            _ => {}
         }
         if id == TABLE_SECTION {
             // `vec(tabletype)`, and a `tabletype` is a reftype byte then
@@ -1729,6 +1741,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        import_count,
         function_count,
         has_start,
         element_overflow,
@@ -1762,6 +1775,13 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             what: "code section bytes",
             found: shape.code_bytes,
             max: MAX_CODE_BYTES,
+        });
+    }
+    if shape.import_count > MAX_IMPORTS {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "imports",
+            found: shape.import_count,
+            max: MAX_IMPORTS,
         });
     }
     if shape.function_count > MAX_FUNCTIONS {
