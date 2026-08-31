@@ -96,12 +96,20 @@ pub enum SbomError {
 // CycloneDX document model
 // ---------------------------------------------------------------------------
 
+// `deny_unknown_fields` throughout is load bearing, not pedantry. `--verify`
+// compares the DESERIALIZED document, so any field this tool does not model
+// would be dropped on read and the comparison would report a match — letting a
+// transported SBOM gain a fabricated `vulnerabilities` array, an injected
+// `metadata.timestamp`, or an extra `dependencies` graph without the gate
+// noticing. Rejecting them is also the honest contract: `--verify` asks "is
+// this the document this tool would generate?", not "is this valid CycloneDX?".
 /// A `CycloneDX` 1.5 bill of materials.
 ///
 /// Field order here IS the serialized key order, which is part of the
 /// determinism contract — do not reorder without regenerating any checked-in
 /// SBOM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 // `bom_format` deliberately repeats the type name: it mirrors CycloneDX's own
 // `bomFormat` key, and renaming the Rust field would only obscure that.
 #[allow(clippy::struct_field_names)]
@@ -122,17 +130,20 @@ pub struct Bom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BomMetadata {
     pub tools: Tools,
     pub component: Component,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tools {
     pub components: Vec<Component>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Component {
     #[serde(rename = "type")]
     pub kind: String,
@@ -160,11 +171,13 @@ pub struct Component {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct License {
     pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalReference {
     #[serde(rename = "type")]
     pub kind: String,
@@ -172,6 +185,7 @@ pub struct ExternalReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Property {
     pub name: String,
     pub value: String,
@@ -1158,7 +1172,10 @@ fn execute(opts: &SbomOptions) -> Result<(), SbomError> {
         let existing = std::fs::read_to_string(path)?;
         let actual: Bom = serde_json::from_str(&existing).map_err(|e| {
             SbomError::VerifyMismatch(format!(
-                "  {} is not a CycloneDX document this CLI can read: {e}",
+                "  {} is not a document this CLI would generate: {e}\n\
+                 \x20 (verification compares against this tool's own output, so any \
+                 field it does not emit — an added timestamp, a vulnerabilities \
+                 array — is a mismatch, not something to ignore)",
                 path.display()
             ))
         })?;
@@ -1438,6 +1455,39 @@ mod tests {
         let a = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
         let b = bom_of(&[("anyhow", "1.0.5"), ("serde", "1.0.0")]);
         assert!(diff(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn verification_rejects_a_document_carrying_fields_this_tool_never_emits() {
+        // Modelling only the fields we write means anything else — an injected
+        // `metadata.timestamp`, a fabricated `vulnerabilities` array, an extra
+        // `dependencies` graph — is silently dropped on read and the comparison
+        // sees a document that matches. Verification has to notice.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["vulnerabilities"] = json!([{ "id": "CVE-0000-0000" }]);
+
+        let err = serde_json::from_str::<Bom>(&doc.to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("vulnerabilities"),
+            "the error must name the unexpected field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verification_rejects_an_injected_timestamp() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["metadata"]["timestamp"] = json!("2026-01-01T00:00:00Z");
+        assert!(serde_json::from_str::<Bom>(&doc.to_string()).is_err());
+    }
+
+    #[test]
+    fn verification_rejects_an_extra_component_field() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
+        doc["components"][0]["description"] = json!("smuggled");
+        assert!(serde_json::from_str::<Bom>(&doc.to_string()).is_err());
     }
 
     #[test]

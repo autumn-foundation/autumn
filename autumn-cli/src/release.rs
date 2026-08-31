@@ -48,22 +48,24 @@ mod templates {
     pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
 }
 
-/// First `autumn-cli` release that ships `autumn sbom`.
+/// First `autumn-cli` release that ships the issue #1615 supply-chain surface:
+/// the `autumn sbom` subcommand AND `autumn build --auditable`.
 ///
 /// The generated Dockerfile `cargo install`s the CLI at
 /// `{{autumn_cli_version}}` — which renders THIS CLI's own version. Between a
 /// feature merging and the next release that is an ALREADY-PUBLISHED version
 /// predating the feature, so a scaffold generated from a source build in that
-/// window would emit `RUN autumn sbom …` against a CLI that has no such
-/// subcommand and the image would not build at all.
+/// window would invoke `autumn sbom` (no such subcommand) or `autumn build
+/// --auditable` (no such flag) and the image would not build at all.
 ///
 /// `0.7.1` means "any release after 0.7.0", which is every future version, so
-/// this needs no maintenance when the next version number is chosen: the SBOM
+/// this needs no maintenance when the next version number is chosen: the gated
 /// steps switch themselves on the moment a CLI that can satisfy them is what
 /// gets installed. Until then the scaffold still produces a working image —
-/// with the auditable binary and the verified Tailwind download, just without
-/// the sidecar SBOM file.
-const SBOM_MIN_CLI_VERSION: &str = "0.7.1";
+/// with the verified Tailwind download and, on the default (non-embed) path,
+/// an auditable binary, since `cargo auditable build` needs only the
+/// cargo-auditable crate and nothing from the autumn CLI.
+const SUPPLY_CHAIN_MIN_CLI_VERSION: &str = "0.7.1";
 
 /// Builder-stage step that writes the image's `CycloneDX` inventory.
 ///
@@ -99,7 +101,7 @@ const SBOM_LABELS: &str = concat!(
 ///
 /// The generated deploy workflows extract and attest the SBOM baked into the
 /// image, which only exists when the pinned CLI could generate it (see
-/// [`SBOM_MIN_CLI_VERSION`]). Rather than duplicate each cloud's image
+/// [`SUPPLY_CHAIN_MIN_CLI_VERSION`]). Rather than duplicate each cloud's image
 /// expression and env block in Rust, the steps live in the template between
 /// markers and this either unwraps them or removes them wholesale.
 fn strip_sbom_block(rendered: &str, keep: bool) -> String {
@@ -143,15 +145,16 @@ fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// Whether a Dockerfile pinned to `cli_version` can run `autumn sbom`.
+/// Whether a Dockerfile pinned to `cli_version` can run this release's
+/// supply-chain CLI surface.
 ///
 /// An unparseable version is treated as capable: it is not a published
 /// crates.io release, so it is a local/source build, which by definition has
 /// whatever this CLI has.
-fn cli_supports_sbom(cli_version: &str) -> bool {
+fn cli_supports_supply_chain_flags(cli_version: &str) -> bool {
     match (
         semver_triple(cli_version),
-        semver_triple(SBOM_MIN_CLI_VERSION),
+        semver_triple(SUPPLY_CHAIN_MIN_CLI_VERSION),
     ) {
         (Some(have), Some(need)) => have >= need,
         _ => true,
@@ -631,15 +634,36 @@ fn render_for_cli(
     split_workers: bool,
     cli_version: &str,
 ) -> String {
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
+    // build` on the default path, which needs only the cargo-auditable crate —
+    // it is subject to the same pin gate as `autumn sbom`. An older pinned CLI
+    // rejects the argument and the image fails to build.
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
+    // build` on the default path, which needs only the cargo-auditable crate —
+    // it is subject to the same pin gate as `autumn sbom`: an older pinned CLI
+    // rejects the argument and the image fails to build. The explanatory
+    // comment is gated with it, so a generated Dockerfile never documents a
+    // flag it does not pass.
+    let (embed_auditable_note, embed_auditable) = if cli_supports_supply_chain_flags(cli_version) {
+        (
+            "# `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
+                 # shipped binary carries its own dependency list.\n",
+            " --auditable",
+        )
+    } else {
+        ("", "")
+    };
+    let embed_build_step = format!(
+        "# Single-binary build: fingerprint static assets, then compile with the\n\
+         # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
+         # manifest) and i18n locales from itself — no sidecar directories. The app\n\
+         # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
+         {embed_auditable_note}\
+         RUN autumn build --embed{embed_auditable}"
+    );
     let (build_step, static_copy) = if embed {
         (
-            "# Single-binary build: fingerprint static assets, then compile with the\n\
-             # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
-             # manifest) and i18n locales from itself — no sidecar directories. The app\n\
-             # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
-             # `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
-             # shipped binary carries its own dependency list.\n\
-             RUN autumn build --embed --auditable",
+            embed_build_step.as_str(),
             // Assets/locales are embedded; only migrations/ is staged below.
             "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
              # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
@@ -653,9 +677,8 @@ fn render_for_cli(
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
     };
-
     // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
-    // SBOM_MIN_CLI_VERSION has. Emitting these steps against an older pin
+    // SUPPLY_CHAIN_MIN_CLI_VERSION has. Emitting these steps against an older pin
     // would make `docker build` fail outright, so they are omitted instead —
     // the image is merely SBOM-less, not broken.
     //
@@ -664,7 +687,7 @@ fn render_for_cli(
     // dependencies; resolving the default set instead would omit crates that
     // are genuinely linked and make the documented sidecar-vs-binary
     // cross-check report spurious binary-only entries.
-    let emits_sbom = cli_supports_sbom(cli_version);
+    let emits_sbom = cli_supports_supply_chain_flags(cli_version);
     let sbom_generate_step = if emits_sbom {
         SBOM_GENERATE_STEP.replace(
             "{{sbom_features}}",
@@ -706,7 +729,7 @@ fn render_for_cli(
         .replace("{{sbom_generate_step}}", &sbom_generate_step)
         .replace("{{sbom_runtime_copy}}", sbom_runtime_copy)
         .replace("{{sbom_labels}}", sbom_labels);
-    strip_sbom_block(&rendered, cli_supports_sbom(cli_version))
+    strip_sbom_block(&rendered, cli_supports_supply_chain_flags(cli_version))
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -916,6 +939,65 @@ mod tests {
     }
 
     #[test]
+    fn an_embed_build_does_not_pass_auditable_to_a_cli_that_lacks_it() {
+        // `--auditable` is a NEW flag on `autumn build`, so it is subject to
+        // exactly the same pin problem as `autumn sbom`: the embed branch
+        // invokes the crates.io CLI the image installed, and an older one
+        // rejects the argument outright. (The non-embed branch is unaffected —
+        // `cargo auditable build` needs only the cargo-auditable crate.)
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed"),
+            "the embed build must still happen: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--auditable"),
+            "a CLI pinned at 0.7.0 has no --auditable flag; passing it fails the \
+             build with an unknown argument:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_embed_build_passes_auditable_to_a_cli_that_has_it() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed --auditable"),
+            "{rendered}"
+        );
+    }
+
+    /// The non-embed path never touches the autumn CLI for its build, so it is
+    /// auditable on every pin.
+    #[test]
+    fn a_non_embed_build_is_auditable_regardless_of_the_pin() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            assert!(
+                rendered.contains("RUN cargo auditable build --release"),
+                "{cli_version}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
         // The Dockerfile `cargo install`s the CLI at its own version. Between a
         // merge and the next release that is an already-published version with
@@ -1024,22 +1106,28 @@ mod tests {
     }
 
     #[test]
-    fn the_sbom_gate_opens_for_every_future_version() {
+    fn the_supply_chain_gate_opens_for_every_future_version() {
         // 0.7.1 is deliberately "anything after 0.7.0", so no future release
         // number has to be predicted.
         for v in ["0.7.1", "0.8.0", "0.10.0", "1.0.0", "2.3.4"] {
-            assert!(cli_supports_sbom(v), "{v} should support autumn sbom");
+            assert!(
+                cli_supports_supply_chain_flags(v),
+                "{v} should support the #1615 CLI surface"
+            );
         }
         for v in ["0.7.0", "0.6.0", "0.1.0"] {
-            assert!(!cli_supports_sbom(v), "{v} predates autumn sbom");
+            assert!(
+                !cli_supports_supply_chain_flags(v),
+                "{v} predates autumn sbom"
+            );
         }
         // A pre-release sorts BEFORE its base version, so `0.7.0-dev` still
         // predates the feature — the gate must not be fooled by the suffix.
-        assert!(!cli_supports_sbom("0.7.0-dev"));
-        assert!(cli_supports_sbom("0.8.0-rc.1"));
+        assert!(!cli_supports_supply_chain_flags("0.7.0-dev"));
+        assert!(cli_supports_supply_chain_flags("0.8.0-rc.1"));
         // A string cargo could never resolve is not a published release at
         // all; nothing is gained by degrading, and the pin would fail first.
-        assert!(cli_supports_sbom("not-a-version"));
+        assert!(cli_supports_supply_chain_flags("not-a-version"));
     }
 
     #[test]
