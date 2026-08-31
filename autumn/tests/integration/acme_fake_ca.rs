@@ -57,6 +57,9 @@ const CA_SERVER_CERT_DAYS: i64 = 365;
 /// Default validity applied to certificates the CA issues.
 pub const DEFAULT_ISSUED_CERT_DAYS: i64 = 90;
 
+/// How long the CA waits for the app's `:80` listener to serve a challenge.
+const HTTP01_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A running fake ACME CA. Dropping it stops the listener.
 pub struct FakeCa {
     /// The ACME directory URL, to configure as `AcmeDirectory::Custom`.
@@ -178,7 +181,10 @@ pub async fn start(challenge_addr: SocketAddr) -> FakeCa {
         .await
         .expect("bind fake CA");
     let addr = tcp.local_addr().expect("fake CA local_addr");
-    let base = format!("https://localhost:{}", addr.port());
+    // The literal the listener binds, not `localhost`: an IPv6-preferring
+    // resolver would try `[::1]` first and fail. The CA's own certificate
+    // carries a `127.0.0.1` IP SAN for exactly this.
+    let base = format!("https://127.0.0.1:{}", addr.port());
 
     let state = Arc::new(CaState {
         base: base.clone(),
@@ -450,9 +456,13 @@ async fn challenge(State(state): State<Arc<CaState>>, Path(id): Path<String>) ->
     let validated = validate_http01(&state, &token).await;
     if !validated {
         state.validations_failed.fetch_add(1, Ordering::SeqCst);
+        // RFC 8555 §6.7: a rejection is a 4xx carrying the problem document.
+        // `instant-acme` treats only non-2xx/3xx as problems, so answering 200
+        // here would make the client try to deserialize the problem as a
+        // `Challenge` and fail with an unrelated serde error instead.
         return problem(
             &state,
-            StatusCode::OK,
+            StatusCode::FORBIDDEN,
             "unauthorized",
             "no valid key authorization was served on port 80 for this token",
         );
@@ -631,12 +641,20 @@ async fn validate_http01(state: &CaState, token: &str) -> bool {
 async fn http_get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let mut stream = tokio::net::TcpStream::connect(addr).await?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    // Bounded: an unresponsive challenge listener must surface as a failed
+    // validation, not as a stalled handler that only unwinds when the test's own
+    // deadline trips.
+    tokio::time::timeout(HTTP01_FETCH_TIMEOUT, async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP-01 fetch timed out"))?
 }
 
 /// Verify the CSR and issue a leaf for `domains` signed by the CA root.

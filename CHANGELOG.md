@@ -12,15 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ACME provisioning against a private CA, and an end-to-end proof of the whole
   flow (#1608):** `[server.tls.acme] directory = { custom = { url = "..." } }`
   was documented for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
-  test server, but the ACME client trusted only the public webpki roots, so the
-  TLS handshake to any such directory failed and every order died before an
-  authorization was created. A new `ca_root_path` names the PEM root that signs
-  the ACME directory's *own* HTTPS certificate; it replaces the client's trust
-  anchors for the ACME control plane only (never for what browsers accept from
-  your site) and is unnecessary for Let's Encrypt, whose staging and production
-  API endpoints are both publicly trusted. `autumn doctor` grades it as
-  `acme_ca_root` and **fails** on a path that is missing or holds no
-  certificate, because that state can only ever produce failed orders.
+  test server, but the ACME client verified the directory against the platform
+  trust store only, so unless that root was installed host-wide the TLS
+  handshake failed and every order died before an authorization was created. A
+  new `ca_root_path` names the PEM root that signs the ACME directory's *own*
+  HTTPS certificate; it replaces the client's trust anchors for the ACME control
+  plane only (never for what browsers accept from your site) and is unnecessary
+  for Let's Encrypt, whose staging and production API endpoints are both
+  publicly trusted. `autumn doctor` grades it as `acme_ca_root`, failing on a
+  path that is blank, unreadable, or yields no usable anchor — validated through
+  the very `CertificateDer::from_pem_file` + `RootCertStore::add` pair the
+  runtime uses — and warning when the file is a bundle (only its first
+  certificate is ever installed) or is pinned against a public Let's Encrypt
+  directory.
 
   This closes the gap that kept the order flow itself untested: with a reachable
   private directory, `autumn/tests/integration/acme_end_to_end.rs` now drives a

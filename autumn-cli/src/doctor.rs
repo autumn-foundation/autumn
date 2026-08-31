@@ -4971,9 +4971,18 @@ pub struct AcmeDoctorConfig {
     pub port_error: Option<String>,
     /// The configured `ca_root_path`: the PEM root that signs the ACME
     /// **directory's own HTTPS certificate**, needed only for a private CA /
-    /// Pebble directory. `None` when unset (the client trusts the public roots,
-    /// which is correct for Let's Encrypt staging and production).
+    /// Pebble directory. `None` when unset (the client uses the platform trust
+    /// store, which is correct for Let's Encrypt staging and production).
     pub ca_root_path: Option<std::path::PathBuf>,
+    /// The rendered invalid `acme.ca_root_path` value when the key is PRESENT
+    /// but is not a TOML string (e.g. `ca_root_path = 123` or an array). The
+    /// runtime's typed `Option<PathBuf>` deserialization FAILS on such a value
+    /// and the server will not boot, so doctor surfaces it rather than silently
+    /// treating it as unset — which would report the "no `ca_root_path`
+    /// configured" Pass for a config the server rejects. Mirrors the
+    /// [`port_error`](Self::port_error) / [`directory_error`](Self::directory_error)
+    /// treatment. `None` when the value is a valid string or the key is absent.
+    pub ca_root_error: Option<String>,
     /// The rendered offending `domains` entry when the `domains` array contains a
     /// NON-STRING element (e.g. `domains = ["app.example.com", 123]`). The
     /// runtime's typed `Vec<String>` deserialization FAILS on such an entry and
@@ -5131,10 +5140,15 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Err(bad_value) => ("staging".to_owned(), Some(bad_value)),
     };
 
-    let ca_root_path = acme
-        .get("ca_root_path")
-        .and_then(toml::Value::as_str)
-        .map(std::path::PathBuf::from);
+    // Deserialize `ca_root_path` the way the runtime's typed `Option<PathBuf>`
+    // does: absent is unset, a string is the path, and anything else is a value
+    // the runtime rejects pre-boot — recorded so the grader FAILs instead of
+    // reporting the "unset" Pass for a config the server won't start on.
+    let (ca_root_path, ca_root_error) = match acme.get("ca_root_path") {
+        None => (None, None),
+        Some(toml::Value::String(path)) => (Some(std::path::PathBuf::from(path)), None),
+        Some(other) => (None, Some(other.to_string())),
+    };
 
     Some(AcmeDoctorConfig {
         domains,
@@ -5146,6 +5160,7 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         directory_error,
         port_error,
         ca_root_path,
+        ca_root_error,
         domains_error,
     })
 }
@@ -5406,30 +5421,62 @@ fn acme_cert_id(domains: &[String]) -> String {
     out
 }
 
-/// Grade the stored ACME certificate's expiry (pure; injectable for tests).
-///
+/// The largest `ca_root_path` file doctor will parse. A root PEM is a couple of
+/// kilobytes; anything past this is not one, and reading it unbounded (a FIFO,
+/// `/dev/zero`, a stray archive) would hang or balloon the CLI.
+const MAX_CA_ROOT_BYTES: u64 = 1 << 20;
+
 /// What `autumn doctor` observed about the configured ACME `ca_root_path`.
 ///
-/// A separate type (rather than a bare `Result`) so the grader stays pure and
+/// A dedicated type (rather than a bare `Result`) so the grader stays pure and
 /// every outcome is unit-testable without touching the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcmeCaRootData {
-    /// No `ca_root_path` configured — the ACME client trusts the public roots.
+    /// No `ca_root_path` configured — the ACME client uses the platform's trust
+    /// store, which is what Let's Encrypt needs.
     NotConfigured,
-    /// The file exists and holds at least one PEM certificate.
-    Usable {
+    /// The key is present but is not a TOML string, so the runtime's
+    /// `Option<PathBuf>` deserialization rejects it and the server will not boot.
+    Malformed {
+        /// The rendered offending value.
+        value: String,
+    },
+    /// The key is present but blank, which `AcmeConfig::validate()` rejects at
+    /// boot.
+    Blank,
+    /// The file parses and its first certificate is a usable trust anchor.
+    Usable,
+    /// Usable, but the file holds more than one certificate and only the
+    /// **first** is installed as a trust anchor.
+    ExtraCertificatesIgnored {
+        /// The configured path, for the message.
+        path: String,
         /// How many certificates the file holds.
         certificates: usize,
     },
-    /// The path does not exist (or is not readable).
-    Missing {
+    /// Configured alongside a built-in Let's Encrypt directory, whose API
+    /// endpoint is publicly trusted — so this can only ever narrow trust and
+    /// break issuance.
+    UnneededForPublicDirectory {
         /// The configured path, for the message.
         path: String,
+        /// The configured built-in directory (`staging` / `production`).
+        directory: String,
     },
-    /// The file exists but holds no PEM certificate.
+    /// The path does not exist, is not a regular file, is too large to be a
+    /// root PEM, or could not be opened.
+    Unreadable {
+        /// The configured path, for the message.
+        path: String,
+        /// Why it could not be used.
+        reason: String,
+    },
+    /// The file was read but yields no usable trust anchor.
     NotACertificate {
         /// The configured path, for the message.
         path: String,
+        /// Why the content is unusable.
+        reason: String,
     },
 }
 
@@ -5448,68 +5495,192 @@ pub fn check_acme_ca_root_impl(data: &AcmeCaRootData) -> CheckResult {
             name: "acme_ca_root",
             status: CheckStatus::Pass,
             detail: Some(
-                "no ca_root_path configured; the ACME client trusts the public roots (correct \
-                 for Let's Encrypt staging and production)"
+                "no ca_root_path configured; the ACME client uses the platform trust store \
+                 (correct for Let's Encrypt staging and production)"
                     .into(),
             ),
             hint: None,
         },
-        AcmeCaRootData::Usable { certificates } => CheckResult {
+        AcmeCaRootData::Blank => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls.acme] ca_root_path is set but blank; the server refuses to start \
+                 with it"
+                    .into(),
+            ),
+            hint: Some(
+                "Remove ca_root_path to use the platform trust store, or point it at the PEM \
+                 root that signs your ACME directory's HTTPS certificate",
+            ),
+        },
+        AcmeCaRootData::Usable => CheckResult {
             name: "acme_ca_root",
             status: CheckStatus::Pass,
-            detail: Some(format!(
-                "ca_root_path holds {certificates} trusted root certificate(s) for the ACME \
-                 directory"
-            )),
+            detail: Some("ca_root_path holds a usable trust anchor for the ACME directory".into()),
             hint: None,
         },
-        AcmeCaRootData::Missing { path } => CheckResult {
+        AcmeCaRootData::Malformed { value } => CheckResult {
             name: "acme_ca_root",
             status: CheckStatus::Fail,
             detail: Some(format!(
-                "[server.tls.acme] ca_root_path {path} cannot be read; the ACME client would \
-                 trust no roots at all and every order would fail its TLS handshake"
+                "[server.tls.acme] ca_root_path is {value}, not a string; the server will not \
+                 start with this value"
+            )),
+            hint: Some("Set ca_root_path to a quoted path, e.g. \"config/ca-root.pem\""),
+        },
+        AcmeCaRootData::ExtraCertificatesIgnored { path, certificates } => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path {path} holds {certificates} certificates, but \
+                 only the FIRST is installed as a trust anchor; if the root is not first, every \
+                 ACME order will fail its TLS handshake"
+            )),
+            hint: Some(
+                "Point ca_root_path at a file containing just the ACME directory's root \
+                 certificate, not a leaf/intermediate bundle",
+            ),
+        },
+        AcmeCaRootData::UnneededForPublicDirectory { path, directory } => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path {path} is set with directory = \"{directory}\"; \
+                 Let's Encrypt's API endpoint is publicly trusted, and this replaces the \
+                 platform trust store with just that root, so orders will fail unless it \
+                 happens to sign Let's Encrypt's endpoint"
+            )),
+            hint: Some(
+                "Remove ca_root_path for a Let's Encrypt directory; it is only for a private CA \
+                 or a Pebble test server reached via a custom directory",
+            ),
+        },
+        AcmeCaRootData::Unreadable { path, reason } => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path {path} cannot be read ({reason}); the ACME \
+                 client would trust no roots at all and every order would fail its TLS handshake"
             )),
             hint: Some(
                 "Point ca_root_path at the PEM root that signs your ACME directory's HTTPS \
-                 certificate, or remove it to trust the public roots",
+                 certificate, or remove it to use the platform trust store",
             ),
         },
-        AcmeCaRootData::NotACertificate { path } => CheckResult {
+        AcmeCaRootData::NotACertificate { path, reason } => CheckResult {
             name: "acme_ca_root",
             status: CheckStatus::Fail,
             detail: Some(format!(
-                "[server.tls.acme] ca_root_path {path} holds no PEM certificate"
+                "[server.tls.acme] ca_root_path {path} yields no usable trust anchor ({reason})"
             )),
             hint: Some(
-                "ca_root_path must be a PEM file containing the ACME directory's root \
-                 certificate (a `-----BEGIN CERTIFICATE-----` block)",
+                "ca_root_path must be a PEM file whose first section is the ACME directory's \
+                 root certificate (a `-----BEGIN CERTIFICATE-----` block)",
             ),
         },
     }
 }
 
-/// Read the configured `ca_root_path` into an [`AcmeCaRootData`] (the bounded
-/// I/O wrapper around [`check_acme_ca_root_impl`]).
-fn resolve_acme_ca_root_data(path: Option<&std::path::Path>) -> AcmeCaRootData {
+/// Read and validate the configured `ca_root_path` into an [`AcmeCaRootData`].
+///
+/// Deliberately parses with the SAME code path
+/// `instant_acme::Account::builder_with_root` uses — `CertificateDer::from_pem_file`
+/// (which decodes only the **first** PEM section) followed by
+/// `RootCertStore::add` — so doctor cannot pass a file the runtime then rejects,
+/// nor bless a bundle whose root is not first.
+fn resolve_acme_ca_root_data(
+    path: Option<&std::path::Path>,
+    ca_root_error: Option<&str>,
+    directory_label: &str,
+) -> AcmeCaRootData {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    if let Some(value) = ca_root_error {
+        return AcmeCaRootData::Malformed {
+            value: value.to_owned(),
+        };
+    }
     let Some(path) = path else {
         return AcmeCaRootData::NotConfigured;
     };
-    let rendered = path.display().to_string();
-    let Ok(bytes) = std::fs::read(path) else {
-        return AcmeCaRootData::Missing { path: rendered };
-    };
-    // Count `-----BEGIN CERTIFICATE-----` blocks the same way a PEM reader
-    // would, without adding a parser dependency to the CLI.
-    let certificates = String::from_utf8_lossy(&bytes)
-        .matches("-----BEGIN CERTIFICATE-----")
-        .count();
-    if certificates == 0 {
-        return AcmeCaRootData::NotACertificate { path: rendered };
+    // Mirror `AcmeConfig::validate()`, which rejects a blank path before boot —
+    // otherwise this reports "cannot be read" with an empty path in the message.
+    if path.to_str().is_none_or(|p| p.trim().is_empty()) {
+        return AcmeCaRootData::Blank;
     }
-    AcmeCaRootData::Usable { certificates }
+    let rendered = path.display().to_string();
+
+    // Bound the read before touching the contents: a FIFO or a device node would
+    // otherwise stall the CLI, and every other doctor probe is bounded.
+    match std::fs::metadata(path) {
+        Err(e) => {
+            return AcmeCaRootData::Unreadable {
+                path: rendered,
+                reason: e.to_string(),
+            };
+        }
+        Ok(meta) if !meta.is_file() => {
+            return AcmeCaRootData::Unreadable {
+                path: rendered,
+                reason: "not a regular file".to_owned(),
+            };
+        }
+        Ok(meta) if meta.len() > MAX_CA_ROOT_BYTES => {
+            return AcmeCaRootData::Unreadable {
+                path: rendered,
+                reason: format!("{} bytes is far larger than a root PEM", meta.len()),
+            };
+        }
+        Ok(_) => {}
+    }
+
+    let first = match CertificateDer::from_pem_file(path) {
+        Ok(der) => der,
+        Err(e) => {
+            return AcmeCaRootData::NotACertificate {
+                path: rendered,
+                reason: e.to_string(),
+            };
+        }
+    };
+    // `builder_with_root` installs it via `RootCertStore::add`, which parses the
+    // DER; a PEM block holding junk gets past the decoder but not past this.
+    let mut roots = rustls::RootCertStore::empty();
+    if let Err(e) = roots.add(first) {
+        return AcmeCaRootData::NotACertificate {
+            path: rendered,
+            reason: e.to_string(),
+        };
+    }
+
+    // Only the first section is ever installed, so warn when the operator has
+    // handed us a bundle: the root is conventionally LAST in one.
+    let certificates = CertificateDer::pem_file_iter(path)
+        .map(|iter| iter.flatten().count())
+        .unwrap_or(1);
+    if certificates > 1 {
+        return AcmeCaRootData::ExtraCertificatesIgnored {
+            path: rendered,
+            certificates,
+        };
+    }
+
+    // A private root pinned against a publicly-trusted Let's Encrypt endpoint
+    // can only narrow trust and break issuance.
+    if matches!(directory_label, "staging" | "production") {
+        return AcmeCaRootData::UnneededForPublicDirectory {
+            path: rendered,
+            directory: directory_label.to_owned(),
+        };
+    }
+
+    AcmeCaRootData::Usable
 }
 
+/// Grade the stored ACME certificate's expiry (pure; injectable for tests).
+///
 /// Mirrors [`check_tls_impl`] but names the check `acme_stored_cert` and reads
 /// "no stored certificate yet" (`NotConfigured`) as a benign Pass — the renewal
 /// task will issue one on first boot.
@@ -7028,7 +7199,11 @@ pub fn run(opts: DoctorOptions) {
             // Offline: the private-CA trust anchor, if one is configured. A bad
             // path here fails every order at the TLS handshake, so it is graded
             // even though no network probe is involved.
-            let ca_root = resolve_acme_ca_root_data(acme.ca_root_path.as_deref());
+            let ca_root = resolve_acme_ca_root_data(
+                acme.ca_root_path.as_deref(),
+                acme.ca_root_error.as_deref(),
+                &acme.directory_label,
+            );
             tasks.push(Box::new(move || check_acme_ca_root_impl(&ca_root)));
 
             // Probe EVERY configured domain: issuance orders authorizations for
@@ -10087,26 +10262,26 @@ pub struct Vault {
     #[test]
     fn acme_ca_root_unset_passes() {
         // Let's Encrypt (staging and production) serves its directory under a
-        // publicly-trusted certificate, so no extra root is the right default.
+        // publicly-trusted certificate, so the platform trust store is right.
         let r = check_acme_ca_root_impl(&AcmeCaRootData::NotConfigured);
         assert_eq!(r.status, CheckStatus::Pass);
         assert_eq!(r.name, "acme_ca_root");
     }
 
     #[test]
-    fn acme_ca_root_usable_passes_and_counts_certificates() {
-        let r = check_acme_ca_root_impl(&AcmeCaRootData::Usable { certificates: 2 });
+    fn acme_ca_root_usable_passes() {
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::Usable);
         assert_eq!(r.status, CheckStatus::Pass);
-        assert!(r.detail.unwrap().contains('2'));
     }
 
     #[test]
-    fn acme_ca_root_missing_fails() {
+    fn acme_ca_root_unreadable_fails() {
         // Setting ca_root_path REPLACES the client's trust anchors, so an
         // unreadable file leaves it trusting nothing: every order dies at the
         // TLS handshake. That is a Fail, not a Warn.
-        let r = check_acme_ca_root_impl(&AcmeCaRootData::Missing {
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::Unreadable {
             path: "/etc/autumn/pebble-root.pem".to_owned(),
+            reason: "No such file or directory".to_owned(),
         });
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.unwrap().contains("/etc/autumn/pebble-root.pem"));
@@ -10117,43 +10292,138 @@ pub struct Vault {
     fn acme_ca_root_non_certificate_fails() {
         let r = check_acme_ca_root_impl(&AcmeCaRootData::NotACertificate {
             path: "/etc/autumn/notes.txt".to_owned(),
+            reason: "no items found".to_owned(),
         });
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.hint.unwrap().contains("BEGIN CERTIFICATE"));
     }
 
     #[test]
-    fn acme_ca_root_resolver_reads_the_configured_file() {
+    fn acme_ca_root_malformed_toml_value_fails() {
+        // The runtime's `Option<PathBuf>` rejects a non-string, so the server
+        // will not boot; doctor must not report the "unset" Pass for it.
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::Malformed {
+            value: "123".to_owned(),
+        });
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.unwrap().contains("not a string"));
+    }
+
+    #[test]
+    fn acme_ca_root_bundle_warns_that_only_the_first_cert_is_used() {
+        // `builder_with_root` installs only the FIRST PEM section, and a root is
+        // conventionally LAST in a fullchain bundle — so a bundle that "looks
+        // fine" pins the leaf as the anchor and fails every order.
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::ExtraCertificatesIgnored {
+            path: "/etc/autumn/fullchain.pem".to_owned(),
+            certificates: 3,
+        });
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains('3'));
+        assert!(detail.contains("FIRST"));
+    }
+
+    #[test]
+    fn acme_ca_root_with_a_public_directory_warns() {
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::UnneededForPublicDirectory {
+            path: "/etc/autumn/private-root.pem".to_owned(),
+            directory: "production".to_owned(),
+        });
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.detail.unwrap().contains("production"));
+    }
+
+    /// The resolver must agree with `instant_acme::Account::builder_with_root`,
+    /// which is `CertificateDer::from_pem_file` (FIRST section only) plus
+    /// `RootCertStore::add`. Anything doctor passes that the runtime rejects is
+    /// a false green light on a config that can only produce failed orders.
+    #[test]
+    fn acme_ca_root_resolver_matches_what_the_runtime_accepts() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         assert_eq!(
-            resolve_acme_ca_root_data(None),
+            resolve_acme_ca_root_data(None, None, "custom-abc"),
             AcmeCaRootData::NotConfigured
         );
+        assert!(matches!(
+            resolve_acme_ca_root_data(None, Some("123"), "custom-abc"),
+            AcmeCaRootData::Malformed { .. }
+        ));
 
         let missing = dir.path().join("absent.pem");
         assert!(matches!(
-            resolve_acme_ca_root_data(Some(&missing)),
-            AcmeCaRootData::Missing { .. }
+            resolve_acme_ca_root_data(Some(&missing), None, "custom-abc"),
+            AcmeCaRootData::Unreadable { .. }
+        ));
+
+        // A directory is not a root PEM, and must not be read as one.
+        assert!(matches!(
+            resolve_acme_ca_root_data(Some(dir.path()), None, "custom-abc"),
+            AcmeCaRootData::Unreadable { .. }
         ));
 
         let junk = dir.path().join("junk.pem");
         std::fs::write(&junk, "not a certificate").expect("write");
         assert!(matches!(
-            resolve_acme_ca_root_data(Some(&junk)),
+            resolve_acme_ca_root_data(Some(&junk), None, "custom-abc"),
             AcmeCaRootData::NotACertificate { .. }
         ));
 
-        let root = dir.path().join("root.pem");
+        // A well-formed PEM block wrapping non-DER gets past the PEM decoder but
+        // not past `RootCertStore::add` — exactly where the runtime fails.
+        let bogus = dir.path().join("bogus.pem");
         std::fs::write(
-            &root,
+            &bogus,
             "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
         )
         .expect("write");
-        assert_eq!(
-            resolve_acme_ca_root_data(Some(&root)),
-            AcmeCaRootData::Usable { certificates: 1 }
+        assert!(
+            matches!(
+                resolve_acme_ca_root_data(Some(&bogus), None, "custom-abc"),
+                AcmeCaRootData::NotACertificate { .. }
+            ),
+            "a PEM block holding junk must not pass; the runtime rejects it"
         );
+
+        // A real self-signed root is usable.
+        let (root_pem, _) = self_signed_root_pem();
+        let root = dir.path().join("root.pem");
+        std::fs::write(&root, &root_pem).expect("write");
+        assert_eq!(
+            resolve_acme_ca_root_data(Some(&root), None, "custom-abc"),
+            AcmeCaRootData::Usable
+        );
+
+        // ...but pinned against a public Let's Encrypt directory it is a Warn.
+        assert!(matches!(
+            resolve_acme_ca_root_data(Some(&root), None, "production"),
+            AcmeCaRootData::UnneededForPublicDirectory { .. }
+        ));
+
+        // A bundle warns: only the first section becomes an anchor.
+        let bundle = dir.path().join("fullchain.pem");
+        std::fs::write(&bundle, format!("{root_pem}{root_pem}")).expect("write");
+        assert!(matches!(
+            resolve_acme_ca_root_data(Some(&bundle), None, "custom-abc"),
+            AcmeCaRootData::ExtraCertificatesIgnored {
+                certificates: 2,
+                ..
+            }
+        ));
+    }
+
+    /// A self-signed CA certificate PEM, for the `ca_root_path` resolver tests.
+    fn self_signed_root_pem() -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(Vec::new()).expect("params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let cert = params.self_signed(&key).expect("self-sign");
+        (cert.pem(), key.serialize_pem())
     }
 
     #[test]
@@ -10955,6 +11225,7 @@ directory = \"production\"
             directory_error: None,
             port_error: None,
             ca_root_path: None,
+            ca_root_error: None,
             domains_error: None,
         };
 

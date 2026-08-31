@@ -51,6 +51,10 @@ use super::acme_fake_ca::{self, FakeCa};
 
 const DOMAIN: &str = "localhost";
 const DAY: i64 = 86_400;
+/// Validity the fake CA is told to issue the *renewed* certificate with, so the
+/// test can prove the CA's window is what lands on the leaf rather than a
+/// hard-coded default.
+const RENEWED_CERT_DAYS: i64 = 60;
 
 fn now_unix() -> i64 {
     i64::try_from(
@@ -232,7 +236,34 @@ async fn run_one_boot(task: AcmeRenewalTask, status: &AcmeStatus, reporter: Repo
     }
 
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    join_renewal_task(handle).await;
+}
+
+/// Run a renewal task that is expected to do NOTHING, then stop it.
+///
+/// Used where there is no status transition to wait on: give the boot path room
+/// to misbehave, then assert on what the CA did (or did not) see.
+async fn run_to_quiescence(task: AcmeRenewalTask, reporter: ReporterFn) {
+    let coordinator: Arc<dyn SchedulerCoordinator> =
+        Arc::new(InProcessSchedulerCoordinator::new("test-replica"));
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(task.run(coordinator, reporter, shutdown.clone()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown.cancel();
+    join_renewal_task(handle).await;
+}
+
+/// Stop waiting on the renewal loop, but do NOT discard the join result: a task
+/// that panicked at boot would otherwise satisfy every "nothing happened"
+/// assertion.
+async fn join_renewal_task(handle: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(Duration::from_secs(5), handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("the ACME renewal task panicked: {e}"),
+        // The loop is mid-sleep when cancelled; not finishing within the grace
+        // period is not a failure, only a panic is.
+        Err(_elapsed) => {}
+    }
 }
 
 // ── TLS client ───────────────────────────────────────────────────────────────
@@ -409,30 +440,43 @@ async fn first_boot_issues_a_certificate_and_serves_it_over_https() {
     assert_eq!(ca.state.validations_failed.load(Ordering::SeqCst), 0);
     assert_eq!(ca.state.fetched_key_authorizations().len(), 1);
 
-    // The issued certificate is what the listener now serves, without a restart.
-    let issued_leaf = served_leaf(app.https_addr).await;
-    assert_ne!(
-        issued_leaf, placeholder_leaf,
-        "the self-signed placeholder is still being served"
-    );
-
-    // ...and it is persisted for the next boot.
+    // The certificate the CA issued — not merely *a* different one — is what the
+    // listener now serves, without a restart.
     let cert_id = CertId::from_domains(&config.domains);
     let stored = store
         .load_cert(&cert_id)
         .await
         .expect("read store")
         .expect("certificate persisted");
+    let issued_leaf = served_leaf(app.https_addr).await;
+    assert_ne!(
+        issued_leaf, placeholder_leaf,
+        "the self-signed placeholder is still being served"
+    );
+    assert_eq!(
+        issued_leaf,
+        leaf_der(&stored),
+        "the listener is serving something other than the certificate that was issued and stored"
+    );
+
     let not_after = leaf_not_after_from_pem(stored.chain_pem.as_bytes()).expect("leaf notAfter");
     assert!(
         not_after > now_unix() + 60 * DAY,
         "issued leaf should carry the CA's full validity window"
     );
 
-    // Tokens are cleaned up once the order completes.
+    // The published token is withdrawn once the order completes, rather than
+    // accumulating in the map across renewals. Derive it from the key
+    // authorization the CA actually fetched (`{token}.{thumbprint}`) so this
+    // does not depend on how the fake CA names its tokens.
+    let fetched = ca.state.fetched_key_authorizations();
+    let issued_token = fetched[0]
+        .split_once('.')
+        .expect("a key authorization is token.thumbprint")
+        .0;
     assert!(
-        app.tokens.get("tok-1-0").is_none(),
-        "the HTTP-01 token was left published after issuance"
+        app.tokens.get(issued_token).is_none(),
+        "the HTTP-01 token {issued_token} was left published after issuance"
     );
 
     // AC1's other half: plain HTTP is redirected to HTTPS on the same listener.
@@ -503,11 +547,22 @@ async fn near_expiry_certificate_rotates_without_restart_or_dropped_connections(
         "the renewed certificate should be well clear of the renew-before window"
     );
 
-    // Rotation happened: a NEW connection is served the NEW leaf.
+    // Rotation happened: a NEW connection is served the NEWLY ISSUED leaf, not
+    // just some other certificate.
+    let stored = store
+        .load_cert(&cert_id)
+        .await
+        .expect("read store")
+        .expect("cert stored");
     let after_leaf = served_leaf(app.https_addr).await;
     assert_ne!(
         after_leaf, before_leaf,
         "the near-expiry certificate was not rotated"
+    );
+    assert_eq!(
+        after_leaf,
+        leaf_der(&stored),
+        "the listener is serving something other than the renewed certificate"
     );
 
     // ...and the connection opened before the swap is still usable: an in-flight
@@ -527,16 +582,17 @@ async fn near_expiry_certificate_rotates_without_restart_or_dropped_connections(
     );
 
     // The rotated certificate replaced the stored one.
-    let stored = store
-        .load_cert(&cert_id)
-        .await
-        .expect("read store")
-        .expect("cert stored");
     assert_ne!(stored.chain_pem, near_expiry.chain_pem);
 }
 
 /// AC3: a restart reuses the persisted account and certificate — no second
 /// registration and no second order, so Let's Encrypt's rate limits are safe.
+///
+/// The second half is the load-bearing one: a restart whose stored certificate
+/// is still healthy never contacts the CA at all, so "the account was not
+/// re-registered" is trivially true there. Only a restart that *must* renew
+/// reaches `load_or_register_account`, and only then does the credential-restore
+/// path (as opposed to the register path) actually run.
 #[tokio::test]
 async fn a_restart_reuses_the_stored_account_and_certificate() {
     let placeholder = self_signed_placeholder(&[DOMAIN.to_owned()]).expect("placeholder");
@@ -545,7 +601,9 @@ async fn a_restart_reuses_the_stored_account_and_certificate() {
     let root = write_ca_root(&app, &ca);
     let config = acme_config(&app, &ca, Some(root));
     let store = fs_store(&config);
+    let cert_id = CertId::from_domains(&config.domains);
 
+    // Boot 1: fresh — registers an account and orders a certificate.
     let first_status = AcmeStatus::new();
     let (reporter, _) = recording_reporter();
     run_one_boot(
@@ -564,8 +622,9 @@ async fn a_restart_reuses_the_stored_account_and_certificate() {
     assert_eq!(ca.state.accounts_registered.load(Ordering::SeqCst), 1);
     assert_eq!(ca.state.orders_created.load(Ordering::SeqCst), 1);
 
-    // "Restart": a second task over the SAME cache dir, told it is serving the
-    // stored certificate, exactly as `build_acme_tls_listener` reports at boot.
+    // Boot 2 — "restart" with a healthy stored certificate: a second task over
+    // the SAME cache dir, told it is serving the stored cert, exactly as
+    // `build_acme_tls_listener` reports at boot. Nothing should reach the CA.
     let restarted = renewal_task(
         &app,
         config.clone(),
@@ -573,27 +632,73 @@ async fn a_restart_reuses_the_stored_account_and_certificate() {
         AcmeStatus::new(),
         true,
     );
-    let coordinator: Arc<dyn SchedulerCoordinator> =
-        Arc::new(InProcessSchedulerCoordinator::new("test-replica"));
     let (reporter, reported_errors) = recording_reporter();
-    let shutdown = CancellationToken::new();
-    let handle = tokio::spawn(restarted.run(coordinator, reporter, shutdown.clone()));
-    // Nothing should happen; give the boot path room to misbehave before asserting.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    run_to_quiescence(restarted, reporter).await;
 
     assert_eq!(
         ca.state.orders_created.load(Ordering::SeqCst),
         1,
         "a restart re-ordered a certificate that was still valid"
     );
+    assert!(reported_errors.lock().unwrap().is_empty());
+
+    // Boot 3 — "restart" with a certificate that is now inside its renew-before
+    // window, so this boot MUST order. That is the only path that reaches
+    // `load_or_register_account`, and with `account.json` already on disk it has
+    // to take the credential-restore branch. If that branch ignored
+    // `ca_root_path`, or failed to reuse the stored credentials, this boot would
+    // either fail outright or register a second account.
+    store
+        .save_cert(&cert_id, &short_lived_cert(5))
+        .await
+        .expect("age the stored certificate into its renew window");
+    // Also prove the CA's validity window is what lands on the renewed leaf.
+    ca.state
+        .cert_lifetime_days
+        .store(RENEWED_CERT_DAYS, Ordering::SeqCst);
+
+    let renewed_status = AcmeStatus::new();
+    let (reporter, reported_errors) = recording_reporter();
+    run_one_boot(
+        renewal_task(
+            &app,
+            config.clone(),
+            fs_store(&config),
+            renewed_status.clone(),
+            true,
+        ),
+        &renewed_status,
+        reporter,
+    )
+    .await;
+
+    let snap = renewed_status.snapshot();
+    assert!(
+        snap.last_failure.is_none(),
+        "the restore path failed: {:?}",
+        snap.last_failure
+    );
+    assert_eq!(
+        ca.state.orders_created.load(Ordering::SeqCst),
+        2,
+        "a restart with a near-expiry certificate must renew it"
+    );
     assert_eq!(
         ca.state.accounts_registered.load(Ordering::SeqCst),
         1,
-        "a restart re-registered the ACME account instead of reusing stored credentials"
+        "the renewal re-registered the ACME account instead of restoring the stored credentials"
     );
     assert!(reported_errors.lock().unwrap().is_empty());
+
+    // The renewed leaf carries the validity the CA issued it with.
+    let renewed_not_after = snap
+        .cert_not_after_unix
+        .expect("renewal recorded an expiry");
+    let expected = now_unix() + RENEWED_CERT_DAYS * DAY;
+    assert!(
+        (renewed_not_after - expected).abs() < DAY,
+        "renewed leaf expires at {renewed_not_after}, expected about {expected}"
+    );
 }
 
 /// AC4: the custom directory is what gets used, and reaching a private CA
@@ -605,8 +710,9 @@ async fn a_private_directory_needs_its_root_configured() {
     let app = boot_app(&placeholder).await;
     let ca = acme_fake_ca::start(app.challenge_addr).await;
 
-    // No `ca_root_path`: the ACME client trusts only the public webpki roots, so
-    // the private CA's directory is unreachable.
+    // No `ca_root_path`: the ACME client verifies the directory against the
+    // platform trust store, which does not know this test root, so the private
+    // CA's directory is unreachable.
     let config = acme_config(&app, &ca, None);
     let status = AcmeStatus::new();
     let (reporter, reported_errors) = recording_reporter();
@@ -728,6 +834,16 @@ fn short_lived_cert(days: i64) -> StoredCert {
         chain_pem: cert.pem(),
         key_pem: key.serialize_pem(),
     }
+}
+
+/// The DER of a stored chain's leaf, for comparison against what a TLS client
+/// was actually served.
+fn leaf_der(stored: &StoredCert) -> Vec<u8> {
+    use rustls_pki_types::pem::PemObject as _;
+
+    CertificateDer::from_pem_slice(stored.chain_pem.as_bytes())
+        .expect("stored chain holds a leaf")
+        .to_vec()
 }
 
 /// A store in a distinct subdirectory, so a test can run two independent boots

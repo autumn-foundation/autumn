@@ -269,12 +269,13 @@ Fields:
 > value and makes the config fail to load at startup — use the inline-table form.
 >
 > A custom directory almost always also needs **`ca_root_path`**. The ACME client
-> speaks HTTPS to the directory and, by default, trusts only the public webpki
-> roots — right for Let's Encrypt (both its staging and production API endpoints
-> carry publicly-trusted certificates) and wrong for a private CA or a Pebble
-> test server, whose API certificate chains to a root nothing knows about.
-> Without it the TLS handshake to the directory fails and **every** order dies
-> before an authorization is even created:
+> speaks HTTPS to the directory and, by default, verifies it against the
+> **platform trust store** — the host's own installed CA certificates. That is
+> right for Let's Encrypt (both its staging and production API endpoints carry
+> publicly-trusted certificates) and wrong for a private CA or a Pebble test
+> server, whose API certificate chains to a root the host does not know. Unless
+> you have installed that root system-wide, the TLS handshake to the directory
+> fails and **every** order dies before an authorization is even created:
 >
 > ```toml
 > [server.tls.acme]

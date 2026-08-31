@@ -1456,6 +1456,13 @@ default. Mutually exclusive with static `cert_path` / `key_path`.
 - `cache_dir` (default `config/acme`).
 - `http_challenge_port` (default `80`).
 - `renew_before_days` (default `30`, must be `< 90`).
+- `ca_root_path` (unset) — PEM root that signs the ACME **directory's own HTTPS
+  certificate**. Needed only for a private CA / Pebble reached through a custom
+  `directory`: by default the client verifies the directory against the platform
+  trust store, which is correct for Let's Encrypt. It REPLACES the trust anchors
+  and only the file's **first** certificate is installed, so pass the root
+  alone, not a bundle. Affects the ACME control plane only, never what browsers
+  accept from the site.
 - Automatic HTTP-01 provisioning + hourly leader-elected renewal. DNS-01 and
   wildcard certs are out of scope (#1620).
 

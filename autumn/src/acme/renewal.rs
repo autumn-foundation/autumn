@@ -687,12 +687,13 @@ impl AcmeRenewalTask {
 
     /// Build an ACME account builder whose HTTP client trusts the right roots.
     ///
-    /// With no `ca_root_path` the client trusts the public webpki roots, which
-    /// is what Let's Encrypt (staging and production alike — both API endpoints
-    /// carry publicly-trusted certificates) needs. A private CA or a Pebble test
-    /// server serves its directory under a root nothing knows about, so
-    /// `ca_root_path` replaces the trust anchors with that root; without it the
-    /// client cannot complete the TLS handshake and every order fails.
+    /// With no `ca_root_path` the client verifies the directory against the
+    /// platform trust store, which is what Let's Encrypt (staging and production
+    /// alike — both API endpoints carry publicly-trusted certificates) needs. A
+    /// private CA or a Pebble test server serves its directory under a root the
+    /// host does not know, so `ca_root_path` replaces the trust anchors with
+    /// that root; without it the client cannot complete the TLS handshake and
+    /// every order fails.
     ///
     /// Both the register and the restore path go through here, so a restart
     /// against a private directory works exactly like a first boot.

@@ -79,6 +79,11 @@ jobs:
         # reason = "…")]` justifying it — is only COMPILED when `tls` is on, so
         # without it here the module's deny never sees the site and a later
         # off-seam read added next to it would ship unlinted.
+        # `acme` joined the set with #1608: it implies `tls`, and adding it is what
+        # puts `autumn/src/acme/**` and the two `acme`-gated integration modules
+        # under `-D warnings` at all — `--all-targets` only lints what the enabled
+        # features compile, so without it the whole ACME tree was unlinted.
+        #
         # Side effect worth knowing: this also lints `autumn/src/tls.rs` (and the
         # rest of the `tls`-gated tree) under `-D warnings` for the first time.
         #
@@ -87,7 +92,7 @@ jobs:
         # webhook route, and `storage` gates the upload path — both are request-path
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate

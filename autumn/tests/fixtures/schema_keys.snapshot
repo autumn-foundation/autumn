@@ -354,6 +354,7 @@ server.timeouts
 server.timeouts.request_timeout_ms
 server.tls
 server.tls.acme
+server.tls.acme.ca_root_path
 server.tls.acme.cache_dir
 server.tls.acme.contact_email
 server.tls.acme.directory

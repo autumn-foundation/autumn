@@ -6325,12 +6325,20 @@ pub struct AcmeConfig {
     /// PEM file holding the root certificate that signs the ACME **directory's
     /// own HTTPS certificate**, for a directory that is not publicly trusted.
     ///
-    /// The ACME client speaks HTTPS to the directory and, by default, trusts
-    /// only the public webpki roots — which is right for Let's Encrypt (both its
-    /// staging and production API endpoints are publicly trusted) and wrong for
-    /// a private CA or a [Pebble](https://github.com/letsencrypt/pebble) test
-    /// server, whose API certificate chains to a root nothing knows about. Point
-    /// this at that root and the client trusts it *instead of* the public set.
+    /// The ACME client speaks HTTPS to the directory and, by default, verifies
+    /// it against the **platform trust store** (the host's own installed CA
+    /// certificates). That is right for Let's Encrypt — both its staging and its
+    /// production API endpoints carry publicly-trusted certificates — and wrong
+    /// for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+    /// test server whose API certificate chains to a root the host does not
+    /// know. Point this at that root and the client trusts it *instead of* the
+    /// platform store.
+    ///
+    /// Only the **first** certificate in the file becomes a trust anchor, so
+    /// give it the root alone rather than a leaf/intermediate bundle. Setting it
+    /// also swaps the platform verifier for a plain path verifier, which on
+    /// macOS and Windows means the OS-level policy and revocation checks no
+    /// longer apply to this one connection.
     ///
     /// Unset by default, and unnecessary for `directory = "staging"` /
     /// `"production"`. This changes trust for the **ACME control plane only**;
@@ -6390,12 +6398,13 @@ impl AcmeConfig {
             ));
         }
         if let Some(path) = &self.ca_root_path
-            && path.as_os_str().is_empty()
+            && path.to_str().is_none_or(|p| p.trim().is_empty())
         {
             return Err(
-                "[server.tls.acme] ca_root_path is set but empty: either remove it (to trust the \
-                 public roots, which is correct for Let's Encrypt staging and production) or \
-                 point it at the PEM root that signs your ACME directory's HTTPS certificate"
+                "[server.tls.acme] ca_root_path is set but blank: either remove it (to use the \
+                 platform trust store, which is correct for Let's Encrypt staging and \
+                 production) or point it at the PEM root that signs your ACME directory's HTTPS \
+                 certificate"
                     .to_owned(),
             );
         }
