@@ -168,6 +168,7 @@ docker run -d \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
   -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
 ```
@@ -191,19 +192,26 @@ docker run -d \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
   -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
 ```
 
-`AUTUMN_HEALTHCHECK_URL` matters: the generated `HEALTHCHECK` defaults to
-`http://localhost:3000/health`, and a plain-HTTP probe against an HTTPS listener
-would mark the container **unhealthy** forever — which, in the generated
-`docker-compose.yml`, means anything waiting on `condition: service_healthy`
-never starts. For an `https://localhost` (or `127.0.0.1` / `[::1]`) probe the
-check skips certificate validation: that call never leaves the container, and
-your certificate is issued to the app's public hostname, so it could never
-validate as `localhost`. Point the override at any other host and the probe
-validates the certificate normally.
+Both health-check variables matter. `AUTUMN_HEALTHCHECK_URL` re-points the
+generated `HEALTHCHECK`, which defaults to `http://localhost:3000/health`: a
+plain-HTTP probe against an HTTPS listener marks the container **unhealthy**
+forever — and in the generated `docker-compose.yml`, anything waiting on
+`condition: service_healthy` then never starts.
+
+`AUTUMN_HEALTHCHECK_INSECURE=1` lets that probe skip certificate verification.
+It is needed because the probe is a loopback call to the container's own
+listener while your certificate is issued to the app's *public* hostname, so it
+can never validate as `localhost`. Set it only with a loopback URL — it applies
+to whatever URL you configure, and unset (the default) the probe always
+verifies. The opt-in is deliberate rather than inferred from the URL: `user@`,
+`#fragment`, and lookalike hostnames all make a URL *read* as loopback while
+curl resolves it somewhere else, so a scheme/host parser in the probe would
+quietly stop verifying certificates for a remote endpoint.
 
 Mount the key read-only and keep it `0600` on the host, owned by a user the
 container's `autumn` user (uid 10001) can read. (certbot's `archive/` is

@@ -100,31 +100,19 @@ EXPOSE 3000
 # `https://localhost:3000/health` — otherwise an HTTPS-serving container would
 # be marked unhealthy forever by a plain-HTTP probe.
 #
-# Certificate validation is skipped ONLY for an https loopback probe: that call
-# never leaves the container, and the certificate is issued to the app's PUBLIC
-# hostname, so it could never validate as `localhost`. Point the override at
-# any other host and the probe validates the certificate normally.
+# Certificate verification is skipped only when AUTUMN_HEALTHCHECK_INSECURE is
+# set to a non-empty value. Set it alongside a LOOPBACK https URL: that probe
+# never leaves the container, and your certificate is issued to the app's
+# PUBLIC hostname, so it can never validate as `localhost`.
 #
-# The host is parsed out the way curl parses it, and matched EXACTLY:
-#   - never by prefix — a glob like `https://localhost*` would also accept
-#     `https://localhost.example.com`, which leaves the container;
-#   - userinfo is stripped first — in `https://localhost:3000@remote.example/`
-#     curl connects to `remote.example`, so the host is what follows the `@`.
+# Deciding this by parsing the URL instead is a bug farm — `user@host`,
+# `#fragment`, and lookalike hostnames all produce URLs that read as loopback
+# but that curl resolves somewhere else — so the choice is an explicit,
+# auditable env var rather than an inference. Unset (the default), the probe
+# always verifies.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD url="${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}"; \
-        rest="${url#https://}"; \
-        if [ "$rest" = "$url" ]; then host=""; \
-        else authority="${rest%%[/?]*}"; \
-          hostport="${authority##*@}"; \
-          case "$hostport" in \
-            "["*) host="${hostport%%]*}]" ;; \
-            *) host="${hostport%%:*}" ;; \
-          esac; fi; \
-        case "$host" in \
-          localhost|127.0.0.1|"[::1]") tls_opt=--insecure ;; \
-          *) tls_opt= ;; \
-        esac; \
-        curl -fsS ${tls_opt} "$url" >/dev/null || exit 1
+    CMD curl -fsS ${AUTUMN_HEALTHCHECK_INSECURE:+--insecure} \
+        "${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}" >/dev/null || exit 1
 
 USER autumn
 

@@ -357,11 +357,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unhealthy forever, and in the generated `docker-compose.yml` anything waiting
   on `condition: service_healthy` never started. The probe URL is now
   `${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}`, so the default is
-  byte-for-byte today's plain-HTTP check and an HTTPS deployment sets one env
-  var. It passes `--insecure` because the probe is a loopback call to the
-  container's own listener: a certificate issued to the app's public hostname
-  cannot validate as `localhost`, and hostname validation buys nothing on a
-  call that never leaves the container. Issue #1603.
+  byte-for-byte today's plain-HTTP check and an HTTPS deployment sets that plus
+  `AUTUMN_HEALTHCHECK_INSECURE=1`. The second variable is needed because the
+  probe is a loopback call to the container's own listener while the
+  certificate is issued to the app's public hostname, so it can never validate
+  as `localhost`; it is an explicit opt-in rather than something inferred from
+  the URL, because `user@host`, `#fragment` and lookalike hostnames all yield
+  URLs that read as loopback but that curl resolves elsewhere. Unset — the
+  default — the probe always verifies. Issue #1603.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every

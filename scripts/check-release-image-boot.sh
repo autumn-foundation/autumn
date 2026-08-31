@@ -497,7 +497,10 @@ run_https_target() {
   # TLS comes entirely from the environment (no autumn.toml edit): the runtime
   # materializes `[server.tls]` from AUTUMN_SERVER__TLS__*, which is the shape a
   # container deployment uses. AUTUMN_HEALTHCHECK_URL re-points the image's own
-  # HEALTHCHECK at https://.
+  # HEALTHCHECK at https://, and AUTUMN_HEALTHCHECK_INSECURE lets that loopback
+  # probe skip verification — the test certificate is issued to `localhost`, but
+  # the container has no CA for it. The gate's OWN probes below still validate
+  # it, with --cacert.
   docker run -d --name "${CONTAINER_NAME}" --network host \
     -v "${TLS_DIR}:/etc/autumn/tls:ro" \
     -e AUTUMN_DATABASE__PRIMARY_URL="${DB_URL}" \
@@ -506,6 +509,7 @@ run_https_target() {
     -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/cert.pem \
     -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/key.pem \
     -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+    -e AUTUMN_HEALTHCHECK_INSECURE=1 \
     "${IMAGE_TAG}"
 
   # Validate the certificate rather than skipping verification: the point of
