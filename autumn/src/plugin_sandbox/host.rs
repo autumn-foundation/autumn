@@ -1669,7 +1669,23 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             let (count, _) = leb128(wasm, after_size)?;
             declared_entries = declared_entries.saturating_add(count);
         }
-        if id == ELEMENT_SECTION {
+        if id == ELEMENT_SECTION || id == DATA_SECTION {
+            let (count, _) = leb128(wasm, after_size)?;
+            segments = segments.saturating_add(count);
+            bytes = bytes.saturating_add(size);
+        }
+        // Past the ceiling the module is refused on this count alone, whatever
+        // the per-segment walks below would find — so the walking is pure cost,
+        // and the cost is the attack: a near-64 MiB module of two-byte passive
+        // segments is tens of millions of iterations spent reaching the refusal
+        // whose entire purpose is to bound that work.
+        //
+        // Skipping is safe *because* `refuse_unbounded_shape` rejects on
+        // `segments` by itself. That is the whole difference from a walk that
+        // gives up and silently takes its bounds check with it: here the
+        // refusal is unconditional and the walk's findings cannot matter.
+        let within_segment_ceiling = segments <= MAX_INIT_SEGMENTS;
+        if id == ELEMENT_SECTION && within_segment_ceiling {
             // The table section precedes this one in a well-formed module, so
             // the minimums are known by the time the segments are read.
             element_overflow = element_section_overflows(
@@ -1679,12 +1695,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
                 table_minimums.get(..table_count_seen).unwrap_or_default(),
             );
         }
-        if id == ELEMENT_SECTION || id == DATA_SECTION {
-            let (count, _) = leb128(wasm, after_size)?;
-            segments = segments.saturating_add(count);
-            bytes = bytes.saturating_add(size);
-        }
-        if id == DATA_SECTION {
+        if id == DATA_SECTION && within_segment_ceiling {
             // Active segments carry a constant offset and a length, and both
             // are needed to know whether the copy fits the memory the module
             // starts with. A segment whose offset is not a plain `i32.const`
@@ -1718,7 +1729,13 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             // allocates before the guest runs.
             let (count, mut at) = leb128(wasm, after_size)?;
             table_count = table_count.saturating_add(count);
-            for _ in 0..count {
+            // The same argument as the segment walk above, and the same shape
+            // this loop's own comment already describes one step further down:
+            // bounding the *allocation* per entry left the *iteration* per
+            // entry unbounded, and an artifact buys that at three bytes an
+            // entry. `MAX_TABLES` refuses on the count alone.
+            let walked = if table_count <= MAX_TABLES { count } else { 0 };
+            for _ in 0..walked {
                 at = at.checked_add(1)?; // reftype
                 let flag = *wasm.get(at)?;
                 at = at.checked_add(1)?;
@@ -4249,6 +4266,70 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn a_module_past_the_segment_ceiling_is_refused_without_walking_its_segments() {
+        // The count check runs before the per-segment walks now, because the
+        // walk was work an artifact could buy at two bytes a segment purely to
+        // reach the refusal that exists to bound it.
+        //
+        // The risk in skipping a walk is that the walk was also doing a bounds
+        // check — the fail-open shape this file has already been bitten by
+        // twice. So the case that matters is a module that is over the ceiling
+        // *and* carries a segment past the end of its memory: it must still be
+        // refused. The sibling tests above cover the other side, that a module
+        // under the ceiling is still walked and still caught.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        // Past the end of the single page this module declares.
+        let _ = writeln!(wat, "  (data (i32.const 65536) \"x\")");
+        for offset in 0..=MAX_INIT_SEGMENTS {
+            let _ = writeln!(wat, "  (data (i32.const {offset}) \"x\")");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the segment ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "data and element segments",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_more_tables_than_the_ceiling_is_refused_on_the_count() {
+        // The same ordering, on the table walk — which the review named only
+        // for elements and data, but which this loop shares. Its own comment
+        // already said a 64 MiB artifact of empty table declarations must not
+        // expand here; bounding the per-entry *allocation* left the per-entry
+        // *iteration* unbounded, at three bytes an entry.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..=MAX_TABLES {
+            let _ = writeln!(wat, "  (table 1 funcref)");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the table ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive { what: "tables", .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn a_module_whose_code_section_is_too_large_is_refused_before_compilation() {
         // One function declares one entry however long its body is, so the
         // declaration ceilings never saw this: a single body filling the file
@@ -4499,6 +4580,75 @@ path = "/hello/greet"
         assert!(
             SandboxHost::imports_of(&wasm).is_err(),
             "the import listing compiled a module the loader would not"
+        );
+    }
+
+    #[test]
+    fn the_metadata_footprint_covers_what_json_escaping_expands_it_to() {
+        // The footprint charged metadata at `4 ×`: the caller's strings, the
+        // frame's clone of them, and the serialised line priced at the raw byte
+        // count. But JSON is an *escaping* encoding — `serde_json` writes a
+        // control character as `\u0000`, six bytes for one — and every byte of
+        // a metadata field can be one. An HTTP request cannot carry them, but
+        // `SandboxHost::run` is public and an embedder builds the request by
+        // hand, so the bound has to hold for the API rather than for the
+        // adapter that is merely its politest caller.
+        //
+        // Measured, not asserted from arithmetic: the constant has to track
+        // what the serialiser actually writes, so if that ever changes this
+        // fails rather than quietly understating the product again.
+        let granted = [SandboxCapability::HttpRequest];
+        let filler = "\u{0}".repeat(4096);
+
+        let mut request = get("/hello/greet");
+        request.query = filler.clone();
+        let with = crate::plugin_sandbox::wire::to_line(
+            &crate::plugin_sandbox::wire::HostFrame::request(&request, &granted),
+        )
+        .expect("serialises")
+        .len();
+
+        request.query = String::new();
+        let without = crate::plugin_sandbox::wire::to_line(
+            &crate::plugin_sandbox::wire::HostFrame::request(&request, &granted),
+        )
+        .expect("serialises")
+        .len();
+
+        // What one raw metadata byte becomes in the line.
+        let expansion = with.saturating_sub(without) / filler.len();
+        assert!(
+            expansion > 4,
+            "the fixture does not exceed the old factor, so it proves nothing: {expansion}"
+        );
+        assert!(
+            expansion <= 6,
+            "escaping expands further than the footprint charges: {expansion}"
+        );
+
+        // …so the term must cover the caller's copy, the frame's clone, and the
+        // expanded line — all three live while the line is built.
+        //
+        // Isolated by subtraction rather than compared against the whole
+        // footprint: at the default limits the other terms come to ~58 MiB, so
+        // `footprint >= 2 MiB` would hold at *any* metadata factor and prove
+        // nothing. Zeroing the three manifest-driven terms leaves only the
+        // fixed ones, which are subtracted here by name.
+        let bare = ResourceLimits {
+            memory_bytes: 0,
+            max_request_body_bytes: 0,
+            max_response_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        let fixed = u128::from(MAX_TABLE_ELEMENTS) * 16
+            + MAX_GLOBALS as u128 * 16
+            + MAX_FUNCTIONS as u128 * 32
+            + 4096;
+        let charged_for_metadata = bare.request_footprint_bytes().saturating_sub(fixed);
+        assert_eq!(
+            charged_for_metadata,
+            MAX_REQUEST_METADATA_BYTES as u128 * (2 + expansion as u128),
+            "the metadata term does not match what the serialiser was measured to write"
         );
     }
 

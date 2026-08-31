@@ -232,6 +232,7 @@ impl ResourceLimits {
     /// | `memory_bytes` | the guest instance's linear memory |
     /// | `4 × max_request_body_bytes` | the body is buffered, cloned into the frame, and base64-expanded (≈4/3) into the NDJSON line that becomes the guest's stdin — all live at once |
     /// | `5 × max_response_bytes` | the response side peaks while the answer is *parsed*, not after: the raw NDJSON line is still live (up to `2 ×`), the base64 field may be copied out of it (`~1.34 ×`, when a guest escapes it), and the decoded body is allocated while both are held |
+    /// | `8 × MAX_REQUEST_METADATA_BYTES` | the caller's strings, the frame's clone of them, and the *escaped* JSON line — `serde_json` writes a control character as `\u0000`, six bytes for one, so the line alone is up to `6 ×` while the other two are still held |
     /// | table storage | bounded per instance by `MAX_TABLE_ELEMENTS`, at 16 bytes a reference |
     ///
     /// The request terms are deliberately counted at their *simultaneous* peak
@@ -250,12 +251,23 @@ impl ResourceLimits {
             // generous 16 bytes a reference. Small, but per-instance storage
             // the footprint would otherwise not know about at all.
             .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
-            // The request's metadata, at the same factor its bytes are walked
-            // building the frame. The ceiling that bounds it is the host's
-            // rather than this manifest's, but it is per-request storage all
-            // the same: leaving it out is what made this product understate a
-            // near-maximum-concurrency plugin by hundreds of megabytes.
-            .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4)
+            // The request's metadata: the caller's strings, the frame's clone
+            // of them, and the serialised line — which is the term that was
+            // wrong. `4 ×` priced the line at the raw byte count, but JSON is
+            // an *escaping* encoding: `serde_json` writes a control character
+            // as `\u0000`, six bytes for one, and every byte of a metadata
+            // field can be one. An HTTP request cannot carry them (the `http`
+            // crate refuses control characters in header values and URIs), but
+            // `SandboxHost::run` is public and an embedder builds the
+            // `SandboxRequest` by hand, so the bound has to hold for the API
+            // rather than for the adapter that is merely its politest caller.
+            //
+            // The ceiling that bounds the raw bytes is the host's rather than
+            // this manifest's, but it is per-request storage all the same:
+            // leaving it out entirely is what made this product understate a
+            // near-maximum-concurrency plugin by hundreds of megabytes, and
+            // pricing it unescaped understated it again by as much.
+            .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8)
             // The instance's globals, at a generous 16 bytes each. Per-instance
             // storage the footprint would otherwise not know about at all — the
             // same omission the tables term above exists to correct.
@@ -1267,7 +1279,7 @@ max_concurrency = 8
             ..ResourceLimits::default()
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
-        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8;
         let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         let functions = crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32;
         assert_eq!(
@@ -1290,7 +1302,7 @@ max_concurrency = 8
             ..ResourceLimits::default()
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
-        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8;
         let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         let functions = crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32;
         assert_eq!(
@@ -1314,7 +1326,7 @@ max_concurrency = 8
             max_response_bytes: 0,
             ..ResourceLimits::default()
         };
-        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8;
         assert!(
             bare.request_footprint_bytes() >= metadata,
             "the metadata a request may carry is not in the footprint"
