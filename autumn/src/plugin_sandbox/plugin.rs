@@ -500,7 +500,13 @@ async fn read_request(
 /// dropped, whichever comes first.
 struct PermitBody {
     inner: Body,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// Taken at EOF rather than only on drop. "Drained or dropped" has to mean
+    /// drained *or* dropped: a consumer that polls the body to its end and then
+    /// keeps the exhausted value — middleware that inspects responses, an
+    /// embedder that stores them — has finished with the plugin's memory, and
+    /// holding its permit until that value happens to be destroyed would keep
+    /// the plugin at capacity for as long as someone kept a receipt.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl http_body::Body for PermitBody {
@@ -511,7 +517,12 @@ impl http_body::Body for PermitBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            // Delivery is complete; the bytes are the caller's problem now.
+            self.permit = None;
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -558,7 +569,7 @@ fn build_response(
     // them: hyper may hold this buffer long after `run` returned.
     let body = Body::new(PermitBody {
         inner: Body::from(response.body.clone()),
-        _permit: permit,
+        permit: Some(permit),
     });
     let Ok(mut built) = out.body(body) else {
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);

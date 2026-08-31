@@ -1569,16 +1569,6 @@ fn refuse_unrunnable_shape(
         });
     }
 
-    // And the same for a segment written into a table rather than into
-    // memory: fixing one without the other would leave half the defect.
-    if let Some((end, capacity)) = shape.element_overflow {
-        return Err(SandboxLoadError::SegmentOutOfBounds {
-            what: "table elements",
-            end,
-            capacity,
-        });
-    }
-
     // The same argument as the memory ceiling above, for the other
     // per-instance store the limiter guards. `table_growing` refuses a
     // total past `MAX_TABLE_ELEMENTS` at instantiation — which is per
@@ -1599,6 +1589,16 @@ fn refuse_unrunnable_shape(
             max: MAX_TABLE_ELEMENTS as usize,
         });
     }
+
+    // And the same for a segment written into a table rather than into
+    // memory: fixing one without the other would leave half the defect.
+    if let Some((end, capacity)) = shape.element_overflow {
+        return Err(SandboxLoadError::SegmentOutOfBounds {
+            what: "table elements",
+            end,
+            capacity,
+        });
+    }
     Ok(())
 }
 
@@ -1613,7 +1613,8 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut code_bytes = 0usize;
     let mut has_start = false;
     let mut data_end = 0u64;
-    let mut table_minimums: Vec<u64> = Vec::new();
+    let mut table_minimums = [0u64; MAX_TABLES];
+    let mut table_count_seen = 0usize;
     let mut element_overflow: Option<(u64, u64)> = None;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
@@ -1629,7 +1630,12 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         if id == ELEMENT_SECTION {
             // The table section precedes this one in a well-formed module, so
             // the minimums are known by the time the segments are read.
-            element_overflow = element_section_overflows(wasm, after_size, end, &table_minimums);
+            element_overflow = element_section_overflows(
+                wasm,
+                after_size,
+                end,
+                table_minimums.get(..table_count_seen).unwrap_or_default(),
+            );
         }
         if id == ELEMENT_SECTION || id == DATA_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
@@ -1671,7 +1677,16 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
                 let (minimum, next) = leb128(wasm, at)?;
                 at = next;
                 table_elements = table_elements.saturating_add(minimum as u64);
-                table_minimums.push(minimum as u64);
+                // Only the first `MAX_TABLES` can ever be admitted, so only those
+                // are worth keeping. Pushing every declaration into a growing
+                // vector put an unbounded per-entry allocation inside the very
+                // walk whose whole purpose is to avoid one: a 64 MiB artifact of
+                // empty table declarations would have expanded here, in the code
+                // meant to refuse it before anything expanded.
+                if let Some(slot) = table_minimums.get_mut(table_count_seen) {
+                    *slot = minimum as u64;
+                    table_count_seen = table_count_seen.saturating_add(1);
+                }
                 if flag == 0x01 {
                     let (_, after_max) = leb128(wasm, at)?;
                     at = after_max;
@@ -4255,6 +4270,35 @@ path = "/hello/greet"
             dear,
             cheap + 64,
             "each admitted global must cost a unit: {cheap} then {dear}"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_table_declarations_is_refused_without_collecting_them() {
+        // The walk collects each table's initial size so element segments can be
+        // bounded against the right table. Collecting them into a growing vector
+        // put an unbounded per-entry allocation inside the code whose entire job
+        // is to refuse before anything allocates per entry — so a module of
+        // empty table declarations expanded the process trying to reject it.
+        // Only the first `MAX_TABLES` can ever be admitted, so only those are
+        // kept, and the refusal names the count.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..50_000 {
+            let _ = writeln!(wat, "  (table 0 funcref)");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        // Refused — by wasmi's own hundred-table limit here, since `module_shape`
+        // runs before `Module::new` and hands off to it. That the walk no longer
+        // grows a vector per declaration on the way is what this change is for,
+        // and it is not observable from a test: the allocation was never visible
+        // in the result, only in the memory used to produce it.
+        assert!(
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm).is_err(),
+            "a flood of table declarations must not load"
         );
     }
 
