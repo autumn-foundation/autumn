@@ -2396,12 +2396,6 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
     }
 }
 
-/// For each DISTINCT path in `routes`, the effective HTTP methods actually
-/// registered there — `WS`→`GET` via [`effective_mount_method`], and
-/// `GET`→`+HEAD` (axum also serves `HEAD` through a `#[get]` handler),
-/// mirroring exactly what [`build_route_timeout_table`] already does for
-/// the same reason.
-#[cfg(feature = "i18n")]
 /// The same map as [`route_list_path_methods`], for routes a plugin *declared*
 /// rather than routes the application built.
 ///
@@ -2440,6 +2434,12 @@ fn declared_path_methods(
     map
 }
 
+/// For each DISTINCT path in `routes`, the effective HTTP methods actually
+/// registered there — `WS`→`GET` via [`effective_mount_method`], and
+/// `GET`→`+HEAD` (axum also serves `HEAD` through a `#[get]` handler),
+/// mirroring exactly what [`build_route_timeout_table`] already does for
+/// the same reason.
+#[cfg(feature = "i18n")]
 fn route_list_path_methods(
     routes: &[Route],
 ) -> std::collections::HashMap<String, Vec<http::Method>> {

@@ -147,6 +147,17 @@ pub const MAX_TABLES: usize = 4;
 /// globals, which no fuel charge priced and no footprint counted.
 pub const MAX_GLOBALS: usize = 4096;
 
+/// The most functions a module may define.
+///
+/// Every instance allocates an entry per defined function, so functions are
+/// per-instance storage and per-instance work exactly as globals and tables
+/// are. Neither general ceiling bounds them: half a million tiny functions sit
+/// under both the aggregate declared-entry cap and the code-section byte cap,
+/// because each one is a couple of bytes of body and one byte of type index.
+/// Generous against real output — a whole Rust web application compiles to a
+/// few tens of thousands of functions.
+pub const MAX_FUNCTIONS: usize = 65_536;
+
 /// The most bytes a module's code section may occupy.
 ///
 /// The declaration counts bound how many *things* a module names; they say
@@ -924,7 +935,8 @@ impl SandboxHost {
         // single number to check it against here, while this charge is fixed by
         // the module and known now.
         let instantiation =
-            instantiation_fuel(segments, init_bytes, import_count, shape.global_count);
+            instantiation_fuel(segments, init_bytes, import_count, shape.global_count)
+                .saturating_add(u64::try_from(shape.function_count).unwrap_or(u64::MAX));
         if manifest.limits.fuel <= instantiation {
             return Err(SandboxLoadError::FuelBelowFixedCharges {
                 fuel: manifest.limits.fuel,
@@ -1327,6 +1339,8 @@ struct ModuleShape {
     /// Zero when the module has none, or when the offsets are not constants
     /// this walk can evaluate.
     data_end: u64,
+    /// How many functions the module defines.
+    function_count: usize,
     /// Whether the module carries a `start` section.
     has_start: bool,
     /// Bytes of instruction stream in the code section.
@@ -1542,6 +1556,8 @@ const DATA_SECTION: u8 = 11;
 const TABLE_SECTION: u8 = 4;
 /// The global section, whose entries each become per-instance storage.
 const GLOBAL_SECTION: u8 = 6;
+/// The function section: one type index per function the module defines.
+const FUNCTION_SECTION: u8 = 3;
 /// The start section: a function the engine runs at instantiation.
 const START_SECTION: u8 = 8;
 /// The code section, whose *size* is the instruction volume the compiler
@@ -1618,6 +1634,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut global_count = 0usize;
     let mut code_bytes = 0usize;
     let mut has_start = false;
+    let mut function_count = 0usize;
     let mut data_end = 0u64;
     let mut table_minimums = [0u64; MAX_TABLES];
     let mut table_count_seen = 0usize;
@@ -1658,6 +1675,10 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             if let Some(end) = data_section_end(wasm, after_size, end) {
                 data_end = data_end.max(end);
             }
+        }
+        if id == FUNCTION_SECTION {
+            let (count, _) = leb128(wasm, after_size)?;
+            function_count = function_count.saturating_add(count);
         }
         if id == START_SECTION {
             has_start = true;
@@ -1708,6 +1729,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        function_count,
         has_start,
         element_overflow,
         data_end,
@@ -1740,6 +1762,13 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             what: "code section bytes",
             found: shape.code_bytes,
             max: MAX_CODE_BYTES,
+        });
+    }
+    if shape.function_count > MAX_FUNCTIONS {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "functions",
+            found: shape.function_count,
+            max: MAX_FUNCTIONS,
         });
     }
     if shape.global_count > MAX_GLOBALS {
@@ -4211,6 +4240,36 @@ path = "/hello/greet"
                 err,
                 SandboxLoadError::InstantiationTooExpensive {
                     what: "code section bytes",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_defining_more_functions_than_the_ceiling_is_refused_at_load() {
+        // Neither general ceiling bounds these: a flood of tiny functions sits
+        // under both the aggregate declared-entry cap and the code-section byte
+        // cap, because each is a couple of bytes of body and one byte of type
+        // index — while every instance still allocates an entry per function.
+        // The section header carries the count, so the refusal reads one LEB128.
+        use std::fmt::Write as _;
+
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for i in 0..=MAX_FUNCTIONS {
+            let _ = writeln!(wat, "  (func $f{i} (nop))");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the function ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "functions",
                     ..
                 }
             ),
