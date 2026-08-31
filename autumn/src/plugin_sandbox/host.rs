@@ -649,6 +649,17 @@ pub enum SandboxLoadError {
     MissingStart,
     /// The module exports no linear memory named `memory`.
     MissingMemory,
+    /// An active data segment does not fit the module's own initial memory.
+    ///
+    /// Copied in during instantiation, which is per request — so a segment
+    /// past the end compiles clean and then fails every instantiation the
+    /// artifact is ever given.
+    SegmentOutOfBounds {
+        /// The byte just past the segment's end.
+        end: u64,
+        /// The initial memory the module declares, in bytes.
+        memory_bytes: u64,
+    },
     /// The module's *initial* linear memory is already over the manifest's
     /// ceiling, so no request could ever instantiate it.
     MemoryTooLarge {
@@ -708,6 +719,11 @@ impl fmt::Display for SandboxLoadError {
                 f,
                 "the plugin's initial linear memory is {found} bytes, over the manifest's \
                  {max}-byte ceiling; no request could instantiate it"
+            ),
+            Self::SegmentOutOfBounds { end, memory_bytes } => write!(
+                f,
+                "an active data segment ends at byte {end}, past the {memory_bytes} bytes of \
+                 memory the module starts with; every instantiation would fail on it"
             ),
             Self::Engine(detail) => write!(f, "the sandbox engine could not be built: {detail}"),
         }
@@ -925,6 +941,17 @@ impl SandboxHost {
             return Err(SandboxLoadError::MemoryTooLarge {
                 found: initial_bytes,
                 max: manifest.limits.memory_bytes,
+            });
+        }
+
+        // An active segment is copied in during instantiation, which is per
+        // request, so one that does not fit the memory the module starts with
+        // fails every instantiation the artifact is ever given. Said once here
+        // rather than 502 for the life of the plugin.
+        if shape.data_end > initial_bytes {
+            return Err(SandboxLoadError::SegmentOutOfBounds {
+                end: shape.data_end,
+                memory_bytes: initial_bytes,
             });
         }
 
@@ -1298,6 +1325,11 @@ struct ModuleShape {
     /// section rather than a walk over the entries themselves — the point is to
     /// know the shape before anything allocates per entry.
     declared_entries: usize,
+    /// The furthest byte any active data segment writes to.
+    ///
+    /// Zero when the module has none, or when the offsets are not constants
+    /// this walk can evaluate.
+    data_end: u64,
     /// Bytes of instruction stream in the code section.
     code_bytes: usize,
     /// How many globals the module declares.
@@ -1315,40 +1347,110 @@ struct ModuleShape {
     table_elements: u64,
 }
 
-fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
-    /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
-    fn leb128(wasm: &[u8], at: usize) -> Option<(usize, usize)> {
-        let mut value: usize = 0;
-        let mut shift: u32 = 0;
-        let mut cursor = at;
-        loop {
-            let byte = *wasm.get(cursor)?;
-            cursor = cursor.checked_add(1)?;
-            value = value.checked_add(usize::from(byte & 0x7f).checked_shl(shift)?)?;
-            if byte & 0x80 == 0 {
-                return Some((value, cursor));
-            }
-            shift = shift.checked_add(7)?;
-            if shift > 63 {
-                return None;
-            }
+/// Read an unsigned LEB128 at `at`, returning the value and the next offset.
+fn leb128(wasm: &[u8], at: usize) -> Option<(usize, usize)> {
+    let mut value: usize = 0;
+    let mut shift: u32 = 0;
+    let mut cursor = at;
+    loop {
+        let byte = *wasm.get(cursor)?;
+        cursor = cursor.checked_add(1)?;
+        value = value.checked_add(usize::from(byte & 0x7f).checked_shl(shift)?)?;
+        if byte & 0x80 == 0 {
+            return Some((value, cursor));
+        }
+        shift = shift.checked_add(7)?;
+        if shift > 63 {
+            return None;
         }
     }
+}
 
-    /// Section ids for the element and data sections.
-    const ELEMENT_SECTION: u8 = 9;
-    const DATA_SECTION: u8 = 11;
-    /// The table section, whose entries carry the initial sizes the limiter
-    /// will be asked to admit.
-    const TABLE_SECTION: u8 = 4;
-    /// The global section, whose entries each become per-instance storage.
-    const GLOBAL_SECTION: u8 = 6;
-    /// The code section, whose *size* is the instruction volume the compiler
-    /// walks — a thing no entry count reveals.
-    const CODE_SECTION: u8 = 10;
-    /// The custom section is the one whose payload is not a counted vector.
-    const CUSTOM_SECTION: u8 = 0;
+/// A signed LEB128, for the `i32.const` in a segment's offset expression.
+fn sleb128(wasm: &[u8], at: usize) -> Option<(i64, usize)> {
+    let mut value: i64 = 0;
+    let mut shift: u32 = 0;
+    let mut cursor = at;
+    loop {
+        let byte = *wasm.get(cursor)?;
+        cursor = cursor.checked_add(1)?;
+        value |= i64::from(byte & 0x7f).checked_shl(shift)?;
+        shift = shift.checked_add(7)?;
+        if byte & 0x80 == 0 {
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= -1i64 << shift;
+            }
+            return Some((value, cursor));
+        }
+        if shift > 63 {
+            return None;
+        }
+    }
+}
 
+/// The furthest byte the data section's *active* segments write to.
+///
+/// `None` when nothing in the section can be evaluated — a passive-only
+/// section, or offsets that are not plain constants. Returning `None`
+/// rather than refusing keeps this from mis-refusing a module whose
+/// offsets this walk simply cannot read.
+fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<u64> {
+    let (count, mut at) = leb128(wasm, start)?;
+    let mut furthest: Option<u64> = None;
+    for _ in 0..count {
+        let (flags, next) = leb128(wasm, at)?;
+        at = next;
+        // Flag 1 is a passive segment: nothing is copied at instantiation,
+        // so it cannot be out of bounds.
+        let active = flags != 1;
+        if flags == 2 {
+            let (_memory_index, next) = leb128(wasm, at)?;
+            at = next;
+        }
+        let mut offset: Option<u64> = None;
+        if active {
+            if *wasm.get(at)? == 0x41 {
+                let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
+                at = next;
+                offset = u64::try_from(value).ok();
+            }
+            // Run to the expression's `end` opcode whatever it contained.
+            while *wasm.get(at)? != 0x0b {
+                at = at.checked_add(1)?;
+                if at > section_end {
+                    return None;
+                }
+            }
+            at = at.checked_add(1)?;
+        }
+        let (len, next) = leb128(wasm, at)?;
+        at = next.checked_add(len)?;
+        if at > section_end {
+            return None;
+        }
+        if let Some(offset) = offset {
+            let segment_end = offset.checked_add(len as u64)?;
+            furthest = Some(furthest.map_or(segment_end, |f: u64| f.max(segment_end)));
+        }
+    }
+    furthest
+}
+
+/// Section ids for the element and data sections.
+const ELEMENT_SECTION: u8 = 9;
+const DATA_SECTION: u8 = 11;
+/// The table section, whose entries carry the initial sizes the limiter
+/// will be asked to admit.
+const TABLE_SECTION: u8 = 4;
+/// The global section, whose entries each become per-instance storage.
+const GLOBAL_SECTION: u8 = 6;
+/// The code section, whose *size* is the instruction volume the compiler
+/// walks — a thing no entry count reveals.
+const CODE_SECTION: u8 = 10;
+/// The custom section is the one whose payload is not a counted vector.
+const CUSTOM_SECTION: u8 = 0;
+
+fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut cursor = 8usize; // magic + version
     let mut segments = 0usize;
     let mut bytes = 0usize;
@@ -1357,6 +1459,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut table_count = 0usize;
     let mut global_count = 0usize;
     let mut code_bytes = 0usize;
+    let mut data_end = 0u64;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
@@ -1372,6 +1475,17 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             let (count, _) = leb128(wasm, after_size)?;
             segments = segments.saturating_add(count);
             bytes = bytes.saturating_add(size);
+        }
+        if id == DATA_SECTION {
+            // Active segments carry a constant offset and a length, and both
+            // are needed to know whether the copy fits the memory the module
+            // starts with. A segment whose offset is not a plain `i32.const`
+            // (a `global.get`, say) is left alone: the shim exports no globals
+            // for one to read, so such a module fails to link for its own
+            // reasons rather than being mis-refused here.
+            if let Some(end) = data_section_end(wasm, after_size, end) {
+                data_end = data_end.max(end);
+            }
         }
         if id == CODE_SECTION {
             code_bytes = code_bytes.saturating_add(size);
@@ -1409,6 +1523,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         segments,
         init_bytes: bytes,
         declared_entries,
+        data_end,
         code_bytes,
         global_count,
         table_count,
@@ -3769,6 +3884,27 @@ path = "/hello/greet"
                     ..
                 }
             ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_data_segment_past_the_end_of_memory_is_refused_at_load() {
+        // An active segment is copied in during instantiation, which is per
+        // request. One that does not fit the module's own initial memory
+        // compiles clean and then fails every instantiation, so the artifact
+        // inspects green and 502s forever — the same shape as a fuel budget
+        // below the fixed charges.
+        let wat = r#"(module
+             (memory (export "memory") 1)
+             (data (i32.const 65536) "x")
+             (func (export "_start") (nop)))"#;
+        let wasm = wat::parse_str(wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a segment past the end of memory must not load");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
             "{err:?}"
         );
     }
