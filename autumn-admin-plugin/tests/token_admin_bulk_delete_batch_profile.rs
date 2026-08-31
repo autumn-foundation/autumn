@@ -315,13 +315,15 @@ async fn token_admin_bulk_delete_batch_profile() {
          revoke SET statement calls={revoke_calls} buffers={revoke_buffers} --"
     );
 
-    // RED baseline: the trait-default `execute_action` loop issues one
-    // revoke statement PER id -- pinned here as the pre-fix behavior this
-    // same PR's fix commit eliminates (see the report's Measurement table).
+    // The N+1 floor claim, pinned as an assertion: one bulk action now costs
+    // exactly one revoke statement, regardless of how many ids were
+    // submitted -- not `expected_ids_len` calls, one per id, the way the
+    // trait-default loop this replaces would have produced (see
+    // docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/baseline/).
     assert_eq!(
-        revoke_calls,
-        i64::try_from(expected_ids_len).expect("fits in i64"),
-        "pre-fix: one revoke statement per submitted id (the N+1 this PR fixes)"
+        revoke_calls, 1,
+        "the batched execute_action must issue exactly one revoke statement \
+         for the whole bulk action, not one per id"
     );
 
     let state_dump = dump_revoked_state(&mut conn, &ids);

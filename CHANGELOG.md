@@ -1067,6 +1067,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expression is unchanged; only how many round trips carry it changed. See
   `docs/reports/2026-08-25-ledger-search-write-documents-batch/`.
 
+- **the admin panel's bulk "delete" action now issues one `UPDATE` instead
+  of one per selected row:** `AdminModel::execute_action`'s trait default
+  (what `POST /admin/{slug}/actions` calls for every model that doesn't
+  override it) looped over the submitted ids and called `delete()` once
+  per id — a full connection checkout plus a single-row `UPDATE` per id, so
+  an operator selecting hundreds of rows in the admin list and clicking
+  "Delete selected" cost hundreds of round trips. `TokenAdminModel` (the
+  built-in `/admin/api-tokens/` model) now overrides `execute_action` for
+  `"delete"` to batch every id into one
+  `UPDATE api_tokens SET revoked_at = ... WHERE id = ANY($1) AND revoked_at IS NULL`
+  round trip; the returned count and end state are unchanged (a duplicate,
+  already-revoked, or nonexistent id is still a silent no-op, still counted
+  as "applied"). Measured against a 50,000-row fixture with a 2,050-id bulk
+  action: revoke statement calls 2,050 → 1. See
+  `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
