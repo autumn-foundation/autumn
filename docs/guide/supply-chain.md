@@ -70,12 +70,15 @@ REPO                       PREDICATE_TYPE                  WORKFLOW
 autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/release.yml@refs/heads/trunk
 ```
 
-> **What the source ref means.** The release workflow is `workflow_run`-triggered,
-> which GitHub always runs in default-branch context, so the ref and commit in
-> the provenance name the default branch — not the tag — even though the build
-> checked the tag out. The subject digest, the repository and the CI run are
-> exact; the ref is not. Verify with `--repo`, and do **not** add
-> `--source-ref refs/tags/...`, which would fail against a genuine asset.
+> **What the source ref means.** The SBOM asset is attested by the Publish
+> Gate, which the tag push triggers directly, so its provenance records the tag
+> and the tagged commit. The CLI archives are attested by `cli-release.yml`,
+> which runs as a child of the `workflow_run`-triggered release workflow — and
+> GitHub always runs those in default-branch context, so their recorded ref and
+> commit name the default branch even though the build checked the tag out.
+> For those assets the subject digest, the repository and the CI run are exact;
+> the ref is not. Verify with `--repo`, and do not add `--source-ref
+> refs/tags/...` for an archive, which would fail against a genuine asset.
 
 `--repo autumn-foundation/autumn` is **not optional**. Without it, an
 attestation from *any* repository would satisfy the check — including one an
@@ -175,6 +178,14 @@ autumn sbom --binary /tmp/my-app | jq -r '.components[] | "\(.name) \(.version)"
 
 If the binary was not built through `cargo-auditable`, the command says so and
 names the fix rather than reporting an empty list.
+
+> **If the `autumn` inside the image is older than `sbom`.** The image installs
+> the CLI at the version its Dockerfile pins, so an image scaffolded before this
+> feature shipped carries a CLI without the subcommand. The binary is still
+> auditable — read it with a newer `autumn` on the host (as in the second
+> snippet above), or with `cargo audit bin`, which reads the same `.dep-v0`
+> section. Regenerating the release files (`autumn release init --force`) with a
+> current CLI updates the pin.
 
 ### 2.3 Cross-check the two
 

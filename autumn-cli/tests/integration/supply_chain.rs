@@ -558,7 +558,7 @@ fn sbom_gate_rejects_a_tag_that_disagrees_with_the_workspace_version() {
 }
 
 #[test]
-fn release_workflow_attaches_the_sbom_and_attests_it() {
+fn release_workflow_attaches_the_sbom() {
     let release = code_only(&read_repo_file(".github/workflows/release.yml"));
     assert!(
         release.contains("mv sbom.cdx.json"),
@@ -568,22 +568,40 @@ fn release_workflow_attaches_the_sbom_and_attests_it() {
         release.contains("files: autumn-"),
         "release.yml must pass the SBOM to the release action's `files:`:\n{release}"
     );
+}
+
+/// The SBOM's provenance must be minted where the workflow actually runs on
+/// the tag. `release.yml` is `workflow_run`-triggered, which GitHub always
+/// runs in default-branch context, so an attestation created there would
+/// record the default branch rather than the tagged commit. The Publish Gate
+/// is triggered by the tag push itself.
+#[test]
+fn the_sbom_is_attested_in_tag_context() {
+    let gate = code_only(&read_repo_file(".github/workflows/publish-gate.yml"));
+    let sbom_job = gate
+        .split_once("\n  sbom:")
+        .expect("publish-gate.yml must have an sbom job")
+        .1;
+    let job = sbom_job.split("\n  smoke:").next().unwrap();
     assert!(
-        release.contains("actions/attest-build-provenance"),
-        "release.yml must attest the assets it uploads:\n{release}"
+        job.contains("actions/attest-build-provenance"),
+        "the sbom job must attest the document it produces:\n{job}"
     );
     assert!(
-        release.contains("attestations: write") && release.contains("id-token: write"),
-        "release.yml needs `attestations: write` + `id-token: write`:\n{release}"
+        job.contains("id-token: write") && job.contains("attestations: write"),
+        "the sbom job needs its own permissions — publish-gate is `contents: \
+         read` at workflow level:\n{job}"
+    );
+    assert!(
+        job.contains("github.ref_type == 'tag'"),
+        "a pull-request run has nothing to attest:\n{job}"
     );
 
-    // Attest BEFORE creating the release: an unattested asset must never reach
-    // a live release.
-    let attest_at = release.find("actions/attest-build-provenance").unwrap();
-    let create_at = release.find("softprops/action-gh-release").unwrap();
+    let release = code_only(&read_repo_file(".github/workflows/release.yml"));
     assert!(
-        attest_at < create_at,
-        "release.yml must attest before publishing the release"
+        !release.contains("actions/attest-build-provenance"),
+        "release.yml must not mint a second, default-branch-scoped attestation \
+         for the same file:\n{release}"
     );
 }
 

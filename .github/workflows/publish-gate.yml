@@ -253,6 +253,18 @@ jobs:
     name: SBOM
     runs-on: ubuntu-latest
     needs: metadata
+    permissions:
+      contents: read
+      # Attest the SBOM HERE rather than in release.yml. This workflow is
+      # triggered by the tag push itself, so its OIDC claims — and therefore
+      # the provenance's source ref and commit — name the tag and the tagged
+      # commit. release.yml is `workflow_run`-triggered, which GitHub always
+      # runs in default-branch context, so an attestation minted there would
+      # record the default branch instead. The attestation binds the file's
+      # DIGEST, and release.yml only renames the file, so it still verifies
+      # against the published `autumn-<tag>.cdx.json`.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -261,6 +273,15 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: ./scripts/check-sbom.sh
+      # Tag pushes only: a PR run has nothing to attest, and publishing
+      # provenance for a document that will never be released is noise in the
+      # transparency log.
+      - name: Attest build provenance for the SBOM
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: sbom.cdx.json
+
       - name: Upload the verified SBOM
         uses: actions/upload-artifact@v7
         with:

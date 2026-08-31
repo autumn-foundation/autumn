@@ -1829,6 +1829,31 @@ discord_severities = "all"
 
 (issue #1630). See `docs/guide/operator-alerts.md`.
 
+## Supply chain — SBOM + provenance (unreleased, issue #1615)
+
+Every autumn release asset carries a CycloneDX SBOM and a keyless SLSA
+build-provenance attestation, and `autumn release init` makes the same posture
+the default for a scaffolded app. Reach for this when asked "what is in this
+build?", "where did this binary come from?", or for compliance/audit evidence.
+
+- `autumn sbom` is deterministic on purpose — no wall-clock timestamp, and a
+  `serialNumber` derived from the document's content — so `--verify` can be a
+  real gate. Do not add a random serial or a timestamp.
+- `autumn sbom --binary <path>` answers "which crate versions are in this
+  binary?" with no source tree and no lockfile, reading the `.dep-v0` section
+  `cargo-auditable` embeds. A binary built without it gets an error naming the
+  fix, never an empty list.
+- The generated production Dockerfile compiles through `cargo auditable`,
+  fetches Tailwind via the checksum-verifying `autumn setup` (never a bare
+  `curl`), and bakes an SBOM at `/usr/share/autumn/sbom.cdx.json` behind the
+  `io.autumn.sbom.path` label.
+- Verify a published artifact with
+  `gh attestation verify <asset> --repo autumn-foundation/autumn`. Always pass
+  `--repo`: without it any repository's attestation would satisfy the check.
+
+See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
+negative case (tamper with a byte, watch verification fail).
+
 ## Observability defaults
 
 Published 0.5.0 behavior:
@@ -2204,6 +2229,11 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
+autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
+autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
+autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
+autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (unreleased, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
 autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
 autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)

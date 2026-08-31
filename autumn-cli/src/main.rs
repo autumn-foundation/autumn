@@ -624,8 +624,15 @@ enum Commands {
         ///
         /// Off by default: the default feature set is what a build actually
         /// links, so it is what the document should describe.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "binary")]
         all_features: bool,
+        /// Extra Cargo features to enable, comma-separated.
+        ///
+        /// Pass the same features the binary was built with, so the SBOM
+        /// describes the crates that are actually linked. The generated
+        /// production Dockerfile does this for `embed-assets` builds.
+        #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
+        features: Option<String>,
         /// Require the SBOM's top-level component to be exactly this version.
         ///
         /// The release gate passes the tag being released, so an SBOM that is
@@ -3975,6 +3982,7 @@ fn run_command(command: Commands) {
             binary,
             locked,
             all_features,
+            features,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
             manifest_path,
@@ -3984,6 +3992,7 @@ fn run_command(command: Commands) {
             locked,
             expect_version,
             all_features,
+            features,
         }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
@@ -5570,6 +5579,7 @@ mod tests {
             manifest_path,
             expect_version,
             all_features,
+            features,
         } = cli.command
         else {
             panic!("expected Sbom command");
@@ -5588,6 +5598,16 @@ mod tests {
             "the default feature set is what a build actually links, so it is \
              what the document describes by default"
         );
+        assert!(features.is_none());
+    }
+
+    #[test]
+    fn parse_sbom_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--features", "embed-assets"]).unwrap();
+        let Commands::Sbom { features, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(features.as_deref(), Some("embed-assets"));
     }
 
     #[test]
@@ -5645,6 +5665,7 @@ mod tests {
         for flag in [
             vec!["--locked"],
             vec!["--all-features"],
+            vec!["--features", "embed-assets"],
             vec!["--verify", "sbom.cdx.json"],
         ] {
             let mut args = vec!["autumn", "sbom", "--binary", "app"];

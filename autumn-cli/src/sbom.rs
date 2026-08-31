@@ -39,12 +39,16 @@ use sha2::{Digest, Sha256};
 /// deprecated flat `tools` array).
 const SPEC_VERSION: &str = "1.5";
 
-/// Section names `cargo-auditable` uses for its embedded dependency list. ELF
-/// uses `.dep-v0`; Mach-O section names are conventionally underscore-prefixed
-/// and carry no leading dot, and the exact spelling has varied, so accept both
-/// forms rather than silently reporting "not built with cargo-auditable" on a
-/// binary that in fact was.
-const DEP_SECTION_NAMES: &[&str] = &[".dep-v0", "dep-v0", "__dep_v0"];
+/// Section names `cargo-auditable` uses for its embedded dependency list.
+///
+/// Upstream uses `.dep-v0` on every format — verified against
+/// `auditable-extract`, which looks up `.dep-v0` for ELF/PE/WASM and
+/// `("__DATA", ".dep-v0")` for Mach-O. The underscore-prefixed spellings are
+/// accepted defensively (Mach-O section names are conventionally
+/// underscore-prefixed, and a future or third-party writer may follow that
+/// convention) so a binary that IS auditable is never reported as one that
+/// is not.
+const DEP_SECTION_NAMES: &[&str] = &[".dep-v0", "dep-v0", "__dep-v0", "__dep_v0"];
 
 /// Ceiling on the DECOMPRESSED size of an embedded dependency list.
 ///
@@ -452,11 +456,28 @@ pub fn render(bom: &Bom) -> Result<String, SbomError> {
 pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
     let mut report = Vec::new();
 
+    if expected.bom_format != actual.bom_format {
+        report.push(format!(
+            "  bom format: expected {}, found {}",
+            expected.bom_format, actual.bom_format
+        ));
+    }
     if expected.spec_version != actual.spec_version {
         report.push(format!(
             "  spec version: expected CycloneDX {}, found {}",
             expected.spec_version, actual.spec_version
         ));
+    }
+    if expected.version != actual.version {
+        report.push(format!(
+            "  document version: expected {}, found {}",
+            expected.version, actual.version
+        ));
+    }
+    if expected.serial_number != actual.serial_number {
+        // Content-derived, so a mismatch means the inventory it was computed
+        // from is not the one in the file.
+        report.push("  serial number: does not match this document's contents".to_owned());
     }
     // Compare the WHOLE root component, not just name+version: an edited
     // `purl`, a forged licence, or a swapped `bom-ref` on the top-level
@@ -1010,6 +1031,14 @@ pub struct SbomOptions {
     /// that cannot exist. It also guarantees the `cargo metadata` view can
     /// never agree with what `--binary` reads out of a real build.
     pub all_features: bool,
+    /// Extra cargo features to enable when resolving, comma-separated.
+    ///
+    /// The image build passes the same features its final compile used, so the
+    /// sidecar SBOM describes the crates that are actually linked. Without
+    /// this, an `embed-assets` build's SBOM would omit the crates that feature
+    /// pulls in, and the documented sidecar-vs-binary cross-check would show
+    /// spurious binary-only entries.
+    pub features: Option<String>,
 }
 
 fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError> {
@@ -1017,6 +1046,14 @@ fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError
     cmd.args(["metadata", "--format-version", "1"]);
     if opts.all_features {
         cmd.arg("--all-features");
+    }
+    if let Some(features) = opts
+        .features
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        cmd.args(["--features", features]);
     }
     if opts.locked {
         cmd.arg("--locked");

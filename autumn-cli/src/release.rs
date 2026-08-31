@@ -65,6 +65,36 @@ mod templates {
 /// the sidecar SBOM file.
 const SBOM_MIN_CLI_VERSION: &str = "0.7.1";
 
+/// Builder-stage step that writes the image's `CycloneDX` inventory.
+///
+/// A raw literal on purpose: these lines land verbatim in a generated
+/// Dockerfile, so any escaping cleverness here shows up as stray indentation
+/// in every scaffolded project.
+const SBOM_GENERATE_STEP: &str = r"
+# Machine-readable inventory of everything compiled into this image, generated
+# from the very source tree that produced the binary above, resolving the same
+# features that build used. Deliberately no `--locked`: a project whose
+# Cargo.lock has drifted still builds (its own build would have updated the
+# lock anyway), and the SBOM records what was actually resolved. Add `--locked`
+# here if you want the stricter posture.
+RUN autumn sbom{{sbom_features}} --output /app/sbom.cdx.json
+";
+
+/// Runtime-stage copy that carries the inventory into the shipped image.
+const SBOM_RUNTIME_COPY: &str = r"# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find
+# it without knowing anything about autumn. The binary itself independently
+# carries the same list (see cargo-auditable above); docs/guide/supply-chain.md
+# shows how to cross-check the two.
+COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json
+";
+
+/// Continuation of the runtime image's `LABEL` instruction, pointing a scanner
+/// at the in-image SBOM without any autumn-specific knowledge.
+const SBOM_LABELS: &str = concat!(
+    " \\\n      io.autumn.sbom.format=\"CycloneDX\"",
+    " \\\n      io.autumn.sbom.path=\"/usr/share/autumn/sbom.cdx.json\""
+);
+
 /// Keep or delete a `{{sbom_steps_begin}}` … `{{sbom_steps_end}}` region.
 ///
 /// The generated deploy workflows extract and attest the SBOM baked into the
@@ -628,16 +658,30 @@ fn render_for_cli(
     // SBOM_MIN_CLI_VERSION has. Emitting these steps against an older pin
     // would make `docker build` fail outright, so they are omitted instead —
     // the image is merely SBOM-less, not broken.
-    let (sbom_generate_step, sbom_runtime_copy, sbom_labels) = if cli_supports_sbom(cli_version) {
-        (
-            "\n# Machine-readable inventory of everything compiled into this image, generated\n             # from the very source tree that produced the binary above. Deliberately no\n             # `--locked`: a project whose Cargo.lock has drifted still builds (its own\n             # build would have updated the lock anyway), and the SBOM records what was\n             # actually resolved. Add `--locked` here if you want the stricter posture.\n             RUN autumn sbom --output /app/sbom.cdx.json\n",
-            "# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find\n             # it without knowing anything about autumn. The binary itself independently\n             # carries the same list (see cargo-auditable above); docs/guide/supply-chain.md\n             # shows how to cross-check the two.\n             COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json\n",
-            " \\\n      io.autumn.sbom.format=\"CycloneDX\" \\\n                   io.autumn.sbom.path=\"/usr/share/autumn/sbom.cdx.json\"",
+    //
+    // The SBOM must resolve the SAME features the binary above was compiled
+    // with. The embed build turns on `embed-assets`, which pulls in optional
+    // dependencies; resolving the default set instead would omit crates that
+    // are genuinely linked and make the documented sidecar-vs-binary
+    // cross-check report spurious binary-only entries.
+    let emits_sbom = cli_supports_sbom(cli_version);
+    let sbom_generate_step = if emits_sbom {
+        SBOM_GENERATE_STEP.replace(
+            "{{sbom_features}}",
+            if embed {
+                " --features embed-assets"
+            } else {
+                ""
+            },
         )
     } else {
-        ("", "", "")
+        String::new()
     };
-
+    let (sbom_runtime_copy, sbom_labels) = if emits_sbom {
+        (SBOM_RUNTIME_COPY, SBOM_LABELS)
+    } else {
+        ("", "")
+    };
     // Split-topology placeholders exist only in the docker-compose template, so
     // these replacements are no-ops for the other files. Substitute them before
     // `{{project_name}}` so the worker block's own `{{project_name}}` tokens are
@@ -659,7 +703,7 @@ fn render_for_cli(
         .replace("{{diesel_cli_version}}", "2.3.8")
         .replace("{{build_step}}", build_step)
         .replace("{{static_copy}}", static_copy)
-        .replace("{{sbom_generate_step}}", sbom_generate_step)
+        .replace("{{sbom_generate_step}}", &sbom_generate_step)
         .replace("{{sbom_runtime_copy}}", sbom_runtime_copy)
         .replace("{{sbom_labels}}", sbom_labels);
     strip_sbom_block(&rendered, cli_supports_sbom(cli_version))
@@ -919,6 +963,64 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("io.autumn.sbom.path"), "{rendered}");
+    }
+
+    /// Generated Dockerfiles are read by humans. A `\`-continued Rust string
+    /// literal that loses its continuation silently indents every following
+    /// line of the block it renders — including instructions — which is how
+    /// this very block first shipped.
+    #[test]
+    fn the_rendered_dockerfile_has_no_stray_indentation() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            for (n, line) in rendered.lines().enumerate() {
+                let leading = line.len() - line.trim_start().len();
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || trimmed.starts_with("COPY ") {
+                    assert_eq!(
+                        leading,
+                        0,
+                        "line {} of the {cli_version} render is indented: {line:?}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_embed_build_sbom_resolves_the_features_it_was_built_with() {
+        // `embed-assets` pulls in optional dependencies; an SBOM resolved
+        // without it would omit crates the shipped binary genuinely links.
+        let embed = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            embed.contains("RUN autumn sbom --features embed-assets --output /app/sbom.cdx.json"),
+            "{embed}"
+        );
+
+        let plain = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            plain.contains("RUN autumn sbom --output /app/sbom.cdx.json"),
+            "a non-embed build takes the default feature set: {plain}"
+        );
     }
 
     #[test]
