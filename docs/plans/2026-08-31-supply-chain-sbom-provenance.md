@@ -86,4 +86,4 @@ Written before implementation; kept as the design rationale for the shipped slic
 | AC2 Provenance on every asset + verify command | `release.yml`, `cli-release.yml` (`actions/attest-build-provenance`), `docs/guide/supply-chain.md` |
 | AC3 Binary reports its crate versions | `autumn sbom --binary`, `RUSTC_WORKSPACE_WRAPPER=cargo-auditable` in `Dockerfile.tmpl` |
 | AC4 Image SBOM + provenance + verified downloads | `Dockerfile.tmpl` (`autumn setup`, `autumn sbom`, SBOM copy + labels), `{aws,gcp,azure}-deploy.yml.tmpl` |
-| AC5 "Verify what you're running" doc | `docs/guide/supply-chain.md`, linked from `deployment.md`, `README.md`, `release-checklist.md` |
+| AC5 "Verify what you're running" doc | `docs/guide/supply-chain.md`, linked from `deployment.md` and `release-checklist.md` |

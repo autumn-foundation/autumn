@@ -525,6 +525,16 @@ enum Commands {
         /// Errors when the project has no `#[edge]` routes.
         #[arg(long)]
         edge: bool,
+        /// Compile through `cargo auditable`, embedding the resolved dependency
+        /// list into the binary.
+        ///
+        /// The binary can then report exactly which crate versions are inside
+        /// it with no source tree and no lockfile — `autumn sbom --binary
+        /// <path>`. Requires `cargo-auditable` on PATH (`cargo install
+        /// --locked cargo-auditable`); the production Dockerfile `autumn
+        /// release init` generates installs it and passes this flag.
+        #[arg(long)]
+        auditable: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -588,7 +598,7 @@ enum Commands {
     ///     lockfile, no network. See docs/guide/supply-chain.md.
     Sbom {
         /// Path to a `Cargo.toml` to describe (defaults to the current directory).
-        #[arg(long, value_name = "PATH", conflicts_with = "binary")]
+        #[arg(long, value_name = "PATH")]
         manifest_path: Option<PathBuf>,
         /// Write the SBOM here instead of stdout.
         #[arg(long, short, value_name = "FILE", conflicts_with = "verify")]
@@ -597,11 +607,25 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         verify: Option<PathBuf>,
         /// Read the embedded dependency list out of an already-compiled binary.
-        #[arg(long, value_name = "FILE")]
+        ///
+        /// Mutually exclusive with every flag that only means something when
+        /// reading a source tree — a compiled binary has no manifest, no
+        /// lockfile and no feature set to resolve.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["manifest_path", "locked", "all_features", "verify"]
+        )]
         binary: Option<PathBuf>,
         /// Pass `--locked` to `cargo metadata`, failing if `Cargo.lock` is stale.
         #[arg(long)]
         locked: bool,
+        /// Resolve with every optional feature enabled.
+        ///
+        /// Off by default: the default feature set is what a build actually
+        /// links, so it is what the document should describe.
+        #[arg(long)]
+        all_features: bool,
         /// Require the SBOM's top-level component to be exactly this version.
         ///
         /// The release gate passes the tag being released, so an SBOM that is
@@ -3540,6 +3564,7 @@ fn run_command(command: Commands) {
             embed,
             features,
             edge,
+            auditable,
         } => build::run(
             debug,
             embed,
@@ -3547,6 +3572,7 @@ fn run_command(command: Commands) {
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
+            auditable,
         ),
         Commands::Dev {
             package,
@@ -3948,6 +3974,7 @@ fn run_command(command: Commands) {
             verify,
             binary,
             locked,
+            all_features,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
             manifest_path,
@@ -3956,6 +3983,7 @@ fn run_command(command: Commands) {
             binary,
             locked,
             expect_version,
+            all_features,
         }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
@@ -5541,6 +5569,7 @@ mod tests {
             locked,
             manifest_path,
             expect_version,
+            all_features,
         } = cli.command
         else {
             panic!("expected Sbom command");
@@ -5553,6 +5582,11 @@ mod tests {
         assert!(
             !locked,
             "--locked must be opt-in so a stale app lockfile still builds"
+        );
+        assert!(
+            !all_features,
+            "the default feature set is what a build actually links, so it is \
+             what the document describes by default"
         );
     }
 
@@ -5602,6 +5636,24 @@ mod tests {
             Cli::try_parse_from(["autumn", "sbom", "--verify", "a.json", "--output", "b.json"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_combined_with_source_tree_flags() {
+        // Each of these only means something when resolving a manifest; with
+        // `--binary` they would be silently ignored.
+        for flag in [
+            vec!["--locked"],
+            vec!["--all-features"],
+            vec!["--verify", "sbom.cdx.json"],
+        ] {
+            let mut args = vec!["autumn", "sbom", "--binary", "app"];
+            args.extend(flag.iter().copied());
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "`autumn sbom --binary` must reject {flag:?}"
+            );
+        }
     }
 
     #[test]
@@ -5691,6 +5743,22 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_auditable() {
+        // The production Dockerfile passes this so the shipped binary carries
+        // its own dependency list (issue #1615).
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--auditable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                embed: true,
+                auditable: true,
+                ..
             }
         ));
     }
@@ -5707,6 +5775,7 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
             }
         ));
     }

@@ -48,6 +48,86 @@ mod templates {
     pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
 }
 
+/// First `autumn-cli` release that ships `autumn sbom`.
+///
+/// The generated Dockerfile `cargo install`s the CLI at
+/// `{{autumn_cli_version}}` — which renders THIS CLI's own version. Between a
+/// feature merging and the next release that is an ALREADY-PUBLISHED version
+/// predating the feature, so a scaffold generated from a source build in that
+/// window would emit `RUN autumn sbom …` against a CLI that has no such
+/// subcommand and the image would not build at all.
+///
+/// `0.7.1` means "any release after 0.7.0", which is every future version, so
+/// this needs no maintenance when the next version number is chosen: the SBOM
+/// steps switch themselves on the moment a CLI that can satisfy them is what
+/// gets installed. Until then the scaffold still produces a working image —
+/// with the auditable binary and the verified Tailwind download, just without
+/// the sidecar SBOM file.
+const SBOM_MIN_CLI_VERSION: &str = "0.7.1";
+
+/// Keep or delete a `{{sbom_steps_begin}}` … `{{sbom_steps_end}}` region.
+///
+/// The generated deploy workflows extract and attest the SBOM baked into the
+/// image, which only exists when the pinned CLI could generate it (see
+/// [`SBOM_MIN_CLI_VERSION`]). Rather than duplicate each cloud's image
+/// expression and env block in Rust, the steps live in the template between
+/// markers and this either unwraps them or removes them wholesale.
+fn strip_sbom_block(rendered: &str, keep: bool) -> String {
+    // Most templates carry no markers; leave those byte-for-byte alone rather
+    // than round-tripping them through a line splitter that would normalise
+    // their trailing newline.
+    if !rendered.contains("{{sbom_steps_begin}}") {
+        return rendered.to_owned();
+    }
+    let mut out = String::with_capacity(rendered.len());
+    let mut inside = false;
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{{sbom_steps_begin}}" {
+            inside = true;
+            continue;
+        }
+        if trimmed == "{{sbom_steps_end}}" {
+            inside = false;
+            continue;
+        }
+        if inside && !keep {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse `x.y.z` (ignoring any `-pre`/`+build` suffix) for ordering.
+fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next().filter(|s| !s.is_empty())?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Whether a Dockerfile pinned to `cli_version` can run `autumn sbom`.
+///
+/// An unparseable version is treated as capable: it is not a published
+/// crates.io release, so it is a local/source build, which by definition has
+/// whatever this CLI has.
+fn cli_supports_sbom(cli_version: &str) -> bool {
+    match (
+        semver_triple(cli_version),
+        semver_triple(SBOM_MIN_CLI_VERSION),
+    ) {
+        (Some(have), Some(need)) => have >= need,
+        _ => true,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseError {
     #[error("'{0}' already exists — run with --force to overwrite")]
@@ -503,23 +583,61 @@ condition: service_completed_successfully\n    restart: unless-stopped\n";
 const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
 
 fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
+    render_for_cli(
+        template,
+        project_name,
+        embed,
+        split_workers,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The Dockerfile/deploy-workflow renderer, with the pinned CLI version
+/// injectable so both sides of the [`cli_supports_sbom`] gate are testable.
+fn render_for_cli(
+    template: &str,
+    project_name: &str,
+    embed: bool,
+    split_workers: bool,
+    cli_version: &str,
+) -> String {
     let (build_step, static_copy) = if embed {
         (
             "# Single-binary build: fingerprint static assets, then compile with the\n\
              # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
              # manifest) and i18n locales from itself — no sidecar directories. The app\n\
              # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
-             RUN autumn build --embed",
+             # `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
+             # shipped binary carries its own dependency list.\n\
+             RUN autumn build --embed --auditable",
             // Assets/locales are embedded; only migrations/ is staged below.
             "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
              # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
         )
     } else {
         (
-            "RUN cargo build --release",
+            "# `cargo auditable` embeds the resolved dependency list into the binary so it\n\
+             # can report its own crate versions with no source tree — see\n\
+             # docs/guide/supply-chain.md. Otherwise an ordinary release build.\n\
+             RUN cargo auditable build --release",
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
     };
+
+    // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
+    // SBOM_MIN_CLI_VERSION has. Emitting these steps against an older pin
+    // would make `docker build` fail outright, so they are omitted instead —
+    // the image is merely SBOM-less, not broken.
+    let (sbom_generate_step, sbom_runtime_copy, sbom_labels) = if cli_supports_sbom(cli_version) {
+        (
+            "\n# Machine-readable inventory of everything compiled into this image, generated\n             # from the very source tree that produced the binary above. Deliberately no\n             # `--locked`: a project whose Cargo.lock has drifted still builds (its own\n             # build would have updated the lock anyway), and the SBOM records what was\n             # actually resolved. Add `--locked` here if you want the stricter posture.\n             RUN autumn sbom --output /app/sbom.cdx.json\n",
+            "# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find\n             # it without knowing anything about autumn. The binary itself independently\n             # carries the same list (see cargo-auditable above); docs/guide/supply-chain.md\n             # shows how to cross-check the two.\n             COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json\n",
+            " \\\n      io.autumn.sbom.format=\"CycloneDX\" \\\n                   io.autumn.sbom.path=\"/usr/share/autumn/sbom.cdx.json\"",
+        )
+    } else {
+        ("", "", "")
+    };
+
     // Split-topology placeholders exist only in the docker-compose template, so
     // these replacements are no-ops for the other files. Substitute them before
     // `{{project_name}}` so the worker block's own `{{project_name}}` tokens are
@@ -529,7 +647,7 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
     } else {
         ("", "")
     };
-    template
+    let rendered = template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
         .replace("{{project_name}}", project_name)
@@ -537,10 +655,14 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
             "{{rust_version}}",
             option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
         )
-        .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{autumn_cli_version}}", cli_version)
         .replace("{{diesel_cli_version}}", "2.3.8")
         .replace("{{build_step}}", build_step)
         .replace("{{static_copy}}", static_copy)
+        .replace("{{sbom_generate_step}}", sbom_generate_step)
+        .replace("{{sbom_runtime_copy}}", sbom_runtime_copy)
+        .replace("{{sbom_labels}}", sbom_labels);
+    strip_sbom_block(&rendered, cli_supports_sbom(cli_version))
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -736,14 +858,117 @@ mod tests {
         // The provenance ENV must precede the build step so the compile sees it.
         let env_pos = content.find("AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA}");
         let build_pos = content.find("{{build_step}}").or_else(|| {
-            // `{{build_step}}` is already substituted; both variants run cargo.
+            // `{{build_step}}` is already substituted; both variants run cargo,
+            // now through `cargo auditable` so the binary carries its own
+            // dependency list (issue #1615).
             content
-                .find("cargo build --release")
-                .or_else(|| content.find("autumn build --embed"))
+                .find("RUN cargo auditable build --release")
+                .or_else(|| content.find("RUN autumn build --embed"))
         });
         assert!(
             matches!((env_pos, build_pos), (Some(e), Some(b)) if e < b),
             "provenance ENV must appear before the build step: {content}"
+        );
+    }
+
+    #[test]
+    fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
+        // The Dockerfile `cargo install`s the CLI at its own version. Between a
+        // merge and the next release that is an already-published version with
+        // no `sbom` subcommand — emitting the step anyway would make every
+        // `docker build` fail on an unrecognised subcommand.
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            !rendered.contains("autumn sbom"),
+            "must not call a subcommand the pinned CLI lacks:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("sbom.cdx.json"),
+            "and must not COPY a file that was never generated:\n{rendered}"
+        );
+        // The rest of the supply-chain posture does not depend on the CLI at
+        // all, so it stays on.
+        assert!(
+            rendered.contains("cargo auditable build --release"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("RUN autumn setup"), "{rendered}");
+    }
+
+    #[test]
+    fn a_cli_pin_that_ships_autumn_sbom_emits_the_sbom_steps() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            rendered.contains("RUN autumn sbom --output /app/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("/usr/share/autumn/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("io.autumn.sbom.path"), "{rendered}");
+    }
+
+    #[test]
+    fn the_sbom_gate_opens_for_every_future_version() {
+        // 0.7.1 is deliberately "anything after 0.7.0", so no future release
+        // number has to be predicted.
+        for v in ["0.7.1", "0.8.0", "0.10.0", "1.0.0", "2.3.4"] {
+            assert!(cli_supports_sbom(v), "{v} should support autumn sbom");
+        }
+        for v in ["0.7.0", "0.6.0", "0.1.0"] {
+            assert!(!cli_supports_sbom(v), "{v} predates autumn sbom");
+        }
+        // A pre-release sorts BEFORE its base version, so `0.7.0-dev` still
+        // predates the feature — the gate must not be fooled by the suffix.
+        assert!(!cli_supports_sbom("0.7.0-dev"));
+        assert!(cli_supports_sbom("0.8.0-rc.1"));
+        // A string cargo could never resolve is not a published release at
+        // all; nothing is gained by degrading, and the pin would fail first.
+        assert!(cli_supports_sbom("not-a-version"));
+    }
+
+    #[test]
+    fn a_gated_deploy_workflow_drops_only_the_sbom_steps() {
+        let with = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        let without = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(with.contains("actions/attest-sbom"), "{with}");
+        assert!(!without.contains("actions/attest-sbom"), "{without}");
+        // The image provenance attestation needs nothing from the autumn CLI,
+        // so it is present either way.
+        for rendered in [&with, &without] {
+            assert!(
+                rendered.contains("actions/attest-build-provenance"),
+                "{rendered}"
+            );
+        }
+        assert!(
+            !with.contains("{{sbom_steps_") && !without.contains("{{sbom_steps_"),
+            "the markers must never reach a generated file"
         );
     }
 
@@ -815,11 +1040,11 @@ mod tests {
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
-            content.contains("RUN cargo build --release"),
+            content.contains("RUN cargo auditable build --release"),
             "non-embed project must use the disk-based build: {content}"
         );
         assert!(
-            !content.contains("autumn build --embed"),
+            !content.contains("RUN autumn build --embed"),
             "non-embed project must not require the embed-assets feature"
         );
         assert!(

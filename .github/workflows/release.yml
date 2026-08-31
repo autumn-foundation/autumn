@@ -11,7 +11,7 @@ name: Release
 # attestation (issue #1615), so a consumer can prove an asset came from this
 # repository's CI at a specific commit:
 #
-#   gh attestation verify autumn-sbom.cdx.json --repo autumn-foundation/autumn
+#   gh attestation verify autumn-<tag>.cdx.json --repo autumn-foundation/autumn
 #
 # See docs/guide/supply-chain.md.
 on:
@@ -103,8 +103,15 @@ jobs:
   binaries:
     name: Build & attach CLI binaries
     needs: release
+    # A job-level `permissions:` block REPLACES the workflow-level one, and a
+    # called reusable workflow can only DOWNGRADE the caller's token — the
+    # `permissions:` inside cli-release.yml cannot add scopes back. Without the
+    # two below, its attestation step gets no OIDC token, fails, and (running
+    # before the upload) leaves the release with no CLI binaries at all.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/cli-release.yml
     with:
       tag: ${{ needs.release.outputs.tag }}

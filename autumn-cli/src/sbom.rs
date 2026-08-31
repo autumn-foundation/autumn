@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The `CycloneDX` specification version emitted. 1.5 is the first version whose
 /// `metadata.tools` is an object with a `components` array (rather than the
@@ -44,6 +45,16 @@ const SPEC_VERSION: &str = "1.5";
 /// forms rather than silently reporting "not built with cargo-auditable" on a
 /// binary that in fact was.
 const DEP_SECTION_NAMES: &[&str] = &[".dep-v0", "dep-v0", "__dep_v0"];
+
+/// Ceiling on the DECOMPRESSED size of an embedded dependency list.
+///
+/// `--binary` inflates a section out of a file the caller did not necessarily
+/// build. zlib reaches ~1000:1 on repetitive input, so a ~100 MB section would
+/// otherwise ask for ~100 GB of `String`. 16 MiB is two orders of magnitude
+/// above any real dependency list (autumn's own ~900-crate graph is well under
+/// 1 MiB uncompressed) and matches the spirit of upstream `auditable-info`'s
+/// own default limit.
+pub const MAX_AUDIT_DATA_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SbomError {
@@ -59,6 +70,12 @@ pub enum SbomError {
     UnsupportedObjectFormat,
     #[error("truncated or malformed object file")]
     MalformedObject,
+    #[error(
+        "embedded dependency list expands to more than {limit} bytes — refusing to \
+         decompress further (a compressed section can amplify ~1000x, so an untrusted \
+         binary could otherwise exhaust memory)"
+    )]
+    AuditDataTooLarge { limit: usize },
     #[error(
         "no embedded dependency list found: the binary was not built with cargo-auditable \
          (build it with `cargo auditable build --release`, or set \
@@ -89,6 +106,12 @@ pub struct Bom {
     pub bom_format: String,
     #[serde(rename = "specVersion")]
     pub spec_version: String,
+    #[serde(
+        rename = "serialNumber",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub serial_number: Option<String>,
     pub version: u32,
     pub metadata: BomMetadata,
     pub components: Vec<Component>,
@@ -125,6 +148,11 @@ pub struct Component {
     pub external_references: Option<Vec<ExternalReference>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub properties: Option<Vec<Property>>,
+    /// The cargo package id this component came from. Never serialized — it is
+    /// an ordering/identity tiebreaker only, so a document round-tripped
+    /// through disk still compares equal to a freshly generated one.
+    #[serde(skip)]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,13 +178,29 @@ impl Component {
         format!("{}@{}", self.name, self.version)
     }
 
-    /// Sort key. `purl` participates so two packages that share a name and
-    /// version but not an identity still order deterministically.
-    fn sort_key(&self) -> (&str, &str, &str) {
+    /// A copy stripped of fields that are never serialized.
+    ///
+    /// `source_id` is an in-memory ordering tiebreaker, so a document read back
+    /// from disk always has `None` there. Comparing it would make every
+    /// `--verify` of a freshly generated document against its own written form
+    /// report that every component "differs".
+    fn comparable(&self) -> Self {
+        Self {
+            source_id: None,
+            ..self.clone()
+        }
+    }
+
+    /// Sort key. `purl` and then the cargo package id participate, so two
+    /// packages sharing a name and version — a vendored copy beside a registry
+    /// one — still order deterministically rather than by whatever order
+    /// `cargo metadata` happened to emit them in.
+    fn sort_key(&self) -> (&str, &str, &str, &str) {
         (
             self.name.as_str(),
             self.version.as_str(),
             self.purl.as_deref().unwrap_or(""),
+            self.source_id.as_deref().unwrap_or(""),
         )
     }
 }
@@ -175,17 +219,86 @@ fn tool_component(tool_version: &str) -> Component {
         licenses: None,
         external_references: None,
         properties: None,
+        source_id: None,
     }
 }
 
 /// Assemble the envelope, sorting and de-duplicating `components` so callers
 /// never have to remember to.
+/// A CONTENT-DERIVED serial number.
+///
+/// `CycloneDX` wants a `serialNumber`, and consumers require one: GitHub's
+/// `actions/attest-sbom` sniffs the document format by looking for
+/// `bomFormat` + `serialNumber` + `specVersion` together, and rejects the
+/// document outright without it. The obvious implementation — a fresh random
+/// UUID per run — would destroy the determinism `--verify` depends on, so
+/// derive it from the document's own content instead: same inventory, same
+/// serial number; one crate different, different serial number.
+///
+/// Formatted as a syntactically valid RFC 4122 v4 UUID (version and variant
+/// bits forced) so tools that parse it are satisfied.
+fn content_serial_number(root: &Component, components: &[Component]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SPEC_VERSION.as_bytes());
+    hasher.update(root.name.as_bytes());
+    hasher.update(b"@");
+    hasher.update(root.version.as_bytes());
+    for c in components {
+        hasher.update(b"\n");
+        hasher.update(c.bom_ref.as_deref().unwrap_or_default().as_bytes());
+    }
+    let d = hasher.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let mut hex = String::with_capacity(32);
+    for byte in b {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Give every component a unique `bom-ref`, disambiguating any that collide.
+///
+/// A purl is `pkg:cargo/<name>@<version>` and carries no source qualifier, so
+/// a `[patch]`ed or vendored copy alongside a registry copy of the same
+/// version collides. Collapsing those would DROP a real dependency from the
+/// inventory, so keep both and suffix the later ones — `CycloneDX` requires
+/// `bom-ref` to be unique within a document. Components are already sorted, so
+/// which one keeps the bare ref is deterministic.
+fn disambiguate_bom_refs(components: &mut [Component]) {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for c in components.iter_mut() {
+        let Some(base) = c.bom_ref.clone() else {
+            continue;
+        };
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            c.bom_ref = Some(format!("{base}#{count}"));
+        }
+    }
+}
+
 fn assemble(root: Component, mut components: Vec<Component>, tool_version: &str) -> Bom {
     components.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-    components.dedup_by(|a, b| a.bom_ref.is_some() && a.bom_ref == b.bom_ref);
+    // Collapse only entries that are identical in every respect — two packages
+    // that merely share a name and version are distinct dependencies.
+    components.dedup_by(|a, b| a == b);
+    disambiguate_bom_refs(&mut components);
     Bom {
         bom_format: "CycloneDX".into(),
         spec_version: SPEC_VERSION.into(),
+        serial_number: Some(content_serial_number(&root, &components)),
         version: 1,
         metadata: BomMetadata {
             tools: Tools {
@@ -240,6 +353,7 @@ fn component_from_package(pkg: &serde_json::Value) -> Result<Component, SbomErro
             }]
         }),
         properties: None,
+        source_id: str_field(pkg, "id").map(str::to_owned),
     })
 }
 
@@ -282,15 +396,23 @@ pub fn bom_from_cargo_metadata(
             kind: "application".into(),
             ..component_from_package(pkg)?
         },
+        // A virtual workspace has no package of its own, so there is no
+        // crates.io identity to claim. Emitting `pkg:cargo/<name>@<version>`
+        // here would point a scanner at whatever unrelated crate happens to
+        // share the repository's name (autumn's own workspace publishes
+        // `autumn-web`, while `autumn` is somebody else's crate), and would
+        // collide with a member's `bom-ref` in workspaces named after one of
+        // their own crates. Use a scheme that asserts nothing instead.
         None => Component {
             kind: "application".into(),
-            bom_ref: Some(purl(&fallback.name, &fallback.version)),
+            bom_ref: Some(format!("workspace:{}@{}", fallback.name, fallback.version)),
             name: fallback.name.clone(),
             version: fallback.version.clone(),
-            purl: Some(purl(&fallback.name, &fallback.version)),
+            purl: None,
             licenses: None,
             external_references: None,
             properties: None,
+            source_id: None,
         },
     };
 
@@ -336,19 +458,36 @@ pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
             expected.spec_version, actual.spec_version
         ));
     }
+    // Compare the WHOLE root component, not just name+version: an edited
+    // `purl`, a forged licence, or a swapped `bom-ref` on the top-level
+    // component is exactly the kind of drift this gate exists to catch.
     let (e, a) = (&expected.metadata.component, &actual.metadata.component);
-    if e.name != a.name || e.version != a.version {
-        report.push(format!(
-            "  root component: expected {}, found {}",
-            e.label(),
-            a.label()
-        ));
+    if e.comparable() != a.comparable() {
+        report.push(if e.name == a.name && e.version == a.version {
+            format!("  root component metadata differs for {}", e.label())
+        } else {
+            format!(
+                "  root component: expected {}, found {}",
+                e.label(),
+                a.label()
+            )
+        });
+    }
+    if expected.metadata.tools != actual.metadata.tools {
+        report.push(
+            "  generator: the SBOM names a different tool than the one verifying it".to_owned(),
+        );
     }
 
     let index = |bom: &Bom| -> BTreeMap<String, Component> {
         bom.components
             .iter()
-            .map(|c| (c.bom_ref.clone().unwrap_or_else(|| c.label()), c.clone()))
+            .map(|c| {
+                (
+                    c.bom_ref.clone().unwrap_or_else(|| c.label()),
+                    c.comparable(),
+                )
+            })
             .collect()
     };
     let (ei, ai) = (index(expected), index(actual));
@@ -371,8 +510,9 @@ pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
 
     // Indexing by `bom-ref` collapses duplicates, so an SBOM listing the same
     // component twice would otherwise compare equal to a clean one. Report the
-    // raw length disagreement, but only when nothing above already explains it.
-    if report.is_empty() && expected.components.len() != actual.components.len() {
+    // raw length disagreement unconditionally — a doubled entry alongside
+    // other drift is still a doubled entry.
+    if expected.components.len() != actual.components.len() {
         report.push(format!(
             "  component count: expected {}, found {} (duplicate entries?)",
             expected.components.len(),
@@ -452,6 +592,7 @@ fn component_from_audit(pkg: &AuditPackage) -> Component {
         licenses: None,
         external_references: None,
         properties: (!properties.is_empty()).then_some(properties),
+        source_id: None,
     }
 }
 
@@ -473,6 +614,7 @@ pub fn bom_from_audit_data(json: &str, tool_version: &str) -> Result<Bom, SbomEr
             licenses: None,
             external_references: None,
             properties: None,
+            source_id: None,
         },
         |p| Component {
             kind: "application".into(),
@@ -631,10 +773,13 @@ fn extract_from_elf(bytes: &[u8]) -> Result<&[u8], SbomError> {
     };
     if shnum == 0 || shstrndx == 0xffff {
         let zero = sh(0)?;
+        // `e_shoff` is attacker-controlled and unbounded, so `zero` can be
+        // usize::MAX here; these adds must be checked like every other read.
+        let at = |delta: usize| zero.checked_add(delta).ok_or(SbomError::MalformedObject);
         let (size_at, link_at) = if class64 {
-            (zero + 32, zero + 40)
+            (at(32)?, at(40)?)
         } else {
-            (zero + 20, zero + 24)
+            (at(20)?, at(24)?)
         };
         if shnum == 0 {
             shnum = usize::try_from(r.usize_at(size_at, class64)?)
@@ -664,11 +809,17 @@ fn extract_from_elf(bytes: &[u8]) -> Result<&[u8], SbomError> {
     };
 
     let (_, strtab_off, strtab_size) = read_hdr(shstrndx)?;
-    let strtab = r.slice(strtab_off, strtab_size)?;
+    // A stripped binary can point at a zero-length (or absent) string table;
+    // that is a "no audit data" case, not a malformed file.
+    let strtab = r.slice(strtab_off, strtab_size).unwrap_or(&[]);
 
     for i in 0..shnum {
         let (name_off, off, size) = read_hdr(i)?;
-        if is_dep_section(cstr_at(strtab, name_off as usize)?) {
+        // A single garbage `sh_name` (or a stripped binary whose `e_shstrndx`
+        // is SHN_UNDEF, leaving an empty string table) must not mask a
+        // `.dep-v0` section later in the table, nor turn an honest "not built
+        // with cargo-auditable" into "malformed object file".
+        if cstr_at(strtab, name_off as usize).is_ok_and(is_dep_section) {
             return r.slice(off, size);
         }
     }
@@ -708,8 +859,10 @@ fn extract_from_macho_thin(bytes: &[u8], base: usize) -> Result<&[u8], SbomError
             };
             let nsects = r.u32(cmd_off + nsects_at)? as usize;
             for s in 0..nsects {
-                let sect = cmd_off
-                    .checked_add(seg_len + s * sect_len)
+                let sect = s
+                    .checked_mul(sect_len)
+                    .and_then(|o| o.checked_add(seg_len))
+                    .and_then(|o| cmd_off.checked_add(o))
                     .ok_or(SbomError::MalformedObject)?;
                 let name = fixed_name(r.slice(sect, 16)?);
                 if is_dep_section(name) {
@@ -722,7 +875,8 @@ fn extract_from_macho_thin(bytes: &[u8], base: usize) -> Result<&[u8], SbomError
                     let size = usize::try_from(r.usize_at(sect + size_at, seg64)?)
                         .map_err(|_| SbomError::MalformedObject)?;
                     let off = r.u32(sect + off_at)? as usize;
-                    return r.slice(base + off, size);
+                    let at = base.checked_add(off).ok_or(SbomError::MalformedObject)?;
+                    return r.slice(at, size);
                 }
             }
         }
@@ -740,7 +894,10 @@ fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError>
     let entry = if fat64 { 32usize } else { 20 };
     let mut last = Err(SbomError::NoAuditData);
     for i in 0..narch {
-        let base = 8 + i * entry;
+        let base = i
+            .checked_mul(entry)
+            .and_then(|o| o.checked_add(8))
+            .ok_or(SbomError::MalformedObject)?;
         let off = if fat64 {
             usize::try_from(r.u64(base + 8)?).map_err(|_| SbomError::MalformedObject)?
         } else {
@@ -760,10 +917,13 @@ fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
     if r.slice(pe_off, 4)? != b"PE\0\0" {
         return Err(SbomError::UnsupportedObjectFormat);
     }
-    let coff = pe_off + 4;
+    let coff = pe_off.checked_add(4).ok_or(SbomError::MalformedObject)?;
     let nsections = r.u16(coff + 2)? as usize;
     let opt_len = r.u16(coff + 16)? as usize;
-    let table = coff + 20 + opt_len;
+    let table = coff
+        .checked_add(20)
+        .and_then(|o| o.checked_add(opt_len))
+        .ok_or(SbomError::MalformedObject)?;
     for i in 0..nsections {
         let sect = table
             .checked_add(i.checked_mul(40).ok_or(SbomError::MalformedObject)?)
@@ -808,7 +968,16 @@ pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
 /// Returns [`SbomError::Io`] when the payload is not valid zlib or not UTF-8.
 pub fn inflate_audit_data(compressed: &[u8]) -> Result<String, SbomError> {
     let mut out = String::new();
-    flate2::read::ZlibDecoder::new(compressed).read_to_string(&mut out)?;
+    // `.take(LIMIT + 1)` caps the work AND lets an over-limit payload be told
+    // apart from one that exactly fills the budget.
+    flate2::read::ZlibDecoder::new(compressed)
+        .take(MAX_AUDIT_DATA_BYTES as u64 + 1)
+        .read_to_string(&mut out)?;
+    if out.len() > MAX_AUDIT_DATA_BYTES {
+        return Err(SbomError::AuditDataTooLarge {
+            limit: MAX_AUDIT_DATA_BYTES,
+        });
+    }
     Ok(out)
 }
 
@@ -832,11 +1001,23 @@ pub struct SbomOptions {
     pub locked: bool,
     /// Require the SBOM's root component to describe exactly this version.
     pub expect_version: Option<String>,
+    /// Resolve with every optional feature enabled rather than the default set.
+    ///
+    /// Off by default on purpose. `--all-features` on this workspace resolves
+    /// 907 packages against 841 for a default build — 66 crates no shipped
+    /// artifact links — and co-enables mutually exclusive backends (both
+    /// `ring` and `aws-lc-rs`), so the document would assert a combination
+    /// that cannot exist. It also guarantees the `cargo metadata` view can
+    /// never agree with what `--binary` reads out of a real build.
+    pub all_features: bool,
 }
 
 fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.args(["metadata", "--format-version", "1", "--all-features"]);
+    cmd.args(["metadata", "--format-version", "1"]);
+    if opts.all_features {
+        cmd.arg("--all-features");
+    }
     if opts.locked {
         cmd.arg("--locked");
     }
@@ -847,9 +1028,12 @@ fn run_cargo_metadata(opts: &SbomOptions) -> Result<serde_json::Value, SbomError
         .output()
         .map_err(|e| SbomError::CargoMetadata(format!("could not run cargo: {e}")))?;
     if !out.status.success() {
-        return Err(SbomError::CargoMetadata(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(SbomError::CargoMetadata(if stderr.is_empty() {
+            format!("cargo exited with {}", out.status)
+        } else {
+            stderr
+        }));
     }
     Ok(serde_json::from_slice(&out.stdout)?)
 }
@@ -1037,13 +1221,32 @@ mod tests {
         // A UUID serial number or a wall-clock timestamp would make the
         // publish gate's `--verify` comparison impossible.
         assert!(
-            !rendered.contains("serialNumber"),
-            "SBOM must not carry a random serialNumber: {rendered}"
-        );
-        assert!(
             !rendered.contains("timestamp"),
             "SBOM must not carry a wall-clock timestamp: {rendered}"
         );
+
+        // A `serialNumber` IS present — consumers require one, and GitHub's
+        // `actions/attest-sbom` refuses a CycloneDX document without it — but
+        // it is derived from the document's content, not randomly generated,
+        // so it survives `--verify`.
+        let serial = serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["serialNumber"]
+            .as_str()
+            .expect("a CycloneDX serialNumber must be present")
+            .to_owned();
+        assert!(serial.starts_with("urn:uuid:"), "{serial}");
+        let again = render(&bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap()).unwrap();
+        assert_eq!(rendered, again, "the serial number must be reproducible");
+
+        // …and it tracks the inventory: one crate different, different serial.
+        let other = metadata_with(&json!([pkg("serde", "1.0.1")]), &json!(null));
+        let other_serial = serde_json::from_str::<serde_json::Value>(
+            &render(&bom_from_cargo_metadata(&other, &fallback(), "0.7.0").unwrap()).unwrap(),
+        )
+        .unwrap()["serialNumber"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(serial, other_serial);
     }
 
     #[test]
@@ -1055,7 +1258,6 @@ mod tests {
         assert_eq!(v["metadata"]["component"]["name"], "autumn");
         assert_eq!(v["metadata"]["component"]["version"], "0.7.0");
         assert_eq!(v["metadata"]["component"]["type"], "application");
-        assert_eq!(v["metadata"]["component"]["purl"], "pkg:cargo/autumn@0.7.0");
     }
 
     #[test]
@@ -1202,6 +1404,21 @@ mod tests {
     }
 
     #[test]
+    fn a_bom_round_tripped_through_json_still_verifies() {
+        // Regression: `source_id` is `#[serde(skip)]`, so a document read back
+        // from disk has `None` where a freshly generated one has the cargo
+        // package id. Comparing it made every component "differ" and the
+        // release gate failed on its own output.
+        let fresh = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
+        let from_disk: Bom = serde_json::from_str(&render(&fresh).unwrap()).unwrap();
+        assert!(
+            diff(&fresh, &from_disk).is_empty(),
+            "{:?}",
+            diff(&fresh, &from_disk)
+        );
+    }
+
+    #[test]
     fn diff_names_the_missing_component() {
         let expected = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
         let actual = bom_of(&[("serde", "1.0.0")]);
@@ -1306,19 +1523,133 @@ mod tests {
 
     #[test]
     fn extracts_dep_v0_from_a_big_endian_mach_o() {
-        let mut macho = synth_macho("dep-v0", b"payload-bytes");
-        // Byte-swap the magic to the big-endian spelling; the rest of the
-        // fixture stays little-endian, so this only proves the magic is not
-        // rejected outright — the swapped-header path is exercised by the
-        // bounds checks that follow.
-        macho[..4].copy_from_slice(&0xfeed_facfu32.to_be_bytes());
+        // A fully byte-swapped image, not just a swapped magic: this is the
+        // only test that actually walks the big-endian load-command path.
+        let macho = synth_macho_endian("dep-v0", b"payload-bytes", true);
+        assert_eq!(&macho[..4], &0xfeed_facfu32.to_be_bytes());
+        assert_eq!(extract_dep_section(&macho).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn refuses_a_decompression_bomb() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+
+        // ~1000:1 amplification is trivially achievable, so an attacker-supplied
+        // binary with a modest `.dep-v0` section can otherwise drive this to an
+        // out-of-memory kill.
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![b'A'; MAX_AUDIT_DATA_BYTES * 2])
+            .unwrap();
+        let bomb = enc.finish().unwrap();
         assert!(
-            !matches!(
-                extract_dep_section(&macho),
-                Err(SbomError::UnsupportedObjectFormat)
-            ),
-            "a big-endian Mach-O magic must not be reported as an unknown format"
+            bomb.len() < MAX_AUDIT_DATA_BYTES,
+            "the fixture must be small enough that only the LIMIT stops it"
         );
+
+        let err = inflate_audit_data(&bomb).unwrap_err();
+        assert!(
+            matches!(err, SbomError::AuditDataTooLarge { .. }),
+            "expected a size refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn does_not_panic_on_an_elf_with_an_absurd_section_table_offset() {
+        // `e_shoff` near usize::MAX previously reached an unchecked `+ 32`
+        // while reading the extended-numbering fields off section header 0.
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1];
+        elf.extend_from_slice(&[0u8; 9]);
+        elf.resize(64, 0);
+        elf[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes()); // e_shoff
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        elf[0x3c..0x3e].copy_from_slice(&0u16.to_le_bytes()); // e_shnum = extended
+        assert!(extract_dep_section(&elf).is_err());
+    }
+
+    #[test]
+    fn a_section_name_pointing_past_the_string_table_does_not_abort_the_scan() {
+        // A stripped or hand-edited binary can carry a garbage `sh_name`. That
+        // must not mask a `.dep-v0` section later in the table, nor turn a
+        // plain "not built with cargo-auditable" into "malformed object".
+        let mut elf = synth_elf(true, false, ".dep-v0", b"payload-bytes");
+        let shoff =
+            usize::try_from(u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap())).unwrap();
+        // Section header 1 is `.shstrtab`; point its own name past the table.
+        elf[shoff + 64..shoff + 68].copy_from_slice(&0xffff_u32.to_le_bytes());
+        assert_eq!(extract_dep_section(&elf).unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn diff_reports_root_component_metadata_drift() {
+        // Comparing only name+version let an edited root purl or licence
+        // through — the release gate must reject the whole component.
+        let expected = bom_of(&[("serde", "1.0.0")]);
+        let mut actual = expected.clone();
+        actual.metadata.component.purl = Some("pkg:cargo/backdoor@0.7.0".into());
+        let report = diff(&expected, &actual).join("\n");
+        assert!(report.contains("root component"), "{report}");
+    }
+
+    #[test]
+    fn a_synthesised_workspace_root_claims_no_crates_io_identity() {
+        // `pkg:cargo/autumn@0.7.0` would point a scanner at an unrelated
+        // crates.io crate: this workspace publishes `autumn-web`, and `autumn`
+        // is somebody else's package.
+        let md = metadata_with(&json!([pkg("serde", "1.0.0")]), &json!(null));
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        assert_eq!(v["metadata"]["component"]["name"], "autumn");
+        assert!(
+            v["metadata"]["component"].get("purl").is_none(),
+            "a synthesised workspace identity has no package URL: {}",
+            v["metadata"]["component"]
+        );
+        assert_eq!(
+            v["metadata"]["component"]["bom-ref"],
+            "workspace:autumn@0.7.0"
+        );
+    }
+
+    #[test]
+    fn two_distinct_packages_sharing_a_name_and_version_both_survive() {
+        // A `[patch]`ed or path copy alongside a registry copy resolves to the
+        // same `name@version`. Collapsing them would drop a real dependency
+        // from the inventory.
+        let md = metadata_with(
+            &json!([
+                {
+                    "id": "registry+https://crates.io#dup@1.0.0",
+                    "name": "dup", "version": "1.0.0", "license": "MIT",
+                },
+                {
+                    "id": "path+file:///vendor/dup#dup@1.0.0",
+                    "name": "dup", "version": "1.0.0", "license": "Apache-2.0",
+                },
+            ]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        let refs: Vec<&str> = v["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["bom-ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(refs.len(), 2, "both copies must appear: {refs:?}");
+        assert_ne!(refs[0], refs[1], "CycloneDX bom-refs must be unique");
+    }
+
+    #[test]
+    fn identical_packages_listed_twice_still_collapse() {
+        let md = metadata_with(
+            &json!([pkg("serde", "1.0.0"), pkg("serde", "1.0.0")]),
+            &json!(null),
+        );
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0").unwrap();
+        assert_eq!(bom.components.len(), 1);
     }
 
     #[test]
@@ -1549,8 +1880,28 @@ mod tests {
     }
 
     /// Build a synthetic 64-bit Mach-O carrying `payload` in `__DATA,<sec_name>`.
+    /// Endian-aware fixed-width writer for the synthetic object-file builders.
+    trait ToEndian {
+        fn to_e(self, big_endian: bool) -> Vec<u8>;
+    }
+    macro_rules! to_endian {
+        ($($t:ty),*) => {$(
+            impl ToEndian for $t {
+                fn to_e(self, big_endian: bool) -> Vec<u8> {
+                    if big_endian { self.to_be_bytes().to_vec() } else { self.to_le_bytes().to_vec() }
+                }
+            }
+        )*};
+    }
+    to_endian!(u16, u32, u64, i32);
+
     #[allow(clippy::cast_possible_truncation)]
     fn synth_macho(sec_name: &str, payload: &[u8]) -> Vec<u8> {
+        synth_macho_endian(sec_name, payload, false)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn synth_macho_endian(sec_name: &str, payload: &[u8], big_endian: bool) -> Vec<u8> {
         fn name16(s: &str) -> [u8; 16] {
             let mut b = [0u8; 16];
             b[..s.len()].copy_from_slice(s.as_bytes());
@@ -1562,40 +1913,40 @@ mod tests {
         let payload_off = header_len + seg_len + sect_len;
 
         let mut out = Vec::new();
-        out.extend_from_slice(&0xfeed_facfu32.to_le_bytes()); // MH_MAGIC_64
-        out.extend_from_slice(&0x0100_0007i32.to_le_bytes()); // cputype x86_64
-        out.extend_from_slice(&3i32.to_le_bytes()); // cpusubtype
-        out.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
-        out.extend_from_slice(&1u32.to_le_bytes()); // ncmds
-        out.extend_from_slice(&((seg_len + sect_len) as u32).to_le_bytes()); // sizeofcmds
-        out.extend_from_slice(&0u32.to_le_bytes()); // flags
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        out.extend_from_slice(&0xfeed_facfu32.to_e(big_endian)); // MH_MAGIC_64
+        out.extend_from_slice(&0x0100_0007i32.to_e(big_endian)); // cputype x86_64
+        out.extend_from_slice(&3i32.to_e(big_endian)); // cpusubtype
+        out.extend_from_slice(&2u32.to_e(big_endian)); // filetype MH_EXECUTE
+        out.extend_from_slice(&1u32.to_e(big_endian)); // ncmds
+        out.extend_from_slice(&((seg_len + sect_len) as u32).to_e(big_endian)); // sizeofcmds
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved
 
-        out.extend_from_slice(&0x19u32.to_le_bytes()); // LC_SEGMENT_64
-        out.extend_from_slice(&((seg_len + sect_len) as u32).to_le_bytes()); // cmdsize
+        out.extend_from_slice(&0x19u32.to_e(big_endian)); // LC_SEGMENT_64
+        out.extend_from_slice(&((seg_len + sect_len) as u32).to_e(big_endian)); // cmdsize
         out.extend_from_slice(&name16("__DATA"));
-        out.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
-        out.extend_from_slice(&0u64.to_le_bytes()); // vmsize
-        out.extend_from_slice(&0u64.to_le_bytes()); // fileoff
-        out.extend_from_slice(&0u64.to_le_bytes()); // filesize
-        out.extend_from_slice(&0i32.to_le_bytes()); // maxprot
-        out.extend_from_slice(&0i32.to_le_bytes()); // initprot
-        out.extend_from_slice(&1u32.to_le_bytes()); // nsects
-        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&0u64.to_e(big_endian)); // vmaddr
+        out.extend_from_slice(&0u64.to_e(big_endian)); // vmsize
+        out.extend_from_slice(&0u64.to_e(big_endian)); // fileoff
+        out.extend_from_slice(&0u64.to_e(big_endian)); // filesize
+        out.extend_from_slice(&0i32.to_e(big_endian)); // maxprot
+        out.extend_from_slice(&0i32.to_e(big_endian)); // initprot
+        out.extend_from_slice(&1u32.to_e(big_endian)); // nsects
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
         assert_eq!(out.len(), header_len + seg_len);
 
         out.extend_from_slice(&name16(sec_name));
         out.extend_from_slice(&name16("__DATA"));
-        out.extend_from_slice(&0u64.to_le_bytes()); // addr
-        out.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // size
-        out.extend_from_slice(&(payload_off as u32).to_le_bytes()); // offset
-        out.extend_from_slice(&0u32.to_le_bytes()); // align
-        out.extend_from_slice(&0u32.to_le_bytes()); // reloff
-        out.extend_from_slice(&0u32.to_le_bytes()); // nreloc
-        out.extend_from_slice(&0u32.to_le_bytes()); // flags
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved1
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved2
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+        out.extend_from_slice(&0u64.to_e(big_endian)); // addr
+        out.extend_from_slice(&(payload.len() as u64).to_e(big_endian)); // size
+        out.extend_from_slice(&(payload_off as u32).to_e(big_endian)); // offset
+        out.extend_from_slice(&0u32.to_e(big_endian)); // align
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reloff
+        out.extend_from_slice(&0u32.to_e(big_endian)); // nreloc
+        out.extend_from_slice(&0u32.to_e(big_endian)); // flags
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved1
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved2
+        out.extend_from_slice(&0u32.to_e(big_endian)); // reserved3
         assert_eq!(out.len(), payload_off);
 
         out.extend_from_slice(payload);

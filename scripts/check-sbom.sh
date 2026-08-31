@@ -7,8 +7,11 @@
 # gate is that the file is:
 #
 #   1. Regenerated from this checkout and compared component-by-component
-#      (`autumn sbom --verify`), so a hand-edited, stale, or substituted SBOM
-#      fails — and the failure names the components that drifted.
+#      (`autumn sbom --verify`), which proves the generator is deterministic —
+#      the property `--verify` depends on everywhere else. The gate that
+#      catches a stale or substituted document is the SAME `--verify` run
+#      again in publish-gate.yml's `prepare-release`, against the artifact
+#      after it has travelled; this script produces the file that gate checks.
 #   2. Checked to describe the version actually being released: `--expect-version`
 #      makes the CLI assert its root component equals [workspace.package].version,
 #      and this script separately requires that version to equal RELEASE_TAG
@@ -46,7 +49,9 @@ ok() {
 # code being released, so a change to the generator is itself gated.
 echo "==> Building the SBOM generator from this checkout"
 cargo build --locked -p autumn-cli --bin autumn
-AUTUMN_BIN="$root/target/debug/autumn"
+# Honour a shared/overridden target directory — the release checklist tells
+# maintainers to run this locally, where CARGO_TARGET_DIR is common.
+AUTUMN_BIN="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 [[ -x "$AUTUMN_BIN" ]] || die "expected the autumn CLI at $AUTUMN_BIN"
 
 # --- 1. Read the version being released -------------------------------------

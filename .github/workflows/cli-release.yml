@@ -153,8 +153,17 @@ jobs:
       # Covers the archive AND its .sha256, so a re-uploaded or edited checksum
       # file is as detectable as a tampered binary. The attestation is bound to
       # each file's digest, so verification fails the moment a byte changes.
-      # Attest before uploading: an unattested asset must never reach a live
-      # release.
+      # Ordered before `Attach to release` below (the workflow-artifact upload
+      # above is not a release asset), so an unattested asset never reaches a
+      # live release.
+      #
+      # NOTE ON THE RECORDED SOURCE REF: this workflow is invoked as a reusable
+      # workflow from release.yml, which is `workflow_run`-triggered and so
+      # executes in DEFAULT-BRANCH context. The OIDC claims — and therefore the
+      # provenance's source ref and commit — name the default branch, not the
+      # tag, even though the checkout above is `ref: inputs.tag`. The subject
+      # digest, repository and run are exact; the ref is not. Verify with
+      # `--repo`, not `--source-ref`. See docs/guide/supply-chain.md.
       - name: Attest build provenance for the release archive
         # Only for real releases. A blank-tag `workflow_dispatch` is a
         # validation build that is never uploaded anywhere, and publishing a

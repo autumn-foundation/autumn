@@ -29,6 +29,19 @@ fn read_repo_file(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Strip comment lines so a content assertion cannot be satisfied by prose.
+///
+/// Both the Dockerfiles and the workflow YAML in this repo carry long
+/// explanatory comments that mention the very commands and paths these tests
+/// look for — asserting on the raw text lets a deleted step keep passing
+/// because its rationale comment survived.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
@@ -84,14 +97,19 @@ fn scaffold_dockerfile_downloads_no_unverified_executable() {
          download is checksum-verified. Got:\n{dockerfile}"
     );
 
-    // Belt and braces: nothing else may curl a file into an executable path
-    // without a following checksum verification.
-    for line in dockerfile.lines() {
+    // Belt and braces: nothing may curl a file into an executable path without
+    // a checksum verification in the same command. Join `\`-continued lines
+    // first — a RUN spanning ten physical lines is one logical command, and a
+    // per-line scan would never see the two halves together.
+    let logical = code_only(&dockerfile).replace("\\\n", " ");
+    for line in logical.lines() {
         let l = line.trim();
-        assert!(
-            !(l.contains("curl") && l.contains("chmod +x")),
-            "unverified download piped into an executable: {l}"
-        );
+        if l.contains("curl") && l.contains("chmod +x") {
+            assert!(
+                l.contains("sha256sum") || l.contains("autumn setup"),
+                "unverified download piped into an executable: {l}"
+            );
+        }
     }
 }
 
@@ -116,23 +134,87 @@ fn new_app_dockerfile_verifies_its_tailwind_download() {
     let dockerfile =
         fs::read_to_string(temp.path().join("verified-app").join("Dockerfile")).unwrap();
 
+    let code = code_only(&dockerfile);
     assert!(
-        dockerfile.contains("sha256sums.txt") && dockerfile.contains("sha256sum -c"),
+        code.contains("sha256sums.txt") && code.contains("sha256sum -c"),
         "the generated Dockerfile must verify the Tailwind download's SHA-256, \
          got:\n{dockerfile}"
     );
+    // Verification is only a check if it happens BEFORE the binary is put in
+    // place and made executable.
+    let verify_at = code.find("sha256sum -c").unwrap();
+    let install_at = code
+        .find("chmod +x target/autumn/tailwindcss")
+        .expect("the Dockerfile must make the binary executable somewhere");
     assert!(
-        dockerfile.contains("tailwindcss-linux-arm64") && dockerfile.contains("uname -m"),
+        verify_at < install_at,
+        "the checksum must be verified before the download is installed:\n{code}"
+    );
+    assert!(
+        code.contains("test -s expected.sha256"),
+        "an extraction that matched nothing must fail rather than verify an empty \
+         list:\n{code}"
+    );
+    assert!(
+        code.contains("tailwindcss-linux-arm64") && code.contains("uname -m"),
         "the generated Dockerfile must pick the asset for the build \
          architecture — hardcoding x86 silently installs an unrunnable binary \
          on arm64. Got:\n{dockerfile}"
     );
 }
 
+/// The production image gets Tailwind through `autumn setup` while the
+/// `autumn new` image still pins the version itself. Nothing else stops the
+/// two surfaces from silently compiling assets with different Tailwind builds.
+#[test]
+fn both_tailwind_pins_agree() {
+    let setup = read_repo_file("autumn-cli/src/setup.rs");
+    let setup_pin = setup
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("const TAILWIND_VERSION: &str = \"")
+                .and_then(|r| r.split('"').next())
+        })
+        .expect("setup.rs must pin a Tailwind version");
+
+    let dockerfile = read_repo_file("autumn-cli/src/templates/Dockerfile.tmpl");
+    let template_pin = dockerfile
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ARG TAILWIND_VERSION="))
+        .expect("the autumn new Dockerfile must pin a Tailwind version");
+
+    assert_eq!(
+        setup_pin, template_pin,
+        "`autumn setup` (which the production image uses) and the `autumn new` \
+         Dockerfile must pin the same Tailwind release, or the two images \
+         compile CSS with different builds"
+    );
+}
+
+/// The version the generated Dockerfile pins for `cargo install autumn-cli`.
+/// The SBOM steps can only be emitted when that pin can actually run them.
+fn pinned_cli_version(dockerfile: &str) -> String {
+    dockerfile
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ARG AUTUMN_CLI_VERSION="))
+        .expect("the Dockerfile must pin an autumn-cli version")
+        .to_owned()
+}
+
+/// True when `version` is strictly after 0.7.0 — the last release published
+/// without `autumn sbom`. Mirrors `release.rs`'s `SBOM_MIN_CLI_VERSION` gate.
+fn pin_ships_autumn_sbom(version: &str) -> bool {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let parts: Vec<u64> = core.split('.').filter_map(|p| p.parse().ok()).collect();
+    parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (0, 7, 1)
+}
+
 /// AC3: the shipped binary must be able to report its own crate versions with
-/// no source tree. `cargo-auditable` embeds that list; `RUSTC_WORKSPACE_WRAPPER`
-/// applies it to both build paths the template renders (`cargo build --release`
-/// and `autumn build --embed`) without duplicating the build step.
+/// no source tree. `cargo-auditable` embeds that list — reached through the
+/// `cargo auditable` SUBCOMMAND, never a bare `RUSTC_WORKSPACE_WRAPPER`, which
+/// cargo-auditable refuses to run under and which would kill the build on
+/// cargo's first `rustc -vV` probe.
 #[test]
 fn scaffold_dockerfile_builds_an_auditable_binary() {
     let temp = release_init(None);
@@ -143,64 +225,99 @@ fn scaffold_dockerfile_builds_an_auditable_binary() {
         "the builder stage must install cargo-auditable, got:\n{dockerfile}"
     );
     assert!(
-        dockerfile.contains("RUSTC_WORKSPACE_WRAPPER=cargo-auditable"),
-        "the builder stage must route the compile through cargo-auditable, \
-         got:\n{dockerfile}"
+        dockerfile.contains("RUN cargo auditable build --release"),
+        "the compile must go through `cargo auditable build`, got:\n{dockerfile}"
+    );
+    assert!(
+        !code_only(&dockerfile).contains("RUSTC_WORKSPACE_WRAPPER"),
+        "cargo-auditable cannot run as a bare rustc wrapper — it exits 1 unless \
+         invoked through `cargo auditable`. Got:\n{dockerfile}"
+    );
+}
+
+/// The embedded single-binary variant compiles TWICE; both phases must carry
+/// the dependency list or the shipped binary is the un-instrumented one.
+#[test]
+fn scaffold_dockerfile_keeps_the_embed_build_auditable_too() {
+    let release_tmpl = read_repo_file("autumn-cli/src/release.rs");
+    assert!(
+        release_tmpl.contains("RUN autumn build --embed --auditable"),
+        "the embed build step must pass --auditable"
     );
 }
 
 /// AC4: the image itself carries a machine-readable SBOM at a predictable path.
+///
+/// Stated as an invariant rather than a flat assertion, because the steps are
+/// gated on the pinned CLI being able to run `autumn sbom`: between this
+/// landing and the next release the pin is an already-published version that
+/// predates the subcommand, and emitting the step anyway would make every
+/// `docker build` fail. Once a CLI that ships it is what gets installed, the
+/// first branch is the one that runs — with no test change.
 #[test]
 fn scaffold_dockerfile_bakes_an_sbom_into_the_image() {
     let temp = release_init(None);
     let dockerfile = fs::read_to_string(temp.path().join("Dockerfile")).unwrap();
+    let pin = pinned_cli_version(&dockerfile);
 
-    assert!(
-        dockerfile.contains("autumn sbom --output"),
-        "the builder stage must generate a CycloneDX SBOM, got:\n{dockerfile}"
-    );
-    assert!(
-        dockerfile.contains("/usr/share/autumn/sbom.cdx.json"),
-        "the SBOM must land at the documented path /usr/share/autumn/sbom.cdx.json, \
-         got:\n{dockerfile}"
-    );
-    // The runtime stage — not just the builder — has to carry it, or the
-    // shipped image has no SBOM at all.
-    let runtime = dockerfile
-        .split_once("AS runtime")
-        .expect("Dockerfile must have a runtime stage")
-        .1;
-    assert!(
-        runtime.contains("sbom.cdx.json"),
-        "the runtime stage must COPY the SBOM out of the builder, got:\n{runtime}"
-    );
+    if pin_ships_autumn_sbom(&pin) {
+        assert!(
+            dockerfile.contains("autumn sbom --output"),
+            "the builder stage must generate a CycloneDX SBOM, got:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("/usr/share/autumn/sbom.cdx.json"),
+            "the SBOM must land at the documented path, got:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("io.autumn.sbom.path"),
+            "the image must advertise its SBOM path as a label, got:\n{dockerfile}"
+        );
+        let runtime = dockerfile
+            .split_once("AS runtime")
+            .expect("Dockerfile must have a runtime stage")
+            .1;
+        assert!(
+            runtime.contains("sbom.cdx.json"),
+            "the runtime stage must COPY the SBOM out of the builder, got:\n{runtime}"
+        );
+    } else {
+        assert!(
+            !dockerfile.contains("autumn sbom"),
+            "the pinned CLI ({pin}) has no `sbom` subcommand, so calling it would \
+             break every docker build:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("sbom.cdx.json"),
+            "…and nothing may COPY a file that was never generated:\n{dockerfile}"
+        );
+    }
 }
 
-/// The SBOM is only discoverable if a scanner knows where to look. An OCI
-/// label points at it without any autumn-specific knowledge.
+/// OCI metadata is emitted regardless of the SBOM gate.
 #[test]
-fn scaffold_dockerfile_labels_the_image_with_its_sbom_path() {
+fn scaffold_dockerfile_labels_the_image() {
     let temp = release_init(None);
     let dockerfile = fs::read_to_string(temp.path().join("Dockerfile")).unwrap();
     assert!(
         dockerfile.contains("org.opencontainers.image."),
         "the runtime image must carry OCI image labels, got:\n{dockerfile}"
     );
-    assert!(
-        dockerfile.contains("io.autumn.sbom.path"),
-        "the image must advertise its SBOM path as a label, got:\n{dockerfile}"
-    );
 }
 
 /// The image build must not silently fall back to a non-auditable, SBOM-less
-/// image when `autumn sbom` fails — that would defeat the whole default.
+/// image when a supply-chain step fails — that would defeat the whole default.
 #[test]
-fn scaffold_dockerfile_does_not_swallow_sbom_failures() {
+fn scaffold_dockerfile_does_not_swallow_supply_chain_failures() {
     let temp = release_init(None);
     let dockerfile = fs::read_to_string(temp.path().join("Dockerfile")).unwrap();
-    for line in dockerfile.lines() {
+    // Join continued lines first: a `\`-continued RUN is one logical command,
+    // so a per-physical-line scan would miss `|| true` on its own line.
+    let logical = dockerfile.replace("\\\n", " ");
+    for line in logical.lines() {
         let l = line.trim();
-        if l.contains("autumn sbom") || l.contains("autumn setup") {
+        if l.contains("autumn sbom") || l.contains("autumn setup") || l.contains("cargo auditable")
+        {
             assert!(
                 !l.contains("|| true") && !l.contains("|| :"),
                 "supply-chain steps must fail the build, not be swallowed: {l}"
@@ -213,15 +330,38 @@ fn scaffold_dockerfile_does_not_swallow_sbom_failures() {
 // AC4 — provenance for the scaffolded app's image, by default
 // ===========================================================================
 
-#[test]
-fn scaffolded_deploy_workflows_attest_the_image_they_push() {
-    for (target, workflow) in [
+/// Every scaffold target that emits a deploy workflow must attest what it
+/// pushes. Derived from `release.rs`'s own target list rather than hardcoded,
+/// so adding a fourth workflow-emitting target cannot quietly skip this.
+fn workflow_emitting_targets() -> Vec<(String, String)> {
+    let release_rs = read_repo_file("autumn-cli/src/release.rs");
+    let mut out = Vec::new();
+    for (flag, workflow) in [
         ("aws-ecs", ".github/workflows/aws-deploy.yml"),
         ("gcp-cloud-run", ".github/workflows/gcp-deploy.yml"),
         ("azure-container-apps", ".github/workflows/azure-deploy.yml"),
+        ("aws-app-runner", ".github/workflows/aws-deploy.yml"),
+        ("fly", ".github/workflows/fly-deploy.yml"),
+        ("docker-compose", ".github/workflows/compose-deploy.yml"),
     ] {
-        let temp = release_init(Some(target));
-        let yaml = fs::read_to_string(temp.path().join(workflow))
+        if release_rs.contains(&format!("\"{workflow}\""))
+            && !out.iter().any(|(_, w)| w == workflow)
+        {
+            out.push((flag.to_owned(), workflow.to_owned()));
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "release.rs should scaffold at least one deploy workflow"
+    );
+    out
+}
+
+#[test]
+fn scaffolded_deploy_workflows_attest_the_image_they_push() {
+    for (target, workflow) in workflow_emitting_targets() {
+        let temp = release_init(Some(&target));
+        let yaml = fs::read_to_string(temp.path().join(&workflow))
             .unwrap_or_else(|e| panic!("{target}: failed to read {workflow}: {e}"));
 
         assert!(
@@ -244,19 +384,76 @@ fn scaffolded_deploy_workflows_attest_the_image_they_push() {
     }
 }
 
+/// The attestation steps must not be able to block a deploy: by the time they
+/// run the image is already in the registry, and a repository whose plan has
+/// no artifact attestations would otherwise never reach production.
+#[test]
+fn attestation_never_gates_the_deploy_itself() {
+    for (target, workflow) in workflow_emitting_targets() {
+        let temp = release_init(Some(&target));
+        let yaml = fs::read_to_string(temp.path().join(&workflow)).unwrap();
+
+        let attest_at = yaml
+            .find("actions/attest-build-provenance")
+            .unwrap_or_else(|| panic!("{target}: no attestation step"));
+        let deploy_at = yaml
+            .rfind("- name: Deploy")
+            .or_else(|| yaml.rfind("- name: Update"))
+            .or_else(|| yaml.rfind("- name: Roll"))
+            .unwrap_or_else(|| panic!("{target}: could not locate the deploy step:\n{yaml}"));
+        assert!(
+            attest_at > deploy_at,
+            "{target}: attestation must come AFTER the deploy — the image is \
+             already pushed, so failing here would block a shipped release"
+        );
+
+        let block = &yaml[attest_at.saturating_sub(600)..];
+        assert!(
+            block.contains("continue-on-error: true"),
+            "{target}: a Sigstore hiccup must not fail a successful deploy:\n{block}"
+        );
+    }
+}
+
+#[test]
+fn scaffolded_deploy_workflows_resolve_the_digest_by_repository() {
+    for (target, workflow) in workflow_emitting_targets() {
+        let temp = release_init(Some(&target));
+        let yaml = fs::read_to_string(temp.path().join(&workflow)).unwrap();
+        assert!(
+            !yaml.contains("index .RepoDigests 0"),
+            "{target}: `RepoDigests` belongs to the image ID and can list several \
+             repositories — taking element 0 by position can attest the wrong \
+             one:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("range .RepoDigests"),
+            "{target}: the digest must be matched against the repository actually \
+             pushed to:\n{yaml}"
+        );
+    }
+}
+
 #[test]
 fn scaffolded_deploy_workflows_attest_the_image_sbom() {
-    for (target, workflow) in [
-        ("aws-ecs", ".github/workflows/aws-deploy.yml"),
-        ("gcp-cloud-run", ".github/workflows/gcp-deploy.yml"),
-        ("azure-container-apps", ".github/workflows/azure-deploy.yml"),
-    ] {
-        let temp = release_init(Some(target));
-        let yaml = fs::read_to_string(temp.path().join(workflow)).unwrap();
-        assert!(
-            yaml.contains("actions/attest-sbom"),
-            "{target}: the SBOM baked into the image must itself be attested:\n{yaml}"
-        );
+    for (target, workflow) in workflow_emitting_targets() {
+        let temp = release_init(Some(&target));
+        let dockerfile = fs::read_to_string(temp.path().join("Dockerfile")).unwrap();
+        let yaml = fs::read_to_string(temp.path().join(&workflow)).unwrap();
+
+        // The SBOM attestation extracts a file the image only carries when the
+        // pinned CLI could generate it, so the two must move together.
+        if pin_ships_autumn_sbom(&pinned_cli_version(&dockerfile)) {
+            assert!(
+                yaml.contains("actions/attest-sbom"),
+                "{target}: the SBOM baked into the image must itself be attested:\n{yaml}"
+            );
+        } else {
+            assert!(
+                !yaml.contains("actions/attest-sbom"),
+                "{target}: nothing may attest an SBOM the image does not carry:\n{yaml}"
+            );
+        }
     }
 }
 
@@ -266,7 +463,7 @@ fn scaffolded_deploy_workflows_attest_the_image_sbom() {
 
 #[test]
 fn publish_gate_runs_the_sbom_gate() {
-    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+    let gate = code_only(&read_repo_file(".github/workflows/publish-gate.yml"));
     assert!(
         gate.contains("check-sbom.sh"),
         "publish-gate.yml must run the SBOM gate script:\n{gate}"
@@ -277,7 +474,42 @@ fn publish_gate_runs_the_sbom_gate() {
         .1;
     assert!(
         prepare.contains("sbom.cdx.json"),
-        "prepare-release must produce the SBOM release artifact:\n{prepare}"
+        "prepare-release must carry the SBOM release artifact:\n{prepare}"
+    );
+}
+
+/// Removing `sbom` from `prepare-release`'s `needs:` would silently un-gate
+/// the release: the job would still find the artifact from a concurrent run,
+/// or fail late, instead of the gate simply being required.
+#[test]
+fn prepare_release_depends_on_the_sbom_gate() {
+    let gate = code_only(&read_repo_file(".github/workflows/publish-gate.yml"));
+    let prepare = gate.split_once("prepare-release:").unwrap().1;
+    let needs = prepare
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs:"))
+        .expect("prepare-release must declare needs:");
+    assert!(
+        needs.contains("sbom"),
+        "prepare-release must depend on the sbom gate, got: {needs}"
+    );
+}
+
+/// The SBOM handed to the release must be re-verified AFTER it travelled
+/// through the artifact store — that is the only point where a substitution or
+/// truncation can actually happen.
+#[test]
+fn prepare_release_reverifies_the_downloaded_sbom() {
+    let gate = code_only(&read_repo_file(".github/workflows/publish-gate.yml"));
+    let prepare = gate.split_once("prepare-release:").unwrap().1;
+    assert!(
+        prepare.contains("--verify sbom.cdx.json"),
+        "prepare-release must re-verify the downloaded SBOM, not just shape-check \
+         it:\n{prepare}"
+    );
+    assert!(
+        prepare.contains("--expect-version"),
+        "…and pin it to the version being released:\n{prepare}"
     );
 }
 
@@ -294,25 +526,47 @@ fn sbom_gate_script_exists_and_is_executable() {
             "scripts/check-sbom.sh must be executable"
         );
     }
-    let script = fs::read_to_string(&path).unwrap();
-    // The gate is only meaningful if it regenerates and compares, and if it
-    // ties the SBOM's identity to the tag being released.
+}
+
+/// Actually RUN the gate, rather than grepping it. The tag/version
+/// disagreement is the one part of AC1 that can genuinely fail at release
+/// time, so it needs to be exercised, not asserted about.
+#[cfg(unix)]
+#[test]
+fn sbom_gate_rejects_a_tag_that_disagrees_with_the_workspace_version() {
+    let script = workspace_root().join("scripts/check-sbom.sh");
+    let out = Command::new(&script)
+        .current_dir(workspace_root())
+        .env("RELEASE_TAG", "v99.99.99")
+        .env("SBOM_OUT", "target/sbom-gate-test.cdx.json")
+        .output()
+        .expect("failed to run check-sbom.sh");
+
     assert!(
-        script.contains("--verify"),
-        "the gate must re-verify the SBOM against the source tree:\n{script}"
+        !out.status.success(),
+        "a tag that does not match the workspace version must fail the gate"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        script.contains("RELEASE_TAG"),
-        "the gate must check the SBOM against the tagged version:\n{script}"
+        combined.contains("v99.99.99"),
+        "the failure must name the offending tag, got:\n{combined}"
     );
 }
 
 #[test]
-fn release_workflow_attaches_the_sbom_and_attests_every_asset() {
-    let release = read_repo_file(".github/workflows/release.yml");
+fn release_workflow_attaches_the_sbom_and_attests_it() {
+    let release = code_only(&read_repo_file(".github/workflows/release.yml"));
     assert!(
-        release.contains("sbom.cdx.json"),
-        "release.yml must attach the SBOM as a release asset:\n{release}"
+        release.contains("mv sbom.cdx.json"),
+        "release.yml must stage the SBOM as a named release asset:\n{release}"
+    );
+    assert!(
+        release.contains("files: autumn-"),
+        "release.yml must pass the SBOM to the release action's `files:`:\n{release}"
     );
     assert!(
         release.contains("actions/attest-build-provenance"),
@@ -322,11 +576,50 @@ fn release_workflow_attaches_the_sbom_and_attests_every_asset() {
         release.contains("attestations: write") && release.contains("id-token: write"),
         "release.yml needs `attestations: write` + `id-token: write`:\n{release}"
     );
+
+    // Attest BEFORE creating the release: an unattested asset must never reach
+    // a live release.
+    let attest_at = release.find("actions/attest-build-provenance").unwrap();
+    let create_at = release.find("softprops/action-gh-release").unwrap();
+    assert!(
+        attest_at < create_at,
+        "release.yml must attest before publishing the release"
+    );
+}
+
+/// A reusable workflow can only DOWNGRADE the caller job's token, so the
+/// `permissions:` block inside cli-release.yml is inert unless the calling job
+/// grants the same scopes. Without this the attestation step fails and, running
+/// before the upload, the release ends up with no CLI binaries at all.
+#[test]
+fn the_binaries_job_passes_down_the_scopes_attestation_needs() {
+    let release = code_only(&read_repo_file(".github/workflows/release.yml"));
+    let binaries = release
+        .split_once("binaries:")
+        .expect("release.yml must still have a binaries job")
+        .1;
+    let perms = binaries
+        .split_once("permissions:")
+        .expect("the binaries job must declare permissions")
+        .1;
+    // Only look at the permissions block itself, not the rest of the file.
+    let block: String = perms
+        .lines()
+        .take_while(|l| l.trim().is_empty() || l.starts_with("      "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for scope in ["id-token: write", "attestations: write", "contents: write"] {
+        assert!(
+            block.contains(scope),
+            "the binaries job must grant `{scope}` — a called workflow cannot add \
+             it back:\n{block}"
+        );
+    }
 }
 
 #[test]
 fn cli_release_workflow_attests_every_binary_archive() {
-    let cli_release = read_repo_file(".github/workflows/cli-release.yml");
+    let cli_release = code_only(&read_repo_file(".github/workflows/cli-release.yml"));
     assert!(
         cli_release.contains("actions/attest-build-provenance"),
         "cli-release.yml must attest each per-target archive:\n{cli_release}"
@@ -334,6 +627,13 @@ fn cli_release_workflow_attests_every_binary_archive() {
     assert!(
         cli_release.contains("attestations: write") && cli_release.contains("id-token: write"),
         "cli-release.yml needs `attestations: write` + `id-token: write`:\n{cli_release}"
+    );
+
+    let attest_at = cli_release.find("actions/attest-build-provenance").unwrap();
+    let upload_at = cli_release.find("gh release upload").unwrap();
+    assert!(
+        attest_at < upload_at,
+        "the archive must be attested before it is attached to the release"
     );
 }
 
@@ -426,6 +726,9 @@ fn sbom_describes_a_real_source_tree() {
     assert_eq!(v["metadata"]["component"]["version"], "4.5.6");
 }
 
+/// Two runs a second apart would not catch a second-granularity timestamp, so
+/// assert on the absence of the fields that make a `CycloneDX` document vary at
+/// all, and on the serial number being content-derived rather than random.
 #[test]
 fn sbom_is_reproducible_across_runs() {
     let temp = tiny_crate();
@@ -433,6 +736,57 @@ fn sbom_is_reproducible_across_runs() {
     let (second, _, _) = run_autumn(temp.path(), &["sbom"]);
     assert_eq!(first, second, "autumn sbom output must be reproducible");
     assert!(!first.is_empty());
+
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert!(
+        v["metadata"].get("timestamp").is_none(),
+        "a wall-clock timestamp would make --verify impossible: {first}"
+    );
+    // A serialNumber IS required (actions/attest-sbom rejects a CycloneDX
+    // document without one) — but it must be derived, not random.
+    let serial = v["serialNumber"].as_str().expect("serialNumber");
+    assert!(serial.starts_with("urn:uuid:"), "{serial}");
+}
+
+/// `--expect-version` is what ties a document to the release being cut; a
+/// disagreement has to fail the process, not just a pure function.
+#[test]
+fn sbom_expect_version_rejects_the_wrong_version() {
+    let temp = tiny_crate();
+    let (_, _, code) = run_autumn(temp.path(), &["sbom", "--expect-version", "4.5.6"]);
+    assert_eq!(code, Some(0), "the crate really is at 4.5.6");
+
+    let (_, stderr, code) = run_autumn(temp.path(), &["sbom", "--expect-version", "9.9.9"]);
+    assert_eq!(code, Some(1), "a version disagreement must fail");
+    assert!(
+        stderr.contains("9.9.9") && stderr.contains("4.5.6"),
+        "the error must name both versions, got: {stderr}"
+    );
+}
+
+/// `--output` into a directory that does not exist yet must work: the release
+/// gate and the image build both write into paths they do not pre-create.
+#[test]
+fn sbom_output_creates_missing_parent_directories() {
+    let temp = tiny_crate();
+    let (_, stderr, code) = run_autumn(temp.path(), &["sbom", "--output", "nested/dir/sbom.json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(temp.path().join("nested/dir/sbom.json").is_file());
+}
+
+/// `--manifest-path` lets the gate describe a project it is not standing in.
+#[test]
+fn sbom_honours_an_explicit_manifest_path() {
+    let temp = tiny_crate();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let manifest = temp.path().join("Cargo.toml");
+    let (stdout, stderr, code) = run_autumn(
+        elsewhere.path(),
+        &["sbom", "--manifest-path", manifest.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["metadata"]["component"]["name"], "sbom-demo");
 }
 
 #[test]

@@ -2,7 +2,10 @@
 FROM rust:{{rust_version}}-bookworm AS chef
 WORKDIR /app
 
-RUN cargo install cargo-chef --locked
+# Version-pinned like every other tool this image installs, so a `docker build`
+# resolves the same cargo-chef today and next month (issue #1615).
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install --locked cargo-chef --version "${CARGO_CHEF_VERSION}"
 
 FROM chef AS planner
 COPY . .
@@ -38,18 +41,16 @@ RUN cargo install --locked diesel_cli \
 
 # `cargo-auditable` embeds the exact resolved dependency list into the
 # compiled binary (a `.dep-v0` section), so a deployed image can answer "which
-# crate versions are actually in you?" with no source tree and no lockfile:
+# crate versions are actually in you?" with no source tree and no lockfile —
+# see docs/guide/supply-chain.md.
 #
-#     docker run --rm --entrypoint autumn IMAGE sbom --binary /usr/local/bin/{{project_name}}
-#
-# It is wired in via RUSTC_WORKSPACE_WRAPPER rather than by rewriting the build
-# command, so BOTH build paths this template can render (the plain release
-# build and the embedded single-binary one) are instrumented by the single ENV
-# line below. Note WORKSPACE_WRAPPER, not RUSTC_WRAPPER: the wrapper must apply
-# only to this project's own crates — switching it to RUSTC_WRAPPER would
-# invalidate the cargo-chef dependency cache layer on every build.
+# It is reached through the `cargo auditable` SUBCOMMAND (which the build step
+# below uses), never by pointing RUSTC_WORKSPACE_WRAPPER at the binary:
+# cargo-auditable only enters wrapper mode when `CARGO_AUDITABLE_ORIG_ARGS` is
+# set, and only `cargo auditable` itself sets it. Wired up any other way it
+# exits 1 on cargo's first `rustc -vV` probe and the build dies before anything
+# compiles.
 RUN cargo install --locked cargo-auditable --version "${CARGO_AUDITABLE_VERSION}"
-ENV RUSTC_WORKSPACE_WRAPPER=cargo-auditable
 
 # Tailwind CSS for asset compilation. `autumn setup` downloads the pinned
 # release for this architecture and verifies its SHA-256 against the
@@ -83,14 +84,7 @@ ENV AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA} \
 
 COPY . .
 {{build_step}}
-
-# Machine-readable inventory of everything compiled into this image, generated
-# from the very source tree that produced the binary above. Deliberately no
-# `--locked`: a project whose Cargo.lock has drifted still builds (its
-# `cargo build` would have updated the lock anyway), and the SBOM records what
-# was actually resolved. Add `--locked` here if you want the stricter posture.
-RUN autumn sbom --output /app/sbom.cdx.json
-
+{{sbom_generate_step}}
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
@@ -110,12 +104,7 @@ COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
 {{static_copy}}COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
-# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find
-# it without knowing anything about autumn. The binary itself independently
-# carries the same list (see cargo-auditable above); `docs/guide/supply-chain.md`
-# shows how to cross-check the two.
-COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json
-# Use the production config example as the runtime autumn.toml.
+{{sbom_runtime_copy}}# Use the production config example as the runtime autumn.toml.
 # It sets host = "0.0.0.0" and leaves migration ownership to an explicit
 # one-shot primary-role job.
 COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /app/autumn.toml
@@ -132,9 +121,7 @@ ARG AUTUMN_BUILD_GIT_SHA=
 ARG AUTUMN_BUILD_TIMESTAMP=
 LABEL org.opencontainers.image.title="{{project_name}}" \
       org.opencontainers.image.revision="${AUTUMN_BUILD_GIT_SHA}" \
-      org.opencontainers.image.created="${AUTUMN_BUILD_TIMESTAMP}" \
-      io.autumn.sbom.format="CycloneDX" \
-      io.autumn.sbom.path="/usr/share/autumn/sbom.cdx.json"
+      org.opencontainers.image.created="${AUTUMN_BUILD_TIMESTAMP}"{{sbom_labels}}
 
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000

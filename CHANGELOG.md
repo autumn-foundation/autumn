@@ -18,35 +18,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dev loop all along.
 
   A new `autumn sbom` generates a deterministic CycloneDX 1.5 document from
-  `cargo metadata`: no random serial number, no build timestamp, components
-  sorted and de-duplicated, so the same source tree always produces the same
-  bytes. That determinism is what makes it a gate rather than a formality —
-  `autumn sbom --verify` regenerates from the source tree and reports a
-  component-level diff (`unexpected component: backdoor@6.6.6`), and
+  `cargo metadata`: no wall-clock timestamp, a `serialNumber` derived from the
+  document's own content rather than randomly generated, components sorted and
+  de-duplicated. Same source tree, same bytes. That determinism is what makes
+  it a gate rather than a formality — `autumn sbom --verify` regenerates and
+  reports a component-level diff (`unexpected component: backdoor@6.6.6`), and
   `--expect-version` ties the document to the version being released.
-  `scripts/check-sbom.sh` runs all of it as the publish gate's new `sbom` job,
-  and the file it verifies is the very file attached to the release as
-  `autumn-<tag>.cdx.json`.
+  `scripts/check-sbom.sh` runs both as the publish gate's new `sbom` job, and
+  the same `--verify` runs *again* in `prepare-release` against the artifact
+  after it has travelled through the artifact store — the point where a
+  substitution or truncation could actually happen. The file that run checks is
+  the one attached to the release as `autumn-<tag>.cdx.json`.
 
-  Every asset on an Autumn release — the SBOM, each CLI archive, each `.sha256`
-  — now carries a keyless SLSA build-provenance attestation, published before
-  the asset is uploaded so an attestation failure stops the release. Consumers
-  verify with one command, `gh attestation verify <asset> --repo
-  autumn-foundation/autumn`; because attestations bind an artifact's digest, a
-  tampered or repacked asset finds no attestation at all.
+  Every release asset — the SBOM, each CLI archive, each `.sha256` — now
+  carries a keyless SLSA build-provenance attestation, published before the
+  asset is uploaded so an attestation failure stops the release rather than
+  leaving unattested assets on a live one. One documented command verifies
+  them: `gh attestation verify <asset> --repo autumn-foundation/autumn`.
 
-  Scaffolded apps get the same posture by default, not as an opt-in. The
-  release Dockerfile compiles through `cargo-auditable`, so the shipped binary
-  reports the exact crate versions inside it with no source tree and no
-  lockfile (`autumn sbom --binary /usr/local/bin/my-app`, reading ELF, Mach-O
-  and PE); it bakes a CycloneDX SBOM into the image at
-  `/usr/share/autumn/sbom.cdx.json`, advertised by an OCI label; and it obtains
-  Tailwind through the checksum-verifying `autumn setup` instead of a bare
-  `curl`. The `autumn new` Dockerfile's own unverified download is verified
-  too — and now detects its architecture rather than hardcoding `linux-x64`,
-  which had been silently installing an unrunnable binary on arm64. The
-  generated AWS/GCP/Azure deploy workflows attest each pushed image and its
-  SBOM against the image digest.
+  Scaffolded apps get the same posture by default. The release Dockerfile
+  compiles through `cargo auditable`, so the shipped binary reports the exact
+  crate versions inside it with no source tree and no lockfile (`autumn sbom
+  --binary /usr/local/bin/my-app`, reading ELF, Mach-O and PE); it obtains
+  Tailwind through the checksum-verifying `autumn setup`; and it bakes a
+  CycloneDX SBOM into the image at `/usr/share/autumn/sbom.cdx.json` behind an
+  OCI label. `autumn build` grows `--auditable` so the embedded single-binary
+  path is instrumented too. The `autumn new` Dockerfile's own unverified
+  download is verified as well, and now detects its architecture instead of
+  hardcoding `linux-x64` — which had been silently installing an unrunnable
+  binary on arm64. The generated AWS/GCP/Azure deploy workflows attest each
+  pushed image and its SBOM against the image digest, as the last steps in the
+  job so a Sigstore hiccup can never block a deploy whose image is already
+  pushed.
+
+  The in-image SBOM step is emitted only once the `autumn-cli` version the
+  Dockerfile pins can actually run `autumn sbom`. The pin is the scaffolding
+  CLI's own version, which between a merge and the next release is an
+  already-published version predating the subcommand — emitting it anyway would
+  make every `docker build` fail. Until then the image is merely SBOM-less, not
+  broken; the auditable binary, the verified Tailwind download and the image
+  provenance attestation are all active immediately.
 
   `docs/guide/supply-chain.md` walks both surfaces end to end, including the
   negative case — tamper with one byte and watch verification fail — because a

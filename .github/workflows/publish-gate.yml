@@ -364,12 +364,23 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: sbom
-      - name: Confirm the SBOM survived the handoff
+      # A real re-verification, not just a shape check: this is the first point
+      # where the SBOM has travelled somewhere (artifact upload → download) and
+      # could have been truncated, replaced, or built from a different tree.
+      # `--verify` regenerates from THIS checkout and diffs component by
+      # component; `--expect-version` pins it to the tag being released.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Re-verify the downloaded SBOM against the tagged source
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           test -s sbom.cdx.json || { echo "error: sbom.cdx.json is missing or empty" >&2; exit 1; }
-          grep -q '"bomFormat": "CycloneDX"' sbom.cdx.json \
-            || { echo "error: sbom.cdx.json is not a CycloneDX document" >&2; exit 1; }
+          cargo build --locked -p autumn-cli --bin autumn
+          ./target/debug/autumn sbom --locked \
+            --expect-version "${RELEASE_TAG#v}" \
+            --verify sbom.cdx.json
 
       - name: Record release tag
         env:

@@ -158,54 +158,6 @@ jobs:
           GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
 
-      # ── Supply chain (issue #1615) ──────────────────────────────────────
-      # Bind both attestations to the image DIGEST, never to its tag: a tag
-      # can later be re-pointed at different bytes, a digest cannot. Read the
-      # digest back from the daemon's record of what the push actually
-      # produced, so a divergence between what was built and what the
-      # registry accepted surfaces here instead of being signed over.
-      - name: Resolve the pushed image digest
-        id: image_digest
-        run: |
-          set -euo pipefail
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$AR_URL/$GCP_SERVICE_NAME:$IMAGE_TAG" | cut -d@ -f2)
-          if [ -z "$DIGEST" ]; then
-            echo "::error::could not resolve the digest of the image just pushed"
-            exit 1
-          fi
-          echo "value=$DIGEST" >> "$GITHUB_OUTPUT"
-        env:
-          AR_URL: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}
-          GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
-          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
-
-      - name: Attest build provenance for the image
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-name: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}/${{ vars.GCP_SERVICE_NAME }}
-          subject-digest: ${{ steps.image_digest.outputs.value }}
-
-      # The image ships a CycloneDX SBOM at a fixed path (see the Dockerfile
-      # `autumn sbom` step). Attest it against the same digest so "what is in
-      # this image" is verifiable without taking the image's word for it.
-      - name: Extract the SBOM baked into the image
-        run: |
-          set -euo pipefail
-          CID=$(docker create "$AR_URL/$GCP_SERVICE_NAME:$IMAGE_TAG")
-          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
-          docker cp "$CID:/usr/share/autumn/sbom.cdx.json" sbom.cdx.json
-        env:
-          AR_URL: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}
-          GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
-          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
-
-      - name: Attest the image SBOM
-        uses: actions/attest-sbom@v3
-        with:
-          subject-name: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}/${{ vars.GCP_SERVICE_NAME }}
-          subject-digest: ${{ steps.image_digest.outputs.value }}
-          sbom-path: sbom.cdx.json
-
       # The concurrency group above prevents two runs from executing at the
       # same time, but GitHub does not document strict FIFO ordering for
       # which queued run goes next. A same-ref check isn't enough either:
@@ -281,3 +233,71 @@ jobs:
           GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           GCP_REGION: ${{ vars.GCP_REGION }}
+
+      # ── Supply chain (issue #1615) ──────────────────────────────────────
+      # Deliberately the LAST steps in the job. The image is already in the
+      # registry by the time they run, so attesting first would buy nothing
+      # while letting a Sigstore hiccup — or a repository whose plan does not
+      # include artifact attestations — block a production deploy that is
+      # otherwise ready. `continue-on-error` keeps that a visible warning
+      # rather than a failed deploy of code that shipped fine.
+      #
+      # Both attestations bind the image DIGEST, never its tag: a tag can be
+      # re-pointed at different bytes later, a digest cannot.
+      - name: Resolve the pushed image digest
+        id: image_digest
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Match on the repository we actually pushed to. `RepoDigests` is a
+          # property of the image ID and can hold entries for several
+          # repositories; taking element 0 by position would attest whichever
+          # one the daemon happened to record first. `|| true` keeps the
+          # explicit diagnostic below reachable instead of dying inside the
+          # command substitution.
+          DIGEST=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                     "$AR_URL/$GCP_SERVICE_NAME:$IMAGE_TAG" 2>/dev/null | grep "^$AR_URL/$GCP_SERVICE_NAME@" | head -n1 | cut -d@ -f2 || true)
+          if [ -z "$DIGEST" ]; then
+            echo "::warning::could not resolve the digest of the image just pushed; skipping attestation"
+            exit 1
+          fi
+          echo "value=$DIGEST" >> "$GITHUB_OUTPUT"
+        env:
+          AR_URL: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}
+          GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
+
+      - name: Attest build provenance for the image
+        if: steps.image_digest.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}/${{ vars.GCP_SERVICE_NAME }}
+          subject-digest: ${{ steps.image_digest.outputs.value }}
+{{sbom_steps_begin}}
+      # The image ships a CycloneDX SBOM at a fixed path (see the Dockerfile's
+      # `autumn sbom` step). Attest it against the same digest so "what is in
+      # this image" is verifiable without taking the image's word for it.
+      - name: Extract the SBOM baked into the image
+        id: image_sbom
+        if: steps.image_digest.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          CID=$(docker create "$AR_URL/$GCP_SERVICE_NAME:$IMAGE_TAG")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          docker cp "$CID:/usr/share/autumn/sbom.cdx.json" sbom.cdx.json
+        env:
+          AR_URL: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}
+          GCP_SERVICE_NAME: ${{ vars.GCP_SERVICE_NAME }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
+
+      - name: Attest the image SBOM
+        if: steps.image_sbom.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest-sbom@v3
+        with:
+          subject-name: ${{ vars.GCP_ARTIFACT_REGISTRY_URL }}/${{ vars.GCP_SERVICE_NAME }}
+          subject-digest: ${{ steps.image_digest.outputs.value }}
+          sbom-path: sbom.cdx.json
+{{sbom_steps_end}}

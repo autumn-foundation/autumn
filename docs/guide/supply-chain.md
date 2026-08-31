@@ -39,8 +39,13 @@ attestation: the CLI archives, their `.sha256` files, and the release SBOM.
 
 ### 1.1 Download an asset
 
+SBOM assets and attestations exist from the first release that ships this
+feature onward, so take the tag from the release list rather than hardcoding
+one:
+
 ```bash
-TAG=v0.7.0
+TAG=$(gh release list --repo autumn-foundation/autumn --limit 1 \
+        --json tagName --jq '.[0].tagName')
 gh release download "$TAG" \
   --repo autumn-foundation/autumn \
   --pattern 'autumn-x86_64-unknown-linux-musl.tar.gz*'
@@ -62,8 +67,15 @@ Loaded 1 attestation from GitHub API
 
 sha256:… was attested by:
 REPO                       PREDICATE_TYPE                  WORKFLOW
-autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/cli-release.yml@refs/tags/v0.7.0
+autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/release.yml@refs/heads/trunk
 ```
+
+> **What the source ref means.** The release workflow is `workflow_run`-triggered,
+> which GitHub always runs in default-branch context, so the ref and commit in
+> the provenance name the default branch — not the tag — even though the build
+> checked the tag out. The subject digest, the repository and the CI run are
+> exact; the ref is not. Verify with `--repo`, and do **not** add
+> `--source-ref refs/tags/...`, which would fail against a genuine asset.
 
 `--repo autumn-foundation/autumn` is **not optional**. Without it, an
 attestation from *any* repository would satisfy the check — including one an
@@ -82,11 +94,20 @@ gh attestation verify tampered.tar.gz --repo autumn-foundation/autumn
 # ✗ Verification failed: no attestations found for subject sha256:…
 ```
 
-The attestation is bound to the artifact's **digest**, so any modification —
-a re-uploaded asset, an extra byte, a repacked tarball with identical contents
-— produces a different digest and finds no attestation. Re-uploading a genuine
-asset under a different name still verifies (the bytes are unchanged), which is
-correct: the claim is about the bytes, not the filename.
+The attestation is bound to the artifact's **digest**, so any modification — an
+extra byte, a repacked tarball with identical contents, a substituted binary —
+produces a different digest and finds no attestation.
+
+What this does *not* catch, by design: re-uploading a **genuine, unmodified**
+asset somewhere else. The claim is about the bytes and who built them, not about
+the filename or which release they hang off. If you need to pin an asset to the
+workflow that produced it as well, add:
+
+```bash
+gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
+  --repo autumn-foundation/autumn \
+  --signer-workflow autumn-foundation/autumn/.github/workflows/cli-release.yml
+```
 
 ### 1.4 Read the release SBOM
 
@@ -148,9 +169,8 @@ This works on any copy of the binary, anywhere — no source tree, no
 `Cargo.lock`, no network:
 
 ```bash
-docker cp "$(docker create my-app:latest)":/usr/local/bin/my-app ./my-app
-cd /tmp && autumn sbom --binary ./my-app | jq -r \
-  '.components[] | "\(.name) \(.version)"' | head
+docker cp "$(docker create my-app:latest)":/usr/local/bin/my-app /tmp/my-app
+autumn sbom --binary /tmp/my-app | jq -r '.components[] | "\(.name) \(.version)"' | head
 ```
 
 If the binary was not built through `cargo-auditable`, the command says so and
@@ -162,7 +182,7 @@ The sidecar SBOM and the embedded list are produced by different mechanisms
 from the same build. They should agree on every runtime crate:
 
 ```bash
-autumn sbom --binary ./my-app \
+autumn sbom --binary /tmp/my-app \
   | jq -r '.components[] | select((.properties // []) | any(.name == "cargo:dependency-kind") | not)
            | "\(.name)@\(.version)"' | sort > from-binary.txt
 
@@ -172,10 +192,13 @@ comm -3 from-binary.txt from-image.txt
 ```
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
-it includes dev-dependencies and every optional feature's crates, which are
-resolved but not linked. The embedded list is what actually went into the
-binary. Entries appearing only in `from-image.txt` are expected; an entry
-appearing only in `from-binary.txt` is not, and is worth investigating.
+it covers the whole resolved graph for the default feature set, including
+dev-dependencies, which are resolved but never linked into the release binary.
+(`--all-features` widens it further, to crates no single build can contain — it
+is available deliberately, and deliberately not the default.) The embedded list
+is what actually went into the binary. Entries appearing only in
+`from-image.txt` are expected; an entry appearing only in `from-binary.txt` is
+not, and is worth investigating.
 
 ### 2.4 Verify the image's provenance
 
@@ -192,15 +215,20 @@ gh attestation verify "oci://$IMAGE@$DIGEST" --repo my-org/my-app
 # And the SBOM attestation for the same image:
 gh attestation verify "oci://$IMAGE@$DIGEST" \
   --repo my-org/my-app \
-  --predicate-type https://spdx.dev/Document
+  --predicate-type https://cyclonedx.org/bom
 ```
+
+(The predicate type follows the SBOM's format. `actions/attest-sbom` maps
+CycloneDX to `https://cyclonedx.org/bom`; an SPDX document would instead be
+`https://spdx.dev/Document/v2.3`.)
 
 Attestations are bound to the image **digest**, never its tag: a tag can be
 re-pointed at different bytes later, a digest cannot. Verifying `:v1.2.3` by
 tag would tell you about whatever that tag points at *today*.
 
-Deploying with a plain `docker build` (the `fly`, `docker-compose`, and default
-targets) still gets you the in-image SBOM and the auditable binary — the
+Deploying with a plain `docker build` — the `fly`, `docker-compose`,
+`aws-app-runner` and default targets, none of which scaffold a CI workflow —
+still gets you the in-image SBOM and the auditable binary — the
 attestation step needs CI, because keyless signing needs a CI identity to sign.
 To add it, copy the `Resolve the pushed image digest` /
 `Attest build provenance` / `Attest the image SBOM` steps out of one of the
@@ -215,10 +243,16 @@ You do not have to take the framework's word for any of it either.
 
 **The SBOM matches the tagged source.** `scripts/check-sbom.sh` runs in the
 Publish Gate on every tag. It builds the generator from the checkout being
-released, generates the SBOM, then *regenerates it and compares
-component-by-component*, and requires the root component's version to equal
-both `[workspace.package].version` and the pushed tag. A stale, substituted, or
-hand-edited SBOM fails, and the failure names the components that drifted:
+released, generates the SBOM, then regenerates it and compares
+component-by-component — which proves the generator is deterministic, the
+property everything else here rests on — and requires the root component's
+version to equal both `[workspace.package].version` and the pushed tag.
+
+The same `--verify` then runs a **second** time in `prepare-release`, against
+the artifact after it has travelled through the artifact store. That is the run
+that can catch a substituted or truncated document, and it is the file that run
+checks which becomes the release asset. Either way the failure names the
+components that drifted:
 
 ```console
 $ autumn sbom --verify sbom.cdx.json
@@ -234,11 +268,22 @@ Run the same gate yourself against any checkout:
 RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
-**Downloads during an image build are checksum-verified.** The generated
-Dockerfile obtains the Tailwind binary through `autumn setup`, which verifies
-its SHA-256 against the `sha256sums.txt` published with that Tailwind release
-and refuses to install on a mismatch. There is no unverified `curl` of an
-executable anywhere in the generated build; an integration test enforces that.
+**Downloads during an image build are checksum-verified.** Every artifact the
+generated build pulls in, and exactly what each check buys you:
+
+| Download | Integrity |
+|---|---|
+| `cargo install` of `cargo-chef`, `autumn-cli`, `diesel_cli`, `cargo-auditable` | crates.io checksums, each `--locked` and pinned to an exact `--version` |
+| `apt-get install …` | apt repository signatures |
+| Tailwind CLI, via `autumn setup` | SHA-256 against the `sha256sums.txt` published with that Tailwind release; refuses to install on a mismatch |
+| Base images (`rust:…`, `debian:bookworm-slim`) | tag-pinned, **not** digest-pinned |
+
+There is no unverified `curl` of an executable anywhere in the generated build,
+and an integration test enforces that. Two honest caveats: the Tailwind check is
+trust-on-first-use against the publisher — it detects a corrupted or truncated
+download, not a compromised upstream release that re-published both the binary
+and its checksum file — and the base images are pinned by tag, so pin them by
+digest yourself if your threat model requires it.
 
 ---
 
@@ -251,6 +296,7 @@ executable anywhere in the generated build; an integration test enforces that.
 | `autumn sbom --verify FILE` | Does `FILE` still describe this source tree? |
 | `autumn sbom --expect-version V` | …and does it describe version `V`? |
 | `autumn sbom --locked` | …with a `Cargo.lock` that matches the manifests. |
+| `autumn sbom --all-features` | …with every optional feature on (broader than any single build). |
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 
