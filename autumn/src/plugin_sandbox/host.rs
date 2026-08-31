@@ -221,10 +221,20 @@ pub const MAX_REQUEST_METADATA_BYTES: usize = 256 * 1024;
 /// bytes that are refused and the bytes that are charged for cannot drift apart
 /// as fields are added to the frame.
 fn request_metadata_bytes(request: &SandboxRequest) -> usize {
+    /// What one `(String, String)` costs before either string holds a byte:
+    /// two 24-byte `String` headers in the vector, and the `["",""],` the
+    /// serialiser writes around them.
+    ///
+    /// Counting only the *contents* would leave a list of a million empty pairs
+    /// summing to zero — past a byte ceiling for free, then cloned and expanded
+    /// into real syntax anyway. That is the same shape as a response frame full
+    /// of `["",""]`, and it has to be priced on this side too.
+    const ENTRY: usize = 56;
+
     let pairs = |list: &[(String, String)]| {
         list.iter()
-            .map(|(name, value)| name.len().saturating_add(value.len()))
-            .sum::<usize>()
+            .map(|(name, value)| name.len().saturating_add(value.len()).saturating_add(ENTRY))
+            .fold(0usize, usize::saturating_add)
     };
     request
         .method
@@ -294,6 +304,15 @@ fn refuse_oversized_request(
 /// which runs it on artifacts nobody has audited. This ceiling does not weaken
 /// that gate: a module hiding one forbidden import behind a million decoys is
 /// still refused at load, now for its shape rather than its contents.
+/// The most entries a module's sections may declare between them.
+///
+/// Checked from the section headers before the module is compiled, because
+/// compilation is itself the allocation that needs bounding. Generous against
+/// real output — a large Rust module declares tens of thousands of functions
+/// and types — and far below what a 64 MiB file of one-byte declarations can
+/// claim.
+pub const MAX_DECLARED_ENTRIES: usize = 1_000_000;
+
 pub const MAX_IMPORTS: usize = 1024;
 
 const MAX_REPORTED_IMPORTS: usize = 256;
@@ -779,6 +798,11 @@ impl SandboxHost {
             .validate()
             .map_err(|err| SandboxLoadError::InvalidManifest(err.to_string()))?;
 
+        // Before `Module::new`, deliberately: compiling is what allocates a
+        // representation of every declaration, so a ceiling checked afterwards
+        // is a ceiling checked too late.
+        let shape = refuse_unbounded_shape(wasm)?;
+
         let mut config = Config::default();
         // Fuel metering is what turns "a plugin might loop forever" into "a
         // plugin gets a bounded number of instructions". It must be on before
@@ -802,11 +826,7 @@ impl SandboxHost {
             return Err(SandboxLoadError::ForbiddenImports(forbidden));
         }
 
-        let Some((segments, init_bytes)) = instantiation_cost(wasm) else {
-            return Err(SandboxLoadError::Wasm(
-                "the module's section stream could not be walked".to_owned(),
-            ));
-        };
+        let (segments, init_bytes) = (shape.segments, shape.init_bytes);
         if segments > MAX_INIT_SEGMENTS {
             return Err(SandboxLoadError::InstantiationTooExpensive {
                 what: "data and element segments",
@@ -901,6 +921,10 @@ impl SandboxHost {
     ///
     /// Returns [`SandboxLoadError::Wasm`] if the bytes are not a module.
     pub fn imports_of(wasm: &[u8]) -> Result<Vec<String>, SandboxLoadError> {
+        // `inspect` calls this on artifacts nobody has audited, and on the ones
+        // the sandbox is about to refuse — so the review surface must not be
+        // the way an artifact exhausts the process reviewing it.
+        refuse_unbounded_shape(wasm)?;
         let engine = Engine::default();
         let module =
             Module::new(&engine, wasm).map_err(|err| SandboxLoadError::Wasm(err.to_string()))?;
@@ -1200,17 +1224,30 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
     SandboxFailure::Trap(guest_text(&err.to_string()))
 }
 
-/// What one instantiation of this module will cost: how many data and element
-/// segments it carries, and how many bytes those sections hold.
+/// What a module's section headers declare, without compiling it.
 ///
-/// Walks the module's top-level sections directly. wasmi's public API does not
-/// expose segments, and this is the number that has to be bounded at load: the
-/// alternative is discovering it per request, in host work no budget prices.
+/// Walks the top-level sections directly. wasmi's public API does not expose
+/// segments, and these are the numbers that have to be bounded at load: the
+/// alternative is discovering them per request, in host work no budget prices.
 ///
-/// Returns `None` for bytes that are not a well-formed section stream. wasmi
-/// has already compiled the module by the time this runs, so that should not
-/// happen — and refusing is the right answer if it does.
-fn instantiation_cost(wasm: &[u8]) -> Option<(usize, usize)> {
+/// Returns `None` for bytes that are not a well-formed section stream. This now
+/// runs *before* wasmi compiles the module, so malformed bytes reach it — and
+/// refusing them is the right answer.
+#[derive(Debug, Clone, Copy)]
+struct ModuleShape {
+    /// Data and element segments, which every instantiation copies.
+    segments: usize,
+    /// Bytes those sections hold.
+    init_bytes: usize,
+    /// Entries every section *declares*, summed.
+    ///
+    /// Read from each section's leading count, so this costs one LEB128 per
+    /// section rather than a walk over the entries themselves — the point is to
+    /// know the shape before anything allocates per entry.
+    declared_entries: usize,
+}
+
+fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
     fn leb128(wasm: &[u8], at: usize) -> Option<(usize, usize)> {
         let mut value: usize = 0;
@@ -1233,16 +1270,23 @@ fn instantiation_cost(wasm: &[u8]) -> Option<(usize, usize)> {
     /// Section ids for the element and data sections.
     const ELEMENT_SECTION: u8 = 9;
     const DATA_SECTION: u8 = 11;
+    /// The custom section is the one whose payload is not a counted vector.
+    const CUSTOM_SECTION: u8 = 0;
 
     let mut cursor = 8usize; // magic + version
     let mut segments = 0usize;
     let mut bytes = 0usize;
+    let mut declared_entries = 0usize;
     while cursor < wasm.len() {
         let id = *wasm.get(cursor)?;
         let (size, after_size) = leb128(wasm, cursor.checked_add(1)?)?;
         let end = after_size.checked_add(size)?;
         if end > wasm.len() {
             return None;
+        }
+        if id != CUSTOM_SECTION {
+            let (count, _) = leb128(wasm, after_size)?;
+            declared_entries = declared_entries.saturating_add(count);
         }
         if id == ELEMENT_SECTION || id == DATA_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
@@ -1251,7 +1295,38 @@ fn instantiation_cost(wasm: &[u8]) -> Option<(usize, usize)> {
         }
         cursor = end;
     }
-    Some((segments, bytes))
+    Some(ModuleShape {
+        segments,
+        init_bytes: bytes,
+        declared_entries,
+    })
+}
+
+/// Refuse a module whose declared shape would cost more to *compile* than the
+/// file's own size suggests.
+///
+/// `Module::new` is the first thing that touches an unaudited artifact's bytes,
+/// and it builds an in-memory representation of every type, function, export
+/// and global before any ceiling here has run. A legal 64 MiB file of tiny
+/// declarations expands many times over in that representation, so the file
+/// bound is not a bound on what compiling it costs. The section headers carry
+/// the counts, so the shape is knowable *first* — one LEB128 per section, no
+/// per-entry work — which is what makes refusing it cheap enough to do before
+/// wasmi ever sees the bytes.
+fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> {
+    let Some(shape) = module_shape(wasm) else {
+        return Err(SandboxLoadError::Wasm(
+            "the module's section stream could not be walked".to_owned(),
+        ));
+    };
+    if shape.declared_entries > MAX_DECLARED_ENTRIES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "declared section entries",
+            found: shape.declared_entries,
+            max: MAX_DECLARED_ENTRIES,
+        });
+    }
+    Ok(shape)
 }
 
 /// Imports the shim will not satisfy — by name **or** by type — as denials.
@@ -3511,6 +3586,70 @@ path = "/hello/greet"
             dear,
             cheap + 32,
             "each admitted import must cost a unit: {cheap} then {dear}"
+        );
+    }
+
+    #[test]
+    fn a_metadata_list_of_empty_pairs_is_charged_for_its_structure() {
+        // Summing only the contents leaves a million empty pairs weighing
+        // nothing: past a byte ceiling for free, then cloned into the frame and
+        // expanded into real JSON syntax anyway. The same shape as a response
+        // frame full of `["",""]`, and it has to be priced on this side too.
+        let host = host(guests::HELLO);
+        let mut request = get("/hello/greet");
+        request.path_params = vec![(String::new(), String::new()); 100_000];
+
+        let err = host
+            .run(&request)
+            .result
+            .expect_err("a list of empty pairs must not be free");
+        assert!(
+            matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_declaring_more_entries_than_the_ceiling_never_reaches_the_compiler() {
+        // `Module::new` builds a representation of every declaration before any
+        // later ceiling runs, so the file's size is not a bound on what
+        // compiling it costs. The section headers carry the counts, so the
+        // shape is knowable first.
+        //
+        // A header claiming far more entries than the section holds is refused
+        // either way — by this ceiling if the claim is large, by wasmi if the
+        // bytes do not back it. Both are a refusal before anything allocates
+        // per entry.
+        let mut wasm = wat::parse_str("(module (func (export \"_start\") (nop)))")
+            .expect("the fixture is valid WAT");
+        // Rewrite the type section's declared count to something no 64 MiB file
+        // could honestly carry.
+        let forged = {
+            let mut bytes = vec![0x01u8, 0x05]; // type section, 5 bytes
+            bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07]); // count: ~2^31
+            bytes
+        };
+        wasm.splice(8..8, forged);
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the declared-entry ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "declared section entries",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // And the review surface refuses it too: `inspect` runs this on
+        // artifacts nobody has audited, so it must not be the way one exhausts
+        // the process reviewing it.
+        assert!(
+            SandboxHost::imports_of(&wasm).is_err(),
+            "the import listing compiled a module the loader would not"
         );
     }
 

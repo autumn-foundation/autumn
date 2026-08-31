@@ -250,6 +250,12 @@ impl ResourceLimits {
             // generous 16 bytes a reference. Small, but per-instance storage
             // the footprint would otherwise not know about at all.
             .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
+            // The request's metadata, at the same factor its bytes are walked
+            // building the frame. The ceiling that bounds it is the host's
+            // rather than this manifest's, but it is per-request storage all
+            // the same: leaving it out is what made this product understate a
+            // near-maximum-concurrency plugin by hundreds of megabytes.
+            .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4)
             .saturating_add(4096)
     }
 
@@ -1212,9 +1218,10 @@ max_concurrency = 8
             ..ResourceLimits::default()
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + 4096
+            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + 4096
         );
     }
 
@@ -1232,10 +1239,32 @@ max_concurrency = 8
             ..ResourceLimits::default()
         };
         let tables = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16;
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
         assert_eq!(
             limits.request_footprint_bytes(),
-            5 * 1_000_000 + tables + 4096,
+            5 * 1_000_000 + tables + metadata + 4096,
             "the response term must cover the line, the base64 copy and the decode at once"
+        );
+    }
+
+    #[test]
+    fn the_footprint_counts_the_metadata_a_request_may_carry() {
+        // The ceiling that bounds request metadata is the host's rather than
+        // this manifest's, but it is per-request storage all the same, cloned
+        // into the frame and serialised around. Left out, this product
+        // understated a near-maximum-concurrency plugin by hundreds of
+        // megabytes — and this product is exactly what the validator checks and
+        // what a reviewer reads.
+        let bare = ResourceLimits {
+            memory_bytes: 0,
+            max_request_body_bytes: 0,
+            max_response_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 4;
+        assert!(
+            bare.request_footprint_bytes() >= metadata,
+            "the metadata a request may carry is not in the footprint"
         );
     }
 
