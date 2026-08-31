@@ -138,6 +138,33 @@ const DENIED_CLASSES: &[&str] = &[
     "process-control",
 ];
 
+/// Characters of artifact-supplied text this screen will render.
+const EXCERPT: usize = 512;
+
+/// Render text lifted out of an unaudited artifact, bounded and neutralised.
+///
+/// Both halves matter and neither substitutes for the other. The **escaping**
+/// is why this screen can be trusted at all: a terminal escape in an import
+/// name could rewrite the lines above it — the routes, the grant, the verdict —
+/// which is an attack on the decision the screen exists to inform.
+///
+/// The **bound** is why rendering it is safe to attempt. `escape_debug()` on a
+/// name that fills most of the 64 MiB module allowance expands every byte
+/// before anything truncates the result, so `inspect` could exhaust memory on
+/// the very artifact it is meant to refuse. Truncating during the expansion
+/// rather than after it is the whole point: the long string is never built.
+fn excerpt(text: &str) -> String {
+    let mut out = String::new();
+    for (kept, ch) in text.chars().enumerate() {
+        if kept == EXCERPT {
+            out.push_str(" … (truncated)");
+            break;
+        }
+        out.extend(ch.escape_debug());
+    }
+    out
+}
+
 impl Report {
     /// Build the verdict for a verified artifact.
     #[must_use]
@@ -200,14 +227,14 @@ impl Report {
             // verdict — which is an attack on the decision this screen exists
             // to inform.
             out.push_str("    ");
-            out.push_str(&import.escape_debug().to_string());
+            out.push_str(&excerpt(import));
             out.push('\n');
         }
         out.push('\n');
         match &self.load_error {
             Some(error) => {
                 out.push_str("\u{2717} this artifact does not load in this build's sandbox:\n  ");
-                out.push_str(&error.escape_debug().to_string());
+                out.push_str(&excerpt(error));
                 out.push('\n');
             }
             None => out.push_str("\u{2713} loads into this build's sandbox\n"),
@@ -334,6 +361,29 @@ mod tests {
   (func (export "_start") (nop))
 )
 "#;
+
+    #[test]
+    fn artifact_text_is_bounded_and_escaped_before_it_is_rendered() {
+        // Both halves, on one string. The name is long enough that expanding it
+        // whole would dwarf the excerpt, and it carries the escape sequence a
+        // hostile artifact would use to rewrite the verdict printed above it.
+        let hostile = format!("wasi_snapshot_preview1::\u{1b}[2K{}", "a".repeat(100_000));
+        let rendered = excerpt(&hostile);
+
+        assert!(
+            rendered.len() < 4 * 1024,
+            "the whole name was expanded: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "an escape survived and can repaint the operator's screen"
+        );
+        // Still legible enough to act on — an operator has to recognise which
+        // import the refusal is about.
+        assert!(rendered.starts_with("wasi_snapshot_preview1::"), "{rendered}");
+    }
 
     fn manifest_toml() -> String {
         // The digest is stamped by packaging, so an authored manifest carries a

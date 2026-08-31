@@ -6645,6 +6645,13 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            // Bound rather than dropped with the rest: a nested router is
+            // opaque, so these declarations are the ONLY thing that lets the
+            // collision preflight see inside a sandboxed plugin's mount.
+            // Replaying with the nests but without them would skip the checks
+            // and reach the axum mount panic the preflight exists to replace
+            // with a refusal.
+            declared_routes,
             custom_layers,
             state_initializers,
             config_loader_factory,
@@ -6832,7 +6839,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
-                declared_routes: Vec::new(),
+                declared_routes,
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]

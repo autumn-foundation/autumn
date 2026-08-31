@@ -158,7 +158,26 @@ fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
     // No segment may climb out of the prefix. The query and fragment are not
     // path, so stop before them.
     let path = rest.split(['?', '#']).next().unwrap_or_default();
-    !path.split('/').any(|segment| segment == "..")
+    !path.split('/').any(is_double_dot_segment)
+}
+
+/// Is this path segment a "double-dot segment" — one that climbs a level?
+///
+/// Comparing against `".."` alone is not enough, and the difference is a real
+/// bypass rather than a nicety: a client normalises the URL *before* it
+/// follows the redirect, and the URL Standard defines a double-dot segment as
+/// `..`, `.%2e`, `%2e.` or `%2e%2e`, ASCII case-insensitively. So
+/// `/hello/%2e%2e/admin` is not literally `..` anywhere, and a browser still
+/// resolves it to `/admin`.
+///
+/// One level of decoding is the right amount: a client decodes percent-escapes
+/// once during normalisation, so `%252e%252e` becomes the literal text
+/// `%2e%2e` and stays a segment name rather than climbing.
+fn is_double_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        ".." | ".%2e" | "%2e." | "%2e%2e"
+    )
 }
 
 /// Content types a sandboxed plugin's response may declare.
@@ -580,6 +599,10 @@ mod tests {
             "https://evil.example/admin", // another origin entirely
             "//evil.example/admin",       // protocol-relative, same effect
             "/hello/../admin",            // starts inside, climbs out
+            "/hello/%2e%2e/admin",        // the same climb, percent-encoded
+            "/hello/%2E%2E/admin",        // and in upper case
+            "/hello/.%2e/admin",          // and half-encoded
+            "/hello/%2e./admin",          // and the other half
             "/helloworld",                // prefix match that is not a segment
             "/hello\\..\\admin",          // backslash as a separator
         ] {
