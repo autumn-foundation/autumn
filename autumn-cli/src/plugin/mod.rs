@@ -263,6 +263,7 @@ pub fn render_add(entry_name: &str, outcome: &AddOutcome, dry_run: bool) -> Stri
             );
         }
         AddOutcome::DependencyOnly {
+            dependency_added,
             dependency_line,
             mount_snippet,
             ..
@@ -272,8 +273,13 @@ pub fn render_add(entry_name: &str, outcome: &AddOutcome, dry_run: bool) -> Stri
                     out,
                     "\nDry run: nothing was written. `autumn plugin add {entry_name}` would add {dependency_line}."
                 );
-            } else {
+            } else if *dependency_added {
                 let _ = writeln!(out, "\nAdded {dependency_line}.");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "\n{dependency_line} is already declared — nothing to change."
+                );
             }
             let _ = writeln!(
                 out,
@@ -625,6 +631,7 @@ mod tests {
             "autumn-plugin-live-feed",
             &AddOutcome::DependencyOnly {
                 plan: Box::new(crate::generate::emit::Plan::new(".")),
+                dependency_added: true,
                 dependency_line: "autumn-plugin-live-feed = \"0.3.1\"".to_owned(),
                 mount_snippet: "        .plugin(autumn_plugin_live_feed::LiveFeedPlugin::new())"
                     .to_owned(),
@@ -634,6 +641,27 @@ mod tests {
         assert!(out.contains("autumn-plugin-live-feed = \"0.3.1\""), "{out}");
         assert!(out.contains("LiveFeedPlugin::new()"), "{out}");
         assert!(out.contains("community crate"), "{out}");
+    }
+
+    /// A community crate's mount is never written, so a re-run is still
+    /// dependency-only: it must not claim the mount is in place, and it must
+    /// keep showing the snippet the user has yet to paste.
+    #[test]
+    fn a_repeated_community_add_still_shows_the_mount() {
+        let out = render_add(
+            "autumn-plugin-live-feed",
+            &AddOutcome::DependencyOnly {
+                plan: Box::new(crate::generate::emit::Plan::new(".")),
+                dependency_added: false,
+                dependency_line: "autumn-plugin-live-feed = \"0.3.1\"".to_owned(),
+                mount_snippet: "        .plugin(autumn_plugin_live_feed::LiveFeedPlugin::new())"
+                    .to_owned(),
+            },
+            false,
+        );
+        assert!(out.contains("already declared"), "{out}");
+        assert!(out.contains("LiveFeedPlugin::new()"), "{out}");
+        assert!(!out.contains("already installed"), "{out}");
     }
 
     #[test]

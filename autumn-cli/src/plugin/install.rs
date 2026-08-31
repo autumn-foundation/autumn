@@ -102,6 +102,9 @@ pub enum AddOutcome {
     DependencyOnly {
         /// Filesystem actions to execute (the manifest edit).
         plan: Box<Plan>,
+        /// Whether this run actually added the dependency. `false` on a
+        /// re-run, where the mount snippet still needs showing.
+        dependency_added: bool,
         /// The `[dependencies]` line that was added.
         dependency_line: String,
         /// The convention-derived builder-chain snippet to paste.
@@ -266,7 +269,8 @@ pub fn dependency_line(crate_name: &str, version: &str) -> String {
     format!("{crate_name} = \"{version}\"")
 }
 
-/// Whether `manifest` already declares `crate_name` in any dependency table.
+/// Whether `manifest` already declares `crate_name` as a **normal** dependency
+/// of the application target.
 ///
 /// Parsed rather than substring-matched: a commented-out line or a mention in
 /// a `description` must not make an install look done.
@@ -275,9 +279,21 @@ pub fn dependency_present(manifest: &str, crate_name: &str) -> bool {
     let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
         return false;
     };
-    ["dependencies", "dev-dependencies", "build-dependencies"]
-        .iter()
-        .filter_map(|kind| table.get(*kind))
+    // `[dependencies]` and the per-target normal tables ONLY. A crate declared
+    // under `[dev-dependencies]` or `[build-dependencies]` is not available to
+    // the application target, so counting one as installed would report a
+    // complete install for an app that cannot compile — and would stop the
+    // command adding the `[dependencies]` entry that fixes it.
+    let mut tables: Vec<&toml::Value> = table.get("dependencies").into_iter().collect();
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        tables.extend(
+            targets
+                .values()
+                .filter_map(|target| target.get("dependencies")),
+        );
+    }
+    tables
+        .into_iter()
         .filter_map(toml::Value::as_table)
         .any(|deps| deps.contains_key(crate_name))
 }
@@ -509,20 +525,26 @@ pub fn plan_add_community(
     let snippet = super::catalog::community_mount_snippet(crate_name)
         .unwrap_or_else(|| "        .plugin(/* see the crate's README */)".to_owned());
 
-    if dependency_present(&manifest_src, crate_name) {
-        return Ok(AddOutcome::AlreadyInstalled);
-    }
+    // NOT `AlreadyInstalled`: that outcome reports the dependency *and* the
+    // mount as in place, and a community mount is never written — so a re-run
+    // would claim a complete install and stop showing the snippet the user
+    // still has to paste. The outcome stays dependency-only; only the wording
+    // changes.
+    let dependency_added = !dependency_present(&manifest_src, crate_name);
     let mut plan = Plan::new(root);
-    let spec = format!("\"{version}\"");
-    let updated = crate::generate::model::ensure_cargo_dependencies(
-        &manifest_src,
-        &[(crate_name, spec.as_str())],
-    );
-    if updated != manifest_src {
-        plan.modify(manifest, updated);
+    if dependency_added {
+        let spec = format!("\"{version}\"");
+        let updated = crate::generate::model::ensure_cargo_dependencies(
+            &manifest_src,
+            &[(crate_name, spec.as_str())],
+        );
+        if updated != manifest_src {
+            plan.modify(manifest, updated);
+        }
     }
     Ok(AddOutcome::DependencyOnly {
         plan: Box::new(plan),
+        dependency_added,
         dependency_line: dependency_line(crate_name, version),
         mount_snippet: snippet,
     })
@@ -811,6 +833,106 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
+    /// A probe hidden in a string literal is not a mount. Reading one as a
+    /// mount made `add` skip the insertion and still report success, leaving
+    /// the app running without the plugin it said it installed.
+    #[test]
+    fn a_probe_inside_a_string_literal_is_not_a_mount() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    \
+                   let help = \"paste AdminPlugin::new( into your builder\";\n    \
+                   let app = autumn_web::app()\n        .routes(routes![index]);\n}\n";
+        assert!(!mount_present(src, &admin().probes()));
+
+        let tmp = fake_project(src, SCAFFOLD_CARGO);
+        let AddOutcome::Installed { plan, .. } = plan_add(tmp.path(), admin(), "0.7.0").unwrap()
+        else {
+            panic!("expected an installable plan");
+        };
+        plan.execute(crate::generate::Flags::default()).unwrap();
+        let main_rs = std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(".plugin(autumn_admin_plugin::AdminPlugin::new())"),
+            "{main_rs}"
+        );
+    }
+
+    /// A dev- or build-dependency is not available to the application target,
+    /// so it cannot count as installed: reporting one as complete leaves the
+    /// app uncompilable AND declines to add the entry that would fix it.
+    #[test]
+    fn only_a_normal_dependency_counts_as_installed() {
+        let cargo =
+            format!("{SCAFFOLD_CARGO}\n[dev-dependencies]\nautumn-admin-plugin = \"0.7.0\"\n");
+        assert!(!dependency_present(&cargo, "autumn-admin-plugin"));
+
+        // Mount already present + dev-dependency only ⇒ still an install, not
+        // "already installed".
+        let mounted = SCAFFOLD_MAIN.replace(
+            ".routes(routes![index])",
+            ".plugin(autumn_admin_plugin::AdminPlugin::new())\n        .routes(routes![index])",
+        );
+        let tmp = fake_project(&mounted, &cargo);
+        let AddOutcome::Installed { plan, .. } = plan_add(tmp.path(), admin(), "0.7.0").unwrap()
+        else {
+            panic!("expected an installable plan, not AlreadyInstalled");
+        };
+        plan.execute(crate::generate::Flags::default()).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        let deps_section = after.split("[dev-dependencies]").next().unwrap();
+        assert!(
+            deps_section.contains("autumn-admin-plugin ="),
+            "the normal dependency must be added: {after}"
+        );
+    }
+
+    #[test]
+    fn a_target_specific_normal_dependency_counts_as_installed() {
+        let cargo = format!(
+            "{SCAFFOLD_CARGO}\n[target.'cfg(unix)'.dependencies]\nautumn-admin-plugin = \"0.7.0\"\n"
+        );
+        assert!(dependency_present(&cargo, "autumn-admin-plugin"));
+    }
+
+    /// A community crate never gets its mount written, so a re-run stays
+    /// dependency-only rather than claiming a complete install.
+    #[test]
+    fn a_repeated_community_add_stays_dependency_only() {
+        let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
+        let AddOutcome::DependencyOnly {
+            plan,
+            dependency_added,
+            ..
+        } = plan_add_community(tmp.path(), "autumn-plugin-live-feed", "0.3.1").unwrap()
+        else {
+            panic!("expected a dependency-only outcome");
+        };
+        assert!(dependency_added);
+        plan.execute(crate::generate::Flags::default()).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+
+        let second = plan_add_community(tmp.path(), "autumn-plugin-live-feed", "0.3.1").unwrap();
+        let AddOutcome::DependencyOnly {
+            plan,
+            dependency_added,
+            mount_snippet,
+            ..
+        } = second
+        else {
+            panic!("a re-run must stay dependency-only, got {second:?}");
+        };
+        assert!(!dependency_added);
+        assert!(
+            mount_snippet.contains("LiveFeedPlugin::new()"),
+            "{mount_snippet}"
+        );
+        plan.execute(crate::generate::Flags::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            after,
+            "a re-run must change nothing"
+        );
+    }
+
     // ── AC #5: safe degradation ──────────────────────────────────────────────
 
     /// A single-line chain has nowhere to splice a call, so the command must
@@ -887,15 +1009,32 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(insert_mount(src, admin().mount).is_none());
     }
 
-    /// The scanner skips comments but not string literals, so a quick-start
-    /// snippet in a raw string inside `main` looks like an anchor. Two
-    /// candidates must mean "no anchor", not "pick the first".
+    /// A quick-start snippet inside a raw string in `main` is not a candidate
+    /// at all — the scanner masks string contents — so the real chain below it
+    /// is still found and spliced.
     #[test]
-    fn an_ambiguous_builder_is_not_an_anchor() {
+    fn a_builder_inside_a_string_literal_is_not_a_candidate() {
         let src = "#[autumn_web::main]\nasync fn main() {\n    let doc = r\"\n    \
                    autumn_web::app()\n        .run()\n\";\n    \
                    let app = autumn_web::app()\n        .routes(routes![index]);\n    \
                    app.run().await;\n}\n";
+        let updated = insert_mount(src, admin().mount).expect("the real chain");
+        // Spliced after the REAL builder line, not the one in the string.
+        let doc_at = updated.find("let doc").unwrap();
+        let mount_at = updated.find(admin().probe).unwrap();
+        let real_at = updated.find("let app = autumn_web::app()").unwrap();
+        assert!(doc_at < real_at, "{updated}");
+        assert!(real_at < mount_at, "{updated}");
+    }
+
+    /// Two REAL builder chains in `main` are genuinely ambiguous: refuse
+    /// rather than pick one.
+    #[test]
+    fn two_real_builders_are_not_an_anchor() {
+        let src = "#[autumn_web::main]\nasync fn main() {\n    \
+                   let a = autumn_web::app()\n        .routes(routes![index]);\n    \
+                   let b = autumn_web::app()\n        .routes(routes![other]);\n    \
+                   pick(a, b).run().await;\n}\n";
         assert!(insert_mount(src, admin().mount).is_none());
     }
 
