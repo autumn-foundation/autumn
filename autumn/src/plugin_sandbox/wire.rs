@@ -352,13 +352,77 @@ pub struct SandboxRequest {
     pub body: Vec<u8>,
 }
 
+/// The most headers a guest's response frame may carry.
+///
+/// This is a *structural* bound, enforced while the frame is deserialized
+/// rather than after. The response ceiling bounds the frame's bytes, not its
+/// shape, and the two amplify very differently: a line of `["",""]` pairs is
+/// eight bytes each on the wire and a 48-byte `(String, String)` in the vector,
+/// so a frame at the stdout budget expands by roughly six before a single
+/// length check runs. `sanitize` then strips those headers, so `check_size`
+/// never sees the bytes they cost — the footprint a manifest declares, and that
+/// an operator sizes a host against, would silently not be the bound.
+///
+/// Sixty-four is far past what the response-header allowlist can usefully
+/// carry; a guest against this limit is malfunctioning or hostile.
+pub const MAX_RESPONSE_HEADERS: usize = 64;
+
+/// Deserialize a header list, refusing one longer than
+/// [`MAX_RESPONSE_HEADERS`] as it streams.
+mod bounded_headers {
+    use serde::de::{Deserializer, Error as _, SeqAccess, Visitor};
+    use std::fmt;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Bounded;
+
+        impl<'de> Visitor<'de> for Bounded {
+            type Value = Vec<(String, String)>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "at most {} response header pairs",
+                    super::MAX_RESPONSE_HEADERS
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // Deliberately not `size_hint`-driven: the hint is computed from
+                // the guest's own framing, so reserving against it hands the
+                // allocation straight back to the thing this cap refuses.
+                let mut headers = Vec::new();
+                while let Some(pair) = seq.next_element::<(String, String)>()? {
+                    if headers.len() >= super::MAX_RESPONSE_HEADERS {
+                        return Err(A::Error::custom(format!(
+                            "a response may carry at most {} headers",
+                            super::MAX_RESPONSE_HEADERS
+                        )));
+                    }
+                    headers.push(pair);
+                }
+                Ok(headers)
+            }
+        }
+
+        deserializer.deserialize_seq(Bounded)
+    }
+}
+
 /// One HTTP response, as a plugin hands it back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxResponse {
     /// HTTP status code.
     pub status: u16,
-    /// Response headers.
+    /// Response headers, capped at [`MAX_RESPONSE_HEADERS`] on the way in.
+    #[serde(deserialize_with = "bounded_headers::deserialize")]
     pub headers: Vec<(String, String)>,
     /// Response body.
     #[serde(rename = "body_b64", with = "body_b64")]
@@ -970,6 +1034,34 @@ mod tests {
                 "header {name:?}: {value:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_response_frame_carrying_more_headers_than_the_cap_is_refused_while_parsing() {
+        // The refusal has to happen *during* deserialization: after it, the
+        // vector this guards against already exists. `["",""]` is eight bytes
+        // on the wire and a 48-byte `(String, String)` in memory, so a frame at
+        // the stdout budget expands roughly sixfold — and `sanitize` then
+        // strips these, so `check_size` never charges for a byte of it.
+        let headers = std::iter::repeat_n(r#"["",""]"#, MAX_RESPONSE_HEADERS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"status":200,"headers":[{headers}],"body_b64":""}}"#);
+
+        let parsed = from_line::<SandboxResponse>(&line);
+        assert!(
+            parsed.is_err(),
+            "a frame past the header cap must not deserialize"
+        );
+
+        // And one at the cap still parses: the bound is a ceiling, not a
+        // narrowing of what a working plugin may answer with.
+        let headers = std::iter::repeat_n(r#"["x","y"]"#, MAX_RESPONSE_HEADERS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(r#"{{"status":200,"headers":[{headers}],"body_b64":""}}"#);
+        let parsed = from_line::<SandboxResponse>(&line).expect("a frame at the cap parses");
+        assert_eq!(parsed.headers.len(), MAX_RESPONSE_HEADERS);
     }
 
     #[test]

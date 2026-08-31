@@ -236,6 +236,23 @@ fn refuse_oversized_body(
 /// artifact into hundreds of megabytes in the process that is trying to refuse
 /// it. A review surface needs enough to recognise what a module reaches for,
 /// not every repetition of it.
+/// The most imports a module may declare.
+///
+/// A structural ceiling, checked before anything walks the import table. Every
+/// import is resolved and retained *per instance*, and an instance is per
+/// request, so a module repeating one allowlisted import a million times makes
+/// every request pay for a million resolutions and hold the results — work no
+/// fuel charge priced and storage `request_footprint_bytes` never counted.
+/// Refusing the shape at load is what keeps that footprint the real bound.
+///
+/// It is checked *first* for a second reason: `forbidden_imports` builds one
+/// owned denial per offending import, so an unbounded import table amplifies
+/// through the refusal path too — including under `autumn plugin inspect`,
+/// which runs it on artifacts nobody has audited. This ceiling does not weaken
+/// that gate: a module hiding one forbidden import behind a million decoys is
+/// still refused at load, now for its shape rather than its contents.
+pub const MAX_IMPORTS: usize = 1024;
+
 const MAX_REPORTED_IMPORTS: usize = 256;
 
 /// Format a module's imports for review, bounded in number.
@@ -727,6 +744,15 @@ impl SandboxHost {
         let module =
             Module::new(&engine, wasm).map_err(|err| SandboxLoadError::Wasm(err.to_string()))?;
 
+        let import_count = module.imports().count();
+        if import_count > MAX_IMPORTS {
+            return Err(SandboxLoadError::InstantiationTooExpensive {
+                what: "imports",
+                found: import_count,
+                max: MAX_IMPORTS,
+            });
+        }
+
         let forbidden = forbidden_imports(&module);
         if !forbidden.is_empty() {
             return Err(SandboxLoadError::ForbiddenImports(forbidden));
@@ -762,7 +788,7 @@ impl SandboxHost {
         // cost: the frame encoding varies with the request, so there is no
         // single number to check it against here, while this charge is fixed by
         // the module and known now.
-        let instantiation = instantiation_fuel(segments, init_bytes);
+        let instantiation = instantiation_fuel(segments, init_bytes, import_count);
         if manifest.limits.fuel <= instantiation {
             return Err(SandboxLoadError::FuelBelowFixedCharges {
                 fuel: manifest.limits.fuel,
@@ -1797,14 +1823,21 @@ fn signature_type(params: &str, results: &str) -> Option<wasmi::FuncType> {
 
 /// What one instantiation costs in fuel: the bytes copied, plus a unit per
 /// segment for the bounds check and copy set-up each one needs regardless of
-/// its length.
-fn instantiation_fuel(segments: usize, init_bytes: usize) -> u64 {
+/// its length, plus a unit per import.
+///
+/// Imports are counted for the same reason segments are: resolving one is
+/// per-instance work the guest does not execute but every request pays for, so
+/// leaving it unpriced is a way to buy host CPU with no fuel. `MAX_IMPORTS`
+/// bounds the count; this makes the admitted ones cost something.
+fn instantiation_fuel(segments: usize, init_bytes: usize, imports: usize) -> u64 {
     let bytes = u64::try_from(init_bytes).unwrap_or(u64::MAX);
     let segments = u64::try_from(segments).unwrap_or(u64::MAX);
+    let imports = u64::try_from(imports).unwrap_or(u64::MAX);
     bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(segments)
+        .saturating_add(imports)
         .saturating_add(1)
 }
 
@@ -3339,6 +3372,102 @@ path = "/hello/greet"
         // The operator must not read a truncated list as the whole of it.
         let last = listed.last().expect("a non-empty list");
         assert!(last.contains("truncated") && last.contains("50"), "{last}");
+    }
+
+    #[test]
+    fn a_module_declaring_more_imports_than_the_ceiling_is_refused_at_load() {
+        // The reporting cap bounds the *review surface*; it does nothing for the
+        // runtime path, where every import is resolved and retained per
+        // instance — per request. A module repeating one allowlisted import
+        // makes every request pay for those resolutions, and neither the fuel
+        // charge nor `request_footprint_bytes` knew about them.
+        let imports = (0..=MAX_IMPORTS)
+            .map(|_| {
+                format!(
+                    r#"  (import "{WASI}" "fd_write" (func (param i32 i32 i32 i32) (result i32)))"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wat = format!(
+            "(module\n{imports}\n  (memory (export \"memory\") 1)\n  (func (export \"_start\") (nop)))"
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the import ceiling must not load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "imports",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // Every import here is allowlisted, so nothing but the *count* refuses
+        // it: the ceiling is structural, not a second spelling of the
+        // capability gate.
+    }
+
+    #[test]
+    fn the_import_ceiling_does_not_weaken_the_forbidden_import_gate() {
+        // A module hiding one forbidden import behind a crowd is still refused;
+        // the count check running first changes why, never whether.
+        let mut lines = (0..=MAX_IMPORTS)
+            .map(|_| {
+                format!(
+                    r#"  (import "{WASI}" "fd_write" (func (param i32 i32 i32 i32) (result i32)))"#
+                )
+            })
+            .collect::<Vec<_>>();
+        lines.push(r#"  (import "env" "escape" (func))"#.to_owned());
+        let wat = format!(
+            "(module\n{}\n  (memory (export \"memory\") 1)\n  (func (export \"_start\") (nop)))",
+            lines.join("\n")
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+        assert!(
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm).is_err(),
+            "a module carrying a forbidden import must never load"
+        );
+    }
+
+    #[test]
+    fn resolving_imports_is_priced_into_the_instantiation_charge() {
+        // Per-instance work the guest never executes but every request pays
+        // for. Unpriced, it is host CPU bought for free — the same defect the
+        // host-side copying charge exists to close.
+        let bare = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+        let imports = (0..32)
+            .map(|_| {
+                format!(
+                    r#"  (import "{WASI}" "fd_write" (func (param i32 i32 i32 i32) (result i32)))"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let with_imports = wat::parse_str(format!(
+            "(module\n{imports}\n  (memory (export \"memory\") 1)\n  (func (export \"_start\") (nop)))"
+        ))
+        .expect("the fixture is valid WAT");
+
+        let cheap = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &bare)
+            .expect("loads")
+            .instantiation_fuel();
+        let dear =
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &with_imports)
+                .expect("loads")
+                .instantiation_fuel();
+        assert_eq!(
+            dear,
+            cheap + 32,
+            "each admitted import must cost a unit: {cheap} then {dear}"
+        );
     }
 
     #[test]
