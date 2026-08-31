@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
@@ -44,6 +46,7 @@ mod replay;
 mod retention;
 mod routes;
 mod routes_audit;
+mod sbom;
 mod scaling_driver;
 mod schema;
 mod search;
@@ -565,6 +568,46 @@ enum Commands {
         /// Re-download even if the binary already exists
         #[arg(long)]
         force: bool,
+    },
+    /// Generate or verify a `CycloneDX` Software Bill of Materials.
+    ///
+    /// With no flags, reads `cargo metadata` for the project in the current
+    /// directory and writes a deterministic `CycloneDX` 1.5 document to stdout.
+    ///
+    ///   autumn sbom --output sbom.cdx.json
+    ///     Write the SBOM for this source tree to a file.
+    ///
+    ///   autumn sbom --verify sbom.cdx.json --locked
+    ///     Regenerate from the source tree and fail if the file drifted. This
+    ///     is the release gate: it reports which components were added,
+    ///     removed, or changed rather than a byte diff.
+    ///
+    ///   autumn sbom --binary /usr/local/bin/my-app
+    ///     Report the exact crate versions compiled into a binary, using the
+    ///     dependency list cargo-auditable embeds — no source tree, no
+    ///     lockfile, no network. See docs/guide/supply-chain.md.
+    Sbom {
+        /// Path to a `Cargo.toml` to describe (defaults to the current directory).
+        #[arg(long, value_name = "PATH", conflicts_with = "binary")]
+        manifest_path: Option<PathBuf>,
+        /// Write the SBOM here instead of stdout.
+        #[arg(long, short, value_name = "FILE", conflicts_with = "verify")]
+        output: Option<PathBuf>,
+        /// Regenerate and compare against this SBOM; exit non-zero if it drifted.
+        #[arg(long, value_name = "FILE")]
+        verify: Option<PathBuf>,
+        /// Read the embedded dependency list out of an already-compiled binary.
+        #[arg(long, value_name = "FILE")]
+        binary: Option<PathBuf>,
+        /// Pass `--locked` to `cargo metadata`, failing if `Cargo.lock` is stale.
+        #[arg(long)]
+        locked: bool,
+        /// Require the SBOM's top-level component to be exactly this version.
+        ///
+        /// The release gate passes the tag being released, so an SBOM that is
+        /// internally consistent but describes the wrong source tree still fails.
+        #[arg(long, value_name = "VERSION")]
+        expect_version: Option<String>,
     },
     /// Pin, vendor, and integrity-verify JS dependencies
     Assets {
@@ -3899,6 +3942,21 @@ fn run_command(command: Commands) {
             model: model.as_deref(),
         }),
         Commands::Setup { force } => setup::run(force),
+        Commands::Sbom {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            expect_version,
+        } => sbom::run(&sbom::SbomOptions {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            expect_version,
+        }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
             AssetsCommands::List => assets::run_list(),
@@ -5471,6 +5529,96 @@ mod tests {
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
         assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn parse_sbom_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "sbom"]).unwrap();
+        let Commands::Sbom {
+            output,
+            verify,
+            binary,
+            locked,
+            manifest_path,
+            expect_version,
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(output.is_none());
+        assert!(verify.is_none());
+        assert!(binary.is_none());
+        assert!(manifest_path.is_none());
+        assert!(expect_version.is_none());
+        assert!(
+            !locked,
+            "--locked must be opt-in so a stale app lockfile still builds"
+        );
+    }
+
+    #[test]
+    fn parse_sbom_output_and_locked() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--output", "sbom.cdx.json", "--locked"])
+            .unwrap();
+        let Commands::Sbom { output, locked, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(output.unwrap().to_str().unwrap(), "sbom.cdx.json");
+        assert!(locked);
+    }
+
+    #[test]
+    fn parse_sbom_expect_version() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--expect-version", "0.7.0"]).unwrap();
+        let Commands::Sbom { expect_version, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(expect_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn parse_sbom_verify() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--verify", "sbom.cdx.json"]).unwrap();
+        let Commands::Sbom { verify, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(verify.unwrap().to_str().unwrap(), "sbom.cdx.json");
+    }
+
+    #[test]
+    fn parse_sbom_binary() {
+        let cli =
+            Cli::try_parse_from(["autumn", "sbom", "--binary", "/usr/local/bin/app"]).unwrap();
+        let Commands::Sbom { binary, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(binary.unwrap().to_str().unwrap(), "/usr/local/bin/app");
+    }
+
+    #[test]
+    fn sbom_rejects_verifying_and_writing_at_once() {
+        // Both would be silently contradictory: `--verify` never writes.
+        assert!(
+            Cli::try_parse_from(["autumn", "sbom", "--verify", "a.json", "--output", "b.json"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_and_a_manifest_at_once() {
+        // `--binary` reads a compiled artifact; a manifest path is meaningless
+        // there and would quietly be ignored.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "sbom",
+                "--binary",
+                "app",
+                "--manifest-path",
+                "Cargo.toml"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

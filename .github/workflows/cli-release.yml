@@ -44,6 +44,13 @@ on:
 
 permissions:
   contents: write
+  # Keyless SLSA build-provenance attestation for every archive this workflow
+  # attaches (issue #1615). `id-token: write` mints the OIDC identity Sigstore
+  # signs over; `attestations: write` publishes the attestation. Consumers
+  # verify with `gh attestation verify <archive> --repo <owner>/<repo>` — see
+  # docs/guide/supply-chain.md.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: cli-release-${{ inputs.tag || github.run_id }}
@@ -142,6 +149,21 @@ jobs:
           name: autumn-${{ matrix.target }}
           path: autumn-${{ matrix.target }}.*
           if-no-files-found: error
+
+      # Covers the archive AND its .sha256, so a re-uploaded or edited checksum
+      # file is as detectable as a tampered binary. The attestation is bound to
+      # each file's digest, so verification fails the moment a byte changes.
+      # Attest before uploading: an unattested asset must never reach a live
+      # release.
+      - name: Attest build provenance for the release archive
+        # Only for real releases. A blank-tag `workflow_dispatch` is a
+        # validation build that is never uploaded anywhere, and publishing a
+        # provenance record for bytes nobody can obtain is just noise in the
+        # transparency log.
+        if: ${{ inputs.tag != '' }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: autumn-${{ matrix.target }}.*
 
       - name: Attach to release
         if: ${{ inputs.tag != '' }}

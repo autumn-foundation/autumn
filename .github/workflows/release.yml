@@ -6,6 +6,14 @@ name: Release
 # are produced by the prepare-release job inside Publish Gate and downloaded
 # here — no checkout of user-controlled code is needed in this privileged
 # workflow_run context.
+#
+# Every asset this workflow attaches also gets a keyless SLSA build-provenance
+# attestation (issue #1615), so a consumer can prove an asset came from this
+# repository's CI at a specific commit:
+#
+#   gh attestation verify autumn-sbom.cdx.json --repo autumn-foundation/autumn
+#
+# See docs/guide/supply-chain.md.
 on:
   workflow_run:
     workflows: ["Publish Gate"]
@@ -14,6 +22,12 @@ on:
 permissions:
   contents: write
   actions: read
+  # Keyless Sigstore signing for the build-provenance attestations below.
+  # `id-token: write` mints the OIDC identity that is signed over;
+  # `attestations: write` publishes the resulting attestation. There is no
+  # signing key to store or rotate.
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,6 +69,28 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The SBOM was generated AND re-verified against the tagged source by
+      # the Publish Gate's `sbom` job; this workflow only re-checks that the
+      # artifact survived the handoff, then publishes it. Naming it after the
+      # tag keeps multiple releases' assets distinguishable once downloaded.
+      # The tag reaches the shell through the environment, never through
+      # `${{ }}` interpolation into the script body: the validation regex above
+      # is unanchored at its end, so a crafted tag could otherwise inject shell.
+      - name: Stage the SBOM release asset
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          test -s sbom.cdx.json || { echo "error: no SBOM in the release artifacts" >&2; exit 1; }
+          mv sbom.cdx.json "autumn-${TAG}.cdx.json"
+
+      # Attest BEFORE publishing: an attestation failure must stop the release
+      # rather than leave unattested assets on a live release.
+      - name: Attest build provenance for the release assets
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: autumn-${{ steps.tag.outputs.name }}.cdx.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -62,6 +98,7 @@ jobs:
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
+          files: autumn-${{ steps.tag.outputs.name }}.cdx.json
 
   binaries:
     name: Build & attach CLI binaries

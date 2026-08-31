@@ -75,6 +75,40 @@ before tagging the Autumn release.
 
 ---
 
+## Supply Chain: SBOM and Provenance
+
+Every tagged release attaches a CycloneDX SBOM (`autumn-<tag>.cdx.json`), and
+every release asset — the SBOM and each CLI archive with its `.sha256` — carries
+a keyless SLSA build-provenance attestation tied to the commit and CI run that
+produced it.
+
+- The `sbom` gate job (`scripts/check-sbom.sh`) generates the SBOM with the CLI
+  from the checkout being released, regenerates it and compares
+  component-by-component, and requires its root component version to equal both
+  `[workspace.package].version` and the pushed tag. The verified file is handed
+  to `prepare-release` as an artifact, so what ships is exactly what passed.
+- Attestations are published by `release.yml` and `cli-release.yml`, which need
+  `id-token: write` + `attestations: write`. Both attest **before** uploading,
+  so an attestation failure stops the release rather than leaving unattested
+  assets on a live one.
+
+Consumers verify with one command; the full walkthrough, including the
+negative (tampered-asset) case, is in
+[docs/guide/supply-chain.md](guide/supply-chain.md):
+
+```bash
+gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
+  --repo autumn-foundation/autumn
+```
+
+Run the gate locally before tagging:
+
+```bash
+RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
+```
+
+---
+
 ## Automated Gates (`publish-gate` Workflow)
 
 The `.github/workflows/publish-gate.yml` workflow runs these jobs. Each must
@@ -164,6 +198,30 @@ Creates a temporary directory outside the workspace, generates a minimal Autumn
 app skeleton, substitutes the candidate crate set (by path, simulating a crates.io
 install), and verifies it compiles. This proves the published `autumn-web` is
 usable from a fresh project without workspace path dependencies.
+
+### 6b · SBOM Gate (`sbom` job)
+
+Script: `scripts/check-sbom.sh`
+
+Builds the `autumn` CLI from the checkout being released and uses it to
+generate a CycloneDX 1.5 SBOM for the workspace, then:
+
+- **regenerates and compares it component-by-component** (`autumn sbom
+  --verify`), so a stale, hand-edited or substituted SBOM fails and the failure
+  names the components that drifted;
+- requires the SBOM's root component version to equal
+  `[workspace.package].version` (`autumn sbom --expect-version`) and, on a tag
+  push, requires that to equal the tag;
+- runs with `--locked`, so a `Cargo.lock` that disagrees with the manifests is
+  a gate failure rather than a silently different dependency set.
+
+The verified file is uploaded as the `sbom` artifact and *downloaded* by
+`prepare-release` rather than regenerated there, so the `autumn-<tag>.cdx.json`
+attached to the GitHub Release is byte-for-byte the document this gate passed.
+
+The SBOM is deterministic by construction — no `serialNumber`, no
+`metadata.timestamp`, components sorted and de-duplicated — which is what makes
+`--verify` possible at all.
 
 ### 7 · Published Quickstart Gate (`quickstart-gate` workflow, post-publish)
 
@@ -313,6 +371,8 @@ the release's rename-level changes.
 - [ ] `cargo test -p autumn-cli --test cli_tests repo_hygiene` — `repo_hygiene`
   is a module inside the consolidated `cli_tests` binary, not a test target of
   its own, so `--test repo_hygiene` errors with "no test target named".
+- [ ] `RELEASE_TAG=v<version> ./scripts/check-sbom.sh` — the SBOM gate, run
+  locally before tagging so a drifted lockfile is caught before CI.
 
 ## First-Run Docs Gate
 

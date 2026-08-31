@@ -75,6 +75,13 @@ jobs:
       contents: read
       id-token: write
       actions: read
+      # Publish a build-provenance attestation for the pushed image and an
+      # SBOM attestation for the inventory baked into it (issue #1615). These
+      # are keyless Sigstore signatures: `id-token: write` above supplies the
+      # OIDC identity, so there is no signing key to store or rotate. See
+      # docs/guide/supply-chain.md for the `gh attestation verify` command
+      # your users run against them.
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
@@ -142,6 +149,52 @@ jobs:
         env:
           ECR_REPOSITORY_URL: ${{ vars.ECR_REPOSITORY_URL }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
+
+      # ── Supply chain (issue #1615) ──────────────────────────────────────
+      # Bind both attestations to the image DIGEST, never to its tag: a tag
+      # can later be re-pointed at different bytes, a digest cannot. Read the
+      # digest back from the daemon's record of what the push actually
+      # produced, so a divergence between what was built and what the
+      # registry accepted surfaces here instead of being signed over.
+      - name: Resolve the pushed image digest
+        id: image_digest
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$ECR_REPOSITORY_URL:$IMAGE_TAG" | cut -d@ -f2)
+          if [ -z "$DIGEST" ]; then
+            echo "::error::could not resolve the digest of the image just pushed"
+            exit 1
+          fi
+          echo "value=$DIGEST" >> "$GITHUB_OUTPUT"
+        env:
+          ECR_REPOSITORY_URL: ${{ vars.ECR_REPOSITORY_URL }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
+
+      - name: Attest build provenance for the image
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ vars.ECR_REPOSITORY_URL }}
+          subject-digest: ${{ steps.image_digest.outputs.value }}
+
+      # The image ships a CycloneDX SBOM at a fixed path (see the Dockerfile
+      # `autumn sbom` step). Attest it against the same digest so "what is in
+      # this image" is verifiable without taking the image's word for it.
+      - name: Extract the SBOM baked into the image
+        run: |
+          set -euo pipefail
+          CID=$(docker create "$ECR_REPOSITORY_URL:$IMAGE_TAG")
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          docker cp "$CID:/usr/share/autumn/sbom.cdx.json" sbom.cdx.json
+        env:
+          ECR_REPOSITORY_URL: ${{ vars.ECR_REPOSITORY_URL }}
+          IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
+
+      - name: Attest the image SBOM
+        uses: actions/attest-sbom@v3
+        with:
+          subject-name: ${{ vars.ECR_REPOSITORY_URL }}
+          subject-digest: ${{ steps.image_digest.outputs.value }}
+          sbom-path: sbom.cdx.json
 
       # The concurrency group above prevents two runs from executing at the
       # same time, but GitHub does not document strict FIFO ordering for

@@ -11,6 +11,8 @@ name: Publish Gate
 #   release-notes — workspace version / CHANGELOG / tag alignment
 #   smoke         — fresh downstream project compiles against the candidate crate set
 #   examples-e2e  — every example builds, boots for real, and passes a Chromium smoke
+#   sbom          — CycloneDX SBOM generated, re-verified against the source
+#                   tree, and pinned to the version/tag being released (#1615)
 
 on:
   push:
@@ -237,6 +239,37 @@ jobs:
         run: ./scripts/check-migration-guides.sh
 
   # ---------------------------------------------------------------------------
+  # 5b. Software Bill of Materials (issue #1615)
+  #
+  # Generates the workspace SBOM with the CLI from THIS checkout, then
+  # regenerates and compares it component-by-component, so a stale or
+  # hand-edited SBOM cannot be published. On a tag push it additionally
+  # requires the SBOM's root component version to equal the tag. The verified
+  # file is handed to `prepare-release` as an artifact rather than rebuilt
+  # there, so the document attached to the GitHub Release is byte-for-byte the
+  # one this gate passed.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate and verify the workspace SBOM
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: ./scripts/check-sbom.sh
+      - name: Upload the verified SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # 6. Downstream smoke test
   # ---------------------------------------------------------------------------
   smoke:
@@ -305,7 +338,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs on tag pushes; depends on all gate jobs so artifacts are only
     # produced when every check passes.
-    needs: [semver, release-notes, smoke, examples-e2e]
+    needs: [semver, release-notes, smoke, examples-e2e, sbom]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v7
@@ -324,6 +357,20 @@ jobs:
           # include the release notes. Do not commit from this detached tag
           # checkout; that races with trunk and can block the GitHub Release.
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
+      # The SBOM the `sbom` job already generated AND verified — downloaded
+      # rather than regenerated so the asset attached to the release is
+      # exactly the artifact that passed the gate.
+      - name: Download the verified SBOM
+        uses: actions/download-artifact@v8
+        with:
+          name: sbom
+      - name: Confirm the SBOM survived the handoff
+        run: |
+          set -euo pipefail
+          test -s sbom.cdx.json || { echo "error: sbom.cdx.json is missing or empty" >&2; exit 1; }
+          grep -q '"bomFormat": "CycloneDX"' sbom.cdx.json \
+            || { echo "error: sbom.cdx.json is not a CycloneDX document" >&2; exit 1; }
+
       - name: Record release tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -335,4 +382,5 @@ jobs:
           path: |
             RELEASE_NOTES.md
             release-tag.txt
+            sbom.cdx.json
           retention-days: 7

@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SBOMs and signed provenance for framework and app releases (#1615):**
+  Autumn could not answer "what exactly is in this artifact, and who built it?"
+  at either surface. Its own releases were body-only GitHub Releases with no
+  SBOM and no attestation, and the production image from `autumn release init`
+  shipped no inventory and `curl`ed the Tailwind binary with no integrity check
+  — while `autumn setup` had been SHA-256-verifying the very same download for
+  the dev loop all along.
+
+  A new `autumn sbom` generates a deterministic CycloneDX 1.5 document from
+  `cargo metadata`: no random serial number, no build timestamp, components
+  sorted and de-duplicated, so the same source tree always produces the same
+  bytes. That determinism is what makes it a gate rather than a formality —
+  `autumn sbom --verify` regenerates from the source tree and reports a
+  component-level diff (`unexpected component: backdoor@6.6.6`), and
+  `--expect-version` ties the document to the version being released.
+  `scripts/check-sbom.sh` runs all of it as the publish gate's new `sbom` job,
+  and the file it verifies is the very file attached to the release as
+  `autumn-<tag>.cdx.json`.
+
+  Every asset on an Autumn release — the SBOM, each CLI archive, each `.sha256`
+  — now carries a keyless SLSA build-provenance attestation, published before
+  the asset is uploaded so an attestation failure stops the release. Consumers
+  verify with one command, `gh attestation verify <asset> --repo
+  autumn-foundation/autumn`; because attestations bind an artifact's digest, a
+  tampered or repacked asset finds no attestation at all.
+
+  Scaffolded apps get the same posture by default, not as an opt-in. The
+  release Dockerfile compiles through `cargo-auditable`, so the shipped binary
+  reports the exact crate versions inside it with no source tree and no
+  lockfile (`autumn sbom --binary /usr/local/bin/my-app`, reading ELF, Mach-O
+  and PE); it bakes a CycloneDX SBOM into the image at
+  `/usr/share/autumn/sbom.cdx.json`, advertised by an OCI label; and it obtains
+  Tailwind through the checksum-verifying `autumn setup` instead of a bare
+  `curl`. The `autumn new` Dockerfile's own unverified download is verified
+  too — and now detects its architecture rather than hardcoding `linux-x64`,
+  which had been silently installing an unrunnable binary on arm64. The
+  generated AWS/GCP/Azure deploy workflows attest each pushed image and its
+  SBOM against the image digest.
+
+  `docs/guide/supply-chain.md` walks both surfaces end to end, including the
+  negative case — tamper with one byte and watch verification fail — because a
+  check nobody has seen fail is not a check.
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted

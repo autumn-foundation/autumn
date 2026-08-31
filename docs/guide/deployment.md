@@ -1474,6 +1474,7 @@ rust:1.88.0-bookworm (chef stage)
                        /usr/local/bin/myapp     ← your binary (assets + locales embedded)
                        /app/migrations/         ← SQL migration files (one-shot migrate job)
                        /app/autumn.toml         ← production config (host=0.0.0.0)
+                       /usr/share/autumn/sbom.cdx.json  ← CycloneDX inventory
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/myapp"]
@@ -1491,6 +1492,13 @@ Key design decisions:
 - **Explicit migration ownership** -- migrations run once through
   `AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate` before web replicas roll.
   The web image starts only the server, so replicas do not race schema changes.
+- **Supply chain, on by default** -- the image carries a CycloneDX SBOM at
+  `/usr/share/autumn/sbom.cdx.json` (advertised by the `io.autumn.sbom.path`
+  label), the binary is compiled through `cargo-auditable` so it can report its
+  own crate versions with no source tree, and Tailwind is fetched through
+  `autumn setup`, whose download is SHA-256 verified. The generated cloud
+  deploy workflows additionally attest each pushed image and its SBOM. See
+  [Verify what you're running](supply-chain.md).
 - **`autumn.production.toml.example` is copied as `/app/autumn.toml`** so the
   binary binds to `0.0.0.0` (all interfaces) instead of the dev default
   `127.0.0.1`. Override any value at runtime via `AUTUMN_*` environment
