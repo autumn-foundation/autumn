@@ -219,6 +219,15 @@ The verified file is uploaded as the `sbom` artifact and *downloaded* by
 `prepare-release` rather than regenerated there, so the `autumn-<tag>.cdx.json`
 attached to the GitHub Release is byte-for-byte the document this gate passed.
 
+Signing happens in a **separate `sbom-attest` job** that checks out nothing and
+only downloads that artifact. That separation is deliberate and load-bearing:
+`publish-gate.yml` also runs on `pull_request`, and job-level `permissions:`
+are not conditional — an `if:` on an attest *step* withholds the step but not
+the token. Keeping `id-token: write` / `attestations: write` out of any job
+that runs branch code is what stops a contributor's branch from minting
+provenance under this repository's identity. `supply_chain.rs` enforces the
+invariant across every job in the workflow.
+
 The SBOM is deterministic by construction — no `serialNumber`, no
 `metadata.timestamp`, components sorted and de-duplicated — which is what makes
 `--verify` possible at all.

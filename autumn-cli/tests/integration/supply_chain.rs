@@ -513,6 +513,94 @@ fn prepare_release_reverifies_the_downloaded_sbom() {
     );
 }
 
+/// Signing credentials must never be live in a job that runs
+/// contributor-controlled code.
+///
+/// `publish-gate.yml` runs on `pull_request`, and for a same-repository branch
+/// that job gets a fully privileged token. Job-level `permissions:` are not
+/// conditional, so an `if:` on the *attest step* does not withhold the
+/// *credentials* — every other step in the job, including a checked-out
+/// `scripts/*.sh` the contributor can edit on their branch, could mint an OIDC
+/// token and publish attestations under this repository's identity. Anything
+/// so attested then satisfies `gh attestation verify --repo
+/// autumn-foundation/autumn`, which is precisely the guarantee this work
+/// exists to create.
+#[test]
+fn no_job_that_checks_out_code_holds_attestation_credentials() {
+    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+
+    for (name, body) in workflow_jobs(&gate) {
+        let signs = body.contains("id-token: write") || body.contains("attestations: write");
+        let checks_out = body.contains("actions/checkout");
+        assert!(
+            !(signs && checks_out),
+            "job `{name}` in publish-gate.yml both checks out repository code and \
+             holds signing credentials. That workflow runs on pull_request, so a \
+             contributor's branch could mint provenance under this repo's \
+             identity. Split the signing into a job that does not check out code."
+        );
+    }
+}
+
+/// Split `yaml` into `(job_name, job_body)` pairs by top-level `jobs:`
+/// indentation, with comment lines stripped.
+///
+/// Stripping comments is not cosmetic: the `sbom` job's body carries a comment
+/// explaining precisely why it must NOT hold `id-token: write` /
+/// `attestations: write`, and a raw substring search reads that explanation as
+/// the thing it warns against.
+fn workflow_jobs(yaml: &str) -> Vec<(String, String)> {
+    let mut jobs = Vec::new();
+    let Some(after) = yaml.split_once("\njobs:\n").map(|(_, rest)| rest) else {
+        return jobs;
+    };
+    let mut current: Option<(String, String)> = None;
+    for line in after.lines() {
+        // A job header is exactly two spaces of indent then `name:`.
+        let is_header = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_header {
+            if let Some(job) = current.take() {
+                jobs.push(job);
+            }
+            current = Some((line.trim().trim_end_matches(':').to_owned(), String::new()));
+        } else if let Some((_, body)) = current.as_mut()
+            && !line.trim_start().starts_with('#')
+        {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    jobs.extend(current);
+    jobs
+}
+
+/// The tag-only attest job must still exist — the split must not have quietly
+/// dropped the attestation instead of relocating it.
+#[test]
+fn the_sbom_attestation_is_minted_by_a_tag_only_job_without_a_checkout() {
+    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+    let (name, body) = workflow_jobs(&gate)
+        .into_iter()
+        .find(|(_, b)| b.contains("actions/attest-build-provenance"))
+        .expect("publish-gate.yml must still attest the SBOM");
+
+    assert!(
+        body.contains("github.ref_type == 'tag'"),
+        "job `{name}` must run only on tag pushes:\n{body}"
+    );
+    assert!(
+        !body.contains("actions/checkout"),
+        "job `{name}` holds signing credentials and must not check out code:\n{body}"
+    );
+    assert!(
+        body.contains("actions/download-artifact"),
+        "job `{name}` must attest the artifact the gate produced:\n{body}"
+    );
+}
+
 #[test]
 fn sbom_gate_script_exists_and_is_executable() {
     let path = workspace_root().join("scripts/check-sbom.sh");

@@ -13,6 +13,9 @@ name: Publish Gate
 #   examples-e2e  — every example builds, boots for real, and passes a Chromium smoke
 #   sbom          — CycloneDX SBOM generated, re-verified against the source
 #                   tree, and pinned to the version/tag being released (#1615)
+#   sbom-attest   — signs that SBOM on tag pushes. A separate, checkout-free
+#                   job: it is the only one holding signing credentials, and
+#                   this workflow also runs on pull_request.
 
 on:
   push:
@@ -253,18 +256,20 @@ jobs:
     name: SBOM
     runs-on: ubuntu-latest
     needs: metadata
+    # `contents: read` ONLY. This job checks out the branch and runs
+    # `scripts/check-sbom.sh` from it, and this workflow runs on
+    # `pull_request` — so on a same-repository PR everything here executes
+    # with whatever the contributor put on their branch. Signing credentials
+    # must never be live in that context: job-level `permissions:` are not
+    # conditional, so an `if:` on an attest STEP would withhold the step and
+    # not the token, and any other step could then mint an OIDC token and
+    # publish provenance under this repository's identity. Whatever it
+    # attested would satisfy `gh attestation verify --repo
+    # autumn-foundation/autumn` — exactly the guarantee this gate exists to
+    # create. The signing lives in `sbom-attest` below, which holds the
+    # credentials and checks out nothing.
     permissions:
       contents: read
-      # Attest the SBOM HERE rather than in release.yml. This workflow is
-      # triggered by the tag push itself, so its OIDC claims — and therefore
-      # the provenance's source ref and commit — name the tag and the tagged
-      # commit. release.yml is `workflow_run`-triggered, which GitHub always
-      # runs in default-branch context, so an attestation minted there would
-      # record the default branch instead. The attestation binds the file's
-      # DIGEST, and release.yml only renames the file, so it still verifies
-      # against the published `autumn-<tag>.cdx.json`.
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -273,15 +278,6 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: ./scripts/check-sbom.sh
-      # Tag pushes only: a PR run has nothing to attest, and publishing
-      # provenance for a document that will never be released is noise in the
-      # transparency log.
-      - name: Attest build provenance for the SBOM
-        if: github.ref_type == 'tag'
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: sbom.cdx.json
-
       - name: Upload the verified SBOM
         uses: actions/upload-artifact@v7
         with:
@@ -289,6 +285,42 @@ jobs:
           path: sbom.cdx.json
           if-no-files-found: error
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 5c. Sign the verified SBOM (tag pushes only)
+  #
+  # Deliberately a separate job that runs NO repository code: it checks out
+  # nothing and only downloads the artifact `sbom` already verified. That is
+  # what makes it safe to hold `id-token: write` + `attestations: write` in a
+  # workflow that also runs on pull requests.
+  #
+  # It must live in THIS workflow rather than release.yml because publish-gate
+  # is triggered by the tag push itself, so its OIDC claims — and therefore the
+  # provenance's source ref and commit — name the tag and the tagged commit.
+  # release.yml is `workflow_run`-triggered, which GitHub always runs in
+  # default-branch context, so an attestation minted there records the default
+  # branch instead (see issue #2380). The attestation binds the file's DIGEST
+  # and release.yml only renames the file, so it still verifies against the
+  # published `autumn-<tag>.cdx.json`.
+  # ---------------------------------------------------------------------------
+  sbom-attest:
+    name: Attest SBOM
+    runs-on: ubuntu-latest
+    needs: sbom
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the verified SBOM
+        uses: actions/download-artifact@v8
+        with:
+          name: sbom
+      - name: Attest build provenance for the SBOM
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: sbom.cdx.json
 
   # ---------------------------------------------------------------------------
   # 6. Downstream smoke test
@@ -359,7 +391,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs on tag pushes; depends on all gate jobs so artifacts are only
     # produced when every check passes.
-    needs: [semver, release-notes, smoke, examples-e2e, sbom]
+    needs: [semver, release-notes, smoke, examples-e2e, sbom, sbom-attest]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v7
