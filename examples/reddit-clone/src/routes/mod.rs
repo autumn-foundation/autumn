@@ -1,6 +1,7 @@
 pub mod about;
 pub mod auth;
 pub mod avatars;
+pub mod consent;
 pub mod errors;
 pub mod layout;
 pub mod live;

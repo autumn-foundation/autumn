@@ -2955,7 +2955,7 @@ async fn main() {
     }
 
     /// `teams`' migration/model templates are fixed Postgres DDL with no
-    /// SQLite-aware rendering path — a SQLite-backed project must be
+    /// `SQLite`-aware rendering path — a `SQLite`-backed project must be
     /// rejected at generate time with an actionable error, not emit a
     /// migration `autumn migrate` would fail to apply (Codex review finding).
     #[test]

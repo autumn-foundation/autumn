@@ -136,7 +136,7 @@ pub fn settings_from_config(config: &crate::config::AutumnConfig) -> CaptureSett
 /// false mismatch this field exists to prevent, only pointed the other way.
 ///
 /// No roles are recorded where replay could not rebuild them: wire capture and
-/// wire replay are both PostgreSQL-only, so a `sqlite` build (and a build
+/// wire replay are both `PostgreSQL`-only, so a `sqlite` build (and a build
 /// without `db` at all) records none — the caller decides by not calling this.
 #[must_use]
 pub fn observed_db_roles(has_primary: bool, has_replica: bool) -> Vec<String> {

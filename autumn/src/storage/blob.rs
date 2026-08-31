@@ -175,15 +175,15 @@ mod diesel_impls {
 
 #[cfg(feature = "sqlite")]
 mod diesel_impls_sqlite {
-    //! `Blob` ↔ SQLite `TEXT` conversion (issue #1924).
+    //! `Blob` ↔ `SQLite` `TEXT` conversion (issue #1924).
     //!
-    //! SQLite has no `JSONB` storage class, so under the `sqlite` runtime
+    //! `SQLite` has no `JSONB` storage class, so under the `sqlite` runtime
     //! backend `Blob` sits on a `TEXT` column and stores the same metadata as
     //! a UTF-8 JSON string. Because `Blob` is a local type, these `FromSql` /
     //! `ToSql<Text, Sqlite>` impls are orphan-rule-legal (the reason
     //! `uuid::Uuid` / `rust_decimal::Decimal` need a wrapper and stay rejected
     //! at generate time). The JSON body is `serde_json`-serialized/deserialized,
-    //! so a `Blob` round-trips losslessly on SQLite exactly as it does on the
+    //! so a `Blob` round-trips losslessly on `SQLite` exactly as it does on the
     //! Postgres `JSONB` path.
     use diesel::deserialize::{self, FromSql};
     use diesel::serialize::{self, IsNull, Output, ToSql};

@@ -53,6 +53,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pub` field into a response view; `Debug` renders `<classified>` everywhere.
   See
   `docs/guide/data-classification.md`.
+- **`autumn db scrub` turns a production copy into an anonymized one, and
+  refuses to guess (#1602):** the moment `autumn db backup` shipped, a
+  production database was one command away from a laptop or a shared staging
+  box — PII and all — and the only remedy was hand-rolled `UPDATE` scripts that
+  rot the first time someone adds an `email` column. `autumn db scrub` takes
+  either a backup artifact (`--artifact`) or the resolved database URL and
+  rewrites every PII-classified column with deterministic, constraint-valid
+  fake values. Classification comes from the schema, not from a config file
+  alone: `#[encrypted]` model columns and tables registered with the GDPR
+  anonymize strategy are classified automatically, everything else is declared
+  in a checked-in `scrub.toml` — and because the column universe is read by
+  introspecting the live database, a column that is neither PII-classified nor
+  explicitly marked safe **aborts the scrub** and is listed by name, with a
+  paste-ready declaration stanza. That makes "we think staging is clean" a
+  CI-verified invariant: `autumn db scrub --check` writes nothing and exits
+  non-zero on any unclassified column. Replacements are derived from an `md5`
+  over the row's primary key salted with the column name, so a `UNIQUE` column
+  stays unique, `NULL`s stay `NULL`, and two columns of one row never collide;
+  PII on a primary- or foreign-key column is refused outright, so referential
+  integrity survives. Writing refuses outside `dev`/`test` without `--force`,
+  the same guard as `autumn db drop`, and every statement for one database runs
+  in a single transaction. `--output` re-dumps the scrubbed database as a fresh
+  artifact, closing the backup → scrub → restore loop.
+
+  The safety work is where most of the substance is. `#[encrypted]` columns are
+  **re-encrypted** under the target's own key rather than overwritten with a
+  plain string (which would make every later read of that row fail as malformed
+  ciphertext). PII is refused on either side of any foreign key — composite keys
+  included — so a natural key another table references is protected, not just
+  the referencing column; on `CHECK`-constrained columns, where no fabricated
+  value can satisfy the predicate; and on generated columns, which Postgres
+  refuses to update at all. Uniqueness is read from every unique index, partial
+  and composite included, and a unique column gets a wider `sha256` token so a
+  narrow `varchar(n)` cannot truncate into collisions. Statements are
+  `public`-qualified with a pinned `search_path` (a tenant `search_path` cannot
+  redirect a write), the planned tables are locked for the transaction, row-level
+  security and non-`public` schemas are refused rather than silently
+  under-scrubbed, materialized views are refreshed in dependency order, and the
+  framework-owned tables that keep verbatim copies of app rows — the ledger, the
+  version history, the search index, `api_tokens` — are reported and can be
+  emptied with `[framework] purge`. See the new
+  [Data Scrubbing guide](docs/guide/data-scrubbing.md).
 
 - **`autumn upgrade` now reconciles framework-owned scaffold files, not just
   app code (#1593):** `autumn new` writes about a dozen framework-owned files
@@ -441,6 +483,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on `/actuator/prometheus` and under `/actuator/metrics`' `app` key with no
     database, and the Chromium smoke asserts the timer end-to-end against the
     real binary.
+
+- **UI/routing documentation and the flagship example that proves it (#2320):**
+  the 0.7.0 docs audit found the UI/Routing block carrying the longest-standing
+  doc gaps and almost no showcased example coverage. Four narrative guides and
+  a reworked `examples/reddit-clone` close it.
+
+  New guides:
+
+  - `docs/guide/forms.md` — the changeset round-trip end to end: `ChangesetForm`
+    and why a rejected submission is *data* rather than an error, `Valid<T>` /
+    `Validated<T>` / `ValidateExt` for callers that are programs, model-level
+    `#[validate(...)]` and the merged-model rule that makes it hold on updates
+    **where it applies** — a repository with hooks or `validate_on_update =
+    fetch` validates the merged model, while a plain generated repository takes
+    the blind-update path and runs no model validation at all — plus
+    `#[normalize(trim, downcase, upcase, squish, with = …)]` and exactly where
+    it runs on the write path (before validation, before hooks, and on derived
+    finders) **and where it does not**: both update paths persist the raw
+    patch, so a direct `repo.update(...)` writes unnormalized values. CSRF,
+    `form_for`, htmx inline validation and the no-JavaScript
+    fallback that costs nothing to keep, accessible fields, and how to test the
+    failure path. This was the last core-surface subsystem documented only
+    obliquely.
+  - `docs/guide/extractors.md` — the extractor catalog, the two ordering rules
+    (one body extractor, and it goes last; head extractors run left to right,
+    which is why `Db` must be dropped before a second pooled checkout), writing
+    your own, and a full section on `Query<T>`'s structured decoding: repeated
+    keys, `tags[]`, `tags[0]`, `filter[status]`, `items[0][sku]`, the depth cap,
+    duplicate-key rejection, why errors never echo a value, and the
+    `HashMap`-typed-target upgrade note.
+  - `docs/guide/cookie-consent.md` — the gate as the actual compliance rather
+    than the banner, the strictly-necessary exemption, `accept_all_cookie` /
+    `reject_non_essential_cookie` / `expire_consent_cookie`, why accept and
+    reject are `POST` while only the preferences page is a `GET`,
+    `inject_consent_banner` and the four bugs its special cases prevent,
+    policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow.
+  - `docs/guide/middleware.md` gains a "which hook do I reach for" decision
+    table, a full `#[intercept(...)]` section (per-route tower layers, stacking
+    order, when to use something else instead, and the `#[edge]` and idempotency
+    trade-offs), and a section on the non-HTTP interceptors —
+    `with_mail_interceptor` / `with_job_interceptor` / `with_db_interceptor` /
+    `with_channels_interceptor` / `with_http_interceptor` — which no tower layer
+    can reach.
+  - `docs/guide/pagination.md` gains the `ListQuery` section the feature never
+    had (allowlisted `sort` / `dir` / `filter[col]`, and why the allowlist lives
+    in the generated `list()` rather than the extractor), plus a costs section:
+    `COUNT(*)`, deep-offset scans, offset instability under concurrent inserts,
+    and the two-connection deadlock.
+
+  `examples/reddit-clone` now exercises the features those guides describe:
+
+  - **Typed accessible forms** — the submit and edit forms are built from
+    `a11y::TextField` / `TextArea` / `Select` / `Button` / `Link`, whose
+    unlabeled forms do not implement `Render` and therefore do not compile.
+    Errors are wired with `aria-invalid` plus `aria-describedby` pointing at a
+    `role="alert"` message element.
+  - **The changeset round-trip** — `submit` and `update` are `ChangesetForm`
+    handlers that re-render the form on 422 with the author's title, URL and
+    body intact, replacing hand-rolled `unprocessable_msg` errors that discarded
+    the draft.
+  - **Rich text** — post bodies are user-submitted Markdown rendered through
+    `markdown::render_user_content` at display time, so the stored source stays
+    editable and a later allowlist change protects posts already written.
+  - **Cookie consent** — `inject_consent_banner` on spliceable HTML pages
+    (registering the layer is not the same as "every page prompts": several
+    response shapes are deliberately passed through untouched, all of them
+    still receiving `Vary: Cookie` — `docs/guide/cookie-consent.md` enumerates
+    them, and is the one place that list is maintained), `POST`
+    accept/reject/withdraw routes, a `GET /consent/manage` preferences page
+    reusing the framework banner widget, a footer link on every page, and the
+    app's one non-essential category gated at its single call site.
+  - **Pagination** — the community listing is offset-paginated with
+    `PageRequest` + `Page` + `pagination_nav`, with page links that are plain
+    `<a href>`, a self-referential canonical on deeper pages, and the live SSE
+    feed wired on page 1 only.
+  - **No-JavaScript fallbacks** — the forms carry no `hx-*` attributes and
+    submit normally; unit tests assert that, the CSRF hidden input, the label
+    and error wiring, and the rich-text sanitizer's script/image/scheme
+    rejections.
 
 - **Cache coherence is now proven at build time — the build fails when a write
   can leave a cached read stale (#1716):** Autumn’s cache was powerful and its

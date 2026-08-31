@@ -284,6 +284,19 @@ jobs:
           # above). Runs in the existing Docker-dependent Linux step rather than a
           # separate required gate.
           cargo test -p autumn-cli --test cli_tests -- --ignored offsite
+          # PII scrub round-trip (#1602): seed known PII -> `autumn db backup`
+          # -> `autumn db scrub --artifact` into a separate staging database ->
+          # assert ZERO occurrences of any original value in the result, plus
+          # the fail-closed refusals (undeclared column, renamed column,
+          # production profile). Needs Docker (testcontainers) + host
+          # pg_dump/pg_restore (installed above). autumn-cli's Docker-gated
+          # tests are NOT auto-swept the way autumn-web's are, so this line is
+          # the only thing that runs them.
+          # `scrubbed_database_migrates_clean_and_boots_the_app` is skipped
+          # here: it compiles and boots a generated app and needs the diesel
+          # CLI, so it runs in generator-conformance.yml's Postgres gate.
+          cargo test -p autumn-cli --test cli_tests -- --ignored db_scrub \
+            --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)

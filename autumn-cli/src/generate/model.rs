@@ -4279,7 +4279,7 @@ mod tests {
     }
 
     /// Regression guard: those same field kinds are unchanged on a Postgres app
-    /// — the diesel-conversion gate is SQLite-only.
+    /// — the diesel-conversion gate is `SQLite`-only.
     #[test]
     fn postgres_app_field_kinds_without_sqlite_conversion_are_unchanged() {
         with_no_db_env(|| {
@@ -4421,7 +4421,7 @@ mod tests {
     }
 
     /// Regression guard: a `--sharded` model on a Postgres app is unchanged —
-    /// the sharded gate is SQLite-only.
+    /// the sharded gate is `SQLite`-only.
     #[test]
     fn postgres_app_sharded_model_is_unchanged() {
         with_no_db_env(|| {
@@ -4442,7 +4442,7 @@ mod tests {
     }
 
     /// Regression guard: `generate model --id uuid` on a Postgres app is
-    /// unchanged — the uuid gate is SQLite-only.
+    /// unchanged — the uuid gate is `SQLite`-only.
     #[test]
     fn postgres_app_uuid_primary_key_is_unchanged() {
         with_no_db_env(|| {

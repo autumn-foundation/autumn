@@ -221,7 +221,7 @@ impl MediaStorageBackend {
 /// [`Memory`](Self::Memory) is the single-process default — rooms live in one
 /// process's [`InMemoryRoomStore`](crate::rooms::InMemoryRoomStore) and do not
 /// survive a restart or span multiple app processes. [`Db`](Self::Db) selects
-/// the shared, Postgres/SQLite-backed
+/// the shared, Postgres/`SQLite`-backed
 /// [`DbRoomStore`](crate::rooms_db::DbRoomStore), so rooms are durable and every
 /// app process/instance sees the same rooms — the correct choice for any
 /// multi-process or horizontally-scaled deployment.
