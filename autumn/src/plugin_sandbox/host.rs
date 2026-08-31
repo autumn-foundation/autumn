@@ -251,20 +251,26 @@ pub const MAX_REQUEST_METADATA_BYTES: usize = 256 * 1024;
 /// One definition, used by both the ceiling below and [`encoding_fuel`], so the
 /// bytes that are refused and the bytes that are charged for cannot drift apart
 /// as fields are added to the frame.
-fn request_metadata_bytes(request: &SandboxRequest) -> usize {
-    /// What one `(String, String)` costs before either string holds a byte:
-    /// two 24-byte `String` headers in the vector, and the `["",""],` the
-    /// serialiser writes around them.
-    ///
-    /// Counting only the *contents* would leave a list of a million empty pairs
-    /// summing to zero — past a byte ceiling for free, then cloned and expanded
-    /// into real syntax anyway. That is the same shape as a response frame full
-    /// of `["",""]`, and it has to be priced on this side too.
+/// What one metadata pair costs, contents plus the structure around them.
+///
+/// Two 24-byte `String` headers in the vector, and the `["",""],` the serialiser
+/// writes around them. Counting only the *contents* would leave a list of a
+/// million empty pairs summing to zero — past a byte ceiling for free, then
+/// cloned and expanded into real syntax anyway.
+///
+/// Public to the crate so the adapter can charge a header the same way before
+/// deciding to clone it. One definition, so the early refusal and the ceiling
+/// cannot disagree about what a pair costs.
+pub(crate) const fn metadata_pair_bytes(name: &str, value: &str) -> usize {
+    /// Two `String` headers plus the `["",""],` around them.
     const ENTRY: usize = 56;
+    name.len().saturating_add(value.len()).saturating_add(ENTRY)
+}
 
+fn request_metadata_bytes(request: &SandboxRequest) -> usize {
     let pairs = |list: &[(String, String)]| {
         list.iter()
-            .map(|(name, value)| name.len().saturating_add(value.len()).saturating_add(ENTRY))
+            .map(|(name, value)| metadata_pair_bytes(name, value))
             .fold(0usize, usize::saturating_add)
     };
     request

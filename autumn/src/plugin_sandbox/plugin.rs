@@ -427,16 +427,32 @@ async fn read_request(
             |original| original.0.path().to_owned(),
         );
     let query = parts.uri.query().unwrap_or_default().to_owned();
-    let headers: Vec<(String, String)> = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
+    // Charged as they are read, and refused before the next one is cloned. The
+    // ceiling used to be applied inside `run`, which is after every header has
+    // already been copied into owned strings — so an oversized set forced the
+    // duplicate allocation the ceiling exists to prevent, and then held it for
+    // the whole body-read deadline before being told no. The cost per pair comes
+    // from the same function the ceiling counts with, so the two agree.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut metadata = 0usize;
+    for (name, value) in &parts.headers {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        metadata = metadata.saturating_add(super::host::metadata_pair_bytes(name.as_str(), value));
+        if metadata > super::host::MAX_REQUEST_METADATA_BYTES {
+            tracing::warn!(
+                plugin,
+                max_request_metadata_bytes = super::host::MAX_REQUEST_METADATA_BYTES,
+                "request headers over the sandbox metadata ceiling; refusing before cloning them"
+            );
+            return Err(Box::new(sandbox_error(
+                plugin,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            )));
+        }
+        headers.push((name.as_str().to_owned(), value.to_owned()));
+    }
 
     // The ceiling is applied while reading, so an oversized body is refused
     // without ever being buffered in full — and the *wait* is bounded too. The

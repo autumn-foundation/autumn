@@ -224,6 +224,61 @@ path = "{path}"
     );
 }
 
+/// An application route whose locale clone is `/en/greet` — the path the
+/// manifest below claims. Without the clone there is no collision to find.
+#[cfg(feature = "i18n")]
+#[autumn_web::get("/greet")]
+async fn plain_greet() -> &'static str {
+    "host"
+}
+
+/// A locale-generated route is a route the declared-route preflight must see.
+///
+/// With `locale_prefix_enabled`, `GET /foo` is cloned to `GET /en/foo` at mount
+/// time. The preflight compared declared plugin routes against `/foo` only, so a
+/// manifest claiming `/en/foo` passed it and axum panicked on the clone — the
+/// same boot-abort the preflight exists to prevent, through a door it was not
+/// looking at. Sibling of the generated SEO routes.
+#[test]
+#[cfg(feature = "i18n")]
+fn a_plugin_declaring_a_locale_generated_route_is_refused_not_a_boot_panic() {
+    let outcome = std::panic::catch_unwind(|| {
+        let mut config = autumn_web::config::AutumnConfig::default();
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "fr".to_owned()];
+        config.i18n.default_locale = "en".to_owned();
+
+        let toml = manifest_toml(&ResourceLimits::default())
+            .replace(r#"prefix = "/hello""#, r#"prefix = "/en/greet""#)
+            .replace(r#"path = "/hello/greet""#, r#"path = "/en/greet""#);
+        let manifest = SandboxManifest::parse(&toml).expect("the manifest is valid");
+        let module = wat::parse_str(guests::HELLO).expect("valid WAT");
+        let artifact = SandboxArtifact::seal(manifest, module).expect("seals");
+        let plugin = SandboxedPlugin::from_artifact(&artifact).expect("loads");
+
+        // `TestClient` is not `Debug`, so discard it rather than unwrapping.
+        let _ = autumn_web::test::TestApp::new()
+            .config(config)
+            .routes(autumn_web::routes![plain_greet])
+            .plugin(plugin)
+            .build();
+    });
+
+    // Either it mounts cleanly or it is refused with the structured error; what
+    // it must never be is the axum overlap panic.
+    if let Err(failure) = outcome {
+        let message = failure
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| failure.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(
+            !message.contains("Overlapping method route"),
+            "the axum mount panic escaped the preflight: {message}"
+        );
+    }
+}
+
 /// An untrusted artifact must not be able to abort the application at boot.
 ///
 /// The manifest is the mount, and `axum::Router::nest` panics with "Overlapping

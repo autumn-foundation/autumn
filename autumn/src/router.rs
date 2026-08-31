@@ -660,6 +660,7 @@ fn build_router_pre_state(
     let mut router = mount_user_routes(
         route_list,
         &ctx.scoped_groups,
+        &ctx.declared_routes,
         idempotency_layers.as_ref(),
         opaque_app_layers_present,
         state,
@@ -2186,6 +2187,7 @@ fn group_and_mount_routes(
 fn mount_user_routes(
     route_list: Vec<Route>,
     scoped_groups: &[ScopedGroup],
+    declared_routes: &[crate::route_listing::RouteInfo],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -2210,6 +2212,7 @@ fn mount_user_routes(
     let excluded_path_methods = route_list_path_methods(&excluded);
     let scoped_path_methods = scoped_group_path_methods(scoped_groups);
     let framework_path_methods = framework_probe_path_methods(config);
+    let declared_path_methods = declared_path_methods(declared_routes);
 
     let valid_locales = validated_locale_prefix_locales(&config.i18n);
 
@@ -2218,6 +2221,7 @@ fn mount_user_routes(
         &excluded_path_methods,
         &scoped_path_methods,
         &framework_path_methods,
+        &declared_path_methods,
         &valid_locales,
     ) {
         return Err(err);
@@ -2255,6 +2259,7 @@ fn mount_user_routes(
 fn mount_user_routes(
     route_list: Vec<Route>,
     _scoped_groups: &[ScopedGroup],
+    _declared_routes: &[crate::route_listing::RouteInfo],
     idempotency_layers: Option<&BuiltIdempotencyLayers>,
     opaque_app_layers_present: bool,
     state: &AppState,
@@ -2397,6 +2402,44 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
 /// mirroring exactly what [`build_route_timeout_table`] already does for
 /// the same reason.
 #[cfg(feature = "i18n")]
+/// The same map as [`route_list_path_methods`], for routes a plugin *declared*
+/// rather than routes the application built.
+///
+/// The locale-prefix check compares generated paths against everything already
+/// mounted, and a sandboxed plugin's manifest is a mount like any other — it
+/// was simply not among the things being compared.
+#[cfg(feature = "i18n")]
+fn declared_path_methods(
+    declared: &[crate::route_listing::RouteInfo],
+) -> std::collections::HashMap<String, Vec<http::Method>> {
+    let mut map: std::collections::HashMap<String, Vec<http::Method>> =
+        std::collections::HashMap::new();
+    for route in declared {
+        let Ok(parsed) = http::Method::from_bytes(route.method.as_bytes()) else {
+            // `WS` is not an HTTP method; it mounts as a GET.
+            if route.method.eq_ignore_ascii_case("WS") {
+                let methods = map.entry(route.path.clone()).or_default();
+                if !methods.contains(&http::Method::GET) {
+                    methods.push(http::Method::GET);
+                }
+                if !methods.contains(&http::Method::HEAD) {
+                    methods.push(http::Method::HEAD);
+                }
+            }
+            continue;
+        };
+        let effective = effective_mount_method(&parsed);
+        let methods = map.entry(route.path.clone()).or_default();
+        if !methods.contains(&effective) {
+            methods.push(effective.clone());
+        }
+        if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
+            methods.push(http::Method::HEAD);
+        }
+    }
+    map
+}
+
 fn route_list_path_methods(
     routes: &[Route],
 ) -> std::collections::HashMap<String, Vec<http::Method>> {
@@ -2546,12 +2589,14 @@ fn detect_locale_prefix_path_collision(
     excluded: &std::collections::HashMap<String, Vec<http::Method>>,
     scoped: &std::collections::HashMap<String, Vec<http::Method>>,
     framework: &std::collections::HashMap<String, Vec<http::Method>>,
+    declared: &std::collections::HashMap<String, Vec<http::Method>>,
     valid_locales: &[String],
 ) -> Option<RouterBuildError> {
     let all_other_paths: Vec<&String> = excluded
         .keys()
         .chain(scoped.keys())
         .chain(framework.keys())
+        .chain(declared.keys())
         .chain(included.keys())
         .collect();
 
@@ -2568,6 +2613,10 @@ fn detect_locale_prefix_path_collision(
                 .into_iter()
                 .chain(scoped.get(&generated))
                 .chain(framework.get(&generated))
+                // A sandboxed plugin's declared mount is a mount: without it
+                // here, a manifest claiming `/en/foo` sailed past this check and
+                // axum panicked at boot on the locale clone of `/foo`.
+                .chain(declared.get(&generated))
                 .chain(included.get(&generated))
                 .any(|other_methods| methods.iter().any(|m| other_methods.contains(m)));
 
