@@ -24,9 +24,18 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Read a repository file with line endings normalized to LF.
+///
+/// `.gitattributes` declares `* text=auto`, so a Windows checkout materializes
+/// these files with CRLF. Every assertion below reasons about line structure —
+/// `\njobs:\n`, per-line indentation, `\`-continuations — and would silently
+/// stop matching there, turning a real invariant into a test that only holds on
+/// Linux. (`repo_hygiene.rs` normalizes for the same reason.)
 fn read_repo_file(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    content.replace("\r\n", "\n")
 }
 
 /// Strip comment lines so a content assertion cannot be satisfied by prose.
@@ -550,6 +559,10 @@ fn no_job_that_checks_out_code_holds_attestation_credentials() {
 /// `attestations: write`, and a raw substring search reads that explanation as
 /// the thing it warns against.
 fn workflow_jobs(yaml: &str) -> Vec<(String, String)> {
+    // Normalize here too: the invariant this backs is security-relevant, and a
+    // caller that forgets to normalize must not silently get "no jobs found"
+    // and therefore a vacuously passing check.
+    let yaml = yaml.replace("\r\n", "\n");
     let mut jobs = Vec::new();
     let Some(after) = yaml.split_once("\njobs:\n").map(|(_, rest)| rest) else {
         return jobs;
@@ -575,6 +588,28 @@ fn workflow_jobs(yaml: &str) -> Vec<(String, String)> {
     }
     jobs.extend(current);
     jobs
+}
+
+/// A Windows checkout materializes CRLF (`.gitattributes` says `* text=auto`),
+/// which made the job parser find nothing — so the security invariant above
+/// passed vacuously rather than failing loudly. Pin both halves.
+#[test]
+fn workflow_jobs_parses_crlf_checkouts() {
+    let lf = read_repo_file(".github/workflows/publish-gate.yml");
+    let crlf = lf.replace('\n', "\r\n");
+
+    let from_lf = workflow_jobs(&lf);
+    let from_crlf = workflow_jobs(&crlf);
+
+    assert!(!from_lf.is_empty(), "the LF parse must find jobs at all");
+    assert_eq!(
+        from_lf.len(),
+        from_crlf.len(),
+        "CRLF input must yield the same jobs, or the invariant checks pass vacuously"
+    );
+    let names: Vec<&str> = from_crlf.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"sbom"), "{names:?}");
+    assert!(names.contains(&"sbom-attest"), "{names:?}");
 }
 
 /// The tag-only attest job must still exist — the split must not have quietly

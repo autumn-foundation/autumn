@@ -1008,7 +1008,12 @@ mod tests {
     /// elsewhere, and a whole-file substring check would read them as this
     /// command's.
     fn sbom_command(rendered: &str) -> String {
+        // Normalize first: `.gitattributes` says `* text=auto`, so on a Windows
+        // checkout this file's own raw string literals carry CRLF, and the
+        // `\`-continuation join below would silently no-op — leaving the
+        // assertions matching against a truncated one-line command.
         rendered
+            .replace("\r\n", "\n")
             .replace("\\\n", " ")
             .lines()
             .find(|l| l.trim_start().starts_with("RUN autumn sbom"))
