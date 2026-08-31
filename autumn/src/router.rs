@@ -2848,6 +2848,43 @@ fn mount_raw_routers(
     router
 }
 
+/// The `compress_when` predicate shared by both compression call sites (this
+/// function's SSG/ISG path and `apply_middleware`'s inline fully-dynamic
+/// path, #2371): extends the default predicate (skips images, gRPC, SSE,
+/// small bodies) to also skip binary media and already-compressed formats —
+/// compressing these wastes CPU, increases transfer size for archives, and
+/// can confuse media players.
+///
+/// Returns `impl Predicate`, not a generic constructor: the two call sites
+/// each use the single concrete opaque type this resolves to, so — unlike
+/// the concern `NormalizeBodyLayer`'s doc comment raises about a type
+/// parameter left as an inference variable inside a merged tuple — nothing
+/// here leaves rustc a variable to solve for at the tuple-typechecking site.
+fn compression_predicate() -> impl tower_http::compression::predicate::Predicate {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+    DefaultPredicate::new()
+        // Binary media — already-encoded by codec, not compressible by gzip/br.
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("application/octet-stream"))
+        // Compressed archive formats — re-compressing wastes CPU.
+        .and(NotForContentType::const_new("application/zip"))
+        .and(NotForContentType::const_new("application/gzip"))
+        .and(NotForContentType::const_new("application/x-gzip"))
+        .and(NotForContentType::const_new("application/zstd"))
+        .and(NotForContentType::const_new("application/x-bzip2"))
+        .and(NotForContentType::const_new("application/x-bzip"))
+        .and(NotForContentType::const_new("application/x-rar-compressed"))
+        .and(NotForContentType::const_new("application/vnd.rar"))
+        .and(NotForContentType::const_new("application/x-7z-compressed"))
+        // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
+        // so gzip/br only wastes CPU and can inflate them. Raw fonts
+        // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
+        // SFNT data that genuinely benefits from transfer compression.
+        .and(NotForContentType::const_new("font/woff"))
+        .and(NotForContentType::const_new("font/woff2"))
+}
+
 /// Apply response compression, when enabled.
 ///
 /// Used only by the SSG/ISG static path (`try_build_router_with_static_inner`),
@@ -2867,33 +2904,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.compression.enabled {
-        use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-        // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
-        // skip binary media and already-compressed formats — compressing these wastes
-        // CPU, increases transfer size for archives, and can confuse media players.
-        let predicate = DefaultPredicate::new()
-            // Binary media — already-encoded by codec, not compressible by gzip/br.
-            .and(NotForContentType::const_new("audio/"))
-            .and(NotForContentType::const_new("video/"))
-            .and(NotForContentType::const_new("application/octet-stream"))
-            // Compressed archive formats — re-compressing wastes CPU.
-            .and(NotForContentType::const_new("application/zip"))
-            .and(NotForContentType::const_new("application/gzip"))
-            .and(NotForContentType::const_new("application/x-gzip"))
-            .and(NotForContentType::const_new("application/zstd"))
-            .and(NotForContentType::const_new("application/x-bzip2"))
-            .and(NotForContentType::const_new("application/x-bzip"))
-            .and(NotForContentType::const_new("application/x-rar-compressed"))
-            .and(NotForContentType::const_new("application/vnd.rar"))
-            .and(NotForContentType::const_new("application/x-7z-compressed"))
-            // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
-            // so gzip/br only wastes CPU and can inflate them. Raw fonts
-            // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
-            // SFNT data that genuinely benefits from transfer compression.
-            .and(NotForContentType::const_new("font/woff"))
-            .and(NotForContentType::const_new("font/woff2"));
-        router =
-            router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
+        router = router.layer(
+            tower_http::compression::CompressionLayer::new().compress_when(compression_predicate()),
+        );
         tracing::info!("Response compression enabled (gzip/brotli)");
     }
     router
@@ -4790,36 +4803,10 @@ fn apply_middleware(
     // other config-gated member of this tuple already avoided via a plain
     // `option_layer`.
     let compression_layer = tower::util::option_layer(config.compression.enabled.then(|| {
-        use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-        // Extend the default predicate (skips images, gRPC, SSE, small bodies)
-        // to also skip binary media and already-compressed formats —
-        // compressing these wastes CPU, increases transfer size for archives,
-        // and can confuse media players.
-        let predicate = DefaultPredicate::new()
-            // Binary media — already-encoded by codec, not compressible by gzip/br.
-            .and(NotForContentType::const_new("audio/"))
-            .and(NotForContentType::const_new("video/"))
-            .and(NotForContentType::const_new("application/octet-stream"))
-            // Compressed archive formats — re-compressing wastes CPU.
-            .and(NotForContentType::const_new("application/zip"))
-            .and(NotForContentType::const_new("application/gzip"))
-            .and(NotForContentType::const_new("application/x-gzip"))
-            .and(NotForContentType::const_new("application/zstd"))
-            .and(NotForContentType::const_new("application/x-bzip2"))
-            .and(NotForContentType::const_new("application/x-bzip"))
-            .and(NotForContentType::const_new("application/x-rar-compressed"))
-            .and(NotForContentType::const_new("application/vnd.rar"))
-            .and(NotForContentType::const_new("application/x-7z-compressed"))
-            // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
-            // so gzip/br only wastes CPU and can inflate them. Raw fonts
-            // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
-            // SFNT data that genuinely benefits from transfer compression.
-            .and(NotForContentType::const_new("font/woff"))
-            .and(NotForContentType::const_new("font/woff2"));
         tracing::info!("Response compression enabled (gzip/brotli)");
         (
             NormalizeBodyLayer,
-            tower_http::compression::CompressionLayer::new().compress_when(predicate),
+            tower_http::compression::CompressionLayer::new().compress_when(compression_predicate()),
         )
     }));
 
@@ -5950,12 +5937,12 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
 /// alongside a revalidating `Cache-Control`, letting caches confirm freshness
 /// (and pick up new bytes) whenever the vendored script changes.
 ///
-/// The validator is **weak**: when compression is enabled,
-/// `apply_compression_middleware` gzips/brotli-encodes this
-/// `application/javascript` response after the handler attaches the `ETag`, so
-/// the identity, gzip, and br variants share one tag despite differing byte
-/// streams. A strong `ETag` asserts byte-for-byte equivalence and would be
-/// invalid across those encodings (matching the sibling CSS asset handler).
+/// The validator is **weak**: when compression is enabled, the response
+/// compression layer gzips/brotli-encodes this `application/javascript`
+/// response after the handler attaches the `ETag`, so the identity, gzip, and
+/// br variants share one tag despite differing byte streams. A strong `ETag`
+/// asserts byte-for-byte equivalence and would be invalid across those
+/// encodings (matching the sibling CSS asset handler).
 #[cfg(feature = "htmx")]
 static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyLock::new(|| {
     use sha2::{Digest, Sha256};
