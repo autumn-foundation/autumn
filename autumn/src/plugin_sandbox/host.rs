@@ -199,6 +199,35 @@ fn guest_text(text: &str) -> String {
     out
 }
 
+/// Refuse a request whose body is over the manifest's declared ceiling.
+///
+/// The ceiling is enforced here, not only in the Axum adapter. The adapter
+/// applies it while reading, so an oversized body never gets buffered on that
+/// path — but [`SandboxHost::run`] is public, and an embedder calling it
+/// directly hands over a `SandboxRequest` that has already been built. Without
+/// this the body is cloned into the frame and base64-expanded regardless of the
+/// ceiling, and the footprint the manifest advertises — which counts the body
+/// at `4 × max_request_body_bytes` — stops bounding anything.
+///
+/// The encoding price charged below it is a real bound, but only against a
+/// manifest whose fuel is small relative to its body ceiling; a generous fuel
+/// budget buys an arbitrarily large host-side copy. So the ceiling is checked
+/// first, before the request is priced or walked at all.
+fn refuse_oversized_body(
+    request: &SandboxRequest,
+    limits: ResourceLimits,
+) -> Option<SandboxOutcome> {
+    (request.body.len() > limits.max_request_body_bytes).then(|| {
+        SandboxOutcome::refused(
+            SandboxFailure::RequestBudget {
+                max: limits.max_request_body_bytes,
+                len: request.body.len(),
+            },
+            0,
+        )
+    })
+}
+
 /// What encoding one request's frame costs, in fuel.
 ///
 /// Priced off the request's own bytes at [`BYTES_PER_FUEL`], the rate every
@@ -768,28 +797,11 @@ impl SandboxHost {
     #[must_use]
     pub fn run(&self, request: &SandboxRequest) -> SandboxOutcome {
         let limits = self.manifest.limits;
+        // Bounds where the response may redirect a client; see `sanitize`.
+        let prefix = self.manifest.prefix.as_str();
 
-        // The body ceiling is enforced *here*, not only in the Axum adapter.
-        // The adapter applies it while reading, so an oversized body never even
-        // gets buffered on that path — but `run` is public, and an embedder
-        // calling it directly hands over a `SandboxRequest` that has already
-        // been built. Without this check that body is cloned into the frame and
-        // base64-expanded regardless of the ceiling the manifest declared, and
-        // the footprint the manifest advertises — which counts the body at
-        // `4 × max_request_body_bytes` — stops bounding anything.
-        //
-        // The encoding price below is a real bound, but only against a manifest
-        // whose fuel is small relative to its body ceiling; a generous fuel
-        // budget buys an arbitrarily large host-side copy. So the ceiling is
-        // checked first, before the request is priced or walked at all.
-        if request.body.len() > limits.max_request_body_bytes {
-            return SandboxOutcome::refused(
-                SandboxFailure::RequestBudget {
-                    max: limits.max_request_body_bytes,
-                    len: request.body.len(),
-                },
-                0,
-            );
+        if let Some(refusal) = refuse_oversized_body(request, limits) {
+            return refusal;
         }
 
         // Admission, before a single buffer is built. `serve` holds a permit of
@@ -872,25 +884,17 @@ impl SandboxHost {
         // charge cannot stop work that has already been admitted. The *price* is
         // here, so the work that is admitted still comes out of the budget the
         // manifest declared rather than being free.
-        match after_encoding.checked_sub(self.instantiation_fuel) {
-            Some(left) => {
-                if let Err(err) = store.set_fuel(left) {
-                    return SandboxOutcome::refused(
-                        SandboxFailure::Instantiation(guest_text(&err.to_string())),
-                        0,
-                    );
-                }
-            }
-            None => {
-                return finish(
-                    store,
-                    limits,
-                    &self.manifest.prefix,
-                    Err(SandboxFailure::FuelExhausted {
-                        budget: limits.fuel,
-                    }),
-                );
-            }
+        let Some(left) = after_encoding.checked_sub(self.instantiation_fuel) else {
+            let failure = SandboxFailure::FuelExhausted {
+                budget: limits.fuel,
+            };
+            return finish(store, limits, prefix, Err(failure));
+        };
+        if let Err(err) = store.set_fuel(left) {
+            return SandboxOutcome::refused(
+                SandboxFailure::Instantiation(guest_text(&err.to_string())),
+                0,
+            );
         }
 
         let mut linker = <Linker<HostState>>::new(&self.engine);
@@ -910,7 +914,7 @@ impl SandboxHost {
                 return finish(
                     store,
                     limits,
-                    &self.manifest.prefix,
+                    prefix,
                     Err(instantiation_failure(&err, limits)),
                 );
             }
@@ -939,7 +943,7 @@ impl SandboxHost {
             (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        finish(store, limits, &self.manifest.prefix, result)
+        finish(store, limits, prefix, result)
     }
 }
 
