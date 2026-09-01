@@ -1,0 +1,7 @@
+📖 Chapter: The `circuit_breaker` module in `autumn-web`
+
+🔦 Insight: Added a high-level module overview explaining the concept of Circuit Breakers to prevent cascading failures. Documented all core public structs (`CircuitBreaker`, `CircuitState`, `CircuitBreakerPolicy`, `CircuitBreakerLayer`, `CircuitBreakerService`) and utility components (`CircuitBreakerGuard`, `CircuitBreakerRegistry`) to clarify their role in evaluating API health and applying protective thresholds. Added explicit notes regarding panics and error returns.
+
+🧪 Example: Added 2 executable doctests (one demonstrating manual circuit breaker usage with `CircuitBreaker::run` and another for `global_registry()`).
+
+🖼️ Preview: (Verified locally via `cargo doc`)
