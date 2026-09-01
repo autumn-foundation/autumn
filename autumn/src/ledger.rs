@@ -1081,6 +1081,25 @@ fn link_break(
 /// nowhere; honouring it would hash an attacker's instant into the chain and
 /// destroy the record's transaction-time history irreversibly.
 ///
+/// Non-decreasing, deliberately, and **not** strictly increasing. Two revisions
+/// of one record written inside a single clock tick — likely on `SQLite`, whose
+/// `'now'` has millisecond resolution — share a `recorded_at`, and
+/// [`snapshot_as_of`] resolves that by sequence number: an as-of query at that
+/// instant returns the *last* revision recorded within it, which is what the
+/// database held at the end of the instant asked about. That is the ordinary
+/// semantics of a timestamp with finite precision, and no acceptance criterion
+/// is bent by it: a revision sharing instant `t` was committed *at* `t`, not
+/// after it.
+///
+/// Advancing past the floor by a tick instead would buy an unambiguous ordering
+/// at two real costs. It would synthesise an instant the database's clock never
+/// produced — the opposite of sourcing transaction time from the database at
+/// all, which is the point of #2323's second half. And it would re-introduce a
+/// forward ratchet: a record written faster than its clock resolution would
+/// drift ahead of `db_now` indefinitely, until [`LEDGER_MAX_CLOCK_SKEW_SECS`]
+/// refused its writes. A coarse honest instant beats a precise invented one in
+/// a ledger whose whole claim is fidelity.
+///
 /// What this does not promise: `db_now` is read before the transaction commits,
 /// so a revision can still become *visible* slightly after the instant it
 /// carries. Closing that would need a commit timestamp, which cannot be read
@@ -1186,7 +1205,11 @@ impl LedgerAsOf {
 /// 3. return the newest survivor.
 ///
 /// Both bounds **filter**; the winner is always the greatest `seq` among what
-/// survives. A revision is a full snapshot of the row, so a later revision does
+/// survives. That is also how a tie is broken: two revisions can share a
+/// `recorded_at` when both were written inside one clock tick (see
+/// [`monotonic_recorded_at`]), and an as-of query at that instant answers with
+/// the last of them — the state the database held at the end of the instant
+/// asked about. A revision is a full snapshot of the row, so a later revision does
 /// not sit beside an earlier one on a timeline — it replaces it outright. Valid
 /// time says when a revision's statement *starts* being true, which is exactly
 /// an eligibility question:

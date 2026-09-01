@@ -185,7 +185,13 @@ Every revision carries two instants:
   than the writing host's clock, which across a multi-node deployment can skew or
   step. It is additionally clamped so it never precedes the revision before it,
   which makes transaction time **non-decreasing along a chain by construction**;
-  `ledger_verify` reports a chain where it is not.
+  `ledger_verify` reports a chain where it is not. Non-decreasing, not strictly
+  increasing: two revisions written inside one clock tick (SQLite resolves to
+  the millisecond) share an instant, and an as-of query at that instant answers
+  with the last of them — the state the database held at the end of it. Bumping
+  the second by a tick would invent an instant the database's clock never
+  produced, which is exactly what sourcing the time from the database is meant
+  to stop.
 - `valid_from` — **valid time**: when the fact became true in the business
   domain. Defaults to `recorded_at`.
 
