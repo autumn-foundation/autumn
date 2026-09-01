@@ -5212,13 +5212,18 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 
 /// The shared `acme_config` Fail shape: every ACME-config violation reports the
 /// same check name and status, so each rule contributes only a detail + hint.
-fn acme_config_fail(detail: String, hint: &'static str) -> Option<CheckResult> {
-    Some(CheckResult {
+///
+/// Returns the bare [`CheckResult`] rather than a `Some(..)`; the graders that
+/// call it return `Option<CheckResult>` (`None` meaning "this rule is satisfied")
+/// and wrap it themselves, so the "always Some" is theirs to state, not this
+/// constructor's.
+const fn acme_config_fail(detail: String, hint: &'static str) -> CheckResult {
+    CheckResult {
         name: "acme_config",
         status: CheckStatus::Fail,
         detail: Some(detail),
         hint: Some(hint),
-    })
+    }
 }
 
 /// Grade the `[server.tls.acme]` values that the runtime rejects while
@@ -5240,17 +5245,17 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
     } = config;
 
     if let Some(bad_value) = domains_error {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] domains {bad_value}: every entry must be a string hostname. \
                  The runtime deserializes domains as a list of strings and fails to boot on a \
                  non-string entry"
             ),
             "List only string hostnames in [server.tls.acme] domains",
-        );
+        ));
     }
     if let Some(bad_value) = directory_error {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] directory value {bad_value} is not a valid ACME directory: use \
                  \"staging\", \"production\", or a custom directory URL. The runtime fails to boot \
@@ -5258,10 +5263,10 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
             ),
             "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom directory \
              URL",
-        );
+        ));
     }
     if let Some(bad_value) = port_error {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] http_challenge_port value {bad_value} is not a valid port: it \
                  must be an integer in the range 0-65535 (the runtime fails to boot on an \
@@ -5269,10 +5274,10 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
             ),
             "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the port a \
              front-end forwards `:80` to)",
-        );
+        ));
     }
     if let Some(bad_value) = renew_before_days_error {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] renew_before_days value {bad_value} is not a valid renewal \
                  window: it must be a whole number of days in the range 0-4294967295 (the runtime \
@@ -5281,7 +5286,7 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
             ),
             "Set [server.tls.acme] renew_before_days to a whole number of days below 90 (default \
              30), unquoted",
-        );
+        ));
     }
     None
 }
@@ -5335,32 +5340,32 @@ pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> 
     }
 
     if domains.is_empty() {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             "[server.tls.acme] domains must list at least one domain to request a certificate for"
                 .to_owned(),
             "Add at least one domain to [server.tls.acme] domains",
-        );
+        ));
     }
     if contact_email.trim().is_empty() {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             "[server.tls.acme] contact_email must be set (the ACME CA requires an account contact \
              for expiry notifications)"
                 .to_owned(),
             "Set [server.tls.acme] contact_email",
-        );
+        ));
     }
     if *http_challenge_port == 0 {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
              OS-assigned port that the ACME HTTP-01 validator (which always connects on port 80) \
              can never reach, so every issuance fails. Use 80, or the port a front-end forwards \
              `:80` to"
                 .to_owned(),
             "Set [server.tls.acme] http_challenge_port to 80 (or the port `:80` forwards to)",
-        );
+        ));
     }
     if *renew_before_days >= 90 {
-        return acme_config_fail(
+        return Some(acme_config_fail(
             format!(
                 "[server.tls.acme] renew_before_days ({renew_before_days}) must be less than 90: \
                  it is compared against the issued certificate's remaining validity, and \
@@ -5370,7 +5375,7 @@ pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> 
                  every hour and burn the CA's rate limits"
             ),
             "Set [server.tls.acme] renew_before_days below 90 (default 30)",
-        );
+        ));
     }
     check_acme_domain_entries(domains)
 }
@@ -5382,30 +5387,30 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
-            return acme_config_fail(
+            return Some(acme_config_fail(
                 format!(
                     "[server.tls.acme] domains must not contain blank entries (entry at index \
                      {index} is empty or whitespace-only)"
                 ),
                 "Remove blank/whitespace-only entries from [server.tls.acme] domains",
-            );
+            ));
         }
         if trimmed.starts_with("*.") {
-            return acme_config_fail(
+            return Some(acme_config_fail(
                 format!(
                     "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
                 ),
                 "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
-            );
+            ));
         }
         // The two rules above read `trimmed`, but the runtime stores and uses the
         // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
         // identifier — so `AcmeConfig::validate()` rejects a padded entry. Mirror
         // that here, or `doctor --strict` passes a file the server won't boot on.
         if domain != trimmed {
-            return acme_config_fail(
+            return Some(acme_config_fail(
                 format!(
                     "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
                      trailing whitespace: the entry is used verbatim as the certificate's SAN and \
@@ -5413,7 +5418,7 @@ fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
                      as-is. Write it as `{trimmed}`"
                 ),
                 "Remove the leading/trailing whitespace from the [server.tls.acme] domains entry",
-            );
+            ));
         }
     }
     None
