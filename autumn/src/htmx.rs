@@ -1190,3 +1190,15 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod bypass_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_id() {
+        let html = "<div id=\"foo\" id=\"bar\"></div>";
+        println!("{:?}", extract_html_id(html));
+        let html = "<div id=\"foo\"></div>";
+        println!("{:?}", extract_html_id(html));
+    }
+}
