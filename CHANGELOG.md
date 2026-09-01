@@ -498,10 +498,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a common convention that Autumn itself follows — the `autumn_time_zone`
   cookie is percent-decoded before use — so an application doing the same
   holds `abc/def`, which matched neither the whole header nor the recorded
-  component. Cookie values now join the echo set under both spellings, the way
-  `mask_raw_urlencoded` already did for form and query values, and stay
-  whole-token-only so a `theme=dark` cookie still cannot shred *darkness* in
-  an unrelated failure.
+  component. Cookie values now join the echo set under both spellings, and
+  stay whole-token-only so a `theme=dark` cookie still cannot shred *darkness*
+  in an unrelated failure. Unlike the form and query values
+  `mask_raw_urlencoded` records both spellings for, a cookie value is not
+  form-encoded: `+` stays a `+` rather than folding to a space, matching
+  Autumn's own cookie decoder.
+
+  The decoded spelling — an inference about what a handler holds, rather than
+  something the request carried — is only recorded once it is at least four
+  bytes and not all whitespace. `%2F`, `%3D`, `%30` and `%20` decode to `/`,
+  `=`, `0` and a space, and a one-byte needle masked as a whole token would
+  rewrite `failed at /`, `x = y` and `status 0` in the outcome while blanking
+  any bind equal to it, which drops that column from replay's comparison. The
+  spelling that actually arrived is still recorded however short, exactly as
+  before.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its

@@ -37,6 +37,7 @@
     )
 )]
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use base64::Engine as _;
@@ -914,9 +915,15 @@ fn redact_headers(
 /// skips the needles it cannot represent as text — free-form text masking is
 /// the one place valid UTF-8 is genuinely required, and a value that is not
 /// UTF-8 cannot appear in a message to be masked out of anyway.
+///
+/// What this still does **not** read: a `token68`-style credential separated
+/// from its scheme by HTAB rather than SP (RFC 7235 says `1*SP`, and the split
+/// below follows it), and the pre-trim spelling of an RFC 6265 quoted cookie
+/// value (`session="abc"` records `abc`, not `"abc"`). Both are spellings a
+/// sloppy handler could hold; both predate this function's byte port and are
+/// tracked separately rather than widened into it.
 fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
-    // `OWS` is SP and HTAB, so ASCII trimming is exactly the header grammar.
-    let trimmed = value.trim_ascii();
+    let trimmed = trim_header_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and
     // reading `password: not valid` as a scheme and a credential would put
@@ -979,7 +986,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
         };
         for pair in pairs {
             if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
-                let cookie_value = trim_ascii_quotes(cookie_value.trim_ascii());
+                let cookie_value = trim_matches_byte(cookie_value.trim_ascii(), b'"');
                 record_cookie_value(cookie_value, values);
             }
         }
@@ -996,58 +1003,43 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
 /// header value nor the raw component, so recording only the wire spelling
 /// leaves exactly the bytes the handler echoes unmasked.
 ///
-/// This is the rule [`mask_raw_urlencoded`] already applies to form and query
-/// values, and applying it here is strictly the *safer* half of that
-/// precedent: those spellings go in as direct inserts and get full substring
-/// masking, whereas a cookie's stay whole-token-only.
+/// Decoding is byte-oriented and leaves `+` literal — a cookie value is not
+/// form-encoded, so `+` is a `+`, which is the same choice `time_zone`'s own
+/// decoder makes. (This is where the analogy to [`mask_raw_urlencoded`] stops:
+/// that one parses through `form_urlencoded`, which *does* fold `+` to a
+/// space, and inserts both spellings *directly* rather than whole-token-only,
+/// because its pair's key already matched the sensitive-parameter filter.
+/// Here every cookie value is decoded, sensitive or not.) A `%XX` escape that
+/// decodes to bytes which are not UTF-8 is still exactly what a byte-oriented
+/// handler binds, so it is recorded too.
 ///
-/// Decoding is deliberately byte-oriented and leaves `+` literal. A cookie
-/// value is not form-encoded, so `+` is a `+` — the same choice `time_zone`'s
-/// own decoder makes — and a `%XX` escape that decodes to bytes which are not
-/// UTF-8 is still exactly what a byte-oriented handler binds.
+/// # Why the decoded spelling has a length floor
+///
+/// The raw spelling is what arrived and is recorded however short, exactly as
+/// before. The decoded one is an *inference* about what a handler might hold,
+/// and a short inference is not worth what it costs. `%2F`, `%3D`, `%30` and
+/// `%20` decode to `/`, `=`, `0` and a space, and a one-byte whole-token
+/// needle rewrites `failed at /`, `x = y` and `status 0` in the outcome — the
+/// harm the `Set-Cookie` attribute rule two comments up exists to prevent —
+/// while blanking any bind equal to it, which drops that column from replay's
+/// comparison and can make the tape select the wrong recorded exchange. A
+/// credential worth masking is never one punctuation byte, and a genuinely
+/// short cookie value is still recorded in the spelling it arrived in. So the
+/// floor is [`MIN_ECHO_LEN`], the same threshold and the same reasoning
+/// [`mask_echoes`] applies to short needles, and a decoded value that is
+/// nothing but whitespace is dropped outright.
 fn record_cookie_value(cookie_value: &[u8], values: &mut RedactedValues) {
-    if cookie_value.is_empty() {
+    values.insert_whole_token_only(cookie_value);
+    // `Cow::Owned` exactly when an escape actually decoded, so a value with
+    // nothing to decode costs no allocation and adds no second entry.
+    let decoded: Cow<'_, [u8]> = percent_encoding::percent_decode(cookie_value).into();
+    let Cow::Owned(decoded) = decoded else {
+        return;
+    };
+    if decoded.len() < MIN_ECHO_LEN || decoded.iter().all(u8::is_ascii_whitespace) {
         return;
     }
-    values.insert_whole_token_only(cookie_value);
-    let decoded: std::borrow::Cow<'_, [u8]> = percent_encoding::percent_decode(cookie_value).into();
-    if decoded.as_ref() != cookie_value {
-        values.insert_whole_token_only(decoded.as_ref());
-    }
-}
-
-/// Split on the first occurrence of `delimiter`, as [`str::split_once`] does
-/// for text.
-///
-/// Written with [`slice::get`] rather than indexing or `split_at` so the
-/// request-path panic gate's `indexing_slicing` denial holds and no arithmetic
-/// can overflow.
-fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
-    let index = bytes.iter().position(|byte| *byte == delimiter)?;
-    let head = bytes.get(..index)?;
-    let tail = bytes.get(index.saturating_add(1)..)?;
-    Some((head, tail))
-}
-
-/// Strip every leading and trailing `"`, as `str::trim_matches('"')` does.
-fn trim_ascii_quotes(bytes: &[u8]) -> &[u8] {
-    let mut trimmed = bytes;
-    while let Some(rest) = trimmed.strip_prefix(b"\"") {
-        trimmed = rest;
-    }
-    while let Some(rest) = trimmed.strip_suffix(b"\"") {
-        trimmed = rest;
-    }
-    trimmed
-}
-
-/// Strip every trailing `byte`, as `str::trim_end_matches` does.
-fn trim_ascii_end_matches(bytes: &[u8], byte: u8) -> &[u8] {
-    let mut trimmed = bytes;
-    while let Some(rest) = trimmed.strip_suffix(&[byte]) {
-        trimmed = rest;
-    }
-    trimmed
+    values.insert_whole_token_only(&decoded);
 }
 
 /// Retain each value of an RFC 7235 auth-param list, not only the list.
@@ -1068,7 +1060,7 @@ fn trim_ascii_end_matches(bytes: &[u8], byte: u8) -> &[u8] {
 /// in every later failure.
 fn record_auth_params(credential: &[u8], values: &mut RedactedValues) {
     for param in split_auth_params(credential) {
-        let Some((name, value)) = split_once_byte(&param, b'=') else {
+        let Some((name, value)) = split_once_byte(param, b'=') else {
             continue;
         };
         // An auth-param name is a token. This rejects the `=` padding of a
@@ -1090,11 +1082,8 @@ fn record_auth_params(credential: &[u8], values: &mut RedactedValues) {
 /// `token68` is `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`:
 /// padding only ever trails. That is what tells it apart from an auth-param
 /// list, whose `=` signs sit between a name and a value.
-///
-/// Takes anything byte-shaped so the parser can hand it a `&[u8]` slice of a
-/// header value while a test can still name a literal.
-fn is_token68(credential: impl AsRef<[u8]>) -> bool {
-    let unpadded = trim_ascii_end_matches(credential.as_ref(), b'=');
+fn is_token68(credential: &[u8]) -> bool {
+    let unpadded = trim_end_matches_byte(credential, b'=');
     !unpadded.is_empty()
         && unpadded.iter().copied().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
@@ -1111,35 +1100,36 @@ fn is_token68(credential: impl AsRef<[u8]>) -> bool {
 /// Escapes are *tracked* but not resolved: a `\"` must not be mistaken for the
 /// end of the quoted string, yet the backslashes have to survive into
 /// [`unquote_auth_param`], which is the only place that can tell a syntactic
-/// boundary quote from a literal one. Returns owned buffers because the panic
-/// gate denies the index arithmetic a borrowing split would need.
+/// boundary quote from a literal one. Every param is therefore a contiguous
+/// run of the input and can be borrowed, which [`slice::get`] does without
+/// tripping the panic gate.
 ///
 /// Walks bytes rather than `char`s. Every delimiter it looks for is ASCII and
 /// a UTF-8 continuation byte is never one, so this is identical to the `char`
 /// walk on text that happens to be valid — and unlike it, a value carrying
 /// `obs-text` still comes out whole.
-fn split_auth_params(credential: &[u8]) -> Vec<Vec<u8>> {
+fn split_auth_params(credential: &[u8]) -> Vec<&[u8]> {
     let mut params = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
+    let mut start = 0_usize;
     let mut quoted = false;
     let mut escaped = false;
-    for byte in credential.iter().copied() {
+    for (index, byte) in credential.iter().copied().enumerate() {
         if escaped {
-            current.push(byte);
             escaped = false;
         } else if byte == b'\\' && quoted {
-            current.push(byte);
             escaped = true;
         } else if byte == b'"' {
             quoted = !quoted;
-            current.push(byte);
         } else if byte == b',' && !quoted {
-            params.push(std::mem::take(&mut current));
-        } else {
-            current.push(byte);
+            if let Some(param) = credential.get(start..index) {
+                params.push(param);
+            }
+            start = index.saturating_add(1);
         }
     }
-    params.push(current);
+    if let Some(param) = credential.get(start..) {
+        params.push(param);
+    }
     params
 }
 
@@ -1153,10 +1143,11 @@ fn split_auth_params(credential: &[u8]) -> Vec<Vec<u8>> {
 /// and stopping at the first *unescaped* quote answers that question exactly,
 /// and a bind byte-equal to what the handler extracted then matches.
 ///
-/// An unquoted value (`qop=auth`) is a token and is returned as it stands.
-fn unquote_auth_param(value: &[u8]) -> Vec<u8> {
+/// An unquoted value (`qop=auth`) is a token, is returned borrowed as it
+/// stands, and is the common case — only a quoted value pays for the walk.
+fn unquote_auth_param(value: &[u8]) -> Cow<'_, [u8]> {
     let Some(inner) = value.strip_prefix(b"\"") else {
-        return value.to_vec();
+        return Cow::Borrowed(value);
     };
     let mut unquoted = Vec::new();
     let mut escaped = false;
@@ -1172,7 +1163,7 @@ fn unquote_auth_param(value: &[u8]) -> Vec<u8> {
             unquoted.push(byte);
         }
     }
-    unquoted
+    Cow::Owned(unquoted)
 }
 
 /// Retain what a `Basic` credential *decodes to*, not only its Base64 text.
@@ -1218,8 +1209,10 @@ fn record_basic_credentials(credential: &[u8], values: &mut RedactedValues) {
 /// Whether `word` is a syntactically valid authorization scheme — an RFC 7235
 /// token.
 ///
-/// Takes anything byte-shaped: the parser hands it a `&[u8]` slice of a header
-/// value that need not be UTF-8, while a test can still name a `&str` literal.
+/// Takes anything byte-shaped rather than `&[u8]` so both callers read
+/// naturally: the parser hands it slices of a header value that need not be
+/// UTF-8, while the tests that pin which spellings count as a scheme name
+/// `&str` literals (`is_auth_scheme("Negotiate")`).
 fn is_auth_scheme(word: impl AsRef<[u8]>) -> bool {
     let word = word.as_ref();
     !word.is_empty()
@@ -1243,6 +1236,76 @@ fn is_auth_scheme(word: impl AsRef<[u8]>) -> bool {
                         | b'~'
                 )
         })
+}
+
+// ── Byte equivalents of the `str` methods the parse above needs ─────────────
+//
+// All three exist because `str` has them and slices do not. They are written
+// with `get`/`strip_*` rather than indexing or `split_at`: `split_at` panics
+// when the midpoint is out of range, which `clippy::indexing_slicing` does not
+// catch, and avoiding panics — not merely avoiding the lint — is what this
+// module's request-path gate is for.
+
+/// Split on the first occurrence of `delimiter`, as [`str::split_once`] does
+/// for text.
+///
+/// Hand-rolled because `slice::split_once` is still unstable
+/// (rust-lang/rust#112811); this can go when it lands. `position` guarantees
+/// `index < len`, so both [`slice::get`] calls always return `Some` — and a
+/// delimiter in the last position yields an empty tail rather than `None`,
+/// which is what `str::split_once` does too.
+fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == delimiter)?;
+    let head = bytes.get(..index)?;
+    let tail = bytes.get(index.saturating_add(1)..)?;
+    Some((head, tail))
+}
+
+/// Strip every leading and trailing `byte`, as `str::trim_matches` does.
+///
+/// Its one caller strips the `DQUOTE`s around a cookie value. RFC 6265 permits
+/// exactly *one* pair, so trimming every quote is deliberately looser than the
+/// grammar: it is what this parser's previous `trim_matches('"')` did, a
+/// doubled quote is malformed whichever way it is read, and what sits inside
+/// is a candidate secret under either reading.
+fn trim_matches_byte(bytes: &[u8], byte: u8) -> &[u8] {
+    let mut trimmed = bytes;
+    while let Some(rest) = trimmed.strip_prefix(&[byte]) {
+        trimmed = rest;
+    }
+    while let Some(rest) = trimmed.strip_suffix(&[byte]) {
+        trimmed = rest;
+    }
+    trimmed
+}
+
+/// Strip every trailing `byte`, as `str::trim_end_matches` does.
+///
+/// "Every" rather than one because its caller strips a `token68`'s Base64
+/// padding, which is one `=` or two depending on the payload's length.
+fn trim_end_matches_byte(bytes: &[u8], byte: u8) -> &[u8] {
+    let mut trimmed = bytes;
+    while let Some(rest) = trimmed.strip_suffix(&[byte]) {
+        trimmed = rest;
+    }
+    trimmed
+}
+
+/// Trim the whitespace around a header value.
+///
+/// `OWS` is SP and HTAB, so [`slice::trim_ascii`] is the grammar. The second
+/// pass keeps the *wider* trim the previous `&str` implementation got for free
+/// from `str::trim`, which strips Unicode whitespace as well. Losing it would
+/// have been a silent regression of exactly the kind this function exists to
+/// prevent: `HeaderValue` rejects only the C0 controls and `DEL`, so a
+/// non-breaking space is a legal (if malformed) pad, and
+/// `Authorization: <U+00A0>Bearer hunter2` would leave `\xc2\xa0Bearer`
+/// failing [`is_auth_scheme`] — recording nothing — while
+/// `Bearer hunter2<U+00A0>` would record `hunter2\xc2\xa0`, which is not what
+/// a handler that trims holds.
+fn trim_header_ows(value: &[u8]) -> &[u8] {
+    let ascii = value.trim_ascii();
+    std::str::from_utf8(ascii).map_or(ascii, |text| text.trim().as_bytes())
 }
 
 /// Rewrite the request target with sensitive query parameters masked, leaving
@@ -2464,87 +2527,84 @@ mod tests {
         );
     }
 
-    /// Percent-encoding a cookie value is a common convention — Autumn itself
-    /// percent-decodes its own `autumn_time_zone` cookie before use — so a
-    /// handler holds `abc/def` where the wire carried `abc%2Fdef`. Recording
-    /// only the wire spelling matches neither the bind nor the echo.
-    ///
-    /// `mask_raw_urlencoded` already records both spellings for form and query
-    /// values; cookie values follow it, staying whole-token-only.
+    /// The boundaries either side of the byte port: where a non-UTF-8
+    /// `Authorization` value now yields a component, and where it still
+    /// yields none because the syntax genuinely is not there.
     #[test]
-    fn cookie_values_record_both_percent_spellings() {
-        let (_request, values) = redact(
-            Request::get("/").header(header::COOKIE, "session=abc%2Fdef; theme=dark"),
-            CapturedBody::Absent,
-            &filter_with(&[]),
+    fn a_non_utf8_authorization_is_read_only_where_the_syntax_survives() {
+        let authorization = |bytes: &[u8]| {
+            let (_request, values) = redact(
+                Request::get("/").header(
+                    header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_bytes(bytes).expect("obs-text is legal"),
+                ),
+                CapturedBody::Absent,
+                &filter_with(&[]),
+            );
+            values
+        };
+
+        // A `Basic` credential that is not Base64 contributes the credential
+        // itself — a direct insert, as for any scheme — but nothing decoded.
+        let mut not_base64 = b"Basic ".to_vec();
+        not_base64.push(0xFF);
+        not_base64.extend_from_slice(b"abc");
+        let values = authorization(&not_base64);
+        assert!(
+            values.contains(b"\xffabc".as_slice()),
+            "the credential after a known scheme is retained even when it does not decode"
         );
 
+        // No space: there is no scheme/credential split to make, so the whole
+        // header value — already inserted by `redact_headers` — is all there
+        // is. Nothing is invented from the bytes.
+        let mut no_space = b"hunter2".to_vec();
+        no_space.push(0xFF);
+        let values = authorization(&no_space);
         assert!(
-            values.contains(b"abc%2Fdef"),
-            "the on-the-wire spelling is still recorded"
+            values.contains(no_space.as_slice()),
+            "the whole value is retained, as for any masked header"
         );
         assert!(
-            values.contains(b"abc/def"),
-            "the percent-decoded spelling is what a decoding handler holds"
-        );
-        assert!(
-            values.contains(b"dark"),
-            "a value with nothing to decode is recorded exactly once, unchanged"
+            !values.contains(b"hunter2"),
+            "a prefix of an unsplittable value is not a component"
         );
 
-        let mut binds = vec![
-            BindValue::Value(b"abc/def".to_vec()),
-            BindValue::Value(b"abc%2Fdef".to_vec()),
-        ];
-        mask_binds(&mut binds, &values);
-        assert_eq!(
-            binds.first(),
-            Some(&BindValue::Masked),
-            "a bind carrying the decoded spelling is masked"
-        );
-        assert_eq!(
-            binds.get(1),
-            Some(&BindValue::Masked),
-            "a bind carrying the raw spelling is masked"
-        );
-        assert_eq!(
-            mask_echoes("cookie abc/def was rejected", &values),
-            format!("cookie {FILTERED_PLACEHOLDER} was rejected"),
-            "the decoded spelling is scrubbed where it stands as a whole token"
-        );
-
-        // Decoding stays whole-token-only, like every other cookie value: it
-        // must not shred a word that merely contains it.
-        assert_eq!(
-            mask_echoes("darkness check failed", &values),
-            "darkness check failed",
-            "the decoded spellings inherit the whole-token classification"
-        );
-
-        // `Set-Cookie` carries one cookie then attributes, and the decoded
-        // spelling follows the same one-pair rule.
-        let (_request, set_cookie) = redact(
-            Request::get("/").header("set-cookie", "session=a%2Fb; Path=%2Fadmin; Max-Age=0"),
-            CapturedBody::Absent,
-            &filter_with(&[]),
-        );
-        assert!(set_cookie.contains(b"a/b"), "the cookie value decodes");
+        // A non-UTF-8 byte *in the scheme* is not an RFC 7235 token, so the
+        // line is not `<scheme> <credential>` and nothing is read from it.
+        let mut bad_scheme = b"Bea".to_vec();
+        bad_scheme.push(0xFF);
+        bad_scheme.extend_from_slice(b"rer hunter2secret");
+        let values = authorization(&bad_scheme);
         assert!(
-            !set_cookie.contains(b"/admin"),
-            "an attribute value is not a secret, decoded or not"
+            !values.contains(b"hunter2secret"),
+            "guessing a credential after an invalid scheme would invent secrets"
         );
+    }
 
-        // A percent-escape that decodes to bytes which are not UTF-8 is still
-        // recorded: a bind carrying them is exactly the echo this exists for.
-        let (_request, binary) = redact(
-            Request::get("/").header(header::COOKIE, "session=raw%FFtail"),
-            CapturedBody::Absent,
-            &filter_with(&[]),
-        );
-        assert!(
-            binary.contains(b"raw\xfftail".as_slice()),
-            "a decoded value that is not UTF-8 is still recorded, for bind masking"
-        );
+    /// `str::trim` stripped Unicode whitespace; `trim_ascii` does not. A
+    /// header padded with a non-breaking space is malformed but perfectly
+    /// representable — `HeaderValue` rejects only the C0 controls and `DEL` —
+    /// so dropping the wider trim in the byte port would have left the token
+    /// the handler holds unmasked, which is the very thing this parser exists
+    /// to prevent.
+    #[test]
+    fn unicode_padding_around_a_header_value_does_not_hide_the_credential() {
+        for padded in [
+            "\u{a0}Bearer hunter2secret",
+            "Bearer hunter2secret\u{a0}",
+            "\u{2028}Bearer hunter2secret\u{2028}",
+        ] {
+            let (_request, values) = redact(
+                Request::get("/").header(header::AUTHORIZATION, padded),
+                CapturedBody::Absent,
+                &filter_with(&[]),
+            );
+            assert!(
+                values.contains(b"hunter2secret"),
+                "the credential must survive Unicode padding ({padded:?})"
+            );
+        }
     }
 
     /// The same bytes can arrive both ways — a filtered body password the
@@ -2758,6 +2818,258 @@ mod tests {
             mask_echoes("bad form field token=a%2Fb%2Bc", &values),
             format!("bad form field token={FILTERED_PLACEHOLDER}"),
             "an echoed raw form body must scrub"
+        );
+    }
+
+    /// Percent-encoding a cookie value is a common convention — Autumn itself
+    /// percent-decodes its own `autumn_time_zone` cookie before use — so a
+    /// handler holds `abc/def` where the wire carried `abc%2Fdef`. Recording
+    /// only the wire spelling matches neither the bind nor the echo.
+    ///
+    /// The decoded spelling is an inference rather than something the request
+    /// carried, so it earns a length floor the raw spelling does not need:
+    /// `%2F` and `%3D` decode to needles that would rewrite ordinary outcome
+    /// text and blank unrelated binds.
+    #[test]
+    fn encoded_cookie_value_forms_join_the_echo_set() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "session=abc%2Fdef; theme=dark"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"abc%2Fdef"),
+            "the on-the-wire spelling is still recorded"
+        );
+        assert!(
+            values.contains(b"abc/def"),
+            "the percent-decoded spelling is what a decoding handler holds"
+        );
+        assert!(
+            values.contains(b"dark"),
+            "a value with nothing to decode is still recorded, in the one spelling it has"
+        );
+
+        let mut binds = vec![
+            BindValue::Value(b"abc/def".to_vec()),
+            BindValue::Value(b"abc%2Fdef".to_vec()),
+        ];
+        mask_binds(&mut binds, &values);
+        assert_eq!(
+            binds.first(),
+            Some(&BindValue::Masked),
+            "a bind carrying the decoded spelling is masked"
+        );
+        assert_eq!(
+            binds.get(1),
+            Some(&BindValue::Masked),
+            "a bind carrying the raw spelling is masked"
+        );
+        assert_eq!(
+            mask_echoes("cookie abc/def was rejected", &values),
+            format!("cookie {FILTERED_PLACEHOLDER} was rejected"),
+            "the decoded spelling is scrubbed where it stands as a whole token"
+        );
+
+        // Decoding stays whole-token-only, like every other cookie value: it
+        // must not shred a word that merely contains it.
+        assert_eq!(
+            mask_echoes("darkness check failed", &values),
+            "darkness check failed",
+            "the decoded spellings inherit the whole-token classification"
+        );
+
+        // A value already carrying the byte contributes one spelling, not two
+        // — and the same one either way, so the echo is scrubbed identically.
+        let (_request, literal) = redact(
+            Request::get("/").header(header::COOKIE, "session=abc/def"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(literal.contains(b"abc/def"), "the literal spelling counts");
+        assert_eq!(
+            mask_echoes("cookie abc/def was rejected", &literal),
+            format!("cookie {FILTERED_PLACEHOLDER} was rejected"),
+        );
+
+        // `Set-Cookie` carries one cookie then attributes, and the decoded
+        // spelling follows the same one-pair rule.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "session=a%2Fbcd; Path=%2Fadmin; Max-Age=0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(set_cookie.contains(b"a/bcd"), "the cookie value decodes");
+        assert!(
+            !set_cookie.contains(b"/admin"),
+            "an attribute value is not a secret, decoded or not"
+        );
+
+        // A percent-escape that decodes to bytes which are not UTF-8 is still
+        // recorded: a bind carrying them is exactly the echo this exists for.
+        let (_request, binary) = redact(
+            Request::get("/").header(header::COOKIE, "session=raw%FFtail"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            binary.contains(b"raw\xfftail".as_slice()),
+            "a decoded value that is not UTF-8 is still recorded, for bind masking"
+        );
+
+        // `+` is a `+`. A cookie value is not form-encoded, so folding it to a
+        // space — as `mask_raw_urlencoded` does for real form values — would
+        // record a spelling no cookie handler holds.
+        let (_request, plus) = redact(
+            Request::get("/").header(header::COOKIE, "session=a+bcd"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(plus.contains(b"a+bcd"), "the wire spelling counts");
+        assert!(
+            !plus.contains(b"a bcd"),
+            "`+` must not be decoded as a space for a cookie"
+        );
+    }
+
+    /// The decoded spelling is an *inference* about what a handler holds, and
+    /// a short inference costs more than it protects: `%2F`, `%3D`, `%30` and
+    /// `%20` decode to `/`, `=`, `0` and a space, each of which is masked as a
+    /// whole token — rewriting `failed at /`, `x = y` and `status 0` in the
+    /// outcome, and blanking any bind equal to it, which drops that column
+    /// from replay's comparison entirely.
+    ///
+    /// This is the same harm the `Set-Cookie` attribute rule prevents from the
+    /// other direction, and decoding must not reopen it through the value.
+    #[test]
+    fn a_short_decoded_cookie_spelling_is_not_worth_what_it_would_shred() {
+        let (_request, values) = redact(
+            Request::get("/").header(
+                header::COOKIE,
+                "nav=%2F; eq=%3D; zero=%30; pad=%20; blank=%20%20%20%20",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        for spelling in [b"%2F".as_slice(), b"%3D", b"%30", b"%20"] {
+            assert!(
+                values.contains(spelling),
+                "the wire spelling is still recorded, however short: {}",
+                String::from_utf8_lossy(spelling)
+            );
+        }
+        for shredder in [b"/".as_slice(), b"=", b"0", b" ", b"    "] {
+            assert!(
+                !values.contains(shredder),
+                "a decoded spelling below the echo floor must stay out: {:?}",
+                String::from_utf8_lossy(shredder)
+            );
+        }
+
+        assert_eq!(
+            mask_echoes("failed at / with status 0", &values),
+            "failed at / with status 0",
+            "a one-byte decoded needle would have rewritten ordinary outcome text"
+        );
+        assert_eq!(
+            mask_echoes("x = y", &values),
+            "x = y",
+            "as would a decoded `=`"
+        );
+
+        let mut binds = vec![
+            BindValue::Value(b"/".to_vec()),
+            BindValue::Value(b"0".to_vec()),
+        ];
+        mask_binds(&mut binds, &values);
+        assert_eq!(
+            binds,
+            vec![
+                BindValue::Value(b"/".to_vec()),
+                BindValue::Value(b"0".to_vec()),
+            ],
+            "blanking these would drop both columns from replay's bind comparison"
+        );
+    }
+
+    /// A malformed escape is not an escape. `percent_decode` leaves `%ZZ`,
+    /// `%A` and a trailing `%` exactly as they arrived, so no half-decoded
+    /// spelling — a fragment no handler ever holds — reaches the echo set.
+    #[test]
+    fn malformed_percent_escapes_contribute_no_invented_spelling() {
+        let (_request, values) = redact(
+            Request::get("/").header(
+                header::COOKIE,
+                "a=bad%ZZtail; b=short%A; c=trailing%; d=full100%",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        for raw in [
+            b"bad%ZZtail".as_slice(),
+            b"short%A",
+            b"trailing%",
+            b"full100%",
+        ] {
+            assert!(
+                values.contains(raw),
+                "the raw spelling is recorded: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        assert!(
+            !values.contains(b"badtail"),
+            "a malformed escape must not be silently dropped into a new spelling"
+        );
+        assert_eq!(
+            mask_echoes("value bad%ZZtail rejected", &values),
+            format!("value {FILTERED_PLACEHOLDER} rejected"),
+            "the spelling that did arrive is still scrubbed"
+        );
+    }
+
+    /// An empty cookie value has no spelling to record, and must not take the
+    /// cookies beside it down with it.
+    #[test]
+    fn an_empty_cookie_value_records_nothing_and_stops_nothing() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "session=; theme=dark; token=sess-abcdef"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"sess-abcdef") && values.contains(b"dark"),
+            "an empty pair must not stop the pairs after it"
+        );
+        assert!(
+            !values.contains(b""),
+            "an empty value is not a secret and must never become a needle"
+        );
+    }
+
+    /// A cookie value the request *also* carried in its own right — the same
+    /// bytes reaching the set as a filtered form field — needs full substring
+    /// masking, not the whole-token treatment a cookie value alone gets. The
+    /// classification must survive percent-decoding, whichever route the bytes
+    /// arrive by.
+    #[test]
+    fn a_direct_insert_outranks_a_decoded_cookie_spelling() {
+        let (_request, values) = redact(
+            Request::post("/login")
+                .header(header::COOKIE, "session=abc%2Fdef")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded"),
+            CapturedBody::Buffered(Bytes::from_static(b"token=abc%2Fdef")),
+            &filter_with(&["token"]),
+        );
+
+        assert_eq!(
+            mask_echoes("upstream rejected abc/defsuffix", &values),
+            format!("upstream rejected {FILTERED_PLACEHOLDER}suffix"),
+            "the form field carried these bytes in their own right, so they mask mid-token"
         );
     }
 
