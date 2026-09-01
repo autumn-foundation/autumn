@@ -518,10 +518,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key *inside* the URL, and the rate-limit backend echoed the configured URL
   into a `WARN` on both of its fallback-to-memory paths — writing that key to
   whatever log sink the app ships to. `autumn_web::redis_tls::redact_url`
-  masks the password, and deliberately over-redacts rather than under-redacts:
-  an Azure access key is base64, whose alphabet includes `/`, and an
-  un-encoded `/` is exactly what makes such a URL fail to parse and reach that
-  log line in the first place.
+  masks the password, and deliberately over-redacts rather than under-redacts.
+  Every input it sees on that path is malformed by definition, and malformed
+  is exactly where a redactor gives up: an Azure access key is base64, whose
+  alphabet includes `/`, and an un-encoded `/` ends the URL's authority early
+  — which is both why the URL fails to parse and why the log line is reached.
+  A mistyped scheme delimiter (`rediss:/:key@host`) leaves nothing to split
+  on at all. Neither returns the input untouched. The invalid-URL branch now
+  also logs no URL whatsoever, redacted or not: the `redis` error names the
+  problem without echoing the value.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its

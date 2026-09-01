@@ -86,20 +86,28 @@ pub fn ensure_tls_crypto_provider(url: &str) {
 /// returns nothing for malformed input is worse than one that leaves a
 /// malformed string alone.
 ///
-/// It over-redacts rather than under-redacts, which is the whole point on that
-/// failure path. An Azure access key is 44 characters of base64 whose alphabet
-/// includes `/`; pasted into a URL without percent-encoding, that `/` ends the
-/// authority early, which is *why* the URL failed to parse — and an
-/// authority-scoped search for the userinfo would then find no `@`, and hand
-/// the untouched key straight to the log. So when the authority holds no `@`,
-/// the search widens to the whole remainder: mistaking a path segment for a
-/// credential costs an ugly log line, missing a credential costs the
-/// credential.
+/// It over-redacts rather than under-redacts, and every early return is
+/// chosen on that basis, because each one is reached by *malformed* input —
+/// which is the only input this ever sees on the failure path.
+///
+/// Two shapes make that concrete. An Azure access key is 44 characters of
+/// base64 whose alphabet includes `/`; pasted without percent-encoding, that
+/// `/` ends the authority early, which is *why* the URL failed to parse — so
+/// an authority-scoped search for the userinfo finds no `@` and would hand
+/// the untouched key to the log. And a mistyped scheme delimiter
+/// (`rediss:/:key@host`) means there is no `://` to split on at all. Neither
+/// may return the input untouched: the search widens to the last `@` anywhere
+/// in the string, and a missing delimiter just means the whole string is
+/// treated as the part that might carry userinfo. Mistaking a path segment
+/// for a credential costs an ugly log line; missing one costs the credential.
 #[must_use]
 pub fn redact_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
+    // A well-formed delimiter splits scheme from the rest; a malformed or
+    // absent one is not grounds to give up — the credential is still in
+    // there, so treat the whole string as potentially carrying userinfo.
+    let (scheme_prefix, rest) = url
+        .split_once("://")
+        .map_or(("", url), |(scheme, rest)| (&url[..scheme.len() + 3], rest));
     // Userinfo is everything before the LAST `@` in the authority, since a
     // password may itself contain one. The authority runs to the first `/`,
     // `?` or `#` — but for a URL that failed to parse, that terminator may
@@ -108,17 +116,20 @@ pub fn redact_url(url: &str) -> String {
     // no credential to hide.
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let Some(at) = rest[..authority_end].rfind('@').or_else(|| rest.rfind('@')) else {
+        // No `@` at all: nothing shaped like a credential to hide.
         return url.to_owned();
     };
     // `rest_from_at` keeps the `@` and everything after it (host, port, path).
     let (userinfo, rest_from_at) = rest.split_at(at);
     let userinfo = match userinfo.split_once(':') {
+        // Split on the FIRST colon, not the last: a password may contain one,
+        // and cutting at the last would leave part of it in the clear.
         Some((user, _)) => format!("{user}:***"),
         // A bare username carries no secret; inventing a `:***` would imply
         // a password that is not there.
         None => userinfo.to_owned(),
     };
-    format!("{scheme}://{userinfo}{rest_from_at}")
+    format!("{scheme_prefix}{userinfo}{rest_from_at}")
 }
 
 /// Open a Redis client, installing the rustls `CryptoProvider` first when
@@ -268,6 +279,26 @@ mod tests {
             "the access key survived redaction: {redacted}"
         );
         assert!(redacted.contains("my-cache.redis.cache.windows.net"));
+    }
+
+    #[test]
+    fn redact_url_hides_a_key_behind_a_mistyped_scheme_delimiter() {
+        // Regression (Codex P1 on #2410): a value missing or mistyping `://`
+        // is rejected by `open_client` and therefore lands on the very log
+        // line this helper guards — so bailing out on a missing delimiter
+        // reproduced the whole secret verbatim.
+        for malformed in [
+            "rediss:/:8kQz-secret@cache.redis.cache.windows.net:6380",
+            "rediss:8kQz-secret@cache",
+            "redis:/user:8kQz-secret@host",
+            ":8kQz-secret@host:6380",
+        ] {
+            let redacted = redact_url(malformed);
+            assert!(
+                !redacted.contains("8kQz-secret"),
+                "the secret survived redaction of {malformed:?}: {redacted}"
+            );
+        }
     }
 
     #[test]

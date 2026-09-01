@@ -595,11 +595,14 @@ impl Limiter {
                         }
                     }
                     Err(err) => {
+                        // No `url` field here, redacted or otherwise: this arm
+                        // fires when the URL failed to PARSE, so its shape is
+                        // exactly what a redactor has least purchase on, and
+                        // the `redis` error text names the problem without
+                        // echoing the value. The key is not worth the
+                        // diagnostic (#2172).
                         tracing::warn!(
                             error = %err,
-                            // Redacted: a managed Redis carries its access key
-                            // in the URL (#2172).
-                            url = %crate::redis_tls::redact_url(url),
                             "rate-limit Redis backend: invalid Redis URL; \
                              falling back to memory"
                         );
