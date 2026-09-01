@@ -493,6 +493,7 @@ dependencies = [
  "proptest",
  "quote",
  "ratatui",
+ "rcgen",
  "reqwest 0.13.4",
  "rustls",
  "serde",

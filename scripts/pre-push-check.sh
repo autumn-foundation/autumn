@@ -107,7 +107,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # `--all-targets` form.
 step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" \
+  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
   --lib -- -D warnings
 
 # --- 5. Compile every workspace test target (compile-only) -------------------
