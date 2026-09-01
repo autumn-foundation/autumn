@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Mermaid,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "mermaid" => Ok(Self::Mermaid),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'mermaid'"
             )),
         }
     }
@@ -97,6 +99,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Mermaid => print_mermaid(&routes),
     }
 }
 
@@ -251,6 +254,44 @@ pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
+}
+
+/// Print routes as a Mermaid flowchart.
+pub fn print_mermaid(routes: &[RouteInfo]) {
+    if routes.is_empty() {
+        println!("No routes found.");
+        return;
+    }
+
+    let mermaid = format_mermaid(routes);
+    println!("{mermaid}");
+}
+
+/// Build the Mermaid string (extracted for testability).
+pub fn format_mermaid(routes: &[RouteInfo]) -> String {
+    let mut out = String::new();
+    out.push_str("flowchart LR\n");
+
+    // Group routes by source
+    let mut by_source: std::collections::BTreeMap<&str, Vec<&RouteInfo>> = std::collections::BTreeMap::new();
+    for route in routes {
+        by_source.entry(&route.source).or_default().push(route);
+    }
+
+    let mut node_id = 0;
+
+    for (source, source_routes) in by_source {
+        out.push_str(&format!("    subgraph {}\n", source.replace(':', "_").replace('-', "_")));
+
+        for route in source_routes {
+            node_id += 1;
+            let current_node = format!("route{}", node_id);
+            out.push_str(&format!("        {}(\"<b>{}</b> {}\")\n", current_node, route.method, route.path));
+        }
+        out.push_str("    end\n");
+    }
+
+    out
 }
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
@@ -540,6 +581,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_format_mermaid() {
+        let f: OutputFormat = "mermaid".parse().unwrap();
+        assert_eq!(f, OutputFormat::Mermaid);
+    }
+
+    #[test]
     fn parse_format_unknown_is_error() {
         let result: Result<OutputFormat, _> = "xml".parse();
         assert!(result.is_err());
@@ -717,6 +764,25 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&routes).unwrap();
         let parsed: Vec<RouteInfo> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), routes.len());
+    }
+
+    // ── format_mermaid ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_mermaid_contains_expected_nodes() {
+        let routes = sample_routes();
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.starts_with("flowchart LR"));
+        assert!(mermaid.contains("subgraph framework"));
+        assert!(mermaid.contains("subgraph plugin_harvest"));
+        assert!(mermaid.contains("subgraph user"));
+
+        // Check for specific routes
+        assert!(mermaid.contains("\"<b>GET</b> /about\""));
+        assert!(mermaid.contains("\"<b>GET</b> /api/posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
+        assert!(mermaid.contains("\"<b>POST</b> /posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /posts/{id}\""));
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────
