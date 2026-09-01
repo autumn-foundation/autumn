@@ -440,6 +440,12 @@ mod tests {
     }
 
     #[test]
+    fn filter_query_preserves_empty_keys_that_are_unlisted() {
+        let q = filter_query("=value&page=2", &["page"]);
+        assert_eq!(q, "=value");
+    }
+
+    #[test]
     fn window_small_total_has_no_ellipsis() {
         // 1..=5 all fit; no gaps.
         let items = page_window(3, 5, 2);
@@ -453,6 +459,32 @@ mod tests {
                 PageItem::Page(5),
             ]
         );
+    }
+
+    #[test]
+    fn window_lo_is_two_includes_page_one_without_ellipsis_or_two() {
+        let items = page_window(2, 5, 0); // current=2, radius=0 => lo=2, hi=2
+        // It should render: 1 (prefix), 2 (for loop), ..., 5 (suffix)
+        let expected = vec![
+            PageItem::Page(1),
+            PageItem::Page(2),
+            PageItem::Ellipsis,
+            PageItem::Page(5),
+        ];
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn window_hi_is_total_minus_one_includes_total_without_ellipsis_or_total_minus_two() {
+        let items = page_window(4, 5, 0); // current=4, radius=0 => lo=4, hi=4
+        // It should render: 1, ..., 4, 5
+        let expected = vec![
+            PageItem::Page(1),
+            PageItem::Ellipsis,
+            PageItem::Page(4),
+            PageItem::Page(5),
+        ];
+        assert_eq!(items, expected);
     }
 
     #[test]
@@ -498,6 +530,12 @@ mod tests {
         // page 1 should appear exactly once even though the window starts low.
         let ones = items.iter().filter(|i| **i == PageItem::Page(1)).count();
         assert_eq!(ones, 1, "{items:?}");
+    }
+
+    #[test]
+    fn window_returns_empty_or_one_when_radius_is_zero_and_total_is_zero_or_one() {
+        assert_eq!(page_window(1, 0, 0), vec![PageItem::Page(1)]);
+        assert_eq!(page_window(1, 1, 0), vec![PageItem::Page(1)]);
     }
 
     // ── filter_query ───────────────────────────────────────────────────
