@@ -39,6 +39,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing outside that crate can verify it. A CI gate installs every first-party
   plugin into a fresh `autumn new` scaffold and requires a green `cargo check`.
 
+- **ACME provisioning against a private CA, and an end-to-end proof of the whole
+  flow (#1608):** `[server.tls.acme] directory = { custom = { url = "..." } }`
+  was documented for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+  test server, but the ACME client verified the directory against the platform
+  trust store only, so unless that root was installed host-wide the TLS
+  handshake failed and every order died before an authorization was created. A
+  new `ca_root_path` names the PEM root that signs the ACME directory's *own*
+  HTTPS certificate; it replaces the client's trust anchors for the ACME control
+  plane only (never for what browsers accept from your site) and is unnecessary
+  for Let's Encrypt, whose staging and production API endpoints are both
+  publicly trusted. `autumn doctor` grades it as `acme_ca_root`, failing on a
+  path that is blank, unreadable, or yields no usable anchor — validated through
+  the very `CertificateDer::from_pem_file` + `RootCertStore::add` pair the
+  runtime uses — and warning when the file is a bundle (only its first
+  certificate is ever installed) or is pinned against a public Let's Encrypt
+  directory.
+
+  This closes the gap that kept the order flow itself untested: with a reachable
+  private directory, `autumn/tests/integration/acme_end_to_end.rs` now drives a
+  real `instant-acme` client over real TLS against an in-process fake CA
+  (`acme_fake_ca.rs` — no Docker, no network), which validates HTTP-01 against
+  the app's own challenge listener, checks the finalize CSR's SANs against the
+  order's identifiers, and issues from its own root with a caller-chosen
+  validity window. The suite covers first-boot issuance and the HTTP→HTTPS
+  redirect, a **forced near-expiry certificate rotating with no restart while a
+  connection opened before the swap keeps serving**, a restart reusing the
+  stored account and certificate instead of re-registering or re-ordering, and a
+  failed order landing in both `/actuator/health` and the error-reporting seam.
+  A new merge-blocking CI lane runs the suite on every push, alongside the
+  direct-TLS lane #1603 added, and `acme` joins the gated clippy feature set —
+  which is what puts `autumn/src/acme/**` under `-D warnings` for the first
+  time, since `--all-targets` lints only what the enabled features compile.
+
+  Also fixes a latent panic on this path: `ca_root_path` reaches
+  `rustls::ClientConfig::builder()`, which panics rather than erroring when it
+  cannot resolve a process-level `CryptoProvider` — the state any app reaches as
+  soon as a dependency enables `aws-lc-rs` alongside autumn's `ring`
+  (`telemetry-otlp` alone is enough). Building the ACME client now installs
+  `ring` as the default when nothing has set one, keeping any provider the
+  application chose deliberately.
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted
