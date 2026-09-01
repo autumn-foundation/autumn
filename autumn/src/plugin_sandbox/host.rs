@@ -1672,13 +1672,50 @@ fn sleb128(wasm: &[u8], at: usize) -> Option<(i64, usize)> {
 /// not happen, so the module is refused; the inner one means the walk
 /// succeeded and there was no active write to measure — a passive-only
 /// section copies nothing at instantiation — so there is nothing to refuse.
-fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<Option<u64>> {
+/// What a walk of the data section found.
+///
+/// Three answers, not two, and collapsing any pair of them has been a bug in
+/// this file already: reading "nothing to measure" as "the check did not run"
+/// refused a runnable module, and reading "the check did not run" as "nothing
+/// to measure" admitted a segment past the end of memory.
+enum DataSectionEnd {
+    /// The walk failed — a malformed section, or an opcode a later proposal
+    /// added that this does not know. The bounds check did not happen.
+    Unreadable,
+    /// The walk succeeded and found no active write to measure: every segment
+    /// is passive, so nothing is copied at instantiation.
+    NothingActive,
+    /// The furthest byte an active segment writes.
+    Furthest(u64),
+}
+
+impl DataSectionEnd {
+    /// What this contributes to the module's `data_end`.
+    ///
+    /// An unreadable section contributes `u64::MAX`, so an offset that cannot
+    /// be read is treated as one that cannot fit — silently contributing
+    /// nothing is how a segment past the end of memory got admitted.
+    const fn contribution(&self) -> u64 {
+        match *self {
+            Self::Unreadable => u64::MAX,
+            Self::NothingActive => 0,
+            Self::Furthest(end) => end,
+        }
+    }
+}
+
+fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> DataSectionEnd {
+    walk_data_section(wasm, start, section_end).unwrap_or(DataSectionEnd::Unreadable)
+}
+
+/// Walk the section, or `None` if it cannot be walked to the end.
+///
+/// The `?`s below are all the same answer — the walk did not finish, so the
+/// bounds check did not happen — and [`data_section_end`] turns that into
+/// [`DataSectionEnd::Unreadable`]. Kept separate so `?` can say it once rather
+/// than every early return spelling out the enum.
+fn walk_data_section(wasm: &[u8], start: usize, section_end: usize) -> Option<DataSectionEnd> {
     let (count, mut at) = leb128(wasm, start)?;
-    // `None` means "walked the whole section and found no active write to
-    // measure" — a passive-only section, or active offsets this cannot
-    // evaluate. It is wrapped so the caller can tell that apart from the outer
-    // `None` this returns when the walk itself fails: one is a module with
-    // nothing to check, the other is a check that did not happen.
     let mut furthest: Option<u64> = None;
     for _ in 0..count {
         let (flags, next) = leb128(wasm, at)?;
@@ -1706,7 +1743,7 @@ fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<Opt
             furthest = Some(furthest.map_or(segment_end, |f: u64| f.max(segment_end)));
         }
     }
-    Some(furthest)
+    Some(furthest.map_or(DataSectionEnd::NothingActive, DataSectionEnd::Furthest))
 }
 
 /// Section ids for the element and data sections.
@@ -1847,21 +1884,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             // (a `global.get`, say) is left alone: the shim exports no globals
             // for one to read, so such a module fails to link for its own
             // reasons rather than being mis-refused here.
-            match data_section_end(wasm, after_size, end) {
-                Some(Some(seen)) => data_end = data_end.max(seen),
-                // Walked the whole section and found no active write to
-                // measure: every segment is passive, so nothing is copied at
-                // instantiation and there is nothing that could be out of
-                // bounds. Distinct from the case below, and conflating the two
-                // refused a module that was perfectly runnable.
-                Some(None) => {}
-                // The walk lost the thread — a malformed section, or an opcode
-                // a later proposal added that this does not know. Either way
-                // the bounds check below did not run, and silently not running
-                // is how a segment past the end of memory got admitted. An
-                // offset that cannot be read is treated as one that cannot fit.
-                None => data_end = u64::MAX,
-            }
+            data_end = data_end.max(data_section_end(wasm, after_size, end).contribution());
         }
         // The sections whose leading count (or size) is the whole answer. The
         // rest need their entries walked and are handled above.
