@@ -583,7 +583,7 @@ mod redis_store {
         IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
         saturating_deadline,
     };
-    use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
+    use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
 
@@ -624,7 +624,7 @@ mod redis_store {
                      [idempotency.redis] url in autumn.toml."
                         .to_owned()
                 })?;
-            let client = Client::open(url).map_err(|e| e.to_string())?;
+            let client = crate::redis_tls::open_client(url).map_err(|e| e.to_string())?;
             let connection =
                 ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
                     .map_err(|e| e.to_string())?;

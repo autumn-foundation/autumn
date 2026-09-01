@@ -82,7 +82,7 @@ const LEDGER_UP: &str =
 ///
 /// Applied after `LEDGER_UP` because its backfill reads the revisions table.
 const LEDGER_HIGH_WATER_UP: &str =
-    include_str!("../../version_history_migrations/20260901000000_create_ledger_high_water/up.sql");
+    include_str!("../../version_history_migrations/20260901213107_create_ledger_high_water/up.sql");
 
 /// A `ledgered` repository implies `versioned`, so both tables must exist.
 const VERSION_HISTORY_UP: &str =

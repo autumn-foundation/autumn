@@ -2113,15 +2113,15 @@ mod tests {
                 ),
             ),
             (
-                include_str!("../migrations/20260901000000_create_ledger_high_water/up.sql"),
+                include_str!("../migrations/20260901213107_create_ledger_high_water/up.sql"),
                 include_str!(
-                    "../version_history_migrations/20260901000000_create_ledger_high_water/up.sql"
+                    "../version_history_migrations/20260901213107_create_ledger_high_water/up.sql"
                 ),
             ),
             (
-                include_str!("../migrations/20260901000000_create_ledger_high_water/down.sql"),
+                include_str!("../migrations/20260901213107_create_ledger_high_water/down.sql"),
                 include_str!(
-                    "../version_history_migrations/20260901000000_create_ledger_high_water/down.sql"
+                    "../version_history_migrations/20260901213107_create_ledger_high_water/down.sql"
                 ),
             ),
         ] {
@@ -2138,10 +2138,10 @@ mod tests {
     #[test]
     fn both_tiers_declare_the_same_high_water_columns() {
         let pg = include_str!(
-            "../version_history_migrations/20260901000000_create_ledger_high_water/up.sql"
+            "../version_history_migrations/20260901213107_create_ledger_high_water/up.sql"
         );
         let sqlite = include_str!(
-            "../version_history_migrations_sqlite/20260901000000_create_ledger_high_water/up.sql"
+            "../version_history_migrations_sqlite/20260901213107_create_ledger_high_water/up.sql"
         );
         for fragment in [
             LEDGER_HIGH_WATER_TABLE,

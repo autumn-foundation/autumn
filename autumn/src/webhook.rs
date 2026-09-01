@@ -826,7 +826,7 @@ impl RedisWebhookReplayStore {
             .as_deref()
             .filter(|url| !url.trim().is_empty())
             .ok_or(WebhookConfigError::RedisReplayMissingUrl)?;
-        let client = redis::Client::open(url)
+        let client = crate::redis_tls::open_client(url)
             .map_err(|error| WebhookConfigError::RedisReplayInvalidUrl(error.to_string()))?;
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
@@ -1617,7 +1617,7 @@ fn validate_redis_replay_config(
 
     #[cfg(feature = "redis")]
     {
-        redis::Client::open(url)
+        crate::redis_tls::open_client(url)
             .map_err(|error| WebhookConfigError::RedisReplayInvalidUrl(error.to_string()))?;
         Ok(())
     }

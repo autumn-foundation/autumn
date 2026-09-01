@@ -118,20 +118,6 @@ fn escape_redis_glob(s: &str) -> String {
     escaped
 }
 
-/// Whether `url` needs the `rustls` `CryptoProvider` installed to connect —
-/// true only for the two TLS schemes `redis::Client::open` itself
-/// recognizes (`rediss://` and Valkey's `valkeys://`), matched
-/// case-insensitively the same way `redis`'s own URL parsing (via the
-/// `url` crate, which lowercases the scheme while parsing) does. A plain
-/// `redis://`/`valkey://` URL never touches TLS, so it must not claim the
-/// process-wide default: doing so could pre-empt a later, unrelated
-/// attempt elsewhere in the process to install a different provider (e.g.
-/// `aws-lc-rs`) for something that actually needs one.
-fn needs_tls_crypto_provider(url: &str) -> bool {
-    let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
-    scheme.eq_ignore_ascii_case("rediss") || scheme.eq_ignore_ascii_case("valkeys")
-}
-
 impl RedisCache {
     /// Connect using an explicit URL and key prefix.
     ///
@@ -142,26 +128,13 @@ impl RedisCache {
         url: &str,
         key_prefix: impl Into<String>,
     ) -> Result<Self, RedisCacheError> {
-        // The workspace links both `ring` and `aws-lc-rs` (via other rustls
-        // consumers, e.g. opentelemetry-otlp's `tls-aws-lc`), so rustls can no
-        // longer auto-select a process-wide default `CryptoProvider` — and
-        // `redis`'s `tokio-rustls-comp` builds its `ClientConfig` via the
-        // short-form `rustls::ClientConfig::builder()`, which panics instead
-        // of erroring when that default is missing. Installing `ring` here
-        // (matching the backend already used by this workspace's other rustls
-        // call sites) makes a `rediss://` URL usable regardless of init
-        // order; `.ok()` makes it idempotent since a concurrent/earlier call
-        // may have already installed one. Scoped to `rediss://` URLs only —
-        // a plain `redis://` connection never touches TLS, so claiming the
-        // process-wide default here would be able to pre-empt a later,
-        // unrelated attempt elsewhere in the process to install a different
-        // provider (e.g. `aws-lc-rs`) for something that actually needs it.
-        if needs_tls_crypto_provider(url) {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .ok();
-        }
-        let client = redis::Client::open(url)?;
+        // `open_client`, not `redis::Client::open`: it installs the
+        // process-wide rustls `CryptoProvider` that `redis`'s
+        // `tokio-rustls-comp` needs before a `rediss://` URL can be dialled,
+        // and it is the same guard every Redis client inside `autumn-web`
+        // goes through. Scoped to TLS schemes there, so a plain `redis://`
+        // connection never claims the process-wide default. See #2172.
+        let client = autumn_web::redis_tls::open_client(url)?;
         let manager = ConnectionManager::new(client).await?;
         Ok(Self {
             manager,
@@ -528,28 +501,46 @@ mod tests {
         assert_eq!(ttl_millis_for_redis(std::time::Duration::ZERO), 1);
     }
 
+    /// This crate must not open its own Redis client: `RedisCache::connect`
+    /// goes through `autumn_web::redis_tls::open_client`, which installs the
+    /// process-level rustls `CryptoProvider` a `rediss://` URL needs before
+    /// rustls is asked to resolve one (#2172). Mirrors the identical scan in
+    /// `autumn_web::redis_tls` so the two crates cannot drift — a second,
+    /// hand-rolled install here is exactly how the `valkeys://` and
+    /// case-insensitivity gaps got fixed in one place and missed in another.
     #[test]
-    fn plain_redis_urls_do_not_claim_the_process_wide_tls_provider() {
-        assert!(!needs_tls_crypto_provider("redis://127.0.0.1:6379/"));
-        assert!(!needs_tls_crypto_provider("redis://user:pass@host:6379/0"));
-        assert!(!needs_tls_crypto_provider("valkey://127.0.0.1:6379/"));
+    fn the_cache_never_opens_a_redis_client_outside_the_shared_tls_guard() {
+        // Split so the needle does not match this test's own source line.
+        let needle = concat!("Client::", "open(");
+        let source = include_str!("lib.rs");
+        let offenders: Vec<_> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with('*') && line.contains(needle)
+            })
+            .map(|(index, line)| format!("lib.rs:{}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "open Redis clients through `autumn_web::redis_tls::open_client`, \
+             not directly — a `rediss://` URL otherwise reaches rustls with no \
+             process-level CryptoProvider installed and panics (#2172):\n{}",
+            offenders.join("\n")
+        );
     }
 
+    /// The TLS scheme classification itself is `autumn_web::redis_tls`'s
+    /// contract; this only pins that this crate is wired to the same one.
     #[test]
-    fn rediss_urls_still_claim_the_tls_provider() {
-        assert!(needs_tls_crypto_provider("rediss://127.0.0.1:6380/"));
-    }
-
-    #[test]
-    fn valkeys_urls_also_claim_the_tls_provider() {
-        // Regression: `redis::Client::open` (via the `url` crate, which
-        // lowercases the scheme while parsing) treats both `rediss://` and
-        // Valkey's `valkeys://` as TLS — a literal `starts_with("rediss://")`
-        // check missed `valkeys://` entirely, so a `valkeys://` connection
-        // could reach `ClientConfig::builder()` with no provider ever
-        // installed (if nothing else in the process had installed one
-        // first) and panic instead of returning a connection error.
-        assert!(needs_tls_crypto_provider("valkeys://127.0.0.1:6380/"));
+    fn the_shared_guard_classifies_the_tls_schemes_this_cache_is_deployed_on() {
+        assert!(autumn_web::redis_tls::url_needs_tls_crypto_provider(
+            "rediss://cache.redis.cache.windows.net:6380/"
+        ));
+        assert!(!autumn_web::redis_tls::url_needs_tls_crypto_provider(
+            "redis://127.0.0.1:6379/"
+        ));
     }
 
     #[test]
@@ -568,17 +559,6 @@ mod tests {
         assert_eq!(escape_redis_glob("a?b"), r"a\?b");
         assert_eq!(escape_redis_glob("[ab]"), r"\[ab]");
         assert_eq!(escape_redis_glob(r"back\slash"), r"back\\slash");
-    }
-
-    #[test]
-    fn tls_scheme_matching_is_case_insensitive() {
-        // Regression: a literal `starts_with("rediss://")` also missed a
-        // case-variant scheme such as `REDISS://` — valid per URL parsing
-        // (schemes are normalized to lowercase), and accepted the same way
-        // by `redis::Client::open`, but invisible to a case-sensitive
-        // prefix check.
-        assert!(needs_tls_crypto_provider("REDISS://127.0.0.1:6380/"));
-        assert!(needs_tls_crypto_provider("Valkeys://127.0.0.1:6380/"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

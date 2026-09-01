@@ -108,6 +108,66 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Audit: `AuditEvent` gains a `metadata` field
+
+**Why:** A retention sweep has to record three facts — which dataset, what
+cutoff, and how many rows it removed (issue #1605) — and `AuditEvent` had
+nowhere to put them. `metadata` is a flat `BTreeMap<String, String>` rather
+than arbitrary JSON so `AuditEvent` keeps `Eq` and a deterministic,
+key-ordered serialization, which is the shape SIEM ingestion expects. It is
+`#[serde(default)]` and skipped when empty, so **archives written before this
+release still deserialize and existing archive lines are unchanged.**
+
+Only code that constructs or destructures `AuditEvent` *by struct literal* has
+to change. `AuditEvent::new(...)` is unaffected, and so is every read of an
+existing field.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::audit::{AuditEvent, AuditStatus};
+
+let event = AuditEvent {
+    timestamp: chrono::Utc::now(),
+    actor_id: "admin-1".into(),
+    action: "user.role.update".into(),
+    target_resource_id: "user-99".into(),
+    ip_address: None,
+    status: AuditStatus::Success,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::audit::{AuditEvent, AuditStatus};
+
+// Preferred: the constructor, which fills `metadata` with an empty map.
+let event = AuditEvent::new(
+    "admin-1",
+    "user.role.update",
+    "user-99",
+    None,
+    AuditStatus::Success,
+);
+
+// …and, where the extra detail is useful:
+let event = event.with_metadata("reason", "promoted by support ticket 4412");
+```
+
+A struct literal still works if you add `metadata: Default::default()`, but
+prefer the constructor — it is the form that survives the next field.
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+the constructor), which no mechanical rewrite can choose safely.
+
+Also additive, and requiring no change: `AuditSink` gains a **provided**
+`purge_before(cutoff, dry_run)` method that defaults to reporting
+"unsupported". Existing sinks keep compiling untouched. Override it if your
+sink stores audit events somewhere that can be pruned in place and you want
+`retention.audit_archives` to reach it — see
+[Data Retention for Framework-Owned Data](../guide/data-retention.md).
+
 ### Failure capsules: `capsule::execute` takes `ReplayFixtures`, and the capsule format is version 3
 
 **Why:** Capsules now record every framework effect a failing run produced —

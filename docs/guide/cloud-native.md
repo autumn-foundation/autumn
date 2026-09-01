@@ -200,6 +200,9 @@ key_prefix = "my-app:sessions"
 The `prod` profile warns when you keep `backend = "memory"` without explicitly
 acknowledging it via `session.allow_memory_in_production = true`.
 
+A managed Redis that only exposes a TLS port takes a `rediss://` URL here —
+see [Redis over TLS](#redis-over-tls-rediss).
+
 ## Mail
 
 The `mail` cargo feature gives apps a `Mailer` extractor and log/file/SMTP
@@ -629,6 +632,31 @@ For read-through fills that coalesce concurrent misses into a single
 recompute (in-process single-flight, plus an opt-in distributed fill lock and
 stale-while-revalidate on the Redis backend), see [Cache Stampede
 Protection](cache-stampede.md).
+
+## Redis over TLS (`rediss://`)
+
+Managed Redis usually speaks TLS and often speaks *only* TLS. Azure Cache for
+Redis provisioned by `autumn release init --target azure-container-apps` sets
+`non_ssl_port_enabled = false`, and ElastiCache with transit encryption on
+behaves the same way, so the only URL you get is a `rediss://` one.
+
+Every Redis-backed subsystem accepts it — sessions, channels, jobs, job
+tracking, idempotency, webhook replay, rate limiting, and the
+`autumn-cache-redis` cache:
+
+```toml
+[session.redis]
+url = "rediss://:<access-key>@my-cache.redis.cache.windows.net:6380"
+```
+
+Valkey's `valkeys://` scheme works the same way. No extra Cargo feature is
+needed; TLS support is compiled in.
+
+Autumn installs the process-wide rustls `CryptoProvider` (`ring`) that the
+`redis` crate's TLS transport requires, once and only for TLS URLs. If your
+application installs its own provider — for example `aws-lc-rs` — install it
+before serving starts and Autumn keeps yours. A plaintext `redis://` URL never
+claims the default, so it cannot pre-empt that choice.
 
 ## Concurrent Writes
 
