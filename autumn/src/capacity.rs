@@ -320,27 +320,81 @@ pub struct Provenance {
 /// false pass) waiting to happen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Calibration {
+    /// Autumn profile the app was booted under (`prod` by default, matching
+    /// the deploy path).
+    ///
+    /// Profile overlays and smart defaults change middleware, backends and
+    /// pool sizing, so a contract measured under `dev` would govern a
+    /// materially different production binary.
+    #[serde(default = "default_calibration_profile")]
+    pub profile: String,
+    /// Cargo features the calibrated binary was built with, verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    /// Whether the binary was built with `--all-features`.
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub all_features: bool,
+    /// Whether the binary was built with `--no-default-features`.
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub no_default_features: bool,
     /// Seed for the request profile.
     pub seed: u64,
     /// Concurrency ladder walked, ascending.
     pub concurrency: Vec<usize>,
     /// Milliseconds each rung was held for.
     pub rung_ms: u64,
+    /// How many times each rung was measured, with the median taken.
+    ///
+    /// A single sample per rung makes the gate hostage to whatever else the
+    /// machine was doing during that one window; repeating and taking the
+    /// median is what the sibling dev-loop benchmarks do, and it is the
+    /// difference between a gate that flags regressions and one that flags
+    /// noisy neighbours.
+    #[serde(default = "default_runs")]
+    pub runs: u32,
     /// Milliseconds of discarded warmup before the ladder.
     pub warmup_ms: u64,
+}
+
+/// `skip_serializing_if` helper for the build-selection booleans.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false_flag(flag: &bool) -> bool {
+    !*flag
+}
+
+/// Serde default for [`Calibration::runs`].
+const fn default_runs() -> u32 {
+    DEFAULT_RUNS
+}
+
+/// Serde default for [`Calibration::profile`].
+fn default_calibration_profile() -> String {
+    DEFAULT_PROFILE.to_owned()
 }
 
 impl Default for Calibration {
     /// The shipped defaults, used when a contract predates this section.
     fn default() -> Self {
         Self {
+            profile: default_calibration_profile(),
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
             seed: DEFAULT_SEED,
             concurrency: DEFAULT_LADDER.to_vec(),
             rung_ms: DEFAULT_RUNG_MS,
+            runs: DEFAULT_RUNS,
             warmup_ms: DEFAULT_WARMUP_MS,
         }
     }
 }
+
+/// Profile a calibration runs under unless told otherwise.
+///
+/// `prod` rather than the ambient default: `autumn deploy` pins the deployment
+/// profile, so calibrating under `dev` would measure a configuration nobody
+/// ships.
+pub const DEFAULT_PROFILE: &str = "prod";
 
 /// Default seed for the request profile.
 ///
@@ -354,6 +408,8 @@ pub const DEFAULT_LADDER: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 pub const DEFAULT_RUNG_MS: u64 = 2000;
 /// Default milliseconds of discarded warmup.
 pub const DEFAULT_WARMUP_MS: u64 = 1000;
+/// Default number of measurements per rung; the median is recorded.
+pub const DEFAULT_RUNS: u32 = 3;
 
 /// The proven envelope: what the build sustains, and what it will admit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

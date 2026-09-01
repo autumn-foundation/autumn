@@ -36,8 +36,8 @@ use autumn_web::capacity::{
 
 use crate::capacity::{
     CheckOutcome, DumpedRoute, RungSamples, RungStats, SaturationOptions, Tolerances,
-    calibratable_targets, check_contract, find_saturation, plan_requests, render_check_report,
-    route_shapes,
+    calibratable_targets, check_contract, find_saturation, median_rung, plan_requests,
+    render_check_report, route_shapes,
 };
 use crate::cold_start_driver::{reserve_free_port, stop_child};
 
@@ -81,12 +81,23 @@ pub struct CalibrateOptions<'a> {
     pub contract_path: &'a str,
     /// Gate mode: compare against the committed contract instead of writing.
     pub check: bool,
+    /// Autumn profile to calibrate under. `None` means the user did not name
+    /// one.
+    pub profile: Option<String>,
+    /// Cargo feature selection for the calibrated build.
+    pub features: crate::routes::CargoFeatures,
+    /// Whether the user named any part of the feature selection.
+    pub named_features: bool,
+    /// Explicit calibration targets, overriding route discovery.
+    pub targets: Vec<String>,
     /// Seed for the request profile. `None` means the user did not name one.
     pub seed: Option<u64>,
     /// Concurrency ladder to walk. Empty means the user did not name one.
     pub concurrency: Vec<usize>,
     /// Milliseconds to hold each rung. `None` means unspecified.
     pub rung_ms: Option<u64>,
+    /// Measurements per rung (median taken). `None` means unspecified.
+    pub runs: Option<u32>,
     /// Milliseconds of discarded warmup. `None` means unspecified.
     pub warmup_ms: Option<u64>,
     /// Regression tolerances used by `--check`.
@@ -99,33 +110,10 @@ pub struct CalibrateOptions<'a> {
 pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
     eprintln!("\u{1F342} autumn calibrate\n");
 
-    let binary = build_binary(opts);
-
-    let dump = match dump_routes(&binary) {
-        Ok(dump) => dump,
-        Err(error) => {
-            eprintln!("\u{2717} {error}");
-            return 1;
-        }
-    };
-
-    let shapes = route_shapes(&dump);
-    let targets = calibratable_targets(&dump);
-    if targets.is_empty() {
-        eprintln!(
-            "\u{2717} no calibratable routes found.\n\n  \
-             A calibration run drives load against unauthenticated `GET` routes with no \
-             path\n  parameters, so it measures handlers rather than auth rejections or \
-             404s.\n  This app exposes none, so there is nothing to calibrate yet."
-        );
-        return 1;
-    }
-
-    // `--check` must replay the workload the committed contract was measured
-    // with, not this invocation's defaults: comparing an envelope taken with
-    // `--concurrency 1,8,64 --rung-ms 5000` against one taken with the default
-    // ladder compares two different experiments, and the verdict would be about
-    // the flags rather than the build.
+    // Resolved before anything is built or booted: in `--check` mode the
+    // committed contract's own profile, feature selection and workload are
+    // what this run must reproduce, and all three change what gets compiled
+    // and what the route graph looks like.
     let committed = if opts.check {
         match CapacityContract::load(opts.contract_path) {
             Ok(contract) => Some(contract),
@@ -149,8 +137,48 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         }
     };
 
+    let features = crate::routes::CargoFeatures {
+        features: calibration.features.clone(),
+        all: calibration.all_features,
+        no_default: calibration.no_default_features,
+    };
+    let binary = build_binary(opts, &features);
+    let manifest_dir = package_manifest_dir(opts.package);
+
+    let dump = match dump_routes(&binary, &calibration.profile, manifest_dir.as_deref()) {
+        Ok(dump) => dump,
+        Err(error) => {
+            eprintln!("\u{2717} {error}");
+            return 1;
+        }
+    };
+
+    let shapes = route_shapes(&dump);
+    // An explicit `--target` wins: route discovery is deliberately
+    // conservative, and a `GET` that needs query parameters or headers looks
+    // callable but answers 4xx. Naming the paths is the escape hatch.
+    let targets = if opts.targets.is_empty() {
+        calibratable_targets(&dump)
+    } else {
+        let mut explicit = opts.targets.clone();
+        explicit.sort();
+        explicit.dedup();
+        explicit
+    };
+    if targets.is_empty() {
+        eprintln!(
+            "\u{2717} no calibratable routes found.\n\n  \
+             A calibration run drives load against unauthenticated `GET` routes with no \
+             path\n  parameters, so it measures handlers rather than auth rejections or \
+             404s.\n  Name the paths explicitly with --target if this app serves some \
+             another way."
+        );
+        return 1;
+    }
+
     eprintln!(
-        "  {} route(s) in the graph, {} calibratable target(s), seed {}, ladder {:?}",
+        "  profile {}, {} route(s) in the graph, {} target(s), seed {}, ladder {:?}",
+        calibration.profile,
         shapes.len(),
         targets.len(),
         calibration.seed,
@@ -166,9 +194,15 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
     };
 
     // `targets` is non-empty (checked above) and sorted, so the first entry is
-    // a stable, unauthenticated, parameterless GET this app really serves.
+    // a stable target this app really serves.
     let ready_path = targets.first().map_or("/", String::as_str);
-    let child = match boot(&binary, port, ready_path) {
+    let child = match boot(
+        &binary,
+        port,
+        ready_path,
+        &calibration.profile,
+        manifest_dir.as_deref(),
+    ) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("\u{2717} {error}");
@@ -179,7 +213,7 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
     // A guard rather than a bare `stop_child` call: a worker panic propagating
     // out of `thread::scope` inside `measure` would otherwise unwind past the
     // cleanup and leave the calibrated app running, holding its port.
-    let mut child = ChildGuard(child);
+    let mut child = ChildGuard::new(child);
     let rungs = measure(&calibration, port, &targets);
     child.stop();
 
@@ -221,9 +255,31 @@ fn resolve_calibration(
     let named_workload = opts.seed.is_some()
         || !opts.concurrency.is_empty()
         || opts.rung_ms.is_some()
-        || opts.warmup_ms.is_some();
+        || opts.runs.is_some()
+        || opts.warmup_ms.is_some()
+        || opts.profile.is_some()
+        || opts.named_features;
 
     let resolved = Calibration {
+        profile: opts
+            .profile
+            .clone()
+            .unwrap_or_else(|| baseline.profile.clone()),
+        features: if opts.named_features {
+            opts.features.features.clone()
+        } else {
+            baseline.features.clone()
+        },
+        all_features: if opts.named_features {
+            opts.features.all
+        } else {
+            baseline.all_features
+        },
+        no_default_features: if opts.named_features {
+            opts.features.no_default
+        } else {
+            baseline.no_default_features
+        },
         seed: opts.seed.unwrap_or(baseline.seed),
         concurrency: if opts.concurrency.is_empty() {
             baseline.concurrency.clone()
@@ -231,12 +287,20 @@ fn resolve_calibration(
             normalized_ladder(&opts.concurrency)
         },
         rung_ms: opts.rung_ms.unwrap_or(baseline.rung_ms),
+        runs: opts.runs.unwrap_or(baseline.runs),
         warmup_ms: opts.warmup_ms.unwrap_or(baseline.warmup_ms),
     };
 
     if resolved.concurrency.is_empty() {
         return Err(
             "the concurrency ladder is empty; pass at least one positive value to --concurrency"
+                .to_owned(),
+        );
+    }
+    if resolved.runs == 0 {
+        return Err(
+            "--runs must be positive: the median of zero measurements is not a \
+                    number anyone can gate on"
                 .to_owned(),
         );
     }
@@ -265,9 +329,14 @@ fn resolve_calibration(
 /// past `find_saturation`'s ascending-order assumption.
 fn normalize_recorded(calibration: &Calibration) -> Calibration {
     Calibration {
+        profile: calibration.profile.clone(),
+        features: calibration.features.clone(),
+        all_features: calibration.all_features,
+        no_default_features: calibration.no_default_features,
         seed: calibration.seed,
         concurrency: normalized_ladder(&calibration.concurrency),
         rung_ms: calibration.rung_ms,
+        runs: calibration.runs,
         warmup_ms: calibration.warmup_ms,
     }
 }
@@ -286,26 +355,103 @@ fn normalize_recorded(calibration: &Calibration) -> Calibration {
 /// Infallible from this side: both helpers report and exit the process
 /// themselves on a compilation or resolution failure, exactly as `autumn
 /// routes` does.
-fn build_binary(opts: &CalibrateOptions<'_>) -> PathBuf {
+fn build_binary(opts: &CalibrateOptions<'_>, features: &crate::routes::CargoFeatures) -> PathBuf {
     eprintln!("  building (release) \u{2026}");
-    crate::routes::compile_binary_with_profile(
-        opts.package,
-        opts.bin,
-        &crate::routes::CargoFeatures::default(),
-        true,
-    );
+    // The deployed binary's feature selection is forwarded verbatim. Measuring
+    // a default-feature build and then enforcing its limit on a production
+    // binary that enables more is a contract about a program nobody runs.
+    crate::routes::compile_binary_with_profile(opts.package, opts.bin, features, true);
     crate::routes::find_binary_in_profile(opts.package, opts.bin, true)
+}
+
+/// Directory the calibrated package's `autumn.toml` lives in.
+///
+/// A workspace member selected with `-p` must be booted against *its* manifest,
+/// not the workspace root's: autumn's config loader searches the working
+/// directory, so without this the child would read a root `autumn.toml` (or
+/// none) and calibrate a configuration the package never runs.
+fn package_manifest_dir(package: Option<&str>) -> Option<PathBuf> {
+    let package = package?;
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    metadata
+        .get("packages")?
+        .as_array()?
+        .iter()
+        .find(|pkg| pkg.get("name").and_then(serde_json::Value::as_str) == Some(package))
+        .and_then(|pkg| pkg.get("manifest_path"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|manifest| Path::new(manifest).parent().map(Path::to_path_buf))
+}
+
+/// Environment every child of a calibration run shares.
+///
+/// Two jobs. First, pin the profile rather than inherit the caller's ambient
+/// one: `autumn deploy` pins the deployment profile, so a contract measured
+/// under `dev` would govern a configuration nobody ships.
+///
+/// Second, satisfy the boot-time prerequisites that profile fails fast on, so
+/// a throwaway localhost process can actually start. A release build defaults
+/// to `prod`, which refuses to boot without a signing secret and without
+/// `[security.trusted_hosts]`. Both are supplied here with values scoped to
+/// this one loopback run — a per-run random secret that never leaves the
+/// process tree, and loopback-only trusted hosts. Neither is
+/// performance-relevant, so neither moves the envelope; anything the operator
+/// has already set in their own environment is left alone, so a calibration
+/// against a real configuration keeps it.
+fn child_env(profile: &str) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("AUTUMN_ENV".to_owned(), profile.to_owned()),
+        // Calibration must measure the app, not a ceiling it already carried.
+        (
+            "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS".to_owned(),
+            "0".to_owned(),
+        ),
+        ("AUTUMN_SERVER__CAPACITY_CONTRACT".to_owned(), String::new()),
+    ];
+
+    let mut default_env = |key: &str, value: String| {
+        if std::env::var_os(key).is_none() {
+            env.push((key.to_owned(), value));
+        }
+    };
+
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_ok() {
+        default_env("AUTUMN_SECURITY__SIGNING_SECRET", hex::encode(bytes));
+    }
+    default_env(
+        "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
+        "127.0.0.1,localhost".to_owned(),
+    );
+
+    env
 }
 
 /// Owns the calibrated app process and reaps it on drop, including while
 /// unwinding.
-struct ChildGuard(std::process::Child);
+struct ChildGuard(Option<std::process::Child>);
 
 impl ChildGuard {
-    /// Stop the child now. Idempotent — `stop_child` on an already-exited
-    /// process is a no-op, so the `Drop` impl running afterwards is harmless.
+    const fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Stop the child now, and remember that it is gone.
+    ///
+    /// The `Option` matters: signalling an already-reaped pid makes
+    /// `stop_child` warn about `ESRCH`, so a plain second call would print a
+    /// scary line at the end of every successful run.
     fn stop(&mut self) {
-        stop_child(&mut self.0);
+        if let Some(mut child) = self.0.take() {
+            stop_child(&mut child);
+        }
     }
 }
 
@@ -316,9 +462,22 @@ impl Drop for ChildGuard {
 }
 
 /// Read the app's route graph back through `AUTUMN_DUMP_ROUTES`.
-fn dump_routes(binary: &Path) -> Result<Vec<DumpedRoute>, String> {
-    let output = Command::new(binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
+fn dump_routes(
+    binary: &Path,
+    profile: &str,
+    manifest_dir: Option<&Path>,
+) -> Result<Vec<DumpedRoute>, String> {
+    let mut command = Command::new(binary);
+    command.env("AUTUMN_DUMP_ROUTES", "1");
+    // The route graph is profile-dependent, so the dump must be taken under
+    // the same profile the ladder will run under.
+    for (key, value) in child_env(profile) {
+        command.env(key, value);
+    }
+    if let Some(dir) = manifest_dir {
+        command.current_dir(dir);
+    }
+    let output = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
@@ -343,13 +502,24 @@ fn dump_routes(binary: &Path) -> Result<Vec<DumpedRoute>, String> {
 /// and every calibration would burn the full timeout without measuring
 /// anything. A 2xx from a route we are about to load-test is a stronger
 /// readiness signal anyway.
-fn boot(binary: &Path, port: u16, ready_path: &str) -> Result<std::process::Child, String> {
-    let mut child = Command::new(binary)
+fn boot(
+    binary: &Path,
+    port: u16,
+    ready_path: &str,
+    profile: &str,
+    manifest_dir: Option<&Path>,
+) -> Result<std::process::Child, String> {
+    let mut command = Command::new(binary);
+    command
         .env("AUTUMN_SERVER__PORT", port.to_string())
-        .env("AUTUMN_SERVER__HOST", "127.0.0.1")
-        // See the module docs: calibration must not measure a ceiling.
-        .env("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "0")
-        .env("AUTUMN_SERVER__CAPACITY_CONTRACT", "")
+        .env("AUTUMN_SERVER__HOST", "127.0.0.1");
+    for (key, value) in child_env(profile) {
+        command.env(key, value);
+    }
+    if let Some(dir) = manifest_dir {
+        command.current_dir(dir);
+    }
+    let mut child = command
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -421,14 +591,23 @@ fn measure(calibration: &Calibration, port: u16, targets: &[String]) -> Vec<Rung
     // one is. Normalising here makes the flag order-insensitive.
     let mut rungs = Vec::with_capacity(calibration.concurrency.len());
     for &concurrency in &calibration.concurrency {
-        let samples = drive(
-            &client,
-            &base,
-            &plan,
-            concurrency,
-            Duration::from_millis(calibration.rung_ms),
-        );
-        rungs.push(RungStats::from_samples(&samples));
+        // Repeat each rung and keep the median: one window is hostage to
+        // whatever else the machine was doing during it.
+        let repeats: Vec<RungStats> = (0..calibration.runs.max(1))
+            .map(|_| {
+                let samples = drive(
+                    &client,
+                    &base,
+                    &plan,
+                    concurrency,
+                    Duration::from_millis(calibration.rung_ms),
+                );
+                RungStats::from_samples(&samples)
+            })
+            .collect();
+        if let Some(median) = median_rung(&repeats) {
+            rungs.push(median);
+        }
     }
     rungs
 }

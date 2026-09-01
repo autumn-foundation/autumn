@@ -1537,6 +1537,26 @@ enum Commands {
         /// tolerance versus the committed contract. Writes nothing.
         #[arg(long)]
         check: bool,
+        /// Autumn profile to calibrate under — the configuration the contract
+        /// will govern.
+        /// [default: prod; with --check, the committed contract's own profile]
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Cargo features for the calibrated build (repeatable; comma- or
+        /// space-separated inside one). Measure the binary you deploy.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Build the calibrated binary with `--all-features`.
+        #[arg(long)]
+        all_features: bool,
+        /// Build the calibrated binary with `--no-default-features`.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Drive load against these paths instead of the discovered ones
+        /// (repeatable). Use when a route needs query parameters or headers
+        /// the driver cannot invent.
+        #[arg(long = "target", value_name = "PATH")]
+        targets: Vec<String>,
         /// Seed for the request profile, so a calibration is replayable.
         /// [default: 1733; with --check, the committed contract's own seed]
         #[arg(long, value_name = "SEED")]
@@ -1553,6 +1573,11 @@ enum Commands {
         /// [default: 1000; with --check, the committed value]
         #[arg(long, value_name = "MS")]
         warmup_ms: Option<u64>,
+        /// Measurements per rung; the median is recorded. Raise it on a noisy
+        /// machine.
+        /// [default: 3; with --check, the committed value]
+        #[arg(long, value_name = "N")]
+        runs: Option<u32>,
         /// Fractional sustained-throughput drop `--check` tolerates.
         #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
         tolerance_rps: f64,
@@ -4239,10 +4264,16 @@ fn run_command(command: Commands) {
             bin,
             contract,
             check,
+            profile,
+            features,
+            all_features,
+            no_default_features,
+            targets,
             seed,
             concurrency,
             rung_ms,
             warmup_ms,
+            runs,
             tolerance_rps,
             tolerance_p99,
             json,
@@ -4252,10 +4283,19 @@ fn run_command(command: Commands) {
                 bin: bin.as_deref(),
                 contract_path: &contract,
                 check,
+                profile,
+                named_features: !features.is_empty() || all_features || no_default_features,
+                features: routes::CargoFeatures {
+                    features,
+                    all: all_features,
+                    no_default: no_default_features,
+                },
+                targets,
                 seed,
                 concurrency,
                 rung_ms,
                 warmup_ms,
+                runs,
                 tolerances: capacity::Tolerances {
                     rps: tolerance_rps,
                     p99: tolerance_p99,

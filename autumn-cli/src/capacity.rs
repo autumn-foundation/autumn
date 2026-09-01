@@ -30,9 +30,13 @@ use serde::Deserialize;
 /// Default band a rebuild's sustained throughput may fall inside before
 /// `--check` calls it a regression.
 ///
-/// Sized between observed run-to-run noise (single-digit percent on a quiet
-/// host) and the 30% regression the issue's Success Metric requires be caught.
-pub const DEFAULT_RPS_TOLERANCE: f64 = 0.15;
+/// Sized between observed run-to-run noise and the 30% regression the issue's
+/// Success Metric requires be caught. That window is narrower than it looks:
+/// repeated no-op calibrations of an identical build on a shared 4-vCPU runner
+/// spread by up to 20% before median-of-repeats was introduced, so this sits
+/// deliberately close to the regression it must catch. A capacity gate needs a
+/// runner class quiet enough for the two to stay separated — see the guide.
+pub const DEFAULT_RPS_TOLERANCE: f64 = 0.20;
 
 /// Default band a rebuild's P99 latency may rise inside before `--check`
 /// calls it a regression. Wider than the throughput band: tail latency is the
@@ -133,6 +137,28 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     let rank = scaled.ceil().max(1.0) as usize;
     let idx = rank.min(sorted.len()).saturating_sub(1);
     sorted.get(idx).copied().unwrap_or(0.0)
+}
+
+/// The median of repeated measurements of one rung, by throughput.
+///
+/// A single sample per rung makes the whole gate hostage to whatever else the
+/// machine was doing during that one window. Measured on a shared runner, the
+/// spread between repeats of an *identical* build reached 20% — wider than the
+/// throughput tolerance itself, which would fail no-op rebuilds. Taking the
+/// median of an odd number of repeats is what the sibling dev-loop benchmarks
+/// do, and it collapses that spread without pretending the noise is not there.
+///
+/// The whole `RungStats` of the median-throughput repeat is returned, rather
+/// than a per-field median, so the reported P99 and error rate belong to the
+/// same measurement as the reported throughput.
+#[must_use]
+pub fn median_rung(repeats: &[RungStats]) -> Option<RungStats> {
+    if repeats.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&RungStats> = repeats.iter().collect();
+    sorted.sort_by(|a, b| a.rps.total_cmp(&b.rps));
+    sorted.get(sorted.len() / 2).map(|stats| (*stats).clone())
 }
 
 /// Knobs for the saturation rule.
@@ -565,15 +591,24 @@ pub fn route_shapes(dump: &[DumpedRoute]) -> Vec<RouteShape> {
 ///   substitute and a fabricated one measures the 404 path.
 /// - **Not `gated`**, because an unauthenticated run would measure the auth
 ///   rejection, not the handler.
-/// - **Application routes only**, since framework probes are exempt from load
-///   shedding anyway and would flatter the envelope.
+/// - **Not framework-owned**, since probes are exempt from load shedding
+///   anyway and would flatter the envelope. Plugin routes *are* included: they
+///   run in the same process, are governed by the same admission limit, and an
+///   app whose public traffic is served by a plugin would otherwise be
+///   calibrated against whatever cheap route it happened to write by hand.
+///
+/// A parameterless `GET` is not automatically callable — one that needs query
+/// values or headers answers 4xx, and enough of those make every rung exceed
+/// the error threshold so no envelope is recorded (loudly, rather than
+/// wrongly). `--target` names the paths explicitly when that happens.
 #[must_use]
 pub fn calibratable_targets(dump: &[DumpedRoute]) -> Vec<String> {
     let mut targets: Vec<String> = dump
         .iter()
         .filter(|r| {
             r.method.eq_ignore_ascii_case("GET")
-                && r.source == "user"
+                && r.source != "framework"
+                && r.classification != "framework"
                 && r.classification != "gated"
                 && !r.path.contains('{')
         })
@@ -777,6 +812,39 @@ mod tests {
             error_rate: 0.0,
         }];
         assert!(find_saturation(&empty, &SaturationOptions::default()).is_none());
+    }
+
+    #[test]
+    fn the_median_repeat_is_taken_whole() {
+        // The reported P99 must belong to the same measurement as the reported
+        // throughput, so the median is a whole rung, not a per-field median.
+        let repeats = [
+            RungStats {
+                rps: 900.0,
+                p99_ms: 9.0,
+                ..stats(8, 0.0, 0.0)
+            },
+            RungStats {
+                rps: 100.0,
+                p99_ms: 1.0,
+                ..stats(8, 0.0, 0.0)
+            },
+            RungStats {
+                rps: 500.0,
+                p99_ms: 5.0,
+                ..stats(8, 0.0, 0.0)
+            },
+        ];
+        let median = median_rung(&repeats).expect("a median");
+        assert!((median.rps - 500.0).abs() < 1e-9);
+        assert!(
+            (median.p99_ms - 5.0).abs() < 1e-9,
+            "p99 must come from the same repeat"
+        );
+
+        assert!(median_rung(&[]).is_none());
+        let single = [stats(4, 42.0, 1.0)];
+        assert!((median_rung(&single).expect("a median").rps - 42.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1014,8 +1082,17 @@ mod tests {
                 source: "framework".to_owned(),
                 ..dumped("GET", "/live", "framework", "compute-bound", &[])
             },
+            // A plugin route runs in the same process and is governed by the
+            // same admission limit, so it belongs in the measured workload.
+            DumpedRoute {
+                source: "plugin:media".to_owned(),
+                ..dumped("GET", "/media/gallery", "public", "io-bound", &["storage"])
+            },
         ];
 
-        assert_eq!(calibratable_targets(&dump), vec!["/about".to_owned()]);
+        assert_eq!(
+            calibratable_targets(&dump),
+            vec!["/about".to_owned(), "/media/gallery".to_owned()]
+        );
     }
 }

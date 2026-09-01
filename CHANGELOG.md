@@ -54,9 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capacity_contract = "capacity.lock"
   ```
 
-  The contract also records the workload that produced it (seed, ladder, rung
-  duration), and `--check` replays that rather than its own defaults — an
-  envelope only means something next to the experiment behind it. Setting
+  The contract also records the workload that produced it — profile, Cargo
+  features, seed, ladder, rung duration and repeat count — and `--check`
+  replays all of it rather than its own defaults, since an envelope only means
+  something next to the experiment behind it. Each rung is measured three times
+  and the median kept: a single sample per rung spread by up to 20% across
+  no-op rebuilds of an identical build on a shared runner, which is wider than
+  the regression tolerance itself. Setting
   `[server] capacity_contract` also makes `autumn deploy` ship the contract
   alongside the manifest that names it.
 

@@ -39,7 +39,8 @@ The run:
 3. Boots the binary on a reserved port **with admission control switched off**,
    so the run measures the app rather than a ceiling it was already carrying.
 4. Warms up, then walks a seeded concurrency ladder (`1,2,4,8,16,32,64` by
-   default), holding each rung for two seconds.
+   default), holding each rung for two seconds and **measuring it three times,
+   keeping the median**.
 5. Records the **saturation knee** — the last rung where more concurrency still
    bought materially more throughput — and writes `capacity.lock`.
 
@@ -75,9 +76,11 @@ logical_cpus = 8
 total_memory_mb = 16384
 
 [calibration]
+profile = "prod"
 seed = 1733
 concurrency = [1, 2, 4, 8, 16, 32, 64]
 rung_ms = 2000
+runs = 3
 warmup_ms = 1000
 
 [envelope]
@@ -94,18 +97,43 @@ shape = "db-bound"
 pools = ["db"]
 ```
 
-Useful flags: `--concurrency 1,4,16,64,256` to reshape the ladder, `--rung-ms`
-and `--warmup-ms` to trade run time for stability, `--seed` to change the
-request profile, `-p` / `--bin` to pick a target in a workspace.
+Useful flags: `--concurrency 1,4,16,64,256` to reshape the ladder, `--runs` and
+`--rung-ms` to trade run time for stability, `--seed` to change the request
+profile, `-p` / `--bin` to pick a target in a workspace, `--features` /
+`--all-features` / `--no-default-features` to build the binary you actually
+deploy, `--profile` to calibrate under a profile other than `prod`, and
+`--target /path` to name the routes to drive when discovery is too
+conservative.
+
+### Profile, features, and the binary you deploy
+
+A contract is only worth as much as the resemblance between the calibrated
+binary and the deployed one, so both the Cargo feature selection and the autumn
+profile are recorded and replayed:
+
+- The binary is built **in release mode** with whatever `--features` you pass.
+  Calibrating a default-feature build and then enforcing its limit on a
+  production binary that enables more is a contract about a program nobody runs.
+- The app boots under **`prod`** by default — the profile `autumn deploy` pins
+  — not the ambient one. Profile overlays change middleware, backends and pool
+  sizing, so a `dev` envelope would govern a materially different program.
+- Because `prod` fails fast on missing prerequisites, the run supplies a
+  per-run random signing secret and loopback-only trusted hosts, scoped to that
+  one throwaway process. Neither is performance-relevant, and anything already
+  set in your environment is left alone.
+- `-p <member>` boots the child in *that package's* directory, so it reads its
+  own `autumn.toml` rather than the workspace root's.
 
 The workload is recorded in the contract, and `--check` **replays it** rather
 than its own defaults:
 
 ```toml
 [calibration]
+profile = "prod"
 seed = 1733
 concurrency = [1, 2, 4, 8, 16, 32, 64]
 rung_ms = 2000
+runs = 3
 warmup_ms = 1000
 ```
 
@@ -161,7 +189,7 @@ non-zero with a human-readable diff:
     - sustained throughput regressed 30.2% (4210.5 → 2940.1 req/s), beyond the 15.0% tolerance
 ```
 
-Tolerances default to **15% for throughput** and **25% for P99**, adjustable
+Tolerances default to **20% for throughput** and **25% for P99**, adjustable
 with `--tolerance-rps` / `--tolerance-p99`. They are sized to sit between
 observed run-to-run noise on a quiet host and a regression worth paging about.
 The P99 band also carries **1 ms of absolute slack** on top of the proportional
@@ -206,6 +234,28 @@ different class exits non-zero with a distinct diagnosis:
 Give the capacity gate a dedicated CI lane on a stable runner class. Bolting it
 onto a shared, noisy-neighbour lane produces exactly the false positives the
 tolerances are designed to avoid.
+
+### How much noise to expect
+
+This is worth being concrete about, because it decides whether the gate is
+worth having. Measured on a shared 4-vCPU container, repeatedly calibrating an
+**identical** build:
+
+| Method | Spread across no-op rebuilds | No-op rebuilds passing |
+|---|---|---|
+| One measurement per rung | up to **20%** | 1 of 3 |
+| Median of three (the default) | up to **8%** | 5 of 5 |
+
+A single sample per rung makes the verdict hostage to whatever else the machine
+was doing during that one window — wider than the throughput tolerance itself,
+so no-op rebuilds fail. `--runs` (default 3) is the mitigation, and `--runs 5`
+is worth it on a machine you do not control.
+
+Even so, the gap between 20% noise and the 30% regression the gate exists to
+catch is not comfortable. **Give this gate the quietest runner class you have**,
+and treat a single red `--check` on a shared runner as a prompt to re-run, not
+as proof. The tolerance defaults are deliberately close to the regressions they
+must catch; widening them further would make the gate decorative.
 
 ---
 
