@@ -474,6 +474,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "csv",
  "ctrlc",
  "diesel",
  "diesel_migrations",

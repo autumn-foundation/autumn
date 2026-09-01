@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Csv,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "csv" => Ok(Self::Csv),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'csv'"
             )),
         }
     }
@@ -97,6 +99,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Csv => print_csv(&routes),
     }
 }
 
@@ -251,6 +254,50 @@ pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
+}
+
+/// Build the CSV string (extracted for testability).
+pub fn format_csv(routes: &[RouteInfo]) -> String {
+    let mut wtr = csv::Writer::from_writer(vec![]);
+
+    // Write header
+    let _ = wtr.write_record([
+        "Method",
+        "Path",
+        "Handler",
+        "Version",
+        "Status",
+        "Source",
+        "Middleware",
+    ]);
+
+    // Write rows
+    for route in routes {
+        let middleware = if route.middleware.is_empty() {
+            String::new()
+        } else {
+            route.middleware.join(", ")
+        };
+        let version = route.api_version.as_deref().unwrap_or("-");
+        let status = route.status.as_deref().unwrap_or("-");
+
+        let _ = wtr.write_record([
+            &route.method,
+            &route.path,
+            &route.handler,
+            version,
+            status,
+            &route.source,
+            &middleware,
+        ]);
+    }
+
+    String::from_utf8(wtr.into_inner().unwrap_or_default()).unwrap_or_default()
+}
+
+pub fn print_csv(routes: &[RouteInfo]) {
+    let csv_str = format_csv(routes);
+    print!("{csv_str}");
 }
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
@@ -526,6 +573,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_format_csv() {
+        let f: OutputFormat = "csv".parse().unwrap();
+        assert_eq!(f, OutputFormat::Csv);
+    }
+
+    #[test]
     fn parse_format_json() {
         let f: OutputFormat = "json".parse().unwrap();
         assert_eq!(f, OutputFormat::Json);
@@ -654,6 +707,31 @@ mod tests {
         assert_eq!(routes[1].method, "GET");
         assert_eq!(routes[2].path, "/posts");
         assert_eq!(routes[2].method, "POST");
+    }
+
+    // ── format_csv ──────────────────────────────────────────────────────
+
+    #[test]
+    fn format_csv_produces_valid_csv() {
+        let routes = sample_routes();
+        let csv_str = crate::routes::format_csv(&routes);
+        let mut reader = csv::Reader::from_reader(csv_str.as_bytes());
+        let headers = reader.headers().unwrap();
+        assert_eq!(headers.len(), 7);
+        assert_eq!(&headers[0], "Method");
+        assert_eq!(&headers[1], "Path");
+        assert_eq!(&headers[2], "Handler");
+        assert_eq!(&headers[3], "Version");
+        assert_eq!(&headers[4], "Status");
+        assert_eq!(&headers[5], "Source");
+        assert_eq!(&headers[6], "Middleware");
+
+        let mut count = 0;
+        for result in reader.records() {
+            let _record: csv::StringRecord = result.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, routes.len());
     }
 
     // ── format_table ──────────────────────────────────────────────────────
