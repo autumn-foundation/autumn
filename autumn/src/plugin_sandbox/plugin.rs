@@ -395,12 +395,19 @@ async fn serve(
             // that fallback is what discards the body. Without this, a HEAD
             // gets the whole GET payload — against both the documented
             // behaviour and HTTP itself.
-            if request_method_is_head {
-                let (parts, _body) = built.into_parts();
-                Response::from_parts(parts, Body::empty())
-            } else {
-                built
-            }
+            //
+            // The bodyless statuses go the same way. RFC 9110 forbids content
+            // on 204, 205 and 304, and hyper drops it on the way out — but only
+            // on the way out. `mounted_router` is public, so middleware and an
+            // embedder see this `Response` itself, and there they would see
+            // payload bytes on a status that cannot carry them. Discarding here
+            // rather than refusing keeps it consistent with the HEAD case and
+            // with what the wire would have done anyway.
+            //
+            // Dropping the body drops its share of the permit, not the permit:
+            // the other share rides in the extensions, which `into_parts`
+            // carries over, so the slot still lasts as long as the response.
+            discard_body_if_it_cannot_be_sent(built, request_method_is_head)
         }
         Err(failure) => {
             tracing::warn!(
@@ -615,6 +622,39 @@ impl AsRef<[u8]> for PermitBuf {
     fn as_ref(&self) -> &[u8] {
         &self.data
     }
+}
+
+/// Drop the body from a response that may not carry one.
+///
+/// Two cases, and the reason they are one function is that the reason is the
+/// same: the status line and the method already say there is no content, so
+/// bytes hanging off the response are bytes nothing should ever read.
+///
+/// - **HEAD.** Naming HEAD in the method filter is deliberate (see
+///   `method_filter`), but it costs axum's GET-to-HEAD fallback, and that
+///   fallback is what discards the body. Without this a HEAD gets the whole GET
+///   payload, against both the documented behaviour and HTTP itself.
+/// - **204, 205, 304.** RFC 9110 forbids content on these, and hyper drops it
+///   on the way out — but only on the way out. `mounted_router` is public, so
+///   middleware and an embedder see this `Response` itself, and there they
+///   would see payload bytes on a status that cannot carry them.
+///
+/// Discarding rather than refusing keeps both cases consistent with each other
+/// and with what the wire would have done anyway.
+///
+/// Dropping the body drops *its share* of the concurrency permit, not the
+/// permit: the other share rides in the extensions, which `into_parts` carries
+/// over, so the slot still lasts as long as the response does.
+fn discard_body_if_it_cannot_be_sent(response: Response, method_is_head: bool) -> Response {
+    let bodyless = matches!(
+        response.status(),
+        StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+    );
+    if !method_is_head && !bodyless {
+        return response;
+    }
+    let (parts, _body) = response.into_parts();
+    Response::from_parts(parts, Body::empty())
 }
 
 fn build_response(
@@ -1041,6 +1081,102 @@ sha256 = "{digest}"
         );
         drop(response);
         assert_eq!(permits.available_permits(), 1, "and give it back on drop");
+    }
+
+    #[tokio::test]
+    async fn a_bodyless_status_carries_no_body_to_an_in_process_caller() {
+        // RFC 9110 forbids content on 204, 205 and 304. Hyper drops it on the
+        // way out, so on a network connection this is invisible — but
+        // `mounted_router` is public, and middleware or an embedder reads this
+        // `Response` directly. There, payload bytes on a status that cannot
+        // carry them are bytes a consumer may well act on.
+        //
+        // The permit is the reason to be careful here rather than just correct:
+        // discarding the body drops its share of the slot, so this also pins
+        // that the extensions share is what keeps the accounting honest.
+        use crate::plugin_sandbox::wire::SandboxResponse;
+        use http_body_util::BodyExt as _;
+
+        for status in [204u16, 205, 304] {
+            let permits = Arc::new(Semaphore::new(1));
+            let answered = SandboxResponse {
+                status,
+                headers: Vec::new(),
+                body: b"content a bodyless status may not carry".to_vec(),
+            };
+            let built = build_response(
+                "autumn-plugin-hello",
+                &answered,
+                Arc::clone(&permits).acquire_owned().await.expect("permit"),
+            );
+            let response = discard_body_if_it_cannot_be_sent(built, false);
+
+            let collected = response
+                .into_body()
+                .collect()
+                .await
+                .expect("the body collects")
+                .to_bytes();
+            assert!(
+                collected.is_empty(),
+                "{status} handed {} body bytes to an in-process caller",
+                collected.len(),
+            );
+        }
+
+        // The converse, so the loop above is about the status and not about
+        // this function emptying everything it is given.
+        let permits = Arc::new(Semaphore::new(1));
+        let ok = SandboxResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"hi".to_vec(),
+        };
+        let built = build_response(
+            "autumn-plugin-hello",
+            &ok,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+        let kept = discard_body_if_it_cannot_be_sent(built, false)
+            .into_body()
+            .collect()
+            .await
+            .expect("the body collects")
+            .to_bytes();
+        assert_eq!(kept.as_ref(), b"hi", "a 200 must keep the answer it gave");
+    }
+
+    #[tokio::test]
+    async fn discarding_a_body_does_not_return_the_slot_the_headers_still_hold() {
+        // `into_parts` carries the extensions over, so the response's share of
+        // the permit survives its body being thrown away. Without that, every
+        // HEAD and every bodyless status would release its slot early — the
+        // header-only defect again, reached through the discard path.
+        use crate::plugin_sandbox::wire::SandboxResponse;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let answered = SandboxResponse {
+            status: 204,
+            headers: vec![("x-plugin-note".to_string(), "v".repeat(4096))],
+            body: b"discarded".to_vec(),
+        };
+        let built = build_response(
+            "autumn-plugin-hello",
+            &answered,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+        let response = discard_body_if_it_cannot_be_sent(built, false);
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the slot came back when the body was discarded, while the headers remain",
+        );
+        drop(response);
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "and back once nothing holds it"
+        );
     }
 
     #[tokio::test]

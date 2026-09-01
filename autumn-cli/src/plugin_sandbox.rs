@@ -205,12 +205,20 @@ impl Report {
                 .map(|capability| capability.as_str().to_owned())
                 .collect(),
             denied: DENIED_CLASSES.iter().map(|&name| name.to_owned()).collect(),
+            // From `route_infos`, not from `manifest.routes`: HTTP serves HEAD
+            // wherever it serves GET, and the runtime mounts it, so a manifest
+            // declaring only GET serves a method its own literal route list
+            // never names. The human surfaces already say so — `consent_summary`
+            // prints the implied HEAD and `autumn routes` reports it — and this
+            // is the surface a policy check reads. Underreporting here is how an
+            // automated approval signs off on a route set smaller than the one
+            // the artifact actually answers on.
             routes: manifest
-                .routes
-                .iter()
+                .route_infos()
+                .into_iter()
                 .map(|route| ReportRoute {
-                    method: route.method.clone(),
-                    path: route.path.clone(),
+                    method: route.method,
+                    path: route.path,
                 })
                 .collect(),
             imports,
@@ -610,6 +618,44 @@ path = "/hello/greet"
         assert_eq!(value["routes"][0]["path"], "/hello/greet");
         assert_eq!(value["loads"], true);
         assert!(value["denied"].as_array().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[test]
+    fn the_json_report_names_the_head_a_get_route_also_serves() {
+        // The JSON report is the surface an automated consent or policy check
+        // reads. HTTP serves HEAD wherever it serves GET and the runtime mounts
+        // it, so a manifest declaring only GET — which this fixture does — still
+        // answers HEAD. Listing only the literal manifest entries let a machine
+        // approve a route set smaller than the artifact actually serves, while
+        // the human surfaces (`consent_summary`, `autumn routes`) named it.
+        let artifact = pack(&good_fixture());
+        let json = Report::of(&artifact).to_json().expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        let routes = value["routes"].as_array().expect("routes is an array");
+
+        let pairs: Vec<(String, String)> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route["method"].as_str().unwrap_or_default().to_owned(),
+                    route["path"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+
+        assert!(
+            pairs.contains(&("GET".to_owned(), "/hello/greet".to_owned())),
+            "the declared route must still be reported: {pairs:?}",
+        );
+        assert!(
+            pairs.contains(&("HEAD".to_owned(), "/hello/greet".to_owned())),
+            "the implied HEAD is reachable but unreported: {pairs:?}",
+        );
+        // And the text surface agrees, so the two cannot drift apart.
+        assert!(
+            Report::of(&artifact).to_text().contains("HEAD"),
+            "the human surface stopped naming the implied HEAD",
+        );
     }
 
     #[test]
