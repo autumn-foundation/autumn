@@ -110,12 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded and the derivation runs as before. An explicit declaration still
   wins, even against the slug (`/notes.txt` declaring `application/json`).
 
-  Two neighbouring fixes fell out of the same work. `ManifestEntry::revalidate`
-  gained `#[serde(default)]`, so a hand-written manifest may omit the key — the
-  shortest documented entry previously failed to parse, which silently disabled
-  the whole static layer. And a manifest that is *present but unparseable* now
-  logs a warning instead of disabling static serving with no trace at all
-  (absent stays quiet — that is just an app with no static build).
+  One neighbouring fix fell out of the same work: a manifest that is *present
+  but unparseable* now logs a warning instead of disabling static serving with
+  no trace at all (absent stays quiet — that is just an app with no static
+  build). `ManifestEntry::revalidate` also gained an explicit `#[serde(default)]`
+  to state that a hand-written entry may omit the key, though it changes
+  nothing on its own — serde's derive already maps a missing `Option` field to
+  `None`, so the shortest documented entry parsed before this release too.
 
   **Breaking:** `ManifestEntry` and `StaticManifest` are now `#[non_exhaustive]`
   and `ManifestEntry` gained a `content_type` field, so struct literals — and

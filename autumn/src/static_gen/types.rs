@@ -134,11 +134,13 @@ pub struct ManifestEntry {
     /// Optional ISR revalidation interval in seconds, copied from
     /// [`StaticRouteMeta::revalidate`].
     ///
-    /// `#[serde(default)]` so a hand-written manifest may omit the key
+    /// `#[serde(default)]` states that a hand-written manifest may omit the key
     /// entirely — the serve path documents hand-written manifests as a
-    /// supported way to map a route straight at a file, and requiring an
-    /// explicit `"revalidate": null` made the shortest such entry fail to
-    /// parse (which silently disables the whole static layer).
+    /// supported way to map a route straight at a file. The attribute is
+    /// belt-and-braces rather than a fix: serde's derive already maps a missing
+    /// `Option` field to `None`, so the shortest such entry parsed before it
+    /// too. It is kept because it says the intent out loud, and because it
+    /// would start mattering the moment this field stopped being an `Option`.
     ///
     /// Deliberately *not* `skip_serializing_if`, so what `autumn build` writes
     /// keeps the exact shape it had before #1832 — `revalidate` has always been
@@ -420,14 +422,16 @@ mod tests {
         );
     }
 
-    /// A manifest written by *this* Autumn must stay loadable by a **pre-#1832**
-    /// runtime, which declares `revalidate` with no `#[serde(default)]` and so
-    /// treats a missing key as a hard error. Omitting it would fail
-    /// `StaticManifest::load` there, `StaticFileLayer::new` would return `None`,
-    /// and every pre-rendered page would silently serve dynamically — breaking
-    /// a rollback or a rolling deploy sharing one `dist/`.
+    /// What `autumn build` *writes* keeps the shape it had before #1832:
+    /// `revalidate` is always present, `content_type` only when there is one.
+    ///
+    /// Not a compatibility requirement — an older Autumn runtime reads either
+    /// form, since serde's derive maps a missing `Option` field to `None`. It
+    /// is a format-stability choice for every other consumer of
+    /// `dist/manifest.json`: a rollback, a rolling deploy sharing one `dist/`
+    /// volume, or external tooling whose reader is stricter than serde's.
     #[test]
-    fn manifest_entry_always_writes_revalidate_for_older_runtimes() {
+    fn manifest_entry_writes_a_stable_manifest_shape() {
         let json =
             serde_json::to_string(&ManifestEntry::new("about/index.html")).expect("serialize");
         assert!(
