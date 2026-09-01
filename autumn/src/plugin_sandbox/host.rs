@@ -270,13 +270,32 @@ fn bounded_guest_text(chars: impl Iterator<Item = char>, hint: usize) -> String 
             out.push_str(" … (truncated)");
             break;
         }
-        if ch.is_control() || super::manifest::is_display_reordering(ch) {
+        if ch.is_control() || is_line_separator(ch) || super::manifest::is_display_reordering(ch) {
             out.extend(ch.escape_debug());
         } else {
             out.push(ch);
         }
     }
     out
+}
+
+/// The two characters Unicode calls line breaks that are not control characters.
+///
+/// C0/C1 gets escaped by `is_control`, and the invisible and bidi characters by
+/// [`is_display_reordering`](super::manifest::is_display_reordering) — and
+/// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR fall between the two.
+/// They are general category Zl and Zp: not `Cc`, so `is_control` says no, and
+/// neither format nor default-ignorable, so the other predicate says no either.
+/// Yet a plain-text log consumer that splits on Unicode line breaks renders
+/// them as exactly the newline the escaping exists to deny, which puts a guest
+/// back in the business of writing its own operator-facing record — the whole
+/// point of escaping C0 in the first place.
+///
+/// A route path needs nothing here: `validate_route_path` refuses
+/// `char::is_whitespace`, and both of these are `White_Space`. The gap is only
+/// in a detail, which is escaped rather than refused.
+const fn is_line_separator(ch: char) -> bool {
+    matches!(ch, '\u{2028}' | '\u{2029}')
 }
 
 /// An import's `module::name`, bounded and escaped without ever being joined.
@@ -5288,6 +5307,33 @@ path = "/hello/greet"
             readable.contains("démarré") && readable.contains("起動しませんでした"),
             "real text was escaped along with the formatting characters: {readable:?}",
         );
+    }
+
+    #[test]
+    fn a_unicode_line_break_cannot_forge_a_second_log_record() {
+        // The line breaks that are not control characters. U+2028 and U+2029 are
+        // general category Zl and Zp, so `is_control` — which answers for Cc —
+        // says no, and they are neither format nor default-ignorable, so the
+        // reordering predicate says no as well. A log consumer that splits on
+        // Unicode line breaks still renders them as a newline, which hands the
+        // guest the forged record that escaping C0 exists to deny.
+        for ch in ['\u{2028}', '\u{2029}'] {
+            assert!(
+                !ch.is_control(),
+                "U+{:04X} is a control character after all; this test guards the wrong gap",
+                ch as u32,
+            );
+            let split = guest_text(&format!("denied{ch}allowed by policy"));
+            assert!(
+                !split.contains(ch),
+                "U+{:04X} reached the log verbatim: {split:?}",
+                ch as u32,
+            );
+            assert!(
+                split.contains(&format!("\\u{{{:x}}}", ch as u32)),
+                "the attempt must survive as an escape, not be dropped: {split:?}",
+            );
+        }
     }
 
     #[test]
