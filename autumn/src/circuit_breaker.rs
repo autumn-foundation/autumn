@@ -1,3 +1,40 @@
+//! # Circuit Breaker
+//!
+//! Imagine a house with faulty wiring. If a short circuit happens, a fuse blows
+//! (or a circuit breaker opens), stopping the flow of electricity to prevent a
+//! fire. In distributed systems, the same concept applies. If a remote service is
+//! failing (timing out, returning 500s), repeatedly slamming it with more requests
+//! will only make it worse and potentially cause cascading failures across your
+//! own systems.
+//!
+//! The `CircuitBreaker` pattern monitors for consecutive failures. Once the failure
+//! rate exceeds a threshold, the breaker "opens", instantly failing future requests
+//! without even hitting the remote service. After a cooldown period, it enters a
+//! "half-open" state, letting a few requests through to see if the service has
+//! recovered. If they succeed, the breaker closes. If they fail, it opens again.
+//!
+//! ## States
+//! - **Closed**: Normal operation. Requests flow freely. If errors spike, it opens.
+//! - **Open**: Service is deemed dead. Requests fail immediately with `CircuitBreakerError::Open`.
+//! - **Half-Open**: A probationary period. A limited number of trial requests are allowed.
+//!
+//! ## Example
+//! ```rust,ignore
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitState};
+//!
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     ..Default::default()
+//! };
+//! let breaker = CircuitBreaker::new("payment_gateway", policy);
+//!
+//! // Run a block of code protected by the circuit breaker
+//! let result: Result<(), _> = breaker.run(async {
+//!     // ... call an external API ...
+//!     Ok(())
+//! }).await;
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
