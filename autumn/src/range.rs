@@ -511,6 +511,86 @@ mod tests {
     }
 
     #[test]
+    fn suffix_range_zero_total_is_unsatisfiable() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=-5"), 0, None),
+            RangeResolution::Unsatisfiable { total: 0 }
+        );
+    }
+
+    #[test]
+    fn open_ended_range_zero_total_is_unsatisfiable() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=5-"), 0, None),
+            RangeResolution::Unsatisfiable { total: 0 }
+        );
+    }
+
+    #[test]
+    fn simple_closed_range_zero_total_is_unsatisfiable() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=0-5"), 0, None),
+            RangeResolution::Unsatisfiable { total: 0 }
+        );
+    }
+
+    #[test]
+    fn range_with_invalid_start_is_full() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=abc-10"), 10, None),
+            RangeResolution::Full
+        );
+    }
+
+    #[test]
+    fn range_with_invalid_end_is_full() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=0-abc"), 10, None),
+            RangeResolution::Full
+        );
+    }
+
+    #[test]
+    fn suffix_range_with_invalid_number_is_full() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=-abc"), 10, None),
+            RangeResolution::Full
+        );
+    }
+
+    #[test]
+    fn multi_range_with_empty_specs_are_ignored() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=0-3,,5-7"), 10, None),
+            RangeResolution::Partial {
+                start: 0,
+                end: 3,
+                total: 10
+            }
+        );
+    }
+
+    #[test]
+    fn multi_range_all_empty_specs_is_full() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=,,,"), 10, None),
+            RangeResolution::Full
+        );
+    }
+
+    #[test]
+    fn suffix_range_matching_total() {
+        assert_eq!(
+            resolve(&headers_with_range("bytes=-10"), 10, None),
+            RangeResolution::Partial {
+                start: 0,
+                end: 9,
+                total: 10
+            }
+        );
+    }
+
+    #[test]
     fn backwards_range_is_full() {
         assert_eq!(
             resolve(&headers_with_range("bytes=5-2"), 10, None),
@@ -614,6 +694,65 @@ mod tests {
         let mut h = headers_with_range("bytes=0-3");
         h.insert(IF_RANGE, HeaderValue::from_static("\"v1\""));
         assert_eq!(resolve(&h, 10, None), RangeResolution::Full);
+    }
+
+    #[test]
+    fn if_range_missing_falls_through_to_range() {
+        let h = headers_with_range("bytes=0-3");
+        let etag = ETag::strong("v1");
+        let validator = Validator::new().with_etag(&etag);
+        assert_eq!(
+            resolve(&h, 10, Some(validator)),
+            RangeResolution::Partial {
+                start: 0,
+                end: 3,
+                total: 10
+            }
+        );
+    }
+
+    #[test]
+    fn if_range_matching_last_modified_with_whitespace() {
+        let lm = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let mut h = headers_with_range("bytes=0-3");
+        h.insert(
+            IF_RANGE,
+            HeaderValue::from_static("  Wed, 21 Oct 2015 07:28:00 GMT  "),
+        );
+        let validator = Validator::new().with_last_modified(lm);
+        assert_eq!(
+            resolve(&h, 10, Some(validator)),
+            RangeResolution::Partial {
+                start: 0,
+                end: 3,
+                total: 10
+            }
+        );
+    }
+
+    // ── slice_inclusive ───────────────────────────────────────────────────────
+
+    #[test]
+    fn slice_inclusive_empty_returns_empty() {
+        assert_eq!(slice_inclusive(&Bytes::new(), 0, 10).len(), 0);
+    }
+
+    #[test]
+    fn slice_inclusive_out_of_bounds_clamps() {
+        let full = Bytes::from_static(b"0123456789");
+        assert_eq!(&slice_inclusive(&full, 5, 20)[..], b"56789");
+    }
+
+    #[test]
+    fn slice_inclusive_start_greater_than_end() {
+        let full = Bytes::from_static(b"0123456789");
+        assert_eq!(slice_inclusive(&full, 5, 2).len(), 0);
+    }
+
+    #[test]
+    fn slice_inclusive_start_greater_than_total() {
+        let full = Bytes::from_static(b"0123456789");
+        assert_eq!(&slice_inclusive(&full, 20, 30)[..], b"9");
     }
 
     // ── response builders ─────────────────────────────────────────────────────
