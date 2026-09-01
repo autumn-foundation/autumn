@@ -77,13 +77,37 @@ pub struct ResolvedStatic {
     pub content_type: http::HeaderValue,
 }
 
+/// A byte a recorded `Content-Type` may contain: visible ASCII (`0x20`-`0x7e`),
+/// or a horizontal tab.
+///
+/// HTAB is legal OWS around media-type parameters (RFC 9110), so
+/// `application/rss+xml;\tprofile="x"` is a perfectly good header — both
+/// `HeaderValue::to_str` and `HeaderValue::from_str` accept it — and rejecting
+/// it would send an extensionless `/feed` back to the `feed/index.html`
+/// derivation and serve it as `text/html`. Tab is also not part of the hazard
+/// this predicate exists for: the compression layer matches its exclusions on
+/// `to_str().ok().unwrap_or_default()`, and `to_str` *succeeds* on tab, so a
+/// tab-bearing type is matched against the carve-outs in full. What must stay
+/// rejected is a value `to_str` fails on (any byte from `0x80` up), or one that
+/// is blank after trimming — both read as an empty `Content-Type` there, which
+/// silently bypasses the image/audio/video and octet-stream carve-outs and
+/// gzips a binary body.
+///
+/// A tab-*only* value is still rejected: `str::trim` strips it, leaving the
+/// empty string the caller refuses.
+#[must_use]
+fn is_legal_content_type_byte(b: u8) -> bool {
+    b == b'\t' || (0x20..0x7f).contains(&b)
+}
+
 /// The recorded `Content-Type` a manifest entry can actually be served with, or
 /// `None` when the stored value is unusable (#1832).
 ///
 /// The single validation the whole static path shares. A value is usable when,
-/// after trimming, it is non-empty **visible ASCII**. `HeaderValue::from_str`
-/// alone is not a sufficient filter: it accepts any byte `>= 0x20` except DEL,
-/// plus tab, so `"   "` and `"text/htmlé"` pass it — and either would produce a
+/// after trimming, it is non-empty and every byte is
+/// [legal](is_legal_content_type_byte) — visible ASCII or a tab.
+/// `HeaderValue::from_str` alone is not a sufficient filter: it accepts any byte
+/// `>= 0x20` except DEL, so `"   "` and `"text/htmlé"` pass it — and either would produce a
 /// `Content-Type` the compression layer reads as empty (it matches its
 /// exclusions on `to_str().ok().unwrap_or_default()`), silently bypassing the
 /// image/audio/video and octet-stream carve-outs and gzipping a binary body.
@@ -98,15 +122,14 @@ pub struct ResolvedStatic {
 /// merely having its bad value ignored. Generation
 /// ([`build::recorded_content_type`](super::build)) screens through the same
 /// function so the manifest can never carry a value the serve path will
-/// discard: `HeaderValue::to_str` accepts a horizontal tab, which is legal OWS
-/// between header parameters, so `application/rss+xml;\tprofile="…"` would
-/// otherwise be recorded, silently ignored at serve time, and the route served
-/// as the `text/html` its `feed/index.html` file name derives.
+/// discard — a recorded-then-ignored value is worse than none, because the
+/// route silently falls back to the very derivation the recorded value existed
+/// to replace.
 #[must_use]
 pub(super) fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&str> {
     recorded
         .map(str::trim)
-        .filter(|value| !value.is_empty() && value.bytes().all(|b| (0x20..0x7f).contains(&b)))
+        .filter(|value| !value.is_empty() && value.bytes().all(is_legal_content_type_byte))
 }
 
 /// The `Content-Type` to serve for a manifest-backed response (#1832).
@@ -137,9 +160,10 @@ pub(super) fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&st
 /// HTTP *client* module — rather than a string, so the caller cannot fail to
 /// build the response.
 ///
-/// A recorded value is used only if it is **visible ASCII** after trimming, and
-/// non-empty. `HeaderValue::from_str` alone is not a sufficient filter: it
-/// accepts any byte `>= 0x20` except DEL, plus tab, so `"   "` and
+/// A recorded value is used only if, after trimming, it is non-empty and every
+/// byte is visible ASCII or a tab (see [`is_legal_content_type_byte`]).
+/// `HeaderValue::from_str` alone is not a sufficient filter: it accepts any byte
+/// `>= 0x20` except DEL, so `"   "` and
 /// `"text/htmlé"` pass it. Either would produce a `Content-Type` the compression
 /// layer reads as empty (it matches its exclusions on
 /// `to_str().ok().unwrap_or_default()`), silently bypassing the image/audio/video
@@ -1309,6 +1333,27 @@ mod tests {
             usable_recorded_content_type(Some("  application/rss+xml  ")),
             Some("application/rss+xml")
         );
+        // A horizontal tab is legal OWS around media-type parameters, so a value
+        // carrying one is usable — rejecting it would send an extensionless
+        // `/feed` back to the `feed/index.html` derivation and serve RSS as
+        // `text/html`. `to_str` succeeds on tab, so the compression layer still
+        // matches such a type against its carve-outs in full; the hazard this
+        // screen exists for is a value that reads as *empty* there.
+        assert_eq!(
+            usable_recorded_content_type(Some("application/rss+xml;\tprofile=\"x\"")),
+            Some("application/rss+xml;\tprofile=\"x\"")
+        );
+        assert_eq!(
+            resolved_content_type(
+                Some("application/rss+xml;\tprofile=\"x\""),
+                "/feed",
+                Path::new("feed/index.html"),
+            ),
+            "application/rss+xml;\tprofile=\"x\"",
+            "a tab-bearing type must be served, not derived around"
+        );
+
+        // A tab-*only* value is still nothing: trimming leaves the empty string.
         for unusable in [None, Some(""), Some("   "), Some("\t"), Some("text/htmlé")] {
             assert!(
                 usable_recorded_content_type(unusable).is_none(),

@@ -141,8 +141,8 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 ///
 /// - the handler declared no `Content-Type`;
 /// - the value is not one the serve path would honour — empty or blank after
-///   trimming, or carrying any byte outside visible ASCII (`0x20`–`0x7e`). The
-///   screen is
+///   trimming, or carrying a byte that is neither visible ASCII (`0x20`–`0x7e`)
+///   nor a horizontal tab. The screen is
 ///   [`usable_recorded_content_type`](super::middleware::usable_recorded_content_type),
 ///   shared verbatim with the serve path so the manifest never stores a value
 ///   that would be discarded at request time; or
@@ -193,12 +193,10 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 /// rather than the manifest carrying a value that is wrong, unusable, or merely
 /// an artifact of the return type.
 ///
-/// A value that passes the shared screen is header-legal by construction — it is
-/// visible ASCII, so `HeaderValue::from_str` cannot reject it. The serve path
-/// re-validates anyway, because a manifest on disk can be edited after the fact.
-/// Note that `HeaderValue::to_str` alone would *not* be enough: it also accepts
-/// a horizontal tab, which is legal OWS between header parameters, so
-/// `application/rss+xml;\tprofile="…"` would be recorded and then ignored.
+/// A value that passes the shared screen is header-legal by construction — every
+/// byte is one `HeaderValue::from_str` accepts — so the serve path can always
+/// re-emit it. It re-validates anyway, because a manifest on disk can be edited
+/// after the fact.
 fn recorded_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<String> {
     let raw = headers
         .get(axum::http::header::CONTENT_TYPE)?
@@ -812,14 +810,15 @@ mod tests {
         );
     }
 
-    /// `HeaderValue::to_str` accepts a horizontal tab, which is legal OWS
-    /// between header parameters — but the serve path's screen rejects it. If
-    /// generation used the looser check, the manifest would carry a value no
-    /// request could ever use: `/feed` would be silently served as the
-    /// `text/html` its `feed/index.html` file name derives, under `nosniff`.
-    /// Generation and serving must screen identically.
+    /// A horizontal tab is legal OWS around media-type parameters, so
+    /// `application/rss+xml;\tprofile="x"` is a good header and must be recorded
+    /// — and, critically, honoured at serve time. Rejecting it would send an
+    /// extensionless `/feed` back to the `feed/index.html` derivation and serve
+    /// an RSS feed as `text/html` under `nosniff`. Both halves are asserted
+    /// here, because recording a value the serve path then discards is worse
+    /// than recording nothing.
     #[tokio::test]
-    async fn skips_content_type_the_serve_path_would_discard() {
+    async fn records_content_type_with_legal_tab_ows() {
         fn tabbed_router() -> axum::Router {
             axum::Router::new().fallback(axum::routing::get(|| async {
                 let mut response = axum::response::Response::new(axum::body::Body::from("<rss/>"));
@@ -839,10 +838,24 @@ mod tests {
             .expect("render");
 
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
-        assert!(
-            manifest.routes["/feed"].content_type.is_none(),
-            "a value the serve path would discard must not be recorded, got {:?}",
-            manifest.routes["/feed"].content_type
+        let recorded = manifest.routes["/feed"].content_type.as_deref();
+        assert_eq!(
+            recorded,
+            Some("application/rss+xml;\tprofile=\"x\""),
+            "tab OWS is legal in a media type and must be recorded verbatim"
+        );
+
+        // ...and the serve path must honour what generation recorded. If it
+        // did not, `/feed` would derive `text/html` from `feed/index.html`.
+        assert_eq!(
+            super::super::resolved_content_type(
+                recorded,
+                "/feed",
+                std::path::Path::new("feed/index.html"),
+            ),
+            "application/rss+xml;\tprofile=\"x\"",
+            "generation and serving must agree, or the recorded value is dead \
+             data and the route silently falls back to the derivation"
         );
     }
 
