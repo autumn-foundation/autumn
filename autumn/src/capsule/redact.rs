@@ -923,7 +923,7 @@ fn redact_headers(
 /// sloppy handler could hold; both predate this function's byte port and are
 /// tracked separately rather than widened into it.
 fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
-    let trimmed = trim_header_ows(value);
+    let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and
     // reading `password: not valid` as a scheme and a credential would put
@@ -946,7 +946,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
     // stays intact.
     if is_authorization && let Some((scheme, credential)) = split_once_byte(trimmed, b' ') {
-        let credential = credential.trim_ascii();
+        let credential = trim_ows(credential);
         if is_auth_scheme(scheme) && !credential.is_empty() {
             values.insert(credential);
             if scheme.eq_ignore_ascii_case(b"basic") {
@@ -986,7 +986,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
         };
         for pair in pairs {
             if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
-                let cookie_value = trim_matches_byte(cookie_value.trim_ascii(), b'"');
+                let cookie_value = trim_matches_byte(trim_ows(cookie_value), b'"');
                 record_cookie_value(cookie_value, values);
             }
         }
@@ -1066,10 +1066,10 @@ fn record_auth_params(credential: &[u8], values: &mut RedactedValues) {
         // An auth-param name is a token. This rejects the `=` padding of a
         // `token68` credential, whose tail is not a name and whose value is
         // empty anyway.
-        if !is_auth_scheme(name.trim_ascii()) {
+        if !is_auth_scheme(trim_ows(name)) {
             continue;
         }
-        let value = unquote_auth_param(value.trim_ascii());
+        let value = unquote_auth_param(trim_ows(value));
         if !value.is_empty() {
             values.insert_whole_token_only(&value);
         }
@@ -1291,19 +1291,26 @@ fn trim_end_matches_byte(bytes: &[u8], byte: u8) -> &[u8] {
     trimmed
 }
 
-/// Trim the whitespace around a header value.
+/// Trim the whitespace around a header value or any component split out of
+/// one, at every point the previous `&str` parser called `str::trim`.
 ///
-/// `OWS` is SP and HTAB, so [`slice::trim_ascii`] is the grammar. The second
-/// pass keeps the *wider* trim the previous `&str` implementation got for free
-/// from `str::trim`, which strips Unicode whitespace as well. Losing it would
-/// have been a silent regression of exactly the kind this function exists to
-/// prevent: `HeaderValue` rejects only the C0 controls and `DEL`, so a
-/// non-breaking space is a legal (if malformed) pad, and
-/// `Authorization: <U+00A0>Bearer hunter2` would leave `\xc2\xa0Bearer`
-/// failing [`is_auth_scheme`] — recording nothing — while
-/// `Bearer hunter2<U+00A0>` would record `hunter2\xc2\xa0`, which is not what
-/// a handler that trims holds.
-fn trim_header_ows(value: &[u8]) -> &[u8] {
+/// `OWS` is SP and HTAB, so [`slice::trim_ascii`] is the grammar, and for a
+/// well-formed header it is the whole job. The second pass keeps the *wider*
+/// trim the `&str` implementation got for free from `str::trim`, which strips
+/// Unicode whitespace too. Dropping it was a silent regression of exactly the
+/// kind this parser exists to prevent, and the outer value is the least of it:
+/// `HeaderValue` rejects only the C0 controls and `DEL`, so a non-breaking
+/// space is a legal (if malformed) pad *anywhere*, and `Bearer <U+00A0>hunter2`
+/// pads the credential from the inside, where trimming the whole value never
+/// reaches. A handler splits on the space and trims what it gets, holding
+/// `hunter2`; recording `\xc2\xa0hunter2` masks neither its echo nor its bind.
+/// The same goes for a padded auth-param name (which [`is_auth_scheme`] would
+/// then reject, losing the value with it), a padded param value, and a padded
+/// cookie value.
+///
+/// Every caller therefore trims through here rather than reaching for
+/// `trim_ascii` directly.
+fn trim_ows(value: &[u8]) -> &[u8] {
     let ascii = value.trim_ascii();
     std::str::from_utf8(ascii).map_or(ascii, |text| text.trim().as_bytes())
 }
@@ -2585,15 +2592,25 @@ mod tests {
     /// `str::trim` stripped Unicode whitespace; `trim_ascii` does not. A
     /// header padded with a non-breaking space is malformed but perfectly
     /// representable — `HeaderValue` rejects only the C0 controls and `DEL` —
-    /// so dropping the wider trim in the byte port would have left the token
-    /// the handler holds unmasked, which is the very thing this parser exists
-    /// to prevent.
+    /// so dropping the wider trim in the byte port would leave the token the
+    /// handler holds unmasked, which is the very thing this parser exists to
+    /// prevent.
+    ///
+    /// Padding *inside* the value is the case trimming the whole value never
+    /// reaches: `Bearer <U+00A0>hunter2` pads the credential, not the header,
+    /// and a handler that splits on the space and trims what it gets holds
+    /// `hunter2`. Every component split out of a header value therefore trims
+    /// through `trim_ows`, not `trim_ascii`.
     #[test]
     fn unicode_padding_around_a_header_value_does_not_hide_the_credential() {
         for padded in [
             "\u{a0}Bearer hunter2secret",
             "Bearer hunter2secret\u{a0}",
             "\u{2028}Bearer hunter2secret\u{2028}",
+            // Interior padding: the outer trim cannot see these at all.
+            "Bearer \u{a0}hunter2secret",
+            "Bearer hunter2secret\u{a0}",
+            "Bearer \u{a0}hunter2secret\u{a0}",
         ] {
             let (_request, values) = redact(
                 Request::get("/").header(header::AUTHORIZATION, padded),
@@ -2604,7 +2621,45 @@ mod tests {
                 values.contains(b"hunter2secret"),
                 "the credential must survive Unicode padding ({padded:?})"
             );
+            let mut binds = vec![BindValue::Value(b"hunter2secret".to_vec())];
+            mask_binds(&mut binds, &values);
+            assert_eq!(
+                binds.first(),
+                Some(&BindValue::Masked),
+                "a bind carrying what the handler trimmed to must be masked ({padded:?})"
+            );
         }
+
+        // An auth-param whose *name* is padded would be rejected outright by
+        // `is_auth_scheme`, losing its value with it; a padded value would be
+        // recorded with the padding still attached.
+        let (_request, params) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                "Digest \u{a0}response=\u{a0}deadbeef\u{a0}, nonce=\u{a0}cafebabe",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            params.contains(b"deadbeef"),
+            "a padded param name must not take its value down with it"
+        );
+        assert!(
+            params.contains(b"cafebabe"),
+            "a padded param value is recorded as the handler holds it"
+        );
+
+        // Same for a cookie value.
+        let (_request, cookie) = redact(
+            Request::get("/").header(header::COOKIE, "session=\u{a0}sess-abcdef\u{a0}"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            cookie.contains(b"sess-abcdef"),
+            "a padded cookie value is recorded as the handler holds it"
+        );
     }
 
     /// The same bytes can arrive both ways — a filtered body password the
