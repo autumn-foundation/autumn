@@ -152,17 +152,32 @@ fn scaffolded_form_render_allocations_on_a_12_field_workload() {
     // for feature-set/toolchain variance, same convention as
     // `config_alloc_gate`/`password_policy_alloc_gate`; a failure a hair over
     // the line means re-measure and re-derive, not nudge upwards.
+    //
+    // Bolt follow-up (looking at `alloc::fmt::format::format_inner`, 2.45% of
+    // a release-profile instruction count on this exact workload — see
+    // `benches/form_render.rs`): all six helpers built their `-field`/
+    // `-error` id suffix with `format!("{field_html}-error")` /
+    // `format!("{field_html}-field")`, which drives an unsized `String::new()`
+    // through the `Arguments`/`fmt::Write` machinery instead of sizing the
+    // output up front. Replaced with `autumn_web::form`'s new private
+    // `concat_suffix` (`String::with_capacity(base.len() + suffix.len())`
+    // plus two `push_str` calls) at all 6 call sites. Blocks dropped to **90**
+    // per render, 18,000 total (-13.5%): `format!`'s own internal growth
+    // apparently cost more than one allocation per call for some of these
+    // short strings, not just the final `String`. Bytes dropped slightly to
+    // **22,828** per render / **4,565,600** total (-0.85%) — exact-capacity
+    // sizing trims the same over-reservation slack the pre-escaping follow-up
+    // above added, though not by much against this workload's larger buffers.
     assert!(
-        info.count_total <= 21_500,
+        info.count_total <= 18_700,
         "scaffolded form render allocated {} blocks over {RENDERS} renders, over the \
-         21,500-block ceiling (20,800 measured; 24,800 was the pre-fix baseline)",
+         18,700-block ceiling (18,000 measured; 20,800 was the pre-fix baseline)",
         info.count_total,
     );
     assert!(
         info.bytes_total <= 4_660_000,
         "scaffolded form render allocated {} bytes over {RENDERS} renders, over the \
-         4,660,000-byte ceiling (4,604,600 measured; 4,495,800 was the pre-Bolt-follow-up \
-         baseline; 4,498,200 was the original pre-fix baseline)",
+         4,660,000-byte ceiling (4,565,600 measured; 4,604,600 was the pre-fix baseline)",
         info.bytes_total,
     );
 }

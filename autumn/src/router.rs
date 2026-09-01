@@ -2848,14 +2848,94 @@ fn mount_raw_routers(
     router
 }
 
+/// Content-type prefixes `CompressionPredicate` skips beyond what
+/// `tower_http`'s own `DefaultPredicate` already excludes (images, gRPC,
+/// SSE, small bodies): binary media and already-compressed formats waste CPU
+/// to (re)compress, inflate archive transfer size, or can confuse media
+/// players.
+const COMPRESSION_EXCLUDED_CONTENT_TYPES: &[&str] = &[
+    // Binary media — already-encoded by codec, not compressible by gzip/br.
+    "audio/",
+    "video/",
+    "application/octet-stream",
+    // Compressed archive formats — re-compressing wastes CPU.
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/zstd",
+    "application/x-bzip2",
+    "application/x-bzip",
+    "application/x-rar-compressed",
+    "application/vnd.rar",
+    "application/x-7z-compressed",
+    // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression, so
+    // gzip/br only wastes CPU and can inflate them. Raw fonts (`font/ttf`,
+    // `font/otf`) are NOT excluded: they are uncompressed SFNT data that
+    // genuinely benefits from transfer compression.
+    "font/woff",
+    "font/woff2",
+];
+
+/// `compress_when` predicate shared by both compression call sites (this
+/// function's SSG/ISG path and `apply_middleware`'s inline fully-dynamic
+/// path, #2371).
+///
+/// A hand-rolled `Predicate` wrapping `DefaultPredicate`, rather than
+/// `DefaultPredicate` extended with 13 chained
+/// `.and(NotForContentType::const_new(...))` calls (the form this replaces):
+/// each `NotForContentType` embeds a ~24-byte `Str` enum, so 13 of them
+/// nested via `tower_http`'s `And<Lhs, Rhs>` inflated `CompressionLayer`'s
+/// own static SIZE by several hundred bytes — harmless while that size only
+/// affected `apply_compression_middleware`'s own local, but #2371 also made
+/// this predicate a member of `apply_middleware`'s `option_layer` `Either`,
+/// whose size is fixed by its larger (`Some`) branch even in the `None`
+/// (compression-off, the default) case. That inflated the per-request byte
+/// count `config_alloc_gate.rs` gates for every app, not just ones with
+/// compression on — caught by CI, not by this repo's `middleware_stack_depth.rs`
+/// probe, which only counts clone *events*, not their size (see that file's
+/// own "What this gate is blind to" section). A `&'static [&'static str]`
+/// slice checked in a loop costs 16 bytes regardless of how many entries it
+/// lists.
+#[derive(Clone)]
+struct CompressionPredicate {
+    default: tower_http::compression::predicate::DefaultPredicate,
+}
+
+impl tower_http::compression::predicate::Predicate for CompressionPredicate {
+    fn should_compress<B>(&self, response: &http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        self.default.should_compress(response)
+            && response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_none_or(|content_type| {
+                    !COMPRESSION_EXCLUDED_CONTENT_TYPES
+                        .iter()
+                        .any(|excluded| content_type.starts_with(excluded))
+                })
+    }
+}
+
+fn compression_predicate() -> CompressionPredicate {
+    CompressionPredicate {
+        default: tower_http::compression::predicate::DefaultPredicate::new(),
+    }
+}
+
 /// Apply response compression, when enabled.
 ///
-/// Unlike the other ingress middleware this keeps its own `Router::layer` call
-/// rather than joining a composed tuple: `CompressionLayer`'s service changes
-/// the response BODY type, which `Route::layer` absorbs via `IntoResponse` but
-/// `option_layer`'s `Either` cannot — both of its branches must share one
-/// `Response` type. Compression is off by default, so the extra nesting level
-/// is only paid by apps that turn it on.
+/// Used only by the SSG/ISG static path (`try_build_router_with_static_inner`),
+/// which keeps this as its own standalone `Router::layer` call. The
+/// fully-dynamic path (`apply_middleware`) instead folds the equivalent
+/// `(NormalizeBodyLayer, CompressionLayer)` pair directly into its single
+/// merged tuple via `option_layer` (#2371) — see the `compression_layer`
+/// local there for why the pairing is required: `CompressionLayer`'s service
+/// changes the response BODY type, which `Route::layer` absorbs via
+/// `IntoResponse` but `option_layer`'s `Either` cannot on its own — both of
+/// its branches must share one `Response` type.
 fn apply_compression_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -2864,33 +2944,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.compression.enabled {
-        use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
-        // Extend the default predicate (skips images, gRPC, SSE, small bodies) to also
-        // skip binary media and already-compressed formats — compressing these wastes
-        // CPU, increases transfer size for archives, and can confuse media players.
-        let predicate = DefaultPredicate::new()
-            // Binary media — already-encoded by codec, not compressible by gzip/br.
-            .and(NotForContentType::const_new("audio/"))
-            .and(NotForContentType::const_new("video/"))
-            .and(NotForContentType::const_new("application/octet-stream"))
-            // Compressed archive formats — re-compressing wastes CPU.
-            .and(NotForContentType::const_new("application/zip"))
-            .and(NotForContentType::const_new("application/gzip"))
-            .and(NotForContentType::const_new("application/x-gzip"))
-            .and(NotForContentType::const_new("application/zstd"))
-            .and(NotForContentType::const_new("application/x-bzip2"))
-            .and(NotForContentType::const_new("application/x-bzip"))
-            .and(NotForContentType::const_new("application/x-rar-compressed"))
-            .and(NotForContentType::const_new("application/vnd.rar"))
-            .and(NotForContentType::const_new("application/x-7z-compressed"))
-            // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
-            // so gzip/br only wastes CPU and can inflate them. Raw fonts
-            // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
-            // SFNT data that genuinely benefits from transfer compression.
-            .and(NotForContentType::const_new("font/woff"))
-            .and(NotForContentType::const_new("font/woff2"));
-        router =
-            router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
+        router = router.layer(
+            tower_http::compression::CompressionLayer::new().compress_when(compression_predicate()),
+        );
         tracing::info!("Response compression enabled (gzip/brotli)");
     }
     router
@@ -4757,13 +4813,43 @@ fn apply_middleware(
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
     //   MethodOverrideRejection -> BotProtection -> CSRF -> SubmitToken ->
     //   TrustedHost -> CORS -> [asset cache-control] -> handler
-    //   (Everything from `Metrics` through `CORS` is ONE `Router::layer` call —
-    //   the merged tuple below; `Compression` keeps its own. `NormalizeBody` is
-    //   a body-type adapter with no request-path behaviour, listed only so this
-    //   order reads against that tuple member-for-member.)
+    //   (Everything from `Compression` through `CORS` is ONE `Router::layer`
+    //   call — the merged tuple below. `NormalizeBody` is a body-type adapter
+    //   with no request-path behaviour, listed only so this order reads
+    //   against that tuple member-for-member; `Compression` carries its own
+    //   private one too — see the tuple below (#2371).)
     //   (In the SSG/ISG path the user layers and a second compression layer are
     //   applied outside the static-first middleware instead — see
     //   `try_build_router_with_static_inner`.)
+    // Response compression, when `[compression] enabled = true` (off by
+    // default). Kept OUTER to `outer_stack` (see above) so it stays outside
+    // ExceptionFilter.
+    //
+    // Wrapped in its own private `(NormalizeBodyLayer, CompressionLayer)`
+    // pair, rather than joining `option_layer` directly on `CompressionLayer`
+    // alone: `option_layer`'s `Either` requires BOTH branches — the `Some`
+    // (compression on) and the `None`/`Identity` (compression off) arm — to
+    // share one `Response` type, and `CompressionLayer`'s service changes the
+    // response BODY type (`Route::layer`'s own bound only needs
+    // `IntoResponse`, which is why the single-purpose standalone
+    // `Router::layer` call this replaces never needed this). Pairing it with
+    // `NormalizeBodyLayer` — the same body-type-adapter trick this tuple
+    // already uses at its `NormalizeBodyLayer` member below — folds
+    // compression's output back to `axum::response::Response` before
+    // `option_layer` compares it against the `Identity` arm's, so the two
+    // arms agree again. This closes the one case #2371 found: a
+    // `[compression]`-enabled app paid a full extra `Router::layer` box level
+    // (and the quadratic per-request re-clone that comes with it) that every
+    // other config-gated member of this tuple already avoided via a plain
+    // `option_layer`.
+    let compression_layer = tower::util::option_layer(config.compression.enabled.then(|| {
+        tracing::info!("Response compression enabled (gzip/brotli)");
+        (
+            NormalizeBodyLayer,
+            tower_http::compression::CompressionLayer::new().compress_when(compression_predicate()),
+        )
+    }));
+
     // Listed OUTERMOST FIRST — see the warning at the top of this function.
     let outer_stack = (
         // Shadow mirroring (#1653) is the outermost member of this group and
@@ -4805,6 +4891,7 @@ fn apply_middleware(
     // still earns its one boxing adapter (it is the compile-time boundary that
     // keeps this single application's type from blowing up).
     let router = router.layer((
+        compression_layer,
         outer_stack,
         session_layer,
         NormalizeBodyLayer,
@@ -4812,10 +4899,6 @@ fn apply_middleware(
         ComposedRegisteredLayers::new(custom_layers),
         inner_stack,
     ));
-
-    // Compression keeps its own `Router::layer` call — see
-    // `apply_compression_middleware` for why it cannot join the tuple above.
-    let router = apply_compression_middleware(router, config);
 
     // NOTE: the `static_gate` layers and the framework's outermost
     // `SecurityHeadersLayer` are intentionally NOT applied here. They are applied
@@ -5858,12 +5941,12 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
 /// alongside a revalidating `Cache-Control`, letting caches confirm freshness
 /// (and pick up new bytes) whenever the vendored script changes.
 ///
-/// The validator is **weak**: when compression is enabled,
-/// `apply_compression_middleware` gzips/brotli-encodes this
-/// `application/javascript` response after the handler attaches the `ETag`, so
-/// the identity, gzip, and br variants share one tag despite differing byte
-/// streams. A strong `ETag` asserts byte-for-byte equivalence and would be
-/// invalid across those encodings (matching the sibling CSS asset handler).
+/// The validator is **weak**: when compression is enabled, the response
+/// compression layer gzips/brotli-encodes this `application/javascript`
+/// response after the handler attaches the `ETag`, so the identity, gzip, and
+/// br variants share one tag despite differing byte streams. A strong `ETag`
+/// asserts byte-for-byte equivalence and would be invalid across those
+/// encodings (matching the sibling CSS asset handler).
 #[cfg(feature = "htmx")]
 static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyLock::new(|| {
     use sha2::{Digest, Sha256};
