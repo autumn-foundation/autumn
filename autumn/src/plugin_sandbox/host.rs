@@ -322,13 +322,27 @@ fn request_metadata_bytes(request: &SandboxRequest) -> usize {
             .map(|(name, value)| metadata_pair_bytes(name, value))
             .fold(0usize, usize::saturating_add)
     };
+    let pairs_where = |list: &[(String, String)], keep: fn(&str) -> bool| {
+        list.iter()
+            .filter(|(name, _)| keep(name))
+            .map(|(name, value)| metadata_pair_bytes(name, value))
+            .fold(0usize, usize::saturating_add)
+    };
     request
         .method
         .len()
         .saturating_add(request.path.len())
         .saturating_add(request.query.len())
         .saturating_add(request.route.len())
-        .saturating_add(pairs(&request.headers))
+        // Only the headers that will actually cross. `HostFrame::request`
+        // filters through the same allowlist, so a `Cookie` or `Authorization`
+        // a direct `run` caller happens to be holding is dropped before the
+        // frame is built and never reaches the guest — counting it here refused
+        // a request that would have cost nothing, and made the public API
+        // stricter than the adapter that is merely its politest caller.
+        .saturating_add(pairs_where(&request.headers, |name| {
+            super::wire::request_header_allowed(&name.to_ascii_lowercase())
+        }))
         .saturating_add(pairs(&request.path_params))
 }
 
@@ -1461,9 +1475,18 @@ fn element_section_overflows(
         if at > section_end {
             return None;
         }
-        if let Some(offset) = offset {
-            let end = offset.checked_add(items as u64)?;
+        // The same rule the data section walk reaches by way of
+        // `DataSectionEnd::ActiveUnevaluable`: an active segment is written at
+        // instantiation whether or not this can work out where, so an offset it
+        // cannot evaluate is treated as one that cannot fit. Skipping it left
+        // the bounds check silently not running — the defect this walk exists
+        // to prevent, in the sibling of the walk where it was just fixed.
+        if active {
             let capacity = table_minimums.get(table_index).copied().unwrap_or(0);
+            let end = match offset {
+                Some(offset) => offset.checked_add(items as u64)?,
+                None => u64::MAX,
+            };
             if end > capacity && overflow.is_none() {
                 overflow = Some((end, capacity));
             }
@@ -4097,6 +4120,106 @@ path = "/hello/greet"
             logged.detail.len() < 1_024,
             "the denial detail carries the guest's whole header: {} bytes",
             logged.detail.len()
+        );
+    }
+
+    #[test]
+    fn an_element_offset_this_cannot_evaluate_is_refused_like_a_data_offset() {
+        // The data walk learned to refuse an active segment whose offset it
+        // cannot evaluate; the element walk beside it still skipped one. Same
+        // fail-open, same shape, in the sibling — an active element segment is
+        // written into its table at instantiation whether or not this can work
+        // out where, so skipping the check because the offset is unknown is the
+        // check silently not running.
+        let mut operands = String::new();
+        let mut adds = String::new();
+        for _ in 0..24 {
+            operands.push_str("i32.const 0 ");
+            adds.push_str("i32.add ");
+        }
+        let wat = format!(
+            r#"(module
+  (table 1 funcref)
+  (memory (export "memory") 1)
+  (func $f (export "_start") (nop))
+  (elem (offset i32.const 65536 {operands} {adds}) $f)
+)"#
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        wasmi::Module::new(&wasmi::Engine::new(&config), &wasm[..])
+            .expect("wasmi compiles a deep extended-const offset; the finding depends on it");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("an active element segment with an unevaluable offset must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::SegmentOutOfBounds {
+                    what: "table elements",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+
+        // A passive element segment writes nothing at instantiation, so an
+        // offset it has no need of cannot make it refusable.
+        let passive = wat::parse_str(
+            r#"(module
+  (table 1 funcref)
+  (memory (export "memory") 1)
+  (func $f (export "_start") (nop))
+  (elem funcref (ref.func $f))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &passive)
+            .expect("a passive element segment must still load");
+    }
+
+    #[test]
+    fn direct_run_does_not_charge_for_headers_the_frame_will_drop() {
+        // `HostFrame::request` filters headers through the allowlist, so a
+        // `Cookie` or `Authorization` never reaches the guest. Counting those
+        // bytes against the metadata ceiling refused a request that would have
+        // cost nothing — and made `SandboxHost::run`, which is public, stricter
+        // than the adapter that is merely its politest caller.
+        let host = host(guests::HELLO);
+
+        let mut credential_heavy = get("/hello/greet");
+        credential_heavy.headers = vec![
+            ("cookie".to_owned(), "s=".repeat(MAX_REQUEST_METADATA_BYTES)),
+            (
+                "authorization".to_owned(),
+                "t=".repeat(MAX_REQUEST_METADATA_BYTES),
+            ),
+        ];
+        assert!(
+            request_metadata_bytes(&credential_heavy) < MAX_REQUEST_METADATA_BYTES,
+            "headers the frame drops are still being charged for",
+        );
+        assert!(
+            host.run(&credential_heavy).result.is_ok(),
+            "a request whose only bulk is dropped headers must still be served",
+        );
+
+        // And the ceiling still holds for headers that *do* cross, or it would
+        // have stopped bounding anything.
+        let mut allowed_heavy = get("/hello/greet");
+        allowed_heavy.headers = vec![(
+            "accept".to_owned(),
+            "text/plain, ".repeat(MAX_REQUEST_METADATA_BYTES),
+        )];
+        let err = host
+            .run(&allowed_heavy)
+            .result
+            .expect_err("oversized allowlisted metadata must still be refused");
+        assert!(
+            matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
+            "{err:?}",
         );
     }
 

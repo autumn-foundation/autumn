@@ -169,7 +169,15 @@ fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
     // needs a control character. The whole C0 range goes, not just the three
     // that are deleted — the parser also trims leading and trailing controls,
     // so none of them mean here what they mean at the client.
-    if target.chars().any(|ch| ch.is_ascii_control()) {
+    //
+    // And the space with them, which the C0 range does not cover and the parser
+    // trims for the same reason: `Location: /hello/.. ` walks below as the
+    // segment `.. `, which climbs nothing, and reaches the client as
+    // `/hello/..`, which resolves to `/`. A legitimate target percent-encodes a
+    // space, so refusing the raw byte costs nothing a redirect actually needs —
+    // and refusing it anywhere rather than only at the ends keeps this one rule
+    // instead of a second normalisation that has to agree with the client's.
+    if target.chars().any(|ch| ch.is_ascii_control() || ch == ' ') {
         return false;
     }
     let Some(rest) = target.strip_prefix(prefix) else {
@@ -677,6 +685,44 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
 mod tests {
 
     #[test]
+    fn a_redirect_cannot_hide_its_climb_behind_a_space_the_client_trims() {
+        // The control-character refusal did not cover U+0020, and the URL
+        // parser trims leading and trailing spaces for the same reason it
+        // deletes tabs: `/hello/.. ` walks here as the segment `.. `, which
+        // climbs nothing, and reaches the client as `/hello/..`, which resolves
+        // to `/` — outside the prefix entirely, with a 307/308 replaying the
+        // method and body there.
+        //
+        // Asserted as an equivalence, like the deleted-character cases: the
+        // trimmed form and the plain form are the same redirect.
+        for smuggled in ["/hello/.. ", "/hello/.. \t", " /hello/.. "] {
+            let as_the_client_sees_it: String = smuggled
+                .chars()
+                .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
+                .collect();
+            let as_the_client_sees_it = as_the_client_sees_it.trim();
+            assert_eq!(
+                as_the_client_sees_it, "/hello/..",
+                "the fixture must be the same redirect once the client trims it",
+            );
+            assert!(
+                !redirect_target_allowed(smuggled, "/hello"),
+                "{smuggled:?} was accepted, and resolves outside the prefix at the client",
+            );
+        }
+
+        // The plain form was already refused, so the assertions above cannot
+        // pass vacuously.
+        assert!(!redirect_target_allowed("/hello/..", "/hello"));
+
+        // A space is refused anywhere rather than only at the ends, so there is
+        // one rule here instead of a second normalisation that has to agree
+        // with the client's. A legitimate target percent-encodes it.
+        assert!(!redirect_target_allowed("/hello/a b", "/hello"));
+        assert!(redirect_target_allowed("/hello/a%20b", "/hello"));
+    }
+
+    #[test]
     fn a_redirect_cannot_hide_its_climb_behind_characters_the_client_deletes() {
         // The cases above are refused because of what they say. This one is
         // refused because of what it will say *later*: the URL Standard has the
@@ -744,6 +790,8 @@ mod tests {
             "/hello/\n../admin",          // and a line feed
             "/hello/\r../admin",          // and a carriage return
             "/hello/.\t./admin",          // the tab inside the segment itself
+            "/hello/.. ",                 // the climb, hidden behind a trailing space
+            "/hello/.. \t",               // and behind both at once
         ] {
             let response = SandboxResponse {
                 status: 307,
