@@ -197,7 +197,25 @@ fn production_refusal(opts: &RetentionOptions<'_>) -> Option<String> {
     if opts.mode != RetentionMode::Purge || opts.force {
         return None;
     }
-    let profile = crate::migrate::effective_profile(Some(opts.profile));
+    // Guard the profile the CHILD will actually boot, which is `opts.profile`
+    // verbatim: `run` sets both `AUTUMN_ENV` and `AUTUMN_PROFILE` to it below,
+    // and `--profile` carries `default_value = "dev"`, so it is always concrete.
+    //
+    // `effective_profile` is the wrong question here (#1605 review round 12).
+    // It resolves `AUTUMN_ENV` -> `AUTUMN_PROFILE` -> the explicit argument, so
+    // the *inherited* environment wins over `--profile` — while the child is
+    // handed `--profile` regardless. That inversion let
+    //
+    //     AUTUMN_ENV=dev autumn db retention --purge --profile prod
+    //
+    // read as "dev" here, skip this refusal, and then purge production without
+    // `--force`. Reading `opts.profile` closes it in both directions: the guard
+    // and the child now agree on which database is about to lose rows.
+    //
+    // Canonicalized the same way the runtime config loader normalizes, so
+    // `--profile development` is recognized as dev rather than refused as a
+    // custom profile name.
+    let profile = crate::migrate::canonical_profile(opts.profile);
     if matches!(profile.as_str(), "dev" | "test") {
         return None;
     }
@@ -662,6 +680,79 @@ mod tests {
     fn dry_run_header_says_would_remove() {
         let table = format_report(&[report("job_history")], RetentionMode::DryRun);
         assert!(table.contains("Would remove"), "{table}");
+    }
+
+    /// Options shaped like the CLI builds them: `--profile` carries
+    /// `default_value = "dev"`, so `profile` is always concrete.
+    fn purge_opts(profile: &str, force: bool) -> RetentionOptions<'_> {
+        RetentionOptions {
+            package: None,
+            bin: None,
+            profile,
+            mode: RetentionMode::Purge,
+            dataset: None,
+            force,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn purge_is_refused_for_the_profile_the_child_will_actually_boot() {
+        // #1605 review round 12. `run` hands the child
+        // `AUTUMN_ENV=AUTUMN_PROFILE=opts.profile`, so `opts.profile` is the
+        // database about to lose rows and is what this guard must judge.
+        //
+        // The guard previously asked `effective_profile`, which resolves
+        // AUTUMN_ENV -> AUTUMN_PROFILE -> the explicit argument — the inherited
+        // environment WINNING over `--profile`, while the child is handed
+        // `--profile` regardless. `AUTUMN_ENV=dev … --purge --profile prod`
+        // therefore read as "dev", skipped this refusal, and purged production
+        // without `--force`. The fix is structural: this function no longer
+        // consults the environment at all, so the inversion cannot recur.
+        let refusal = production_refusal(&purge_opts("prod", false))
+            .expect("a purge against prod without --force must be refused");
+        assert!(
+            refusal.contains("prod"),
+            "the refusal must name the profile it is protecting: {refusal}"
+        );
+        assert!(
+            production_refusal(&purge_opts("production", false)).is_some(),
+            "`production` is the same profile as `prod` and must refuse too"
+        );
+    }
+
+    #[test]
+    fn a_development_profile_is_recognized_by_its_long_spelling() {
+        // Canonicalization matters because the guard now reads `--profile`
+        // verbatim: before, `effective_profile` returned "development"
+        // unchanged, which is neither "dev" nor "test", so this ordinary
+        // invocation was refused. The runtime config loader treats
+        // development/dev (and production/prod) as aliases; this guard has to
+        // agree with it or it refuses work it should permit.
+        for profile in ["dev", "development", "DEV", "Development", "test"] {
+            assert!(
+                production_refusal(&purge_opts(profile, false)).is_none(),
+                "--profile {profile} is a non-production profile and must not be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn force_overrides_the_refusal_and_non_purge_modes_never_trip_it() {
+        assert!(
+            production_refusal(&purge_opts("prod", true)).is_none(),
+            "--force is the documented escape hatch for a deliberate prod purge"
+        );
+        for mode in [RetentionMode::Report, RetentionMode::DryRun] {
+            let opts = RetentionOptions {
+                mode,
+                ..purge_opts("prod", false)
+            };
+            assert!(
+                production_refusal(&opts).is_none(),
+                "{mode:?} deletes nothing, so it has nothing to refuse"
+            );
+        }
     }
 
     #[test]
