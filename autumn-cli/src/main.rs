@@ -53,6 +53,7 @@ mod seed;
 mod serve;
 mod setup;
 mod shard;
+mod simulate;
 mod starters;
 mod task;
 mod test_cmd;
@@ -1542,6 +1543,18 @@ enum Commands {
         /// `--ceiling`. Only used with `--overload`.
         #[arg(long, default_value = "2")]
         load_multiplier: u32,
+    },
+    /// Generate load against a running Autumn application
+    Simulate {
+        /// Base URL to simulate traffic against
+        #[arg(long, default_value = "http://127.0.0.1:3000")]
+        url: String,
+        /// Duration in seconds to run the simulation
+        #[arg(short, long, default_value_t = 10)]
+        duration: u64,
+        /// Number of concurrent simulated users
+        #[arg(short, long, default_value_t = 50)]
+        concurrency: usize,
     },
 }
 
@@ -4372,6 +4385,18 @@ fn run_command(command: Commands) {
                 });
             }
         },
+        Commands::Simulate {
+            url,
+            duration,
+            concurrency,
+        } => {
+            if let Err(e) =
+                simulate::run(&url, std::time::Duration::from_secs(duration), concurrency)
+            {
+                eprintln!("Simulation failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::DevLoopBench {
             example,
             runs,
