@@ -2565,21 +2565,27 @@ fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpl
     // that is not there, the remote load fails, and — because contract
     // failures deliberately fall open — the advertised admission control is
     // silently absent on exactly the deploy path the guide recommends.
-    //
-    // Read from the layered config the *deploy* resolves, so an override file
-    // that sets (or clears) the key is honoured; a path that escapes the
-    // project directory is skipped rather than uploaded to a surprising
-    // remote basename.
     if let Some(configured) = configured_capacity_contract(dirs, profile) {
-        let basename = Path::new(&configured)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        if let Some(basename) = basename
-            && let Some(local) = first_dir_with_file(dirs, &configured)
+        // `ManifestUpload` places every file flat in the release directory,
+        // but the uploaded config still names the path it was written with. A
+        // `contracts/prod.lock` uploaded as `prod.lock` would therefore be
+        // missing at the path the app looks in — the same silent fall-open
+        // this block exists to prevent. Ship only a contract that already sits
+        // beside the manifest; anything nested is left to the operator, loudly.
+        if Path::new(&configured)
+            .parent()
+            .is_some_and(|p| p != Path::new(""))
         {
+            eprintln!(
+                "\u{26A0}\u{FE0F}  warning: [server] capacity_contract is '{configured}', which is \
+                 not beside autumn.toml.\n   The release directory is flat, so this file is NOT \
+                 uploaded and the deployed app will\n   fall back to unlimited admission. Move the \
+                 contract next to autumn.toml, or ship it\n   yourself as part of your release."
+            );
+        } else if let Some(local) = first_dir_with_file(dirs, &configured) {
             uploads.push(exec::ManifestUpload {
                 local,
-                remote_basename: basename,
+                remote_basename: configured,
             });
         }
     }
@@ -2589,59 +2595,49 @@ fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpl
 
 /// `[server] capacity_contract` as the deployed config will see it.
 ///
-/// Layers the same way the runtime does — base `autumn.toml` first, then the
-/// profile override file — so a profile that sets or clears the key wins, and
-/// a stray `capacity.lock` nobody points at is never shipped.
+/// Layers exactly as the runtime does — base `autumn.toml`, then the inline
+/// `[profile.<name>]` sections of that same file, then the
+/// `autumn-<profile>.toml` sibling — reusing the same helpers the media-host
+/// resolution already mirrors. Getting this wrong is not cosmetic: a contract
+/// configured only under `[profile.prod.server]` would be left out of the
+/// release while the deployed runtime still resolves it, and admission control
+/// would fall open with no signal.
+///
+/// A key present but empty clears the setting, matching the env override.
 fn configured_capacity_contract(dirs: &[PathBuf], profile: &str) -> Option<String> {
-    /// What one config layer says about `[server] capacity_contract`.
-    ///
-    /// The three states are distinct and all matter: a layer that is silent
-    /// must not override an earlier one, while a layer that sets the key to
-    /// the empty string deliberately *clears* it — matching how the
-    /// `AUTUMN_SERVER__CAPACITY_CONTRACT` env override behaves.
-    enum LayerValue {
-        Silent,
-        Cleared,
-        Set(String),
-    }
+    let base_path = first_dir_with_file(dirs, "autumn.toml")?;
+    let mut merged: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&base_path).ok()?).ok()?;
 
-    fn read_key(path: &Path) -> LayerValue {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return LayerValue::Silent;
-        };
-        let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
-            return LayerValue::Silent;
-        };
-        match parsed
-            .get("server")
-            .and_then(|server| server.get("capacity_contract"))
-            .and_then(toml::Value::as_str)
-        {
-            None => LayerValue::Silent,
-            Some("") => LayerValue::Cleared,
-            Some(value) => LayerValue::Set(value.to_owned()),
+    let canonical =
+        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
+
+    // Inline `[profile.<name>]` overlays from the base file, alias first so the
+    // canonical spelling wins — identical to the runtime.
+    for name in profile_inline_lookup_names(&canonical) {
+        if let Some(section) = profile_section_from_base_toml(&merged.clone(), name) {
+            deep_merge_toml(&mut merged, section);
         }
     }
 
-    let mut configured = match first_dir_with_file(dirs, "autumn.toml").map(|p| read_key(&p)) {
-        Some(LayerValue::Set(value)) => Some(value),
-        _ => None,
-    };
-
-    let normalized =
-        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
-    for name in autumn_web::config::profile_override_file_lookup_names(&normalized, profile) {
+    // Then the first existing `autumn-<profile>.toml` sibling.
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile) {
         if let Some(local) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) {
-            match read_key(&local) {
-                LayerValue::Set(value) => configured = Some(value),
-                LayerValue::Cleared => configured = None,
-                LayerValue::Silent => {}
+            if let Ok(text) = std::fs::read_to_string(&local)
+                && let Ok(overlay) = toml::from_str::<toml::Value>(&text)
+            {
+                deep_merge_toml(&mut merged, overlay);
             }
             break;
         }
     }
 
-    configured
+    merged
+        .get("server")
+        .and_then(|server| server.get("capacity_contract"))
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Locate the config manifest(s) to upload for the resolved deploy, reading from
@@ -6170,6 +6166,68 @@ mod tests {
         let uploads = manifest_uploads_in(&dirs, "prod");
         let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
         assert_eq!(names, vec!["autumn.toml"]);
+    }
+
+    #[test]
+    fn manifest_uploads_read_the_contract_from_an_inline_profile_overlay() {
+        // A contract configured only under `[profile.prod.server]` is still
+        // resolved by the deployed runtime, so it must still travel with the
+        // release — otherwise admission control falls open with no signal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\n\n[profile.prod.server]\ncapacity_contract = \"capacity.lock\"\n",
+        )
+        .expect("write base");
+        std::fs::write(dir.path().join("capacity.lock"), "version = 1\n").expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "capacity.lock"]);
+    }
+
+    #[test]
+    fn manifest_uploads_refuse_to_flatten_a_nested_contract_path() {
+        // The release directory is flat, but the uploaded config still names
+        // `contracts/prod.lock`. Uploading it as `prod.lock` would leave the
+        // app looking at a path that does not exist — the very fall-open this
+        // upload exists to prevent — so it is skipped with a warning instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\ncapacity_contract = \"contracts/prod.lock\"\n",
+        )
+        .expect("write base");
+        std::fs::create_dir_all(dir.path().join("contracts")).expect("mkdir");
+        std::fs::write(dir.path().join("contracts/prod.lock"), "version = 1\n")
+            .expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml"]);
+    }
+
+    #[test]
+    fn manifest_uploads_honour_a_profile_sibling_clearing_the_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\ncapacity_contract = \"capacity.lock\"\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\ncapacity_contract = \"\"\n",
+        )
+        .expect("write sibling");
+        std::fs::write(dir.path().join("capacity.lock"), "version = 1\n").expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "autumn-prod.toml"]);
     }
 
     #[test]

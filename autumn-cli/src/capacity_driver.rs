@@ -165,7 +165,10 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         }
     };
 
-    let child = match boot(&binary, port) {
+    // `targets` is non-empty (checked above) and sorted, so the first entry is
+    // a stable, unauthenticated, parameterless GET this app really serves.
+    let ready_path = targets.first().map_or("/", String::as_str);
+    let child = match boot(&binary, port, ready_path) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("\u{2717} {error}");
@@ -331,9 +334,16 @@ fn dump_routes(binary: &Path) -> Result<Vec<DumpedRoute>, String> {
     serde_json::from_str(&stdout).map_err(|e| format!("failed to parse route listing JSON: {e}"))
 }
 
-/// Boot the binary on `port` with admission control disabled, and wait for it
-/// to report live.
-fn boot(binary: &Path, port: u16) -> Result<std::process::Child, String> {
+/// Boot the binary on `port` with admission control disabled, and wait until
+/// it answers.
+///
+/// Readiness is probed against the first route the ladder will actually drive,
+/// not a hard-coded `/live`: an app that moves `health.live_path` (to `/livez`,
+/// say) or disables the built-in probes entirely would 404 that path forever,
+/// and every calibration would burn the full timeout without measuring
+/// anything. A 2xx from a route we are about to load-test is a stronger
+/// readiness signal anyway.
+fn boot(binary: &Path, port: u16, ready_path: &str) -> Result<std::process::Child, String> {
     let mut child = Command::new(binary)
         .env("AUTUMN_SERVER__PORT", port.to_string())
         .env("AUTUMN_SERVER__HOST", "127.0.0.1")
@@ -346,7 +356,7 @@ fn boot(binary: &Path, port: u16) -> Result<std::process::Child, String> {
         .map_err(|e| format!("failed to start {}: {e}", binary.display()))?;
 
     let client = blocking_client();
-    let live = format!("http://127.0.0.1:{port}/live");
+    let ready_url = format!("http://127.0.0.1:{port}{ready_path}");
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         match child.try_wait() {
@@ -363,7 +373,7 @@ fn boot(binary: &Path, port: u16) -> Result<std::process::Child, String> {
             }
         }
         if client
-            .get(&live)
+            .get(&ready_url)
             .send()
             .is_ok_and(|response| response.status().is_success())
         {
@@ -372,7 +382,9 @@ fn boot(binary: &Path, port: u16) -> Result<std::process::Child, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     stop_child(&mut child);
-    Err("the app did not become live within 60s".to_owned())
+    Err(format!(
+        "the app did not answer {ready_path} with a success status within 60s"
+    ))
 }
 
 /// A keep-alive HTTP client sized for the ladder's widest rung.
@@ -475,7 +487,19 @@ fn drive(
                     let Some(path) = plan.get(idx) else { break };
                     let url = format!("{base}{path}");
                     let sent = Instant::now();
-                    match client.get(&url).send() {
+                    let outcome = client.get(&url).send();
+                    // Count only what finished inside the offered window. A
+                    // request still in flight at the deadline was neither
+                    // delivered during the window nor is its latency
+                    // attributable to it, and counting it against a
+                    // fixed-length denominator would overstate throughput for
+                    // exactly the slow handlers where the envelope matters
+                    // most. Requests issued before the deadline that land
+                    // after it are simply dropped from both tallies.
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    match outcome {
                         Ok(response) if response.status().is_success() => {
                             local.push(sent.elapsed().as_secs_f64() * 1000.0);
                         }
@@ -499,6 +523,8 @@ fn drive(
     // then read as "gained too little" and record a ceiling far below what the
     // binary sustains. Every counted response was issued inside this window,
     // so the window is the honest denominator.
+    // The offered window, and now an honest denominator for it: every counted
+    // response both started and finished inside it.
     let wall_secs = duration.as_secs_f64();
     debug_assert!(started.elapsed() >= duration || concurrency == 0);
     let latencies_ms = latencies.lock().map(|l| l.clone()).unwrap_or_default();

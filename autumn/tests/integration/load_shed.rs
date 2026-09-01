@@ -321,6 +321,7 @@ fn write_contract(
             saturation_concurrency: admission_limit,
             admission_limit,
         },
+        calibration: autumn_web::capacity::Calibration::default(),
         routes,
     };
 
