@@ -1500,31 +1500,127 @@ fn skip_const_expr(wasm: &[u8], mut at: usize, limit: usize) -> Option<usize> {
             0xd0 => at = at.checked_add(1)?,
             // ref.func / global.get: one unsigned LEB128
             0xd2 | 0x23 => at = leb128(wasm, at)?.1,
+            // extended-const arithmetic: no immediates. wasmi enables the
+            // proposal by default, so these appear in offsets the engine
+            // accepts and this walk has to keep step with.
+            0x6a..=0x6c | 0x7c..=0x7e => {}
             _ => return None,
         }
     }
 }
 
-/// The `i32.const` value a constant expression evaluates to, if it is one.
+/// The `i32` value a constant expression evaluates to, if this can tell.
 ///
 /// Returns the offset past the expression either way, so a caller can keep
 /// walking past an expression it cannot evaluate.
+///
+/// Reading only a bare `i32.const` was not enough, and the gap was a fail-open.
+/// wasmi enables the extended-const proposal by default, so
+/// `i32.const 65535; i32.const 2; i32.add` is a legal active data offset that
+/// the engine compiles happily. Against the bare-form reader it was not merely
+/// unevaluable: `skip_const_expr` did not know `i32.add` either, so the whole
+/// data section's walk returned `None`, the caller dropped it, and `data_end`
+/// stayed at zero. The bounds check did not run at all, and packaging approved
+/// an artifact whose every request would then fail at instantiation — the one
+/// outcome the load-time check exists to prevent.
+///
+/// So the arithmetic is evaluated. Everything else a constant expression may
+/// contain is still stepped over and reported as unevaluable rather than
+/// guessed at: `global.get` reads a global this walk has not tracked, and the
+/// float and reference forms are not offsets at all.
 fn const_i32(wasm: &[u8], at: usize, limit: usize) -> Option<(Option<u64>, usize)> {
-    if *wasm.get(at)? == 0x41 {
-        let (value, next) = sleb128(wasm, at.checked_add(1)?)?;
-        let end = skip_const_expr(wasm, next, limit)?;
-        let Ok(narrow) = i32::try_from(value) else {
-            // Not a well-formed `i32.const`; leave it to the engine.
-            return Some((None, end));
-        };
+    // The proposal's grammar is a fold over constants, so a handful of slots is
+    // more than any real offset needs; a deeper expression is reported as
+    // unevaluable rather than growing a stack for an untrusted module.
+    let mut stack = [0i32; 8];
+    let mut depth = 0usize;
+    let mut evaluable = true;
+    let mut at = at;
+    loop {
+        if at > limit {
+            return None;
+        }
+        let opcode = *wasm.get(at)?;
+        at = at.checked_add(1)?;
+        match opcode {
+            // end
+            0x0b => break,
+            // i32.const
+            0x41 => {
+                let (value, next) = sleb128(wasm, at)?;
+                at = next;
+                match (i32::try_from(value), stack.get_mut(depth)) {
+                    (Ok(narrow), Some(slot)) => {
+                        *slot = narrow;
+                        depth = depth.saturating_add(1);
+                    }
+                    _ => evaluable = false,
+                }
+            }
+            // i32.add / i32.sub / i32.mul, which wrap in wasm as they do here.
+            0x6a..=0x6c => {
+                // Folded through `checked_sub` and `get` rather than indexing:
+                // this module is in the request-path panic-gate manifest, and
+                // the depth these run against comes out of an untrusted module.
+                let folded = depth.checked_sub(2).and_then(|left_at| {
+                    let right = *stack.get(depth.checked_sub(1)?)?;
+                    let left = *stack.get(left_at)?;
+                    let value = match opcode {
+                        0x6a => left.wrapping_add(right),
+                        0x6b => left.wrapping_sub(right),
+                        _ => left.wrapping_mul(right),
+                    };
+                    Some((left_at, value))
+                });
+                match folded {
+                    Some((left_at, value)) => {
+                        if let Some(slot) = stack.get_mut(left_at) {
+                            *slot = value;
+                        }
+                        depth = left_at.saturating_add(1);
+                    }
+                    None => evaluable = false,
+                }
+            }
+            // i64.const, and the i64 arithmetic: stepped over, not evaluated —
+            // a memory or table offset is an `i32`, so an expression built from
+            // these is not one this caller is asking about.
+            0x42 => {
+                at = sleb128(wasm, at)?.1;
+                evaluable = false;
+            }
+            0x7c..=0x7e => evaluable = false,
+            // f32.const / f64.const: raw little-endian bits, never an offset.
+            0x43 => {
+                at = at.checked_add(4)?;
+                evaluable = false;
+            }
+            0x44 => {
+                at = at.checked_add(8)?;
+                evaluable = false;
+            }
+            // ref.null: one heap type byte.
+            0xd0 => {
+                at = at.checked_add(1)?;
+                evaluable = false;
+            }
+            // ref.func / global.get: one unsigned LEB128.
+            0xd2 | 0x23 => {
+                at = leb128(wasm, at)?.1;
+                evaluable = false;
+            }
+            _ => return None,
+        }
+    }
+    if let (true, 1, Some(&result)) = (evaluable, depth, stack.first()) {
         // A wasm offset is a `u32`, so `i32.const -1` addresses 4294967295 —
         // past the end of any memory or table the sandbox will admit. Dropping
         // a negative as "unevaluable" was a fail-open: the one class of offset
         // that is *certainly* out of bounds was the one recorded as unknown.
-        let unsigned = u64::from(u32::from_ne_bytes(narrow.to_ne_bytes()));
-        return Some((Some(unsigned), end));
+        let unsigned = u64::from(u32::from_ne_bytes(result.to_ne_bytes()));
+        return Some((Some(unsigned), at));
     }
-    Some((None, skip_const_expr(wasm, at, limit)?))
+    Some((None, at))
 }
 
 /// Read an unsigned LEB128 at `at`, returning the value and the next offset.
@@ -1744,8 +1840,14 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             // (a `global.get`, say) is left alone: the shim exports no globals
             // for one to read, so such a module fails to link for its own
             // reasons rather than being mis-refused here.
-            if let Some(end) = data_section_end(wasm, after_size, end) {
-                data_end = data_end.max(end);
+            match data_section_end(wasm, after_size, end) {
+                Some(seen) => data_end = data_end.max(seen),
+                // The walk lost the thread — a malformed section, or an opcode
+                // a later proposal added that this does not know. Either way
+                // the bounds check below did not run, and silently not running
+                // is how a segment past the end of memory got admitted. An
+                // offset that cannot be read is treated as one that cannot fit.
+                None => data_end = u64::MAX,
             }
         }
         // The sections whose leading count (or size) is the whole answer. The
@@ -3942,6 +4044,62 @@ path = "/hello/greet"
             "the denial detail carries the guest's whole header: {} bytes",
             logged.detail.len()
         );
+    }
+
+    #[test]
+    fn an_extended_const_segment_offset_is_evaluated_rather_than_waved_through() {
+        // wasmi enables the extended-const proposal by default, so an active
+        // data offset need not be a bare `i32.const`. Against a reader that
+        // knew only the bare form this was not merely unevaluable: the walk did
+        // not know `i32.add` either, so it desynced, the whole data section
+        // returned nothing, and `data_end` stayed at zero. The bounds check did
+        // not run — and packaging and `plugin inspect` then approved an
+        // artifact whose every request would fail at instantiation, which is
+        // precisely what checking at load is for.
+        let out_of_bounds = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (offset (i32.add (i32.const 65535) (i32.const 2))) "xx")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+
+        // The engine accepts it, which is what makes the gap reachable: if
+        // wasmi refused the module this walk's silence would cost nothing.
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        wasmi::Module::new(&wasmi::Engine::new(&config), &out_of_bounds[..])
+            .expect("wasmi compiles an extended-const offset; the finding depends on it");
+
+        let err =
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &out_of_bounds)
+                .expect_err("a segment past the end of memory must be refused at load");
+        // Refused for the true reason, with the offset the arithmetic actually
+        // produces — 65535 + 2, plus the two bytes copied there.
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::SegmentOutOfBounds { end, capacity, .. }
+                    if end == 65539 && capacity == WASM_PAGE_BYTES
+            ),
+            "{err:?}",
+        );
+
+        // And the arithmetic is *evaluated*, not merely refused for being
+        // unfamiliar: the same shape landing inside the memory still loads.
+        // Refusing every extended-const module would pass the assertion above
+        // and fail this one.
+        let in_bounds = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (offset (i32.add (i32.const 16) (i32.const 8))) "xx")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &in_bounds)
+            .expect("an extended-const offset inside the memory must still load");
     }
 
     #[test]
