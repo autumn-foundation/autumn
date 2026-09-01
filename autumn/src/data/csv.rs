@@ -53,6 +53,9 @@
 use std::collections::HashMap;
 use std::io;
 
+use axum::response::{IntoResponse, Response};
+use http::header;
+
 // ── Row-level error ───────────────────────────────────────────────────────────
 
 /// A parse or validation error for a single CSV row.
@@ -249,6 +252,60 @@ where
 
     wtr.flush()?;
     Ok(())
+}
+
+/// Axum response wrapper that streams an iterator of [`CsvSchema`] records as
+/// a downloaded CSV file.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::{CsvSchema, CsvExport};
+///
+/// struct Post { id: i64, title: String }
+/// impl CsvSchema for Post {
+///     fn csv_columns() -> &'static [&'static str] { &["id", "title"] }
+///     fn to_csv_record(&self) -> Vec<String> {
+///         vec![self.id.to_string(), self.title.clone()]
+///     }
+/// }
+///
+/// #[get("/posts.csv")]
+/// async fn export() -> impl axum::response::IntoResponse {
+///     let posts = vec![Post { id: 1, title: "Hello".into() }];
+///     CsvExport("posts.csv".to_owned(), posts)
+/// }
+/// ```
+pub struct CsvExport<I>(pub String, pub I);
+
+impl<I, T> IntoResponse for CsvExport<I>
+where
+    I: IntoIterator<Item = T>,
+    T: CsvSchema,
+{
+    fn into_response(self) -> Response {
+        let mut out = Vec::new();
+        if export_csv(self.1, &mut out).is_err() {
+            return (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate CSV export",
+            )
+                .into_response();
+        }
+
+        (
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    &format!("attachment; filename=\"{}\"", self.0),
+                ),
+            ],
+            out,
+        )
+            .into_response()
+    }
 }
 
 // ── import_csv ────────────────────────────────────────────────────────────────
