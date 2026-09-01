@@ -36,6 +36,8 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod capacity;
+mod capacity_driver;
 mod overload_driver;
 mod paths;
 mod pg;
@@ -1523,6 +1525,48 @@ enum Commands {
     /// Rows are stable-sorted by path, then method, so the output is
     /// diff-friendly. Redirect to a file and `git diff` two snapshots to
     /// audit route changes between commits.
+    /// Derive and enforce this build's capacity contract (issue #1733).
+    ///
+    /// Builds the app in release mode, reads its route graph, walks a seeded
+    /// concurrency ladder against it, and records the saturation envelope in
+    /// `capacity.lock`. With `--check`, compares a rebuild against the
+    /// committed contract instead of writing one — the CI gate.
+    Calibrate {
+        /// Package to calibrate (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to calibrate (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Path of the capacity contract to write, or to check against.
+        #[arg(long, default_value = autumn_web::capacity::CONTRACT_FILE_NAME, value_name = "PATH")]
+        contract: String,
+        /// Gate mode: fail with a diff when this build regresses beyond
+        /// tolerance versus the committed contract. Writes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Seed for the request profile, so a calibration is replayable.
+        #[arg(long, default_value = "1733")]
+        seed: u64,
+        /// Concurrency ladder to walk (comma-separated).
+        #[arg(long, value_delimiter = ',', default_value = crate::capacity_driver::DEFAULT_LADDER, value_name = "N")]
+        concurrency: Vec<usize>,
+        /// Milliseconds to hold each rung of the ladder.
+        #[arg(long, default_value = "2000", value_name = "MS")]
+        rung_ms: u64,
+        /// Milliseconds of discarded warmup before the ladder.
+        #[arg(long, default_value = "1000", value_name = "MS")]
+        warmup_ms: u64,
+        /// Fractional sustained-throughput drop `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
+        tolerance_rps: f64,
+        /// Fractional P99-latency rise `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_P99_TOLERANCE, value_name = "FRACTION")]
+        tolerance_p99: f64,
+        /// Also emit the measured contract as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     Routes {
         /// Package to inspect (for workspaces).
         #[arg(short, long)]
@@ -4185,6 +4229,38 @@ fn run_command(command: Commands) {
                 features,
                 release: args.release,
             });
+        }
+        Commands::Calibrate {
+            package,
+            bin,
+            contract,
+            check,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            tolerance_rps,
+            tolerance_p99,
+            json,
+        } => {
+            let exit_code = capacity_driver::run(&capacity_driver::CalibrateOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                contract_path: &contract,
+                check,
+                seed,
+                concurrency,
+                rung_ms,
+                warmup_ms,
+                tolerances: capacity::Tolerances {
+                    rps: tolerance_rps,
+                    p99: tolerance_p99,
+                },
+                json,
+            });
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Commands::Routes {
             package,
@@ -9384,6 +9460,73 @@ mod tests {
         };
         assert_eq!(example, "examples/todo-app");
         assert_eq!(runs, 10);
+    }
+
+    // ── autumn calibrate (#1733) ────────────────────────────────────
+
+    #[test]
+    fn parse_calibrate_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "calibrate"]).unwrap();
+        let Commands::Calibrate {
+            contract,
+            check,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert_eq!(contract, "capacity.lock");
+        assert!(!check, "calibrate writes a contract unless --check is passed");
+        assert_eq!(seed, 1733);
+        assert_eq!(concurrency, vec![1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(rung_ms, 2000);
+        assert_eq!(warmup_ms, 1000);
+        assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_calibrate_check_mode_with_custom_ladder_and_tolerances() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "calibrate",
+            "--check",
+            "-p",
+            "blog",
+            "--contract",
+            "deploy/capacity.lock",
+            "--concurrency",
+            "1,8,64,256",
+            "--tolerance-rps",
+            "0.1",
+            "--tolerance-p99",
+            "0.3",
+        ])
+        .unwrap();
+        let Commands::Calibrate {
+            package,
+            contract,
+            check,
+            concurrency,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert!(check);
+        assert_eq!(package.as_deref(), Some("blog"));
+        assert_eq!(contract, "deploy/capacity.lock");
+        assert_eq!(concurrency, vec![1, 8, 64, 256]);
+        assert!((tolerance_rps - 0.1).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

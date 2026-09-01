@@ -1,0 +1,135 @@
+name: Capacity Contract Gate
+
+# The CI half of the per-deploy capacity contract (issue #1733).
+#
+# Per-PR: only the pure logic runs — the ladder statistics, the saturation-knee
+# rule, the seeded request profile, the `--check` comparison and its rendered
+# diff, plus the contract model and the runtime admission-sourcing rules. None
+# of that needs a build of a target app or a load-generating server.
+#
+# Scheduled / manual: the live gate runs — it builds a reference app in RELEASE
+# mode and drives a concurrency ladder against it, which is far too slow and
+# far too sensitive to a shared runner's noisy neighbours to be a per-PR
+# required check. That is the same posture the cold-start and dev-loop-scaling
+# gates take, and it is load bearing here: a capacity gate that cries wolf gets
+# switched off, which is strictly worse than not having one.
+on:
+  schedule:
+    # Every Monday at 09:00 UTC (after the cold-start and dev-loop gates).
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      example:
+        description: "Reference app to calibrate (path relative to the workspace root)"
+        required: false
+        default: "examples/hello"
+      noop_rebuilds:
+        description: "How many no-op `--check` rebuilds to run (the false-positive probe)"
+        required: false
+        default: "3"
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/src/capacity.rs"
+      - "autumn/src/route_listing.rs"
+      - "autumn-cli/src/capacity.rs"
+      - "autumn-cli/src/capacity_driver.rs"
+      - "autumn-cli/src/main.rs"
+      - "autumn-macros/src/route.rs"
+      - "docs/guide/capacity-contracts.md"
+      - ".github/workflows/capacity-contract.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # See the identical note in cold-start-latency.yml: this CLI's whole clap
+  # command tree is built inside one `Commands::augment_subcommands` frame, and
+  # `Cli::try_parse_from` runs close enough to the 2 MiB default thread stack
+  # that adding a subcommand (this workflow adds `calibrate`) can overflow it.
+  RUST_MIN_STACK: 8388608
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Pure logic (runs on every PR; no build of a target app, no server) ─────
+  unit-tests:
+    name: Capacity contract unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Run capacity contract unit tests
+        # `shell: bash` enables `pipefail`, so a failing `cargo test` is not
+        # masked by the `tee` in the pipeline.
+        shell: bash
+        run: |
+          cargo test -p autumn-web --lib -- capacity:: 2>&1 | tee web-output.txt
+          cargo test -p autumn-cli --lib -- capacity:: 2>&1 | tee cli-output.txt
+          grep -E "^test result:" web-output.txt cli-output.txt
+          # Guard against a stale filter silently matching zero tests.
+          for f in web-output.txt cli-output.txt; do
+            if ! grep -qE "^test capacity::tests::.* \.\.\. ok" "$f"; then
+              echo "::error::No capacity unit tests ran in $f — the filter may be stale."
+              exit 1
+            fi
+          done
+
+      - name: Show `autumn calibrate --help`
+        run: |
+          cargo build -p autumn-cli
+          ./target/debug/autumn calibrate --help
+
+  # ── Live calibrate → check round trip (scheduled / manual only) ────────────
+  calibrate:
+    name: Calibrate a reference app and gate a rebuild
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    # A release build of the reference app plus the ladder runs.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build CLI
+        run: cargo build -p autumn-cli
+
+      - name: Calibrate the reference app
+        shell: bash
+        run: |
+          EXAMPLE="${{ inputs.example || 'examples/hello' }}"
+          PKG="$(basename "$EXAMPLE")"
+          ./target/debug/autumn calibrate -p "$PKG" --contract capacity.lock
+          echo '### Recorded contract' >> "$GITHUB_STEP_SUMMARY"
+          echo '```toml' >> "$GITHUB_STEP_SUMMARY"
+          cat capacity.lock >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate no-op rebuilds (the false-positive probe)
+        # The Success Metric asks for zero false positives across repeated
+        # no-op rebuilds. Nothing changed between these runs, so every one of
+        # them must pass; a failure here means the tolerances are too tight for
+        # this runner class, not that the app regressed.
+        shell: bash
+        run: |
+          N="${{ inputs.noop_rebuilds || '3' }}"
+          for i in $(seq 1 "$N"); do
+            echo "── no-op rebuild $i/$N ──"
+            PKG="$(basename "${{ inputs.example || 'examples/hello' }}")"
+            ./target/debug/autumn calibrate -p "$PKG" --contract capacity.lock --check
+          done
+
+      - name: Upload the contract
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-lock
+          path: capacity.lock
+          if-no-files-found: warn

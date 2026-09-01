@@ -111,6 +111,7 @@ pub mod canary;
 /// Enabled by the `reporting` Cargo feature (on by default), armed by
 /// `[failure_capture] enabled = true` (off by default).
 #[cfg(feature = "reporting")]
+pub mod capacity;
 pub mod capsule;
 pub mod circuit_breaker;
 // Compile-time data classification (issue #1654): carries a "personal data"
