@@ -162,6 +162,15 @@ routes that name their own extension are unaffected: `/theme.css` returning a
 `String` still serves `text/css`, because axum's `text/plain; charset=utf-8` is
 a default from the return type rather than a statement about the page.
 
+That check is by value, because axum's inferred default and a hand-written
+declaration of the same type produce byte-identical responses. Only axum's two
+exact spellings are treated as inferred, so if you deliberately want
+`text/plain` or `application/octet-stream` on a route whose extension is in
+Autumn's asset table, declare it distinctly — bare `text/plain`, or
+`application/octet-stream` with a parameter — and it is recorded. Prefer
+`Content-Disposition: attachment` for downloads. Extensions outside the asset
+table (`.pdf`, `.zip`) always keep the declared type.
+
 An **extensionless** route is the one visible change. `#[static_get("/about")]
 async fn about() -> String { html }` has no extension to fall back on, so it is
 now served as the `text/plain; charset=utf-8` axum declares, instead of the

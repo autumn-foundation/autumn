@@ -160,6 +160,32 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 /// slug: `/notes.txt` declaring `application/json` is not a generic default, so
 /// it is recorded and served as JSON.
 ///
+/// # The one ambiguity, and how to escape it
+///
+/// axum builds `String`'s response as
+/// `([(CONTENT_TYPE, "text/plain; charset=utf-8")], body)`, which is *byte-for-byte*
+/// the response a handler writing that tuple by hand produces. There is no
+/// provenance to read: at this layer "inferred default" and "deliberate
+/// declaration of the same type" are indistinguishable. So a route with a
+/// recognized extension that deliberately declares one of these two types —
+/// `/logo.png` declaring `application/octet-stream` to force a download — is
+/// treated as the inferred case and falls back to `image/png`.
+///
+/// The direction is chosen on which mistake is worse. Serving a stylesheet or a
+/// script as `text/plain` is *silently fatal* under `nosniff` (the browser drops
+/// it, with no console error about the type), and writing `-> String` is the
+/// obvious way to author such a route. Serving a deliberately-octet-stream
+/// `.png` as `image/png` is visible and mild — and forcing a download is
+/// properly expressed with `Content-Disposition: attachment`, which this does
+/// not touch.
+///
+/// The escape hatch is exact-match: only axum's own two spellings are treated as
+/// generic. A handler that really wants one of these types on an extensioned
+/// route declares it distinctly — bare `text/plain`, or
+/// `application/octet-stream` with a parameter — and it is recorded. Extensions
+/// outside the asset table (`.pdf`, `.zip`) are unaffected: there is nothing to
+/// prefer, so the declared type is always recorded.
+///
 /// In every `None` case nothing is recorded and the serve path keeps deriving,
 /// rather than the manifest carrying a value that is wrong, unusable, or merely
 /// an artifact of the return type.
@@ -924,6 +950,63 @@ mod tests {
         assert_eq!(
             manifest.routes["/data.bin"].content_type.as_deref(),
             Some("application/octet-stream")
+        );
+    }
+
+    /// The documented escape hatch from the generic-default guard: only axum's
+    /// own two exact spellings are treated as inferred, so a handler that
+    /// deliberately wants a plain-text `.css` route declares it distinctly
+    /// (bare `text/plain`) and that declaration is recorded.
+    #[tokio::test]
+    async fn explicitly_distinct_generic_type_is_recorded_on_an_extensioned_route() {
+        fn plain_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    "not really css",
+                )
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(plain_router(), &[test_meta("/theme.css", "theme")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/theme.css"].content_type.as_deref(),
+            Some("text/plain"),
+            "a distinctly-spelled declaration is intent, not an inferred default"
+        );
+    }
+
+    /// An extension outside the asset table has nothing to prefer, so even an
+    /// exact generic default is recorded. (This is why a `/report.pdf` handler
+    /// declaring `application/octet-stream` keeps that type.)
+    #[tokio::test]
+    async fn generic_default_is_recorded_for_an_extension_outside_the_asset_table() {
+        fn pdf_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                    "%PDF-1.7",
+                )
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(pdf_router(), &[test_meta("/report.pdf", "report")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/report.pdf"].content_type.as_deref(),
+            Some("application/octet-stream"),
+            ".pdf is not in the asset table, so there is no extension to prefer"
         );
     }
 

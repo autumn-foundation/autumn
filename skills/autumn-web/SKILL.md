@@ -313,8 +313,21 @@ async fn feed() -> impl IntoResponse {
 }
 ```
 
-Return `Markup` (or `Html<String>`) for HTML pages: a handler returning a bare
-`String` declares `text/plain; charset=utf-8`, which is what will now be served.
+Only a type you *declare* is recorded. axum attaches one to every response, but
+for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
+(`application/octet-stream`) it comes from the return type, not from you — so on
+a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
+exact values are ignored and the extension wins, which is what stops a `->
+String` stylesheet from being served as plain text and dropped by `nosniff`.
+The two are indistinguishable in the response, so if you genuinely want one of
+them on such a route, declare it distinctly (bare `text/plain`, or
+`application/octet-stream` with a parameter) and it is recorded; to force a
+download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
+asset table (`.pdf`, `.zip`) are unaffected.
+
+Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a
+handler returning a bare `String` declares `text/plain; charset=utf-8`, which is
+what will now be served.
 A `dist/` built before 0.7.0 records nothing and keeps its previous derived
 type until the next `autumn build`. ISR refuses a regeneration whose handler
 declares a *different* type than the manifest recorded, so a stale-but-correctly
