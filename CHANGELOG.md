@@ -40,16 +40,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt from a tampered manifest) and falls back instead, returning a
   `HeaderValue` so the request path cannot panic on a bad manifest.
 
-  Two API notes: `ManifestEntry` gained a public field, so struct literals need
-  `content_type` — the new `ManifestEntry::new(file)` plus `with_revalidate` /
-  `with_content_type` builders are the construction path that keeps compiling as
-  the entry evolves. And after a rebuild, a `#[static_get]` handler returning a
-  bare `String` is now served as the `text/plain; charset=utf-8` axum actually
-  declares, rather than the `text/html` the old heuristic assumed; this matches
-  what the same handler already served on the dynamic path. Return `Markup` or
-  `Html<String>` for HTML. ISR regeneration rewrites the file, not the manifest,
-  so a handler that starts declaring a different type logs a `WARN` pointing at
-  `autumn build` instead of drifting silently.
+  ISR does not rewrite the manifest (it is immutable behind an `Arc`, with file
+  mtime driving staleness), so the header served for a route is fixed for the
+  process lifetime while the body on disk is not. A regeneration whose handler
+  declares a *different* type — or stops declaring one — is therefore refused
+  rather than written: the previous file stays, still matching its recorded
+  type, so the route degrades to stale-but-correct instead of serving fresh
+  bytes under a header that mislabels them. The refusal is logged; `autumn
+  build` re-records the type.
+
+  Only a type the handler *deliberately* declared is recorded. axum's blanket
+  `IntoResponse` impls always attach one — `text/plain; charset=utf-8` for
+  `String`, `application/octet-stream` for `Vec<u8>` — purely from the return
+  type, so recording those over a route that names its own extension would have
+  served `#[static_get("/theme.css")] async fn theme() -> String` as plain text
+  and let `X-Content-Type-Options: nosniff` drop the stylesheet outright. When a
+  declared type is one of those two generic defaults and the route's final
+  segment carries a recognized asset extension that disagrees, nothing is
+  recorded and the derivation runs as before. An explicit declaration still
+  wins, even against the slug (`/notes.txt` declaring `application/json`).
+
+  **Breaking:** `ManifestEntry` and `StaticManifest` are now `#[non_exhaustive]`
+  and `ManifestEntry` gained a `content_type` field, so struct literals must
+  become `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)`
+  and `StaticManifest::new(routes)`. Behaviourally, an *extensionless*
+  `#[static_get]` route whose handler returns a bare `String` is served as the
+  `text/plain; charset=utf-8` axum declares rather than the `text/html` the old
+  heuristic assumed — matching what that same handler already served on the
+  dynamic path. Return `Markup` or `Html<String>` for HTML. See
+  [the migration guide](docs/migrations/next.md).
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"

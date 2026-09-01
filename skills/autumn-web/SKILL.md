@@ -294,6 +294,33 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
+**Declare the `Content-Type` on a `#[static_get]` route that is not HTML
+(0.7.0, #1832).** `autumn build` records the type each handler's response
+declares into `dist/manifest.json`, and the static-first middleware serves that
+value verbatim — it no longer guesses from the route slug, which it had to do
+because every non-root route is stored as `<route>/index.html`. So the handler's
+own header is the whole contract:
+
+```rust
+#[static_get("/sitemap.xml")]
+async fn sitemap() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/xml")], build_sitemap())
+}
+
+#[static_get("/feed")]                       // extensionless — no extension to infer from
+async fn feed() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/rss+xml")], build_feed())
+}
+```
+
+Return `Markup` (or `Html<String>`) for HTML pages: a handler returning a bare
+`String` declares `text/plain; charset=utf-8`, which is what will now be served.
+A `dist/` built before 0.7.0 records nothing and keeps its previous derived
+type until the next `autumn build`. ISR refuses a regeneration whose handler
+declares a *different* type than the manifest recorded, so a stale-but-correctly
+-typed page is served instead of fresh bytes under the wrong header — re-run
+`autumn build` after changing a route's type.
+
 **Route-level SEO defaults (issue #1182, 0.7.0):** declare
 per-page meta tag values once on the route with a `seo(...)` argument instead of
 rebuilding a `SeoMeta` in every handler. `SeoMeta` is an extractor, so a handler

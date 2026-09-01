@@ -101,7 +101,12 @@ impl std::fmt::Debug for StaticRouteMeta {
 /// by the static-file middleware.
 ///
 /// Stored as JSON alongside the generated HTML files.
+///
+/// `#[non_exhaustive]`: build one with [`StaticManifest::new`] rather than a
+/// struct literal, for the same reason as [`ManifestEntry`] — the manifest
+/// format is expected to grow, and a literal breaks each time it does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StaticManifest {
     /// ISO-8601 timestamp of when the build ran.
     pub generated_at: String,
@@ -112,13 +117,26 @@ pub struct StaticManifest {
 }
 
 /// A single entry inside a [`StaticManifest`].
+///
+/// `#[non_exhaustive]`: build one with [`ManifestEntry::new`] plus the
+/// `with_*` setters rather than a struct literal. The entry gained a field in
+/// #1832 and may gain more; the constructor keeps downstream code compiling
+/// when it does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ManifestEntry {
     /// Relative filesystem path to the generated HTML file
     /// (e.g. `"about/index.html"`).
     pub file: String,
     /// Optional ISR revalidation interval in seconds, copied from
     /// [`StaticRouteMeta::revalidate`].
+    ///
+    /// `#[serde(default)]` so a hand-written manifest may omit the key
+    /// entirely — the serve path documents hand-written manifests as a
+    /// supported way to map a route straight at a file, and requiring an
+    /// explicit `"revalidate": null` made the shortest such entry fail to
+    /// parse (which silently disables the whole static layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revalidate: Option<u64>,
     /// The `Content-Type` the route's handler declared when this page was
     /// generated (#1832).
@@ -152,9 +170,9 @@ impl ManifestEntry {
     /// A manifest entry for `file` with no revalidation interval and no
     /// recorded `Content-Type`.
     ///
-    /// Prefer this over a struct literal: the entry has gained fields before
-    /// (`content_type` in #1832) and may gain more, and a literal has to be
-    /// updated every time while this constructor does not.
+    /// The only way to build one from outside the crate: [`ManifestEntry`] is
+    /// `#[non_exhaustive]`, so a new field can never again break a downstream
+    /// struct literal.
     ///
     /// # Example
     ///
@@ -190,6 +208,32 @@ impl ManifestEntry {
 }
 
 impl StaticManifest {
+    /// A manifest for `routes`, stamped with the current time and the running
+    /// Autumn version.
+    ///
+    /// The only way to build one from outside the crate: [`StaticManifest`] is
+    /// `#[non_exhaustive]`, so a new field can never break a downstream struct
+    /// literal.
+    #[must_use]
+    pub fn new(routes: HashMap<String, ManifestEntry>) -> Self {
+        Self {
+            generated_at: unix_timestamp_now(),
+            autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
+            routes,
+        }
+    }
+
+    /// Override the build timestamp `new` stamped.
+    ///
+    /// Sealing the struct would otherwise remove the ability to write a
+    /// manifest with a fixed `generated_at`, which a reproducible-build tool
+    /// needs.
+    #[must_use]
+    pub fn with_generated_at(mut self, generated_at: impl Into<String>) -> Self {
+        self.generated_at = generated_at.into();
+        self
+    }
+
     /// Load a manifest from a JSON file on disk.
     ///
     /// # Errors
@@ -223,6 +267,16 @@ pub fn url_to_file_path(url_path: &str) -> String {
     }
 }
 
+/// Seconds since the Unix epoch, as a decimal string (avoids pulling in
+/// chrono/time just to stamp a manifest).
+fn unix_timestamp_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{secs}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,21 +305,10 @@ mod tests {
     #[test]
     fn manifest_roundtrip() {
         let mut routes = HashMap::new();
-        routes.insert(
-            "/".to_owned(),
-            ManifestEntry {
-                file: "index.html".to_owned(),
-                revalidate: None,
-                content_type: None,
-            },
-        );
+        routes.insert("/".to_owned(), ManifestEntry::new("index.html".to_owned()));
         routes.insert(
             "/about".to_owned(),
-            ManifestEntry {
-                file: "about/index.html".to_owned(),
-                revalidate: Some(3600),
-                content_type: None,
-            },
+            ManifestEntry::new("about/index.html".to_owned()).with_revalidate(Some(3600)),
         );
 
         let manifest = StaticManifest {
@@ -307,11 +350,8 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert(
             "/feed.xml".to_owned(),
-            ManifestEntry {
-                file: "feed.xml/index.html".to_owned(),
-                revalidate: None,
-                content_type: Some("application/rss+xml".to_owned()),
-            },
+            ManifestEntry::new("feed.xml/index.html".to_owned())
+                .with_content_type(Some("application/rss+xml".to_owned())),
         );
         let manifest = StaticManifest {
             generated_at: "2026-09-01T00:00:00Z".to_owned(),
@@ -355,11 +395,7 @@ mod tests {
     fn manifest_entry_omits_absent_content_type_from_json() {
         // Keep the on-disk manifest readable by older runtimes (and small):
         // an entry with nothing recorded serializes without the key at all.
-        let entry = ManifestEntry {
-            file: "about/index.html".to_owned(),
-            revalidate: None,
-            content_type: None,
-        };
+        let entry = ManifestEntry::new("about/index.html".to_owned());
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
             !json.contains("content_type"),

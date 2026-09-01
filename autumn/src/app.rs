@@ -14513,11 +14513,7 @@ mod tests {
             autumn_version: "0.2.0".to_owned(),
             routes: HashMap::from([(
                 "/docs".to_owned(),
-                crate::static_gen::ManifestEntry {
-                    file: "docs/index.html".to_owned(),
-                    revalidate: None,
-                    content_type: None,
-                },
+                crate::static_gen::ManifestEntry::new("docs/index.html".to_owned()),
             )]),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");

@@ -108,6 +108,92 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### SSG: `ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`, and generated pages carry their declared `Content-Type`
+
+**Why:** The static-first serve path used to reverse-engineer each cached page's
+`Content-Type` at request time from the route slug and the served file name.
+Because every non-root route is stored as `<route>/index.html`, both clues lie,
+and the heuristic needed three consecutive corrections during review of #1819.
+`autumn build` now records the type each handler declares into
+`dist/manifest.json` and the middleware serves it verbatim (issue #1832). The
+manifest types were sealed in the same release so a future field cannot break
+callers again.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::static_gen::{ManifestEntry, StaticManifest};
+
+let entry = ManifestEntry {
+    file: "about/index.html".to_owned(),
+    revalidate: Some(3600),
+};
+let manifest = StaticManifest {
+    generated_at: timestamp(),
+    autumn_version: "{X.Y.Z}".to_owned(),
+    routes,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::static_gen::{ManifestEntry, StaticManifest};
+
+let entry = ManifestEntry::new("about/index.html")
+    .with_revalidate(Some(3600))
+    .with_content_type(Some("text/html; charset=utf-8".to_owned()));
+// `new` stamps `generated_at` and `autumn_version` for you.
+let manifest = StaticManifest::new(routes);
+```
+
+**Automation:** `manual` — the rewrite is not a rename or an import move. A
+struct literal has to become a constructor call plus a variable number of
+`with_*` setters chosen from which fields the literal actually set, and
+`StaticManifest::new` *drops* two of the fields the old literal supplied
+(stamping them itself), so no purely syntactic rewrite is correct. Both types
+are niche (only an app that reads or writes `dist/manifest.json` itself touches
+them), so `cargo check` pointing at each E0639/E0063 is enough.
+
+#### Behaviour change: extensionless `#[static_get]` routes returning `String`
+
+Nothing is recorded unless the handler *deliberately* declared a type, so
+routes that name their own extension are unaffected: `/theme.css` returning a
+`String` still serves `text/css`, because axum's `text/plain; charset=utf-8` is
+a default from the return type rather than a statement about the page.
+
+An **extensionless** route is the one visible change. `#[static_get("/about")]
+async fn about() -> String { html }` has no extension to fall back on, so it is
+now served as the `text/plain; charset=utf-8` axum declares, instead of the
+`text/html` the old heuristic assumed — the same thing that route already served
+on the dynamic path (in dev, or on a manifest miss). Return `Markup` or
+`Html<String>` and the page is `text/html` on both paths:
+
+```rust
+#[static_get("/about")]
+async fn about() -> Markup { html! { h1 { "About" } } }   // text/html
+```
+
+For a non-HTML route, declare the type explicitly — this is now the whole
+contract, and it is what makes types the old heuristic could never produce
+(`application/rss+xml` from `/feed`) work at all:
+
+```rust
+#[static_get("/feed")]
+async fn feed() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/rss+xml")], build_feed())
+}
+```
+
+An existing `dist/` records nothing and keeps its previous derived behaviour
+until the next `autumn build`.
+
+One operational note: ISR does not rewrite the manifest, so a regeneration whose
+handler declares a *different* type than was recorded is refused (logged at
+`error`, with the previous page still served) rather than writing bytes the
+recorded header would mislabel. Re-run `autumn build` after changing a static
+route's `Content-Type`.
+
 ### Failure capsules: `capsule::execute` takes `ReplayFixtures`, and the capsule format is version 3
 
 **Why:** Capsules now record every framework effect a failing run produced —

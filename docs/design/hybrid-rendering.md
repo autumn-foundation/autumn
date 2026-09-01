@@ -366,9 +366,15 @@ not a legal header (CR/LF from a hand-edited or tampered manifest) and falls
 back, so a bad manifest can neither inject a header nor panic the request path.
 
 The type is a *build-time* property: ISR regeneration rewrites the file, not the
-manifest. If a regenerated handler starts declaring a different type, the
-mismatch is logged with a `WARN` pointing at `autumn build` rather than drifting
-silently.
+manifest (which stays immutable behind an `Arc`, with file `mtime` driving
+staleness — see above). The served header is therefore fixed for the process
+lifetime while the body on disk is not, so a regeneration whose handler declares
+a **different** `Content-Type`, or stops declaring one, is **refused** rather
+than written. The previous file stays on disk still matching its recorded type,
+which degrades the route to stale-but-correct instead of serving fresh bytes
+under a header that mislabels them. The refusal travels the normal regeneration
+error path (logged, then throttled by the ISR cooldown); `autumn build` is what
+re-records the type.
 
 ### ISR Background Regeneration
 

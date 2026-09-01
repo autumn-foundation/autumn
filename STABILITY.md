@@ -476,6 +476,38 @@ entirely from already-stable primitives, not a new library surface.
 See `docs/generate-teams.md` for the two-line auth-integration seam this
 generator relies on instead of generating its own login/signup.
 
+## SSG manifest `Content-Type` (issue #1832)
+
+### SemVer impact
+
+**Breaking**, and deliberately taken pre-1.0 to close the hole permanently.
+`static_gen::ManifestEntry` gained a public `content_type` field, and both it
+and `static_gen::StaticManifest` became `#[non_exhaustive]` — so an existing
+`ManifestEntry { file, revalidate }` or `StaticManifest { .. }` literal stops
+compiling (E0063/E0639). Sealing them is the point: the manifest format is
+expected to keep growing, and after this release a new field is additive rather
+than breaking. Only code that reads or writes `dist/manifest.json` itself is
+affected; ordinary `#[static_get]` applications are not. See
+[`docs/migrations/next.md`](docs/migrations/next.md).
+
+The JSON format itself is compatible in both directions: `content_type` is
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so a new runtime
+reads an old manifest (the field defaults to absent, and the pre-#1832
+derivation runs unchanged), and an old runtime reads a new one (no
+`deny_unknown_fields`, so the extra key is ignored).
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `ManifestEntry::new` / `with_revalidate` / `with_content_type` | `autumn_web::static_gen` | The construction path that survives future fields |
+| `ManifestEntry::content_type` | `autumn_web::static_gen` | `Option<String>`; `None` means "nothing recorded", not "unknown type" |
+| `StaticManifest::new` | `autumn_web::static_gen` | Stamps `generated_at` and `autumn_version` |
+| `StaticFileLayer::resolve_entry` → `ResolvedStatic` | `autumn_web::static_gen` | Returns the file path plus the ready-to-serve `Content-Type`; `resolve` remains the file-path-only shorthand |
+| `resolved_content_type` | `autumn_web::static_gen` | The decision function, public so an app serving `dist/` itself can match Autumn's behaviour exactly |
+
+`ResolvedStatic` is `#[non_exhaustive]` from the start.
+
 ## Pre-1.0 notes
 
 Until Autumn reaches `1.0.0`:
