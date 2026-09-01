@@ -508,13 +508,19 @@ pub const MAX_IMPORTS: usize = 1024;
 
 const MAX_REPORTED_IMPORTS: usize = 256;
 
-/// Format a module's imports for review, bounded in number.
+/// Format a module's imports for review, bounded in number and in length.
 ///
 /// The total is still reported honestly — an operator must not read a truncated
 /// list as the whole of what an artifact imports — but only the first
 /// [`MAX_REPORTED_IMPORTS`] are allocated. Counting the rest costs nothing: the
 /// import table is already parsed, and walking it without formatting allocates
 /// nothing per entry.
+///
+/// Each entry is built with [`import_operation`], the same bounded formatter
+/// the denial path uses, so the *length* is capped where the string is made
+/// rather than where it is rendered. A count-only bound left 256 names each as
+/// long as an artifact cared to make them, and the review surface's own excerpt
+/// runs afterwards — which is one copy too late to matter.
 ///
 /// This bounds the *review* surface only. The load gate checks every import
 /// against the shim's allowlist with no cap, because a module that hides a
@@ -525,7 +531,7 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
     for import in imports {
         total = total.saturating_add(1);
         if names.len() < MAX_REPORTED_IMPORTS {
-            names.push(format!("{}::{}", import.module(), import.name()));
+            names.push(import_operation(import.module(), import.name()));
         }
     }
     if let Some(hidden) = total.checked_sub(names.len()).filter(|more| *more > 0) {
@@ -4740,6 +4746,38 @@ path = "/hello/greet"
         // charge bounds rather than forbids.
         SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
             .expect("a table within a normal fuel budget must still load");
+    }
+
+    #[test]
+    fn the_review_list_bounds_an_import_name_where_it_builds_it() {
+        // The sibling of the denial-path fix, and the site it did not reach.
+        // `reported_imports` bounded how *many* names it formatted and not how
+        // long each one was, so 256 entries could each be as long as an
+        // artifact cared to make them. The review surface does excerpt them —
+        // afterwards, which is one copy too late to be the bound.
+        let huge = "z".repeat(99_000);
+        let wat = format!(
+            r#"(module
+  (import "not_wasi" "{huge}" (func))
+  (memory (export "memory") 1)
+  (func (export "_start") (nop))
+)"#
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let imports = SandboxHost::imports_of(&wasm).expect("the module's shape is readable");
+        assert_eq!(imports.len(), 1);
+        assert!(
+            imports[0].len() <= DENIAL_RECORD_BYTES,
+            "the review list carries {} bytes of a {}-byte name",
+            imports[0].len(),
+            huge.len(),
+        );
+        assert!(
+            imports[0].starts_with("not_wasi::"),
+            "the entry must still say what is imported: {}",
+            &imports[0][..imports[0].len().min(64)],
+        );
     }
 
     #[test]
