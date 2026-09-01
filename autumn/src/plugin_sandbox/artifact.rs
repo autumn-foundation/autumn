@@ -579,6 +579,43 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn splitting_a_container_on_a_nul_byte_truncates_it_at_the_version_field() {
+        // Not a property of the reader — a property of the format, pinned here
+        // because the fuzz target depends on it. `fuzz_targets/sandbox.rs` used
+        // to split its input on the first NUL and hand the first half to the
+        // container reader. Every v1 header writes the format version as a
+        // little-endian `u32`, so `\x01\0\0\0` sits at offset 8 and the first
+        // NUL of any well-formed container is at offset 9: the reader could
+        // never see past the version field, and the manifest length, manifest
+        // and digest that target exists to fuzz were unreachable.
+        //
+        // If the format ever changes so that a container's first NUL moves,
+        // this is the test that should be read before assuming the framing is
+        // safe again.
+        let bytes = sealed().to_bytes().expect("packs");
+        assert_eq!(
+            bytes.iter().position(|byte| *byte == 0),
+            Some(SandboxArtifact::MAGIC.len() + 1),
+            "the first NUL should fall in the version field, right after the magic",
+        );
+
+        let split = bytes
+            .splitn(2, |byte| *byte == 0)
+            .next()
+            .expect("splitn always yields once");
+        assert!(
+            matches!(
+                SandboxArtifact::read(split),
+                Err(ArtifactError::Truncated { .. })
+            ),
+            "the split half must be too short to be read as a container",
+        );
+
+        // And the whole thing reads, which is what the target now receives.
+        SandboxArtifact::read(&bytes).expect("the unsplit container reads");
+    }
+
+    #[test]
     fn round_trips_through_the_container() {
         let artifact = sealed();
         let bytes = artifact.to_bytes().expect("packs");
