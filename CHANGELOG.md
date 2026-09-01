@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sustained_rps = 4210.5
   p99_latency_ms = 18.42
   saturation_concurrency = 64
-  admission_limit = 64
+  admission_limit = 128
 
   [[routes]]
   method = "GET"
@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [server]
   capacity_contract = "capacity.lock"
   ```
+
+  The contract also records the workload that produced it (seed, ladder, rung
+  duration), and `--check` replays that rather than its own defaults — an
+  envelope only means something next to the experiment behind it. Setting
+  `[server] capacity_contract` also makes `autumn deploy` ship the contract
+  alongside the manifest that names it.
 
   Both the gate and the runtime refuse to compare envelopes across host classes,
   and every failure along the contract path (missing file, malformed document,

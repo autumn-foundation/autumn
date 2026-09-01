@@ -2018,6 +2018,22 @@ Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
 sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
 and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
 
+The ceiling no longer has to be a guess. `autumn calibrate` measures what the
+build sustains and writes a committed `capacity.lock`; `autumn calibrate
+--check` gates rebuilds against it in CI, and pointing the runtime at it
+sources the ceiling from the proven envelope:
+
+```toml
+[server]
+capacity_contract = "capacity.lock"   # explicit max_concurrent_requests still wins
+```
+
+Each route in the contract also carries a resource shape (`db-bound`,
+`io-bound`, `compute-bound`) derived statically from the extractors its handler
+declares. Every contract failure — missing file, malformed document, a contract
+measured on a different host class — falls back to *unlimited*, never to a
+ceiling. See `docs/guide/capacity-contracts.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
@@ -2254,6 +2270,8 @@ autumn canary status
 autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
+autumn calibrate                 # measure the capacity envelope -> capacity.lock
+autumn calibrate --check         # CI gate: fail when a rebuild leaves the envelope
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 autumn plugin list
 autumn plugin add autumn-admin-plugin

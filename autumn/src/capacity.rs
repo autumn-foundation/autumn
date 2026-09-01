@@ -101,8 +101,9 @@ pub enum ResourceShape {
     /// Touches a database pool: its concurrency is bounded by pool checkout,
     /// not by CPU.
     DbBound,
-    /// Touches a non-database external resource (cache, lock, mail, search,
-    /// object storage, event bus).
+    /// Touches a non-database external resource. In this slice that means the
+    /// mail transport, the event bus, the presence store, or notifications —
+    /// the extractors the derivation can actually prove.
     IoBound,
     /// Touches no pool this build can prove. The default, and the honest
     /// reading of a handler whose signature declares no resource extractor.
@@ -178,14 +179,13 @@ impl<'de> Deserialize<'de> for ResourceShape {
 /// [`ResourceShape::DbBound`], because holding a pooled connection for the
 /// length of a request bounds concurrency in a way nothing else here does.
 pub const POOL_DB: &str = "db";
-/// Pool tag for the outbound mail transport.
-pub const POOL_MAIL: &str = "mail";
-/// Pool tag for the event bus.
-pub const POOL_EVENTS: &str = "events";
-/// Pool tag for the presence store.
-pub const POOL_PRESENCE: &str = "presence";
-/// Pool tag for the notification store.
-pub const POOL_NOTIFICATIONS: &str = "notifications";
+/// Every pool tag the derivation can emit, sorted.
+///
+/// The vocabulary is *produced* by `autumn-macros`, which cannot depend on this
+/// crate and so repeats the literals. This list is the reader's reference and
+/// the anchor for the round-trip test below — a macro-side rename that is not
+/// mirrored here shows up as a route whose pool tag is not in this set.
+pub const POOL_TAGS: &[&str] = &[POOL_DB, "events", "mail", "notifications", "presence"];
 
 /// One route's statically derived resource shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +310,51 @@ pub struct Provenance {
     pub route_graph_digest: String,
 }
 
+/// The calibration parameters that produced an envelope.
+///
+/// Recorded because an envelope only means something next to the workload that
+/// produced it. `autumn calibrate --check` replays these rather than its own
+/// defaults: comparing a contract measured with `--concurrency 1,8,64
+/// --rung-ms 5000` against a rebuild measured with the default ladder would be
+/// comparing two different experiments, which is a false regression (or a
+/// false pass) waiting to happen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Calibration {
+    /// Seed for the request profile.
+    pub seed: u64,
+    /// Concurrency ladder walked, ascending.
+    pub concurrency: Vec<usize>,
+    /// Milliseconds each rung was held for.
+    pub rung_ms: u64,
+    /// Milliseconds of discarded warmup before the ladder.
+    pub warmup_ms: u64,
+}
+
+impl Default for Calibration {
+    /// The shipped defaults, used when a contract predates this section.
+    fn default() -> Self {
+        Self {
+            seed: DEFAULT_SEED,
+            concurrency: DEFAULT_LADDER.to_vec(),
+            rung_ms: DEFAULT_RUNG_MS,
+            warmup_ms: DEFAULT_WARMUP_MS,
+        }
+    }
+}
+
+/// Default seed for the request profile.
+///
+/// Lives here, not in the CLI, so the `#[serde(default)]` fallback for a
+/// contract written before the calibration section existed matches what that
+/// contract was actually measured with.
+pub const DEFAULT_SEED: u64 = 1733;
+/// Default concurrency ladder.
+pub const DEFAULT_LADDER: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
+/// Default milliseconds held per rung.
+pub const DEFAULT_RUNG_MS: u64 = 2000;
+/// Default milliseconds of discarded warmup.
+pub const DEFAULT_WARMUP_MS: u64 = 1000;
+
 /// The proven envelope: what the build sustains, and what it will admit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -337,6 +382,11 @@ pub struct CapacityContract {
     pub host: HostProfile,
     /// The proven envelope.
     pub envelope: Envelope,
+    /// The workload that produced [`Self::envelope`], replayed verbatim by
+    /// `autumn calibrate --check`. Defaulted when absent so a contract written
+    /// before this field was recorded still loads.
+    #[serde(default)]
+    pub calibration: Calibration,
     /// Statically derived per-route resource shape.
     #[serde(default, rename = "routes")]
     pub routes: Vec<RouteShape>,
@@ -566,19 +616,18 @@ pub fn resolve_admission_limit(
         }
     };
 
-    match contract.admission_limit_for_host(host) {
-        Some(limit) => AdmissionLimit::Contract(limit),
-        None => {
-            tracing::warn!(
-                path = %path.display(),
-                contract_host = %contract.host.summary(),
-                running_host = %host.summary(),
-                admission_limit = contract.envelope.admission_limit,
-                "capacity contract licenses no admission limit here (different host \
-                 class, or no limit recorded); leaving admission control unlimited"
-            );
-            AdmissionLimit::Unlimited
-        }
+    if let Some(limit) = contract.admission_limit_for_host(host) {
+        AdmissionLimit::Contract(limit)
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            contract_host = %contract.host.summary(),
+            running_host = %host.summary(),
+            admission_limit = contract.envelope.admission_limit,
+            "capacity contract licenses no admission limit here (different host \
+             class, or no limit recorded); leaving admission control unlimited"
+        );
+        AdmissionLimit::Unlimited
     }
 }
 
@@ -628,6 +677,7 @@ mod tests {
                 saturation_concurrency: 64,
                 admission_limit: 64,
             },
+            calibration: Calibration::default(),
             routes,
         }
     }
@@ -643,6 +693,10 @@ mod tests {
         assert_eq!(parsed.envelope.admission_limit, 64);
         assert!((parsed.envelope.sustained_rps - 4210.5).abs() < 1e-9);
         assert_eq!(parsed.routes.len(), 2);
+        // The workload travels with the envelope: `--check` replays it rather
+        // than its own defaults.
+        assert_eq!(parsed.calibration, Calibration::default());
+        assert_eq!(parsed.calibration.concurrency, DEFAULT_LADDER.to_vec());
     }
 
     #[test]
@@ -728,6 +782,33 @@ mod tests {
         assert_eq!(
             contract.admission_limit_for_host(&contract.host.clone()),
             None
+        );
+    }
+
+    #[test]
+    fn every_pool_tag_classifies_and_the_database_tag_dominates() {
+        // `autumn-macros` cannot depend on this crate, so it repeats these
+        // literals. Pin the vocabulary here: a macro-side rename that is not
+        // mirrored shows up as a tag this set does not contain.
+        assert!(POOL_TAGS.contains(&POOL_DB));
+        let mut sorted = POOL_TAGS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, POOL_TAGS, "POOL_TAGS must stay sorted");
+
+        for tag in POOL_TAGS {
+            let shape = ResourceShape::from_pools(&[*tag]);
+            let expected = if *tag == POOL_DB {
+                ResourceShape::DbBound
+            } else {
+                ResourceShape::IoBound
+            };
+            assert_eq!(shape, expected, "tag {tag} classified wrongly");
+        }
+
+        // A handler touching both is bounded by the database.
+        assert_eq!(
+            ResourceShape::from_pools(&["mail", POOL_DB]),
+            ResourceShape::DbBound
         );
     }
 
@@ -849,5 +930,4 @@ mod tests {
             AdmissionLimit::Configured(32)
         );
     }
-
 }

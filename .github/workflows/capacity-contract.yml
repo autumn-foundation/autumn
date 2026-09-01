@@ -26,7 +26,11 @@ on:
       noop_rebuilds:
         description: "How many no-op `--check` rebuilds to run (the false-positive probe)"
         required: false
-        default: "3"
+        # The issue's Success Metric is "zero false positives across 20 no-op
+        # rebuilds"; three samples cannot tell a 15%-flake gate from a 0% one.
+        # Each iteration is a cached rebuild plus one ladder, so the cost is
+        # bounded.
+        default: "20"
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
@@ -71,7 +75,9 @@ jobs:
         shell: bash
         run: |
           cargo test -p autumn-web --lib -- capacity:: 2>&1 | tee web-output.txt
-          cargo test -p autumn-cli --lib -- capacity:: 2>&1 | tee cli-output.txt
+          # NOT `--lib`: autumn-cli is bin-only (`[[bin]] name = "autumn"`, no
+          # src/lib.rs), so `--lib` fails with "no library targets found".
+          cargo test -p autumn-cli -- capacity:: 2>&1 | tee cli-output.txt
           grep -E "^test result:" web-output.txt cli-output.txt
           # Guard against a stale filter silently matching zero tests.
           for f in web-output.txt cli-output.txt; do
@@ -128,7 +134,7 @@ jobs:
 
       - name: Upload the contract
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: capacity-lock
           path: capacity.lock

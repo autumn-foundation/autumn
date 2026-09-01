@@ -8,6 +8,8 @@ mod assets;
 mod build;
 mod cache_audit;
 mod canary;
+mod capacity;
+mod capacity_driver;
 mod capsule;
 mod check;
 mod cold_start_driver;
@@ -36,8 +38,6 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
-mod capacity;
-mod capacity_driver;
 mod overload_driver;
 mod paths;
 mod pg;
@@ -1517,14 +1517,6 @@ enum Commands {
     #[command(name = "data-flow")]
     DataFlow(DataFlowArgs),
 
-    /// Print every mounted route — method, path, handler, source, middleware.
-    ///
-    /// Compiles the application (debug profile) and introspects its route
-    /// table without starting the HTTP server or connecting to a database.
-    ///
-    /// Rows are stable-sorted by path, then method, so the output is
-    /// diff-friendly. Redirect to a file and `git diff` two snapshots to
-    /// audit route changes between commits.
     /// Derive and enforce this build's capacity contract (issue #1733).
     ///
     /// Builds the app in release mode, reads its route graph, walks a seeded
@@ -1546,17 +1538,21 @@ enum Commands {
         #[arg(long)]
         check: bool,
         /// Seed for the request profile, so a calibration is replayable.
-        #[arg(long, default_value = "1733")]
-        seed: u64,
+        /// [default: 1733; with --check, the committed contract's own seed]
+        #[arg(long, value_name = "SEED")]
+        seed: Option<u64>,
         /// Concurrency ladder to walk (comma-separated).
-        #[arg(long, value_delimiter = ',', default_value = crate::capacity_driver::DEFAULT_LADDER, value_name = "N")]
+        /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
+        #[arg(long, value_delimiter = ',', value_name = "N")]
         concurrency: Vec<usize>,
         /// Milliseconds to hold each rung of the ladder.
-        #[arg(long, default_value = "2000", value_name = "MS")]
-        rung_ms: u64,
+        /// [default: 2000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        rung_ms: Option<u64>,
         /// Milliseconds of discarded warmup before the ladder.
-        #[arg(long, default_value = "1000", value_name = "MS")]
-        warmup_ms: u64,
+        /// [default: 1000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        warmup_ms: Option<u64>,
         /// Fractional sustained-throughput drop `--check` tolerates.
         #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
         tolerance_rps: f64,
@@ -1567,6 +1563,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Print every mounted route — method, path, handler, source, middleware.
+    ///
+    /// Compiles the application (debug profile) and introspects its route
+    /// table without starting the HTTP server or connecting to a database.
+    ///
+    /// Rows are stable-sorted by path, then method, so the output is
+    /// diff-friendly. Redirect to a file and `git diff` two snapshots to
+    /// audit route changes between commits.
     Routes {
         /// Package to inspect (for workspaces).
         #[arg(short, long)]
@@ -9482,11 +9486,16 @@ mod tests {
             panic!("expected calibrate");
         };
         assert_eq!(contract, "capacity.lock");
-        assert!(!check, "calibrate writes a contract unless --check is passed");
-        assert_eq!(seed, 1733);
-        assert_eq!(concurrency, vec![1, 2, 4, 8, 16, 32, 64]);
-        assert_eq!(rung_ms, 2000);
-        assert_eq!(warmup_ms, 1000);
+        assert!(
+            !check,
+            "calibrate writes a contract unless --check is passed"
+        );
+        // Unspecified, so `--check` can replay whatever the committed
+        // contract recorded rather than this invocation's defaults.
+        assert_eq!(seed, None);
+        assert!(concurrency.is_empty());
+        assert_eq!(rung_ms, None);
+        assert_eq!(warmup_ms, None);
         assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
         assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
     }

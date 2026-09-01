@@ -39,6 +39,17 @@ pub const DEFAULT_RPS_TOLERANCE: f64 = 0.15;
 /// noisier of the two measurements.
 pub const DEFAULT_P99_TOLERANCE: f64 = 0.25;
 
+/// Absolute slack, in milliseconds, added to the P99 ceiling on top of the
+/// proportional tolerance.
+///
+/// A purely relative band collapses on a fast app: an app whose handlers
+/// return a `&'static str` has a loopback P99 of a few hundred microseconds,
+/// where 25% is well under the jitter one context switch on a shared CI runner
+/// contributes. Without this floor the gate would fail no-op rebuilds of
+/// exactly the reference apps it is most likely to be pointed at — and on the
+/// metric the issue's success criterion does not even ask about.
+pub const P99_ABSOLUTE_SLACK_MS: f64 = 1.0;
+
 /// Raw samples collected at one rung of the concurrency ladder.
 #[derive(Debug, Clone)]
 pub struct RungSamples {
@@ -57,6 +68,11 @@ pub struct RungSamples {
 pub struct RungStats {
     /// Offered concurrency at this rung.
     pub concurrency: usize,
+    /// Successful responses observed. Carried so a rung that completed
+    /// *nothing* stays distinguishable from one that genuinely measured zero
+    /// throughput — without it, a ladder that never ran would look like a
+    /// valid saturation point at the first rung.
+    pub completed: u64,
     /// Successful responses per second.
     pub rps: f64,
     /// P99 latency of successful responses, in milliseconds.
@@ -95,6 +111,7 @@ impl RungStats {
 
         Self {
             concurrency: samples.concurrency,
+            completed,
             rps,
             p99_ms,
             error_rate,
@@ -145,20 +162,22 @@ impl Default for SaturationOptions {
 /// a contract that *under*-claims costs some headroom, while one that
 /// over-claims is a promise the binary cannot keep under load.
 ///
-/// `None` when the ladder is empty, or when even its first rung failed beyond
-/// [`SaturationOptions::max_error_rate`] — there is no sustainable envelope to
-/// record.
+/// `None` when the ladder is empty, when its first rung completed nothing at
+/// all (a zero-length rung, or an app that answered no request), or when that
+/// rung failed beyond [`SaturationOptions::max_error_rate`] — in each case
+/// there is no sustainable envelope to record, and recording one anyway would
+/// hand the runtime a ceiling nobody measured.
 #[must_use]
 pub fn find_saturation(rungs: &[RungStats], opts: &SaturationOptions) -> Option<RungStats> {
     let mut iter = rungs.iter();
     let first = iter.next()?;
-    if first.error_rate > opts.max_error_rate {
+    if first.error_rate > opts.max_error_rate || first.completed == 0 {
         return None;
     }
 
     let mut best = first;
     for rung in iter {
-        if rung.error_rate > opts.max_error_rate {
+        if rung.error_rate > opts.max_error_rate || rung.completed == 0 {
             break;
         }
         if rung.rps > best.rps * (1.0 + opts.min_throughput_gain) {
@@ -201,6 +220,11 @@ pub enum CheckOutcome {
     /// reached. Exit non-zero, but with a different diagnosis than a
     /// regression — the fix is to re-calibrate, not to optimise.
     HostMismatch,
+    /// The committed contract does not describe a usable envelope (a
+    /// non-positive or `NaN` throughput or latency), so there is nothing to
+    /// gate against. Distinct from [`Self::Regressed`] because the build under
+    /// test is not what is wrong.
+    Unusable,
 }
 
 /// One metric's committed → candidate movement.
@@ -286,6 +310,17 @@ pub fn check_contract(
         return report;
     }
 
+    // A committed envelope of zero (a degenerate calibration, or a hand-edit)
+    // would make `candidate < 0.0 * 0.85` unsatisfiable and silently neuter
+    // exactly the check this gate exists for. Refuse to compare rather than
+    // report a green pass nobody earned. `is_finite` also rejects NaN and
+    // infinities, which every ordinary comparison would wave through.
+    let unusable = |value: f64| !value.is_finite() || value <= 0.0;
+    if unusable(committed.envelope.sustained_rps) || unusable(committed.envelope.p99_latency_ms) {
+        report.outcome = CheckOutcome::Unusable;
+        return report;
+    }
+
     report.notes.extend(shape_drift_notes(committed, candidate));
 
     let rps_floor = committed.envelope.sustained_rps * (1.0 - tolerances.rps);
@@ -300,7 +335,8 @@ pub fn check_contract(
         ));
     }
 
-    let p99_ceiling = committed.envelope.p99_latency_ms * (1.0 + tolerances.p99);
+    let p99_ceiling = (committed.envelope.p99_latency_ms * (1.0 + tolerances.p99))
+        .max(committed.envelope.p99_latency_ms + P99_ABSOLUTE_SLACK_MS);
     if candidate.envelope.p99_latency_ms > p99_ceiling {
         report.regressions.push(format!(
             "P99 latency regressed {:.1}% ({:.2} → {:.2} ms), \
@@ -326,8 +362,16 @@ fn shape_drift_notes(committed: &CapacityContract, candidate: &CapacityContract)
     use std::collections::BTreeMap;
 
     let key = |r: &RouteShape| (r.method.clone(), r.path.clone());
-    let before: BTreeMap<_, _> = committed.routes.iter().map(|r| (key(r), r.clone())).collect();
-    let after: BTreeMap<_, _> = candidate.routes.iter().map(|r| (key(r), r.clone())).collect();
+    let before: BTreeMap<_, _> = committed
+        .routes
+        .iter()
+        .map(|r| (key(r), r.clone()))
+        .collect();
+    let after: BTreeMap<_, _> = candidate
+        .routes
+        .iter()
+        .map(|r| (key(r), r.clone()))
+        .collect();
 
     let mut notes = Vec::new();
     for ((method, path), route) in &after {
@@ -369,34 +413,41 @@ fn pool_suffix(pools: &[String]) -> String {
 /// Render a `--check` report for a human reading CI output.
 #[must_use]
 pub fn render_check_report(report: &CheckReport) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
 
     out.push_str("\u{1F342} autumn calibrate --check\n\n");
-    out.push_str(&format!(
-        "  host              {} (committed: {})\n",
+    // Writing into a `String` is infallible, so the `Result` carries nothing
+    // to handle.
+    let _ = writeln!(
+        out,
+        "  host              {} (committed: {})",
         report.host_candidate, report.host_committed
-    ));
-    out.push_str(&format!(
-        "  sustained req/s   {:.1} \u{2192} {:.1}  ({}{:.1}%, tolerance -{:.1}%)\n",
+    );
+    let _ = writeln!(
+        out,
+        "  sustained req/s   {:.1} \u{2192} {:.1}  ({}{:.1}%, tolerance -{:.1}%)",
         report.rps.committed,
         report.rps.candidate,
         sign(report.rps.pct_change),
         report.rps.pct_change,
         report.tolerances.rps * 100.0
-    ));
-    out.push_str(&format!(
-        "  P99 latency (ms)  {:.2} \u{2192} {:.2}  ({}{:.1}%, tolerance +{:.1}%)\n",
+    );
+    let _ = writeln!(
+        out,
+        "  P99 latency (ms)  {:.2} \u{2192} {:.2}  ({}{:.1}%, tolerance +{:.1}%)",
         report.p99.committed,
         report.p99.candidate,
         sign(report.p99.pct_change),
         report.p99.pct_change,
         report.tolerances.p99 * 100.0
-    ));
+    );
 
     if !report.notes.is_empty() {
         out.push_str("\n  route graph:\n");
         for note in &report.notes {
-            out.push_str(&format!("    \u{2022} {note}\n"));
+            let _ = writeln!(out, "    \u{2022} {note}");
         }
     }
 
@@ -408,11 +459,19 @@ pub fn render_check_report(report: &CheckReport) -> String {
         CheckOutcome::Regressed => {
             out.push_str("\u{2717} this build no longer meets the committed capacity.lock:\n");
             for regression in &report.regressions {
-                out.push_str(&format!("    - {regression}\n"));
+                let _ = writeln!(out, "    - {regression}");
             }
             out.push_str(
                 "\n  Fix the regression, or re-run `autumn calibrate` to record a new \
                  capacity.lock\n  if the envelope changed on purpose.\n",
+            );
+        }
+        CheckOutcome::Unusable => {
+            out.push_str(
+                "\u{2717} the committed capacity.lock does not record a usable envelope \
+                 (its sustained\n  throughput or P99 latency is zero, negative, or not a \
+                 number), so there is nothing\n  to gate against. Re-run `autumn calibrate` \
+                 to record a real one.\n",
             );
         }
         CheckOutcome::HostMismatch => {
@@ -551,7 +610,7 @@ pub fn plan_requests(seed: u64, targets: &[String], count: usize) -> Vec<String>
         .collect()
 }
 
-/// SplitMix64 — a tiny, dependency-free, fully specified PRNG.
+/// `SplitMix64` — a tiny, dependency-free, fully specified PRNG.
 ///
 /// Written out rather than pulled from `rand` so the load profile is
 /// reproducible across autumn versions: a contract is only re-checkable if the
@@ -563,7 +622,7 @@ impl SplitMix64 {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -572,25 +631,29 @@ impl SplitMix64 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use autumn_web::capacity::{
-        CONTRACT_VERSION, CapacityContract, Envelope, HostProfile, Provenance, ResourceShape,
-        RouteShape, route_graph_digest,
+        CONTRACT_VERSION, Calibration, CapacityContract, Envelope, HostProfile, Provenance,
+        ResourceShape, RouteShape, route_graph_digest,
     };
 
     fn stats(concurrency: usize, rps: f64, p99_ms: f64) -> RungStats {
         RungStats {
             concurrency,
+            completed: 100,
             rps,
             p99_ms,
             error_rate: 0.0,
         }
     }
 
-    fn contract(sustained_rps: f64, p99_latency_ms: f64, routes: Vec<RouteShape>) -> CapacityContract {
+    fn contract(
+        sustained_rps: f64,
+        p99_latency_ms: f64,
+        routes: Vec<RouteShape>,
+    ) -> CapacityContract {
         CapacityContract {
             version: CONTRACT_VERSION,
             provenance: Provenance {
@@ -610,8 +673,9 @@ mod tests {
                 sustained_rps,
                 p99_latency_ms,
                 saturation_concurrency: 64,
-                admission_limit: 64,
+                admission_limit: 128,
             },
+            calibration: Calibration::default(),
             routes,
         }
     }
@@ -643,7 +707,11 @@ mod tests {
         assert_eq!(s.concurrency, 8);
         assert!((s.rps - 49.5).abs() < 1e-9, "rps was {}", s.rps);
         assert!((s.p99_ms - 99.0).abs() < 1e-9, "p99 was {}", s.p99_ms);
-        assert!((s.error_rate - 0.01).abs() < 1e-9, "error rate {}", s.error_rate);
+        assert!(
+            (s.error_rate - 0.01).abs() < 1e-9,
+            "error rate {}",
+            s.error_rate
+        );
     }
 
     #[test]
@@ -684,6 +752,7 @@ mod tests {
             stats(2, 1000.0, 2.2),
             RungStats {
                 concurrency: 4,
+                completed: 8000,
                 rps: 2000.0,
                 p99_ms: 5.0,
                 // Throughput doubled, but a twentieth of it was failures —
@@ -693,6 +762,21 @@ mod tests {
         ];
         let knee = find_saturation(&rungs, &SaturationOptions::default()).expect("a knee");
         assert_eq!(knee.concurrency, 2);
+    }
+
+    #[test]
+    fn a_ladder_that_completed_nothing_yields_no_envelope() {
+        // `--rung-ms 0`, or an app that answers nothing, must not be written
+        // up as "sustains 0 req/s, admit 1" — that contract would cap a deploy
+        // at a single in-flight request.
+        let empty = [RungStats {
+            concurrency: 1,
+            completed: 0,
+            rps: 0.0,
+            p99_ms: 0.0,
+            error_rate: 0.0,
+        }];
+        assert!(find_saturation(&empty, &SaturationOptions::default()).is_none());
     }
 
     #[test]
@@ -726,7 +810,12 @@ mod tests {
         let candidate = contract(940.0, 22.0, one_route());
         let report = check_contract(&committed, &candidate, &Tolerances::default());
 
-        assert_eq!(report.outcome, CheckOutcome::Pass, "{:?}", report.regressions);
+        assert_eq!(
+            report.outcome,
+            CheckOutcome::Pass,
+            "{:?}",
+            report.regressions
+        );
     }
 
     #[test]
@@ -757,6 +846,44 @@ mod tests {
             report.regressions.iter().any(|r| r.contains("P99")),
             "{:?}",
             report.regressions
+        );
+    }
+
+    #[test]
+    fn a_committed_envelope_of_zero_is_refused_rather_than_passed() {
+        // `candidate < 0.0 * 0.85` is unsatisfiable, so comparing against a
+        // zero envelope would report a green pass for any build at all —
+        // silently neutering the one check this gate exists for.
+        let committed = contract(0.0, 0.0, one_route());
+        let candidate = contract(3912.4, 0.8, one_route());
+        let report = check_contract(&committed, &candidate, &Tolerances::default());
+
+        assert_eq!(report.outcome, CheckOutcome::Unusable);
+        assert!(render_check_report(&report).contains("usable envelope"));
+    }
+
+    #[test]
+    fn a_small_absolute_tail_movement_is_not_a_regression() {
+        // A reference app with sub-millisecond handlers has a 25% band of a
+        // fraction of a millisecond — less than the jitter one context switch
+        // on a shared runner contributes.
+        let committed = contract(1000.0, 0.40, one_route());
+        let candidate = contract(1000.0, 0.95, one_route());
+        let report = check_contract(&committed, &candidate, &Tolerances::default());
+
+        assert_eq!(
+            report.outcome,
+            CheckOutcome::Pass,
+            "{:?}",
+            report.regressions
+        );
+
+        // The absolute slack must not swallow a real blowout on a slow app.
+        let slow = contract(1000.0, 200.0, one_route());
+        let blown = contract(1000.0, 400.0, one_route());
+        assert_eq!(
+            check_contract(&slow, &blown, &Tolerances::default()).outcome,
+            CheckOutcome::Regressed
         );
     }
 
@@ -840,7 +967,13 @@ mod tests {
 
     // ── route graph read back from the calibrated binary ─────────────────
 
-    fn dumped(method: &str, path: &str, classification: &str, shape: &str, pools: &[&str]) -> DumpedRoute {
+    fn dumped(
+        method: &str,
+        path: &str,
+        classification: &str,
+        shape: &str,
+        pools: &[&str],
+    ) -> DumpedRoute {
         DumpedRoute {
             method: method.to_owned(),
             path: path.to_owned(),
@@ -885,5 +1018,4 @@ mod tests {
 
         assert_eq!(calibratable_targets(&dump), vec!["/about".to_owned()]);
     }
-
 }

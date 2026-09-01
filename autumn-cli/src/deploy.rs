@@ -2560,7 +2560,62 @@ fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpl
         }
     }
 
+    // The capacity contract the deployed config points at (#1733). Without
+    // this the release ships an `autumn.toml` naming a `capacity_contract`
+    // that is not there, the remote load fails, and — because contract
+    // failures deliberately fall open — the advertised admission control is
+    // silently absent on exactly the deploy path the guide recommends.
+    //
+    // Read from the layered config the *deploy* resolves, so an override file
+    // that sets (or clears) the key is honoured; a path that escapes the
+    // project directory is skipped rather than uploaded to a surprising
+    // remote basename.
+    if let Some(configured) = configured_capacity_contract(dirs, profile) {
+        let basename = Path::new(&configured)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        if let Some(basename) = basename
+            && let Some(local) = first_dir_with_file(dirs, &configured)
+        {
+            uploads.push(exec::ManifestUpload {
+                local,
+                remote_basename: basename,
+            });
+        }
+    }
+
     uploads
+}
+
+/// `[server] capacity_contract` as the deployed config will see it.
+///
+/// Layers the same way the runtime does — base `autumn.toml` first, then the
+/// profile override file — so a profile that sets or clears the key wins, and
+/// a stray `capacity.lock` nobody points at is never shipped.
+fn configured_capacity_contract(dirs: &[PathBuf], profile: &str) -> Option<String> {
+    fn read_key(path: &Path) -> Option<Option<String>> {
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let server = parsed.get("server")?;
+        // Present-but-empty clears the key, matching the env override.
+        server
+            .get("capacity_contract")
+            .map(|value| value.as_str().map(str::to_owned).filter(|s| !s.is_empty()))
+    }
+
+    let mut configured = first_dir_with_file(dirs, "autumn.toml").and_then(|p| read_key(&p))?;
+
+    let normalized =
+        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
+    for name in autumn_web::config::profile_override_file_lookup_names(&normalized, profile) {
+        if let Some(local) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) {
+            if let Some(override_value) = read_key(&local) {
+                configured = override_value;
+            }
+            break;
+        }
+    }
+
+    configured
 }
 
 /// Locate the config manifest(s) to upload for the resolved deploy, reading from
@@ -6056,6 +6111,39 @@ mod tests {
         assert_eq!(uploads.len(), 1, "only autumn.toml is present");
         assert_eq!(uploads[0].remote_basename, "autumn.toml");
         assert_eq!(uploads[0].local, dir.path().join("autumn.toml"));
+    }
+
+    #[test]
+    fn manifest_uploads_include_the_configured_capacity_contract() {
+        // A release that ships `autumn.toml` naming a `capacity_contract` but
+        // not the contract itself would silently disable the admission control
+        // it advertises: the remote load fails and deliberately falls back to
+        // unlimited (#1733).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\ncapacity_contract = \"capacity.lock\"\n",
+        )
+        .expect("write base");
+        std::fs::write(dir.path().join("capacity.lock"), "version = 1\n").expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "capacity.lock"]);
+    }
+
+    #[test]
+    fn manifest_uploads_skip_a_capacity_contract_that_is_not_configured() {
+        // A stray capacity.lock nobody points at is not part of the release.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("capacity.lock"), "version = 1\n").expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml"]);
     }
 
     #[test]

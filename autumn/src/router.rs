@@ -3455,7 +3455,11 @@ fn build_load_shed_layer(
         tracing::info!(
             limit,
             source = resolved.source(),
-            contract = config.server.capacity_contract.as_deref().unwrap_or_default(),
+            contract = config
+                .server
+                .capacity_contract
+                .as_deref()
+                .unwrap_or_default(),
             "admission control sourced from the committed capacity contract"
         );
     }

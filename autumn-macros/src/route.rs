@@ -382,15 +382,16 @@ fn has_extension_param(input_fn: &syn::ItemFn) -> bool {
 /// resource for the length of the request, paired with the pool tag recorded
 /// in the capacity contract (issue #1733).
 ///
-/// Deliberately narrow: only extractors that *are* a handle on the resource
-/// are listed. An extractor that merely happens to consult the database on
+/// Deliberately narrow: only extractors that *are* a handle on the resource,
+/// for the length of the request, are listed. `DeferredDb` is excluded on both
+/// counts — it is `pub(crate)`, so no app author can write it, and its whole
+/// point is *not* holding a connection across the body read. An extractor that merely happens to consult the database on
 /// some paths (`Session`, `Tenant`, `Flags`) is not, because a contract that
 /// over-claims is worse than one that under-claims — see the "provable
 /// subset" caveat on `RouteInfo::pools`.
 const POOL_EXTRACTORS: &[(&str, &str)] = &[
     ("CrossShard", "db"),
     ("Db", "db"),
-    ("DeferredDb", "db"),
     ("Events", "events"),
     ("Mailer", "mail"),
     ("Notifications", "notifications"),
@@ -413,16 +414,49 @@ fn derive_pools(input_fn: &syn::ItemFn) -> Vec<&'static str> {
         let syn::FnArg::Typed(pat_type) = arg else {
             continue;
         };
-        let ty = &pat_type.ty;
-        let tokens = quote! { #ty };
-        for (extractor, pool) in POOL_EXTRACTORS {
-            if tokens_contain_ident(&tokens, extractor) && !pools.contains(pool) {
+        let Some(extractor) = declared_extractor(&pat_type.ty) else {
+            continue;
+        };
+        for (name, pool) in POOL_EXTRACTORS {
+            if extractor == *name && !pools.contains(pool) {
                 pools.push(pool);
             }
         }
     }
     pools.sort_unstable();
     pools
+}
+
+/// The name of the extractor a parameter *declares*, or `None` when the type
+/// is not a plain path.
+///
+/// Deliberately NOT a recursive search for a resource name anywhere in the
+/// type: `State<AppState<Db>>` declares `State`, not `Db`. Matching nested
+/// generic arguments would contradict the documented rule that a pool held
+/// through an application `State` value is invisible to this derivation, and
+/// would write false `db-bound` shapes — and digest drift — into the contract.
+/// Under-claiming is the safe direction here; over-claiming is a lie.
+///
+/// Transparent wrappers axum itself sees through are peeled, so `Option<Db>`
+/// and `&Db` still declare `Db`. Like every source-level check in this crate,
+/// a type alias that hides the name is not resolved.
+fn declared_extractor(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Reference(inner) => declared_extractor(&inner.elem),
+        syn::Type::Paren(inner) => declared_extractor(&inner.elem),
+        syn::Type::Group(inner) => declared_extractor(&inner.elem),
+        syn::Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            if segment.ident == "Option"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+            {
+                return declared_extractor(inner);
+            }
+            Some(segment.ident.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Emit the derived pool set as a `&'static [&'static str]` literal.
@@ -2215,7 +2249,7 @@ mod tests {
 
     #[test]
     fn route_macro_recognizes_sharded_database_extractors() {
-        for extractor in ["ShardedDb", "ShardedReadDb", "Shards", "DeferredDb"] {
+        for extractor in ["ShardedDb", "ShardedReadDb", "Shards", "CrossShard"] {
             let ty = syn::Ident::new(extractor, proc_macro2::Span::call_site());
             let generated = route_macro(
                 "GET",
@@ -2258,4 +2292,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn route_macro_does_not_read_a_pool_out_of_a_nested_generic() {
+        // `State<AppState<Db>>` is an application-held state value, not a `Db`
+        // extractor. Recording the database pool here would contradict the
+        // documented rule that `State`-held resources are invisible, and would
+        // put false `db-bound` shapes (and digest drift) into the contract.
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/posts" },
+            quote! {
+                async fn index(state: State<AppState<Db>>) -> String {
+                    let _ = state;
+                    String::new()
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pools : & []"),
+            "a pool name nested inside another type is not a declared extractor: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_still_sees_a_pool_through_option_and_reference_wrappers() {
+        // The recognizer looks at the declared extractor, so the transparent
+        // wrappers axum itself understands must not hide it.
+        for spelling in ["Option < Db >", "& Db"] {
+            let ty: syn::Type = syn::parse_str(spelling).expect("type parses");
+            let generated = route_macro(
+                "GET",
+                "get",
+                quote! { "/posts" },
+                quote! {
+                    async fn index(db: #ty) -> String {
+                        let _ = db;
+                        String::new()
+                    }
+                },
+            )
+            .to_string();
+
+            assert!(
+                generated.contains(r#"pools : & ["db"]"#),
+                "`{spelling}` still declares the database extractor: {generated}"
+            );
+        }
+    }
 }

@@ -271,6 +271,27 @@ framework.
 
 ---
 
+### Capacity contracts: three metadata structs gain fields
+
+Deploys can now carry a proven capacity contract (`autumn calibrate` →
+`capacity.lock` → `[server] capacity_contract`; see
+[the guide](../guide/capacity-contracts.md)). Nothing about existing behaviour
+changes — an app that configures no contract sheds exactly as before — but the
+feature adds fields to three public, non-`#[non_exhaustive]` structs, so
+**struct-literal construction** of them no longer compiles:
+
+* `openapi::ApiDoc` gains `pools: &'static [&'static str]` — the pool tags a
+  handler's declared extractors prove it holds.
+* `route_listing::RouteInfo` gains `resource_shape: ResourceShape` and
+  `pools: Vec<String>`.
+* `config::ServerConfig` gains `capacity_contract: Option<String>`.
+
+All three derive `Default`, so the fix is to end the literal with
+`..Default::default()` — which is what every construction site inside the
+workspace already does, and what the route macros emit. Field access, pattern
+matching with a `..` rest, and deserialization of an older routes dump are all
+unaffected: the two `RouteInfo` fields are `#[serde(default)]`.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the

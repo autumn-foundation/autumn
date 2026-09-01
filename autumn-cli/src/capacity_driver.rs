@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use autumn_web::capacity::{
-    CONTRACT_VERSION, CapacityContract, Envelope, HostProfile, Provenance, route_graph_digest,
+    CONTRACT_VERSION, Calibration, CapacityContract, Envelope, HostProfile, Provenance,
+    route_graph_digest,
 };
 
 use crate::capacity::{
@@ -40,15 +41,35 @@ use crate::capacity::{
 };
 use crate::cold_start_driver::{reserve_free_port, stop_child};
 
-/// Default concurrency ladder. Doubling rungs span 1..64 in seven steps, which
-/// is enough resolution to locate a knee for a typical single-host app without
-/// turning calibration into a coffee break. Widen it with `--concurrency` for
-/// a service that saturates higher.
-pub const DEFAULT_LADDER: &str = "1,2,4,8,16,32,64";
-
 /// How many requests the seeded plan holds. Long enough that a mixed-shape app
 /// sees every route many times, short enough to build once and replay.
 const PLAN_LENGTH: usize = 4096;
+
+/// Multiplier applied to the measured saturation concurrency to get the
+/// admission limit the contract licenses.
+///
+/// The two numbers are deliberately not the same, because the concurrency a
+/// loopback driver offers is not the concurrency the runtime counts. A
+/// `LoadShedLayer` slot is held from the moment the layer sees a request until
+/// the handler's future resolves — which in production also spans reading the
+/// request body off a real network. By Little's law the same throughput needs
+/// a strictly larger in-flight count over a WAN than over `127.0.0.1`, so
+/// enforcing the raw knee would shed traffic the binary can actually serve.
+/// Headroom errs toward admitting; the envelope itself is still recorded
+/// unscaled as `saturation_concurrency`.
+const ADMISSION_HEADROOM: usize = 2;
+
+/// Floor for the licensed admission limit.
+///
+/// A ladder whose second rung fails to gain 5% — a CPU-quota'd container, a
+/// noisy shared runner, one calibratable route that serialises on a lock —
+/// puts the knee at concurrency 1, and a contract licensing a single in-flight
+/// request would 503 essentially all production traffic. Never let a
+/// degenerate calibration write a ceiling below what the host can obviously
+/// carry.
+fn admission_floor(host: &HostProfile) -> usize {
+    host.logical_cpus.max(1)
+}
 
 /// Options for `autumn calibrate`.
 pub struct CalibrateOptions<'a> {
@@ -60,14 +81,14 @@ pub struct CalibrateOptions<'a> {
     pub contract_path: &'a str,
     /// Gate mode: compare against the committed contract instead of writing.
     pub check: bool,
-    /// Seed for the request profile, so a run is replayable.
-    pub seed: u64,
-    /// Concurrency ladder to walk.
+    /// Seed for the request profile. `None` means the user did not name one.
+    pub seed: Option<u64>,
+    /// Concurrency ladder to walk. Empty means the user did not name one.
     pub concurrency: Vec<usize>,
-    /// Milliseconds to hold each rung.
-    pub rung_ms: u64,
-    /// Milliseconds of discarded warmup before the ladder.
-    pub warmup_ms: u64,
+    /// Milliseconds to hold each rung. `None` means unspecified.
+    pub rung_ms: Option<u64>,
+    /// Milliseconds of discarded warmup. `None` means unspecified.
+    pub warmup_ms: Option<u64>,
     /// Regression tolerances used by `--check`.
     pub tolerances: Tolerances,
     /// Emit the contract as JSON on stdout instead of the human summary.
@@ -78,13 +99,7 @@ pub struct CalibrateOptions<'a> {
 pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
     eprintln!("\u{1F342} autumn calibrate\n");
 
-    let binary = match build_binary(opts) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("\u{2717} {error}");
-            return 1;
-        }
-    };
+    let binary = build_binary(opts);
 
     let dump = match dump_routes(&binary) {
         Ok(dump) => dump,
@@ -106,11 +121,40 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         return 1;
     }
 
+    // `--check` must replay the workload the committed contract was measured
+    // with, not this invocation's defaults: comparing an envelope taken with
+    // `--concurrency 1,8,64 --rung-ms 5000` against one taken with the default
+    // ladder compares two different experiments, and the verdict would be about
+    // the flags rather than the build.
+    let committed = if opts.check {
+        match CapacityContract::load(opts.contract_path) {
+            Ok(contract) => Some(contract),
+            Err(error) => {
+                eprintln!(
+                    "\u{2717} {error}\n\n  Run `autumn calibrate` to record a contract before \
+                     gating against one."
+                );
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
+    let calibration = match resolve_calibration(opts, committed.as_ref()) {
+        Ok(calibration) => calibration,
+        Err(error) => {
+            eprintln!("\u{2717} {error}");
+            return 1;
+        }
+    };
+
     eprintln!(
-        "  {} route(s) in the graph, {} calibratable target(s), seed {}",
+        "  {} route(s) in the graph, {} calibratable target(s), seed {}, ladder {:?}",
         shapes.len(),
         targets.len(),
-        opts.seed
+        calibration.seed,
+        calibration.concurrency
     );
 
     let port = match reserve_free_port() {
@@ -121,7 +165,7 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         }
     };
 
-    let mut child = match boot(&binary, port) {
+    let child = match boot(&binary, port) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("\u{2717} {error}");
@@ -129,16 +173,12 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         }
     };
 
-    let result = measure(opts, port, &targets);
-    stop_child(&mut child);
-
-    let rungs = match result {
-        Ok(rungs) => rungs,
-        Err(error) => {
-            eprintln!("\u{2717} {error}");
-            return 1;
-        }
-    };
+    // A guard rather than a bare `stop_child` call: a worker panic propagating
+    // out of `thread::scope` inside `measure` would otherwise unwind past the
+    // cleanup and leave the calibrated app running, holding its port.
+    let mut child = ChildGuard(child);
+    let rungs = measure(&calibration, port, &targets);
+    child.stop();
 
     let Some(knee) = find_saturation(&rungs, &SaturationOptions::default()) else {
         eprintln!(
@@ -151,12 +191,81 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
 
     print_ladder(&rungs, knee.concurrency);
 
-    let candidate = build_contract(&knee, shapes);
+    let candidate = build_contract(&knee, shapes, calibration);
 
-    if opts.check {
-        check(opts, &candidate)
-    } else {
-        write(opts, &candidate)
+    match committed {
+        Some(committed) => check(opts, &committed, &candidate),
+        None => write(opts, &candidate),
+    }
+}
+
+/// The workload this run should drive.
+///
+/// A flag the user did not name arrives as `None`/empty rather than as its
+/// default, so "I did not say" stays distinguishable from "I said the
+/// default". In `--check` mode the first replays the committed contract's own
+/// workload, because an envelope only means something next to the workload
+/// that produced it; the second is honoured, with a warning that the
+/// comparison now spans two experiments.
+fn resolve_calibration(
+    opts: &CalibrateOptions<'_>,
+    committed: Option<&CapacityContract>,
+) -> Result<Calibration, String> {
+    let baseline = committed.map_or_else(Calibration::default, |contract| {
+        normalize_recorded(&contract.calibration)
+    });
+
+    let named_workload = opts.seed.is_some()
+        || !opts.concurrency.is_empty()
+        || opts.rung_ms.is_some()
+        || opts.warmup_ms.is_some();
+
+    let resolved = Calibration {
+        seed: opts.seed.unwrap_or(baseline.seed),
+        concurrency: if opts.concurrency.is_empty() {
+            baseline.concurrency.clone()
+        } else {
+            normalized_ladder(&opts.concurrency)
+        },
+        rung_ms: opts.rung_ms.unwrap_or(baseline.rung_ms),
+        warmup_ms: opts.warmup_ms.unwrap_or(baseline.warmup_ms),
+    };
+
+    if resolved.concurrency.is_empty() {
+        return Err(
+            "the concurrency ladder is empty; pass at least one positive value to --concurrency"
+                .to_owned(),
+        );
+    }
+    if resolved.rung_ms == 0 {
+        return Err(
+            "--rung-ms must be positive: a zero-length rung measures nothing, and a \
+                    contract built from it would record an envelope nobody proved"
+                .to_owned(),
+        );
+    }
+
+    if committed.is_some() && named_workload && resolved != baseline {
+        eprintln!(
+            "  note: measuring with the workload you passed, which differs from the one the \
+             committed contract records (seed {}, ladder {:?}, rung {}ms). The comparison below \
+             therefore spans two different experiments.",
+            baseline.seed, baseline.concurrency, baseline.rung_ms
+        );
+    }
+
+    Ok(resolved)
+}
+
+/// A recorded calibration put through the same normalisation a fresh one gets,
+/// so a hand-edited contract cannot smuggle a descending or zero-bearing ladder
+/// past `find_saturation`'s ascending-order assumption.
+fn normalize_recorded(calibration: &Calibration) -> Calibration {
+    Calibration {
+        seed: calibration.seed,
+        concurrency: normalized_ladder(&calibration.concurrency),
+        rung_ms: calibration.rung_ms,
+        warmup_ms: calibration.warmup_ms,
     }
 }
 
@@ -170,7 +279,11 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
 /// `cfg!(debug_assertions)` and profile-gated `#[cfg]` code make a debug
 /// binary a genuinely different program, and its throughput is not a number
 /// anyone should size infrastructure from.
-fn build_binary(opts: &CalibrateOptions<'_>) -> Result<PathBuf, String> {
+///
+/// Infallible from this side: both helpers report and exit the process
+/// themselves on a compilation or resolution failure, exactly as `autumn
+/// routes` does.
+fn build_binary(opts: &CalibrateOptions<'_>) -> PathBuf {
     eprintln!("  building (release) \u{2026}");
     crate::routes::compile_binary_with_profile(
         opts.package,
@@ -178,11 +291,25 @@ fn build_binary(opts: &CalibrateOptions<'_>) -> Result<PathBuf, String> {
         &crate::routes::CargoFeatures::default(),
         true,
     );
-    Ok(crate::routes::find_binary_in_profile(
-        opts.package,
-        opts.bin,
-        true,
-    ))
+    crate::routes::find_binary_in_profile(opts.package, opts.bin, true)
+}
+
+/// Owns the calibrated app process and reaps it on drop, including while
+/// unwinding.
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    /// Stop the child now. Idempotent — `stop_child` on an already-exited
+    /// process is a no-op, so the `Drop` impl running afterwards is harmless.
+    fn stop(&mut self) {
+        stop_child(&mut self.0);
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Read the app's route graph back through `AUTUMN_DUMP_ROUTES`.
@@ -222,11 +349,18 @@ fn boot(binary: &Path, port: u16) -> Result<std::process::Child, String> {
     let live = format!("http://127.0.0.1:{port}/live");
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("failed to poll the app process: {e}"))?
-        {
-            return Err(format!("the app exited during startup with status {status}"));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Already exited: nothing to reap.
+                return Err(format!(
+                    "the app exited during startup with status {status}"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                stop_child(&mut child);
+                return Err(format!("failed to poll the app process: {error}"));
+            }
         }
         if client
             .get(&live)
@@ -253,38 +387,50 @@ fn blocking_client() -> reqwest::blocking::Client {
 // ── the ladder ───────────────────────────────────────────────────────────
 
 /// Warm up, then walk the ladder, returning one [`RungStats`] per rung.
-fn measure(
-    opts: &CalibrateOptions<'_>,
-    port: u16,
-    targets: &[String],
-) -> Result<Vec<RungStats>, String> {
+fn measure(calibration: &Calibration, port: u16, targets: &[String]) -> Vec<RungStats> {
     let client = blocking_client();
     let base = format!("http://127.0.0.1:{port}");
-    let plan = plan_requests(opts.seed, targets, PLAN_LENGTH);
+    let plan = plan_requests(calibration.seed, targets, PLAN_LENGTH);
 
-    if opts.warmup_ms > 0 {
-        eprintln!("  warming up for {}ms …", opts.warmup_ms);
+    if calibration.warmup_ms > 0 {
+        eprintln!("  warming up for {}ms …", calibration.warmup_ms);
         drop(drive(
             &client,
             &base,
             &plan,
             1,
-            Duration::from_millis(opts.warmup_ms),
+            Duration::from_millis(calibration.warmup_ms),
         ));
     }
 
-    let mut rungs = Vec::with_capacity(opts.concurrency.len());
-    for &concurrency in &opts.concurrency {
+    // `find_saturation` walks the ladder assuming ascending concurrency: a
+    // descending one would make the widest rung the baseline and stop at the
+    // second, recording that widest rung as the knee no matter where the real
+    // one is. Normalising here makes the flag order-insensitive.
+    let mut rungs = Vec::with_capacity(calibration.concurrency.len());
+    for &concurrency in &calibration.concurrency {
         let samples = drive(
             &client,
             &base,
             &plan,
             concurrency,
-            Duration::from_millis(opts.rung_ms),
+            Duration::from_millis(calibration.rung_ms),
         );
         rungs.push(RungStats::from_samples(&samples));
     }
-    Ok(rungs)
+    rungs
+}
+
+/// Ascending, deduplicated, zero-free concurrency ladder.
+///
+/// A rung of `0` spawns no workers and measures nothing, which
+/// `find_saturation` would have to reject anyway; dropping it here keeps the
+/// ladder meaningful instead.
+fn normalized_ladder(requested: &[usize]) -> Vec<usize> {
+    let mut ladder: Vec<usize> = requested.iter().copied().filter(|&n| n > 0).collect();
+    ladder.sort_unstable();
+    ladder.dedup();
+    ladder
 }
 
 /// Closed-loop load: `concurrency` threads each issue requests back to back
@@ -345,7 +491,16 @@ fn drive(
         }
     });
 
-    let wall_secs = started.elapsed().as_secs_f64();
+    // Deliberately the *offered* window, not `started.elapsed()`. Workers stop
+    // issuing at the deadline, but `thread::scope` joins on the slowest
+    // in-flight request: a single straggler that runs into the client's 30s
+    // timeout would stretch the denominator to 30s and report a rung at a few
+    // percent of what it actually delivered — which `find_saturation` would
+    // then read as "gained too little" and record a ceiling far below what the
+    // binary sustains. Every counted response was issued inside this window,
+    // so the window is the honest denominator.
+    let wall_secs = duration.as_secs_f64();
+    debug_assert!(started.elapsed() >= duration || concurrency == 0);
     let latencies_ms = latencies.lock().map(|l| l.clone()).unwrap_or_default();
     // `usize` -> `u64` is lossless on every target autumn supports.
     #[allow(clippy::cast_possible_truncation)]
@@ -383,8 +538,22 @@ fn print_ladder(rungs: &[RungStats], knee: usize) {
 fn build_contract(
     knee: &RungStats,
     routes: Vec<autumn_web::capacity::RouteShape>,
+    calibration: Calibration,
 ) -> CapacityContract {
     let (git_commit, git_dirty) = git_provenance();
+    let host = HostProfile::detect();
+    let admission_limit = knee
+        .concurrency
+        .saturating_mul(ADMISSION_HEADROOM)
+        .max(admission_floor(&host));
+    if admission_limit > knee.concurrency.saturating_mul(ADMISSION_HEADROOM) {
+        eprintln!(
+            "  note: saturation was measured at concurrency {}, which is below this host's \
+             {} logical\n        CPUs; licensing {admission_limit} instead so a degenerate \
+             ladder cannot write a\n        ceiling that brownouts the deploy.",
+            knee.concurrency, host.logical_cpus
+        );
+    }
     let mut contract = CapacityContract {
         version: CONTRACT_VERSION,
         provenance: Provenance {
@@ -394,15 +563,14 @@ fn build_contract(
             git_dirty,
             route_graph_digest: route_graph_digest(&routes),
         },
-        host: HostProfile::detect(),
+        host,
         envelope: Envelope {
             sustained_rps: knee.rps,
             p99_latency_ms: knee.p99_ms,
             saturation_concurrency: knee.concurrency,
-            // The binary should admit exactly as far as it was still gaining
-            // throughput, and shed past it.
-            admission_limit: knee.concurrency,
+            admission_limit,
         },
+        calibration,
         routes,
     };
     contract.canonicalize();
@@ -450,10 +618,7 @@ fn write(opts: &CalibrateOptions<'_>, contract: &CapacityContract) -> i32 {
     }
 
     if let Err(error) = std::fs::write(opts.contract_path, rendered) {
-        eprintln!(
-            "\u{2717} failed to write {}: {error}",
-            opts.contract_path
-        );
+        eprintln!("\u{2717} failed to write {}: {error}", opts.contract_path);
         return 1;
     }
 
@@ -474,23 +639,20 @@ fn write(opts: &CalibrateOptions<'_>, contract: &CapacityContract) -> i32 {
 }
 
 /// Compare the freshly measured contract against the committed one.
-fn check(opts: &CalibrateOptions<'_>, candidate: &CapacityContract) -> i32 {
-    let committed = match CapacityContract::load(opts.contract_path) {
-        Ok(committed) => committed,
-        Err(error) => {
-            eprintln!(
-                "\u{2717} {error}\n\n  Run `autumn calibrate` to record a contract before \
-                 gating against one."
-            );
-            return 1;
-        }
-    };
-
-    let report = check_contract(&committed, candidate, &opts.tolerances);
+fn check(
+    opts: &CalibrateOptions<'_>,
+    committed: &CapacityContract,
+    candidate: &CapacityContract,
+) -> i32 {
+    let report = check_contract(committed, candidate, &opts.tolerances);
     print!("{}", render_check_report(&report));
 
     match report.outcome {
         CheckOutcome::Pass => 0,
-        CheckOutcome::Regressed | CheckOutcome::HostMismatch => 1,
+        CheckOutcome::Regressed => 1,
+        // A distinct code so a red X can be told apart from a real regression
+        // without reading the log: exit 2 means "this gate could not judge
+        // this build", which is a re-calibration, not an optimisation.
+        CheckOutcome::HostMismatch | CheckOutcome::Unusable => 2,
     }
 }

@@ -43,6 +43,21 @@ The run:
 5. Records the **saturation knee** — the last rung where more concurrency still
    bought materially more throughput — and writes `capacity.lock`.
 
+`saturation_concurrency` is the knee as measured. `admission_limit` is
+deliberately **not** the same number: it carries a 2x headroom factor, floored
+at the host's logical CPU count. Both adjustments exist because the concurrency
+a loopback driver offers is not the concurrency the runtime counts. A load-shed
+slot is held from the moment the layer sees a request until the handler's future
+resolves — which in production also spans reading the request body off a real
+network — so by Little's law the same throughput needs a strictly larger
+in-flight count over a WAN than over `127.0.0.1`. Enforcing the raw knee would
+shed traffic the binary can actually serve. The floor covers the other
+direction: a ladder whose second rung fails to gain (a CPU-quota'd container, a
+noisy runner, one route that serialises on a lock) puts the knee at concurrency
+1, and a contract licensing a single in-flight request would brown out the
+deploy. Headroom errs toward admitting; the measured envelope is still recorded
+unscaled.
+
 ```toml
 version = 1
 
@@ -59,11 +74,17 @@ arch = "x86_64"
 logical_cpus = 8
 total_memory_mb = 16384
 
+[calibration]
+seed = 1733
+concurrency = [1, 2, 4, 8, 16, 32, 64]
+rung_ms = 2000
+warmup_ms = 1000
+
 [envelope]
 sustained_rps = 4210.5
 p99_latency_ms = 18.42
 saturation_concurrency = 64
-admission_limit = 64
+admission_limit = 128
 
 [[routes]]
 method = "GET"
@@ -76,6 +97,24 @@ pools = ["db"]
 Useful flags: `--concurrency 1,4,16,64,256` to reshape the ladder, `--rung-ms`
 and `--warmup-ms` to trade run time for stability, `--seed` to change the
 request profile, `-p` / `--bin` to pick a target in a workspace.
+
+The workload is recorded in the contract, and `--check` **replays it** rather
+than its own defaults:
+
+```toml
+[calibration]
+seed = 1733
+concurrency = [1, 2, 4, 8, 16, 32, 64]
+rung_ms = 2000
+warmup_ms = 1000
+```
+
+That matters more than it looks. An envelope only means something next to the
+workload that produced it: gating a contract measured with `--concurrency
+1,8,64 --rung-ms 5000` against a rebuild measured with the default ladder
+compares two different experiments, and the verdict would be about the flags
+rather than the build. Pass a workload flag explicitly to `--check` and it is
+honoured, with a warning saying exactly that.
 
 ### What gets driven
 
@@ -125,6 +164,16 @@ non-zero with a human-readable diff:
 Tolerances default to **15% for throughput** and **25% for P99**, adjustable
 with `--tolerance-rps` / `--tolerance-p99`. They are sized to sit between
 observed run-to-run noise on a quiet host and a regression worth paging about.
+The P99 band also carries **1 ms of absolute slack** on top of the proportional
+one: an app whose handlers return a `&'static str` has a sub-millisecond
+loopback P99, where 25% is less headroom than a single context switch on a
+shared runner consumes, and a gate that fails no-op rebuilds of the very apps
+it is most likely pointed at is worse than no gate.
+
+Exit codes distinguish the two ways `--check` can be red: **1** means this build
+regressed, **2** means the gate could not judge it (a different host class, or a
+committed contract that records no usable envelope). Only the first is a reason
+to go optimise something.
 
 The gate is deliberately narrow. It compares **two numbers**, and only when the
 rebuild ran on the same host class as the contract. It never compares
@@ -169,10 +218,11 @@ capacity_contract = "capacity.lock"
 ```
 
 With this set — and `max_concurrent_requests` **unset** — the load-shedding
-admission ceiling is sourced from the contract's proven envelope instead of a
-hand-tuned guess. The binary admits up to the concurrency it was still gaining
-throughput at and sheds past it, exactly as ADR-0009 describes, but against a
-number someone measured.
+admission ceiling is sourced from the contract's `admission_limit` instead of a
+hand-tuned guess, and the binary sheds past it exactly as ADR-0009 describes —
+but against a number someone measured rather than guessed. (`admission_limit`
+is the measured knee plus headroom, floored at the host's CPU count; see
+[Calibrate](#1-calibrate) for why the two numbers differ.)
 
 Precedence, and the reasoning behind it:
 
@@ -254,6 +304,16 @@ describing your production system:
 - **The measured workload is the calibratable subset.** Unauthenticated,
   parameterless `GET` routes. If your traffic is dominated by authenticated
   writes, the envelope describes a workload you do not run.
+- **Loopback is not your network.** Calibration drives `127.0.0.1`, so a
+  request's in-flight lifetime is essentially handler time, while in production
+  it also spans reading the body off the wire. The 2x headroom on
+  `admission_limit` is a blunt correction for this, not a measurement of it.
+- **The contract is not re-validated against the running route graph.** The
+  runtime checks the host class, not whether the app still has the routes the
+  envelope was measured against. A `capacity.lock` left uncommitted-to for
+  months, against an app that has since grown forty routes, is enforced
+  verbatim. Re-calibrate when the shape of the app changes; the `[[routes]]`
+  section and `route_graph_digest` are there so the diff shows you when it has.
 - **No external dependencies are calibrated.** A run measures your process. If
   your database saturates before your app does, the contract records your app's
   ceiling, not your system's.

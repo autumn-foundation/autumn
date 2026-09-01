@@ -502,7 +502,10 @@ type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 /// generated CRUD handlers own their pool checkout internally, so no extractor
 /// appears in a signature the route macro could read. Adding the database tag
 /// here keeps the contract honest about the routes an app never wrote by hand.
-fn pools_of(api_doc: &crate::openapi::ApiDoc, repository: Option<&crate::route::RepositoryApiMeta>) -> Vec<String> {
+fn pools_of(
+    api_doc: &crate::openapi::ApiDoc,
+    repository: Option<&crate::route::RepositoryApiMeta>,
+) -> Vec<String> {
     let mut pools: Vec<String> = api_doc.pools.iter().map(|p| (*p).to_owned()).collect();
     if repository.is_some() && !pools.iter().any(|p| p == POOL_DB) {
         pools.push(POOL_DB.to_owned());
@@ -2076,7 +2079,10 @@ mod tests {
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
             .expect("route listing should collect");
 
-        assert_eq!(infos[0].resource_shape, crate::capacity::ResourceShape::DbBound);
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
         assert_eq!(infos[0].pools, vec!["db".to_owned()]);
     }
 
@@ -2089,7 +2095,10 @@ mod tests {
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
             .expect("route listing should collect");
 
-        assert_eq!(infos[0].resource_shape, crate::capacity::ResourceShape::IoBound);
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::IoBound
+        );
     }
 
     #[test]
@@ -2116,8 +2125,10 @@ mod tests {
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
             .expect("route listing should collect");
 
-        assert_eq!(infos[0].resource_shape, crate::capacity::ResourceShape::DbBound);
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
         assert_eq!(infos[0].pools, vec!["db".to_owned()]);
     }
-
 }
