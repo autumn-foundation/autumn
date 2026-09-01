@@ -504,6 +504,10 @@ pub mod markdown;
 /// Enabled by the `reporting` Cargo feature (on by default).
 #[cfg(feature = "reporting")]
 pub mod reporting;
+/// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
+/// URLs — see [`redis_tls::open_client`] (issue #2172).
+#[cfg(feature = "redis")]
+pub mod redis_tls;
 pub mod scheduler;
 pub mod security;
 pub mod session;
