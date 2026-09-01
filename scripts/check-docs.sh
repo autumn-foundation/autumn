@@ -41,7 +41,7 @@ echo ""
 # Build each publishable crate with its declared docs.rs feature set.
 # autumn-web declares [package.metadata.docs.rs].features which cargo doc
 # does not read directly — we pass them explicitly here.
-AUTUMN_WEB_DOCS_FEATURES="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,pdf,edge,plugin-sandbox"
+AUTUMN_WEB_DOCS_FEATURES="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,pdf,edge,plugin-sandbox,tls"
 
 echo "==> autumn-web (explicit docs.rs features)"
 cargo doc -p autumn-web --no-deps \

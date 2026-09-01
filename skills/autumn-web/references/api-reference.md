@@ -246,6 +246,47 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
+- **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
+  non-null `String` column as **personal data** and carries that classification
+  on the *type*, not in a name denylist. The generated field becomes
+  `autumn_web::classify::Classified<String, {Model}{Column}Classified>` — a
+  wrapper with no `Serialize`, `Display`, `Deref`, `Hash` or `into_inner` — and
+  the model loses its `Serialize` derive as a consequence, so `Json(model)` and
+  `Json(Dto { email: model.email })` are both **compile errors** naming the
+  offending field and the `Json` sink. `Json`'s `IntoResponse` is bounded on
+  `classify::JsonSink` (blanket over `Serialize`, `#[diagnostic::do_not_recommend]`),
+  which is the seam later sinks plug into. Release is declared, never incidental:
+  `autumn_web::declassify! { pub NAME: {Model}{Column}Classified => JsonResponse,
+  purpose = "…", reason = "…" }` yields a boundary typed to exactly one column,
+  and `value.declassify(&NAME)` takes the value **by move** (a release is a
+  single event) and emits an auditable `tracing` record on
+  `autumn::declassification` carrying model/field/tier/purpose/sink/reason —
+  never the value. Purpose and reason must be non-blank literals. The write
+  structs (`NewX`/`UpdateX`/`Changeset`) and the generated `XFactory` still
+  accept the value — taking personal data *in* is not a release — but carry the
+  wrapper too (the factory's setter still takes the plain type, so
+  `.email("a@b.c")` is unchanged)
+  (`Classified<String, F>`, `Patch<Classified<String, F>>` on the patch, so
+  building one by hand costs an `.into()`) and get `#[serde(skip_serializing)]`;
+  their fields are `pub`, so a bare `String` would have let a handler move the
+  plaintext into a response view with no boundary;
+  `Debug` renders `<classified>` on every generated struct; `#[validate]` still
+  runs (the wrapper forwards `validator`'s string rules, and the two
+  value-returning accessors `as_email_string`/`as_url_string` return `None` so
+  they cannot hand the plaintext back). The column is also excluded from the
+  client-controlled `list()` allowlists, so `?filter[col]=` and `?sort=col` can
+  neither probe nor order by it. Refused in combination with `#[encrypted]`,
+  `#[searchable]`, `#[normalize]`, `#[translatable]`, `#[id]`, `#[lock_version]`,
+  `#[position]`, `#[state_machine]`, a `tenant_id` column, `#[serde(rename)]` /
+  `rename_all`, and `#[serde(with/serialize_with/deserialize_with)]`; non-`String`
+  fields are a compile error (mirrors `#[encrypted]`). A `#[repository]` that is
+  `versioned`/`ledgered` does not compile against a classified model, and durable
+  commit hooks refuse the payload at runtime — both snapshot the whole record.
+  Generated: the field marker + `classify::ClassifiedField` impl (with a
+  `module_path!()`-qualified `MODEL_PATH`), a
+  `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
+  `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
+  See `docs/guide/data-classification.md`.
 - `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -1022,7 +1063,7 @@ double-submits and replays.
 | `mail_previews(...)` | Dev mail previews |
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
-| `plugin(plugin)`, `plugins(tuple)` | Plugin install |
+| `plugin(plugin)`, `plugins(tuple)` | Plugin install (`autumn plugin add <crate>` writes the call for first-party plugins, #1606) |
 | `listeners(listeners![...])` | Event listeners (**0.6.0**) |
 | `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**0.6.0**) |
 | `with_shard_router(router)` | Sharding router (**0.6.0**) |
@@ -1403,7 +1444,22 @@ In-process HTTPS termination on the same host:port (off by default).
 - `reload_interval_secs` (default `60`) — certs hot-reload by polling file
   mtimes.
 - `handshake_timeout_secs` (default `10`).
-- Fail-fast at startup on bad / missing / mismatched / expired PEM.
+- Fail-fast at startup on bad / missing / mismatched / expired PEM, on
+  `[server.tls]` without the `tls` feature compiled in, and on `[server.tls]`
+  combined with `server.unix_socket`.
+- Everything else behaves as it does over plain HTTP: the `/health`, `/live`,
+  `/ready`, `/startup` probes and `/actuator/health`, the `[server.timeouts]`
+  request deadline, SSE streaming, `wss://` WebSockets, and graceful shutdown.
+- `autumn_web::tls::CertReloader` is the public reload task (mtime polling)
+  the app spawns; `CertReloader::load` builds the resolver and its reloader
+  together so a renewal during startup cannot be missed.
+- **In a container:** the image builder runs a bare `cargo build --release`, so
+  `tls` must be a *default* feature of the app; mount the PEMs and set
+  `AUTUMN_SERVER__TLS__CERT_PATH` / `__KEY_PATH`; set
+  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health` plus
+  `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
+  probes its own loopback listener over TLS instead of failing forever. See
+  `docs/guide/tls.md`.
 
 ### `[server.tls.acme]` (feature `acme`, 0.6.0, #1608)
 

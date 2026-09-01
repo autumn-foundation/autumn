@@ -982,7 +982,7 @@ fn inject_push_router(source: &str) -> String {
 /// nothing pointing at the cause. So the scan ignores comments, exactly as
 /// [`push_router_anchor`] does.
 fn push_router_already_mounted(source: &str) -> bool {
-    for_each_code_line(source, |line, _offset| {
+    crate::rust_source::for_each_code_line(source, |line, _offset| {
         line.contains("autumn_web::push::router()").then_some(())
     })
     .is_some()
@@ -994,7 +994,7 @@ fn push_router_already_mounted(source: &str) -> bool {
 /// See [`inject_push_router`]'s "Anchor selection" for why each rule is here.
 fn push_router_anchor(source: &str) -> Option<usize> {
     let mut seen_main = false;
-    for_each_code_line(source, |line, offset| {
+    crate::rust_source::for_each_code_line(source, |line, offset| {
         if line.trim().contains("async fn main") {
             seen_main = true;
         }
@@ -1005,51 +1005,6 @@ fn push_router_anchor(source: &str) -> Option<usize> {
         (seen_main && line.trim_end().ends_with("autumn_web::app()"))
             .then(|| offset + line.trim_end().len())
     })
-}
-
-/// Walk `source`'s lines that are **code**, skipping comments, and return the
-/// first non-`None` result of `f`.
-///
-/// `f` receives the raw line and its byte offset in `source`. The offset is
-/// tracked as the walk proceeds rather than recovered afterwards with
-/// `source.find(line)`, which would re-locate an identical earlier line and
-/// splice at the wrong place.
-///
-/// Shared by [`push_router_anchor`] and [`push_router_already_mounted`] so the
-/// two can never disagree about what counts as a comment — a disagreement
-/// there is what lets a doc-comment mention suppress both the injection and
-/// the warning about it.
-fn for_each_code_line<T>(source: &str, mut f: impl FnMut(&str, usize) -> Option<T>) -> Option<T> {
-    let mut offset = 0_usize;
-    let mut in_block_comment = false;
-
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim();
-        let line_start = offset;
-        offset += line.len();
-
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if trimmed.starts_with("/*") {
-            if !trimmed.contains("*/") {
-                in_block_comment = true;
-            }
-            continue;
-        }
-        // `//`, `///`, `//!`, and continuation lines of a block comment.
-        if trimmed.starts_with("//") || trimmed.starts_with('*') {
-            continue;
-        }
-
-        if let Some(found) = f(line, line_start) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// Inverse of [`inject_push_router`]: remove exactly the line it inserted.

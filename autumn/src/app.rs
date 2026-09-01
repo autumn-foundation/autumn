@@ -3228,6 +3228,18 @@ impl AppBuilder {
             return;
         }
 
+        // ── Data-flow manifest dump mode ───────────────────────────────
+        // When AUTUMN_DUMP_DATA_FLOW=1, print the classified-data flow manifest
+        // (#1654) and exit. Triggered by `autumn data-flow`, which needs the
+        // whole binary's registrations -- every `#[classified]` column and every
+        // declared declassification boundary, across the app AND its plugins --
+        // and link-time `inventory` collection is the only place they all exist
+        // together. Runs before any database or port is touched.
+        if crate::classify::manifest::is_dump_mode() {
+            crate::classify::manifest::print_manifest_dump(&crate::classify::manifest::audit());
+            return;
+        }
+
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
         // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
@@ -4219,7 +4231,7 @@ impl AppBuilder {
         // Carries the cert/key reload wiring from the TLS bind path to the
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
-        let mut tls_reload_state: Option<TlsReloadState> = None;
+        let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
 
         // Carries the ACME challenge listener + renewal task wiring from the TLS
         // bind path to the sibling tasks spawned once `server_shutdown` exists.
@@ -4577,7 +4589,7 @@ impl AppBuilder {
         if let Some(reload) = tls_reload_state.take() {
             let reload_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
-                run_tls_cert_reload(reload, reload_shutdown).await;
+                reload.run(reload_shutdown).await;
             });
         }
 
@@ -8019,38 +8031,6 @@ enum BoundListener {
     Tls(crate::tls::TlsListener),
 }
 
-/// Current UNIX time in seconds, saturating on the (impossible) pre-epoch case.
-///
-/// Deliberately **real** time, not the injected clock: this is the reference
-/// instant TLS certificate validity is judged against
-/// ([`crate::tls::load_certified_key`]). A certificate's `notBefore`/`notAfter`
-/// are facts about the real world, so a test or simulation clock pinned to the
-/// sim epoch must never be able to declare a live certificate not-yet-valid (or
-/// an expired one fine). It also runs at bind time and on a `spawn_blocking`
-/// reload timer, neither of which is on a request path a sim drives.
-#[cfg(feature = "tls")]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "TLS certificate validity is judged against real wall time by \
-              design — see this function's doc comment. Injecting a virtual \
-              clock here would let a simulation misjudge a real certificate."
-)]
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
-/// State carried from the TLS bind path to the background reload task.
-#[cfg(feature = "tls")]
-struct TlsReloadState {
-    resolver: std::sync::Arc<crate::tls::ReloadableCertResolver>,
-    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    interval: std::time::Duration,
-}
-
 /// Bind a TLS-terminating listener over `tcp`, loading and validating the
 /// configured certificate and key (fail-fast on any problem).
 #[cfg(feature = "tls")]
@@ -8058,7 +8038,7 @@ fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, TlsReloadState), crate::tls::TlsError> {
+) -> Result<(crate::tls::TlsListener, crate::tls::CertReloader), crate::tls::TlsError> {
     let provider = crate::tls::crypto_provider();
     // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
     // static-cert mode (the only mode that reaches this function; ACME mode is
@@ -8071,24 +8051,26 @@ fn build_tls_listener(
         .key_path
         .as_deref()
         .expect("validated: static [server.tls] sets key_path");
-    let certified = crate::tls::load_certified_key(cert_path, key_path, &provider, now_unix())?;
-    let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(certified));
+    // One call, so the reload baseline is stat'd before the certificate is
+    // loaded: a renewal landing in that gap must read as a change on the next
+    // poll, not as the baseline (which would serve the superseded certificate
+    // until the following renewal).
+    let (resolver, reload) = crate::tls::CertReloader::load(
+        cert_path.to_path_buf(),
+        key_path.to_path_buf(),
+        std::sync::Arc::clone(&provider),
+        crate::tls::now_unix(),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
+    )?;
     let server_config = crate::tls::build_server_config(
         std::sync::Arc::clone(&provider),
         std::sync::Arc::clone(&resolver),
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
-    // at least one second, mirroring the reload-interval clamp below.
+    // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    let reload = TlsReloadState {
-        resolver,
-        provider,
-        cert_path: cert_path.to_path_buf(),
-        key_path: key_path.to_path_buf(),
-        // A zero interval would busy-loop; clamp to at least one second.
-        interval: std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
-    };
     Ok((listener, reload))
 }
 
@@ -8245,90 +8227,6 @@ fn make_acme_reporter(
 #[cfg(all(feature = "acme", not(feature = "reporting")))]
 fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {
     std::sync::Arc::new(|_message: String| {})
-}
-
-/// Modification times of the cert and key files, `None` for a file that could
-/// not be stat'd. Reloads trigger on any change to this pair.
-#[cfg(feature = "tls")]
-fn tls_file_mtimes(
-    cert: &std::path::Path,
-    key: &std::path::Path,
-) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
-    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    (mtime(cert), mtime(key))
-}
-
-/// Background task: poll the cert/key file mtimes and hot-swap the served
-/// certificate on change. Never breaks the listener — a failed reload keeps the
-/// previously loaded certificate and retries on the next tick.
-#[cfg(feature = "tls")]
-async fn run_tls_cert_reload(state: TlsReloadState, shutdown: tokio_util::sync::CancellationToken) {
-    // Stat and PEM-read the cert/key on a blocking thread — both touch the
-    // filesystem and must not run on a tokio worker. On a `JoinError` (the
-    // blocking pool shutting down) just skip the tick and retry next time.
-    let stat_mtimes = |cert: std::path::PathBuf, key: std::path::PathBuf| {
-        tokio::task::spawn_blocking(move || tls_file_mtimes(&cert, &key))
-    };
-
-    let mut last = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
-        Ok(mtimes) => mtimes,
-        Err(e) => {
-            tracing::warn!(error = %e, "TLS reload: initial mtime read failed; assuming unknown");
-            (None, None)
-        }
-    };
-    loop {
-        tokio::select! {
-            () = tokio::time::sleep(state.interval) => {}
-            () = shutdown.cancelled() => break,
-        }
-
-        let current = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
-            Ok(mtimes) => mtimes,
-            Err(e) => {
-                tracing::warn!(error = %e, "TLS reload: mtime read task failed; skipping tick");
-                continue;
-            }
-        };
-        if current == last {
-            continue;
-        }
-
-        let cert_path = state.cert_path.clone();
-        let key_path = state.key_path.clone();
-        let provider = std::sync::Arc::clone(&state.provider);
-        let loaded = tokio::task::spawn_blocking(move || {
-            crate::tls::load_certified_key(&cert_path, &key_path, &provider, now_unix())
-        })
-        .await;
-        let loaded = match loaded {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(error = %e, "TLS reload: load task failed; skipping tick");
-                continue;
-            }
-        };
-
-        match loaded {
-            Ok(next) => {
-                state.resolver.store(next);
-                // Only advance the baseline on a successful load, so a partial
-                // write observed mid-renewal is retried on the next tick.
-                last = current;
-                tracing::info!(
-                    cert = %state.cert_path.display(),
-                    "Reloaded TLS certificate after detecting a change on disk"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    cert = %state.cert_path.display(),
-                    "TLS certificate reload failed; keeping the previously loaded certificate"
-                );
-            }
-        }
-    }
 }
 
 /// Connection info for a Unix-domain-socket request.

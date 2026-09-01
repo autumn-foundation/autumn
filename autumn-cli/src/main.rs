@@ -13,6 +13,7 @@ mod config;
 mod console;
 mod credentials;
 mod data;
+mod data_flow;
 mod db;
 mod db_pull;
 mod deploy;
@@ -36,6 +37,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod plugin;
 mod plugin_check;
 mod plugin_sandbox;
 mod process;
@@ -44,6 +46,7 @@ mod replay;
 mod retention;
 mod routes;
 mod routes_audit;
+mod rust_source;
 mod scaling_driver;
 mod schema;
 mod search;
@@ -145,6 +148,53 @@ pub struct CacheAuditArgs {
     no_default_features: bool,
 }
 
+/// Arguments for `autumn data-flow`.
+///
+/// A separate `Args` struct for the same reason as [`CacheAuditArgs`]: clap's
+/// derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct DataFlowArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON data-flow manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human report.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed manifest and exit non-zero on drift, so a
+    /// new release edge has to be reviewed rather than merged silently.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A `#[classified]` column or a
+    /// declassification boundary behind a feature the build does not enable is
+    /// not compiled in, so it cannot appear in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release binary rather than the debug one.
+    ///
+    /// The manifest describes the binary that produced it, and a debug binary
+    /// is not the one that ships: a classified column or a declassification
+    /// boundary behind `#[cfg(not(debug_assertions))]` exists only in the
+    /// release build. Run `--check` in CI under the profile you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
 /// Subcommands for `autumn cache`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum CacheSubcommands {
@@ -233,61 +283,6 @@ pub enum LifecycleSubcommands {
     },
 }
 
-/// Subcommands for `autumn plugin` — the capability-sandboxed plugin lane.
-#[derive(Subcommand)]
-pub enum PluginSubcommands {
-    /// Bind a manifest to a `wasm32-wasip1` module and write a
-    /// `.autumn-plugin` artifact.
-    ///
-    /// The module's SHA-256 is computed here and stamped into the manifest, so
-    /// an author never types the digest and can never ship one that describes
-    /// different bytes. The module is loaded into the same sandbox the runtime
-    /// uses before anything is written: an artifact that could not run is
-    /// refused at the author's desk rather than at the operator's boot.
-    ///
-    /// # Examples
-    ///
-    ///   autumn plugin package --manifest plugin.toml \
-    ///       --module target/wasm32-wasip1/release/plugin.wasm \
-    ///       --out hello.autumn-plugin
-    #[command(verbatim_doc_comment)]
-    Package {
-        /// The authored manifest, as TOML.
-        #[arg(long, value_name = "FILE")]
-        manifest: String,
-        /// The `wasm32-wasip1` module the manifest describes.
-        #[arg(long, value_name = "FILE")]
-        module: String,
-        /// Where to write the artifact.
-        #[arg(long, value_name = "FILE")]
-        out: String,
-    },
-
-    /// Review a `.autumn-plugin` artifact before installing it.
-    ///
-    /// Prints the capability grant, the routes it may serve, the module digest
-    /// that was reviewed, every host function it imports, and the classes of
-    /// authority the sandbox denies unconditionally. Then it loads the module
-    /// into this build's sandbox and runs the same route-conformance checks
-    /// `autumn plugin-check` runs against a native plugin — with no binary to
-    /// build and no process to start. Exits 1 if the artifact is not fit to
-    /// install.
-    ///
-    /// # Examples
-    ///
-    ///   autumn plugin inspect hello.autumn-plugin
-    ///   autumn plugin inspect hello.autumn-plugin --format json
-    #[command(verbatim_doc_comment)]
-    Inspect {
-        /// The artifact to review.
-        #[arg(value_name = "ARTIFACT")]
-        artifact: String,
-        /// Output format: `text` (default) or `json`.
-        #[arg(long, default_value = "text", value_name = "FORMAT")]
-        format: String,
-    },
-}
-
 /// Subcommands for `autumn search`.
 #[derive(Subcommand)]
 pub enum SearchSubcommands {
@@ -337,6 +332,92 @@ pub enum SearchSubcommands {
         /// Binary target to run (for packages with multiple bin targets).
         #[arg(long)]
         bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn plugin` — both plugin lanes.
+///
+/// `list`/`add` are consumer-facing discovery and install for a native plugin
+/// crate (issue #1606); `package`/`inspect` build and review a
+/// `.autumn-plugin` artifact for the capability-sandboxed lane (issue #1609).
+/// The author-facing conformance gate for a native plugin stays at
+/// `autumn plugin-check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PluginSubcommands {
+    /// List installable plugins with the version compatible with this app.
+    ///
+    /// Covers every first-party plugin plus community crates discoverable on
+    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Do not query crates.io; list the first-party catalog only.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    Add {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not query crates.io. First-party plugins install normally;
+        /// a community crate cannot have its version resolved and is refused.
+        #[arg(long)]
+        offline: bool,
+    },
+
+    /// Bind a manifest to a `wasm32-wasip1` module and write a
+    /// `.autumn-plugin` artifact.
+    ///
+    /// The module's SHA-256 is computed here and stamped into the manifest, so
+    /// an author never types the digest and can never ship one that describes
+    /// different bytes. The module is loaded into the same sandbox the runtime
+    /// uses before anything is written: an artifact that could not run is
+    /// refused at the author's desk rather than at the operator's boot.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin package --manifest plugin.toml \
+    ///       --module target/wasm32-wasip1/release/plugin.wasm \
+    ///       --out hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Package {
+        /// The authored manifest, as TOML.
+        #[arg(long, value_name = "FILE")]
+        manifest: String,
+        /// The `wasm32-wasip1` module the manifest describes.
+        #[arg(long, value_name = "FILE")]
+        module: String,
+        /// Where to write the artifact.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+
+    /// Review a `.autumn-plugin` artifact before installing it.
+    ///
+    /// Prints the capability grant, the routes it may serve, the module digest
+    /// that was reviewed, every host function it imports, and the classes of
+    /// authority the sandbox denies unconditionally. Then it loads the module
+    /// into this build's sandbox and runs the same route-conformance checks
+    /// `autumn plugin-check` runs against a native plugin — with no binary to
+    /// build and no process to start. Exits 1 if the artifact is not fit to
+    /// install.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin --format json
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// The artifact to review.
+        #[arg(value_name = "ARTIFACT")]
+        artifact: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
     },
 }
 
@@ -1248,14 +1329,37 @@ enum Commands {
         action: SearchSubcommands,
     },
 
-    /// Package, review and install capability-sandboxed plugins.
+    /// Discover, install, package and review Autumn plugins.
     ///
-    /// A sandboxed plugin runs as a `wasm32-wasip1` module inside a
-    /// deny-by-default sandbox: it may serve HTTP under the one prefix its
-    /// manifest declares, and it has no filesystem, no network, no environment
-    /// and no database. See `docs/guide/sandboxed-plugins.md`.
-    #[command(subcommand, verbatim_doc_comment)]
-    Plugin(PluginSubcommands),
+    /// `list` shows every installable plugin with the version compatible with
+    /// this app (querying crates.io for community crates unless `--offline`);
+    /// `add` writes the dependency, mounts the plugin in the
+    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// `package` and `inspect` are the capability-sandboxed lane: a sandboxed
+    /// plugin runs as a `wasm32-wasip1` module inside a deny-by-default
+    /// sandbox, serving HTTP under the one prefix its manifest declares with no
+    /// filesystem, no network, no environment and no database. See
+    /// `docs/guide/sandboxed-plugins.md`.
+    ///
+    /// Writing a native plugin instead? `autumn generate plugin`. Auditing one
+    /// you wrote? `autumn plugin-check`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin list
+    ///   autumn plugin list --json --offline
+    ///   autumn plugin add autumn-admin-plugin
+    ///   autumn plugin add autumn-cache-redis --dry-run
+    ///   autumn plugin package --manifest plugin.toml --module hello.wasm \
+    ///       --out hello.autumn-plugin
+    ///   autumn plugin inspect hello.autumn-plugin
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// The plugin subcommand to run.
+        #[command(subcommand)]
+        action: PluginSubcommands,
+    },
 
     /// Run conformance checks against a plugin's route contributions.
     ///
@@ -1263,6 +1367,9 @@ enum Commands {
     /// and verifies that the named plugin satisfies five checks: installability,
     /// route attribution, route prefix, route collision, and sensitive-surface
     /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// This is the AUTHOR-facing gate. To discover and install a plugin as a
+    /// consumer, use `autumn plugin list` / `autumn plugin add`.
     ///
     /// A *sandboxed* plugin is checked with `autumn plugin inspect` instead,
     /// which runs these same checks over its manifest with no binary to build.
@@ -1383,6 +1490,17 @@ enum Commands {
     ///   autumn cache audit --strict -p blog
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
+    /// Emit the classified-data flow manifest (#1654).
+    ///
+    /// Compiles the app and reads back the manifest the framework assembles from
+    /// every `#[classified]` column and every declared declassification
+    /// boundary: one row per classified column, listing every sink it is proven
+    /// reachable to. An empty reachable set means the column cannot leave the
+    /// process through a gated sink. The compiler is the gate; this is the
+    /// diffable record, and `--check` fails when it drifts from the committed
+    /// copy.
+    #[command(name = "data-flow")]
+    DataFlow(DataFlowArgs),
 
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
@@ -1769,6 +1887,57 @@ enum DbCommands {
         #[arg(long)]
         offsite: bool,
     },
+    /// Anonymize a database (or a backup artifact) for non-production use.
+    ///
+    /// Rewrites every PII-classified column with deterministic, constraint-valid
+    /// fake values so a production copy is safe on a laptop or a shared staging
+    /// box. Classification is fail-closed: `#[encrypted]` model columns and
+    /// tables registered with the GDPR anonymize strategy are classified
+    /// automatically, everything else must be declared in `scrub.toml`, and a
+    /// column that is neither PII nor explicitly `safe` aborts the scrub — so a
+    /// newly added column can never silently pass through with real data.
+    ///
+    /// Refuses to run outside the `dev`/`test` profile without `--force`, the
+    /// same guard as `autumn db drop`.
+    ///
+    /// # Examples
+    ///
+    ///   # Refresh staging from a production backup:
+    ///   `AUTUMN_ENV=staging` autumn db scrub --artifact backups/prod/latest-run --force
+    ///
+    ///   # Prove the classification is complete (CI):
+    ///   autumn db scrub --check
+    #[command(verbatim_doc_comment)]
+    Scrub {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore this backup run directory (or artifact file) into the
+        /// resolved database(s) before scrubbing.
+        #[arg(long, value_name = "ARTIFACT")]
+        artifact: Option<std::path::PathBuf>,
+        /// After a successful scrub, write a fresh (scrubbed) backup run here.
+        #[arg(long, value_name = "DIR")]
+        output: Option<std::path::PathBuf>,
+        /// Path to the PII declaration file (default: `./scrub.toml`).
+        #[arg(long, value_name = "PATH")]
+        config: Option<std::path::PathBuf>,
+        /// Classify only: report the plan (or the unclassified columns) and
+        /// write nothing. Exits non-zero when any column is unclassified.
+        #[arg(long, conflicts_with_all = ["artifact", "output", "dry_run"])]
+        check: bool,
+        /// Print the exact SQL the scrub would run and write nothing.
+        #[arg(long, conflicts_with_all = ["artifact", "output"])]
+        dry_run: bool,
+        /// Allow the scrub against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Allow writing over the database an artifact's own (non-dev/test)
+        /// profile config file declares. Separate from `--force`, which the
+        /// staging drill always passes.
+        #[arg(long)]
+        allow_source_overwrite: bool,
+    },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
@@ -1788,15 +1957,21 @@ enum OffsiteCommands {
 impl DbCommands {
     /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
     /// module's command and the optional profile override the connection should
-    /// be resolved under. `pull`/`backup`/`restore` are dispatched separately
-    /// (they do not map onto [`db::DbCommand`]).
+    /// be resolved under. `pull`/`backup`/`restore`/`scrub` are dispatched
+    /// separately (they do not map onto [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } | Self::Offsite(_) => {
-                unreachable!("db pull/backup/restore/offsite are dispatched before into_command")
+            Self::Pull { .. }
+            | Self::Backup { .. }
+            | Self::Restore { .. }
+            | Self::Scrub { .. }
+            | Self::Offsite(_) => {
+                unreachable!(
+                    "db pull/backup/restore/scrub/offsite are dispatched before into_command"
+                )
             }
         }
     }
@@ -3585,6 +3760,25 @@ fn run_command(command: Commands) {
                 shard,
                 offsite,
             }),
+            DbCommands::Scrub {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
+            } => db::scrub::run(&db::scrub::ScrubArgs {
+                profile,
+                artifact,
+                output,
+                config,
+                check,
+                dry_run,
+                force,
+                allow_source_overwrite,
+            }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
             }
@@ -3859,6 +4053,22 @@ fn run_command(command: Commands) {
                 features,
             });
         }
+        Commands::DataFlow(args) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            data_flow::run(&data_flow::DataFlowOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
+            });
+        }
         Commands::Routes {
             package,
             bin,
@@ -4100,24 +4310,51 @@ fn run_command(command: Commands) {
                 });
             }
         },
-        Commands::Plugin(cmd) => match cmd {
-            PluginSubcommands::Package {
-                manifest,
-                module,
-                out,
-            } => plugin_sandbox::run_package(&plugin_sandbox::PackageOptions {
-                manifest: std::path::Path::new(&manifest),
-                module: std::path::Path::new(&module),
-                out: std::path::Path::new(&out),
-            }),
-            PluginSubcommands::Inspect { artifact, format } => {
-                let format = format.parse().unwrap_or_else(|e| {
-                    eprintln!("autumn plugin inspect: {e}");
-                    std::process::exit(1);
-                });
-                plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
+        Commands::Plugin { action } => {
+            let root = std::path::Path::new(".");
+            let code = match action {
+                PluginSubcommands::List { json, offline } => {
+                    plugin::run_list(&plugin::ListOptions {
+                        root,
+                        json,
+                        offline,
+                    })
+                }
+                PluginSubcommands::Add {
+                    name,
+                    dry_run,
+                    offline,
+                } => plugin::run_add(&plugin::AddOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    offline,
+                }),
+                PluginSubcommands::Package {
+                    manifest,
+                    module,
+                    out,
+                } => {
+                    plugin_sandbox::run_package(&plugin_sandbox::PackageOptions {
+                        manifest: std::path::Path::new(&manifest),
+                        module: std::path::Path::new(&module),
+                        out: std::path::Path::new(&out),
+                    });
+                    0
+                }
+                PluginSubcommands::Inspect { artifact, format } => {
+                    let format = format.parse().unwrap_or_else(|e| {
+                        eprintln!("autumn plugin inspect: {e}");
+                        std::process::exit(1);
+                    });
+                    plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
+                    0
+                }
+            };
+            if code != 0 {
+                std::process::exit(code);
             }
-        },
+        }
         Commands::PluginCheck {
             package,
             bin,
@@ -6363,6 +6600,88 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
+    // ── autumn db scrub tests (issue #1602) ────────────────────────────────
+
+    #[test]
+    fn parse_db_scrub_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "scrub"]).unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert!(profile.is_none());
+        assert!(artifact.is_none());
+        assert!(output.is_none());
+        assert!(config.is_none());
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_db_scrub_with_artifact_output_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--profile",
+            "staging",
+            "--artifact",
+            "backups/prod/20260101T000000Z",
+            "--output",
+            "scrubbed",
+            "--config",
+            "config/scrub.toml",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub {
+            profile,
+            artifact,
+            output,
+            config,
+            check,
+            dry_run,
+            force,
+            allow_source_overwrite,
+        }) = cli.command
+        else {
+            panic!("expected db scrub");
+        };
+        assert!(!allow_source_overwrite);
+        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(
+            artifact.as_deref(),
+            Some(std::path::Path::new("backups/prod/20260101T000000Z"))
+        );
+        assert_eq!(output.as_deref(), Some(std::path::Path::new("scrubbed")));
+        assert_eq!(
+            config.as_deref(),
+            Some(std::path::Path::new("config/scrub.toml"))
+        );
+        assert!(!check);
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_db_scrub_check_conflicts_with_dry_run() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--check", "--dry-run"]).is_err(),
+            "--check and --dry-run are two different no-write modes; asking for both is a mistake"
+        );
+    }
+
     // ── autumn console tests (issue #1039) ─────────────────────────────────
 
     #[test]
@@ -7481,11 +7800,14 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Commands::Plugin(PluginSubcommands::Package {
-                manifest,
-                module,
-                out,
-            }) => {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Package {
+                        manifest,
+                        module,
+                        out,
+                    },
+            } => {
                 assert_eq!(manifest, "plugin.toml");
                 assert_eq!(module, "plugin.wasm");
                 assert_eq!(out, "hello.autumn-plugin");
@@ -7503,7 +7825,9 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "plugin", "inspect", "hello.autumn-plugin"])
             .expect("parses");
         match cli.command {
-            Commands::Plugin(PluginSubcommands::Inspect { artifact, format }) => {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { artifact, format },
+            } => {
                 assert_eq!(artifact, "hello.autumn-plugin");
                 assert_eq!(format, "text");
             }
@@ -7523,11 +7847,78 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Commands::Plugin(PluginSubcommands::Inspect { format, .. }) => {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { format, .. },
+            } => {
                 assert_eq!(format, "json");
             }
             _ => panic!("expected plugin inspect"),
         }
+    }
+
+    // ── autumn plugin (list/add) tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_list_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(!json);
+                assert!(!offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_json_and_offline() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list", "--json", "--offline"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(json);
+                assert!(offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["autumn", "plugin", "add"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_add_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Add { name, dry_run, .. },
+            } => {
+                assert_eq!(name, "autumn-admin-plugin");
+                assert!(dry_run);
+            }
+            _ => panic!("expected plugin add"),
+        }
+    }
+
+    /// `autumn plugin-check` predates `autumn plugin` and must keep working
+    /// as its own top-level command.
+    #[test]
+    fn plugin_and_plugin_check_are_distinct_commands() {
+        let check =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        assert!(matches!(check.command, Commands::PluginCheck { .. }));
     }
 
     // ── autumn plugin-check tests ──────────────────────────────────────────

@@ -72,15 +72,15 @@ jobs:
         # the gated modules with no new services.)
         #
         # `tls` is in the list for the determinism seam gate (#1797), not the
-        # panic gate. `app.rs` is a gated module, and its
-        # `#[cfg(feature = "tls")] fn now_unix` is the one site in it that reads
-        # real wall time on purpose (certificate validity is a fact about the
-        # real world). That function — and the `#[allow(clippy::disallowed_methods,
-        # reason = "…")]` justifying it — is only COMPILED when `tls` is on, so
-        # without it here the module's deny never sees the site and a later
-        # off-seam read added next to it would ship unlinted.
-        # Side effect worth knowing: this also lints `autumn/src/tls.rs` (and the
-        # rest of the `tls`-gated tree) under `-D warnings` for the first time.
+        # panic gate. `autumn/src/tls.rs` owns `fn now_unix` — the one site in
+        # THAT MODULE that reads real wall time on purpose (certificate validity
+        # is a fact about the real world), used from `app.rs`'s bind path and the
+        # `CertReloader` poll loop. (`acme/renewal.rs` has its own, still
+        # ungated: there is no enforcing `--features acme` lane yet.) That function — and the
+        # `#[allow(clippy::disallowed_methods, reason = "…")]` justifying it — is
+        # only COMPILED when `tls` is on, so without it here the deny never sees
+        # the site and a later off-seam read added next to it would ship unlinted.
+        # This also lints the whole `tls`-gated tree under `-D warnings`.
         #
         # `inbound-mail`/`inbound-mailgun`/`inbound-ses` gate `inbound_mail`, which
         # parses untrusted RFC 5322 / MIME bodies straight off an unauthenticated
@@ -251,6 +251,45 @@ jobs:
           cargo test -p autumn-web --features plugin-sandbox --lib plugin_sandbox
           cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
           cargo test -p autumn-web --features plugin-sandbox --doc plugin_sandbox
+
+      - name: Run direct-TLS (HTTPS) tests
+        # `tls` is not a default feature, so the workspace `cargo test` above
+        # compiles neither `tls`'s in-module suite nor the `[server.tls]`
+        # integration modules. Those are the behavioural proof for #1603 — the
+        # listener itself (`tls_serving`) plus the app-surface parity the ACs
+        # name: the framework probes, the inbound request timeout, SSE, `wss://`
+        # sockets, graceful shutdown of an in-flight HTTPS request, and a
+        # renewed certificate served without a restart (`tls_app_surface`). They
+        # have to run in a lane that blocks merge rather than only in the
+        # (non-blocking, Codecov-driven) coverage job. `ws` is on so the
+        # `wss://` test is compiled rather than silently skipped.
+        #
+        # Linux only: two of these assert on elapsed time (the request deadline
+        # and the mtime-polled certificate reload), and the Windows/macOS
+        # runners are the slow, contended ones — the TLS listener itself is
+        # platform-independent, so paying for that flake risk in a
+        # merge-blocking lane buys nothing.
+        #
+        # Each suite is run under its own module-anchored filter and then
+        # checked for a non-zero pass count: `cargo test` exits 0 when a filter
+        # matches NOTHING, so a cfg drift that stopped compiling these modules
+        # in would otherwise leave this step green with zero HTTPS coverage.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features tls --lib tls:: \
+            | tee "${RUNNER_TEMP}/tls-lib.log"
+          assert_ran "${RUNNER_TEMP}/tls-lib.log" "autumn-web tls unit tests"
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_serving:: | tee "${RUNNER_TEMP}/tls-serving.log"
+          assert_ran "${RUNNER_TEMP}/tls-serving.log" "tls_serving"
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
+          assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends
@@ -312,6 +351,19 @@ jobs:
           # above). Runs in the existing Docker-dependent Linux step rather than a
           # separate required gate.
           cargo test -p autumn-cli --test cli_tests -- --ignored offsite
+          # PII scrub round-trip (#1602): seed known PII -> `autumn db backup`
+          # -> `autumn db scrub --artifact` into a separate staging database ->
+          # assert ZERO occurrences of any original value in the result, plus
+          # the fail-closed refusals (undeclared column, renamed column,
+          # production profile). Needs Docker (testcontainers) + host
+          # pg_dump/pg_restore (installed above). autumn-cli's Docker-gated
+          # tests are NOT auto-swept the way autumn-web's are, so this line is
+          # the only thing that runs them.
+          # `scrubbed_database_migrates_clean_and_boots_the_app` is skipped
+          # here: it compiles and boots a generated app and needs the diesel
+          # CLI, so it runs in generator-conformance.yml's Postgres gate.
+          cargo test -p autumn-cli --test cli_tests -- --ignored db_scrub \
+            --skip scrubbed_database_migrates_clean_and_boots_the_app
           # Consolidated `integration_tests` binary: discover-and-run ALL the
           # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
           # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)

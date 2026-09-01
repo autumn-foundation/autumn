@@ -463,6 +463,11 @@ features = [
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
   "plugin-sandbox",
+  # Direct HTTPS termination (#1603). Pure Rust (rustls/ring), no system
+  # libraries, so it builds in the docs.rs sandbox — and without it the whole
+  # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
+  # from the published docs.
+  "tls",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

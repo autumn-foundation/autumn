@@ -50,6 +50,8 @@ mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
 mod custom_layer;
+#[cfg(feature = "db")]
+mod data_classification;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
@@ -321,7 +323,11 @@ mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
+mod tls_app_surface;
+#[cfg(feature = "tls")]
 mod tls_serving;
+#[cfg(feature = "tls")]
+mod tls_support;
 mod transactional_test_integration;
 #[cfg(all(feature = "db", feature = "i18n"))]
 mod translatable_model;

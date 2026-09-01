@@ -14922,6 +14922,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let api_handlers = if let Some(ref api_path) = config.api_path {
         let prefix = to_snake_case(&model_name.to_string());
 
+        // #1654: the generated CRUD handlers return the model through `Json`.
+        // If the model carries a `#[classified]` column it is not `JsonSink`, so
+        // the handlers cannot compile -- but the failure surfaces as axum's
+        // `Handler` bound, which swallows autumn's own diagnostic. Assert the
+        // obligation directly first so the developer reads the message that says
+        // what is wrong and what to do. This is a call-site obligation, not a
+        // trivial where-clause, so it costs nothing for an unclassified model.
+        let api_sink_assertion = quote! {
+            const _: () = {
+                fn __autumn_api_response_must_be_releasable<
+                    __T: ::autumn_web::classify::JsonSink,
+                >() {
+                }
+                #[allow(dead_code)]
+                fn __autumn_assert_api_response_is_releasable() {
+                    __autumn_api_response_must_be_releasable::<#model_name>();
+                }
+            };
+        };
+
         let list_fn = format_ident!("{prefix}_api_list");
         let get_fn = format_ident!("{prefix}_api_get");
         let create_fn = format_ident!("{prefix}_api_create");
@@ -15708,6 +15728,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
 
+            #api_sink_assertion
             #policy_type_assertion
             #scope_type_assertion
 

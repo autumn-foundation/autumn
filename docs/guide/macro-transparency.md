@@ -492,7 +492,8 @@ Beyond `#[id]`, `#[default]`, `#[validate(...)]`, `#[indexed]`, and
 These are stripped from the emitted Diesel query struct (they'd confuse the
 derives) and instead drive extra generated code. The full recognized set is
 `id`, `indexed`, `validate`, `default`, `factory_assoc`, `lock_version`,
-`searchable`, `encrypted`, `private`, `normalize`, and `state_machine`. The
+`searchable`, `encrypted`, `classified`, `private`, `normalize`, and
+`state_machine`. The
 association attributes `belongs_to` / `has_many` / `has_one` are **not**
 field-level — they are struct-level attributes placed *above* the struct (see
 [Associations and search keys](#associations-and-search-keys) below).
@@ -560,6 +561,49 @@ pub struct Customer {
 **Gotcha:** deterministic mode trades a real security property (equality
 leakage) for queryability — reach for it only when you must filter on the
 column. See [Attribute Encryption](./attribute-encryption.md).
+
+#### `#[classified]` / `#[classified(personal_data)]`
+
+Marks a `String` column as personal data and carries that classification on the
+**type**: the generated field is `Classified<String, {Model}{Column}Classified>`, a
+wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`, and
+the model itself loses its `Serialize` derive. There is no expression that gets
+the value to a serializer, so `Json(model)` and `Json(View { email: model.email })`
+are both compile errors.
+
+```rust
+#[model(table = "customers")]
+pub struct Customer {
+    #[id] pub id: i64,
+    pub name: String,
+    #[classified] pub email: String, // Classified<String, CustomerEmailClassified>
+}
+
+autumn_web::declassify! {
+    /// Support agents need the customer's email address to answer the ticket.
+    pub SUPPORT_LOOKUP: CustomerEmailClassified => JsonResponse,
+    purpose = "support_lookup",
+    reason = "Support agents need the email address to answer the ticket.",
+}
+```
+
+The write structs (`New*` / `Update*` / changeset) and the generated factory
+still *accept* the value —
+a client sets it, and deserialization, `#[validate]` and form rendering are
+unchanged — but they carry the wrapper too (`Classified<String, F>`, or
+`Patch<Classified<String, F>>` on the patch) and get
+`#[serde(skip_serializing)]`. Their fields are `pub`, so a bare `String` there
+would have let a handler move the plaintext into a response view and release it
+with no boundary; building one by hand now costs an `.into()`. `Debug` renders
+`<classified>` on every generated struct. `autumn data-flow` emits the manifest of which sinks each classified
+column can reach.
+
+**Gotcha:** it cannot be combined with `#[encrypted]`, `#[searchable]`,
+`#[normalize]`, `#[translatable]`, `#[id]`, `#[lock_version]`, `#[position]`,
+`#[state_machine]`, or a serde rename — each is rejected with a diagnostic
+saying why. A `#[repository]` recording version history or a ledger serializes
+the whole model, which a classified model cannot do; gating those sinks is a
+follow-up slice. See [Data Classification](./data-classification.md).
 
 #### `#[normalize(trim, downcase, upcase, squish, with = path)]`
 

@@ -1421,6 +1421,49 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
+
+**Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
+One command adds the dependency at a version compatible with the app's
+`autumn-web`, mounts the plugin in the `autumn_web::app()` chain, and prints
+the post-install steps (config keys, follow-up generators):
+
+```bash
+autumn plugin list                      # name, description, compatible version
+autumn plugin list --json --offline     # machine-readable; skip the crates.io lookup
+autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
+autumn plugin add autumn-cache-redis --dry-run
+```
+
+`list` covers the five first-party crates (`autumn-admin-plugin`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`) plus community crates found on crates.io under the
+documented `autumn-plugin-<name>` convention.
+
+Four behaviours worth knowing before advising on it:
+
+- **Idempotent.** A second `add` reports "already installed" and changes
+  nothing. It also detects a mount written by hand behind a `use` import, so
+  it will not splice a second, default-constructed mount over a configured one.
+- **Version-gated before any write.** Installing into an app on an
+  incompatible `autumn-web` fails naming both versions, with the app
+  byte-identical. First-party plugins ship in lockstep with `autumn-web` and
+  the CLI, so the version installed is the CLI's — an app on an older line
+  needs the matching CLI, or `autumn upgrade`.
+- **It degrades rather than guessing.** If the `autumn_web::app()` chain
+  cannot be found unambiguously inside `async fn main` — a builder factored
+  into a helper, a one-line chain, two candidate lines — it writes *nothing*
+  and prints the dependency line and mount snippet on stderr, exiting 2. It
+  never leaves an app that does not compile.
+- **Community crates get the dependency only.** The `<Name>Plugin` mount is
+  derived from the naming convention and printed, not spliced: nothing outside
+  that crate can verify it exposes one.
+
+It writes no `features = [...]` onto the app's `autumn-web` dependency — each
+plugin crate already carries the features its mount needs and Cargo unifies
+them. `autumn plugin-check` is the separate, author-facing conformance gate;
+`autumn generate plugin` scaffolds a new plugin crate.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -2260,6 +2303,8 @@ autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
+autumn plugin list
+autumn plugin add autumn-admin-plugin
 ```
 
 **(0.6.0)** CLI additions — absent from a 0.5.x `autumn-cli`, but present in
@@ -2280,6 +2325,7 @@ autumn test                      # provision/target an isolated *_test DB, migra
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
+autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
@@ -2300,6 +2346,11 @@ autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever
 autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
 autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
+autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
+autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
+autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
+autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
+autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
 ```
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
@@ -2478,6 +2529,80 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 [--force]` verifies every artifact before touching a database and is gated by the
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
+
+### `autumn db scrub` (issue #1602)
+
+`autumn db scrub [--artifact ARTIFACT] [--output DIR] [--config PATH] [--check]
+[--dry-run] [--force]` turns a production database — or an `autumn db backup`
+artifact restored into the resolved target — into an anonymized copy safe for
+staging/dev. It rewrites every PII-classified column with deterministic,
+constraint-valid fake values, resolving the target(s) exactly like `db backup`
+(control plus every shard) and refusing non-dev/test profiles without `--force`
+(the same guard as `db drop`).
+
+Classification is **fail-closed and schema-driven** — the column universe comes
+from introspecting the live database, not from a config file — in precedence
+order:
+
+1. `[tables.<t>.pii]` in `scrub.toml` (the explicit declaration + strategy);
+2. `#[encrypted]` model columns (PII by construction — a `safe` declaration may
+   NOT override one);
+3. tables registered with the GDPR anonymize strategy
+   (`ModelRegistration::anonymize("t")`, read statically) — every non-key column
+   of that table, narrowable with `safe`.
+
+Anything left over aborts the scrub, listing the columns and printing a
+paste-ready `scrub.toml` stanza. So a newly added column can never silently
+carry real data into staging.
+
+```toml
+# scrub.toml
+[defaults]
+safe_columns = ["id", "created_at", "updated_at"]   # safe in EVERY table
+
+[tables.users]
+safe = ["role", "locale"]          # reviewed, kept verbatim
+
+[tables.users.pii]
+email = "email"                    # scrubbed+<token>@example.invalid
+full_name = "name"
+phone = "phone"
+bio = "redact"
+
+[framework]
+# `autumn_*` tables are outside the classified universe; empty the ones whose
+# rows carry app payloads (opt-in; framework-owned names only).
+purge = ["api_tokens", "autumn_jobs", "autumn_sync_rows"]
+```
+
+Strategies: `auto` (derived from the column type), `email`, `name`, `phone`,
+`redact`, `null`, `uuid`, `bytes`, `json`, `zero`, `epoch`. Each value derives
+from a hash over the row's primary key salted with the column name (a doubled
+`md5` for a column that must stay unique), so a `UNIQUE` column stays unique, two columns
+of one row never collide, and a re-run is idempotent.
+
+`#[encrypted]` columns are **re-encrypted** under the target's own key (same
+deterministic/randomized mode as the model), never overwritten with a plain
+string — that would make every later read of the row fail as malformed
+ciphertext — so the scrub needs the target's `active_record_encryption`
+credentials and refuses before writing if they are missing.
+
+`NULL`s stay `NULL`. PII is refused on a primary key, on **either side** of any
+foreign key (composite components included), on `CHECK`-constrained columns, and
+on generated columns; `null` is refused on `NOT NULL` and under `NULLS NOT
+DISTINCT`; a constant-valued strategy is refused on any column in a unique index
+(partial, composite, and expression-index inputs); a `varchar(n)` bound narrows the token or
+refuses. Statements are `public`-qualified with a pinned `search_path` and the
+planned tables are locked; non-`public` schemas, tables the role
+cannot see, and RLS-enabled tables are refused rather than silently
+under-scrubbed; materialized views are refreshed in
+dependency order. Every target is classified before any is written, and each
+database's statements run in one transaction.
+
+`--check` classifies and writes nothing, exiting non-zero on any unclassified
+column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
+`--output DIR` re-dumps the scrubbed database as a fresh backup run. See
+`docs/guide/data-scrubbing.md`.
 
 ### Offsite S3 backups (0.6.0, issue #1619)
 

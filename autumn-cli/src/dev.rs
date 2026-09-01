@@ -923,6 +923,10 @@ fn start_server(
 
     let mut command = Command::new(binary);
     command.envs(dotenv_vars);
+    // See `serve::base_command`: this one-shot mode is dispatched before the
+    // server starts, so an inherited flag would turn every hot-reload restart
+    // into a manifest dump that exits cleanly and never serves.
+    command.env_remove(crate::data_flow::DUMP_ENV);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());

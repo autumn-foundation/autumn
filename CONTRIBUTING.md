@@ -67,6 +67,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `encrypted_nested_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--belongs-to` → `cargo check --tests` |
 | `encrypted_admin_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `generate admin` (wired in) → `cargo check --tests` |
 | `constrained_scaffold_cargo_checks` | `integration/scaffold_validation.rs` | `{min,max}`/`{email}`/`{url}`/nullable-bound scaffold → `cargo check --tests` (#1388) |
+| `plugin_add_first_party_scaffolds_cargo_check` | `generate.rs` | `autumn plugin add` for every first-party plugin into its own fresh scaffold → `cargo check --all-targets` (#1606) |
 
 The `console.rs`, `scaffold_encrypted.rs`, and `scaffold_validation.rs` entries
 compile into the consolidated `cli_tests` binary, whose only other CI
@@ -86,10 +87,14 @@ tests explicitly via `-- --ignored --exact`. It fires on every PR or push
 that touches:
 
 - `autumn-cli/src/generate/**` (generator logic)
+- `autumn-cli/src/plugin/**` (`autumn plugin add` catalog, mounts, install planning)
 - `autumn-cli/src/templates/**` (scaffold/model/auth templates)
 - `autumn-cli/src/new.rs` (project scaffolding)
 - `autumn/src/lib.rs` or `autumn/src/prelude.rs` (public API surface)
 - `autumn-macros/**` (proc-macro API surface)
+- `autumn-admin-plugin/**`, `autumn-cache-redis/**`, `autumn-media-plugin/**`,
+  `autumn-search/**`, `autumn-storage-s3/**` (the crates whose mount snippets
+  the `plugin add` gate compiles)
 
 A weekly scheduled run also catches breakage that arrives through transitive
 dependency updates rather than direct file edits.

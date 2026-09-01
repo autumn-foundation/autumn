@@ -9,6 +9,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One-command plugin install — `autumn plugin add` / `autumn plugin list`
+  (#1606):** Autumn had a real plugin seam (the `Plugin` trait, first-party
+  plugin crates, a crates.io naming convention, an author-facing
+  `autumn plugin-check`) and no consumer-facing tooling at all: using a shipped
+  capability meant finding the crate, hand-editing `Cargo.toml`, hand-writing
+  the `.plugin(...)` mount, and reading config docs — four places to pick an
+  incompatible version or misconfigure the mount. `autumn plugin list` now shows
+  every installable plugin with a one-line description and the version
+  compatible with the app's `autumn-web` — the five first-party crates plus
+  community crates discovered on crates.io through the documented
+  `autumn-plugin-<name>` convention (`--json` for machine-readable output,
+  `--offline` to skip the lookup). `autumn plugin add <name>` performs the whole
+  install: the dependency at a compatible version, the mount spliced into the
+  `autumn_web::app()` builder chain, and the post-install steps (config keys,
+  follow-up generators like `autumn generate admin`) printed.
+
+  Every refusal is total rather than partial. The version gate runs before a
+  single filesystem action exists, so installing a plugin whose supported
+  `autumn-web` range excludes the app fails naming both versions with the app
+  byte-identical. A second `add` of the same plugin reports it as already
+  installed and changes nothing — no duplicate dependency, no duplicate mount.
+  And when the builder chain cannot be edited confidently (a heavily customized
+  `main.rs`, or a one-line chain with nowhere to splice a call) the command
+  writes **nothing** and prints the exact dependency line and mount snippet to
+  apply by hand, so it can never leave an app in a non-compiling state. Community
+  crates get their dependency written but never an automatic mount: the
+  `<Name>Plugin` is derived from the naming convention and printed, because
+  nothing outside that crate can verify it. A CI gate installs every first-party
+  plugin into a fresh `autumn new` scaffold and requires a green `cargo check`.
+
+- **Personal data that cannot reach a JSON response by accident (#1654):**
+  Autumn's protections for sensitive data were all *name*-based and ran at
+  runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted
+  three header names, `gdpr.rs` keyed erasure off table-name strings — so
+  renaming a column, adding an endpoint, or routing personal data through a
+  differently-named field silently reopened the hole. A `#[model]` column can
+  now be annotated `#[classified]`, and the classification is carried by the
+  *type*: the field is generated as `Classified<String, CustomerEmailClassified>`,
+  a wrapper with no `Serialize`, no `Display`, no `Deref` and no `into_inner`,
+  and the model itself loses its `Serialize` derive. There is no expression that
+  puts the value where a serializer can reach it, so `Json(customer)` and
+  `Json(View { email: customer.email })` are both build failures — with a
+  diagnostic that names the offending field and the `Json` sink and says what to
+  do about it.
+
+  Releasing the value is declared, not incidental. `autumn_web::declassify!`
+  names the column, the sink, a purpose and a non-blank reason, and yields a
+  boundary typed to exactly that column — so one field's approved purpose cannot
+  release another's. `value.declassify(&BOUNDARY)` takes the value by move (a
+  release is a single event, not a permanent widening) and emits an auditable
+  record on the `autumn::declassification` tracing target carrying the model,
+  field, tier, purpose, sink and reason — never the released value itself.
+
+  `autumn data-flow` emits the diffable manifest: one row per classified column
+  listing every sink it is proven reachable to, where an empty reachable set
+  means the column cannot leave the process through a gated sink at all.
+  `--check` fails the build when it drifts from the committed copy, so a new
+  release edge has to be reviewed rather than merged silently. Pass `--release`
+  (and the `--features` you ship) to audit the binary you actually deploy: a
+  boundary behind `#[cfg(not(debug_assertions))]` exists only in the release
+  build.
+
+  The manifest keys each row on the model's module-qualified path, so two crates
+  that each define a `Customer` with a classified `email` cannot merge into one
+  row, and the Diesel column wrapper carries the column's field marker, so a
+  value cannot be converted in as one classified column and back out as another.
+
+  The first slice deliberately stops at one tier and one sink. Name-based log
+  and header redaction are untouched and still run; the write structs and the
+  generated factory still accept the value (taking personal data *in* is not a
+  release) but carry the wrapper too, so the plaintext cannot be moved out of a
+  `pub` field into a response view; `Debug` renders `<classified>` everywhere.
+  See
+  `docs/guide/data-classification.md`.
+- **`autumn db scrub` turns a production copy into an anonymized one, and
+  refuses to guess (#1602):** the moment `autumn db backup` shipped, a
+  production database was one command away from a laptop or a shared staging
+  box — PII and all — and the only remedy was hand-rolled `UPDATE` scripts that
+  rot the first time someone adds an `email` column. `autumn db scrub` takes
+  either a backup artifact (`--artifact`) or the resolved database URL and
+  rewrites every PII-classified column with deterministic, constraint-valid
+  fake values. Classification comes from the schema, not from a config file
+  alone: `#[encrypted]` model columns and tables registered with the GDPR
+  anonymize strategy are classified automatically, everything else is declared
+  in a checked-in `scrub.toml` — and because the column universe is read by
+  introspecting the live database, a column that is neither PII-classified nor
+  explicitly marked safe **aborts the scrub** and is listed by name, with a
+  paste-ready declaration stanza. That makes "we think staging is clean" a
+  CI-verified invariant: `autumn db scrub --check` writes nothing and exits
+  non-zero on any unclassified column. Replacements are derived from an `md5`
+  over the row's primary key salted with the column name, so a `UNIQUE` column
+  stays unique, `NULL`s stay `NULL`, and two columns of one row never collide;
+  PII on a primary- or foreign-key column is refused outright, so referential
+  integrity survives. Writing refuses outside `dev`/`test` without `--force`,
+  the same guard as `autumn db drop`, and every statement for one database runs
+  in a single transaction. `--output` re-dumps the scrubbed database as a fresh
+  artifact, closing the backup → scrub → restore loop.
+
+  The safety work is where most of the substance is. `#[encrypted]` columns are
+  **re-encrypted** under the target's own key rather than overwritten with a
+  plain string (which would make every later read of that row fail as malformed
+  ciphertext). PII is refused on either side of any foreign key — composite keys
+  included — so a natural key another table references is protected, not just
+  the referencing column; on `CHECK`-constrained columns, where no fabricated
+  value can satisfy the predicate; and on generated columns, which Postgres
+  refuses to update at all. Uniqueness is read from every unique index, partial
+  and composite included, and a unique column gets a wider `sha256` token so a
+  narrow `varchar(n)` cannot truncate into collisions. Statements are
+  `public`-qualified with a pinned `search_path` (a tenant `search_path` cannot
+  redirect a write), the planned tables are locked for the transaction, row-level
+  security and non-`public` schemas are refused rather than silently
+  under-scrubbed, materialized views are refreshed in dependency order, and the
+  framework-owned tables that keep verbatim copies of app rows — the ledger, the
+  version history, the search index, `api_tokens` — are reported and can be
+  emptied with `[framework] purge`. See the new
+  [Data Scrubbing guide](docs/guide/data-scrubbing.md).
+
 - **`autumn upgrade` now reconciles framework-owned scaffold files, not just
   app code (#1593):** `autumn new` writes about a dozen framework-owned files
   into every project — `Dockerfile`, `.dockerignore`, `build.rs`, `autumn.toml`,
@@ -99,6 +216,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example in `examples/hot-upgrade` (whose `live_upgrade` test proves zero
   refused connections and 100% carry-over under sustained load across the
   cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
+
+- **Direct HTTPS is now proven end-to-end, not just at the listener:** serving
+  TLS in-process (`[server.tls]`) had coverage for the listener itself, but
+  nothing exercised the rest of the app surface through it — so "everything
+  behaves the same under TLS" was a claim rather than a test.
+  `tls_app_surface.rs` now serves the **same** router twice, once over the real
+  `TlsListener` and once over plain TCP, and requires the framework probes
+  (`/health`, `/live`, `/ready`, `/startup`) and `/actuator/health` to match on
+  status, body, and content type; it drives the inbound
+  request timeout (a slow handler still 503s, a fast one still doesn't), an SSE
+  stream (events arrive incrementally and outlive the request deadline), a
+  `wss://` WebSocket echo, and a graceful shutdown that drains an in-flight
+  HTTPS request. A new blocking CI lane runs the whole `tls` suite, which the
+  workspace `cargo test` — where `tls` is off by default — never compiled.
+  Renewal is covered the same way: the mtime-polling reloader moved out of
+  `app.rs` into `autumn_web::tls::CertReloader`, so a test can rewrite the cert
+  and key on disk and watch the served certificate change with the site up and
+  no restart. `autumn/src/tls.rs` also joins the determinism seam gate, so its
+  one deliberate wall-clock read (certificate validity) stays the only one in
+  that module.
+  Issue #1603.
+
+- **The release-image boot gate now covers an HTTPS boot** (a new
+  `https-target` job): it builds the generated image with the `tls` feature on,
+  boots it with a self-signed test certificate supplied through
+  `AUTUMN_SERVER__TLS__*`, and requires an HTTPS `/health` + `/actuator/health`
+  200 validated with `--cacert` (not `-k`), that plain HTTP on the same port
+  does *not* answer, and that the container's own HEALTHCHECK reaches
+  `healthy`. `docs/guide/tls.md` gains the matching "Serving HTTPS from the
+  release image" walkthrough — including that the `tls` feature must be a
+  default feature for the image's `cargo build --release` to link it — and a
+  "What behaves the same under TLS" section naming the two things that
+  deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
+  #1603.
 
 ### Changed
 
@@ -268,6 +419,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+
+- **A container that terminates TLS itself is no longer permanently
+  `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
+  `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app
+  serves direct HTTPS (`[server.tls]`) failed every probe — Docker marked it
+  unhealthy forever, and in the generated `docker-compose.yml` anything waiting
+  on `condition: service_healthy` never started. The probe URL is now
+  `${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}`, so the default is
+  byte-for-byte today's plain-HTTP check and an HTTPS deployment sets that plus
+  `AUTUMN_HEALTHCHECK_INSECURE=1`. The second variable is needed because the
+  probe is a loopback call to the container's own listener while the
+  certificate is issued to the app's public hostname, so it can never validate
+  as `localhost`; it is an explicit opt-in rather than something inferred from
+  the URL, because `user@host`, `#fragment` and lookalike hostnames all yield
+  URLs that read as loopback but that curl resolves elsewhere. Unset — the
+  default — the probe always verifies. Issue #1603.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every
@@ -1127,6 +1294,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bytes barely move — each wasted allocation is a handful of bytes against a
   ~22KB/render budget dominated by larger buffers — but the block-count and
   instruction-count deltas both clear the impact floor on their own.
+
+- **scaffolded form helpers pre-escape their own field values, labels, and
+  error text instead of letting `maud::html!` re-scan them byte by byte:**
+  `text_input`, `password_input`, `textarea_input`, `number_input`,
+  `checkbox_input`, `date_input` built every dynamic string — the field's
+  current value, its label, its `id`/`name`, and any validation-error text —
+  through `maud::html!`'s ordinary `(expr)` splice, which calls
+  `maud::escape::escape_to_string`: a loop that matches and pushes one byte
+  at a time even when nothing needs escaping. Profiling the committed
+  `autumn/benches/form_render.rs` workload showed that loop was 26% of the
+  release-build instruction count on a realistic 12-field form.
+
+  A new `Esc` type implements `maud::Render` directly (`autumn_web::form`)
+  and writes the escaped bytes straight into `html!`'s own output buffer
+  via one bulk `push_str` per clean run instead of one call per byte — an
+  earlier version of this fix pre-built an owned, escaped `String` and
+  handed it to `maud::PreEscaped`, which a reviewer (Codex) correctly
+  flagged as a second, avoidable copy for any value that actually needs
+  escaping; writing straight into `html!`'s buffer needs only the one copy
+  `escape_to_string` was already doing, in every case. `fast_escape` (used
+  only to build `id`/`name`-derived strings like `"{field}-error"` ahead of
+  a `html!` block, where the result has to be a concatenatable `str` rather
+  than something written into a buffer) still returns the input completely
+  unallocated when nothing needs escaping. Output is byte-for-byte
+  unchanged — checked against a naive reference by a proptest over
+  arbitrary strings (including multi-byte UTF-8), and by the unchanged 209
+  `form`/`nested_form` lib tests.
+
+  Measured with the committed `autumn/benches/form_render.rs` harness and
+  the existing `autumn/tests/form_render_alloc_gate.rs` allocation gate
+  (both the same 12-field workload), `valgrind --tool=callgrind`, before
+  and after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 185,711,127 | 159,908,641 | **-13.90%** |
+  | `maud::escape::escape_to_string` instructions | 48,339,450 (26.0%) | 0 (eliminated) | **-100%** |
+  | Allocation blocks (200 renders) | 20,800 | 20,800 | unchanged |
+  | Allocation bytes (200 renders) | 4,495,800 | 4,604,600 | +2.4% |
+
+  Allocation *count* is unchanged — escaping never allocates for this
+  fixture's clean values (and, with the direct-`Render` design, never
+  allocates a temporary buffer even when a value *does* need escaping).
+  Bytes rose slightly: `maud_macros` sizes each `html!` block's output
+  buffer from the *source token length* of the macro invocation, not
+  runtime content, and the interpolations calling into `Esc`/`fast_escape`
+  read as "expect more output" than the plain, unescaped splices they
+  replaced. That reservation is never grown again (the unchanged block
+  count proves it), so it's unused slack, not extra allocator work — see
+  `form_render_alloc_gate.rs` for the full explanation and its updated
+  ceiling.
 
 ## [0.7.0] - 2026-08-23
 
