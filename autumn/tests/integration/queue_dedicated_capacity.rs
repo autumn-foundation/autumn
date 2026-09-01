@@ -187,9 +187,25 @@ static CAPPED_COMPLETED: AtomicUsize = AtomicUsize::new(0);
 // The uncapped control queue: without it, `peak == BULK_CAP` is also what a
 // process with only BULK_CAP workers produces, so the test would prove nothing
 // about the cap.
-static FREE_RUNNING: AtomicUsize = AtomicUsize::new(0);
-static FREE_PEAK: AtomicUsize = AtomicUsize::new(0);
 static FREE_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+// In-flight across BOTH queues, and its high-water mark. This is the control,
+// not the uncapped queue's own peak: with equal weights and identical handlers,
+// a perfectly valid schedule parks two jobs in each queue forever, so `free`
+// alone may never exceed BULK_CAP even while all four slots are busy. What the
+// control has to establish is only that the process ran more than BULK_CAP jobs
+// at once — so measure exactly that.
+static TOTAL_RUNNING: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Enter a job: bump the shared in-flight count and record the high-water mark.
+fn enter_inflight() {
+    let total = TOTAL_RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+    TOTAL_PEAK.fetch_max(total, Ordering::SeqCst);
+}
+
+fn leave_inflight() {
+    TOTAL_RUNNING.fetch_sub(1, Ordering::SeqCst);
+}
 
 /// The cap under test, and the worker count it must stay below.
 const BULK_CAP: usize = 2;
@@ -203,8 +219,10 @@ fn capped_handler(
     Box::pin(async move {
         let running = CAPPED_RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
         CAPPED_PEAK.fetch_max(running, Ordering::SeqCst);
+        enter_inflight();
         // Long enough that, uncapped, all four workers would overlap here.
         sleep(Duration::from_millis(250)).await;
+        leave_inflight();
         CAPPED_RUNNING.fetch_sub(1, Ordering::SeqCst);
         CAPPED_COMPLETED.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -222,10 +240,9 @@ fn free_handler(
     _payload: Value,
 ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
     Box::pin(async move {
-        let running = FREE_RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
-        FREE_PEAK.fetch_max(running, Ordering::SeqCst);
+        enter_inflight();
         sleep(Duration::from_millis(250)).await;
-        FREE_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        leave_inflight();
         FREE_COMPLETED.fetch_add(1, Ordering::SeqCst);
         Ok(())
     })
@@ -285,9 +302,9 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
     CAPPED_RUNNING.store(0, Ordering::SeqCst);
     CAPPED_PEAK.store(0, Ordering::SeqCst);
     CAPPED_COMPLETED.store(0, Ordering::SeqCst);
-    FREE_RUNNING.store(0, Ordering::SeqCst);
-    FREE_PEAK.store(0, Ordering::SeqCst);
     FREE_COMPLETED.store(0, Ordering::SeqCst);
+    TOTAL_RUNNING.store(0, Ordering::SeqCst);
+    TOTAL_PEAK.store(0, Ordering::SeqCst);
 
     let container = RedisImage::default()
         .start()
@@ -352,15 +369,21 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
          — the test would not distinguish a cap from a stalled queue",
     );
     // The control: `peak <= BULK_CAP` alone is also what a process with only
-    // BULK_CAP workers would produce. The uncapped queue exceeding the cap is
-    // what establishes the shared pool really is larger, so `bulk`'s ceiling is
-    // the configured cap and not the worker count.
-    let free_peak = FREE_PEAK.load(Ordering::SeqCst);
+    // BULK_CAP workers would produce. Total in-flight exceeding the cap is what
+    // establishes the shared pool really is larger, so `bulk`'s ceiling is the
+    // configured cap and not the worker count.
+    //
+    // Deliberately the *combined* count rather than the uncapped queue's own
+    // peak: with equal weights and identical handlers, a schedule that parks two
+    // jobs in each queue is entirely valid and leaves `free` at BULK_CAP too —
+    // that schedule has four slots busy and proves the point, so asserting on
+    // `free` alone would fail a correct run.
+    let total_peak = TOTAL_PEAK.load(Ordering::SeqCst);
     assert!(
-        free_peak > BULK_CAP,
-        "the uncapped `free` queue peaked at {free_peak}, not above the {BULK_CAP} cap — so \
-         this run never proved the process had more than {BULK_CAP} slots to withhold, and \
-         `bulk`'s peak of {peak} says nothing about the cap",
+        total_peak > BULK_CAP,
+        "the process never ran more than {total_peak} job(s) at once, so this run never \
+         proved it had more than the {BULK_CAP} slots `bulk` is capped at — `bulk`'s peak \
+         of {peak} therefore says nothing about the cap",
     );
 
     shutdown.cancel();
@@ -466,10 +489,14 @@ async fn sample_critical_latency() -> Duration {
 }
 
 /// p95 by nearest-rank: the smallest sample at or above the 95th percentile.
+///
+/// Integer arithmetic rather than `(len as f64 * 0.95).ceil() as usize` — the
+/// float round trip buys nothing here and costs two lint suppressions.
+/// `(n * 95).div_ceil(100)` is the same nearest rank, computed exactly.
 fn p95(mut samples: Vec<Duration>) -> Duration {
     assert!(!samples.is_empty(), "no samples");
     samples.sort_unstable();
-    let rank = (samples.len() as f64 * 0.95).ceil() as usize;
+    let rank = (samples.len() * 95).div_ceil(100);
     let index = rank.saturating_sub(1).min(samples.len() - 1);
     samples[index]
 }

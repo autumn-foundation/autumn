@@ -4188,20 +4188,27 @@ where
 /// table, so the topology lives beside them, is profile-aware, and is checked
 /// into the repo as one source of truth for the fleet.
 fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
-    let fleet = table
+    // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
+    // Every `?` here would otherwise return `None`, which the caller reads as
+    // "no topology declared" and answers with the informational-only report —
+    // quietly switching the AC6 hard-fail off, with nothing reporting it. The
+    // typed `JobFleetConfig` rejects each of these shapes at app boot, so a
+    // pre-deploy gate that passes them has the ordering exactly backwards.
+    let jobs = table
         .and_then(|t| t.get("jobs"))
-        .and_then(toml::Value::as_table)
-        .and_then(|j| j.get("fleet"))
         .and_then(toml::Value::as_table)?;
-    let declared = fleet.get("tiers").and_then(toml::Value::as_array)?;
-    // A malformed `tiers` must NOT be silently dropped. `filter_map(as_array)`
-    // alone turns the very easy flat typo `tiers = ["critical", "bulk"]` (the
-    // shape `jobs.pin` uses, sitting a few lines above it in the same file) into
-    // an empty topology → `None` → the check falls back to informational-only
-    // and the AC6 hard-fail is quietly switched off, with nothing reporting it.
-    // Signal it instead so the caller can fail loudly. (The typed
-    // `JobFleetConfig` rejects the same input at app boot; surfacing it here
-    // keeps the pre-deploy gate from passing what the app will refuse.)
+    // Genuinely absent: nothing declared, nothing to check.
+    let fleet = jobs.get("fleet")?;
+    let Some(fleet) = fleet.as_table() else {
+        return Some(FleetTopology::malformed());
+    };
+    let declared = fleet.get("tiers")?;
+    // `tiers = "critical"` — a bare value rather than a list of lists.
+    let Some(declared) = declared.as_array() else {
+        return Some(FleetTopology::malformed());
+    };
+    // `tiers = ["critical", "bulk"]` — the flat shape `jobs.pin` uses, sitting a
+    // few lines above it in the same file, so an easy mistake to make.
     let mut tiers: Vec<Vec<String>> = Vec::with_capacity(declared.len());
     for entry in declared {
         let Some(tier) = entry.as_array() else {
@@ -14566,36 +14573,70 @@ foo = "bar"
     /// the ordering exactly backwards.
     #[test]
     fn a_malformed_tiers_fails_instead_of_silently_disabling_the_check() {
+        // Every shape the app's typed `JobFleetConfig` rejects at boot. Each one
+        // must be reported here, not read as "no topology declared" — that would
+        // fall through to the informational-only report and pass, switching the
+        // AC6 hard-fail off with nothing saying so.
+        for doc in [
+            // The flat shape `jobs.pin` uses a few lines above it.
+            "[jobs.fleet]\ntiers = [\"critical\", \"bulk\"]\n",
+            // A bare value instead of a list at all.
+            "[jobs.fleet]\ntiers = \"critical\"\n",
+            "[jobs.fleet]\ntiers = 3\n",
+            // Mixed: one well-formed tier and one that is not.
+            "[jobs.fleet]\ntiers = [[\"critical\"], \"bulk\"]\n",
+        ] {
+            let table: toml::Table = toml::from_str(doc).expect("parse toml");
+            let fleet = resolve_fleet_topology(Some(&table)).unwrap_or_else(|| {
+                panic!("a present-but-malformed tiers must be reported, not dropped: {doc}")
+            });
+            assert!(fleet.malformed, "{doc}");
+
+            let result = check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &["critical".to_string()],
+                &[],
+                Some(&fleet),
+            );
+            assert_eq!(
+                result.status,
+                CheckStatus::Fail,
+                "{doc}: {:?}",
+                result.detail
+            );
+            assert!(
+                result.detail.unwrap_or_default().contains("list of lists"),
+                "the failure must say what is wrong with the value: {doc}",
+            );
+
+            // The app refuses the same document, so both gates agree.
+            let fleet_value = table
+                .get("jobs")
+                .and_then(|j| j.get("fleet"))
+                .cloned()
+                .expect("jobs.fleet present");
+            let parsed: Result<autumn_web::config::JobFleetConfig, _> = fleet_value.try_into();
+            assert!(
+                parsed.is_err(),
+                "the typed config must reject it too: {doc}"
+            );
+        }
+
+        // `[jobs.fleet]` itself not a table is the same class of mistake.
         let table: toml::Table =
-            toml::from_str("[jobs.fleet]\ntiers = [\"critical\", \"bulk\"]\n").expect("parse toml");
+            toml::from_str("[jobs]\nfleet = \"critical\"\n").expect("parse toml");
         let fleet = resolve_fleet_topology(Some(&table))
-            .expect("a present-but-malformed tiers is reported, not dropped");
+            .expect("a present-but-malformed [jobs.fleet] must be reported");
         assert!(fleet.malformed);
 
-        let result = check_queue_coverage_topology(
-            ProcessRole::Worker,
-            &["critical".to_string(), "bulk".to_string()],
-            &["critical".to_string()],
-            &[],
-            Some(&fleet),
-        );
-        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
-        assert!(
-            result.detail.unwrap_or_default().contains("list of lists"),
-            "the failure must say what is wrong with the value",
-        );
-
-        // The app refuses the same document, so both gates agree.
-        let fleet_value = table
-            .get("jobs")
-            .and_then(|j| j.get("fleet"))
-            .cloned()
-            .expect("jobs.fleet present");
-        let parsed: Result<autumn_web::config::JobFleetConfig, _> = fleet_value.try_into();
-        assert!(
-            parsed.is_err(),
-            "the typed config must reject a flat tiers list too",
-        );
+        // …while a genuinely absent section stays "nothing declared".
+        let absent: toml::Table =
+            toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&absent)).is_none());
+        let no_tiers: toml::Table =
+            toml::from_str("[jobs.fleet]\ndeclared_queues = [\"a\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&no_tiers)).is_none());
     }
 
     #[test]

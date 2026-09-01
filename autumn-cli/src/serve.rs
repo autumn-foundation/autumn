@@ -234,11 +234,11 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
             // and re-recorded, making the stale pin sticky forever. Restoring
             // the recording is still what stops a bare `restart` from turning a
             // pinned worker tier into an unpinned one that drains every queue.
-            let keep_pin = opts
-                .pin
-                .clone()
-                .or_else(env_pin)
-                .or_else(|| recorded_mode.as_ref().and_then(|m| m.pin.clone()));
+            let keep_pin = resolve_restart_pin(
+                opts.pin.clone(),
+                env_pin(),
+                recorded_mode.as_ref().and_then(|m| m.pin.clone()),
+            );
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
@@ -1493,6 +1493,24 @@ fn env_pin() -> Option<Vec<String>> {
         .map(|v| parse_pin_value(&v))
 }
 
+/// The queue pin a `restart` relaunches with (issue #1623): the explicit `--pin`
+/// on *this* restart, else the restart shell's own `AUTUMN_JOBS__PIN`, else what
+/// the running daemon recorded in `serve.mode`.
+///
+/// The live environment has to come before the recording: without it,
+/// re-pointing a worker tier by exporting a new `AUTUMN_JOBS__PIN` and running
+/// `restart` is silently overridden by the pin captured at the daemon's original
+/// start — and then re-recorded, making the stale pin permanent. Restoring the
+/// recording is still what stops a bare `restart` from turning a pinned tier into
+/// an unpinned one that drains every queue.
+fn resolve_restart_pin(
+    explicit: Option<Vec<String>>,
+    env: Option<Vec<String>>,
+    recorded: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    explicit.or(env).or(recorded)
+}
+
 /// The effective queue pin to record for `restart` recovery (issue #1623): the
 /// explicit `--pin` when given, else the `AUTUMN_JOBS__PIN` the daemon selected
 /// via its environment.
@@ -2300,30 +2318,38 @@ mod tests {
     /// making the stale pin permanent). Mirrors `keep_profile`'s precedence.
     #[test]
     fn restart_precedence_prefers_the_flag_then_the_live_env_then_the_recording() {
-        // The pure core the restart path composes: flag > live env > recorded.
         let recorded = Some(vec!["critical".to_owned()]);
         let live_env = Some(vec!["bulk".to_owned(), "default".to_owned()]);
+        let flag = Some(vec!["reports".to_owned()]);
 
-        let with_flag = Some(vec!["reports".to_owned()]);
         assert_eq!(
-            with_flag
-                .clone()
-                .or_else(|| live_env.clone())
-                .or_else(|| recorded.clone()),
-            with_flag,
+            resolve_restart_pin(flag.clone(), live_env.clone(), recorded.clone()),
+            flag,
             "an explicit --pin on this restart wins",
         );
         assert_eq!(
-            None.or_else(|| live_env.clone())
-                .or_else(|| recorded.clone()),
+            resolve_restart_pin(None, live_env.clone(), recorded.clone()),
             live_env,
-            "otherwise the restart shell's own AUTUMN_JOBS__PIN wins over the recording",
+            "otherwise the restart shell's own AUTUMN_JOBS__PIN wins over the recording — \
+             without this, re-pointing a tier by exporting a new pin is overridden by the \
+             one captured at the daemon's original start, and then re-recorded",
         );
         assert_eq!(
-            None.or_else(|| Option::<Vec<String>>::None)
-                .or_else(|| recorded.clone()),
+            resolve_restart_pin(None, None, recorded.clone()),
             recorded,
-            "and only with neither does the recorded pin come back",
+            "and only with neither does the recorded pin come back, so a bare restart never \
+             turns a pinned tier into an unpinned one",
+        );
+        assert_eq!(
+            resolve_restart_pin(None, None, None),
+            None,
+            "nothing anywhere leaves AUTUMN_JOBS__PIN untouched for the child",
+        );
+        // An explicit unpin is a real choice at every layer, not an absent one.
+        assert_eq!(
+            resolve_restart_pin(None, Some(Vec::new()), recorded),
+            Some(Vec::new()),
+            "an explicitly-empty live pin must not fall through to the recording",
         );
     }
 
