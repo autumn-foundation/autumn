@@ -1350,6 +1350,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `form_render_alloc_gate.rs` for the full explanation and its updated
   ceiling.
 
+- **`[compression]`-enabled apps no longer pay an extra ingress box level for
+  it (#2371):** every other config-gated member of `apply_middleware`'s
+  single merged `Router::layer` tuple composes in via a plain
+  `tower::util::option_layer`, but `CompressionLayer` changes the response
+  body type, which `option_layer`'s `Either` cannot absorb (both of its
+  branches must share one `Response` type) — so `apply_compression_middleware`
+  kept its own standalone `Router::layer` call, the one member of the ingress
+  stack #2198 didn't fold in. That call boxes the whole downstream stack in a
+  fresh `BoxCloneSyncService` that every request above it deep-clones, the
+  same quadratic-per-layer cost #2193/#2198 fixed for the rest of the stack.
+  Compression now folds into the merged tuple too, paired with
+  `NormalizeBodyLayer` — the same body-type-adapter the tuple already uses
+  elsewhere — so `option_layer`'s two branches agree on a `Response` type
+  again. Compression is off by default, so this is a pure win for the apps
+  that turn it on and a no-op otherwise, confirmed by
+  `middleware_stack_depth.rs`'s `compression_enabled_does_not_deepen_the_framework_cascade`
+  (traversal count no longer moves when `[compression] enabled = true` is
+  toggled) alongside the unmoved default-feature `INGRESS_TRAVERSAL_WINDOW`
+  gate. `AssetCacheControlLayer`, the event-bus/oauth tuple, and the
+  outermost `SecurityHeadersLayer` remain separate `Router::layer` calls —
+  each has a genuine ordering/scope constraint (route-mount timing,
+  dev-profile-only middleware injected between it and the rest of the stack,
+  and MCP-dispatch-clone timing respectively) that folding would change the
+  behavior of, not just its cost.
 - **scaffolded form helpers build their `-field`/`-error` id suffix by direct
   string concatenation instead of `format!`:** `text_input`, `password_input`,
   `textarea_input`, `number_input`, `checkbox_input`, `date_input` each built
