@@ -172,13 +172,10 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
     // An explicit `--target` wins: route discovery is deliberately
     // conservative, and a `GET` that needs query parameters or headers looks
     // callable but answers 4xx. Naming the paths is the escape hatch.
-    let targets = if opts.targets.is_empty() {
+    let targets = if calibration.targets.is_empty() {
         calibratable_targets(&dump)
     } else {
-        let mut explicit = opts.targets.clone();
-        explicit.sort();
-        explicit.dedup();
-        explicit
+        calibration.targets.clone()
     };
     if targets.is_empty() {
         eprintln!(
@@ -267,7 +264,8 @@ fn resolve_calibration(
         normalize_recorded(&contract.calibration)
     });
 
-    let named_workload = opts.seed.is_some()
+    let named_workload = !opts.targets.is_empty()
+        || opts.seed.is_some()
         || !opts.concurrency.is_empty()
         || opts.rung_ms.is_some()
         || opts.runs.is_some()
@@ -300,6 +298,14 @@ fn resolve_calibration(
             baseline.concurrency.clone()
         } else {
             normalized_ladder(&opts.concurrency)
+        },
+        targets: if opts.targets.is_empty() {
+            baseline.targets.clone()
+        } else {
+            let mut explicit = opts.targets.clone();
+            explicit.sort();
+            explicit.dedup();
+            explicit
         },
         rung_ms: opts.rung_ms.unwrap_or(baseline.rung_ms),
         runs: opts.runs.unwrap_or(baseline.runs),
@@ -350,6 +356,7 @@ fn normalize_recorded(calibration: &Calibration) -> Calibration {
         no_default_features: calibration.no_default_features,
         seed: calibration.seed,
         concurrency: normalized_ladder(&calibration.concurrency),
+        targets: calibration.targets.clone(),
         rung_ms: calibration.rung_ms,
         runs: calibration.runs,
         warmup_ms: calibration.warmup_ms,
@@ -445,6 +452,17 @@ fn child_env(profile: &str) -> Vec<(String, String)> {
         "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS",
         "127.0.0.1,localhost".to_owned(),
     );
+
+    // The driver speaks plain HTTP to a reserved TCP port, so a profile that
+    // terminates TLS in-process or binds a unix socket would leave it probing
+    // a listener that is not there — a 60s wait and no measurement. Clear both
+    // for the calibration child rather than teaching the driver two more
+    // transports. The cost this omits (TLS handshake and record framing) is a
+    // per-connection cost the keep-alive ladder would barely see anyway, and
+    // the guide says so.
+    env.push(("AUTUMN_SERVER__TLS__CERT_PATH".to_owned(), String::new()));
+    env.push(("AUTUMN_SERVER__TLS__KEY_PATH".to_owned(), String::new()));
+    env.push(("AUTUMN_SERVER__UNIX_SOCKET".to_owned(), String::new()));
 
     env
 }

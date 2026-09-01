@@ -337,6 +337,16 @@ pub struct Calibration {
     /// Whether the binary was built with `--no-default-features`.
     #[serde(default, skip_serializing_if = "is_false_flag")]
     pub no_default_features: bool,
+    /// Paths the ladder drove, when they were named explicitly rather than
+    /// discovered.
+    ///
+    /// Replayed by `--check`: a contract measured against an explicitly named
+    /// (often deliberately expensive) route would otherwise be gated against a
+    /// rediscovered, cheaper mix — certifying a rebuild on a workload that
+    /// never produced the committed envelope. Empty means "discover them",
+    /// which is itself stable for an unchanged route graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
     /// Seed for the request profile.
     pub seed: u64,
     /// Concurrency ladder walked, ascending.
@@ -380,6 +390,7 @@ impl Default for Calibration {
             features: Vec::new(),
             all_features: false,
             no_default_features: false,
+            targets: Vec::new(),
             seed: DEFAULT_SEED,
             concurrency: DEFAULT_LADDER.to_vec(),
             rung_ms: DEFAULT_RUNG_MS,
@@ -752,7 +763,27 @@ mod tests {
         // The workload travels with the envelope: `--check` replays it rather
         // than its own defaults.
         assert_eq!(parsed.calibration, Calibration::default());
+        assert!(
+            parsed.calibration.targets.is_empty(),
+            "an unset target list round-trips as 'discover them'"
+        );
         assert_eq!(parsed.calibration.concurrency, DEFAULT_LADDER.to_vec());
+    }
+
+    #[test]
+    fn explicitly_named_targets_survive_the_round_trip() {
+        // `--check` replays these: a contract measured against a deliberately
+        // expensive named route must not be gated against a rediscovered,
+        // cheaper mix.
+        let mut contract = sample_contract();
+        contract.calibration.targets = vec!["/search".to_owned(), "/report".to_owned()];
+        let rendered = contract.to_toml().expect("serialize");
+        let parsed = CapacityContract::parse(&rendered).expect("parse");
+
+        assert_eq!(
+            parsed.calibration.targets,
+            vec!["/search".to_owned(), "/report".to_owned()]
+        );
     }
 
     #[test]

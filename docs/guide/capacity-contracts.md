@@ -123,6 +123,15 @@ profile are recorded and replayed:
   set in your environment is left alone.
 - `-p <member>` boots the child in *that package's* directory, so it reads its
   own `autumn.toml` rather than the workspace root's.
+- The ladder speaks **plain HTTP over a reserved TCP port**, so in-process TLS
+  and `server.unix_socket` are cleared for the calibration child — otherwise the
+  driver would probe a listener that is not there. The cost this omits (TLS
+  handshake and record framing) is per-connection, which a keep-alive ladder
+  barely pays; if you terminate TLS in-process and care about that cost, treat
+  the envelope as an upper bound.
+
+`--target` is recorded in the contract too, so a run against explicitly named
+routes is replayed rather than rediscovered.
 
 The workload is recorded in the contract, and `--check` **replays it** rather
 than its own defaults:
@@ -354,6 +363,9 @@ describing your production system:
 - **The measured workload is the calibratable subset.** Unauthenticated,
   parameterless `GET` routes. If your traffic is dominated by authenticated
   writes, the envelope describes a workload you do not run.
+- **The transport is plain HTTP over loopback TCP.** In-process TLS and unix
+  sockets are switched off for the calibration child, so a deployment that uses
+  either is measured without that layer.
 - **Loopback is not your network.** Calibration drives `127.0.0.1`, so a
   request's in-flight lifetime is essentially handler time, while in production
   it also spans reading the body off the wire. The 2x headroom on
