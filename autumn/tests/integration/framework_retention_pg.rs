@@ -263,7 +263,16 @@ async fn a_sweep_removes_aged_records_and_leaves_newer_ones() {
     insert_assignment(&pool, "old-actor", 90).await;
     insert_assignment(&pool, "recent-actor", 1).await;
 
-    let state = state_with(&pool, config_with_windows());
+    // `job_tracking` is only *sweep*-enforced when the jobs backend is
+    // Postgres: under `local`/`redis` the rows do not live in
+    // `autumn_job_tracking` at all and the window is applied by capping the
+    // record TTL at write time instead (see
+    // `RetentionDataset::enforcement_for`). This test inserts into that
+    // table directly, so it must configure the backend that owns it.
+    let mut config = config_with_windows();
+    config.jobs.backend = "postgres".to_owned();
+
+    let state = state_with(&pool, config);
     let reports = run_retention(&state, &RetentionRunOptions::default())
         .await
         .expect("sweep runs");
@@ -434,6 +443,8 @@ async fn the_shorter_of_the_policy_and_tracking_ttl_is_what_gets_swept() {
     let mut config = AutumnConfig::default();
     config.retention.job_tracking = Some("30d".to_owned());
     config.jobs.tracking.ttl_secs = 5 * 86_400;
+    // Sweep enforcement for this dataset is backend-gated; see above.
+    config.jobs.backend = "postgres".to_owned();
 
     let state = state_with(&pool, config);
     let reports = run_retention(
@@ -605,7 +616,11 @@ async fn only_datasets_that_are_actually_bounded_are_audited() {
     // sweep is a deletion worth auditing.
     let (pool, _url, _container) = start_pg().await;
     let events = Arc::new(Mutex::new(Vec::new()));
-    let state = state_with(&pool, AutumnConfig::default());
+    // `job_tracking` counts as sweep-enforced only under the Postgres jobs
+    // backend, which is what makes it the one audited dataset here.
+    let mut config = AutumnConfig::default();
+    config.jobs.backend = "postgres".to_owned();
+    let state = state_with(&pool, config);
     state.insert_extension(AuditLogger::new().with_sink(Arc::new(RecordingAuditSink {
         events: events.clone(),
     })));
