@@ -137,6 +137,20 @@ pub const MAX_TABLE_ELEMENTS: u32 = 16_384;
 /// drift apart.
 pub const MAX_TABLES: usize = 4;
 
+/// The most linear memories a module may declare.
+///
+/// The `MemoryLimiter` reports one, so wasmi refuses to create a second at
+/// instantiation — which is per request, as a gateway error, on an artifact
+/// `autumn plugin inspect` said was fine. wasmi's own `Config` enables the
+/// multi-memory proposal by default, so `Module::new` accepts such a module
+/// and only the limiter objects, and the limiter runs too late to tell anyone
+/// useful. The one export named `memory` is what the shim reads and writes, so
+/// a second is authority the wire could not describe even if it were created.
+///
+/// Said once at load, like the table ceiling beside it, rather than once per
+/// request forever.
+pub const MAX_MEMORIES: usize = 1;
+
 /// The most globals a module may declare.
 ///
 /// Every instance allocates and initialises its own copy of each, and an
@@ -1461,6 +1475,8 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
 /// refusing them is the right answer.
 #[derive(Debug, Clone, Copy)]
 struct ModuleShape {
+    /// How many linear memories the module declares for itself.
+    memory_count: usize,
     /// Section headers the module carries, custom ones included.
     ///
     /// Counted because a custom section contributes to no other ceiling and
@@ -1882,6 +1898,8 @@ const DATA_SECTION: u8 = 11;
 /// The table section, whose entries carry the initial sizes the limiter
 /// will be asked to admit.
 const TABLE_SECTION: u8 = 4;
+/// `vec(memtype)` — every linear memory the module declares for itself.
+const MEMORY_SECTION: u8 = 5;
 /// The global section, whose entries each become per-instance storage.
 const GLOBAL_SECTION: u8 = 6;
 /// The import section: entries the compiler builds a representation for.
@@ -1927,6 +1945,13 @@ fn refuse_unrunnable_shape(
     // request — so a module whose tables are *already* over it at rest
     // loads cleanly and then fails every request it is ever given. Said
     // once here, it is a verdict `autumn plugin inspect` can be trusted on.
+    if shape.memory_count > MAX_MEMORIES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "linear memories",
+            found: shape.memory_count,
+            max: MAX_MEMORIES,
+        });
+    }
     if shape.table_count > MAX_TABLES {
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "tables",
@@ -2013,6 +2038,7 @@ fn table_section_shape(
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut cursor = 8usize; // magic + version
     let mut sections = 0usize;
+    let mut memory_count = 0usize;
     let mut segments = 0usize;
     let mut bytes = 0usize;
     let mut declared_entries = 0usize;
@@ -2092,6 +2118,9 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             GLOBAL_SECTION => {
                 global_count = global_count.saturating_add(leb128(wasm, after_size)?.0);
             }
+            MEMORY_SECTION => {
+                memory_count = memory_count.saturating_add(leb128(wasm, after_size)?.0);
+            }
             CODE_SECTION => code_bytes = code_bytes.saturating_add(size),
             START_SECTION => has_start = true,
             _ => {}
@@ -2112,6 +2141,7 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     }
     Some(ModuleShape {
         sections,
+        memory_count,
         segments,
         init_bytes: bytes,
         declared_entries,
@@ -4493,6 +4523,52 @@ path = "/hello/greet"
             shape.sections,
         );
         refuse_unbounded_shape(&hello).expect("a real module must still load");
+    }
+
+    #[test]
+    fn a_module_declaring_a_second_memory_is_refused_at_load_not_once_per_request() {
+        // wasmi enables the multi-memory proposal by default, so `Module::new`
+        // compiles this happily and only the `MemoryLimiter` objects — and it
+        // objects at instantiation, which is per request. The artifact would
+        // pass `autumn plugin inspect` and then answer every request with a
+        // gateway error, which is the shape this file already refuses
+        // elsewhere: a passing verdict on an artifact that can only ever 504 is
+        // worse than no verdict, because an operator installs on it.
+        let wat = r#"(module
+  (memory (export "memory") 1)
+  (memory 1)
+  (func (export "_start") (nop))
+)"#;
+        let wasm = wat::parse_str(wat).expect("the fixture is valid WAT");
+
+        // First, that the engine really does accept it — a fix for a module the
+        // compiler already rejects would be guarding nothing.
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&config);
+        wasmi::Module::new(&engine, &wasm[..])
+            .expect("wasmi enables multi-memory by default; if this fails the ceiling is moot");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a second memory must be refused at load");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "linear memories",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+
+        // One memory is the normal case and still loads.
+        let single = wat::parse_str(
+            r#"(module (memory (export "memory") 1) (func (export "_start") (nop)))"#,
+        )
+        .expect("the fixture is valid WAT");
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &single)
+            .expect("a single-memory module must still load");
     }
 
     #[test]
