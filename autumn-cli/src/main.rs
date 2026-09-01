@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
@@ -37,6 +39,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod plugin;
 mod plugin_check;
 mod process;
 mod release;
@@ -44,6 +47,8 @@ mod replay;
 mod retention;
 mod routes;
 mod routes_audit;
+mod rust_source;
+mod sbom;
 mod scaling_driver;
 mod schema;
 mod search;
@@ -332,6 +337,37 @@ pub enum SearchSubcommands {
     },
 }
 
+/// `autumn plugin ...` — consumer-facing plugin discovery and install
+/// (issue #1606). The author-facing conformance gate stays at
+/// `autumn plugin-check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PluginSubcommands {
+    /// List installable plugins with the version compatible with this app.
+    ///
+    /// Covers every first-party plugin plus community crates discoverable on
+    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Do not query crates.io; list the first-party catalog only.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    Add {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not query crates.io. First-party plugins install normally;
+        /// a community crate cannot have its version resolved and is refused.
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
 /// Subcommands for `autumn jobs`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum JobsSubcommands {
@@ -522,6 +558,16 @@ enum Commands {
         /// Errors when the project has no `#[edge]` routes.
         #[arg(long)]
         edge: bool,
+        /// Compile through `cargo auditable`, embedding the resolved dependency
+        /// list into the binary.
+        ///
+        /// The binary can then report exactly which crate versions are inside
+        /// it with no source tree and no lockfile — `autumn sbom --binary
+        /// <path>`. Requires `cargo-auditable` on PATH (`cargo install
+        /// --locked cargo-auditable`); the production Dockerfile `autumn
+        /// release init` generates installs it and passes this flag.
+        #[arg(long)]
+        auditable: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -565,6 +611,76 @@ enum Commands {
         /// Re-download even if the binary already exists
         #[arg(long)]
         force: bool,
+    },
+    /// Generate or verify a `CycloneDX` Software Bill of Materials.
+    ///
+    /// With no flags, reads `cargo metadata` for the project in the current
+    /// directory and writes a deterministic `CycloneDX` 1.5 document to stdout.
+    ///
+    ///   autumn sbom --output sbom.cdx.json
+    ///     Write the SBOM for this source tree to a file.
+    ///
+    ///   autumn sbom --verify sbom.cdx.json --locked
+    ///     Regenerate from the source tree and fail if the file drifted. This
+    ///     is the release gate: it reports which components were added,
+    ///     removed, or changed rather than a byte diff.
+    ///
+    ///   autumn sbom --binary /usr/local/bin/my-app
+    ///     Report the exact crate versions compiled into a binary, using the
+    ///     dependency list cargo-auditable embeds — no source tree, no
+    ///     lockfile, no network. See docs/guide/supply-chain.md.
+    Sbom {
+        /// Path to a `Cargo.toml` to describe (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+        /// Write the SBOM here instead of stdout.
+        #[arg(long, short, value_name = "FILE", conflicts_with = "verify")]
+        output: Option<PathBuf>,
+        /// Regenerate and compare against this SBOM; exit non-zero if it drifted.
+        #[arg(long, value_name = "FILE")]
+        verify: Option<PathBuf>,
+        /// Read the embedded dependency list out of an already-compiled binary.
+        ///
+        /// Mutually exclusive with every flag that only means something when
+        /// reading a source tree — a compiled binary has no manifest, no
+        /// lockfile and no feature set to resolve.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["manifest_path", "locked", "all_features", "verify"]
+        )]
+        binary: Option<PathBuf>,
+        /// Pass `--locked` to `cargo metadata`, failing if `Cargo.lock` is stale.
+        #[arg(long)]
+        locked: bool,
+        /// Resolve with every optional feature enabled.
+        ///
+        /// Off by default: the default feature set is what a build actually
+        /// links, so it is what the document should describe.
+        #[arg(long, conflicts_with = "binary")]
+        all_features: bool,
+        /// Extra Cargo features to enable, comma-separated.
+        ///
+        /// Pass the same features the binary was built with, so the SBOM
+        /// describes the crates that are actually linked. The generated
+        /// production Dockerfile does this for `embed-assets` builds.
+        #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
+        features: Option<String>,
+        /// Restrict resolution to one target triple.
+        ///
+        /// Without it the document lists target-specific dependencies for
+        /// every platform — the whole `windows-*` family in a Linux image.
+        /// The generated production Dockerfile passes the builder's host
+        /// triple. Leave unset for a source release consumed on every
+        /// platform, which is why it is not the default.
+        #[arg(long, value_name = "TRIPLE", conflicts_with = "binary")]
+        filter_platform: Option<String>,
+        /// Require the SBOM's top-level component to be exactly this version.
+        ///
+        /// The release gate passes the tag being released, so an SBOM that is
+        /// internally consistent but describes the wrong source tree still fails.
+        #[arg(long, value_name = "VERSION")]
+        expect_version: Option<String>,
     },
     /// Pin, vendor, and integrity-verify JS dependencies
     Assets {
@@ -1240,12 +1356,38 @@ enum Commands {
         action: SearchSubcommands,
     },
 
+    /// Discover and install Autumn plugins.
+    ///
+    /// `list` shows every installable plugin with the version compatible with
+    /// this app (querying crates.io for community crates unless `--offline`);
+    /// `add` writes the dependency, mounts the plugin in the
+    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// Writing a plugin instead? `autumn generate plugin`. Auditing one you
+    /// wrote? `autumn plugin-check`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin list
+    ///   autumn plugin list --json --offline
+    ///   autumn plugin add autumn-admin-plugin
+    ///   autumn plugin add autumn-cache-redis --dry-run
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// The plugin subcommand to run.
+        #[command(subcommand)]
+        action: PluginSubcommands,
+    },
+
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
     /// and verifies that the named plugin satisfies five checks: installability,
     /// route attribution, route prefix, route collision, and sensitive-surface
     /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// This is the AUTHOR-facing gate. To discover and install a plugin as a
+    /// consumer, use `autumn plugin list` / `autumn plugin add`.
     ///
     /// # Examples
     ///
@@ -3497,6 +3639,7 @@ fn run_command(command: Commands) {
             embed,
             features,
             edge,
+            auditable,
         } => build::run(
             debug,
             embed,
@@ -3504,6 +3647,7 @@ fn run_command(command: Commands) {
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
+            auditable,
         ),
         Commands::Dev {
             package,
@@ -3899,6 +4043,27 @@ fn run_command(command: Commands) {
             model: model.as_deref(),
         }),
         Commands::Setup { force } => setup::run(force),
+        Commands::Sbom {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        } => sbom::run(&sbom::SbomOptions {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
             AssetsCommands::List => assets::run_list(),
@@ -4181,6 +4346,31 @@ fn run_command(command: Commands) {
                 });
             }
         },
+        Commands::Plugin { action } => {
+            let root = std::path::Path::new(".");
+            let code = match action {
+                PluginSubcommands::List { json, offline } => {
+                    plugin::run_list(&plugin::ListOptions {
+                        root,
+                        json,
+                        offline,
+                    })
+                }
+                PluginSubcommands::Add {
+                    name,
+                    dry_run,
+                    offline,
+                } => plugin::run_add(&plugin::AddOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    offline,
+                }),
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::PluginCheck {
             package,
             bin,
@@ -5474,6 +5664,159 @@ mod tests {
     }
 
     #[test]
+    fn parse_sbom_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "sbom"]).unwrap();
+        let Commands::Sbom {
+            output,
+            verify,
+            binary,
+            locked,
+            manifest_path,
+            expect_version,
+            all_features,
+            features,
+            filter_platform,
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(output.is_none());
+        assert!(verify.is_none());
+        assert!(binary.is_none());
+        assert!(manifest_path.is_none());
+        assert!(expect_version.is_none());
+        assert!(
+            !locked,
+            "--locked must be opt-in so a stale app lockfile still builds"
+        );
+        assert!(
+            !all_features,
+            "the default feature set is what a build actually links, so it is \
+             what the document describes by default"
+        );
+        assert!(features.is_none());
+        assert!(
+            filter_platform.is_none(),
+            "a source release is consumed on every platform, so no filter by default"
+        );
+    }
+
+    #[test]
+    fn parse_sbom_filter_platform() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "sbom",
+            "--filter-platform",
+            "aarch64-unknown-linux-gnu",
+        ])
+        .unwrap();
+        let Commands::Sbom {
+            filter_platform, ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(
+            filter_platform.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn parse_sbom_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--features", "embed-assets"]).unwrap();
+        let Commands::Sbom { features, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_output_and_locked() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--output", "sbom.cdx.json", "--locked"])
+            .unwrap();
+        let Commands::Sbom { output, locked, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(output.unwrap().to_str().unwrap(), "sbom.cdx.json");
+        assert!(locked);
+    }
+
+    #[test]
+    fn parse_sbom_expect_version() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--expect-version", "0.7.0"]).unwrap();
+        let Commands::Sbom { expect_version, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(expect_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn parse_sbom_verify() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--verify", "sbom.cdx.json"]).unwrap();
+        let Commands::Sbom { verify, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(verify.unwrap().to_str().unwrap(), "sbom.cdx.json");
+    }
+
+    #[test]
+    fn parse_sbom_binary() {
+        let cli =
+            Cli::try_parse_from(["autumn", "sbom", "--binary", "/usr/local/bin/app"]).unwrap();
+        let Commands::Sbom { binary, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(binary.unwrap().to_str().unwrap(), "/usr/local/bin/app");
+    }
+
+    #[test]
+    fn sbom_rejects_verifying_and_writing_at_once() {
+        // Both would be silently contradictory: `--verify` never writes.
+        assert!(
+            Cli::try_parse_from(["autumn", "sbom", "--verify", "a.json", "--output", "b.json"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_combined_with_source_tree_flags() {
+        // Each of these only means something when resolving a manifest; with
+        // `--binary` they would be silently ignored.
+        for flag in [
+            vec!["--locked"],
+            vec!["--all-features"],
+            vec!["--features", "embed-assets"],
+            vec!["--filter-platform", "x86_64-unknown-linux-gnu"],
+            vec!["--verify", "sbom.cdx.json"],
+        ] {
+            let mut args = vec!["autumn", "sbom", "--binary", "app"];
+            args.extend(flag.iter().copied());
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "`autumn sbom --binary` must reject {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_and_a_manifest_at_once() {
+        // `--binary` reads a compiled artifact; a manifest path is meaningless
+        // there and would quietly be ignored.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "sbom",
+                "--binary",
+                "app",
+                "--manifest-path",
+                "Cargo.toml"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn new_rejects_removed_wasm_flag() {
         assert!(Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).is_err());
     }
@@ -5543,6 +5886,22 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_auditable() {
+        // The production Dockerfile passes this so the shipped binary carries
+        // its own dependency list (issue #1615).
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--auditable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                embed: true,
+                auditable: true,
+                ..
             }
         ));
     }
@@ -5559,6 +5918,7 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
             }
         ));
     }
@@ -7607,6 +7967,71 @@ mod tests {
     #[test]
     fn parse_token_revoke_without_token_is_error() {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
+    }
+
+    // ── autumn plugin (list/add) tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_list_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(!json);
+                assert!(!offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_json_and_offline() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list", "--json", "--offline"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(json);
+                assert!(offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["autumn", "plugin", "add"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_add_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Add { name, dry_run, .. },
+            } => {
+                assert_eq!(name, "autumn-admin-plugin");
+                assert!(dry_run);
+            }
+            _ => panic!("expected plugin add"),
+        }
+    }
+
+    /// `autumn plugin-check` predates `autumn plugin` and must keep working
+    /// as its own top-level command.
+    #[test]
+    fn plugin_and_plugin_check_are_distinct_commands() {
+        let check =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        assert!(matches!(check.command, Commands::PluginCheck { .. }));
     }
 
     // ── autumn plugin-check tests ──────────────────────────────────────────

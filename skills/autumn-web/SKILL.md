@@ -1421,6 +1421,49 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
+
+**Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
+One command adds the dependency at a version compatible with the app's
+`autumn-web`, mounts the plugin in the `autumn_web::app()` chain, and prints
+the post-install steps (config keys, follow-up generators):
+
+```bash
+autumn plugin list                      # name, description, compatible version
+autumn plugin list --json --offline     # machine-readable; skip the crates.io lookup
+autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
+autumn plugin add autumn-cache-redis --dry-run
+```
+
+`list` covers the five first-party crates (`autumn-admin-plugin`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`) plus community crates found on crates.io under the
+documented `autumn-plugin-<name>` convention.
+
+Four behaviours worth knowing before advising on it:
+
+- **Idempotent.** A second `add` reports "already installed" and changes
+  nothing. It also detects a mount written by hand behind a `use` import, so
+  it will not splice a second, default-constructed mount over a configured one.
+- **Version-gated before any write.** Installing into an app on an
+  incompatible `autumn-web` fails naming both versions, with the app
+  byte-identical. First-party plugins ship in lockstep with `autumn-web` and
+  the CLI, so the version installed is the CLI's — an app on an older line
+  needs the matching CLI, or `autumn upgrade`.
+- **It degrades rather than guessing.** If the `autumn_web::app()` chain
+  cannot be found unambiguously inside `async fn main` — a builder factored
+  into a helper, a one-line chain, two candidate lines — it writes *nothing*
+  and prints the dependency line and mount snippet on stderr, exiting 2. It
+  never leaves an app that does not compile.
+- **Community crates get the dependency only.** The `<Name>Plugin` mount is
+  derived from the naming convention and printed, not spliced: nothing outside
+  that crate can verify it exposes one.
+
+It writes no `features = [...]` onto the app's `autumn-web` dependency — each
+plugin crate already carries the features its mount needs and Cargo unifies
+them. `autumn plugin-check` is the separate, author-facing conformance gate;
+`autumn generate plugin` scaffolds a new plugin crate.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -1829,6 +1872,31 @@ discord_severities = "all"
 
 (issue #1630). See `docs/guide/operator-alerts.md`.
 
+## Supply chain — SBOM + provenance (unreleased, issue #1615)
+
+Every autumn release asset carries a CycloneDX SBOM and a keyless SLSA
+build-provenance attestation, and `autumn release init` makes the same posture
+the default for a scaffolded app. Reach for this when asked "what is in this
+build?", "where did this binary come from?", or for compliance/audit evidence.
+
+- `autumn sbom` is deterministic on purpose — no wall-clock timestamp, and a
+  `serialNumber` derived from the document's content — so `--verify` can be a
+  real gate. Do not add a random serial or a timestamp.
+- `autumn sbom --binary <path>` answers "which crate versions are in this
+  binary?" with no source tree and no lockfile, reading the `.dep-v0` section
+  `cargo-auditable` embeds. A binary built without it gets an error naming the
+  fix, never an empty list.
+- The generated production Dockerfile compiles through `cargo auditable`,
+  fetches Tailwind via the checksum-verifying `autumn setup` (never a bare
+  `curl`), and bakes an SBOM at `/usr/share/autumn/sbom.cdx.json` behind the
+  `io.autumn.sbom.path` label.
+- Verify a published artifact with
+  `gh attestation verify <asset> --repo autumn-foundation/autumn`. Always pass
+  `--repo`: without it any repository's attestation would satisfy the check.
+
+See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
+negative case (tamper with a byte, watch verification fail).
+
 ## Observability defaults
 
 Published 0.5.0 behavior:
@@ -2174,6 +2242,8 @@ autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
+autumn plugin list
+autumn plugin add autumn-admin-plugin
 ```
 
 **(0.6.0)** CLI additions — absent from a 0.5.x `autumn-cli`, but present in
@@ -2204,6 +2274,11 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
+autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
+autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
+autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
+autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (unreleased, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
 autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
 autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)
@@ -2215,6 +2290,8 @@ autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever
 autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
 autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
+autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
+autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)

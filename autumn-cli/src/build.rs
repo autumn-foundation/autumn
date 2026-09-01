@@ -35,8 +35,23 @@ fn build_cargo_command(
     package: Option<&str>,
     bin: Option<&str>,
     extra_features: Option<&str>,
+    auditable: bool,
 ) -> Command {
     let mut cargo = Command::new("cargo");
+    // `cargo auditable build` embeds the resolved dependency list into the
+    // compiled binary (a `.dep-v0` section), so a deployed single binary can
+    // report exactly which crate versions are inside it with no source tree
+    // and no lockfile — see `autumn sbom --binary` and
+    // docs/guide/supply-chain.md.
+    //
+    // It MUST be reached through this subcommand. `cargo-auditable` only enters
+    // wrapper mode when `CARGO_AUDITABLE_ORIG_ARGS` is set, and only `cargo
+    // auditable` itself sets it; pointing RUSTC_WORKSPACE_WRAPPER straight at
+    // the binary makes it exit 1 on cargo's first `rustc -vV` probe, failing
+    // the build before anything compiles.
+    if auditable {
+        cargo.arg("auditable");
+    }
     cargo.arg("build");
     if !debug {
         cargo.arg("--release");
@@ -410,6 +425,7 @@ fn build_embedded(
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
+    auditable: bool,
 ) {
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
@@ -423,14 +439,18 @@ fn build_embedded(
     // Phase 1: compile WITHOUT embed-assets so build scripts populate static/.
     // Pass extra features (e.g. managed-pg-bundled) so apps wiring
     // ManagedPostgresPoolProvider can compile even in this pre-embed phase.
-    run_cargo_or_exit(build_cargo_command(debug, false, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, false, package, bin, features, auditable,
+    ));
 
     eprintln!("\nFingerprinting static assets for embedding...");
     fingerprint_assets_in(&static_dir);
 
     eprintln!("\nEmbedding assets and locales into the binary...");
     // Phase 3: recompile WITH embed-assets so include_dir! bakes the tree in.
-    run_cargo_or_exit(build_cargo_command(debug, true, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, true, package, bin, features, auditable,
+    ));
 
     eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
 }
@@ -493,6 +513,10 @@ fn effective_package<'a>(
 }
 
 /// Run the static build pipeline.
+// Each flag is an independent, orthogonal switch on the same pipeline and every
+// call site is the single `Commands::Build` match arm, so grouping them into an
+// options struct would add a type without removing an argument.
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn run(
     debug: bool,
     embed: bool,
@@ -500,6 +524,7 @@ pub fn run(
     package: Option<&str>,
     bin: Option<&str>,
     features: Option<&str>,
+    auditable: bool,
 ) {
     eprintln!("\u{1F342} autumn build\n");
 
@@ -529,12 +554,14 @@ pub fn run(
     // routes and the app's runtime state) and lets dynamic-server apps build a
     // single binary without a database or pre-render step.
     if embed {
-        build_embedded(debug, profile, package, bin, features);
+        build_embedded(debug, profile, package, bin, features, auditable);
         return;
     }
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, embed, package, bin, features));
+    run_cargo_or_exit(build_cargo_command(
+        debug, embed, package, bin, features, auditable,
+    ));
 
     // Resolve the selected package's directory before fingerprinting so that
     // when --bin selects a member of a workspace without -p, we fingerprint
@@ -959,10 +986,50 @@ mod tests {
         bin: Option<&str>,
         extra_features: Option<&str>,
     ) -> Vec<String> {
-        build_cargo_command(debug, embed, package, bin, extra_features)
+        build_cargo_command(debug, embed, package, bin, extra_features, false)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn cargo_args_auditable(debug: bool, embed: bool, auditable: bool) -> Vec<String> {
+        build_cargo_command(debug, embed, None, None, None, auditable)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn auditable_builds_go_through_the_cargo_auditable_subcommand() {
+        // `cargo-auditable` CANNOT be used as a bare RUSTC_WORKSPACE_WRAPPER:
+        // its wrapper mode only engages when `CARGO_AUDITABLE_ORIG_ARGS` is
+        // set, which only `cargo auditable` itself does. Invoked any other way
+        // it prints "'cargo auditable' should be invoked through Cargo" and
+        // exits 1 — killing the build on cargo's very first `rustc -vV` probe.
+        let args = cargo_args_auditable(false, false, true);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("auditable"),
+            "auditable builds must run `cargo auditable build ...`: {args:?}"
+        );
+        assert_eq!(args.get(1).map(String::as_str), Some("build"));
+        assert!(args.contains(&"--release".to_string()));
+    }
+
+    #[test]
+    fn non_auditable_builds_are_unchanged() {
+        let args = cargo_args_auditable(false, false, false);
+        assert_eq!(args.first().map(String::as_str), Some("build"));
+        assert!(!args.contains(&"auditable".to_string()));
+    }
+
+    #[test]
+    fn auditable_applies_to_the_embed_phase_too() {
+        // The embed path compiles TWICE; both must carry the dependency list,
+        // or the shipped single binary is the un-instrumented one.
+        let args = cargo_args_auditable(false, true, true);
+        assert_eq!(args.first().map(String::as_str), Some("auditable"));
+        assert!(args.windows(2).any(|w| w == ["--features", "embed-assets"]));
     }
 
     #[test]

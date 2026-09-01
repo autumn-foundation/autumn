@@ -6321,6 +6321,36 @@ pub struct AcmeConfig {
     /// left. Default: `30`.
     #[serde(default = "default_acme_renew_before_days")]
     pub renew_before_days: u32,
+
+    /// PEM file holding the root certificate that signs the ACME **directory's
+    /// own HTTPS certificate**, for a directory that is not publicly trusted.
+    ///
+    /// The ACME client speaks HTTPS to the directory and, by default, verifies
+    /// it against the **platform trust store** (the host's own installed CA
+    /// certificates). That is right for Let's Encrypt — both its staging and its
+    /// production API endpoints carry publicly-trusted certificates — and wrong
+    /// for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+    /// test server whose API certificate chains to a root the host does not
+    /// know. Point this at that root and the client trusts it *instead of* the
+    /// platform store.
+    ///
+    /// Only the **first** certificate in the file becomes a trust anchor, so
+    /// give it the root alone rather than a leaf/intermediate bundle. Setting it
+    /// also swaps the platform verifier for a plain path verifier, which on
+    /// macOS and Windows means the OS-level policy and revocation checks no
+    /// longer apply to this one connection.
+    ///
+    /// Unset by default, and unnecessary for `directory = "staging"` /
+    /// `"production"`. This changes trust for the **ACME control plane only**;
+    /// it has no bearing on which certificates browsers accept from your site.
+    ///
+    /// Like every other `[server.tls.acme]` key, this has no
+    /// `AUTUMN_SERVER__TLS__ACME__*` environment override: the section is
+    /// configured in `autumn.toml` as a unit. Deliberate, and worth knowing if
+    /// the root arrives as a container mount — the path still has to be named in
+    /// the config file.
+    #[serde(default)]
+    pub ca_root_path: Option<PathBuf>,
 }
 
 impl AcmeConfig {
@@ -6372,6 +6402,17 @@ impl AcmeConfig {
                  the CA's rate limits. Use a smaller value (default 30)",
                 self.renew_before_days
             ));
+        }
+        if let Some(path) = &self.ca_root_path
+            && path.to_str().is_none_or(|p| p.trim().is_empty())
+        {
+            return Err(
+                "[server.tls.acme] ca_root_path is set but blank: either remove it (to use the \
+                 platform trust store, which is correct for Let's Encrypt staging and \
+                 production) or point it at the PEM root that signs your ACME directory's HTTPS \
+                 certificate"
+                    .to_owned(),
+            );
         }
         for (index, domain) in self.domains.iter().enumerate() {
             let trimmed = domain.trim();
@@ -13692,6 +13733,7 @@ path = "/healthz"
             cache_dir: default_acme_cache_dir(),
             http_challenge_port: default_acme_http_challenge_port(),
             renew_before_days: default_acme_renew_before_days(),
+            ca_root_path: None,
         }
     }
 
@@ -13715,6 +13757,45 @@ path = "/healthz"
         assert_eq!(acme.http_challenge_port, 80);
         assert_eq!(acme.renew_before_days, 30);
         assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn acme_ca_root_path_defaults_to_unset_and_round_trips() {
+        // Unset is the default: Let's Encrypt's staging and production API
+        // endpoints are publicly trusted, so no extra root is needed.
+        let acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        assert_eq!(acme.ca_root_path, None);
+        assert!(acme.validate().is_ok());
+
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["app.example.com"]
+            contact_email = "ops@example.com"
+            directory = { custom = { url = "https://pebble.test/dir" } }
+            ca_root_path = "config/pebble-root.pem"
+            "#,
+        )
+        .expect("ca_root_path should parse");
+        let acme = config.server.tls.unwrap().acme.unwrap();
+        assert_eq!(
+            acme.ca_root_path,
+            Some(PathBuf::from("config/pebble-root.pem"))
+        );
+        assert!(acme.validate().is_ok());
+    }
+
+    #[test]
+    fn acme_rejects_a_blank_ca_root_path() {
+        // An empty path would otherwise be carried all the way into the renewal
+        // loop and fail every order at the TLS handshake with a far less
+        // actionable message.
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.ca_root_path = Some(PathBuf::new());
+        let err = acme
+            .validate()
+            .expect_err("a blank ca_root_path is invalid");
+        assert!(err.contains("ca_root_path"), "unhelpful message: {err}");
     }
 
     #[test]

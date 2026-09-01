@@ -48,6 +48,123 @@ mod templates {
     pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
 }
 
+/// First `autumn-cli` release that ships the issue #1615 supply-chain surface:
+/// the `autumn sbom` subcommand AND `autumn build --auditable`.
+///
+/// The generated Dockerfile `cargo install`s the CLI at
+/// `{{autumn_cli_version}}` — which renders THIS CLI's own version. Between a
+/// feature merging and the next release that is an ALREADY-PUBLISHED version
+/// predating the feature, so a scaffold generated from a source build in that
+/// window would invoke `autumn sbom` (no such subcommand) or `autumn build
+/// --auditable` (no such flag) and the image would not build at all.
+///
+/// `0.7.1` means "any release after 0.7.0", which is every future version, so
+/// this needs no maintenance when the next version number is chosen: the gated
+/// steps switch themselves on the moment a CLI that can satisfy them is what
+/// gets installed. Until then the scaffold still produces a working image —
+/// with the verified Tailwind download and, on the default (non-embed) path,
+/// an auditable binary, since `cargo auditable build` needs only the
+/// cargo-auditable crate and nothing from the autumn CLI.
+const SUPPLY_CHAIN_MIN_CLI_VERSION: &str = "0.7.1";
+
+/// Builder-stage step that writes the image's `CycloneDX` inventory.
+///
+/// A raw literal on purpose: these lines land verbatim in a generated
+/// Dockerfile, so any escaping cleverness here shows up as stray indentation
+/// in every scaffolded project.
+const SBOM_GENERATE_STEP: &str = r#"
+# Machine-readable inventory of everything compiled into this image, generated
+# from the very source tree that produced the binary above, resolving the same
+# features that build used and filtered to this builder's own target triple.
+# Without that filter the document lists target-specific dependencies for every
+# platform — the whole `windows-*` family — none of which can be in a Linux
+# image. Deliberately no `--locked`: a project whose Cargo.lock has drifted
+# still builds (its own build would have updated the lock anyway), and the SBOM
+# records what was actually resolved. Add `--locked` for the stricter posture.
+RUN autumn sbom{{sbom_features}} \
+    --filter-platform "$(rustc -vV | grep '^host:' | cut -d' ' -f2)" \
+    --output /app/sbom.cdx.json
+"#;
+
+/// Runtime-stage copy that carries the inventory into the shipped image.
+const SBOM_RUNTIME_COPY: &str = r"# Supply-chain inventory, at a fixed path so scanners and `docker cp` can find
+# it without knowing anything about autumn. The binary itself independently
+# carries the same list (see cargo-auditable above); docs/guide/supply-chain.md
+# shows how to cross-check the two.
+COPY --chown=autumn:autumn --from=builder /app/sbom.cdx.json /usr/share/autumn/sbom.cdx.json
+";
+
+/// Continuation of the runtime image's `LABEL` instruction, pointing a scanner
+/// at the in-image SBOM without any autumn-specific knowledge.
+const SBOM_LABELS: &str = concat!(
+    " \\\n      io.autumn.sbom.format=\"CycloneDX\"",
+    " \\\n      io.autumn.sbom.path=\"/usr/share/autumn/sbom.cdx.json\""
+);
+
+/// Keep or delete a `{{sbom_steps_begin}}` … `{{sbom_steps_end}}` region.
+///
+/// The generated deploy workflows extract and attest the SBOM baked into the
+/// image, which only exists when the pinned CLI could generate it (see
+/// [`SUPPLY_CHAIN_MIN_CLI_VERSION`]). Rather than duplicate each cloud's image
+/// expression and env block in Rust, the steps live in the template between
+/// markers and this either unwraps them or removes them wholesale.
+fn strip_sbom_block(rendered: &str, keep: bool) -> String {
+    // Most templates carry no markers; leave those byte-for-byte alone rather
+    // than round-tripping them through a line splitter that would normalise
+    // their trailing newline.
+    if !rendered.contains("{{sbom_steps_begin}}") {
+        return rendered.to_owned();
+    }
+    let mut out = String::with_capacity(rendered.len());
+    let mut inside = false;
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{{sbom_steps_begin}}" {
+            inside = true;
+            continue;
+        }
+        if trimmed == "{{sbom_steps_end}}" {
+            inside = false;
+            continue;
+        }
+        if inside && !keep {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse `x.y.z` (ignoring any `-pre`/`+build` suffix) for ordering.
+fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next().filter(|s| !s.is_empty())?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Whether a Dockerfile pinned to `cli_version` can run this release's
+/// supply-chain CLI surface.
+///
+/// An unparseable version is treated as capable: it is not a published
+/// crates.io release, so it is a local/source build, which by definition has
+/// whatever this CLI has.
+fn cli_supports_supply_chain_flags(cli_version: &str) -> bool {
+    match (
+        semver_triple(cli_version),
+        semver_triple(SUPPLY_CHAIN_MIN_CLI_VERSION),
+    ) {
+        (Some(have), Some(need)) => have >= need,
+        _ => true,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseError {
     #[error("'{0}' already exists — run with --force to overwrite")]
@@ -503,22 +620,95 @@ condition: service_completed_successfully\n    restart: unless-stopped\n";
 const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
 
 fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
+    render_for_cli(
+        template,
+        project_name,
+        embed,
+        split_workers,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The Dockerfile/deploy-workflow renderer, with the pinned CLI version
+/// injectable so both sides of the [`cli_supports_supply_chain_flags`] gate are
+/// testable.
+fn render_for_cli(
+    template: &str,
+    project_name: &str,
+    embed: bool,
+    split_workers: bool,
+    cli_version: &str,
+) -> String {
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
+    // build` on the default path, which needs only the cargo-auditable crate —
+    // it is subject to the same pin gate as `autumn sbom`. An older pinned CLI
+    // rejects the argument and the image fails to build.
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
+    // build` on the default path, which needs only the cargo-auditable crate —
+    // it is subject to the same pin gate as `autumn sbom`: an older pinned CLI
+    // rejects the argument and the image fails to build. The explanatory
+    // comment is gated with it, so a generated Dockerfile never documents a
+    // flag it does not pass.
+    let (embed_auditable_note, embed_auditable) = if cli_supports_supply_chain_flags(cli_version) {
+        (
+            "# `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
+                 # shipped binary carries its own dependency list.\n",
+            " --auditable",
+        )
+    } else {
+        ("", "")
+    };
+    let embed_build_step = format!(
+        "# Single-binary build: fingerprint static assets, then compile with the\n\
+         # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
+         # manifest) and i18n locales from itself — no sidecar directories. The app\n\
+         # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
+         {embed_auditable_note}\
+         RUN autumn build --embed{embed_auditable}"
+    );
     let (build_step, static_copy) = if embed {
         (
-            "# Single-binary build: fingerprint static assets, then compile with the\n\
-             # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
-             # manifest) and i18n locales from itself — no sidecar directories. The app\n\
-             # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
-             RUN autumn build --embed",
+            embed_build_step.as_str(),
             // Assets/locales are embedded; only migrations/ is staged below.
             "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
              # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
         )
     } else {
         (
-            "RUN cargo build --release",
+            "# `cargo auditable` embeds the resolved dependency list into the binary so it\n\
+             # can report its own crate versions with no source tree — see\n\
+             # docs/guide/supply-chain.md. Otherwise an ordinary release build.\n\
+             RUN cargo auditable build --release",
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
+    };
+    // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
+    // SUPPLY_CHAIN_MIN_CLI_VERSION has. Emitting these steps against an older pin
+    // would make `docker build` fail outright, so they are omitted instead —
+    // the image is merely SBOM-less, not broken.
+    //
+    // The SBOM must resolve the SAME features the binary above was compiled
+    // with. The embed build turns on `embed-assets`, which pulls in optional
+    // dependencies; resolving the default set instead would omit crates that
+    // are genuinely linked and make the documented sidecar-vs-binary
+    // cross-check report spurious binary-only entries.
+    let emits_sbom = cli_supports_supply_chain_flags(cli_version);
+    let sbom_generate_step = if emits_sbom {
+        SBOM_GENERATE_STEP.replace(
+            "{{sbom_features}}",
+            if embed {
+                " --features embed-assets"
+            } else {
+                ""
+            },
+        )
+    } else {
+        String::new()
+    };
+    let (sbom_runtime_copy, sbom_labels) = if emits_sbom {
+        (SBOM_RUNTIME_COPY, SBOM_LABELS)
+    } else {
+        ("", "")
     };
     // Split-topology placeholders exist only in the docker-compose template, so
     // these replacements are no-ops for the other files. Substitute them before
@@ -529,7 +719,7 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
     } else {
         ("", "")
     };
-    template
+    let rendered = template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
         .replace("{{project_name}}", project_name)
@@ -537,10 +727,14 @@ fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) 
             "{{rust_version}}",
             option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
         )
-        .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{autumn_cli_version}}", cli_version)
         .replace("{{diesel_cli_version}}", "2.3.8")
         .replace("{{build_step}}", build_step)
         .replace("{{static_copy}}", static_copy)
+        .replace("{{sbom_generate_step}}", &sbom_generate_step)
+        .replace("{{sbom_runtime_copy}}", sbom_runtime_copy)
+        .replace("{{sbom_labels}}", sbom_labels);
+    strip_sbom_block(&rendered, cli_supports_supply_chain_flags(cli_version))
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -736,14 +930,263 @@ mod tests {
         // The provenance ENV must precede the build step so the compile sees it.
         let env_pos = content.find("AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA}");
         let build_pos = content.find("{{build_step}}").or_else(|| {
-            // `{{build_step}}` is already substituted; both variants run cargo.
+            // `{{build_step}}` is already substituted; both variants run cargo,
+            // now through `cargo auditable` so the binary carries its own
+            // dependency list (issue #1615).
             content
-                .find("cargo build --release")
-                .or_else(|| content.find("autumn build --embed"))
+                .find("RUN cargo auditable build --release")
+                .or_else(|| content.find("RUN autumn build --embed"))
         });
         assert!(
             matches!((env_pos, build_pos), (Some(e), Some(b)) if e < b),
             "provenance ENV must appear before the build step: {content}"
+        );
+    }
+
+    #[test]
+    fn an_embed_build_does_not_pass_auditable_to_a_cli_that_lacks_it() {
+        // `--auditable` is a NEW flag on `autumn build`, so it is subject to
+        // exactly the same pin problem as `autumn sbom`: the embed branch
+        // invokes the crates.io CLI the image installed, and an older one
+        // rejects the argument outright. (The non-embed branch is unaffected —
+        // `cargo auditable build` needs only the cargo-auditable crate.)
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed"),
+            "the embed build must still happen: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--auditable"),
+            "a CLI pinned at 0.7.0 has no --auditable flag; passing it fails the \
+             build with an unknown argument:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_embed_build_passes_auditable_to_a_cli_that_has_it() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            rendered.contains("RUN autumn build --embed --auditable"),
+            "{rendered}"
+        );
+    }
+
+    /// The non-embed path never touches the autumn CLI for its build, so it is
+    /// auditable on every pin.
+    #[test]
+    fn a_non_embed_build_is_auditable_regardless_of_the_pin() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            assert!(
+                rendered.contains("RUN cargo auditable build --release"),
+                "{cli_version}: {rendered}"
+            );
+        }
+    }
+
+    /// The rendered `RUN autumn sbom …` instruction as ONE logical command,
+    /// `\`-continuations joined. Assertions must be scoped to it: the
+    /// Dockerfile legitimately carries flags like `--features postgres`
+    /// elsewhere, and a whole-file substring check would read them as this
+    /// command's.
+    fn sbom_command(rendered: &str) -> String {
+        // Normalize first: `.gitattributes` says `* text=auto`, so on a Windows
+        // checkout this file's own raw string literals carry CRLF, and the
+        // `\`-continuation join below would silently no-op — leaving the
+        // assertions matching against a truncated one-line command.
+        rendered
+            .replace("\r\n", "\n")
+            .replace("\\\n", " ")
+            .lines()
+            .find(|l| l.trim_start().starts_with("RUN autumn sbom"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
+        // The Dockerfile `cargo install`s the CLI at its own version. Between a
+        // merge and the next release that is an already-published version with
+        // no `sbom` subcommand — emitting the step anyway would make every
+        // `docker build` fail on an unrecognised subcommand.
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(
+            !rendered.contains("autumn sbom"),
+            "must not call a subcommand the pinned CLI lacks:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("sbom.cdx.json"),
+            "and must not COPY a file that was never generated:\n{rendered}"
+        );
+        // The rest of the supply-chain posture does not depend on the CLI at
+        // all, so it stays on.
+        assert!(
+            rendered.contains("cargo auditable build --release"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("RUN autumn setup"), "{rendered}");
+    }
+
+    #[test]
+    fn a_cli_pin_that_ships_autumn_sbom_emits_the_sbom_steps() {
+        let rendered = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            sbom_command(&rendered).contains("--output /app/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("/usr/share/autumn/sbom.cdx.json"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("io.autumn.sbom.path"), "{rendered}");
+    }
+
+    /// Generated Dockerfiles are read by humans. A `\`-continued Rust string
+    /// literal that loses its continuation silently indents every following
+    /// line of the block it renders — including instructions — which is how
+    /// this very block first shipped.
+    #[test]
+    fn the_rendered_dockerfile_has_no_stray_indentation() {
+        for cli_version in ["0.7.0", "0.7.1"] {
+            let rendered = render_for_cli(
+                include_str!("templates/release/Dockerfile.tmpl"),
+                "my-app",
+                false,
+                false,
+                cli_version,
+            );
+            for (n, line) in rendered.lines().enumerate() {
+                let leading = line.len() - line.trim_start().len();
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || trimmed.starts_with("COPY ") {
+                    assert_eq!(
+                        leading,
+                        0,
+                        "line {} of the {cli_version} render is indented: {line:?}",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_embed_build_sbom_resolves_the_features_it_was_built_with() {
+        // `embed-assets` pulls in optional dependencies; an SBOM resolved
+        // without it would omit crates the shipped binary genuinely links.
+        let embed = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            true,
+            false,
+            "0.7.1",
+        );
+        assert!(
+            sbom_command(&embed).contains("--features embed-assets"),
+            "{embed}"
+        );
+
+        let plain = render_for_cli(
+            include_str!("templates/release/Dockerfile.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        // Scoped to the sbom command: the file legitimately contains
+        // `--features postgres` on the diesel_cli install.
+        assert!(
+            !sbom_command(&plain).contains("--features"),
+            "a non-embed build takes the default feature set: {plain}"
+        );
+    }
+
+    #[test]
+    fn the_supply_chain_gate_opens_for_every_future_version() {
+        // 0.7.1 is deliberately "anything after 0.7.0", so no future release
+        // number has to be predicted.
+        for v in ["0.7.1", "0.8.0", "0.10.0", "1.0.0", "2.3.4"] {
+            assert!(
+                cli_supports_supply_chain_flags(v),
+                "{v} should support the #1615 CLI surface"
+            );
+        }
+        for v in ["0.7.0", "0.6.0", "0.1.0"] {
+            assert!(
+                !cli_supports_supply_chain_flags(v),
+                "{v} predates autumn sbom"
+            );
+        }
+        // A pre-release sorts BEFORE its base version, so `0.7.0-dev` still
+        // predates the feature — the gate must not be fooled by the suffix.
+        assert!(!cli_supports_supply_chain_flags("0.7.0-dev"));
+        assert!(cli_supports_supply_chain_flags("0.8.0-rc.1"));
+        // A string cargo could never resolve is not a published release at
+        // all; nothing is gained by degrading, and the pin would fail first.
+        assert!(cli_supports_supply_chain_flags("not-a-version"));
+    }
+
+    #[test]
+    fn a_gated_deploy_workflow_drops_only_the_sbom_steps() {
+        let with = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.1",
+        );
+        let without = render_for_cli(
+            include_str!("templates/release/gcp-deploy.yml.tmpl"),
+            "my-app",
+            false,
+            false,
+            "0.7.0",
+        );
+        assert!(with.contains("actions/attest-sbom"), "{with}");
+        assert!(!without.contains("actions/attest-sbom"), "{without}");
+        // The image provenance attestation needs nothing from the autumn CLI,
+        // so it is present either way.
+        for rendered in [&with, &without] {
+            assert!(
+                rendered.contains("actions/attest-build-provenance"),
+                "{rendered}"
+            );
+        }
+        assert!(
+            !with.contains("{{sbom_steps_") && !without.contains("{{sbom_steps_"),
+            "the markers must never reach a generated file"
         );
     }
 
@@ -815,11 +1258,11 @@ mod tests {
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
-            content.contains("RUN cargo build --release"),
+            content.contains("RUN cargo auditable build --release"),
             "non-embed project must use the disk-based build: {content}"
         );
         assert!(
-            !content.contains("autumn build --embed"),
+            !content.contains("RUN autumn build --embed"),
             "non-embed project must not require the embed-assets feature"
         );
         assert!(
@@ -924,6 +1367,136 @@ mod tests {
             content.contains("/health"),
             "HEALTHCHECK must probe the /health actuator endpoint"
         );
+    }
+
+    /// Extract the generated `HEALTHCHECK`'s shell command (everything after
+    /// `CMD`), with the Dockerfile line continuations left intact — `sh`
+    /// accepts them verbatim, so the string can be executed as-is.
+    fn healthcheck_command(dockerfile: &str) -> String {
+        let mut lines = dockerfile
+            .lines()
+            .skip_while(|line| !line.starts_with("HEALTHCHECK"));
+        let mut instruction = String::new();
+        for line in &mut lines {
+            instruction.push_str(line);
+            instruction.push('\n');
+            if !line.trim_end().ends_with('\\') {
+                break;
+            }
+        }
+        let cmd_at = instruction
+            .find("CMD ")
+            .unwrap_or_else(|| panic!("HEALTHCHECK has no CMD: {instruction}"));
+        instruction[cmd_at + 4..].to_owned()
+    }
+
+    /// Issue #1603 AC6: an image whose app terminates TLS itself
+    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// hardcoded to `http://` marks that container permanently unhealthy —
+    /// and in compose, `depends_on: condition: service_healthy` never
+    /// releases. The probe URL must therefore be overridable at runtime.
+    #[test]
+    fn dockerfile_healthcheck_url_is_overridable_for_direct_tls() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_URL"),
+            "HEALTHCHECK must honor $AUTUMN_HEALTHCHECK_URL so an HTTPS-terminating \
+             image can be probed over https://, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("http://localhost:3000/health"),
+            "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_INSECURE"),
+            "an HTTPS-terminating image needs a way to skip verification on its own \
+             loopback probe, got: {healthcheck}"
+        );
+    }
+
+    /// The probe skips certificate verification only when the operator says so
+    /// with `AUTUMN_HEALTHCHECK_INSECURE`, never by inferring it from the URL:
+    /// `user@host`, `#fragment` and lookalike hostnames all yield URLs that
+    /// read as loopback but that curl resolves elsewhere, so a URL parser here
+    /// silently turns verification off for a remote endpoint.
+    ///
+    /// Runs the generated command under `sh` with `curl` stubbed out, so this
+    /// asserts the shell's real behavior rather than the template's text.
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_healthcheck_skips_verification_only_on_explicit_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+
+        // `curl` becomes a shell function that echoes its arguments to stderr
+        // (stdout is redirected to /dev/null by the probe itself).
+        let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
+
+        // (url, insecure env, expect --insecure, expect this URL to be probed)
+        let cases: [(Option<&str>, Option<&str>, bool); 7] = [
+            // Default: today's plain-HTTP probe, verification on.
+            (None, None, false),
+            // An https URL alone is NOT enough — fail safe, not fail open.
+            (Some("https://localhost:3000/health"), None, false),
+            // The documented direct-TLS pairing.
+            (Some("https://localhost:3000/health"), Some("1"), true),
+            // Any non-empty value opts in; the value itself is not parsed.
+            (Some("https://localhost:3000/health"), Some("true"), true),
+            // An empty value is not an opt-in.
+            (Some("https://localhost:3000/health"), Some(""), false),
+            // URLs that a parser would have mistaken for loopback stay verified
+            // unless the operator opted in — curl resolves both remotely.
+            (
+                Some("https://localhost:3000@remote.example/health"),
+                None,
+                false,
+            ),
+            (
+                Some("https://remote.example#@localhost/health"),
+                None,
+                false,
+            ),
+        ];
+
+        for (url, insecure, expect_insecure) in cases {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&harness);
+            command.env_remove("AUTUMN_HEALTHCHECK_URL");
+            command.env_remove("AUTUMN_HEALTHCHECK_INSECURE");
+            if let Some(url) = url {
+                command.env("AUTUMN_HEALTHCHECK_URL", url);
+            }
+            if let Some(insecure) = insecure {
+                command.env("AUTUMN_HEALTHCHECK_INSECURE", insecure);
+            }
+            let output = command.output().expect("run the probe under sh");
+            let invocation = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "the probe should exit 0 for {url:?}/{insecure:?}, got {:?}: {invocation}",
+                output.status
+            );
+            assert_eq!(
+                invocation.contains("--insecure"),
+                expect_insecure,
+                "certificate verification for url={url:?} insecure={insecure:?} must {} be \
+                 skipped; curl was called as: {invocation}",
+                if expect_insecure { "" } else { "NOT" }
+            );
+            // The probe must hit the URL it was given, verbatim.
+            let expected_url = url.unwrap_or("http://localhost:3000/health");
+            assert!(
+                invocation.contains(expected_url),
+                "the probe must request {expected_url}; curl was called as: {invocation}"
+            );
+        }
     }
 
     #[test]

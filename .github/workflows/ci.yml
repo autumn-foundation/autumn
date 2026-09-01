@@ -72,22 +72,27 @@ jobs:
         # the gated modules with no new services.)
         #
         # `tls` is in the list for the determinism seam gate (#1797), not the
-        # panic gate. `app.rs` is a gated module, and its
-        # `#[cfg(feature = "tls")] fn now_unix` is the one site in it that reads
-        # real wall time on purpose (certificate validity is a fact about the
-        # real world). That function — and the `#[allow(clippy::disallowed_methods,
-        # reason = "…")]` justifying it — is only COMPILED when `tls` is on, so
-        # without it here the module's deny never sees the site and a later
-        # off-seam read added next to it would ship unlinted.
-        # Side effect worth knowing: this also lints `autumn/src/tls.rs` (and the
-        # rest of the `tls`-gated tree) under `-D warnings` for the first time.
+        # panic gate. `autumn/src/tls.rs` owns `fn now_unix` — the one site in
+        # THAT MODULE that reads real wall time on purpose (certificate validity
+        # is a fact about the real world), used from `app.rs`'s bind path and the
+        # `CertReloader` poll loop. That function — and the
+        # `#[allow(clippy::disallowed_methods, reason = "…")]` justifying it — is
+        # only COMPILED when `tls` is on, so without it here the deny never sees
+        # the site and a later off-seam read added next to it would ship unlinted.
+        # This also lints the whole `tls`-gated tree under `-D warnings`.
+        #
+        # `acme` joined the set in #1608, which closes the gap the `tls`-only
+        # version of this comment recorded: `acme/renewal.rs` has its own
+        # `now_unix`, and `--all-targets` lints only what the enabled features
+        # compile, so until `acme` was listed here the entire ACME tree — that
+        # seam included — was never linted at all.
         #
         # `inbound-mail`/`inbound-mailgun`/`inbound-ses` gate `inbound_mail`, which
         # parses untrusted RFC 5322 / MIME bodies straight off an unauthenticated
         # webhook route, and `storage` gates the upload path — both are request-path
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" --all-targets -- -D warnings
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -223,6 +228,77 @@ jobs:
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+      - name: Run direct-TLS (HTTPS) tests
+        # `tls` is not a default feature, so the workspace `cargo test` above
+        # compiles neither `tls`'s in-module suite nor the `[server.tls]`
+        # integration modules. Those are the behavioural proof for #1603 — the
+        # listener itself (`tls_serving`) plus the app-surface parity the ACs
+        # name: the framework probes, the inbound request timeout, SSE, `wss://`
+        # sockets, graceful shutdown of an in-flight HTTPS request, and a
+        # renewed certificate served without a restart (`tls_app_surface`). They
+        # have to run in a lane that blocks merge rather than only in the
+        # (non-blocking, Codecov-driven) coverage job. `ws` is on so the
+        # `wss://` test is compiled rather than silently skipped.
+        #
+        # Linux only: two of these assert on elapsed time (the request deadline
+        # and the mtime-polled certificate reload), and the Windows/macOS
+        # runners are the slow, contended ones — the TLS listener itself is
+        # platform-independent, so paying for that flake risk in a
+        # merge-blocking lane buys nothing.
+        #
+        # Each suite is run under its own module-anchored filter and then
+        # checked for a non-zero pass count: `cargo test` exits 0 when a filter
+        # matches NOTHING, so a cfg drift that stopped compiling these modules
+        # in would otherwise leave this step green with zero HTTPS coverage.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features tls --lib tls:: \
+            | tee "${RUNNER_TEMP}/tls-lib.log"
+          assert_ran "${RUNNER_TEMP}/tls-lib.log" "autumn-web tls unit tests"
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_serving:: | tee "${RUNNER_TEMP}/tls-serving.log"
+          assert_ran "${RUNNER_TEMP}/tls-serving.log" "tls_serving"
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
+          assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+      - name: Run ACME-gated tests (certificate provisioning + renewal)
+        # `acme` is not a default feature either, so the workspace `cargo test`
+        # above compiles neither `acme`'s in-module suite nor `acme_end_to_end`.
+        # That suite is the behavioural proof for #1608 — first-boot issuance and
+        # the HTTP→HTTPS redirect, a forced near-expiry rotation with no restart,
+        # a restart reusing the stored account and certificate, and a failed order
+        # reaching health plus the error-reporting seam — driven through a real
+        # `instant-acme` client against an in-process fake CA (`acme_fake_ca`).
+        # No Docker and no network, so it belongs in this fast lane rather than
+        # the Docker sweep below.
+        #
+        # The `tls` half of this path is covered by the direct-TLS step above;
+        # `acme` implies `tls`, so this step deliberately runs only the ACME
+        # suites rather than rebuilding and re-running those.
+        #
+        # Linux only, and `assert_ran` for the same two reasons the step above
+        # gives: the renewal tests wait on real elapsed time, and `cargo test`
+        # exits 0 when a filter matches NOTHING — so a cfg drift that stopped
+        # compiling these modules in would otherwise leave this step green with
+        # zero ACME coverage.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features acme --lib acme:: \
+            | tee "${RUNNER_TEMP}/acme-lib.log"
+          assert_ran "${RUNNER_TEMP}/acme-lib.log" "autumn-web acme unit tests"
+          cargo test -p autumn-web --features acme \
+            --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
+          assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
       - name: Run system-test harness (non-browser) tests
         # `system-tests` is not a default feature. The `cargo test --workspace`
         # above happens to compile it today only because `example-e2e` depends
