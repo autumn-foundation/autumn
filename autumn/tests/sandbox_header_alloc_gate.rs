@@ -47,10 +47,10 @@ fn manifest() -> SandboxManifest {
     }
 }
 
-fn request(cookie: Option<String>) -> SandboxRequest {
+fn request(dropped: Option<(String, String)>) -> SandboxRequest {
     let mut headers = vec![("accept".to_owned(), "text/plain".to_owned())];
-    if let Some(cookie) = cookie {
-        headers.push(("Cookie".to_owned(), cookie));
+    if let Some((name, value)) = dropped {
+        headers.push((name, value));
     }
     SandboxRequest {
         method: "GET".to_owned(),
@@ -75,7 +75,10 @@ fn a_dropped_request_header_is_not_copied_before_it_is_dropped() {
     // allocating half a megabyte inside the window would swamp exactly the
     // difference this is looking for.
     let plain = request(None);
-    let with_credential = request(Some("s=".repeat(CREDENTIAL_BYTES / 2)));
+    let with_credential = request(Some((
+        "Cookie".to_owned(),
+        "s=".repeat(CREDENTIAL_BYTES / 2),
+    )));
 
     // Warm-up outside the measured windows too: whatever the first run sets up,
     // neither measurement should be charged for.
@@ -100,5 +103,43 @@ fn a_dropped_request_header_is_not_copied_before_it_is_dropped() {
         "serving a request with a {CREDENTIAL_BYTES}-byte dropped header allocated \
          {extra} bytes more than the same request without it — the header was \
          copied on its way to being discarded",
+    );
+}
+
+#[test]
+fn deciding_a_header_name_is_not_wanted_does_not_copy_the_name() {
+    // The value was the obvious half. The name is the same trap one step
+    // smaller: looking a header up in the allowlist by lower-casing it first
+    // allocates a copy of a string the caller chose the length of, purely to
+    // conclude it is not wanted. A dropped header is not charged against the
+    // metadata ceiling — rightly, it never crosses — so nothing else bounds
+    // how long that name may be.
+    //
+    // Same shape as the value gate, and measured for the same reason: the
+    // returned headers are identical whether the predicate compares in place
+    // or against a lower-cased copy.
+    let wasm = wat::parse_str(autumn_web::plugin_sandbox::test_guests::HELLO)
+        .expect("the fixture is valid WAT");
+    let host = SandboxHost::from_module(manifest(), &wasm).expect("loads");
+
+    let plain = request(None);
+    let with_long_name = request(Some(("X".repeat(CREDENTIAL_BYTES), "1".to_owned())));
+
+    drop(host.run(&plain));
+
+    let without = allocation_counter::measure(|| {
+        let outcome = host.run(&plain);
+        std::hint::black_box(&outcome);
+    });
+    let with = allocation_counter::measure(|| {
+        let outcome = host.run(&with_long_name);
+        std::hint::black_box(&outcome);
+    });
+
+    let extra = with.bytes_total.saturating_sub(without.bytes_total);
+    assert!(
+        extra < CREDENTIAL_BYTES as u64,
+        "deciding a {CREDENTIAL_BYTES}-byte header name is not on the allowlist \
+         allocated {extra} bytes — the name was copied in order to reject it",
     );
 }

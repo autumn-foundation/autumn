@@ -340,9 +340,10 @@ fn request_metadata_bytes(request: &SandboxRequest) -> usize {
         // frame is built and never reaches the guest — counting it here refused
         // a request that would have cost nothing, and made the public API
         // stricter than the adapter that is merely its politest caller.
-        .saturating_add(pairs_where(&request.headers, |name| {
-            super::wire::request_header_allowed(&name.to_ascii_lowercase())
-        }))
+        .saturating_add(pairs_where(
+            &request.headers,
+            super::wire::request_header_allowed,
+        ))
         .saturating_add(pairs(&request.path_params))
 }
 
@@ -447,22 +448,46 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
 ///
 /// Priced off the request's own bytes at [`BYTES_PER_FUEL`], the rate every
 /// other host-side copy pays, multiplied by the number of times those bytes are
-/// walked on the way to the guest's stdin: cloned into the frame, base64
-/// expanded, and serialised into JSON around it. That is the same factor the
-/// manifest's footprint check counts those buffers at, so one number describes
-/// both the memory and the CPU a request costs before it starts.
+/// walked on the way to the guest's stdin.
+///
+/// A flat multiplier over the *raw* input was the wrong shape, because the
+/// passes are not all over the raw input. The body is base64-encoded, which
+/// expands it by 4/3, and every walk after that is over the expansion.
+/// Metadata is JSON-escaped, and `serde_json` writes a control character as
+/// `\u0000` — six bytes for one — so a direct caller filling a header value
+/// with them expands it sixfold. Then [`HostState::seed_from`] reads the
+/// finished line end to end, so the largest single walk is over the expanded
+/// form, not the raw one. Charging four times the raw bytes let a request buy
+/// host work the ceiling never saw.
+///
+/// So body and metadata are priced separately, each at its own worst-case
+/// expansion:
+///
+/// | | raw passes | expanded passes | charged |
+/// |---|---|---|---|
+/// | body | clone, encode-read | encode-write, copy into line, seed scan | `2 + 3 × 4/3 = 6` |
+/// | metadata | clone, escape-read | escape-write, seed scan | `2 + 2 × 6 = 14` |
+///
+/// Both are upper bounds rather than measurements, because this runs *before*
+/// the line exists — that is the point of it. The expansion factors are the
+/// same ones [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::manifest::ResourceLimits::request_footprint_bytes)
+/// budgets memory at, so the two describe the same request.
 fn encoding_fuel(request: &SandboxRequest) -> u64 {
-    /// Times the request's bytes are walked building the frame.
-    const PASSES: u64 = 4;
+    /// Raw-equivalent walks of the body: two over the raw bytes, three over the
+    /// base64 expansion of them, which is 4/3. `2 + 3 × 4/3` is exactly 6.
+    const BODY_PASSES: u64 = 6;
+    /// Raw-equivalent walks of the metadata: two over the raw bytes, two over a
+    /// JSON escaping that can reach six bytes per byte.
+    const METADATA_PASSES: u64 = 14;
 
-    let bytes = request
-        .body
-        .len()
-        .saturating_add(request_metadata_bytes(request));
+    let charge = |bytes: usize, passes: u64| {
+        u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(passes)
+    };
 
-    u64::try_from(bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(PASSES)
+    charge(request.body.len(), BODY_PASSES)
+        .saturating_add(charge(request_metadata_bytes(request), METADATA_PASSES))
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(1)
@@ -4178,6 +4203,95 @@ path = "/hello/greet"
         .expect("the fixture is valid WAT");
         SandboxHost::from_module(manifest_with(ResourceLimits::default()), &passive)
             .expect("a passive element segment must still load");
+    }
+
+    #[test]
+    fn deciding_a_header_does_not_cross_costs_nothing_to_decide() {
+        // The value clone was the obvious half. The name is the same trap one
+        // step smaller: looking a header up in the allowlist by lower-casing it
+        // first allocates a copy of a string the caller chose the length of, in
+        // order to conclude it is not wanted. And a dropped header is no longer
+        // charged against the metadata ceiling — rightly, it never crosses —
+        // so nothing bounds how large that name may be.
+        //
+        // The predicate now compares in place. Asserted by behaviour rather
+        // than by allocation here (`tests/sandbox_header_alloc_gate.rs` does
+        // the measuring): a name that cannot be an allowlisted header must be
+        // rejected without the length ever mattering.
+        let enormous = "x".repeat(4 * 1024 * 1024);
+        assert!(!super::super::wire::request_header_allowed(&enormous));
+
+        // Case-insensitive, because HTTP header names are — which is what lets
+        // the caller skip the lower-casing rather than merely defer it.
+        assert!(super::super::wire::request_header_allowed("Accept"));
+        assert!(super::super::wire::request_header_allowed("ACCEPT"));
+        assert!(super::super::wire::request_header_allowed("accept"));
+        assert!(!super::super::wire::request_header_allowed("Cookie"));
+
+        // And the canonical form is still what reaches the guest, so accepting
+        // a mixed-case name does not mean forwarding one.
+        let canonical = super::super::wire::canonicalize_headers(&[(
+            "AcCePt".to_owned(),
+            "text/plain".to_owned(),
+        )]);
+        assert_eq!(
+            canonical,
+            vec![("accept".to_owned(), "text/plain".to_owned())],
+        );
+    }
+
+    #[test]
+    fn encoding_fuel_prices_the_line_that_is_written_not_the_bytes_handed_in() {
+        // A flat multiplier over the raw input under-charged, because most of
+        // the walks are over the *expanded* form: base64 grows the body by 4/3
+        // and every pass after the encode is over that, while `serde_json`
+        // writes a control character as six bytes and `seed_from` then reads
+        // the whole finished line. A request could buy host work the ceiling
+        // never saw.
+        //
+        // Measured against what the serialiser actually writes, so the factors
+        // cannot drift from the encoding they claim to cover.
+        let granted = [SandboxCapability::HttpRequest];
+
+        let mut request = get("/hello/greet");
+        request.body = vec![b'x'; 60_000];
+        let line = crate::plugin_sandbox::wire::to_line(
+            &crate::plugin_sandbox::wire::HostFrame::request(&request, &granted),
+        )
+        .expect("serialises")
+        .len();
+
+        // The charge has to cover writing that line and reading it back at
+        // least once — the seed scan — on top of the copies before it.
+        let charged_bytes = encoding_fuel(&request).saturating_mul(BYTES_PER_FUEL);
+        assert!(
+            charged_bytes >= (line as u64).saturating_mul(2),
+            "the charge ({charged_bytes}) is under writing and re-reading a \
+             {line}-byte line",
+        );
+
+        // The metadata side expands further than the body does, so it must be
+        // charged at a higher rate rather than at one flat factor for both.
+        let mut escaped = get("/hello/greet");
+        escaped.query = "\u{0}".repeat(10_000);
+        let mut plain = get("/hello/greet");
+        plain.query = "a".repeat(10_000);
+        assert!(
+            encoding_fuel(&escaped) == encoding_fuel(&plain),
+            "the charge is computed from raw sizes, so it must not vary with \
+             content — it is an upper bound taken before the line exists",
+        );
+        let escaped_line = crate::plugin_sandbox::wire::to_line(
+            &crate::plugin_sandbox::wire::HostFrame::request(&escaped, &granted),
+        )
+        .expect("serialises")
+        .len();
+        let escaped_charge = encoding_fuel(&escaped).saturating_mul(BYTES_PER_FUEL);
+        assert!(
+            escaped_charge >= (escaped_line as u64).saturating_mul(2),
+            "the charge ({escaped_charge}) is under writing and re-reading a \
+             JSON-escaped {escaped_line}-byte line",
+        );
     }
 
     #[test]

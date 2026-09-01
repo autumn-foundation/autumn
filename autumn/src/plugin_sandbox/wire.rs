@@ -94,10 +94,20 @@ pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "user-agent",
 ];
 
-/// Whether a request header of this (lower-cased) name may cross into a guest.
+/// Whether a request header of this name may cross into a guest.
+///
+/// Case-insensitive, and deliberately so: HTTP header names are, and a caller
+/// that had to lower-case first would have to *allocate* first. That allocation
+/// was the whole cost of deciding a header does not cross — a name arrives from
+/// an untrusted `SandboxRequest`, is not bounded by the metadata ceiling once it
+/// is dropped, and copying it in order to refuse it is work an attacker chooses
+/// the size of. `eq_ignore_ascii_case` compares the borrowed name in place and
+/// rejects on length before it looks at a byte.
 #[must_use]
 pub fn request_header_allowed(name: &str) -> bool {
-    ALLOWED_REQUEST_HEADERS.contains(&name)
+    ALLOWED_REQUEST_HEADERS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
 }
 
 /// Response headers a sandboxed plugin may set.
@@ -672,19 +682,22 @@ pub(crate) enum GuestFrame {
 /// changed.
 #[must_use]
 pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    // Filtered before the clone, not after. Cloning first and discarding on the
-    // next step duplicated every byte of headers that never reach the guest —
-    // and once the metadata ceiling stopped charging for those headers (rightly,
-    // since they are dropped) nothing else stood between a direct
-    // `SandboxHost::run` caller and an arbitrarily large `Cookie` being copied
-    // in full before being thrown away. `filter_map` also lower-cases once
-    // rather than twice, and clones only what survives.
+    // Filtered before anything is allocated, not after. Cloning first and
+    // discarding on the next step duplicated every byte of headers that never
+    // reach the guest — and once the metadata ceiling stopped charging for
+    // those headers (rightly, since they are dropped) nothing else stood
+    // between a direct `SandboxHost::run` caller and an arbitrarily large
+    // credential being copied in full before being thrown away.
+    //
+    // The *name* is the same trap one step smaller: lower-casing it to look it
+    // up allocates a copy of a string the caller chose the length of, in order
+    // to decide it is not wanted. `request_header_allowed` compares the
+    // borrowed name case-insensitively, so nothing is allocated until a header
+    // has earned it.
     let mut out: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(name, value)| {
-            let name = name.to_ascii_lowercase();
-            request_header_allowed(&name).then(|| (name, value.clone()))
-        })
+        .filter(|(name, _)| request_header_allowed(name))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect();
     out.sort_by(|(left, _), (right, _)| left.cmp(right));
     out
