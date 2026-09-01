@@ -59,6 +59,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sinks keep compiling untouched. See the
   [migration guide](docs/migrations/next.md).
 
+- **One-command plugin install — `autumn plugin add` / `autumn plugin list`
+  (#1606):** Autumn had a real plugin seam (the `Plugin` trait, first-party
+  plugin crates, a crates.io naming convention, an author-facing
+  `autumn plugin-check`) and no consumer-facing tooling at all: using a shipped
+  capability meant finding the crate, hand-editing `Cargo.toml`, hand-writing
+  the `.plugin(...)` mount, and reading config docs — four places to pick an
+  incompatible version or misconfigure the mount. `autumn plugin list` now shows
+  every installable plugin with a one-line description and the version
+  compatible with the app's `autumn-web` — the five first-party crates plus
+  community crates discovered on crates.io through the documented
+  `autumn-plugin-<name>` convention (`--json` for machine-readable output,
+  `--offline` to skip the lookup). `autumn plugin add <name>` performs the whole
+  install: the dependency at a compatible version, the mount spliced into the
+  `autumn_web::app()` builder chain, and the post-install steps (config keys,
+  follow-up generators like `autumn generate admin`) printed.
+
+  Every refusal is total rather than partial. The version gate runs before a
+  single filesystem action exists, so installing a plugin whose supported
+  `autumn-web` range excludes the app fails naming both versions with the app
+  byte-identical. A second `add` of the same plugin reports it as already
+  installed and changes nothing — no duplicate dependency, no duplicate mount.
+  And when the builder chain cannot be edited confidently (a heavily customized
+  `main.rs`, or a one-line chain with nowhere to splice a call) the command
+  writes **nothing** and prints the exact dependency line and mount snippet to
+  apply by hand, so it can never leave an app in a non-compiling state. Community
+  crates get their dependency written but never an automatic mount: the
+  `<Name>Plugin` is derived from the naming convention and printed, because
+  nothing outside that crate can verify it. A CI gate installs every first-party
+  plugin into a fresh `autumn new` scaffold and requires a green `cargo check`.
+
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
   runtime — `log/filter.rs` scrubbed a key denylist, `http_client.rs` redacted
@@ -237,6 +267,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused connections and 100% carry-over under sustained load across the
   cutover) and the guide in `docs/guide/hot-upgrades.md`. Issue #1674.
 
+- **Direct HTTPS is now proven end-to-end, not just at the listener:** serving
+  TLS in-process (`[server.tls]`) had coverage for the listener itself, but
+  nothing exercised the rest of the app surface through it — so "everything
+  behaves the same under TLS" was a claim rather than a test.
+  `tls_app_surface.rs` now serves the **same** router twice, once over the real
+  `TlsListener` and once over plain TCP, and requires the framework probes
+  (`/health`, `/live`, `/ready`, `/startup`) and `/actuator/health` to match on
+  status, body, and content type; it drives the inbound
+  request timeout (a slow handler still 503s, a fast one still doesn't), an SSE
+  stream (events arrive incrementally and outlive the request deadline), a
+  `wss://` WebSocket echo, and a graceful shutdown that drains an in-flight
+  HTTPS request. A new blocking CI lane runs the whole `tls` suite, which the
+  workspace `cargo test` — where `tls` is off by default — never compiled.
+  Renewal is covered the same way: the mtime-polling reloader moved out of
+  `app.rs` into `autumn_web::tls::CertReloader`, so a test can rewrite the cert
+  and key on disk and watch the served certificate change with the site up and
+  no restart. `autumn/src/tls.rs` also joins the determinism seam gate, so its
+  one deliberate wall-clock read (certificate validity) stays the only one in
+  that module.
+  Issue #1603.
+
+- **The release-image boot gate now covers an HTTPS boot** (a new
+  `https-target` job): it builds the generated image with the `tls` feature on,
+  boots it with a self-signed test certificate supplied through
+  `AUTUMN_SERVER__TLS__*`, and requires an HTTPS `/health` + `/actuator/health`
+  200 validated with `--cacert` (not `-k`), that plain HTTP on the same port
+  does *not* answer, and that the container's own HEALTHCHECK reaches
+  `healthy`. `docs/guide/tls.md` gains the matching "Serving HTTPS from the
+  release image" walkthrough — including that the `tls` feature must be a
+  default feature for the image's `cargo build --release` to link it — and a
+  "What behaves the same under TLS" section naming the two things that
+  deliberately differ (no Unix socket, no in-place upgrade handoff). Issue
+  #1603.
+
 ### Changed
 
 - **The `Listening` log line now reports the address actually bound** rather
@@ -365,6 +429,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
 ### Fixed
+
+- **A container that terminates TLS itself is no longer permanently
+  `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
+  `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app
+  serves direct HTTPS (`[server.tls]`) failed every probe — Docker marked it
+  unhealthy forever, and in the generated `docker-compose.yml` anything waiting
+  on `condition: service_healthy` never started. The probe URL is now
+  `${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}`, so the default is
+  byte-for-byte today's plain-HTTP check and an HTTPS deployment sets that plus
+  `AUTUMN_HEALTHCHECK_INSECURE=1`. The second variable is needed because the
+  probe is a loopback call to the container's own listener while the
+  certificate is issued to the app's public hostname, so it can never validate
+  as `localhost`; it is an explicit opt-in rather than something inferred from
+  the URL, because `user@host`, `#fragment` and lookalike hostnames all yield
+  URLs that read as loopback but that curl resolves elsewhere. Unset — the
+  default — the probe always verifies. Issue #1603.
 
 - **CSV import row numbers are now the same for CRLF and LF files:**
   `autumn_web::data::csv::import_csv` reports a 1-based line number for every
@@ -1174,6 +1254,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bytes barely move — each wasted allocation is a handful of bytes against a
   ~22KB/render budget dominated by larger buffers — but the block-count and
   instruction-count deltas both clear the impact floor on their own.
+
+- **scaffolded form helpers pre-escape their own field values, labels, and
+  error text instead of letting `maud::html!` re-scan them byte by byte:**
+  `text_input`, `password_input`, `textarea_input`, `number_input`,
+  `checkbox_input`, `date_input` built every dynamic string — the field's
+  current value, its label, its `id`/`name`, and any validation-error text —
+  through `maud::html!`'s ordinary `(expr)` splice, which calls
+  `maud::escape::escape_to_string`: a loop that matches and pushes one byte
+  at a time even when nothing needs escaping. Profiling the committed
+  `autumn/benches/form_render.rs` workload showed that loop was 26% of the
+  release-build instruction count on a realistic 12-field form.
+
+  A new `Esc` type implements `maud::Render` directly (`autumn_web::form`)
+  and writes the escaped bytes straight into `html!`'s own output buffer
+  via one bulk `push_str` per clean run instead of one call per byte — an
+  earlier version of this fix pre-built an owned, escaped `String` and
+  handed it to `maud::PreEscaped`, which a reviewer (Codex) correctly
+  flagged as a second, avoidable copy for any value that actually needs
+  escaping; writing straight into `html!`'s buffer needs only the one copy
+  `escape_to_string` was already doing, in every case. `fast_escape` (used
+  only to build `id`/`name`-derived strings like `"{field}-error"` ahead of
+  a `html!` block, where the result has to be a concatenatable `str` rather
+  than something written into a buffer) still returns the input completely
+  unallocated when nothing needs escaping. Output is byte-for-byte
+  unchanged — checked against a naive reference by a proptest over
+  arbitrary strings (including multi-byte UTF-8), and by the unchanged 209
+  `form`/`nested_form` lib tests.
+
+  Measured with the committed `autumn/benches/form_render.rs` harness and
+  the existing `autumn/tests/form_render_alloc_gate.rs` allocation gate
+  (both the same 12-field workload), `valgrind --tool=callgrind`, before
+  and after on the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 185,711,127 | 159,908,641 | **-13.90%** |
+  | `maud::escape::escape_to_string` instructions | 48,339,450 (26.0%) | 0 (eliminated) | **-100%** |
+  | Allocation blocks (200 renders) | 20,800 | 20,800 | unchanged |
+  | Allocation bytes (200 renders) | 4,495,800 | 4,604,600 | +2.4% |
+
+  Allocation *count* is unchanged — escaping never allocates for this
+  fixture's clean values (and, with the direct-`Render` design, never
+  allocates a temporary buffer even when a value *does* need escaping).
+  Bytes rose slightly: `maud_macros` sizes each `html!` block's output
+  buffer from the *source token length* of the macro invocation, not
+  runtime content, and the interpolations calling into `Esc`/`fast_escape`
+  read as "expect more output" than the plain, unescaped splices they
+  replaced. That reservation is never grown again (the unchanged block
+  count proves it), so it's unused slack, not extra allocator work — see
+  `form_render_alloc_gate.rs` for the full explanation and its updated
+  ceiling.
 
 ## [0.7.0] - 2026-08-23
 

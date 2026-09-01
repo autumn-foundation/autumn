@@ -1422,6 +1422,49 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
+
+**Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
+One command adds the dependency at a version compatible with the app's
+`autumn-web`, mounts the plugin in the `autumn_web::app()` chain, and prints
+the post-install steps (config keys, follow-up generators):
+
+```bash
+autumn plugin list                      # name, description, compatible version
+autumn plugin list --json --offline     # machine-readable; skip the crates.io lookup
+autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
+autumn plugin add autumn-cache-redis --dry-run
+```
+
+`list` covers the five first-party crates (`autumn-admin-plugin`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`) plus community crates found on crates.io under the
+documented `autumn-plugin-<name>` convention.
+
+Four behaviours worth knowing before advising on it:
+
+- **Idempotent.** A second `add` reports "already installed" and changes
+  nothing. It also detects a mount written by hand behind a `use` import, so
+  it will not splice a second, default-constructed mount over a configured one.
+- **Version-gated before any write.** Installing into an app on an
+  incompatible `autumn-web` fails naming both versions, with the app
+  byte-identical. First-party plugins ship in lockstep with `autumn-web` and
+  the CLI, so the version installed is the CLI's — an app on an older line
+  needs the matching CLI, or `autumn upgrade`.
+- **It degrades rather than guessing.** If the `autumn_web::app()` chain
+  cannot be found unambiguously inside `async fn main` — a builder factored
+  into a helper, a one-line chain, two candidate lines — it writes *nothing*
+  and prints the dependency line and mount snippet on stderr, exiting 2. It
+  never leaves an app that does not compile.
+- **Community crates get the dependency only.** The `<Name>Plugin` mount is
+  derived from the naming convention and printed, not spliced: nothing outside
+  that crate can verify it exposes one.
+
+It writes no `features = [...]` onto the app's `autumn-web` dependency — each
+plugin crate already carries the features its mount needs and Cargo unifies
+them. `autumn plugin-check` is the separate, author-facing conformance gate;
+`autumn generate plugin` scaffolds a new plugin crate.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -2175,6 +2218,8 @@ autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
+autumn plugin list
+autumn plugin add autumn-admin-plugin
 ```
 
 **(0.6.0)** CLI additions — absent from a 0.5.x `autumn-cli`, but present in
@@ -2217,6 +2262,8 @@ autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever
 autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
 autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
+autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
+autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
