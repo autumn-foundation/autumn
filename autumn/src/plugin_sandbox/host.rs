@@ -1920,7 +1920,7 @@ const CUSTOM_SECTION: u8 = 0;
 /// loading may *cost*: these say the module can be built at all. Each one
 /// stands for a defect where the artifact loaded clean, inspected clean, and
 /// then failed every single request it was ever given.
-fn refuse_unrunnable_shape(
+const fn refuse_unrunnable_shape(
     shape: &ModuleShape,
     initial_bytes: u64,
 ) -> Result<(), SandboxLoadError> {
@@ -1936,34 +1936,6 @@ fn refuse_unrunnable_shape(
             what: "linear memory",
             end: shape.data_end,
             capacity: initial_bytes,
-        });
-    }
-
-    // The same argument as the memory ceiling above, for the other
-    // per-instance store the limiter guards. `table_growing` refuses a
-    // total past `MAX_TABLE_ELEMENTS` at instantiation — which is per
-    // request — so a module whose tables are *already* over it at rest
-    // loads cleanly and then fails every request it is ever given. Said
-    // once here, it is a verdict `autumn plugin inspect` can be trusted on.
-    if shape.memory_count > MAX_MEMORIES {
-        return Err(SandboxLoadError::InstantiationTooExpensive {
-            what: "linear memories",
-            found: shape.memory_count,
-            max: MAX_MEMORIES,
-        });
-    }
-    if shape.table_count > MAX_TABLES {
-        return Err(SandboxLoadError::InstantiationTooExpensive {
-            what: "tables",
-            found: shape.table_count,
-            max: MAX_TABLES,
-        });
-    }
-    if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
-        return Err(SandboxLoadError::InstantiationTooExpensive {
-            what: "initial table elements",
-            found: usize::try_from(shape.table_elements).unwrap_or(usize::MAX),
-            max: MAX_TABLE_ELEMENTS as usize,
         });
     }
 
@@ -2231,6 +2203,40 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             what: "globals",
             found: shape.global_count,
             max: MAX_GLOBALS,
+        });
+    }
+    // The per-instance stores the limiter guards. These say the module can be
+    // built at all, so they read as runnability rules — but they are also cost
+    // ceilings, and that is what decides where they live. A module declaring
+    // hundreds of thousands of empty memories or tables sits under
+    // `MAX_DECLARED_ENTRIES` and is refused by these anyway, so compiling it
+    // first buys a representation of every declaration on the way to a verdict
+    // that never depended on one. Checked after that compile, they were the
+    // right answer at the wrong time.
+    //
+    // All three move together. `table_elements` is the same argument as the
+    // other two — tables already over the ceiling at rest are refused whatever
+    // `Module::new` would say — and leaving it behind would be the half-fix
+    // this file warns about elsewhere.
+    if shape.memory_count > MAX_MEMORIES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "linear memories",
+            found: shape.memory_count,
+            max: MAX_MEMORIES,
+        });
+    }
+    if shape.table_count > MAX_TABLES {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "tables",
+            found: shape.table_count,
+            max: MAX_TABLES,
+        });
+    }
+    if shape.table_elements > u64::from(MAX_TABLE_ELEMENTS) {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "initial table elements",
+            found: usize::try_from(shape.table_elements).unwrap_or(usize::MAX),
+            max: MAX_TABLE_ELEMENTS as usize,
         });
     }
     if shape.declared_entries > MAX_DECLARED_ENTRIES {
@@ -4562,6 +4568,25 @@ path = "/hello/greet"
             "{err:?}",
         );
 
+        // And refused *before* `Module::new`, not after it. The pre-compilation
+        // gate is a separate function precisely so that a shape guaranteed to
+        // be rejected does not first get a representation built for every
+        // declaration in it — so the ceiling has to live there rather than
+        // merely be reached eventually. Asserted by calling that gate directly:
+        // it is what runs ahead of the compiler.
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("the pre-compilation gate must refuse it, not a later one");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "linear memories",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+
         // One memory is the normal case and still loads.
         let single = wat::parse_str(
             r#"(module (memory (export "memory") 1) (func (export "_start") (nop)))"#,
@@ -4569,6 +4594,61 @@ path = "/hello/greet"
         .expect("the fixture is valid WAT");
         SandboxHost::from_module(manifest_with(ResourceLimits::default()), &single)
             .expect("a single-memory module must still load");
+    }
+
+    #[test]
+    fn a_swarm_of_empty_tables_is_refused_before_anything_is_compiled() {
+        // The sibling of the memory case, and the reason all three ceilings
+        // moved together. A module can declare far more tables than
+        // `MAX_TABLES` while staying under `MAX_DECLARED_ENTRIES`, so nothing
+        // else refuses it — and while the table ceiling did refuse it, it
+        // refused after `Module::new` had already built a representation of
+        // every declaration. The right answer at the wrong time.
+        let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
+        for _ in 0..=MAX_TABLES {
+            wat.push_str("  (table 0 funcref)\n");
+        }
+        wat.push_str("  (func (export \"_start\") (nop))\n)");
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        // Under the aggregate ceiling, so `MAX_DECLARED_ENTRIES` is not what
+        // catches this — otherwise the test would pass for the wrong reason.
+        let shape = module_shape(&wasm).expect("the header walk must not fail");
+        assert!(
+            shape.declared_entries <= MAX_DECLARED_ENTRIES,
+            "the fixture is caught by the aggregate ceiling, not the table one",
+        );
+
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("the pre-compilation gate must refuse too many tables");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive { what: "tables", .. }
+            ),
+            "{err:?}",
+        );
+
+        // And the third of the three: tables that are already over the element
+        // ceiling at rest, also refused before compiling.
+        let heavy = wat::parse_str(format!(
+            "(module (memory (export \"memory\") 1) (table {} funcref) \
+             (func (export \"_start\") (nop)))",
+            u64::from(MAX_TABLE_ELEMENTS) + 1,
+        ))
+        .expect("the fixture is valid WAT");
+        let err = refuse_unbounded_shape(&heavy)
+            .expect_err("the pre-compilation gate must refuse oversized tables");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "initial table elements",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
     }
 
     #[test]
