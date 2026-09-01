@@ -414,7 +414,11 @@ impl LiveEventBusPublisher {
                         "distributed.live_feed_bus.redis_url is required when kind = redis_pubsub",
                     )
                 })?;
-                let client = redis::Client::open(redis_url)
+                // `open_client`, not `redis::Client::open`: a `rediss://` URL
+                // (Azure Redis Cache only offers TLS) panics inside rustls
+                // unless a process-level CryptoProvider is installed first.
+                // See `autumn_web::redis_tls` and issue #2172.
+                let client = autumn_web::redis_tls::open_client(redis_url)
                     .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
                 LiveEventBusPublisherInner::RedisPubSub {
                     channel: config.channel.clone(),
@@ -719,7 +723,7 @@ async fn connect_redis_live_event_listener(
         warn!("distributed.live_feed_bus.redis_url is missing; falling back to polling");
         return None;
     };
-    match redis::Client::open(redis_url) {
+    match autumn_web::redis_tls::open_client(redis_url) {
         Ok(client) => setup_redis_pubsub(client, channel).await,
         Err(error) => {
             warn!(
@@ -1245,6 +1249,33 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
 
 #[cfg(test)]
 mod tests {
+    /// The live-feed bus must open its Redis clients through
+    /// `autumn_web::redis_tls::open_client`. A managed Redis (Azure Redis
+    /// Cache, ElastiCache with transit encryption) only offers `rediss://`,
+    /// and a bare `redis::Client::open` on that scheme panics inside rustls
+    /// unless a process-level `CryptoProvider` was installed first (#2172).
+    /// Examples get copied, so the wrong pattern must not survive here.
+    #[test]
+    fn redis_clients_are_opened_through_the_shared_tls_guard() {
+        // Split so the needle does not match this test's own source line.
+        let needle = concat!("redis::Client::", "open(");
+        let offenders: Vec<_> = include_str!("live_events.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && line.contains(needle)
+            })
+            .map(|(index, line)| format!("live_events.rs:{}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "use `autumn_web::redis_tls::open_client` so a `rediss://` URL \
+             cannot panic inside rustls (#2172):\n{}",
+            offenders.join("\n")
+        );
+    }
+
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;

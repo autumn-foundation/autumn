@@ -474,6 +474,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rediss://` no longer panics at startup, in any Redis-backed subsystem
+  (#2172):** `redis`'s `tokio-rustls-comp` builds its TLS `ClientConfig`
+  through `rustls::ClientConfig::builder()`, which *panics* rather than
+  erroring when no process-level `CryptoProvider` is installed — and rustls
+  can only resolve one implicitly while exactly one of its `ring`/`aws-lc-rs`
+  features is on, which Cargo's whole-graph feature unification can break from
+  any dependency (`telemetry-otlp` alone is enough). Only `autumn-cache-redis`
+  guarded against this; sessions, channels, the Redis job queue, job tracking,
+  idempotency, webhook replay and Redis rate limiting each opened their own
+  unguarded client. Since the `azure-container-apps` release target provisions
+  a Redis Cache with `non_ssl_port_enabled = false` — it can only ever hand the
+  app a `rediss://` URL — pointing any of those subsystems at it crashed the
+  app on boot.
+
+  Every Redis client the framework opens now goes through
+  `autumn_web::redis_tls::open_client`, which installs `ring` once,
+  idempotently, and only when the URL is a TLS one — decided by asking the
+  `redis` crate to parse it and checking whether it resolved to a TLS address,
+  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
+  accepts are all covered without a scheme list to keep in sync. (The previous
+  `starts_with("rediss://")` check had already missed both.) A plaintext
+  `redis://` URL deliberately does **not** claim the process-wide default, so
+  it cannot pre-empt an application that installs `aws-lc-rs` for something
+  else, and an already-installed provider is always kept rather than replaced.
+  `autumn-cache-redis` now delegates to the same guard instead of carrying its
+  own copy, and a source scan in each crate keeps a future subsystem from
+  re-opening the hole with a bare `redis::Client::open`.
+
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
   `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app

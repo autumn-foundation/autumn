@@ -7648,7 +7648,7 @@ fn start_redis_runtime(
             ))
         })?;
 
-    let client = redis::Client::open(url).map_err(|e| {
+    let client = crate::redis_tls::open_client(&url).map_err(|e| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
             "invalid jobs redis url: {e}"
         )))
@@ -12064,7 +12064,7 @@ mod tests {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
         let url = format!("redis://127.0.0.1:{port}");
-        (container, redis::Client::open(url).unwrap())
+        (container, crate::redis_tls::open_client(&url).unwrap())
     }
 
     #[cfg(feature = "redis")]

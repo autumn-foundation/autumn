@@ -615,7 +615,7 @@ impl SessionConfig {
 
                 #[cfg(feature = "redis")]
                 {
-                    if let Err(error) = redis::Client::open(url.clone()) {
+                    if let Err(error) = crate::redis_tls::open_client(&url) {
                         return Err(SessionBackendConfigError::InvalidRedisUrl(
                             error.to_string(),
                         ));
