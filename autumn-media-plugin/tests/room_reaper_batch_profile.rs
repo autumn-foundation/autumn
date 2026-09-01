@@ -291,6 +291,10 @@ struct StatementRow {
     calls: i64,
     #[diesel(sql_type = BigInt)]
     buffers: i64,
+    #[diesel(sql_type = BigInt)]
+    temp_read: i64,
+    #[diesel(sql_type = BigInt)]
+    temp_written: i64,
 }
 
 fn reset_stats(conn: &mut PgConnection) {
@@ -318,7 +322,8 @@ struct Profile {
 fn print_profile(conn: &mut PgConnection, label: &str) -> Profile {
     println!("\n=== pg_stat_statements: {label} ===");
     let rows = diesel::sql_query(
-        "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers \
+        "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers, \
+                temp_blks_read AS temp_read, temp_blks_written AS temp_written \
          FROM pg_stat_statements \
          WHERE query ILIKE '%media_room%' \
            AND query NOT ILIKE '%pg_stat_statements%' \
@@ -332,12 +337,15 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> Profile {
     let (mut delete_room_calls, mut delete_room_buffers) = (0i64, 0i64);
     let (mut cascade_calls, mut cascade_buffers) = (0i64, 0i64);
     let (mut sweep_calls, mut sweep_buffers) = (0i64, 0i64);
+    let (mut temp_read, mut temp_written) = (0i64, 0i64);
     for row in &rows {
         let normalized = row.query.split_whitespace().collect::<Vec<_>>().join(" ");
         println!(
-            "calls={:<6} buffers={:<8} {normalized}",
-            row.calls, row.buffers
+            "calls={:<6} buffers={:<8} temp_read={:<4} temp_written={:<4} {normalized}",
+            row.calls, row.buffers, row.temp_read, row.temp_written
         );
+        temp_read += row.temp_read;
+        temp_written += row.temp_written;
         // Diesel quotes every identifier; drop the quotes (and the `ONLY
         // public.` the FK cascade's internal RI statement carries) so the
         // match below is against bare table names.
@@ -372,7 +380,8 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> Profile {
          buffers={count_buffers} -- media_rooms DELETE calls={delete_room_calls} \
          buffers={delete_room_buffers} -- FK cascade calls={cascade_calls} \
          buffers={cascade_buffers} -- phase-1 sweep calls={sweep_calls} \
-         buffers={sweep_buffers} --"
+         buffers={sweep_buffers} -- temp_blks_read={temp_read} \
+         temp_blks_written={temp_written} (all media_room statements) --"
     );
     Profile {
         candidate_scan_calls,

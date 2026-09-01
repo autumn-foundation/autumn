@@ -345,6 +345,14 @@ jobs:
           cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          # Media-room reaper phase-2 profiling harness: asserts the sweep's
+          # reap set, its boundary cases (created_at / last_seen_at exactly ON
+          # the cutoff), and its namespace isolation against a
+          # production-shaped fixture. Testcontainer-managed, so no `services:`
+          # block. NOTE: autumn-media-plugin has no crate-wide `--ignored`
+          # sweep, so `tests/room_store_db.rs`'s own Docker tests still run
+          # nowhere in CI — a pre-existing gap, not addressed here.
+          cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
           cargo test -p autumn-cache-redis -- --ignored
           # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
           # suites are testcontainer-managed, so no `services:` block is needed.
