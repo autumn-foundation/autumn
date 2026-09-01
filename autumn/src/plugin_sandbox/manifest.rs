@@ -841,44 +841,53 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
 /// failure detail is evidence and has to survive to be read.
 pub(super) const fn is_display_reordering(ch: char) -> bool {
     matches!(ch,
-        // Unicode's format class (general category Cf), which is the class this
-        // is really asking about. Enumerated rather than queried because the
+        // Unicode's format class (general category Cf) that is *not* also
+        // default-ignorable. Enumerated rather than queried because the
         // standard library exposes no general-category predicate — `is_control`
         // answers for Cc only, and `is_whitespace` for the separators, so a
         // format character passes both.
+        '\u{0600}'..='\u{0605}'            // Arabic number signs
+        | '\u{06DD}'                        // Arabic end of ayah
+        | '\u{070F}'                        // Syriac abbreviation mark
+        | '\u{0890}'..='\u{0891}'          // Arabic pound and piastre marks
+        | '\u{08E2}'                        // Arabic disputed end of ayah
+        | '\u{110BD}'                       // Kaithi number sign
+        | '\u{110CD}'                       // Kaithi number sign above
+        | '\u{13430}'..='\u{1343F}'        // Egyptian hieroglyph formats
+        | '\u{FFF9}'..='\u{FFFB}'          // interlinear annotation
+
+        // Unicode's `Default_Ignorable_Code_Point` set, in full. This is the
+        // property that actually names the hazard — "a renderer may show
+        // nothing here" — and it is not the same set as Cf. Enumerating Cf and
+        // adding exceptions was the shape of two bugs in a row: first U+00AD
+        // SOFT HYPHEN, then U+115F HANGUL CHOSEONG FILLER, which is general
+        // category Lo. A *letter*, neither whitespace nor control nor format,
+        // that renders as nothing — so `/hello/ad\u{115F}min` reads as
+        // `/hello/admin` on the consent screen while the router mounts a path
+        // that is not it. The Hangul fillers below are the same trick four
+        // times over.
         //
-        // Listing selected ranges was not enough and the gap was invisible in
-        // the most literal sense: U+00AD SOFT HYPHEN renders as nothing at all,
-        // so `/hello/ad\u{00AD}min` reads as `/hello/admin` on the consent
-        // screen while mounting a path that is not it.
-        '\u{00AD}'                          // soft hyphen
-        | '\u{0600}'..='\u{0605}'            // Arabic number signs
-        | '\u{061C}'                         // Arabic letter mark
-        | '\u{06DD}'                         // Arabic end of ayah
-        | '\u{070F}'                         // Syriac abbreviation mark
-        | '\u{0890}'..='\u{0891}'            // Arabic pound and piastre marks
-        | '\u{08E2}'                         // Arabic disputed end of ayah
-        | '\u{180E}'                         // Mongolian vowel separator
-        | '\u{200B}'..='\u{200F}'            // zero-width, LRM/RLM
-        | '\u{202A}'..='\u{202E}'            // bidi embedding and override
-        | '\u{2060}'..='\u{2064}'            // word joiner and invisibles
-        | '\u{2066}'..='\u{2069}'            // bidi isolates
-        | '\u{206A}'..='\u{206F}'            // deprecated shaping and digit forms
-        | '\u{FEFF}'                         // zero-width no-break space
-        | '\u{FFF9}'..='\u{FFFB}'            // interlinear annotation
-        | '\u{110BD}'                        // Kaithi number sign
-        | '\u{110CD}'                        // Kaithi number sign above
-        | '\u{13430}'..='\u{1343F}'          // Egyptian hieroglyph formats
-        | '\u{1BCA0}'..='\u{1BCA3}'          // Duployan shorthand formats
-        | '\u{1D173}'..='\u{1D17A}'          // musical notation formats
-        | '\u{E0001}'                        // deprecated language tag
-        | '\u{E0020}'..='\u{E007F}'          // tag characters
-        // Not Cf, but display-altering by definition and just as invisible: the
-        // variation selectors and the combining grapheme joiner.
-        | '\u{034F}'                         // combining grapheme joiner
-        | '\u{180B}'..='\u{180D}'            // Mongolian free variation selectors
-        | '\u{FE00}'..='\u{FE0F}'            // variation selectors 1-16
-        | '\u{E0100}'..='\u{E01EF}'          // variation selectors 17-256
+        // Ranges that are partly unassigned (U+2065, U+FFF0..U+FFF8, most of
+        // the U+E0000 block) are covered deliberately: the property is stable
+        // for them, and a code point reserved to be invisible is exactly what a
+        // future spoof would reach for.
+        | '\u{00AD}'                        // soft hyphen
+        | '\u{034F}'                        // combining grapheme joiner
+        | '\u{061C}'                        // Arabic letter mark
+        | '\u{115F}'..='\u{1160}'          // Hangul choseong/jungseong filler
+        | '\u{17B4}'..='\u{17B5}'          // Khmer inherent vowels
+        | '\u{180B}'..='\u{180F}'          // Mongolian variation and vowel separators
+        | '\u{200B}'..='\u{200F}'          // zero-width, LRM/RLM
+        | '\u{202A}'..='\u{202E}'          // bidi embedding and override
+        | '\u{2060}'..='\u{206F}'          // word joiner, invisibles, isolates, deprecated
+        | '\u{3164}'                        // Hangul filler
+        | '\u{FE00}'..='\u{FE0F}'          // variation selectors 1-16
+        | '\u{FEFF}'                        // zero-width no-break space
+        | '\u{FFA0}'                        // halfwidth Hangul filler
+        | '\u{FFF0}'..='\u{FFF8}'          // reserved, default-ignorable
+        | '\u{1BCA0}'..='\u{1BCA3}'        // Duployan shorthand formats
+        | '\u{1D173}'..='\u{1D17A}'        // musical notation formats
+        | '\u{E0000}'..='\u{E0FFF}'        // tags and variation selectors 17-256
     )
 }
 
@@ -1257,6 +1266,35 @@ max_concurrency = 8
     }
 
     #[test]
+    fn an_invisible_letter_is_refused_though_no_format_class_contains_it() {
+        // The reason the Cf-plus-exceptions shape kept leaking. U+115F HANGUL
+        // CHOSEONG FILLER is general category Lo — a *letter*. It is not a
+        // control, not whitespace, not a format character, and `is_alphabetic`
+        // says yes about it. It also renders as nothing, which is the only
+        // property that matters here.
+        //
+        // So the predicate is written against `Default_Ignorable_Code_Point`,
+        // the property that actually names the hazard, rather than against a
+        // general category that happens to contain most of it.
+        for (ch, what) in [
+            ('\u{115F}', "hangul choseong filler"),
+            ('\u{1160}', "hangul jungseong filler"),
+            ('\u{3164}', "hangul filler"),
+            ('\u{FFA0}', "halfwidth hangul filler"),
+        ] {
+            assert!(
+                ch.is_alphabetic(),
+                "{what} is not a letter, so it does not test the gap that let it through",
+            );
+            assert!(
+                is_display_reordering(ch),
+                "{what} (U+{:04X}) renders as nothing and was admitted",
+                ch as u32,
+            );
+        }
+    }
+
+    #[test]
     fn an_invisible_format_character_in_a_route_is_refused_like_a_visible_one() {
         // The predicate listed the bidi and zero-width ranges and stopped
         // there, which left the most literally invisible case through: U+00AD
@@ -1279,6 +1317,15 @@ max_concurrency = 8
             ('\u{034F}', "combining grapheme joiner"),
             ('\u{FE0F}', "variation selector-16"),
             ('\u{E0041}', "tag latin capital A"),
+            // Default-ignorable but *not* format characters, which is how the
+            // Cf-plus-exceptions shape let them through a second time.
+            ('\u{115F}', "hangul choseong filler"),
+            ('\u{1160}', "hangul jungseong filler"),
+            ('\u{3164}', "hangul filler"),
+            ('\u{FFA0}', "halfwidth hangul filler"),
+            ('\u{17B4}', "khmer vowel inherent aq"),
+            ('\u{180F}', "mongolian free variation selector four"),
+            ('\u{2065}', "reserved, default-ignorable"),
         ] {
             assert!(
                 !ch.is_control() && !ch.is_whitespace(),
