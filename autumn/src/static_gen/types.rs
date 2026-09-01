@@ -140,15 +140,19 @@ pub struct ManifestEntry {
     /// explicit `"revalidate": null` made the shortest such entry fail to
     /// parse (which silently disables the whole static layer).
     ///
-    /// Deliberately *not* `skip_serializing_if`: making reads lenient is
-    /// backward compatible, but dropping the key from what `autumn build`
-    /// **writes** is not. A pre-#1832 runtime has no `#[serde(default)]` here,
-    /// so an omitted key is a hard `missing field` error for it — which fails
-    /// `StaticManifest::load`, returns `None` from `StaticFileLayer::new`, and
-    /// silently serves every pre-rendered page dynamically. That would break a
-    /// rollback, or a rolling deploy where old and new replicas share one
-    /// `dist/` volume. `content_type` is safe to skip because it is a *new*
-    /// key an old runtime ignores; `revalidate` is an existing required one.
+    /// Deliberately *not* `skip_serializing_if`, so what `autumn build` writes
+    /// keeps the exact shape it had before #1832 — `revalidate` has always been
+    /// present in generated manifests, and nothing is gained by dropping it.
+    /// That matters for any consumer of `dist/manifest.json` that is not this
+    /// struct: a rollback, a rolling deploy sharing one `dist/` volume, or
+    /// external tooling with a stricter reader.
+    ///
+    /// It is *not* needed for an older Autumn runtime, which reads either form:
+    /// serde's derive maps a missing `Option` field to `None` even without
+    /// `#[serde(default)]`, so omitting the key would not have failed there.
+    /// `content_type` is skipped when absent for the same
+    /// keep-the-format-boring reason in the other direction — it is a new key,
+    /// so not writing it leaves pre-#1832 manifests byte-identical.
     #[serde(default)]
     pub revalidate: Option<u64>,
     /// The `Content-Type` the route's handler declared when this page was
@@ -428,12 +432,12 @@ mod tests {
             serde_json::to_string(&ManifestEntry::new("about/index.html")).expect("serialize");
         assert!(
             json.contains("\"revalidate\""),
-            "revalidate must stay present in written manifests for pre-#1832 \
-             runtimes that require the key, got {json}"
+            "revalidate must stay present so generated manifests keep the shape \
+             they had before #1832, got {json}"
         );
 
-        // The half that *is* safe to omit: `content_type` is a new key an older
-        // runtime ignores, so skipping it costs nothing.
+        // `content_type` is a new key, so omitting it when absent keeps a
+        // manifest byte-identical to what pre-#1832 `autumn build` wrote.
         assert!(
             !json.contains("content_type"),
             "absent content_type must still be omitted, got {json}"

@@ -499,13 +499,13 @@ derivation runs unchanged), and an old runtime reads a new one (no
 `deny_unknown_fields`, so the extra key is ignored).
 
 `revalidate` gained `#[serde(default)]` — a hand-written entry may now omit it —
-but deliberately **not** `skip_serializing_if`. Leniency in what a new runtime
-*reads* is backward compatible; dropping a key from what `autumn build` *writes*
-is not. A pre-#1832 runtime declares `revalidate` with no default, so a missing
-key is a hard `missing field` error there: `StaticManifest::load` fails,
-`StaticFileLayer::new` returns `None`, and every pre-rendered page silently
-serves dynamically. Keeping the key written preserves rollback and rolling
-deploys that share one `dist/` volume.
+but deliberately **not** `skip_serializing_if`, so what `autumn build` writes
+keeps the shape it has always had. An older Autumn runtime would read either
+form (serde's derive maps a missing `Option` field to `None` even without
+`#[serde(default)]`), so this is not a compatibility fix; it is a decision to
+leave the generated format unchanged for anything else that reads
+`dist/manifest.json` — a rollback, a rolling deploy sharing one `dist/` volume,
+or external tooling with a stricter reader.
 
 ### New public items
 
