@@ -130,6 +130,11 @@ pub struct SandboxedPlugin {
     /// One permit per concurrently-executing request, so `max_concurrency ×
     /// memory_bytes` bounds what this plugin can cost the host at any instant.
     permits: Arc<Semaphore>,
+    /// The identity an operator reviewed, logged at mount so the grant in the
+    /// log can be compared with the one on the review screen. `None` when the
+    /// plugin was built from a bare host rather than an artifact — there is no
+    /// container to have an identity, and saying so beats inventing one.
+    artifact_sha256: Option<String>,
 }
 
 impl fmt::Debug for SandboxedPlugin {
@@ -149,6 +154,7 @@ impl SandboxedPlugin {
         Self {
             host: Arc::new(host),
             permits,
+            artifact_sha256: None,
         }
     }
 
@@ -159,7 +165,12 @@ impl SandboxedPlugin {
     /// Returns [`SandboxPluginError::Load`] if the module does not compile or
     /// imports something the sandbox does not provide.
     pub fn from_artifact(artifact: &SandboxArtifact) -> Result<Self, SandboxPluginError> {
-        Ok(Self::new(SandboxHost::load(artifact)?))
+        let mut plugin = Self::new(SandboxHost::load(artifact)?);
+        // The whole container, not just the module: the grant an operator
+        // reviewed is in the manifest, and the module digest does not move when
+        // that does. See `SandboxArtifact::artifact_digest`.
+        plugin.artifact_sha256 = Some(artifact.artifact_digest()?);
+        Ok(plugin)
     }
 
     /// Read, verify and load a `.autumn-plugin` file.
@@ -264,7 +275,14 @@ impl Plugin for SandboxedPlugin {
             plugin = manifest.name,
             version = manifest.version,
             prefix = manifest.prefix,
-            sha256 = manifest.sha256,
+            module_sha256 = manifest.sha256,
+            // The number to compare against the one `plugin inspect` printed:
+            // it covers the manifest too, so a grant rewritten after review
+            // does not match a log line from before it.
+            artifact_sha256 = self
+                .artifact_sha256
+                .as_deref()
+                .unwrap_or("(built from a host, not an artifact)"),
             capabilities = manifest
                 .capabilities
                 .iter()

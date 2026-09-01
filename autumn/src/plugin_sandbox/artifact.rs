@@ -262,6 +262,37 @@ impl SandboxArtifact {
         Ok(Self { manifest, module })
     }
 
+    /// The digest of the whole artifact — the manifest *and* the module.
+    ///
+    /// [`digest`](Self::digest) covers the module alone, which is what the
+    /// manifest's `sha256` field declares and what [`read`](Self::read)
+    /// verifies. That binding answers "are these the bytes the author built",
+    /// and it is the right question for the payload. It is the wrong question
+    /// for a review.
+    ///
+    /// What an operator reviews is not only the module: it is the prefix, the
+    /// routes, the capabilities and the ceilings — all of which live in the
+    /// manifest. Those can be rewritten while the module is untouched, and the
+    /// module digest stays correct because it is still describing the same
+    /// bytes. An artifact reviewed under one grant could then be deployed under
+    /// a wider one and match the digest that was written down.
+    ///
+    /// So this is the identity to record and compare. It is taken over the
+    /// canonical container bytes, so it moves when anything the consent screen
+    /// shows moves, and does not move for a difference the format does not
+    /// carry, such as how the authored TOML was laid out.
+    ///
+    /// It is still a binding rather than a signature: anyone who can rewrite
+    /// the file can recompute it. What it buys is that the number an operator
+    /// wrote down covers everything they agreed to.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`to_bytes`](Self::to_bytes) error.
+    pub fn artifact_digest(&self) -> Result<String, ArtifactError> {
+        Ok(Self::digest(&self.to_bytes()?))
+    }
+
     /// The capability manifest these bytes were verified against.
     #[must_use]
     pub const fn manifest(&self) -> &SandboxManifest {
@@ -587,6 +618,63 @@ path = "/hello/greet"
 
         let bytes = read_bounded(&path, usize::MAX).expect("an unlimited cap must read the file");
         assert_eq!(bytes, b"some bytes", "the read came back empty or short");
+    }
+
+    #[test]
+    fn the_artifact_digest_moves_when_the_grant_does_and_the_module_digest_does_not() {
+        // The guide tells an operator that reviewing an artifact means
+        // recording the digest `inspect` printed and comparing it against what
+        // the deployment loads. The module digest cannot carry that promise:
+        // what is reviewed is the prefix, the routes, the capabilities and the
+        // ceilings, and every one of those lives in the manifest. Rewrite them
+        // and the module digest is still correct — it is still describing the
+        // same bytes — so a wider grant matches the number that was written
+        // down.
+        let reviewed = sealed();
+        let reviewed_identity = reviewed.artifact_digest().expect("digests");
+
+        // The same module, one word of the grant different: a prefix that
+        // reaches somewhere else in the host's origin.
+        let widened = SandboxManifest::parse(
+            &manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE)).replace("/hello", "/admin"),
+        )
+        .expect("valid manifest");
+        let widened = SandboxArtifact::seal(widened, EMPTY_MODULE.to_vec()).expect("seals");
+
+        // The module digest is identical, and honestly so — same bytes.
+        assert_eq!(
+            widened.manifest().sha256,
+            reviewed.manifest().sha256,
+            "the module did not change, so its digest must not",
+        );
+        // …which is exactly why it cannot be the review identity.
+        assert_ne!(
+            widened.artifact_digest().expect("digests"),
+            reviewed_identity,
+            "a rewritten grant kept the identity an operator recorded",
+        );
+
+        // A ceiling is part of the grant too, not just the routing.
+        let mut raised =
+            SandboxManifest::parse(&manifest_toml(&SandboxArtifact::digest(EMPTY_MODULE)))
+                .expect("valid manifest");
+        raised.limits.max_concurrency = raised.limits.max_concurrency.saturating_add(1);
+        let raised = SandboxArtifact::seal(raised, EMPTY_MODULE.to_vec()).expect("seals");
+        assert_ne!(
+            raised.artifact_digest().expect("digests"),
+            reviewed_identity,
+            "a raised ceiling kept the identity an operator recorded",
+        );
+
+        // And it is stable: the same artifact through the container and back
+        // reviews as the same thing, or an operator could never compare it.
+        let round_tripped =
+            SandboxArtifact::read(&reviewed.to_bytes().expect("packs")).expect("reads back");
+        assert_eq!(
+            round_tripped.artifact_digest().expect("digests"),
+            reviewed_identity,
+            "the identity must survive a round trip through the container",
+        );
     }
 
     #[test]

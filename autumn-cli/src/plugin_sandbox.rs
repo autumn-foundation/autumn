@@ -105,8 +105,17 @@ pub struct Report {
     pub version: String,
     /// The prefix it mounts under.
     pub prefix: String,
-    /// The module digest that was reviewed.
+    /// The module digest the manifest declares and the loader verifies.
+    ///
+    /// Not the review identity: it answers "are these the author's bytes", and
+    /// stays correct when the manifest around them is rewritten.
     pub sha256: String,
+    /// The digest of the whole artifact — manifest and module together.
+    ///
+    /// This is the number to record and compare, because a review is of the
+    /// grant as much as of the code. `None` if the container could not be
+    /// re-rendered to digest it, which is reported rather than papered over.
+    pub artifact_sha256: Option<String>,
     /// Capabilities the manifest asks for.
     pub capabilities: Vec<String>,
     /// Classes of authority this build denies unconditionally.
@@ -199,6 +208,7 @@ impl Report {
             version: manifest.version.clone(),
             prefix: manifest.prefix.clone(),
             sha256: manifest.sha256.clone(),
+            artifact_sha256: artifact.artifact_digest().ok(),
             capabilities: manifest
                 .capabilities
                 .iter()
@@ -239,6 +249,21 @@ impl Report {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = self.consent.clone();
+        // Printed right under the consent block, because it is the number this
+        // screen is asking to be trusted on. The module digest above it answers
+        // a narrower question — "are these the author's bytes" — and stays
+        // correct if the grant beside them is rewritten, so an operator
+        // comparing that one could match a wider artifact than they approved.
+        match self.artifact_sha256.as_deref() {
+            Some(digest) => {
+                out.push_str("  artifact sha256 (record this one): ");
+                out.push_str(digest);
+                out.push('\n');
+            }
+            None => out.push_str(
+                "  artifact sha256: (could not be computed; review the manifest by hand)\n",
+            ),
+        }
         out.push_str("  host functions it imports:\n");
         match self.imports.as_ref() {
             // Not the same as none, and saying so matters: the artifacts whose
@@ -618,6 +643,39 @@ path = "/hello/greet"
         assert_eq!(value["routes"][0]["path"], "/hello/greet");
         assert_eq!(value["loads"], true);
         assert!(value["denied"].as_array().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[test]
+    fn both_review_surfaces_carry_the_identity_that_covers_the_grant() {
+        // The guide tells an operator to record the digest this screen printed
+        // and compare it against what the deployment loads. The module digest
+        // cannot carry that: the grant being reviewed — prefix, routes,
+        // capabilities, ceilings — is all manifest, and rewriting it leaves the
+        // module digest correct, because the module really did not change.
+        let artifact = pack(&good_fixture());
+        let identity = artifact.artifact_digest().expect("the artifact re-renders");
+        let report = Report::of(&artifact);
+
+        let text = report.to_text();
+        assert!(
+            text.contains(&identity),
+            "the text review surface does not print the identity:\n{text}",
+        );
+        assert!(
+            text.contains("record this one"),
+            "the screen must say which of the two digests to keep:\n{text}",
+        );
+
+        let json = report.to_json().expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        assert_eq!(value["artifact_sha256"], identity.as_str());
+        // Both are reported, because they answer different questions and the
+        // narrower one is still what the loader verifies.
+        assert_eq!(value["sha256"], artifact.manifest().sha256.as_str());
+        assert_ne!(
+            value["artifact_sha256"], value["sha256"],
+            "an identity equal to the module digest would not cover the manifest",
+        );
     }
 
     #[test]

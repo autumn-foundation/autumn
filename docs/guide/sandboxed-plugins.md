@@ -242,6 +242,7 @@ Sandboxed plugin: autumn-plugin-hello 0.1.0
   resource ceilings per request:
     cpu 200000000 fuel units, memory 33554432 bytes, request body 1048576 bytes,
     response 4194304 bytes, at most 8 concurrent requests
+  artifact sha256 (record this one): 4b7e…
   host functions it imports:
     wasi_snapshot_preview1::fd_read
     wasi_snapshot_preview1::fd_write
@@ -279,11 +280,28 @@ async fn main() {
 }
 ```
 
-`from_file` verifies the digest before the module is compiled, so a file whose
-manifest and module have come apart is refused with a message naming the
-mismatch. The digest is a binding, not a signature: anyone who can rewrite the
-file can recompute it, so reviewing an artifact means **recording the digest
-`inspect` printed** and comparing it against the one your deployment loads.
+`from_file` verifies the module digest before the module is compiled, so a file
+whose manifest and module have come apart is refused with a message naming the
+mismatch.
+
+Two digests appear on the review screen, and they answer different questions.
+The **module sha256** is the one the manifest declares and the loader verifies:
+it answers "are these the author's bytes". It is not the one to write down. What
+you are reviewing is the grant as much as the code — the prefix, the routes, the
+capabilities, the ceilings — and every one of those lives in the manifest, not
+the module. Rewrite them and the module digest is still correct, because the
+module really did not change, so an artifact reviewed under a narrow grant can be
+deployed under a wide one and still match.
+
+The **artifact sha256** covers the whole container, manifest included, and it is
+the one `inspect` labels `record this one`. Reviewing an artifact means recording
+that number and comparing it against what your deployment loads. The mount log
+carries it too, as `artifact_sha256`, so "what did we agree to run" can be
+checked against what was approved rather than merely read.
+
+Either digest is a binding, not a signature: anyone who can rewrite the file can
+recompute both. What the artifact digest buys is that the number you wrote down
+covers everything you agreed to.
 At mount time the resolved grant is written to the log at `info`, so "what did
 we agree to run" is answerable from a production log alone.
 
