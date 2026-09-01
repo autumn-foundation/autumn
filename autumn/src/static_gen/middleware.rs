@@ -77,6 +77,32 @@ pub struct ResolvedStatic {
     pub content_type: http::HeaderValue,
 }
 
+/// The recorded `Content-Type` a manifest entry can actually be served with, or
+/// `None` when the stored value is unusable (#1832).
+///
+/// The single validation the whole static path shares. A value is usable when,
+/// after trimming, it is non-empty **visible ASCII**. `HeaderValue::from_str`
+/// alone is not a sufficient filter: it accepts any byte `>= 0x20` except DEL,
+/// plus tab, so `"   "` and `"text/htmlé"` pass it — and either would produce a
+/// `Content-Type` the compression layer reads as empty (it matches its
+/// exclusions on `to_str().ok().unwrap_or_default()`), silently bypassing the
+/// image/audio/video and octet-stream carve-outs and gzipping a binary body.
+/// CR/LF and NUL are rejected by both checks, so header injection is impossible
+/// either way.
+///
+/// Serving and ISR must agree on this, which is why it is one function. The
+/// serve path ignores an unusable value and derives instead; if the ISR check
+/// still treated that same value as authoritative, no handler response could
+/// ever match it and every regeneration would be refused forever — a
+/// hand-written or tampered manifest would freeze the route rather than merely
+/// having its bad value ignored.
+#[must_use]
+fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&str> {
+    recorded
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| (0x20..0x7f).contains(&b)))
+}
+
 /// The `Content-Type` to serve for a manifest-backed response (#1832).
 ///
 /// The single decision point for the static-first serve path:
@@ -124,9 +150,7 @@ pub fn resolved_content_type(
     route_path: &str,
     file_path: &Path,
 ) -> http::HeaderValue {
-    if let Some(recorded) = recorded
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.bytes().all(|b| (0x20..0x7f).contains(&b)))
+    if let Some(recorded) = usable_recorded_content_type(recorded)
         && let Ok(value) = http::HeaderValue::from_str(recorded)
     {
         return value;
@@ -279,7 +303,10 @@ impl StaticFileLayer {
                 request_path,
                 &file_path,
                 revalidate,
-                entry.content_type.as_deref(),
+                // Only a value the serve path would actually honour: an
+                // unusable one is ignored there, so treating it as the ISR
+                // expectation would refuse every regeneration forever.
+                usable_recorded_content_type(entry.content_type.as_deref()),
             );
         }
 
@@ -423,25 +450,87 @@ fn build_isr_state(manifest: &StaticManifest) -> HashMap<String, IsrRouteState> 
     state
 }
 
-/// Whether two `Content-Type` header values mean the same thing, ignoring ASCII
-/// case and all whitespace.
+/// Whether two `Content-Type` header values mean the same thing.
 ///
 /// The ISR refusal compares the regenerated response's type against the string
 /// the build recorded, and a false mismatch there freezes the route until the
 /// next `autumn build`. `text/html;charset=utf-8` and `text/html; charset=utf-8`
 /// are one type spelled two ways, and a layer that reconstructs the header can
-/// easily change the spelling — so compare on meaning, not bytes. A genuine
-/// change of media type *or* of a parameter value (a different charset, say)
-/// still differs, and is still refused.
+/// easily change the spacing — so compare on meaning rather than on bytes.
+///
+/// "Meaning" follows RFC 9110 §8.3 rather than being a blanket
+/// lowercase-and-strip: the **media type** and **parameter names** are
+/// case-insensitive, and parameter order is not significant, but a parameter
+/// **value** is case-sensitive and its interior spacing is its own. Flattening
+/// values would be a correctness bug in the safety-critical direction: a
+/// `multipart/…; boundary=Aa` recorded at build time would compare equal to a
+/// regenerated `boundary=aa`, so ISR would overwrite the body while every
+/// request still advertised the old boundary — exactly the undecodable-response
+/// desync this check exists to prevent. `charset` is the one exception: RFC 2046
+/// §4.1.2 defines its values as case-insensitive.
+///
+/// Quoted values are unquoted so `boundary="x"` and `boundary=x` agree, and `;`
+/// inside quotes does not split a parameter.
 fn content_type_equivalent(a: &str, b: &str) -> bool {
-    let normalized = |value: &str| {
-        value
-            .bytes()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .map(|byte| byte.to_ascii_lowercase())
-            .collect::<Vec<u8>>()
-    };
-    normalized(a) == normalized(b)
+    normalize_content_type(a) == normalize_content_type(b)
+}
+
+/// Split a header value on `;`, ignoring separators inside a quoted string.
+fn split_unquoted_semicolons(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' && in_quotes {
+            escaped = true;
+        } else if byte == b'"' {
+            in_quotes = !in_quotes;
+        } else if byte == b';' && !in_quotes {
+            parts.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Canonical form of a `Content-Type` for comparison: the lowercased media type
+/// followed by its parameters as sorted `name=value` pairs, names lowercased and
+/// values left alone (see [`content_type_equivalent`]).
+fn normalize_content_type(value: &str) -> Vec<String> {
+    let mut segments = split_unquoted_semicolons(value).into_iter();
+    let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
+
+    let mut parameters: Vec<String> = segments
+        .map(|segment| {
+            let segment = segment.trim();
+            let Some((name, raw_value)) = segment.split_once('=') else {
+                // A malformed segment with no `=` has no value to protect.
+                return segment.to_ascii_lowercase();
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let raw_value = raw_value.trim();
+            let unquoted = raw_value
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(raw_value);
+            if name == "charset" {
+                format!("{name}={}", unquoted.to_ascii_lowercase())
+            } else {
+                format!("{name}={unquoted}")
+            }
+        })
+        .collect();
+    // Parameter order carries no meaning.
+    parameters.sort();
+
+    let mut normalized = Vec::with_capacity(parameters.len() + 1);
+    normalized.push(media_type);
+    normalized.extend(parameters);
+    normalized
 }
 
 /// Re-render a single page by sending a request through the router.
@@ -1005,12 +1094,28 @@ mod tests {
     }
 
     #[test]
-    fn content_type_equivalent_ignores_case_and_whitespace() {
+    fn content_type_equivalent_ignores_spacing_and_media_type_case() {
         assert!(content_type_equivalent(
             "text/html;charset=utf-8",
             "text/html; charset=utf-8"
         ));
-        assert!(content_type_equivalent("TEXT/HTML", "text/html"));
+        assert!(content_type_equivalent("TEXT/HTML", "  text/html  "));
+        // Parameter names are case-insensitive; order carries no meaning.
+        assert!(content_type_equivalent(
+            "multipart/mixed; BOUNDARY=xyz; charset=utf-8",
+            "multipart/mixed; charset=utf-8; boundary=xyz"
+        ));
+        // `charset` values are case-insensitive (RFC 2046 §4.1.2).
+        assert!(content_type_equivalent(
+            "text/html; charset=UTF-8",
+            "text/html; charset=utf-8"
+        ));
+        // Quoting a value does not change it.
+        assert!(content_type_equivalent(
+            r#"multipart/mixed; boundary="xyz""#,
+            "multipart/mixed; boundary=xyz"
+        ));
+
         // A different media type or a different parameter value is a real
         // change and must still be caught.
         assert!(!content_type_equivalent("text/html", "application/json"));
@@ -1018,6 +1123,95 @@ mod tests {
             "text/html; charset=utf-8",
             "text/html; charset=iso-8859-1"
         ));
+    }
+
+    /// Parameter values other than `charset` are case-sensitive, and their
+    /// interior spacing is their own. Flattening them would be a bug in the
+    /// dangerous direction: a recorded `boundary=Aa` matching a regenerated
+    /// `boundary=aa` lets ISR overwrite the body while every request still
+    /// advertises the old boundary, making the multipart response undecodable.
+    #[test]
+    fn content_type_equivalent_preserves_parameter_value_case_and_spacing() {
+        assert!(!content_type_equivalent(
+            "multipart/form-data; boundary=Aa",
+            "multipart/form-data; boundary=aa"
+        ));
+        assert!(!content_type_equivalent(
+            r#"multipart/form-data; boundary="a b""#,
+            r#"multipart/form-data; boundary="ab""#
+        ));
+        // A `;` inside quotes is part of the value, not a parameter separator.
+        assert!(!content_type_equivalent(
+            r#"multipart/form-data; boundary="a;b""#,
+            r#"multipart/form-data; boundary="a;c""#
+        ));
+        assert!(content_type_equivalent(
+            r#"multipart/form-data; boundary="a;b""#,
+            r#"MULTIPART/FORM-DATA;  boundary="a;b""#
+        ));
+    }
+
+    /// A manifest whose recorded type the serve path refuses to honour must not
+    /// become the ISR expectation: the handler's perfectly good type could never
+    /// match it, so every regeneration would be refused forever and the route
+    /// would freeze — a strictly worse outcome than the bad value being ignored.
+    #[tokio::test]
+    async fn isr_ignores_unusable_recorded_content_type_and_still_regenerates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(dist.join("about")).expect("mkdir");
+        let file = dist.join("about/index.html");
+        std::fs::write(&file, "<h1>stale</h1>").expect("write");
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/about".to_owned(),
+            ManifestEntry::new("about/index.html")
+                .with_revalidate(Some(1))
+                // Blank: `resolved_content_type` ignores it and derives
+                // text/html from `index.html`.
+                .with_content_type(Some("   ".to_owned())),
+        );
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&StaticManifest::new(routes)).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
+        let _ = filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old));
+
+        let fresh = axum::Router::new().fallback(axum::routing::get(|| async {
+            axum::response::Html("<h1>fresh</h1>")
+        }));
+        let layer = StaticFileLayer::new(&dist)
+            .expect("layer")
+            .with_router(fresh);
+
+        // The serve path ignores the unusable value and derives instead.
+        let hit = layer.resolve_entry("/about").expect("resolves");
+        assert_eq!(hit.content_type, "text/html; charset=utf-8");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "<h1>fresh</h1>",
+            "an unusable recorded type must not freeze regeneration"
+        );
+    }
+
+    #[test]
+    fn usable_recorded_content_type_matches_what_the_serve_path_honours() {
+        assert_eq!(
+            usable_recorded_content_type(Some("  application/rss+xml  ")),
+            Some("application/rss+xml")
+        );
+        for unusable in [None, Some(""), Some("   "), Some("\t"), Some("text/htmlé")] {
+            assert!(
+                usable_recorded_content_type(unusable).is_none(),
+                "{unusable:?} must be treated as nothing recorded"
+            );
+        }
     }
 
     /// A spelling difference must not freeze ISR: the regenerated response is
