@@ -431,6 +431,8 @@ pub enum ManifestError {
         /// The duplicated path.
         path: String,
     },
+    /// The same capability is granted twice.
+    DuplicateCapability(SandboxCapability),
     /// The module digest is not 64 lowercase hex characters.
     InvalidDigest(String),
     /// A declared limit is zero or above this build's ceiling.
@@ -512,6 +514,12 @@ impl fmt::Display for ManifestError {
             Self::DuplicateRoute { method, path } => {
                 write!(f, "declared route `{method} {path}` appears twice")
             }
+            Self::DuplicateCapability(cap) => write!(
+                f,
+                "the manifest grants `{cap}` more than once; a repeated grant conveys no \
+                 additional authority, so list each capability exactly once",
+                cap = cap.as_str()
+            ),
             Self::InvalidDigest(digest) => write!(
                 f,
                 "invalid module digest {digest:?}; expected 64 lowercase hex characters"
@@ -716,6 +724,20 @@ impl SandboxManifest {
             return Err(ManifestError::MissingCapability(
                 SandboxCapability::HttpRequest,
             ));
+        }
+        // A repeat grants nothing the first did, so there is no manifest a
+        // repeat makes legal — and every request clones this vector and
+        // serialises it into the frame. Left unbounded it is per-request work
+        // that `request_footprint_bytes` never counted and `encoding_fuel`
+        // never priced, bought once in a manifest and paid for on every call.
+        // Refusing here, rather than deduplicating, keeps the list an operator
+        // reads on the consent screen the same list the guest is handed.
+        let mut granted: Vec<SandboxCapability> = Vec::with_capacity(self.capabilities.len());
+        for capability in &self.capabilities {
+            if granted.contains(capability) {
+                return Err(ManifestError::DuplicateCapability(*capability));
+            }
+            granted.push(*capability);
         }
         validate_digest(&self.sha256)?;
         if self.routes.is_empty() {
@@ -1321,6 +1343,29 @@ max_concurrency = 8
         );
         let err = SandboxManifest::parse(&src).expect_err("duplicate route must fail");
         assert!(matches!(err, ManifestError::DuplicateRoute { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_capability_granted_twice_is_refused() {
+        // A repeat conveys no authority the first grant did not, so there is no
+        // manifest it makes legal — and the cost is not zero. Every request
+        // hands the grant list to the frame and serialises it, work that
+        // `request_footprint_bytes` never counted and `encoding_fuel` never
+        // priced. Thousands of repeats fit inside the manifest size limit, and
+        // a `SandboxManifest` built in-process has no size limit at all.
+        let src = valid_toml().replace(
+            r#"capabilities = ["http-request"]"#,
+            r#"capabilities = ["http-request", "http-request"]"#,
+        );
+        let err = SandboxManifest::parse(&src).expect_err("a repeated capability must be refused");
+        assert!(
+            matches!(err, ManifestError::DuplicateCapability(_)),
+            "{err}",
+        );
+
+        // Granted once, it still parses — the point is the repetition, not the
+        // capability.
+        SandboxManifest::parse(&valid_toml()).expect("one grant is the normal case");
     }
 
     #[test]

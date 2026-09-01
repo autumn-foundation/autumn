@@ -68,7 +68,7 @@ use tokio::sync::Semaphore;
 use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::artifact::SandboxArtifact;
-use super::manifest::{ResourceLimits, SandboxCapability, SandboxManifest};
+use super::manifest::{ResourceLimits, SandboxManifest};
 use super::wire::{GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_line};
 
 /// The WASI module name every import in the shim lives under.
@@ -433,6 +433,21 @@ fn refuse_oversized_request(
 /// and types — and far below what a 64 MiB file of one-byte declarations can
 /// claim.
 pub const MAX_DECLARED_ENTRIES: usize = 1_000_000;
+
+/// The most sections a module may carry, custom ones included.
+///
+/// Every other shape ceiling is read from a section's leading count, which is
+/// what makes reading them cheap. A custom section has no such count — its body
+/// is a name and opaque bytes — so it contributes to nothing, and an empty one
+/// encodes in three bytes. A 64 MiB artifact of those is roughly 22 million
+/// section headers walked to reach a verdict this loop exists to reach cheaply.
+///
+/// So the headers are counted too, and the walk stops at the ceiling rather
+/// than running to the end and refusing afterwards: here the iteration *is* the
+/// cost, unlike the per-entry walks below it, where refusing on the count alone
+/// is enough. A real module carries a dozen sections; a toolchain that emits
+/// names, producers and debug info carries a few dozen.
+pub const MAX_SECTIONS: usize = 1_024;
 
 pub const MAX_IMPORTS: usize = 1024;
 
@@ -1179,8 +1194,12 @@ impl SandboxHost {
             );
         };
 
-        let granted: Vec<SandboxCapability> = self.manifest.capabilities.clone();
-        let frame = HostFrame::request(request, &granted);
+        // Borrowed, not cloned: `HostFrame::request` reads the grants to decide
+        // what the guest is told it may do and never keeps them, so copying the
+        // vector on every request bought nothing. Validation refuses a repeated
+        // grant, so this list is at most one entry per capability this build
+        // understands.
+        let frame = HostFrame::request(request, &self.manifest.capabilities);
 
         let line = match to_line(&frame) {
             Ok(line) => line,
@@ -1422,6 +1441,11 @@ fn guest_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
 /// refusing them is the right answer.
 #[derive(Debug, Clone, Copy)]
 struct ModuleShape {
+    /// Section headers the module carries, custom ones included.
+    ///
+    /// Counted because a custom section contributes to no other ceiling and
+    /// costs three bytes to encode; see `MAX_SECTIONS`.
+    sections: usize,
     /// Data and element segments, which every instantiation copies.
     segments: usize,
     /// Bytes those sections hold.
@@ -1910,8 +1934,65 @@ fn refuse_unrunnable_shape(
     Ok(())
 }
 
+/// Read a table section's declared count and the elements its tables start with.
+///
+/// `vec(tabletype)`, and a `tabletype` is a reftype byte then `limits`: a flag,
+/// the minimum, and a maximum when the flag says so. Only the minimum matters
+/// here — it is what the instance allocates before the guest runs.
+///
+/// Returns the declared count and the summed minimums, and writes the first
+/// `MAX_TABLES` minimums into `minimums`.
+fn table_section_shape(
+    wasm: &[u8],
+    after_size: usize,
+    end: usize,
+    already_counted: usize,
+    minimums: &mut [u64; MAX_TABLES],
+    seen: &mut usize,
+) -> Option<(usize, u64)> {
+    let (count, mut at) = leb128(wasm, after_size)?;
+    // The same argument as the segment walk in the caller, and the same shape
+    // its own comment describes one step further down: bounding the
+    // *allocation* per entry left the *iteration* per entry unbounded, and an
+    // artifact buys that at three bytes an entry. `MAX_TABLES` refuses on the
+    // count alone, so past it there is nothing left for a walk to establish.
+    let walked = if already_counted.saturating_add(count) <= MAX_TABLES {
+        count
+    } else {
+        0
+    };
+    let mut elements = 0u64;
+    for _ in 0..walked {
+        at = at.checked_add(1)?; // reftype
+        let flag = *wasm.get(at)?;
+        at = at.checked_add(1)?;
+        let (minimum, next) = leb128(wasm, at)?;
+        at = next;
+        elements = elements.saturating_add(minimum as u64);
+        // Only the first `MAX_TABLES` can ever be admitted, so only those are
+        // worth keeping. Pushing every declaration into a growing vector put an
+        // unbounded per-entry allocation inside the very walk whose whole
+        // purpose is to avoid one: a 64 MiB artifact of empty table
+        // declarations would have expanded here, in the code meant to refuse it
+        // before anything expanded.
+        if let Some(slot) = minimums.get_mut(*seen) {
+            *slot = minimum as u64;
+            *seen = seen.saturating_add(1);
+        }
+        if flag == 0x01 {
+            let (_, after_max) = leb128(wasm, at)?;
+            at = after_max;
+        }
+        if at > end {
+            return None;
+        }
+    }
+    Some((count, elements))
+}
+
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     let mut cursor = 8usize; // magic + version
+    let mut sections = 0usize;
     let mut segments = 0usize;
     let mut bytes = 0usize;
     let mut declared_entries = 0usize;
@@ -1932,6 +2013,13 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         let end = after_size.checked_add(size)?;
         if end > wasm.len() {
             return None;
+        }
+        sections = sections.saturating_add(1);
+        if sections > MAX_SECTIONS {
+            // Stopping here rather than at the end is the whole point: past the
+            // ceiling the module is refused whatever the remaining headers say,
+            // so reading them is work an artifact chose for this process.
+            break;
         }
         if id != CUSTOM_SECTION {
             let (count, _) = leb128(wasm, after_size)?;
@@ -1989,47 +2077,21 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             _ => {}
         }
         if id == TABLE_SECTION {
-            // `vec(tabletype)`, and a `tabletype` is a reftype byte then
-            // `limits`: a flag, the minimum, and a maximum when the flag says
-            // so. Only the minimum matters here — it is what the instance
-            // allocates before the guest runs.
-            let (count, mut at) = leb128(wasm, after_size)?;
+            let (count, elements) = table_section_shape(
+                wasm,
+                after_size,
+                end,
+                table_count,
+                &mut table_minimums,
+                &mut table_count_seen,
+            )?;
             table_count = table_count.saturating_add(count);
-            // The same argument as the segment walk above, and the same shape
-            // this loop's own comment already describes one step further down:
-            // bounding the *allocation* per entry left the *iteration* per
-            // entry unbounded, and an artifact buys that at three bytes an
-            // entry. `MAX_TABLES` refuses on the count alone.
-            let walked = if table_count <= MAX_TABLES { count } else { 0 };
-            for _ in 0..walked {
-                at = at.checked_add(1)?; // reftype
-                let flag = *wasm.get(at)?;
-                at = at.checked_add(1)?;
-                let (minimum, next) = leb128(wasm, at)?;
-                at = next;
-                table_elements = table_elements.saturating_add(minimum as u64);
-                // Only the first `MAX_TABLES` can ever be admitted, so only those
-                // are worth keeping. Pushing every declaration into a growing
-                // vector put an unbounded per-entry allocation inside the very
-                // walk whose whole purpose is to avoid one: a 64 MiB artifact of
-                // empty table declarations would have expanded here, in the code
-                // meant to refuse it before anything expanded.
-                if let Some(slot) = table_minimums.get_mut(table_count_seen) {
-                    *slot = minimum as u64;
-                    table_count_seen = table_count_seen.saturating_add(1);
-                }
-                if flag == 0x01 {
-                    let (_, after_max) = leb128(wasm, at)?;
-                    at = after_max;
-                }
-                if at > end {
-                    return None;
-                }
-            }
+            table_elements = table_elements.saturating_add(elements);
         }
         cursor = end;
     }
     Some(ModuleShape {
+        sections,
         segments,
         init_bytes: bytes,
         declared_entries,
@@ -2062,6 +2124,16 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             "the module's section stream could not be walked".to_owned(),
         ));
     };
+    // First, because it is the one ceiling the walk stops early for: past it
+    // the shape is only partly read, so every count below is a floor rather
+    // than a total, and refusing on one of those would name the wrong reason.
+    if shape.sections > MAX_SECTIONS {
+        return Err(SandboxLoadError::InstantiationTooExpensive {
+            what: "sections",
+            found: shape.sections,
+            max: MAX_SECTIONS,
+        });
+    }
     // Before `Module::new`, with the rest of them. These two used to be
     // checked in `from_module` *after* compiling — so a module declaring half
     // a million empty segments, under the aggregate entry ceiling and thus
@@ -3263,7 +3335,7 @@ fn deny(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin_sandbox::manifest::{ResourceLimits, SandboxManifest};
+    use crate::plugin_sandbox::manifest::{ResourceLimits, SandboxCapability, SandboxManifest};
     use crate::plugin_sandbox::test_guests as guests;
 
     fn manifest_with(limits: ResourceLimits) -> SandboxManifest {
@@ -4355,6 +4427,52 @@ path = "/hello/greet"
             matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
             "{err:?}",
         );
+    }
+
+    #[test]
+    fn a_module_of_nothing_but_custom_sections_is_refused_without_reading_them_all() {
+        // Every other shape ceiling is read from a section's leading count.
+        // A custom section has no count — a name and opaque bytes — so it was
+        // excluded from `declared_entries` and contributed to nothing, while
+        // costing three bytes to encode. The refusal that is supposed to be
+        // cheap became the expensive part.
+        let mut wasm = Vec::from(b"\0asm\x01\0\0\0".as_slice());
+        // Empty custom section: id 0, size 1, a zero-length name.
+        for _ in 0..=MAX_SECTIONS {
+            wasm.extend_from_slice(&[CUSTOM_SECTION, 0x01, 0x00]);
+        }
+        let shape = module_shape(&wasm).expect("the header walk must not fail on legal sections");
+
+        // The walk stopped at the ceiling rather than reading every header.
+        assert_eq!(
+            shape.sections,
+            MAX_SECTIONS + 1,
+            "the walk read past the ceiling instead of stopping at it",
+        );
+
+        let err = refuse_unbounded_shape(&wasm)
+            .expect_err("a module past the section ceiling must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "sections",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+
+        // And an ordinary module, which carries a handful of sections, is not
+        // caught by this — or the ceiling would refuse every real plugin.
+        let hello = wat::parse_str(guests::HELLO).expect("the fixture is valid WAT");
+        let shape = module_shape(&hello).expect("a real module walks");
+        assert!(
+            shape.sections <= MAX_SECTIONS,
+            "a real module carries {} sections, at or over the ceiling",
+            shape.sections,
+        );
+        refuse_unbounded_shape(&hello).expect("a real module must still load");
     }
 
     #[test]
