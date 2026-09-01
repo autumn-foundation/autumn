@@ -581,8 +581,35 @@ async fn read_request(
 struct PermitBuf {
     data: Vec<u8>,
     /// Never read: it is held so that dropping this buffer returns the slot.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    ///
+    /// A *share* of the permit rather than the permit, because the body is not
+    /// the only part of the response that occupies the footprint — see
+    /// [`PermitShare`].
+    _permit: PermitShare,
 }
+
+/// A share of one concurrency slot, released when the last share drops.
+///
+/// The slot has two holders, because the response has two halves that occupy
+/// the footprint and they are not dropped together. The body's bytes may
+/// outlive the response (hyper holds them by `Bytes`), which is why
+/// [`PermitBuf`] exists. But the *headers* may outlive the bytes: a guest may
+/// answer with an empty body, and `check_size` charges header bytes against the
+/// same response ceiling the body is charged against, so up to the whole
+/// allowance can sit in `HeaderValue`s with no body at all. `Bytes::from_owner`
+/// over an empty buffer drops its owner at construction, so a permit that lived
+/// only in the buffer came back before such a response was even returned —
+/// letting a caller retain header-only responses and admit another request for
+/// each, outside `max_concurrency`.
+///
+/// Holding a share in each place makes the slot outlive whichever half is
+/// dropped last, without either half needing to know about the other.
+type PermitShare = Arc<tokio::sync::OwnedSemaphorePermit>;
+
+/// The response's share of the slot, parked in its extensions so it lives
+/// exactly as long as the head does.
+#[derive(Clone)]
+struct PermitExtension(#[allow(dead_code)] PermitShare);
 
 impl AsRef<[u8]> for PermitBuf {
     fn as_ref(&self) -> &[u8] {
@@ -625,16 +652,18 @@ fn build_response(
     // it: hyper may hold these bytes long after `run` returned, and it holds
     // them by `Bytes` rather than by the body they came out of.
     //
-    // An empty answer costs nothing here either, and needs no special case:
-    // `Full` drops an empty buffer at construction, which drops the permit with
-    // it. The slot comes back before the response is even returned.
+    // It rides in the response's extensions too, because the headers are
+    // charged against the same ceiling and are not dropped with the bytes. See
+    // [`PermitShare`].
+    let permit: PermitShare = Arc::new(permit);
     let body = Body::from(bytes::Bytes::from_owner(PermitBuf {
         data: response.body.clone(),
-        _permit: permit,
+        _permit: Arc::clone(&permit),
     }));
     let Ok(mut built) = out.body(body) else {
         return sandbox_error(plugin, StatusCode::BAD_GATEWAY);
     };
+    built.extensions_mut().insert(PermitExtension(permit));
     stamp_host_headers(&mut built, plugin);
     built
 }
@@ -951,13 +980,18 @@ sha256 = "{digest}"
     }
 
     #[tokio::test]
-    async fn an_empty_answer_hands_its_permit_back_without_being_polled() {
-        // The release rides on `poll_frame` reaching the end of the stream, but
+    async fn an_empty_answer_returns_its_slot_on_drop_without_being_polled() {
+        // Release must not ride on `poll_frame` reaching the end of the stream:
         // a body that is *already* ended need never be polled at all — a
         // consumer is entitled to read `is_end_stream` and stop there. Every
-        // 204, and every empty error page a guest returns, takes that path, so
-        // a permit tied to one would come back only when the response value
-        // happened to be dropped, somewhere well outside this plugin.
+        // 204, and every empty error page a guest returns, takes that path.
+        //
+        // This test used to assert that such an answer held no slot at all,
+        // which was the defect rather than the design: header bytes are charged
+        // against the same response ceiling as body bytes, so "empty body" does
+        // not mean "occupies nothing". The slot is now held until the response
+        // is dropped, and — the part that still matters here — it comes back
+        // then without anything having polled the body.
         use crate::plugin_sandbox::wire::SandboxResponse;
 
         let permits = Arc::new(Semaphore::new(1));
@@ -971,18 +1005,25 @@ sha256 = "{digest}"
             &empty,
             Arc::clone(&permits).acquire_owned().await.expect("permit"),
         );
+        assert!(
+            http_body::Body::is_end_stream(response.body()),
+            "the fixture must be the never-polled shape this test is about",
+        );
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the response is still resident, so its slot is still spent",
+        );
+        drop(response);
         assert_eq!(
             permits.available_permits(),
             1,
-            "an empty answer holds no slot"
+            "the slot must come back on drop, with no poll anywhere",
         );
-        // Dropped only after the assertion, so the slot cannot have come back
-        // by way of the destructor the fix exists to stop relying on.
-        drop(response);
 
-        // The converse, so the assertion above is about emptiness and not about
-        // the permit having been dropped on the floor: bytes still resident do
-        // hold a slot, until they are.
+        // The converse, so the assertion above is about the response being gone
+        // and not about the permit having been dropped on the floor: bytes still
+        // resident do hold a slot, until they are.
         let full = SandboxResponse {
             status: 200,
             headers: Vec::new(),
@@ -1000,6 +1041,53 @@ sha256 = "{digest}"
         );
         drop(response);
         assert_eq!(permits.available_permits(), 1, "and give it back on drop");
+    }
+
+    #[tokio::test]
+    async fn a_header_only_response_holds_its_permit_until_the_headers_go() {
+        // `PermitBuf` tied the slot to the response *bytes*, which is right for
+        // every answer that has some. A guest may answer with none: headers are
+        // charged against the same response ceiling (`check_size` sums header
+        // bytes and body bytes against one `max`), so up to the whole allowance
+        // can sit in `HeaderValue`s with an empty body. `Bytes::from_owner`
+        // drops its owner at construction for an empty buffer, so the slot came
+        // back before the response was even returned — and a caller retaining
+        // header-only responses could admit another request for each, holding
+        // response-sized allocations outside `max_concurrency`.
+        use crate::plugin_sandbox::wire::SandboxResponse;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let header_only = SandboxResponse {
+            status: 200,
+            headers: vec![("x-plugin-note".to_string(), "v".repeat(4096))],
+            body: Vec::new(),
+        };
+        let response = build_response(
+            "autumn-plugin-hello",
+            &header_only,
+            Arc::clone(&permits).acquire_owned().await.expect("permit"),
+        );
+
+        // The body is empty and end-of-stream from the start, so nothing about
+        // the *bytes* can be holding the slot here.
+        assert!(http_body::Body::is_end_stream(response.body()));
+        assert!(
+            response.headers().contains_key("x-plugin-note"),
+            "the header this response is made of must survive to be held",
+        );
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the slot came back while the response headers were still held",
+        );
+
+        // And it is the headers keeping it: dropping them returns it.
+        drop(response);
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "the slot must come back once nothing holds the response",
+        );
     }
 
     #[tokio::test]
