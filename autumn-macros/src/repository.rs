@@ -2119,13 +2119,24 @@ fn vh_insert_ts(
 /// Emitted from [`vh_insert_ts`] inside the caller's already-open transaction,
 /// so the revision and the row it describes commit together or not at all.
 ///
-/// The append is a read-then-write: it reads the record's current chain head
-/// (`ORDER BY seq DESC LIMIT 1`) to learn the next sequence number and the hash
-/// to chain onto, then inserts. Both statements run under the write
-/// transaction's row lock on the record, and the migration's
+/// The append is a read-then-write: one statement reads the record's current
+/// chain head (`ORDER BY seq DESC LIMIT 1`), its out-of-band high-water mark and
+/// the database's own clock, then two statements insert the revision and raise
+/// the mark. All of them run under the write transaction's row lock on the
+/// record, and the migration's
 /// `(table_name, COALESCE(tenant_id, ''), record_id, seq)` unique index turns
 /// any race that slips past that lock into a hard error rather than a silently
 /// forked chain.
+///
+/// Two #2323 properties come out of that shape:
+///
+/// * the sequence number is `max(chain head, high-water mark) + 1`, so deleting
+///   the newest revision and letting an ordinary write land leaves a permanent
+///   gap rather than silently re-using the deleted number;
+/// * `recorded_at` is the database's clock, clamped against the greater of the
+///   head revision's and the mark's instants, so transaction time is
+///   non-decreasing along a record's chain by construction rather than by
+///   trusting the writing host's clock.
 ///
 /// Backend-forked exactly as the version-history writer is (#1996): the Postgres
 /// arm binds `Timestamptz`; the `SQLite` arm binds `TimestamptzSqlite` (there is
@@ -2191,31 +2202,101 @@ fn ledger_append_ts(
         quote! {}
     };
 
-    // The head read and the append differ per backend only in casts and
-    // timestamp bind types; the chain arithmetic and hashing are shared.
-    let head_read_pg = quote! {
+    // One statement reads everything the append needs to decide *when* and
+    // *where* it lands: the database's own clock, the record's chain head, and
+    // the record's out-of-band high-water mark (#2323). Two LEFT JOINs off a
+    // one-row anchor rather than three round trips — and the anchor is what
+    // makes the row come back even when neither side has anything, so the clock
+    // read is never lost with the head.
+    //
+    // `SQLite` documents that every `'now'` inside one `sqlite3_step` sees the
+    // same value, so its clock is coherent with the head it rides along with;
+    // Postgres reads `clock_timestamp()` rather than `now()` because the latter
+    // is the transaction's *start*, which two overlapping transactions can
+    // observe out of commit order.
+    //
+    // Backends differ only in casts and in how the clock is spelled.
+    let state_read_pg = quote! {
         ::autumn_web::reexports::diesel::sql_query(
-            "SELECT seq, hash FROM _autumn_ledger_revisions \
-             WHERE table_name = $1 AND record_id = $2 \
-             AND COALESCE(tenant_id, '') = COALESCE($3::text, '') \
-             ORDER BY seq DESC LIMIT 1"
+            "SELECT clock_timestamp() AS db_now, \
+                    __head.seq AS head_seq, \
+                    __head.hash AS head_hash, \
+                    __head.recorded_at AS head_recorded_at, \
+                    __mark.high_seq AS mark_seq, \
+                    __mark.recorded_at AS mark_recorded_at \
+             FROM (SELECT 1 AS anchor) AS __anchor \
+             LEFT JOIN ( \
+                 SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 \
+                 AND COALESCE(tenant_id, '') = COALESCE($3::text, '') \
+                 ORDER BY seq DESC LIMIT 1 \
+             ) AS __head ON 1 = 1 \
+             LEFT JOIN _autumn_ledger_chain_heads AS __mark \
+             ON __mark.table_name = $1 AND __mark.record_id = $2 \
+             AND __mark.tenant_key = COALESCE($3::text, '')"
         )
     };
-    let head_read_sqlite = quote! {
+    let state_read_sqlite = quote! {
         ::autumn_web::reexports::diesel::sql_query(
-            "SELECT seq, hash FROM _autumn_ledger_revisions \
-             WHERE table_name = $1 AND record_id = $2 \
-             AND COALESCE(tenant_id, '') = COALESCE($3, '') \
-             ORDER BY seq DESC LIMIT 1"
+            "SELECT strftime('%Y-%m-%d %H:%M:%f', 'now') AS db_now, \
+                    __head.seq AS head_seq, \
+                    __head.hash AS head_hash, \
+                    __head.recorded_at AS head_recorded_at, \
+                    __mark.high_seq AS mark_seq, \
+                    __mark.recorded_at AS mark_recorded_at \
+             FROM (SELECT 1 AS anchor) AS __anchor \
+             LEFT JOIN ( \
+                 SELECT seq, hash, recorded_at FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 \
+                 AND COALESCE(tenant_id, '') = COALESCE($3, '') \
+                 ORDER BY seq DESC LIMIT 1 \
+             ) AS __head ON 1 = 1 \
+             LEFT JOIN _autumn_ledger_chain_heads AS __mark \
+             ON __mark.table_name = $1 AND __mark.record_id = $2 \
+             AND __mark.tenant_key = COALESCE($3, '')"
         )
     };
-    let head_binds = quote! {
+    let state_binds = quote! {
         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
         .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__lg_record_id)
         .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__lg_tenant_id)
-        .get_results::<__AutumnLedgerHeadRow>(#conn_ident)
-        .await
-        .map_err(::autumn_web::AutumnError::from)?
+    };
+
+    // The high-water upsert. `WHERE ... high_seq < EXCLUDED.high_seq` is what
+    // makes the mark monotonic in the database rather than merely in the code
+    // above it: a writer that somehow computed a lower sequence number cannot
+    // lower the mark, it can only fail to raise it — and then the mark disagrees
+    // with the head it is supposed to name, which `ledger_verify` reports.
+    let mark_upsert_pg = quote! {
+        ::autumn_web::reexports::diesel::sql_query(
+            "INSERT INTO _autumn_ledger_chain_heads \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES ($1, COALESCE($2::text, ''), $3, $4, $5, $6) \
+             ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+             high_seq = EXCLUDED.high_seq, \
+             head_hash = EXCLUDED.head_hash, \
+             recorded_at = EXCLUDED.recorded_at \
+             WHERE _autumn_ledger_chain_heads.high_seq < EXCLUDED.high_seq"
+        )
+    };
+    let mark_upsert_sqlite = quote! {
+        ::autumn_web::reexports::diesel::sql_query(
+            "INSERT INTO _autumn_ledger_chain_heads \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES ($1, COALESCE($2, ''), $3, $4, $5, $6) \
+             ON CONFLICT (table_name, tenant_key, record_id) DO UPDATE SET \
+             high_seq = excluded.high_seq, \
+             head_hash = excluded.head_hash, \
+             recorded_at = excluded.recorded_at \
+             WHERE _autumn_ledger_chain_heads.high_seq < excluded.high_seq"
+        )
+    };
+    let mark_binds = quote! {
+        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__lg_tenant_id)
+        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__lg_record_id)
+        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__lg_seq)
+        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__lg_hash.as_str())
     };
     let insert_binds = quote! {
         .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
@@ -2230,12 +2311,22 @@ fn ledger_append_ts(
 
     quote! {
         {
-            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-            struct __AutumnLedgerHeadRow {
-                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                seq: i64,
-                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                hash: ::std::string::String,
+            /// Everything the append reads before it can decide its own sequence
+            /// number and transaction time. Backend-neutral: each
+            /// `backend_select!` arm decodes its own `QueryableByName` row into
+            /// this, because the clock and the two instants come back as
+            /// different SQL types on each tier.
+            struct __AutumnLedgerChainState {
+                db_now: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                head_seq: ::core::option::Option<i64>,
+                head_hash: ::core::option::Option<::std::string::String>,
+                head_recorded_at: ::core::option::Option<
+                    ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                >,
+                mark_seq: ::core::option::Option<i64>,
+                mark_recorded_at: ::core::option::Option<
+                    ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                >,
             }
 
             let __lg_record_id: i64 = {
@@ -2259,12 +2350,129 @@ fn ledger_append_ts(
             let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
                 (#record_expr).__autumn_commit_hook_to_value()?;
             #soft_delete_stamp
-            // Transaction time. Truncated to microseconds — the precision both
-            // storage tiers keep — so the value that is hashed is the value that
-            // comes back on read and `ledger_verify` stays true.
-            #[allow(clippy::disallowed_methods, reason = "generated code has no AppState to reach the injected clock (autumn #1797)")]
-            let __lg_recorded_at = ::autumn_web::ledger::truncate_to_micros(
-                ::autumn_web::reexports::chrono::Utc::now()
+
+            let __lg_state: __AutumnLedgerChainState = ::autumn_web::backend_select! {
+                pg => {{
+                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                    struct __AutumnLedgerChainStateRow {
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                        db_now: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                        head_seq: ::core::option::Option<i64>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                        head_hash: ::core::option::Option<::std::string::String>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
+                        head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                        mark_seq: ::core::option::Option<i64>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
+                        mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                    }
+                    let __lg_row: __AutumnLedgerChainStateRow = #state_read_pg
+                        #state_binds
+                        .get_results::<__AutumnLedgerChainStateRow>(#conn_ident)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name_ts.to_string(),
+                                record_id: __lg_record_id,
+                                detail: "the chain-state read returned no row".to_string(),
+                            },
+                        ))?;
+                    __AutumnLedgerChainState {
+                        db_now: __lg_row.db_now,
+                        head_seq: __lg_row.head_seq,
+                        head_hash: __lg_row.head_hash,
+                        head_recorded_at: __lg_row.head_recorded_at,
+                        mark_seq: __lg_row.mark_seq,
+                        mark_recorded_at: __lg_row.mark_recorded_at,
+                    }
+                }},
+                sqlite => {{
+                    // `db_now` comes back as the `strftime` text rather than a
+                    // bound timestamp: the accepted encoding is then pinned by
+                    // `parse_sqlite_instant`'s own test in this crate instead of
+                    // by whichever format list Diesel's SQLite decoder carries.
+                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                    struct __AutumnLedgerChainStateRow {
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                        db_now: ::std::string::String,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                        head_seq: ::core::option::Option<i64>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                        head_hash: ::core::option::Option<::std::string::String>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
+                        head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
+                        mark_seq: ::core::option::Option<i64>,
+                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
+                        mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                    }
+                    let __lg_row: __AutumnLedgerChainStateRow = #state_read_sqlite
+                        #state_binds
+                        .get_results::<__AutumnLedgerChainStateRow>(#conn_ident)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name_ts.to_string(),
+                                record_id: __lg_record_id,
+                                detail: "the chain-state read returned no row".to_string(),
+                            },
+                        ))?;
+                    let __lg_db_now = ::autumn_web::ledger::parse_sqlite_instant(&__lg_row.db_now)
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name_ts.to_string(),
+                                record_id: __lg_record_id,
+                                detail: format!(
+                                    "the database clock read back as {:?}, which is not the \
+                                     encoding the ledger expects",
+                                    __lg_row.db_now,
+                                ),
+                            },
+                        ))?;
+                    __AutumnLedgerChainState {
+                        db_now: __lg_db_now,
+                        head_seq: __lg_row.head_seq,
+                        head_hash: __lg_row.head_hash,
+                        head_recorded_at: __lg_row.head_recorded_at,
+                        mark_seq: __lg_row.mark_seq,
+                        mark_recorded_at: __lg_row.mark_recorded_at,
+                    }
+                }},
+            };
+
+            // #2323: the sequence number is allocated from the greater of the
+            // surviving chain head and the out-of-band high-water mark, never
+            // from the chain alone. Deleting the newest revision and letting an
+            // ordinary write land therefore leaves a gap where the deleted
+            // revision was, instead of quietly re-using its number.
+            let __lg_seq: i64 = ::core::cmp::max(
+                __lg_state.head_seq.unwrap_or(0),
+                __lg_state.mark_seq.unwrap_or(0),
+            )
+            .saturating_add(1);
+            // The chain still links to the revision that is actually there.
+            let __lg_prev_hash: ::core::option::Option<::std::string::String> =
+                __lg_state.head_hash;
+
+            // Transaction time, sourced from the database rather than this
+            // host's clock and clamped so it can never precede the revision it
+            // follows — including across the gap a deleted revision leaves,
+            // since the mark's instant outlives the row. Truncated to
+            // microseconds, the precision both storage tiers keep, so the value
+            // that is hashed is the value that comes back on read and
+            // `ledger_verify` stays true. `Option`'s ordering puts `None` below
+            // every `Some`, so `max` picks whichever floor exists.
+            let __lg_recorded_at = ::autumn_web::ledger::monotonic_recorded_at(
+                __lg_state.db_now,
+                ::core::cmp::max(__lg_state.head_recorded_at, __lg_state.mark_recorded_at),
             );
             // Valid time: the model's own instant when it declares one, else the
             // transaction time (the fact became true when the database learned it).
@@ -2274,17 +2482,6 @@ fn ledger_append_ts(
                     .map(::autumn_web::ledger::truncate_to_micros)
                     .unwrap_or(__lg_recorded_at)
             };
-
-            let __lg_head: ::core::option::Option<__AutumnLedgerHeadRow> =
-                ::autumn_web::backend_select! {
-                    pg => {{ #head_read_pg #head_binds }},
-                    sqlite => {{ #head_read_sqlite #head_binds }},
-                }
-                .into_iter()
-                .next();
-            let __lg_seq: i64 = __lg_head.as_ref().map_or(1, |h| h.seq.saturating_add(1));
-            let __lg_prev_hash: ::core::option::Option<::std::string::String> =
-                __lg_head.map(|h| h.hash);
 
             let __lg_hash: ::std::string::String = ::autumn_web::ledger::revision_hash(
                 &::autumn_web::ledger::RevisionHashInput {
@@ -2324,7 +2521,18 @@ fn ledger_append_ts(
                     .bind::<::autumn_web::reexports::diesel::sql_types::Timestamptz, _>(__lg_valid_from)
                     .bind::<::autumn_web::reexports::diesel::sql_types::Timestamptz, _>(__lg_recorded_at)
                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__lg_prev_hash.as_deref())
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__lg_hash)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__lg_hash.as_str())
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                    // Raise the record's high-water mark to the revision just
+                    // written, in the same transaction as the revision itself:
+                    // the mark and the row it names commit together or not at
+                    // all, so the two can never disagree because of a crash.
+                    #mark_upsert_pg
+                    #mark_binds
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Timestamptz, _>(__lg_recorded_at)
                     .execute(#conn_ident)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
@@ -2340,7 +2548,15 @@ fn ledger_append_ts(
                     .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(__lg_valid_from)
                     .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(__lg_recorded_at)
                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__lg_prev_hash.as_deref())
-                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__lg_hash)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__lg_hash.as_str())
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                    // See the Postgres arm: same transaction, same guarantee.
+                    #mark_upsert_sqlite
+                    #mark_binds
+                    .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(__lg_recorded_at)
                     .execute(#conn_ident)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
@@ -18666,6 +18882,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // reported — a concurrent write is not tampering.
                     let revisions = self.ledger_revisions(record_id).await?;
                     let live = self.__autumn_ledger_live_view(record_id).await?;
+                    let high_water = self.ledger_high_water(record_id).await?;
                     let settled_head = self.ledger_head(record_id).await?;
                     let stable = settled_head.as_ref().map(|h| h.seq)
                         == revisions.last().map(|r| r.seq);
@@ -18695,8 +18912,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::ledger::LedgerLiveState::NotChecked
                     };
 
+                    // #2323: the high-water mark is read under the same
+                    // stability gate as the live row. It is not authoritative —
+                    // `verify_chain_with_high_water` reports the two
+                    // disagreeing in either direction — but a mark read while a
+                    // write was landing would look exactly like a truncation, so
+                    // a moving head skips it rather than accusing.
+                    let high_water_state = if stable {
+                        match high_water.as_ref() {
+                            ::core::option::Option::Some(mark) =>
+                                ::autumn_web::ledger::LedgerHighWaterState::Present(mark),
+                            ::core::option::Option::None =>
+                                ::autumn_web::ledger::LedgerHighWaterState::Absent,
+                        }
+                    } else {
+                        ::autumn_web::ledger::LedgerHighWaterState::NotChecked
+                    };
+
                     ::core::result::Result::Ok(
-                        ::autumn_web::ledger::verify_chain_against(record_id, &revisions, live_state),
+                        ::autumn_web::ledger::verify_chain_with_high_water(
+                            record_id,
+                            &revisions,
+                            live_state,
+                            high_water_state,
+                        ),
                     )
                 }
 
@@ -18863,6 +19102,103 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }},
                     };
                     ::core::result::Result::Ok(head)
+                }
+
+                /// The record's out-of-band high-water mark (issue #2323).
+                ///
+                /// The highest sequence number the record's chain has ever
+                /// reached, kept in `_autumn_ledger_chain_heads` rather than
+                /// among the revisions themselves — so deleting the newest
+                /// revision no longer lets an ordinary write re-use its
+                /// sequence number.
+                ///
+                /// Returns `None` for a record that has no mark: one that was
+                /// never written, or whose mark row was removed.
+                /// [`ledger_verify`](Self::ledger_verify) is what turns the
+                /// second case into an accusation — a mark on its own proves
+                /// nothing, and this method deliberately does not judge.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if the mark table cannot be read.
+                pub async fn ledger_high_water(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHighWater>> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    // A single primary-key row, like `ledger_head`: cheap enough
+                    // to pin on a schedule beside the head hash.
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    let mark = ::autumn_web::backend_select! {
+                        pg => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerMark {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                high_seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                head_hash: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT high_seq, head_hash, recorded_at \
+                                 FROM _autumn_ledger_chain_heads \
+                                 WHERE table_name = $1 AND record_id = $2 \
+                                 AND tenant_key = COALESCE($3::text, '')"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerMark>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerHighWater {
+                                record_id,
+                                seq: row.high_seq,
+                                hash: row.head_hash,
+                                recorded_at: row.recorded_at,
+                            })
+                        }},
+                        sqlite => {{
+                            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                            struct __AutumnLedgerMark {
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                high_seq: i64,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                head_hash: ::std::string::String,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                            }
+                            ::autumn_web::reexports::diesel::sql_query(
+                                "SELECT high_seq, head_hash, recorded_at \
+                                 FROM _autumn_ledger_chain_heads \
+                                 WHERE table_name = $1 AND record_id = $2 \
+                                 AND tenant_key = COALESCE($3, '')"
+                            )
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                            .get_results::<__AutumnLedgerMark>(&mut conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .into_iter()
+                            .next()
+                            .map(|row| ::autumn_web::ledger::LedgerHighWater {
+                                record_id,
+                                seq: row.high_seq,
+                                hash: row.head_hash,
+                                recorded_at: row.recorded_at,
+                            })
+                        }},
+                    };
+                    ::core::result::Result::Ok(mark)
                 }
             }
         }
@@ -26462,6 +26798,7 @@ mod tests {
             "ledger_diff",
             "ledger_verify",
             "ledger_head",
+            "ledger_high_water",
         ] {
             assert!(
                 generated.contains(method),

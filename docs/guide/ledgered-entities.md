@@ -66,6 +66,26 @@ CREATE UNIQUE INDEX idx_autumn_ledger_revisions_chain
     ON _autumn_ledger_revisions (table_name, COALESCE(tenant_id, ''), record_id, seq);
 ```
 
+A second framework table holds each record's **high-water mark** — the highest
+sequence number its chain has ever reached, kept where deleting a revision
+cannot reach it:
+
+```sql
+CREATE TABLE _autumn_ledger_chain_heads (
+    table_name  TEXT        NOT NULL,
+    tenant_key  TEXT        NOT NULL,   -- COALESCE(tenant_id, '')
+    record_id   BIGINT      NOT NULL,
+    high_seq    BIGINT      NOT NULL,   -- never decreases
+    head_hash   TEXT        NOT NULL,   -- hash of the revision at high_seq
+    recorded_at TIMESTAMPTZ NOT NULL,   -- and its transaction time
+    PRIMARY KEY (table_name, tenant_key, record_id)
+);
+```
+
+Its migration backfills a mark for every chain that already exists, so adopting
+it is a plain `autumn migrate` with nothing to reconcile afterwards. See
+[Tamper evidence](#tamper-evidence) for what it buys.
+
 `snapshot` is `TEXT`, not `JSONB`, on purpose. `JSONB` parses each number into
 `numeric` and re-renders it on output, so a float serde writes as `1e16` comes
 back as `10000000000000000`. The revision hash covers the exact bytes that were
@@ -102,6 +122,9 @@ let revisions = repo.ledger_revisions(id).await?;
 
 // The head hash, for pinning outside the database.
 let head = repo.ledger_head(id).await?;
+
+// The out-of-band high-water mark this record's chain has reached.
+let mark = repo.ledger_high_water(id).await?;
 ```
 
 `ledger_as_of` returns `None` when the record did not exist yet. Because a
@@ -145,8 +168,14 @@ Three consequences worth knowing:
 
 Every revision carries two instants:
 
-- `recorded_at` — **transaction time**: when the database learned the fact.
-  Always set by the framework from the write's own clock read.
+- `recorded_at` — **transaction time**: when the database learned the fact. Set
+  by the framework from the **database's** clock (`clock_timestamp()` on
+  Postgres, `strftime(…, 'now')` on SQLite), read at the point the append has
+  already read the record's chain head — so it reflects database ordering rather
+  than the writing host's clock, which across a multi-node deployment can skew or
+  step. It is additionally clamped so it never precedes the revision before it,
+  which makes transaction time **non-decreasing along a chain by construction**;
+  `ledger_verify` reports a chain where it is not.
 - `valid_from` — **valid time**: when the fact became true in the business
   domain. Defaults to `recorded_at`.
 
@@ -196,7 +225,13 @@ Each revision embeds the hash of its predecessor, forming a per-record chain.
 | The chain no longer starts at seq 1 | `BrokenChainStart` / `MissingRevision` |
 | A sequence number is at `i64::MAX` and cannot be followed | `UnusableSeq` |
 | The newest revision does not describe the live row | `LiveStateMismatch` |
-| A live row with no chain at all | *Not* a break — see below |
+| The newest revision was deleted (before *or* after the next write) | `MissingRevision` at the absent sequence number |
+| The whole chain was erased | `MissingRevision` at sequence 1 |
+| Revisions exist but the high-water mark row was deleted | `HighWaterMissing` |
+| The high-water mark was rolled back, or revisions appended without it | `HighWaterBehind` |
+| The high-water mark names a different revision at the same sequence | `HighWaterMismatch` |
+| Transaction time moves backwards along the chain | `RecordedAtRegression` |
+| A live row with no chain **and no mark** at all | *Not* a break — see below |
 
 An intact report carries `head_hash`; a broken one carries none.
 
@@ -228,26 +263,54 @@ hash, plus — via the live-row cross-check — a truncated tail and any write t
 bypassed the ledger.
 
 What it cannot see is a *consistent* rewrite. The hashing rule is open source, so
-an adversary with write access to the ledger table can re-derive a whole chain
-and adjust the row to match. Nothing stored inside the same database can prevent
-that.
+an adversary with write access to the ledger tables can re-derive a whole chain,
+adjust the row to match, and re-establish the high-water mark. Nothing stored
+inside the same database can prevent that.
 
-One state is deliberately **not** reported: a live row with no revisions at all.
-That is what every existing row looks like on the day you adopt `ledgered` —
-ledgering is not retroactive — so accusing it would put a false positive in front
-of every adopting deployment. The cost is that a *wholly* erased chain looks
-identical from inside the database; `revisions_checked == 0` on the report is
-what makes the empty case visible, and a pinned head (below) is what tells the
-two apart.
+One state is deliberately **not** reported: a live row with no revisions *and no
+high-water mark*. That is what every existing row looks like on the day you adopt
+`ledgered` — ledgering is not retroactive — so accusing it would put a false
+positive in front of every adopting deployment. `revisions_checked == 0` on the
+report is what makes the empty case visible to a caller that cares.
 
-There is also a narrower window worth knowing about. Deleting the newest
-revision and then letting a *normal* write land re-uses the deleted sequence
-number: the new revision chains cleanly onto its predecessor and matches the live
-row, so both the chain and the cross-check report intact and the deleted state
-leaves no trace. `ledger_verify` catches the truncation in the window *before*
-that next write — but only if it runs there.
+### The high-water mark
 
-Both gaps close the same way: pin the head hash somewhere the database cannot
+A revision's sequence number used to be allocated purely from the rows that
+survive in `_autumn_ledger_revisions`. That left a window an attacker could close
+themselves: delete the newest revision, then wait for a *normal* application
+write. The append read `N-1`, re-allocated `N`, chained cleanly onto its
+predecessor and matched the live row — so both the chain and the cross-check
+reported intact, and the deleted state left no trace.
+
+`_autumn_ledger_chain_heads` closes it. Every append allocates
+`max(chain head, high-water mark) + 1`, and the mark lives outside the deletable
+revision rows and never decreases. The same attack now allocates `N+1` and leaves
+a **permanent gap** at `N` that `ledger_verify` reports as `MissingRevision` —
+whenever it runs, not only in the window before the next write. A *wholly* erased
+chain is caught the same way: the mark outlives the rows, so an empty chain
+beside a surviving mark is reported rather than mistaken for a row that predates
+ledgering.
+
+The mark is never *authoritative*, only cross-checked. `ledger_verify` compares
+it with the chain in both directions and reports either side disagreeing:
+
+```rust
+// Both are cheap single-row reads; pin them together.
+let head = repo.ledger_head(id).await?;
+let mark = repo.ledger_high_water(id).await?;
+```
+
+| Tamper with the mark | Reported |
+|---|---|
+| Roll `high_seq` back so a truncation looks clean | `HighWaterBehind` |
+| Rewrite `head_hash` / `recorded_at` to match a forgery | `HighWaterMismatch` |
+| Delete the mark row so the old attack works again | `HighWaterMissing` |
+
+What it does **not** do is close the class. An attacker with `DELETE` on the
+revisions table usually has it on this one too, and rewriting both consistently
+is still possible — it raises the bar rather than removing the ceiling.
+
+So the ceiling is unchanged: pin the head hash somewhere the database cannot
 reach. Treat that as required for an audit posture, not optional.
 
 ```rust
@@ -295,19 +358,24 @@ instead.
 
 ## Cost
 
-Each write adds one indexed `SELECT … ORDER BY seq DESC LIMIT 1` and one
-`INSERT`, inside the transaction the write already opened; a ledgered **delete**
-adds a third statement, reading back the `deleted_at` the update wrote so the
-revision snapshots the post-delete row exactly. Bulk paths (`save_many`,
+Each write adds one indexed read — a single statement that fetches the database
+clock, the chain head (`ORDER BY seq DESC LIMIT 1`) and the high-water mark
+together — plus the revision `INSERT` and the mark's upsert, inside the
+transaction the write already opened; a ledgered **delete** adds a fourth
+statement, reading back the `deleted_at` the update wrote so the revision
+snapshots the post-delete row exactly. Bulk paths (`save_many`,
 `upsert_many`, `delete_many`) pay this per row, inside the transaction that
 already holds their row locks — a `delete_many` over 1000 ids goes from a couple
 of statements to a few thousand. Chunk accordingly, or keep bulk writes off
 ledgered entities where throughput matters.
 
-`ledger_head` is a single indexed row, so pinning it on a schedule is cheap.
+`ledger_head` and `ledger_high_water` are single indexed rows each, so pinning
+them on a schedule is cheap.
 `ledger_revisions`, `ledger_as_of`, `ledger_diff` and `ledger_verify` read a
 record's whole chain (there is no pagination in this slice), and `ledger_verify`
-additionally reads the live row and re-reads the head.
+additionally reads the live row, the high-water mark, and re-reads the head — the
+last of those is the stability gate that keeps a concurrent write from being
+mistaken for tampering.
 
 Snapshots store the full row, so a ledgered table's history grows with row width,
 not just with the size of each change — the price of O(1) as-of reconstruction
@@ -329,6 +397,18 @@ this slice.
   repository, a hand-written `UPDATE` — do not append a revision. They cannot be
   refused at compile time (they are declared elsewhere), but `ledger_verify`
   reports each as a `LiveStateMismatch`.
+- Transaction time is read from the database *before* the write commits, so a
+  revision can still become visible a commit's worth of time after the instant it
+  carries. Closing that would need a commit timestamp, which cannot be read
+  before the insert that has to hash it.
+- The high-water mark raises the bar on a consistent rewrite rather than closing
+  it: an attacker who can rewrite the revisions table can usually rewrite the
+  mark table too. Anchoring a chain outside the database — a notary, an
+  append-only object store — is still the answer, and pinning `ledger_head` is
+  the supported form of it.
+- A revision written by a **pre-#2323 writer** during a rolling deploy does not
+  raise the mark, so `ledger_verify` reports `HighWaterBehind` until that
+  record's next write re-establishes it. Migrate, then finish the deploy.
 
 ## See also
 

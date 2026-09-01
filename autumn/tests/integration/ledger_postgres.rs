@@ -78,6 +78,13 @@ pub trait LedgerInvoiceRepository {}
 const LEDGER_UP: &str =
     include_str!("../../version_history_migrations/20260826000000_create_ledger_revisions/up.sql");
 
+/// The #2323 high-water marks, from the same shipped migration set.
+///
+/// Applied after `LEDGER_UP` because its backfill reads the revisions table.
+const LEDGER_CHAIN_HEADS_UP: &str = include_str!(
+    "../../version_history_migrations/20260901000000_create_ledger_chain_heads/up.sql"
+);
+
 /// A `ledgered` repository implies `versioned`, so both tables must exist.
 const VERSION_HISTORY_UP: &str =
     include_str!("../../version_history_migrations/20260526000000_create_version_history/up.sql");
@@ -109,6 +116,7 @@ async fn setup_pool() -> (
          )",
         VERSION_HISTORY_UP,
         LEDGER_UP,
+        LEDGER_CHAIN_HEADS_UP,
     ] {
         conn.batch_execute(ddl)
             .await
@@ -426,8 +434,234 @@ async fn verify_detects_a_truncated_tail_on_postgres() {
         .expect("verify")
         .broken
         .expect("a truncated tail must be detected");
+    assert_eq!(
+        broken.kind,
+        LedgerBreak::MissingRevision,
+        "the #2323 mark outlives the revision it names, so the break is the \
+         absent sequence number rather than a live row that merely disagrees"
+    );
+    assert_eq!(broken.seq, 2);
+
+    // Cover the mark up too — the adversary the threat model concedes — and the
+    // live-row cross-check still holds the line.
+    resync_high_water_mark(&pool, created.id).await;
+    let broken = repo
+        .ledger_verify(created.id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the live row must still expose the truncation");
     assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
     assert_eq!(broken.seq, 1);
+}
+
+/// Rewrite a record's #2323 high-water mark to agree with whatever revisions
+/// survive, or remove it when none do — the `SQLite` tier's helper, on this tier.
+async fn resync_high_water_mark(pool: &Pool<AsyncPgConnection>, record_id: i64) {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "DELETE FROM _autumn_ledger_chain_heads \
+         WHERE table_name = 'test_ledger_invoices' AND record_id = $1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(record_id)
+    .execute(&mut conn)
+    .await
+    .expect("clear the mark");
+    diesel::sql_query(
+        "INSERT INTO _autumn_ledger_chain_heads \
+         (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+         SELECT table_name, COALESCE(tenant_id, ''), record_id, seq, hash, recorded_at \
+         FROM _autumn_ledger_revisions \
+         WHERE table_name = 'test_ledger_invoices' AND record_id = $1 \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(record_id)
+    .execute(&mut conn)
+    .await
+    .expect("re-establish the mark over the surviving chain");
+}
+
+/// The Postgres fork of #2323's headline case: delete the newest revision, then
+/// let an ordinary write land. The append must allocate past the gap rather than
+/// re-use the deleted sequence number — which on this tier means the
+/// `_autumn_ledger_chain_heads` primary key, the `ON CONFLICT … DO UPDATE …
+/// WHERE` upsert and the `clock_timestamp()` chain-state read all behaving as
+/// the `SQLite` tier's do.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_post_truncation_append_leaves_a_gap_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "PG-HW".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+        })
+        .await
+        .expect("insert");
+    for step in 2..=3 {
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(step),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let mark = repo
+        .ledger_high_water(created.id)
+        .await
+        .expect("mark")
+        .expect("a written record has a mark");
+    assert_eq!(mark.seq, 3, "the mark tracks every append");
+    let head = repo
+        .ledger_head(created.id)
+        .await
+        .expect("head")
+        .expect("head");
+    assert_eq!(mark.hash, head.hash, "the mark names the head revision");
+    assert_eq!(mark.recorded_at, head.recorded_at);
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $1 AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut conn)
+        .await
+        .expect("lop off the newest revision");
+    }
+
+    repo.update(
+        created.id,
+        &UpdateLedgerInvoice {
+            amount_cents: Patch::Set(4_242),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an ordinary write lands after the truncation");
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 4],
+        "the append must allocate past the deleted sequence number"
+    );
+
+    let broken = repo
+        .ledger_verify(created.id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the gap the append left must be reported");
+    assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+    assert_eq!(broken.seq, 3);
+}
+
+/// The Postgres fork of the transaction-time guarantee: `recorded_at` comes from
+/// `clock_timestamp()` and is clamped against the chain's floor, so it is
+/// non-decreasing along a chain however the writing host's clock behaves.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    let before = now();
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "PG-TT".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+        })
+        .await
+        .expect("insert");
+    for step in 2..=4 {
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(step),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let recorded: Vec<DateTime<Utc>> = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .iter()
+        .map(|r| r.recorded_at)
+        .collect();
+    assert_eq!(recorded.len(), 4);
+    assert!(
+        recorded.windows(2).all(|w| w[0] <= w[1]),
+        "transaction time must be non-decreasing along a chain: {recorded:?}"
+    );
+    // The container's clock and this host's are the same machine here, so this
+    // is a sanity bound rather than a skew test: what it pins is that
+    // `clock_timestamp()` advances per statement rather than being frozen at the
+    // transaction's start, which `now()` would have been.
+    assert!(
+        recorded[0] >= before - Duration::minutes(5),
+        "the database clock read is a real instant: {:?}",
+        recorded[0]
+    );
+    assert!(
+        recorded[0] < recorded[3],
+        "four separate writes must not share one frozen transaction timestamp"
+    );
+
+    // Push the record's floor an hour ahead, as a fast host clock would have,
+    // and let an ordinary write land behind it.
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::hours(1));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_chain_heads SET recorded_at = $1 \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $2",
+        )
+        .bind::<diesel::sql_types::Timestamptz, _>(ahead)
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut conn)
+        .await
+        .expect("move the record's transaction-time floor forward");
+    }
+
+    repo.update(
+        created.id,
+        &UpdateLedgerInvoice {
+            amount_cents: Patch::Set(7),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    let head = revisions.last().expect("head");
+    assert!(
+        head.recorded_at >= ahead,
+        "a write behind the chain's floor must be clamped up to it: {} < {ahead}",
+        head.recorded_at
+    );
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact(),
+        "the clamped instant is the one that was hashed, so the chain still verifies"
+    );
 }
 
 #[tokio::test]

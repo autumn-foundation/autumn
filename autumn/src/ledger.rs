@@ -39,7 +39,9 @@
 //! Each revision carries two instants:
 //!
 //! * `recorded_at` — **transaction time**: when the database learned the fact.
-//!   Always set by the framework from the write's own clock read.
+//!   Always set by the framework, from the *database's* clock at the point the
+//!   append has read the record's chain head, and clamped so it never precedes
+//!   the revision before it (#2323).
 //! * `valid_from` — **valid time**: when the fact became true in the business
 //!   domain. Defaults to `recorded_at`; a model can supply its own via
 //!   `ledgered(valid_time = "effective_at")` on the repository.
@@ -51,12 +53,12 @@
 //! # Threat model
 //!
 //! The chain is **tamper-evident**, not tamper-proof.
-//! [`verify_chain_against`](crate::ledger::verify_chain_against) — which the
-//! generated `ledger_verify` calls — detects any mutation, insertion, deletion,
-//! or reordering of stored revisions that does not also re-derive every
-//! subsequent hash, plus, by cross-checking the head against the live row, a
-//! truncated tail and any write that reached the table without appending a
-//! revision.
+//! [`verify_chain_with_high_water`](crate::ledger::verify_chain_with_high_water)
+//! — which the generated `ledger_verify` calls — detects any mutation,
+//! insertion, deletion, or reordering of stored revisions that does not also
+//! re-derive every subsequent hash, plus, by cross-checking the head against the
+//! live row, a truncated tail and any write that reached the table without
+//! appending a revision.
 //!
 //! (That link is written out in full because `lib.rs` puts an outer `///`
 //! comment on `pub mod ledger;`: rustdoc concatenates it with this header and
@@ -64,15 +66,31 @@
 //! types are in scope. A bare `[`verify_chain_against`]` fails
 //! `-D rustdoc::broken_intra_doc_links`.)
 //!
-//! What it cannot see is a *consistent* rewrite: the hashing rule is open
-//! source, so an adversary with write access to the ledger table can re-derive a
-//! whole chain (and adjust the row to match). A narrower case has the same
-//! shape: deleting the newest revision and then letting a normal write land
-//! re-uses the deleted sequence number, so the replacement chains cleanly and
-//! matches the live row. The cross-check catches that truncation in the window
-//! *before* the next write, but only if it runs there.
+//! Three checks sit on top of the chain walk, each seeing something the walk
+//! cannot:
 //!
-//! Nothing stored inside the same database closes either gap. Pin
+//! * the **live row**, compared against the head revision, catches a truncated
+//!   tail and any write that bypassed the ledger — but only in the window before
+//!   the next ordinary write lands;
+//! * the **high-water mark** ([`LedgerHighWater`], #2323), which lives outside
+//!   the deletable revision rows and never decreases, makes a post-truncation
+//!   append allocate past the deleted sequence number instead of re-using it. A
+//!   deleted revision therefore leaves a permanent gap rather than a window, and
+//!   a wholly erased chain stops looking like a row that predates ledgering. The
+//!   mark is cross-checked against the chain in both directions, so rolling it
+//!   back, rewriting it or deleting its row is itself reported;
+//! * **transaction time** is read from the database and clamped against the
+//!   chain's own floor (see [`monotonic_recorded_at`]), so a `recorded_at` that
+//!   moves backwards along a chain is a break rather than a plausible clock
+//!   step.
+//!
+//! What none of them can see is a *consistent* rewrite: the hashing rule is open
+//! source, so an adversary with write access to the ledger tables can re-derive
+//! a whole chain, adjust the row to match, and re-establish the mark. The mark
+//! raises the bar — the same attacker now needs `DELETE` on a second table and
+//! has to keep it consistent — but it does not close the class.
+//!
+//! Nothing stored inside the same database closes that gap. Pin
 //! [`LedgerHead::hash`] somewhere the database cannot reach — an append-only
 //! object store, a notary, a second operator's inbox — and a rewritten or
 //! re-numbered chain disagrees with the pin. For an audit posture that pin is
@@ -109,6 +127,14 @@ use crate::version_history::{ColumnChange, VersionOp};
 
 /// The ledger table every revision is appended to.
 pub const LEDGER_TABLE: &str = "_autumn_ledger_revisions";
+
+/// The table holding each record's high-water mark (issue #2323).
+///
+/// A revision's sequence number is allocated from the greater of the chain head
+/// and this mark, plus one, and the mark lives *outside* the deletable revision
+/// rows — so deleting the newest revision and letting an ordinary write land no
+/// longer re-uses the deleted sequence number. See [`LedgerHighWater`].
+pub const LEDGER_CHAIN_HEAD_TABLE: &str = "_autumn_ledger_chain_heads";
 
 /// Domain-separation tag mixed into every revision hash.
 ///
@@ -321,8 +347,13 @@ fn format_instant(at: DateTime<Utc>) -> String {
 // ── Verification ─────────────────────────────────────────────────────
 
 /// How a chain was broken.
+///
+/// `#[non_exhaustive]`: new detection classes are added as the ledger learns to
+/// see more (#2323 added the four high-water and transaction-time variants), and
+/// a downstream `match` should not have to be revisited to keep compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LedgerBreak {
     /// A revision's stored hash does not match its stored fields: the row was
     /// mutated after it was written.
@@ -347,6 +378,35 @@ pub enum LedgerBreak {
     /// the live row closes that gap, and with it every write that reached the
     /// table without appending a revision.
     LiveStateMismatch,
+    /// A record's transaction time moves backwards along its chain.
+    ///
+    /// The write path sources `recorded_at` from the database and clamps it
+    /// against the predecessor's, so a regression cannot be produced by a
+    /// well-behaved writer on either tier — see [`monotonic_recorded_at`]. One
+    /// in stored data is a forgery, or a chain written by a pre-#2323 writer
+    /// across a host clock step.
+    RecordedAtRegression,
+    /// The record has revisions but no [high-water mark](LedgerHighWater).
+    ///
+    /// The mark is what makes a deleted tail survive the next append, so
+    /// deleting the mark row is the obvious way to restore that attack. Its
+    /// absence beside a live chain is therefore reported rather than tolerated:
+    /// the migration that creates the table backfills a mark for every chain
+    /// that already existed, so "revisions but no mark" is never a legitimate
+    /// state.
+    HighWaterMissing,
+    /// The high-water mark is behind the chain's newest revision.
+    ///
+    /// Either the mark was rolled back, or revisions were appended by something
+    /// that did not maintain it. Self-healing: the record's next ledgered write
+    /// re-establishes the mark above both.
+    HighWaterBehind,
+    /// The high-water mark reaches the chain's newest revision but does not
+    /// describe it — a different hash, or a different transaction time.
+    ///
+    /// Either the head revision was replaced by a re-hashed forgery, or the mark
+    /// itself was rewritten to match one.
+    HighWaterMismatch,
 }
 
 impl LedgerBreak {
@@ -361,6 +421,10 @@ impl LedgerBreak {
             Self::BrokenChainStart => "broken_chain_start",
             Self::UnusableSeq => "unusable_seq",
             Self::LiveStateMismatch => "live_state_mismatch",
+            Self::RecordedAtRegression => "recorded_at_regression",
+            Self::HighWaterMissing => "high_water_missing",
+            Self::HighWaterBehind => "high_water_behind",
+            Self::HighWaterMismatch => "high_water_mismatch",
         }
     }
 }
@@ -425,6 +489,71 @@ pub struct LedgerHead {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// A record's high-water mark: the highest sequence number its chain has ever
+/// reached, kept outside the revision rows (issue #2323).
+///
+/// A revision's sequence number used to be allocated purely from the rows that
+/// survive in `_autumn_ledger_revisions`. Delete the newest revision and let an
+/// *ordinary* application write land: the append reads `N-1`, re-allocates `N`,
+/// chains onto `N-1`'s hash and matches the live row, so the chain walk and the
+/// live-row cross-check both report intact. An attacker who deletes and then
+/// waits for ordinary traffic closes the detection window themselves.
+///
+/// The mark closes that. It lives in [`LEDGER_CHAIN_HEAD_TABLE`], is never
+/// decreased (the writer's upsert refuses to lower it), and the write path
+/// allocates one past the greater of the two — so the same attack allocates `N+1`
+/// and leaves a permanent gap at `N` that [`verify_chain_with_high_water`]
+/// reports as [`LedgerBreak::MissingRevision`].
+///
+/// It is never *authoritative*, only cross-checked. Verification compares it
+/// with the chain in both directions and reports either side disagreeing, so
+/// rolling the mark back ([`LedgerBreak::HighWaterBehind`]), rewriting it
+/// ([`LedgerBreak::HighWaterMismatch`]) or deleting its row
+/// ([`LedgerBreak::HighWaterMissing`]) is itself an accusation. What it does not
+/// do is close the class: an adversary with `DELETE` on the revisions table
+/// usually has it on this one too, and rewriting both consistently is still
+/// possible. Pinning [`LedgerHead::hash`] outside the database remains required
+/// for an audit posture.
+///
+/// `recorded_at` doubles as the floor the next revision's transaction time is
+/// clamped against, which is what makes transaction time non-decreasing along a
+/// chain even across the gap a deleted revision leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerHighWater {
+    /// The record this mark belongs to.
+    pub record_id: i64,
+    /// Highest sequence number ever allocated for the record.
+    pub seq: i64,
+    /// Hash of the revision that was written at [`seq`](Self::seq).
+    pub hash: String,
+    /// Transaction time of the revision that was written at
+    /// [`seq`](Self::seq).
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// What a verification knows about a record's
+/// [high-water mark](LedgerHighWater).
+///
+/// Distinguishes "the mark row is gone" from "no mark was read", exactly as
+/// [`LedgerLiveState`] distinguishes a missing row from an unread one. The
+/// difference matters: an absent mark beside a live chain is an accusation
+/// ([`LedgerBreak::HighWaterMissing`]), while an unread one must be silent — the
+/// pre-#2323 [`verify_chain_against`] entry point, and the case where a
+/// concurrent write moved the chain head under the reader, both pass
+/// [`NotChecked`](Self::NotChecked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerHighWaterState<'a> {
+    /// The mark was not read, or moved under the reader, so no cross-check is
+    /// performed. Chain-internal breaks are still reported.
+    NotChecked,
+    /// The record has no mark row. Beside a non-empty chain this is itself a
+    /// break: the migration backfills a mark for every chain that already
+    /// existed, so the only way to reach this state is to delete one.
+    Absent,
+    /// The record's mark, as stored.
+    Present(&'a LedgerHighWater),
+}
+
 /// How the live table row compares to the chain's head revision.
 ///
 /// A hash chain proves the revisions that are *present* were not edited. It
@@ -460,11 +589,12 @@ pub enum LedgerLiveState {
 
 /// Verify one record's revision chain and report the first broken link.
 ///
-/// Equivalent to [`verify_chain_against`] with [`LedgerLiveState::NotChecked`]:
-/// it proves the stored revisions were not edited, inserted into, or deleted
-/// from the middle, but cannot see a truncated tail or a write that never
-/// appended a revision. The generated `ledger_verify` reads the live row and
-/// calls [`verify_chain_against`] instead.
+/// Equivalent to [`verify_chain_with_high_water`] with no live row and no
+/// high-water mark: it proves the stored revisions were not edited, inserted
+/// into, or deleted from the middle, and that their transaction time never moves
+/// backwards, but cannot see a truncated tail or a write that never appended a
+/// revision. The generated `ledger_verify` reads both and calls
+/// [`verify_chain_with_high_water`] instead.
 #[must_use]
 pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerification {
     verify_chain_against(record_id, revisions, LedgerLiveState::NotChecked)
@@ -495,17 +625,63 @@ pub fn verify_chain(record_id: i64, revisions: &[LedgerRevision]) -> LedgerVerif
 ///
 /// An empty slice always verifies as intact, live row or not: a record may never
 /// have been written, or may predate the day its model was ledgered (the
-/// migration guide says ledgering is not retroactive). Distinguishing that from
-/// a wholly erased chain needs metadata outside the deletable rows — see #2323;
-/// a pinned head covers it meanwhile. `revisions_checked` reports the emptiness.
+/// migration guide says ledgering is not retroactive). `revisions_checked`
+/// reports the emptiness. [`verify_chain_with_high_water`] is what tells that
+/// apart from a *wholly erased* chain, whose mark outlives its rows.
 #[must_use]
 pub fn verify_chain_against(
     record_id: i64,
     revisions: &[LedgerRevision],
     live: LedgerLiveState,
 ) -> LedgerVerification {
+    verify_chain_with_high_water(record_id, revisions, live, LedgerHighWaterState::NotChecked)
+}
+
+/// Verify one record's revision chain against the row the table holds **and**
+/// its out-of-band [high-water mark](LedgerHighWater), and report the first
+/// broken link (issue #2323).
+///
+/// The superset of [`verify_chain_against`], which is this function with
+/// `high_water = None`. The generated `ledger_verify` reads the mark and calls
+/// this.
+///
+/// Breaks are reported in order of how specific they are:
+///
+/// 1. **chain-internal** — everything [`verify_chain_against`] lists, plus a
+///    transaction time that moves backwards along the chain
+///    ([`LedgerBreak::RecordedAtRegression`]);
+/// 2. **high-water** — the mark and the chain disagree:
+///    * the mark reaches past the newest surviving revision: the tail was
+///      deleted, and the sequence numbers between them are gone
+///      ([`LedgerBreak::MissingRevision`], reported at the lowest absent one);
+///    * the chain reaches past the mark ([`LedgerBreak::HighWaterBehind`]);
+///    * they agree on the sequence number but not on the revision it names
+///      ([`LedgerBreak::HighWaterMismatch`]);
+///    * the chain is non-empty and there is no mark at all
+///      ([`LedgerBreak::HighWaterMissing`]);
+/// 3. **live-state** — the head revision does not describe the live row
+///    ([`LedgerBreak::LiveStateMismatch`]).
+///
+/// A truncated tail trips both (2) and (3); (2) is reported because it names the
+/// sequence number that is gone, which the live-row comparison cannot.
+///
+/// An empty chain with no mark still verifies as intact: that is what every
+/// existing row looks like on the day a team adopts `ledgered`, and ledgering is
+/// not retroactive. An empty chain *with* a mark does not — the mark proves the
+/// chain existed, so its erasure is reported. The migration that creates the
+/// mark table backfills one for every chain that already existed, so a chain
+/// written before #2323 is covered too.
+#[must_use]
+pub fn verify_chain_with_high_water(
+    record_id: i64,
+    revisions: &[LedgerRevision],
+    live: LedgerLiveState,
+    high_water: LedgerHighWaterState<'_>,
+) -> LedgerVerification {
     let checked = revisions.len();
-    let broken = first_break(revisions).or_else(|| live_state_break(revisions, live));
+    let broken = first_break(revisions)
+        .or_else(|| high_water_break(revisions, high_water))
+        .or_else(|| live_state_break(revisions, live));
     let head_hash = if broken.is_none() {
         revisions.last().map(|r| r.hash.clone())
     } else {
@@ -517,6 +693,104 @@ pub fn verify_chain_against(
         head_hash,
         broken,
     }
+}
+
+/// Cross-check the chain against its out-of-band high-water mark.
+///
+/// Runs after the chain itself verifies, so the chain side of every comparison
+/// here is known-consistent and a disagreement is always about what is *missing*
+/// from the end, or about the mark itself.
+///
+/// Neither source is trusted over the other: a mark ahead of the chain accuses
+/// the chain, a mark behind it accuses the mark, and a mark that names a
+/// different revision at the same sequence number accuses both without guessing
+/// which. That is what keeps the mark from being a second thing to forge
+/// silently.
+fn high_water_break(
+    revisions: &[LedgerRevision],
+    high_water: LedgerHighWaterState<'_>,
+) -> Option<LedgerBreakReport> {
+    let high_water = match high_water {
+        // Nothing was read, so there is nothing to disagree with.
+        LedgerHighWaterState::NotChecked => return None,
+        LedgerHighWaterState::Absent => None,
+        LedgerHighWaterState::Present(mark) => Some(mark),
+    };
+    match (revisions.last(), high_water) {
+        // No chain and no mark: a record that was never written, or one that
+        // predates the day its model was ledgered. Not an accusation — see
+        // `live_state_break` for why that false positive matters.
+        (None, None) => None,
+        // A mark with no chain at all. The mark is proof the chain existed, so
+        // this is the wholesale erasure that was previously indistinguishable
+        // from the case above.
+        (None, Some(mark)) => Some(LedgerBreakReport {
+            seq: 1,
+            revision_id: None,
+            kind: LedgerBreak::MissingRevision,
+            detail: format!(
+                "the high-water mark reaches revision {} but the record has no \
+                 revisions at all; the whole chain was erased",
+                mark.seq
+            ),
+        }),
+        (Some(head), None) => Some(LedgerBreakReport {
+            seq: head.seq,
+            revision_id: Some(head.id),
+            kind: LedgerBreak::HighWaterMissing,
+            detail: format!(
+                "the chain reaches revision {} but the record has no high-water \
+                 mark; the mark that would expose a deleted tail was itself removed",
+                head.seq
+            ),
+        }),
+        (Some(head), Some(mark)) => head_versus_mark(head, mark),
+    }
+}
+
+/// Compare a non-empty chain's head revision with its mark.
+fn head_versus_mark(head: &LedgerRevision, mark: &LedgerHighWater) -> Option<LedgerBreakReport> {
+    if mark.seq > head.seq {
+        // Saturating is safe: `first_break` already refused a chain whose head
+        // sits at `i64::MAX`, so `head.seq + 1` cannot wrap here.
+        let absent = head.seq.saturating_add(1);
+        return Some(LedgerBreakReport {
+            seq: absent,
+            revision_id: None,
+            kind: LedgerBreak::MissingRevision,
+            detail: format!(
+                "the high-water mark reaches revision {} but the chain stops at {}; \
+                 revision {absent} onwards was deleted from the end",
+                mark.seq, head.seq
+            ),
+        });
+    }
+    if mark.seq < head.seq {
+        return Some(LedgerBreakReport {
+            seq: head.seq,
+            revision_id: Some(head.id),
+            kind: LedgerBreak::HighWaterBehind,
+            detail: format!(
+                "the chain reaches revision {} but its high-water mark stops at {}; \
+                 the mark was rolled back, or revisions were appended without it",
+                head.seq, mark.seq
+            ),
+        });
+    }
+    if mark.hash != head.hash || mark.recorded_at != head.recorded_at {
+        return Some(LedgerBreakReport {
+            seq: head.seq,
+            revision_id: Some(head.id),
+            kind: LedgerBreak::HighWaterMismatch,
+            detail: format!(
+                "the high-water mark names revision {} but does not describe the \
+                 revision stored there; the head revision was replaced, or the mark \
+                 was rewritten to match a replacement",
+                head.seq
+            ),
+        });
+    }
+    None
 }
 
 /// Cross-check the head revision against the live row.
@@ -537,12 +811,12 @@ fn live_state_break(
     // would put a false positive in front of every such deployment, against the
     // one metric this module is held to.
     //
-    // The cost is that a *wholly* erased chain is indistinguishable from a
-    // pre-ledgering row from inside the database. Telling them apart needs
-    // per-record initialization metadata kept outside the deletable rows
-    // (tracked in #2323); a pinned head covers it meanwhile, naming a sequence
-    // the ledger no longer has. `revisions_checked == 0` on the report is what
-    // makes the empty case visible to a caller that cares.
+    // A *wholly* erased chain used to be indistinguishable from a pre-ledgering
+    // row from inside the database. `high_water_break` tells them apart now
+    // (#2323): the mark lives outside the deletable rows and survives the
+    // erasure, so a chain that has a mark and no revisions is reported while one
+    // with neither stays silent. `revisions_checked == 0` on the report is still
+    // what makes the empty case visible to a caller that cares.
     let head = revisions.last()?;
 
     match live {
@@ -682,9 +956,86 @@ fn link_break(
                     ),
                 });
             }
+            // Transaction time only ever moves forward along a chain: the write
+            // path reads the instant from the database and clamps it against the
+            // predecessor's (see `monotonic_recorded_at`), so a regression cannot
+            // be produced by a well-behaved writer on either tier. Valid time is
+            // deliberately *not* checked — a back-dated correction is the whole
+            // point of the second axis.
+            if revision.recorded_at < previous.recorded_at {
+                return Some(LedgerBreakReport {
+                    seq: revision.seq,
+                    revision_id: Some(revision.id),
+                    kind: LedgerBreak::RecordedAtRegression,
+                    detail: format!(
+                        "revision {} was recorded before revision {}, which precedes it \
+                         in the chain; transaction time cannot move backwards along a \
+                         chain the framework wrote",
+                        revision.seq, previous.seq
+                    ),
+                });
+            }
         }
     }
     None
+}
+
+/// The transaction time a revision must carry, given the database's own clock
+/// read and the chain's current floor (issue #2323).
+///
+/// `recorded_at` used to be `Utc::now()` on the writing node. Across a
+/// multi-node deployment with clock skew, or after a host clock adjustment, a
+/// later sequence could carry an earlier instant — and `snapshot_as_of` filters
+/// on `recorded_at` before taking the greatest surviving `seq`, so an as-of
+/// query could return a revision that was not yet current at the instant asked
+/// about. Verification never noticed: it walks the chain in `seq` order.
+///
+/// Two things fix that together. The write path now reads `db_now` from the
+/// database (`clock_timestamp()` on Postgres, `strftime(…, 'now')` on `SQLite`)
+/// at the point the append has already read the record's chain head — so the
+/// instant reflects database ordering rather than a host clock. And this
+/// function clamps it against `floor`, the greater of the predecessor
+/// revision's `recorded_at` and the high-water mark's, which makes transaction
+/// time non-decreasing along a chain *by construction* rather than by
+/// assumption — including across the gap a deleted revision leaves, since the
+/// mark outlives the row.
+///
+/// Both sides are truncated to microseconds first, the precision both storage
+/// tiers keep, so the value that enters the hash preimage is exactly the value
+/// the database stores.
+///
+/// What this does not promise: `db_now` is read before the transaction commits,
+/// so a revision can still become *visible* slightly after the instant it
+/// carries. Closing that would need a commit timestamp, which cannot be read
+/// before the insert that has to hash it.
+#[must_use]
+pub fn monotonic_recorded_at(db_now: DateTime<Utc>, floor: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let now = truncate_to_micros(db_now);
+    floor.map_or(now, |floor| now.max(truncate_to_micros(floor)))
+}
+
+/// Parse the instant the `SQLite` arm of the write path reads from the database
+/// clock.
+///
+/// `SQLite` has no `clock_timestamp()`; the write path reads
+/// `strftime('%Y-%m-%d %H:%M:%f', 'now')`, which renders UTC to millisecond
+/// precision (`2026-09-01 18:08:53.597`). `SQLite` documents that every `'now'`
+/// inside one `sqlite3_step` sees the same value, so the read is coherent with
+/// the chain-head read it rides along with.
+///
+/// Parsed here rather than bound through `TimestamptzSqlite` so the accepted
+/// encoding is pinned by a test in this crate instead of by whichever format
+/// list Diesel's `SQLite` timestamp decoder happens to carry.
+///
+/// Returns `None` for anything that is not that encoding, which the write path
+/// turns into a [`LedgerError::ChainUnreadable`] rather than falling back to a
+/// host clock: a ledgered write that cannot establish its transaction time must
+/// not proceed.
+#[must_use]
+pub fn parse_sqlite_instant(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|naive| naive.and_utc())
 }
 
 // ── As-of reconstruction ─────────────────────────────────────────────
@@ -1667,6 +2018,318 @@ mod tests {
         let report = verify_chain_against(7, &chain(2), LedgerLiveState::NotChecked);
         assert!(report.is_intact(), "{report:?}");
         assert_eq!(report.head_hash.as_deref(), Some(chain(2)[1].hash.as_str()));
+    }
+
+    // ── high-water mark (#2323): truncation survives the next append ──
+
+    /// The mark a well-behaved writer would have left for `revisions`.
+    fn mark_for(revisions: &[LedgerRevision]) -> LedgerHighWater {
+        let head = revisions.last().expect("a non-empty chain");
+        LedgerHighWater {
+            record_id: head.record_id,
+            seq: head.seq,
+            hash: head.hash.clone(),
+            recorded_at: head.recorded_at,
+        }
+    }
+
+    #[test]
+    fn verify_accepts_a_chain_its_high_water_mark_agrees_with() {
+        let revisions = chain(3);
+        let report = verify_chain_with_high_water(
+            7,
+            &revisions,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark_for(&revisions)),
+        );
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(
+            report.head_hash.as_deref(),
+            Some(revisions[2].hash.as_str())
+        );
+    }
+
+    #[test]
+    fn verify_reports_a_truncated_tail_the_high_water_mark_remembers() {
+        // The #2318 live-row cross-check only sees this in the window before the
+        // next write. The mark sees it whenever `verify` runs.
+        let full = chain(3);
+        let mark = mark_for(&full);
+        let truncated = &full[..2];
+
+        let broken = verify_chain_with_high_water(
+            7,
+            truncated,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("the mark must expose the deleted head revision");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(
+            broken.seq, 3,
+            "the absent sequence number, not the survivor"
+        );
+        assert_eq!(broken.revision_id, None);
+    }
+
+    #[test]
+    fn verify_reports_the_gap_a_post_truncation_append_leaves() {
+        // The issue's headline case. Revision 3 is deleted, then an ordinary
+        // write lands: because the writer allocates `max(head, mark) + 1` it
+        // takes 4, not 3, so the evidence survives the append.
+        let full = chain(4);
+        let mut surviving: Vec<LedgerRevision> = full[..2].to_vec();
+        surviving.push(full[3].clone());
+
+        let broken = verify_chain_with_high_water(
+            7,
+            &surviving,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark_for(&surviving)),
+        )
+        .broken
+        .expect("the gap left by the re-numbered append must be reported");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn verify_reports_a_wholly_erased_chain_against_its_mark() {
+        // Previously indistinguishable from a row that predates ledgering — the
+        // limitation `verify_does_not_accuse_a_row_that_predates_ledgering`
+        // documents. The mark tells the two apart.
+        let mark = mark_for(&chain(3));
+        let broken = verify_chain_with_high_water(
+            7,
+            &[],
+            LedgerLiveState::Absent,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("an erased chain whose mark survives must be reported");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(broken.seq, 1);
+    }
+
+    #[test]
+    fn verify_still_accepts_a_row_that_predates_ledgering() {
+        // No revisions and no mark: exactly what every existing row looks like
+        // on the day a team adopts `ledgered`. Still not an accusation.
+        let report = verify_chain_with_high_water(
+            7,
+            &[],
+            LedgerLiveState::Diverged,
+            LedgerHighWaterState::Absent,
+        );
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 0);
+    }
+
+    #[test]
+    fn verify_reports_a_deleted_high_water_row() {
+        // Deleting the mark is the obvious way to restore the original attack,
+        // so its absence beside a live chain is itself the accusation.
+        let broken = verify_chain_with_high_water(
+            7,
+            &chain(3),
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Absent,
+        )
+        .broken
+        .expect("a chain with no mark at all must be reported");
+        assert_eq!(broken.kind, LedgerBreak::HighWaterMissing);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn verify_reports_a_high_water_mark_rolled_backwards() {
+        let revisions = chain(3);
+        let mut mark = mark_for(&revisions);
+        mark.seq = 1;
+        mark.hash = revisions[0].hash.clone();
+        mark.recorded_at = revisions[0].recorded_at;
+
+        let broken = verify_chain_with_high_water(
+            7,
+            &revisions,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("a rolled-back mark must be reported");
+        assert_eq!(broken.kind, LedgerBreak::HighWaterBehind);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn verify_reports_a_rewritten_high_water_hash() {
+        let revisions = chain(3);
+        let mut mark = mark_for(&revisions);
+        mark.hash = "0".repeat(64);
+
+        let broken = verify_chain_with_high_water(
+            7,
+            &revisions,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("a mark that no longer names the head revision must be reported");
+        assert_eq!(broken.kind, LedgerBreak::HighWaterMismatch);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn verify_reports_a_high_water_mark_whose_instant_was_rewritten() {
+        // `recorded_at` on the mark is the floor the next write clamps against,
+        // so moving it is a way to steer future transaction times.
+        let revisions = chain(3);
+        let mut mark = mark_for(&revisions);
+        mark.recorded_at = at(9_999);
+
+        let broken = verify_chain_with_high_water(
+            7,
+            &revisions,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("a mark whose instant disagrees with the head must be reported");
+        assert_eq!(broken.kind, LedgerBreak::HighWaterMismatch);
+    }
+
+    #[test]
+    fn a_chain_internal_break_outranks_a_high_water_break() {
+        let mut revisions = chain(3);
+        let mark = mark_for(&revisions);
+        revisions[1].snapshot = json!({ "id": 7, "title": "tampered" });
+
+        let broken = verify_chain_with_high_water(
+            7,
+            &revisions,
+            LedgerLiveState::Matches,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("break detected");
+        assert_eq!(broken.kind, LedgerBreak::HashMismatch);
+        assert_eq!(broken.seq, 2);
+    }
+
+    #[test]
+    fn a_high_water_break_outranks_a_live_state_mismatch() {
+        // A truncated tail trips both. `MissingRevision` names the sequence
+        // number that is gone, which `LiveStateMismatch` cannot.
+        let full = chain(3);
+        let mark = mark_for(&full);
+        let broken = verify_chain_with_high_water(
+            7,
+            &full[..2],
+            LedgerLiveState::Diverged,
+            LedgerHighWaterState::Present(&mark),
+        )
+        .broken
+        .expect("break detected");
+        assert_eq!(broken.kind, LedgerBreak::MissingRevision);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn verify_chain_against_still_checks_without_a_mark() {
+        // The three-argument entry point stays exactly as it was: no mark, no
+        // high-water reporting, so a caller that has not migrated is unaffected.
+        let report = verify_chain_against(7, &chain(3), LedgerLiveState::Matches);
+        assert!(report.is_intact(), "{report:?}");
+    }
+
+    // ── transaction time is non-decreasing along a chain (#2323) ──────
+
+    #[test]
+    fn verify_reports_a_transaction_time_that_moves_backwards() {
+        // Sourcing `recorded_at` from the database and clamping it against the
+        // predecessor makes a regression impossible by construction, so one in
+        // stored data is either a forgery or a chain written by a pre-#2323
+        // writer across a clock step.
+        let mut revisions = chain(3);
+        revisions[2].recorded_at = revisions[1].recorded_at - chrono::Duration::seconds(1);
+        revisions[2].hash = revisions[2].compute_hash();
+
+        let broken = verify_chain(7, &revisions)
+            .broken
+            .expect("a backwards transaction time must be reported");
+        assert_eq!(broken.kind, LedgerBreak::RecordedAtRegression);
+        assert_eq!(broken.seq, 3);
+    }
+
+    #[test]
+    fn equal_transaction_times_are_not_a_regression() {
+        // Two writes inside one database clock tick are legitimate: the
+        // guarantee is non-decreasing, not strictly increasing.
+        let mut revisions = chain(3);
+        revisions[2].recorded_at = revisions[1].recorded_at;
+        revisions[2].hash = revisions[2].compute_hash();
+
+        assert!(verify_chain(7, &revisions).is_intact());
+    }
+
+    #[test]
+    fn valid_time_may_move_backwards_without_being_a_break() {
+        // Valid time is a business claim: a back-dated correction is the whole
+        // point of the second axis.
+        let mut revisions = chain(3);
+        revisions[2].valid_from = revisions[0].valid_from - chrono::Duration::days(30);
+        revisions[2].hash = revisions[2].compute_hash();
+
+        assert!(verify_chain(7, &revisions).is_intact());
+    }
+
+    #[test]
+    fn monotonic_recorded_at_never_precedes_its_floor() {
+        let now = at(100);
+        assert_eq!(monotonic_recorded_at(now, None), now);
+        assert_eq!(monotonic_recorded_at(now, Some(at(50))), now);
+        assert_eq!(monotonic_recorded_at(now, Some(at(150))), at(150));
+        assert_eq!(monotonic_recorded_at(now, Some(now)), now);
+    }
+
+    #[test]
+    fn monotonic_recorded_at_truncates_both_sides_to_micros() {
+        // The value that is hashed has to be the value the database stores, and
+        // both tiers keep microseconds.
+        let now = at(100) + chrono::Duration::nanoseconds(1_500);
+        assert_eq!(
+            monotonic_recorded_at(now, None),
+            at(100) + chrono::Duration::microseconds(1)
+        );
+        let floor = at(200) + chrono::Duration::nanoseconds(1_500);
+        assert_eq!(
+            monotonic_recorded_at(at(100), Some(floor)),
+            at(200) + chrono::Duration::microseconds(1)
+        );
+    }
+
+    #[test]
+    fn sqlite_instants_round_trip_from_the_database_clock() {
+        // `strftime('%Y-%m-%d %H:%M:%f', 'now')` — what the SQLite arm of the
+        // write path reads, to millisecond precision.
+        let parsed = parse_sqlite_instant("2026-09-01 18:08:53.597")
+            .expect("the documented SQLite clock encoding parses");
+        assert_eq!(
+            parsed.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-09-01T18:08:53.597000Z"
+        );
+
+        // Whole seconds carry no fractional part at all.
+        assert_eq!(
+            parse_sqlite_instant("2026-09-01 18:08:53")
+                .expect("a fractionless instant parses")
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-09-01T18:08:53.000000Z"
+        );
+
+        assert_eq!(parse_sqlite_instant("not an instant"), None);
+        assert_eq!(parse_sqlite_instant(""), None);
     }
 
     // ── sequence overflow ────────────────────────────────────────────

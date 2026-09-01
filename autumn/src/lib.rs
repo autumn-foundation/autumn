@@ -350,7 +350,7 @@ pub mod sync;
 pub mod ledger;
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
-    LedgerRevision, LedgerVerification, LedgeredRecord,
+    LedgerHighWater, LedgerRevision, LedgerVerification, LedgeredRecord,
 };
 
 /// Automatic record version history for `#[repository]` writes.
