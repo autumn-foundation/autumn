@@ -295,11 +295,24 @@ pub const FIXED_HOST_BUFFER_BYTES: usize = STDERR_BUDGET_BYTES
 /// first, before the request is priced or walked at all.
 pub const MAX_REQUEST_METADATA_BYTES: usize = 256 * 1024;
 
-/// Every byte of a request that is not its body, summed.
+/// Every byte of a request that is not its body, summed — or the first running
+/// total to cross [`MAX_REQUEST_METADATA_BYTES`], whichever comes first.
 ///
 /// One definition, used by both the ceiling below and [`encoding_fuel`], so the
 /// bytes that are refused and the bytes that are charged for cannot drift apart
 /// as fields are added to the frame.
+///
+/// The walk stops at the ceiling rather than finishing and reporting a true
+/// total. Charging every entry made an oversized list *fail*; it did not bound
+/// the work of discovering that it fails, and that discovery happens before the
+/// permit is taken — so an unbounded list still bought an unbounded scan, per
+/// concurrent caller, from a ceiling meant to refuse it cheaply. Past the
+/// ceiling the answer cannot change, because the total only grows, so the
+/// entries after it have nothing left to establish.
+///
+/// The cost of stopping is that a value over the ceiling is a floor rather than
+/// a total. Only the refusal ever sees one: `encoding_fuel` prices requests that
+/// were already admitted, and an admitted request finished the walk.
 /// What one metadata pair costs, contents plus the structure around them.
 ///
 /// Two 24-byte `String` headers in the vector, and the `["",""],` the serialiser
@@ -333,28 +346,16 @@ pub(crate) const fn metadata_pair_bytes(name: &str, value: &str) -> usize {
 pub(crate) const DROPPED_PAIR_BYTES: usize = metadata_pair_bytes("", "");
 
 fn request_metadata_bytes(request: &SandboxRequest) -> usize {
-    let pairs = |list: &[(String, String)]| {
-        list.iter()
-            .map(|(name, value)| metadata_pair_bytes(name, value))
-            .fold(0usize, usize::saturating_add)
-    };
-    let header_pairs = |list: &[(String, String)]| {
-        list.iter()
-            .map(|(name, value)| {
-                if super::wire::request_header_allowed(name) {
-                    metadata_pair_bytes(name, value)
-                } else {
-                    DROPPED_PAIR_BYTES
-                }
-            })
-            .fold(0usize, usize::saturating_add)
-    };
-    request
+    let mut total = request
         .method
         .len()
         .saturating_add(request.path.len())
         .saturating_add(request.query.len())
-        .saturating_add(request.route.len())
+        .saturating_add(request.route.len());
+    if total > MAX_REQUEST_METADATA_BYTES {
+        return total;
+    }
+    for (name, value) in &request.headers {
         // Contents only for the headers that will actually cross.
         // `HostFrame::request` filters through the same allowlist, so a
         // `Cookie` or `Authorization` a direct `run` caller happens to be
@@ -363,8 +364,22 @@ fn request_metadata_bytes(request: &SandboxRequest) -> usize {
         // cost nothing, and made the public API stricter than the adapter that
         // is merely its politest caller. The entry itself is still charged;
         // see `DROPPED_PAIR_BYTES` for why the two halves separate.
-        .saturating_add(header_pairs(&request.headers))
-        .saturating_add(pairs(&request.path_params))
+        total = total.saturating_add(if super::wire::request_header_allowed(name) {
+            metadata_pair_bytes(name, value)
+        } else {
+            DROPPED_PAIR_BYTES
+        });
+        if total > MAX_REQUEST_METADATA_BYTES {
+            return total;
+        }
+    }
+    for (name, value) in &request.path_params {
+        total = total.saturating_add(metadata_pair_bytes(name, value));
+        if total > MAX_REQUEST_METADATA_BYTES {
+            return total;
+        }
+    }
+    total
 }
 
 fn refuse_oversized_request(
@@ -668,7 +683,12 @@ pub enum SandboxFailure {
     RequestMetadataBudget {
         /// The ceiling it blew through.
         max: usize,
-        /// What the caller actually handed over.
+        /// How much metadata the caller handed over — at least this much.
+        ///
+        /// A floor rather than a total: the walk stops as soon as it knows the
+        /// answer, so the entries past the ceiling are never counted. Bounding
+        /// the work of refusing costs the exact figure, and the exact figure is
+        /// not what the refusal turns on.
         len: usize,
     },
 }
@@ -4473,6 +4493,61 @@ path = "/hello/greet"
             shape.sections,
         );
         refuse_unbounded_shape(&hello).expect("a real module must still load");
+    }
+
+    #[test]
+    fn the_metadata_walk_stops_at_the_ceiling_instead_of_finishing_the_list() {
+        // Charging every entry made an oversized list fail. It did not bound
+        // the work of discovering that it fails — the fold visited every pair
+        // first, before the permit was taken and before the guest spent any
+        // fuel — so an unbounded list still bought an unbounded scan per
+        // concurrent caller. Fixing the verdict is not fixing the cost.
+        //
+        // Observable because a stopped walk returns a floor: run to the end and
+        // the answer is the whole sum, stop at the ceiling and it is barely
+        // past it. Same instrument as the section walk.
+        let over = MAX_REQUEST_METADATA_BYTES / DROPPED_PAIR_BYTES * 16;
+        let mut swarm = get("/hello/greet");
+        swarm.headers = std::iter::repeat_with(|| ("cookie".to_owned(), String::new()))
+            .take(over)
+            .collect();
+
+        let counted = request_metadata_bytes(&swarm);
+        let whole_list = over.saturating_mul(DROPPED_PAIR_BYTES);
+        assert!(
+            counted <= MAX_REQUEST_METADATA_BYTES + DROPPED_PAIR_BYTES,
+            "the walk counted {counted} bytes, past the ceiling plus the entry \
+             that crossed it — it finished the list instead of stopping",
+        );
+        assert!(
+            counted < whole_list / 2,
+            "the walk counted {counted} of a {whole_list}-byte list, so it did \
+             not stop early",
+        );
+
+        // Stopping early must not stop it refusing.
+        let host = host(guests::HELLO);
+        let err = host
+            .run(&swarm)
+            .result
+            .expect_err("a list past the ceiling must still be refused");
+        assert!(
+            matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
+            "{err:?}",
+        );
+
+        // And a request under the ceiling is still counted in full, or the
+        // charge the ceiling is made of would be wrong for every real request.
+        let mut ordinary = get("/hello/greet");
+        ordinary.headers = vec![("accept".to_owned(), "text/plain".to_owned())];
+        assert_eq!(
+            request_metadata_bytes(&ordinary),
+            ordinary.method.len()
+                + ordinary.path.len()
+                + ordinary.query.len()
+                + ordinary.route.len()
+                + metadata_pair_bytes("accept", "text/plain"),
+        );
     }
 
     #[test]
