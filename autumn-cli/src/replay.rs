@@ -14,10 +14,13 @@ const EXIT_REFUSED: i32 = 2;
 ///
 /// `Command` inherits the parent process's environment by default, so any of
 /// these left over in the CLI's own environment (e.g. from a wrapping script,
-/// or a previous `autumn migrate`/`autumn task run ...` invocation in the same
-/// shell) would silently hijack a replay into a completely different — and
-/// potentially mutating — mode, since every one of them is dispatched earlier
-/// than `AUTUMN_REPLAY_CAPSULE` in `AppBuilder::run`.
+/// or a previous `autumn migrate`/`autumn task run ...`/`autumn db retention
+/// --purge` invocation in the same shell) would silently hijack a replay into
+/// a completely different — and potentially mutating — mode, since every one
+/// of them is dispatched earlier than `AUTUMN_REPLAY_CAPSULE` in
+/// `AppBuilder::run`. `AUTUMN_DB_RETENTION=purge` is the sharpest of them: it
+/// would turn a read-only replay into a sweep that deletes rows from every
+/// framework-owned dataset.
 fn clear_competing_one_shot_env(command: &mut Command) {
     for var in [
         "AUTUMN_BUILD_STATIC",
@@ -28,6 +31,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
         "AUTUMN_RUN_TASK",
         "AUTUMN_MIGRATE",
         "AUTUMN_RETENTION_DRY_RUN",
+        "AUTUMN_DB_RETENTION",
     ] {
         command.env_remove(var);
     }
@@ -374,6 +378,7 @@ mod tests {
             "AUTUMN_RUN_TASK",
             "AUTUMN_MIGRATE",
             "AUTUMN_RETENTION_DRY_RUN",
+            "AUTUMN_DB_RETENTION",
         ];
         let mut command = Command::new("true");
         for var in competing_vars {
@@ -391,6 +396,24 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "these competing one-shot vars survived: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn an_inherited_framework_retention_purge_cannot_hijack_a_replay() {
+        // AUTUMN_DB_RETENTION=purge is dispatched *before* AUTUMN_REPLAY_CAPSULE
+        // in AppBuilder::run, so an inherited value would turn `autumn replay`
+        // -- a read-only reproduction of a recorded failure -- into a
+        // destructive sweep of every framework-owned dataset (#1605).
+        let mut command = Command::new("true");
+        command.env("AUTUMN_DB_RETENTION", "purge");
+        clear_competing_one_shot_env(&mut command);
+        let survived = command
+            .get_envs()
+            .any(|(key, value)| key == "AUTUMN_DB_RETENTION" && value.is_some());
+        assert!(
+            !survived,
+            "an inherited AUTUMN_DB_RETENTION=purge must never survive into a replay"
         );
     }
 

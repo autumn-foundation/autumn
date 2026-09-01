@@ -73,6 +73,7 @@ the framework almost certainly already generates or ships it:
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
+| A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.7.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
@@ -128,6 +129,18 @@ my-app/
 ├── autumn.toml
 └── autumn-dev.toml    # legacy profile file; [profile.dev] also works
 ```
+
+> **Never hand-create a directory under `migrations/`.** Run `autumn generate
+> migration <Name>` (or `autumn schema diff --write-migration`) and put your SQL
+> in the `up.sql`/`down.sql` it creates — including when you are writing every
+> line of that SQL yourself. The generator's job is picking the version.
+>
+> App, framework and plugin migrations share one version space, keyed on the
+> 14-digit prefix, so a hand-typed `20260831000000` collides with whatever
+> anyone else authored that day and one of the two silently never runs. The
+> generator mints a full `YYYYMMDDHHMMSS` from the clock. CI rejects a `000000`
+> time component, a version that isn't a real UTC timestamp, and any duplicate
+> (`scripts/check-migration-versions.sh`).
 
 ## Cargo.toml
 
@@ -2265,6 +2278,7 @@ autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args t
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
+autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
@@ -2547,6 +2561,67 @@ database's statements run in one transaction.
 column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
 `--output DIR` re-dumps the scrubbed database as a fresh backup run. See
 `docs/guide/data-scrubbing.md`.
+
+### `[retention]` + `autumn db retention` (0.7.0, issue #1605)
+
+Autumn's *own* tables and stores grow forever by default. `[retention]` in
+`autumn.toml` declares one window per framework-owned dataset and the framework
+enforces it on a recurring, fleet-coordinated in-process sweep — no external
+cron. **This is separate from `#[repository(..., retention(...))]`, which covers
+*your* models**; reach for that one for app data and this one for Autumn's.
+
+```toml
+[retention]
+sweep_interval         = "1h"    # default
+job_history            = "90d"   # terminal rows in autumn_jobs
+commit_hooks           = "30d"   # terminal autumn_repository_commit_hooks rows
+job_tracking           = "7d"    # autumn_job_tracking
+idempotency            = "2d"    # stored Idempotency-Key responses
+experiment_assignments = "365d"  # autumn_experiment_assignments
+webhook_replay         = "3d"    # inbound replay markers
+sessions               = "30d"   # server-side session records
+audit_archives         = "400d"  # JSONL audit archive entries
+```
+
+Every window is unset by default, and unset registers **no sweep task at
+all** — an app that never writes `[retention]` behaves exactly as before.
+Each key has an `AUTUMN_RETENTION__*` env override; an empty value clears one.
+
+Three enforcement mechanisms, reported per dataset rather than conflated:
+`sweep` (batched `DELETE`, 500 rows/batch, cutoff resolved by the database's
+own clock, `truncated` reported when a run hits its per-run cap), `backend ttl`
+(the window *caps* the record's TTL at write time — idempotency, sessions), and
+`archive rewrite` (the JSONL audit archive rewritten atomically, keeping any
+line it cannot parse).
+
+**Precedence:** where a per-subsystem knob already exists
+(`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`, `session.max_age_secs`, a
+webhook endpoint's `replay_window_secs`) the **shorter bound wins**. Those knobs
+keep their exact meaning; adding `[retention]` can never make data live longer
+than it does today. `retention.webhook_replay` shorter than a protected
+endpoint's `replay_window_secs` **fails boot** rather than weakening a security
+control through a compliance knob.
+
+**Safety rails the sweep enforces:** `job_history` matches only terminal rows
+(`completed`/`failed`/`discarded`) with a `finished_at`, and never one still
+holding a `#[job(unique, unique_for_ms = N)]` dedup key (deleting it would run
+the job twice); `experiment_assignments` only sweeps concluded/archived/orphaned
+experiments, never a running one's sticky assignments. Data whose table is
+registered under a GDPR legal hold (`ModelRegistration::retain`) is never
+removed — the hold vetoes the whole dataset. Every real sweep writes an audit
+record (`action = "retention.sweep"`) carrying the dataset, cutoff and rows
+removed.
+
+```bash
+autumn db retention                       # effective policy + rows eligible now
+autumn db retention --dry-run             # what a sweep would remove
+autumn db retention --purge --dataset job_history   # enforce now (--force outside dev/test)
+autumn db retention --json                # machine-readable, for CI/compliance
+```
+
+It compiles and runs the app binary, so the report reflects the app's own
+resolved config, GDPR registrations and audit sinks — report and enforcement
+share one code path. See `docs/guide/data-retention.md`.
 
 ### Offsite S3 backups (0.6.0, issue #1619)
 
