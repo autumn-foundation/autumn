@@ -1131,6 +1131,7 @@ impl SandboxHost {
             import_count,
             shape.global_count,
             initial_bytes,
+            shape.table_elements,
         )
         .saturating_add(u64::try_from(shape.function_count).unwrap_or(u64::MAX));
         if manifest.limits.fuel <= instantiation {
@@ -2917,6 +2918,7 @@ fn instantiation_fuel(
     imports: usize,
     globals: usize,
     initial_memory_bytes: u64,
+    table_elements: u64,
 ) -> u64 {
     let bytes = u64::try_from(init_bytes).unwrap_or(u64::MAX);
     let segments = u64::try_from(segments).unwrap_or(u64::MAX);
@@ -2934,10 +2936,19 @@ fn instantiation_fuel(
     let memory = initial_memory_bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX);
+    // The table's initial entries, for exactly the reason the memory term
+    // above exists — and the sibling that term did not cover. A module can
+    // declare a table's minimum with no element segments at all, so `segments`
+    // and `init_bytes` price none of it, and wasmi still allocates and
+    // initialises every slot on every instantiation before the guest runs.
+    // Charged per entry rather than per byte, like `segments`, `imports` and
+    // `globals` beside it: what the host pays here is a slot initialised, not a
+    // block copied.
     bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(memory)
+        .saturating_add(table_elements)
         .saturating_add(segments)
         .saturating_add(imports)
         .saturating_add(globals)
@@ -4681,6 +4692,54 @@ path = "/hello/greet"
             rendered.len(),
             huge.len(),
         );
+    }
+
+    #[test]
+    fn a_table_the_instance_fills_is_charged_like_the_memory_it_fills() {
+        // The memory term exists because a module can declare an initial size
+        // with no data segments, so the init-section terms price none of it
+        // while the host still zero-fills it every instantiation. A table's
+        // minimum is the same shape and was not charged: `segments` and
+        // `init_bytes` see nothing, and wasmi still allocates and initialises
+        // every slot before the guest runs.
+        let bare = instantiation_fuel(0, 0, 0, 0, 0, 0);
+        let with_table = instantiation_fuel(0, 0, 0, 0, 0, u64::from(MAX_TABLE_ELEMENTS));
+        assert!(
+            with_table > bare,
+            "a full table cost the same as no table at all ({with_table} vs {bare})",
+        );
+        assert_eq!(
+            with_table - bare,
+            u64::from(MAX_TABLE_ELEMENTS),
+            "the charge should be one unit per slot the instance initialises",
+        );
+
+        // End to end: a module whose only weight is its table must be refused
+        // when its fuel cannot cover filling it. Zero-page memory and no
+        // segments, so every other fixed term is at its floor.
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 0)
+  (table {MAX_TABLE_ELEMENTS} funcref)
+  (func (export "_start") (nop))
+)"#
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+        let limits = ResourceLimits {
+            fuel: u64::from(MAX_TABLE_ELEMENTS) / 2,
+            ..ResourceLimits::default()
+        };
+        let err = SandboxHost::from_module(manifest_with(limits), &wasm)
+            .expect_err("fuel below the cost of filling the table must be refused");
+        assert!(
+            matches!(err, SandboxLoadError::FuelBelowFixedCharges { .. }),
+            "{err:?}",
+        );
+
+        // And the same module loads once its budget covers the table, so the
+        // charge bounds rather than forbids.
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect("a table within a normal fuel budget must still load");
     }
 
     #[test]

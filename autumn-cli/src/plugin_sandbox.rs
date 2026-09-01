@@ -240,9 +240,18 @@ impl Report {
     }
 
     /// Whether the artifact is fit to install.
+    ///
+    /// The artifact digest is part of the verdict, not decoration beside it.
+    /// `SandboxedPlugin::from_artifact` computes the same digest and refuses an
+    /// artifact whose container cannot be re-rendered — a manifest that fits
+    /// under the size limit on disk can exceed it once written back in
+    /// canonical form — so a report that passed without one said "fit to
+    /// install" about an artifact the runtime would reject. The digest is also
+    /// the number the consent screen asks an operator to record, and there is
+    /// nothing to record when it is missing.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.loads && self.conformance.passed()
+        self.loads && self.artifact_sha256.is_some() && self.conformance.passed()
     }
 
     /// Render the report for a human.
@@ -629,6 +638,28 @@ path = "/hello/greet"
             report.conformance.to_text_report()
         );
         assert!(report.passed());
+    }
+
+    #[test]
+    fn an_artifact_without_a_recordable_identity_does_not_pass() {
+        let artifact = pack(&good_fixture());
+        let mut report = Report::of(&artifact);
+        assert!(report.passed(), "the fixture should pass to begin with");
+
+        // `artifact_digest()` fails when the container cannot be re-rendered —
+        // a manifest that fits the size limit on disk can exceed it once
+        // written back in canonical form — and `Report::of` turns that into
+        // `None` rather than papering over it. But reporting it is not the same
+        // as failing on it: `SandboxedPlugin::from_artifact` computes the same
+        // digest and refuses, so a report that still passed said "fit to
+        // install" about an artifact the runtime rejects. It is also the number
+        // the consent screen asks the operator to record, and there is nothing
+        // to record when it is missing.
+        report.artifact_sha256 = None;
+        assert!(
+            !report.passed(),
+            "a report with no artifact identity must not pass",
+        );
     }
 
     #[test]
