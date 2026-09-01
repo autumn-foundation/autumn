@@ -117,7 +117,7 @@ fn a_configured_window_is_used_when_no_subsystem_ttl_competes() {
     config.retention.job_history = Some("90d".to_owned());
     let effective = effective_retention(&config, RetentionDataset::JobHistory);
     assert_eq!(effective.window, Some(Duration::from_secs(90 * 86_400)));
-    assert_eq!(effective.source, RetentionSource::Policy);
+    assert_eq!(effective.source, RetentionSource::RetentionSection);
 }
 
 #[test]
@@ -141,7 +141,7 @@ fn the_shorter_of_policy_and_job_tracking_ttl_wins() {
     config.retention.job_tracking = Some("1h".to_owned());
     let tighter = effective_retention(&config, RetentionDataset::JobTracking);
     assert_eq!(tighter.window, Some(Duration::from_secs(3_600)));
-    assert_eq!(tighter.source, RetentionSource::Policy);
+    assert_eq!(tighter.source, RetentionSource::RetentionSection);
 
     config.retention.job_tracking = Some("30d".to_owned());
     let looser = effective_retention(&config, RetentionDataset::JobTracking);
@@ -164,7 +164,7 @@ fn the_shorter_of_policy_and_idempotency_ttl_wins() {
     config.retention.idempotency = Some("2h".to_owned());
     let tighter = effective_retention(&config, RetentionDataset::Idempotency);
     assert_eq!(tighter.window, Some(Duration::from_secs(7_200)));
-    assert_eq!(tighter.source, RetentionSource::Policy);
+    assert_eq!(tighter.source, RetentionSource::RetentionSection);
 
     config.retention.idempotency = Some("7d".to_owned());
     let looser = effective_retention(&config, RetentionDataset::Idempotency);

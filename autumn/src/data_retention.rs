@@ -302,7 +302,13 @@ pub enum RetentionSource {
     /// Nothing bounds this dataset: it is kept forever.
     Unset,
     /// The `[retention]` policy window is what actually applies.
-    Policy,
+    ///
+    /// Named `RetentionSection` rather than `Policy` so the crate exports no
+    /// second public item called `Policy`: a duplicate name stops rustc from
+    /// trimming paths, which turns `Policy<Widget>` into
+    /// `autumn_web::authorization::Policy<Widget>` in every authorization
+    /// diagnostic users see.
+    RetentionSection,
     /// A pre-existing per-subsystem knob is what actually applies, named
     /// here by its config key.
     SubsystemTtl(&'static str),
@@ -312,7 +318,7 @@ impl std::fmt::Display for RetentionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unset => f.write_str("unset"),
-            Self::Policy => f.write_str("[retention]"),
+            Self::RetentionSection => f.write_str("[retention]"),
             Self::SubsystemTtl(key) => write!(f, "{key}"),
         }
     }
@@ -348,11 +354,11 @@ pub fn effective_retention(config: &AutumnConfig, dataset: RetentionDataset) -> 
     let subsystem = dataset.subsystem_ttl(config);
     let (window, source) = match (policy, subsystem) {
         (None, None) => (None, RetentionSource::Unset),
-        (Some(policy), None) => (Some(policy), RetentionSource::Policy),
+        (Some(policy), None) => (Some(policy), RetentionSource::RetentionSection),
         (None, Some((key, ttl))) => (Some(ttl), RetentionSource::SubsystemTtl(key)),
         (Some(policy), Some((key, ttl))) => {
             if policy <= ttl {
-                (Some(policy), RetentionSource::Policy)
+                (Some(policy), RetentionSource::RetentionSection)
             } else {
                 (Some(ttl), RetentionSource::SubsystemTtl(key))
             }
