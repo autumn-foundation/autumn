@@ -4995,8 +4995,11 @@ pub struct AcmeDoctorConfig {
     /// PRESENT but does not deserialize as a `u32` the way the runtime's typed
     /// `AcmeConfig` does (a quoted string like `"30"`, a float, a bool, a
     /// negative, or an out-of-`u32`-range integer). Doctor's old `as_integer()`
-    /// chain treated such a value as ABSENT and silently defaulted to 30, so
-    /// `doctor --strict` passed a file the runtime refuses to boot on (#1874).
+    /// chain treated a NON-INTEGER as ABSENT and silently defaulted to 30, so
+    /// `doctor --strict` passed a file the runtime refuses to boot on (#1874);
+    /// a negative / out-of-range integer did parse, but was clamped to
+    /// `u32::MAX` and reported against the `>= 90` renewal-window rule rather
+    /// than as the malformed value it is.
     /// Mirrors the [`port_error`](Self::port_error) treatment. `None` when the
     /// value is a valid `u32` or the key is absent (absent uses the runtime
     /// default, 30).
@@ -5207,39 +5210,6 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     })
 }
 
-/// Grade the resolved ACME config against the runtime's boot-time invariants,
-/// mirroring [`autumn_web::config::AcmeConfig::validate`] (pure; injectable for
-/// tests).
-///
-/// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
-/// config that (a) has a `directory` value that fails to deserialize as
-/// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
-/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
-/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
-/// rule, a blank `ca_root_path`, is graded by
-/// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
-/// non-string, unreadable, unusable, a bundle, or redundant against a public
-/// directory) belongs in one check with one name, rather than splitting the
-/// blank case away from its siblings. Doctor previously turned
-/// a missing/empty `domains` into an empty list and reported `acme_stored_cert`
-/// as Pass with no probes, and silently defaulted a malformed `directory` to
-/// staging, so `doctor --strict` blessed a deployment that immediately exits.
-/// This grader returns a `Fail` [`CheckResult`] for the first violated rule
-/// (messages mirror the runtime's), or `None` when the ACME config is valid.
-///
-/// The recorded deserialize errors on `config` — [`domains_error`],
-/// [`directory_error`], [`port_error`] and [`renew_before_days_error`] — are
-/// checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
-/// non-string `domains` entry, a bad `directory`, or an out-of-range /
-/// non-integer `http_challenge_port` / `renew_before_days`) before it ever runs
-/// `validate()`. Each one is a rendered invalid value the operator wrote, so the
-/// FAIL can name it.
-///
-/// [`domains_error`]: AcmeDoctorConfig::domains_error
-/// [`directory_error`]: AcmeDoctorConfig::directory_error
-/// [`port_error`]: AcmeDoctorConfig::port_error
-/// [`renew_before_days_error`]: AcmeDoctorConfig::renew_before_days_error
-#[must_use]
 /// The shared `acme_config` Fail shape: every ACME-config violation reports the
 /// same check name and status, so each rule contributes only a detail + hint.
 fn acme_config_fail(detail: String, hint: &'static str) -> Option<CheckResult> {
@@ -5316,6 +5286,39 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
     None
 }
 
+/// Grade the resolved ACME config against the runtime's boot-time invariants,
+/// mirroring [`autumn_web::config::AcmeConfig::validate`] (pure; injectable for
+/// tests).
+///
+/// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
+/// config that (a) has a `directory` value that fails to deserialize as
+/// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
+/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
+/// DNS-01, tracked in #1620) — the server exits at boot. `validate()`'s fifth
+/// rule, a blank `ca_root_path`, is graded by
+/// [`check_acme_ca_root_impl`] instead: the whole `ca_root_path` story (blank,
+/// non-string, unreadable, unusable, a bundle, or redundant against a public
+/// directory) belongs in one check with one name, rather than splitting the
+/// blank case away from its siblings. Doctor previously turned
+/// a missing/empty `domains` into an empty list and reported `acme_stored_cert`
+/// as Pass with no probes, and silently defaulted a malformed `directory` to
+/// staging, so `doctor --strict` blessed a deployment that immediately exits.
+/// This grader returns a `Fail` [`CheckResult`] for the first violated rule
+/// (messages mirror the runtime's), or `None` when the ACME config is valid.
+///
+/// The recorded deserialize errors on `config` — [`domains_error`],
+/// [`directory_error`], [`port_error`] and [`renew_before_days_error`] — are
+/// checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
+/// non-string `domains` entry, a bad `directory`, or an out-of-range /
+/// non-integer `http_challenge_port` / `renew_before_days`) before it ever runs
+/// `validate()`. Each one is a rendered invalid value the operator wrote, so the
+/// FAIL can name it.
+///
+/// [`domains_error`]: AcmeDoctorConfig::domains_error
+/// [`directory_error`]: AcmeDoctorConfig::directory_error
+/// [`port_error`]: AcmeDoctorConfig::port_error
+/// [`renew_before_days_error`]: AcmeDoctorConfig::renew_before_days_error
+#[must_use]
 pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> {
     let AcmeDoctorConfig {
         domains,
@@ -10892,7 +10895,9 @@ renew_before_days = 30
     #[test]
     fn acme_config_fail_when_renew_before_days_malformed() {
         for (bad_line, needle) in [
-            ("renew_before_days = \"30\"", "30"),
+            // The QUOTING is the bug here, so the FAIL must echo it: a wrong fix
+            // that reused the `>= 90` detail would still contain a bare `30`.
+            ("renew_before_days = \"30\"", "\"30\""),
             ("renew_before_days = 30.5", "30.5"),
             ("renew_before_days = true", "true"),
             ("renew_before_days = -1", "-1"),
@@ -10920,6 +10925,13 @@ contact_email = \"ops@example.com\"
             assert!(
                 detail.contains("renew_before_days") && detail.contains(needle),
                 "detail must name the bad renew_before_days value: {detail}"
+            );
+            // The deserialize tier, not the `>= 90` renewal-window rule: the
+            // runtime never gets far enough to compare this against 90.
+            assert!(
+                detail.contains("is not a valid renewal window"),
+                "`{bad_line}` must FAIL as a malformed value, not as a >= 90 \
+                 renewal window: {detail}"
             );
         }
     }
@@ -10980,8 +10992,54 @@ contact_email = \"ops@example.com\"
         assert_eq!(r.name, "acme_config");
         let detail = r.detail.as_deref().unwrap_or_default();
         assert!(
-            detail.contains("whitespace") && detail.contains("app.example.com"),
-            "detail must name the problem and the entry: {detail}"
+            detail.contains("whitespace") && detail.contains("` app.example.com `"),
+            "detail must name the problem and echo the RAW padded entry (not just \
+             the trimmed spelling it suggests): {detail}"
+        );
+
+        // Leading-only, trailing-only and tab/newline padding are rejected too.
+        for line in [
+            "domains = [\" app.example.com\"]",
+            "domains = [\"app.example.com \"]",
+            "domains = [\"\\tapp.example.com\\n\"]",
+        ] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+{line}
+contact_email = \"ops@example.com\"
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            let r = check_acme_config_impl(&acme)
+                .unwrap_or_else(|| panic!("`{line}` must be an acme_config FAIL"));
+            assert!(
+                r.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("whitespace"),
+                "`{line}` must FAIL on whitespace: {:?}",
+                r.detail
+            );
+        }
+
+        // A padded entry is caught behind a well-formed one, and the FAIL names
+        // the right index.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\", \" www.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        let r = check_acme_config_impl(&acme).expect("a padded entry at index 1 must FAIL");
+        assert!(
+            r.detail.as_deref().unwrap_or_default().contains("index 1"),
+            "detail must name the offending index: {:?}",
+            r.detail
         );
 
         // And, as in the runtime, the padded rule does not shadow the blank or
@@ -11004,6 +11062,76 @@ contact_email = \"ops@example.com\"
             assert!(
                 detail.contains(needle),
                 "`{line}` should report `{needle}`, got: {detail}"
+            );
+        }
+    }
+
+    // The doctor grader is a HAND-COPY of `AcmeConfig::validate()`, and the two
+    // have now drifted three times (#1608, and both items of #1874). Every other
+    // test here pins one side against a hard-coded expectation; this one pins the
+    // two sides against EACH OTHER, so the next divergence fails a test instead of
+    // shipping. Verdicts only — the messages deliberately differ in shape (doctor
+    // splits the runtime's closing advice into a separate `hint`).
+    //
+    // `ca_root_path` is excluded on purpose: `validate()` grades a blank one, but
+    // doctor routes the whole `ca_root_path` story through `check_acme_ca_root_impl`
+    // instead (see `check_acme_config_impl`'s docs).
+    #[test]
+    fn acme_config_grader_agrees_with_runtime_validate() {
+        let cases: &[(&[&str], &str, u16, u32)] = &[
+            (&["app.example.com"], "ops@example.com", 80, 30),
+            (
+                &["app.example.com", "www.example.com"],
+                "ops@example.com",
+                8080,
+                89,
+            ),
+            // Item 2 (#1874) and its neighbours: padded, wildcard, blank.
+            (&[" app.example.com "], "ops@example.com", 80, 30),
+            (&["app.example.com\t"], "ops@example.com", 80, 30),
+            (&["\u{a0}app.example.com"], "ops@example.com", 80, 30),
+            (&[" *.example.com "], "ops@example.com", 80, 30),
+            (&["   "], "ops@example.com", 80, 30),
+            (
+                &["app.example.com", " www.example.com"],
+                "ops@example.com",
+                80,
+                30,
+            ),
+            // The pre-existing invariants.
+            (&[], "ops@example.com", 80, 30),
+            (&["app.example.com"], "  ", 80, 30),
+            (&["app.example.com"], "ops@example.com", 0, 30),
+            (&["app.example.com"], "ops@example.com", 80, 0),
+            (&["app.example.com"], "ops@example.com", 80, 90),
+            (&["app.example.com"], "ops@example.com", 80, 100),
+            // Whitespace INSIDE a name is out of scope for both sides today; this
+            // row records that they agree about it rather than that it is allowed.
+            (&["app .example.com"], "ops@example.com", 80, 30),
+        ];
+
+        for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
+            let mut doctor_cfg = acme_doctor_cfg(domains, contact_email);
+            doctor_cfg.http_challenge_port = *http_challenge_port;
+            doctor_cfg.renew_before_days = *renew_before_days;
+
+            let runtime_cfg = autumn_web::config::AcmeConfig {
+                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+                contact_email: (*contact_email).to_owned(),
+                directory: autumn_web::config::AcmeDirectory::Staging,
+                cache_dir: std::path::PathBuf::from("config/acme"),
+                http_challenge_port: *http_challenge_port,
+                renew_before_days: *renew_before_days,
+                ca_root_path: None,
+            };
+
+            assert_eq!(
+                check_acme_config_impl(&doctor_cfg).is_some(),
+                runtime_cfg.validate().is_err(),
+                "doctor and AcmeConfig::validate disagree on domains={domains:?} \
+                 contact_email={contact_email:?} port={http_challenge_port} \
+                 renew_before_days={renew_before_days} (runtime said {:?})",
+                runtime_cfg.validate()
             );
         }
     }
@@ -11429,20 +11557,8 @@ directory = \"production\"
     // unprobed domain. A 2-domain config must yield a port + DNS check per domain.
     #[test]
     fn online_probes_every_configured_domain() {
-        let config = AcmeDoctorConfig {
-            domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
-            contact_email: "ops@example.com".to_owned(),
-            http_challenge_port: 80,
-            renew_before_days: 30,
-            cache_dir: std::path::PathBuf::from("config/acme"),
-            directory_label: "production".to_owned(),
-            directory_error: None,
-            port_error: None,
-            ca_root_path: None,
-            ca_root_error: None,
-            domains_error: None,
-            renew_before_days_error: None,
-        };
+        let mut config = acme_doctor_cfg(&["ok.example.com", "bad.example.com"], "ops@example.com");
+        config.directory_label = "production".to_owned();
 
         // Every configured domain is scheduled for probing, not just the first.
         let domains = acme_online_probe_domains(&config);

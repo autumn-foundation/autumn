@@ -14479,6 +14479,38 @@ path = "/healthz"
         assert!(err.contains("blank entries"), "got: {err}");
     }
 
+    // The `autumn doctor` grader FAILs a malformed `http_challenge_port` /
+    // `renew_before_days` (#1608, #1874) on the premise that the runtime's TYPED
+    // deserialization rejects the same spellings before boot. Pin that premise
+    // here: if a future lenient `deserialize_with` ever made the runtime accept
+    // `"30"`, doctor would start FAILing a file that boots fine — the same parity
+    // bug in the opposite direction, and today nothing would catch it.
+    #[test]
+    fn acme_numeric_fields_reject_non_integer_toml_values() {
+        for key in ["http_challenge_port", "renew_before_days"] {
+            for bad in ["\"30\"", "30.5", "true", "-1", "4294967296"] {
+                let src = format!(
+                    "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                     contact_email = \"ops@example.com\"\n{key} = {bad}\n"
+                );
+                assert!(
+                    toml::from_str::<AutumnConfig>(&src).is_err(),
+                    "{key} = {bad} must fail to deserialize"
+                );
+            }
+            // ... while the plain unquoted integer the doctor grader treats as
+            // valid really is accepted.
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                 contact_email = \"ops@example.com\"\n{key} = 45\n"
+            );
+            assert!(
+                toml::from_str::<AutumnConfig>(&src).is_ok(),
+                "{key} = 45 must deserialize"
+            );
+        }
+    }
+
     // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
     // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
     // but the UNTRIMMED value is what is stored, so the padded string reached the
@@ -14502,8 +14534,13 @@ path = "/healthz"
                 "message must name the problem: {err}"
             );
             assert!(
-                err.contains("app.example.com"),
-                "message must name the offending entry: {err}"
+                err.contains(&format!("`{padded}`")),
+                "message must echo the RAW padded entry, not only the trimmed \
+                 spelling it suggests: {err}"
+            );
+            assert!(
+                err.contains("`app.example.com`"),
+                "message must name the trimmed spelling to use: {err}"
             );
         }
 

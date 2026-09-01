@@ -526,14 +526,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor
-  --strict` bless an `autumn.toml` the server refuses to boot on, and let one
-  malformed value through both. A **string-typed `renew_before_days`**
-  (`renew_before_days = "30"`, and likewise a float, a bool, a negative, or an
-  out-of-`u32`-range integer) was read by doctor's `as_integer()` chain as
-  *absent* and silently defaulted to 30, while the runtime's typed
-  deserialization rejects it — doctor now records the value the operator
-  actually wrote and reports an `acme_config` **Fail** naming it, exactly as it
-  already did for `http_challenge_port` and `directory`. A
+  --strict` bless an `autumn.toml` the server refuses to boot on. A
+  **non-integer `renew_before_days`** — a quoted `renew_before_days = "30"`, a
+  float, or a bool — was read by doctor's `as_integer()` chain as *absent* and
+  silently defaulted to 30, so the check passed while the runtime's typed
+  deserialization rejects the file at boot. Doctor now records the value the
+  operator actually wrote and reports an `acme_config` **Fail** naming it,
+  exactly as it already did for `http_challenge_port` and `directory`. (A
+  negative or out-of-`u32`-range integer already failed, having been clamped to
+  `u32::MAX` and caught by the `>= 90` rule; it now fails with a message about
+  the value rather than about the renewal window.) A
   **whitespace-padded domain** (`domains = [" app.example.com "]`) passed
   `AcmeConfig::validate()`, which trims only for its blank and wildcard checks
   but stores the entry untrimmed — and the untrimmed string is what becomes the
