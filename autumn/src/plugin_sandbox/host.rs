@@ -316,16 +316,37 @@ pub(crate) const fn metadata_pair_bytes(name: &str, value: &str) -> usize {
     name.len().saturating_add(value.len()).saturating_add(ENTRY)
 }
 
+/// What a metadata pair the frame will discard still costs.
+///
+/// Not its contents. Those never cross, and charging them refused requests
+/// that cost the guest nothing — a 256 KiB `Cookie` turning a confidentiality
+/// promise into an availability one. But the pair sits in a list the host
+/// walks three times before the guest starts: once for the ceiling, once to
+/// price the encoding, once to filter it back out. That walk is per entry and
+/// is not priced by fuel, which the guest has not begun to spend, nor bounded
+/// by `max_concurrency`, which limits guests and not the work done to reach
+/// one. So the entry is charged even when nothing in it is.
+///
+/// At 56 bytes an entry this caps a request at a few thousand headers, which
+/// is far above what any HTTP client sends and far below what costs anything
+/// to walk.
+pub(crate) const DROPPED_PAIR_BYTES: usize = metadata_pair_bytes("", "");
+
 fn request_metadata_bytes(request: &SandboxRequest) -> usize {
     let pairs = |list: &[(String, String)]| {
         list.iter()
             .map(|(name, value)| metadata_pair_bytes(name, value))
             .fold(0usize, usize::saturating_add)
     };
-    let pairs_where = |list: &[(String, String)], keep: fn(&str) -> bool| {
+    let header_pairs = |list: &[(String, String)]| {
         list.iter()
-            .filter(|(name, _)| keep(name))
-            .map(|(name, value)| metadata_pair_bytes(name, value))
+            .map(|(name, value)| {
+                if super::wire::request_header_allowed(name) {
+                    metadata_pair_bytes(name, value)
+                } else {
+                    DROPPED_PAIR_BYTES
+                }
+            })
             .fold(0usize, usize::saturating_add)
     };
     request
@@ -334,16 +355,15 @@ fn request_metadata_bytes(request: &SandboxRequest) -> usize {
         .saturating_add(request.path.len())
         .saturating_add(request.query.len())
         .saturating_add(request.route.len())
-        // Only the headers that will actually cross. `HostFrame::request`
-        // filters through the same allowlist, so a `Cookie` or `Authorization`
-        // a direct `run` caller happens to be holding is dropped before the
-        // frame is built and never reaches the guest — counting it here refused
-        // a request that would have cost nothing, and made the public API
-        // stricter than the adapter that is merely its politest caller.
-        .saturating_add(pairs_where(
-            &request.headers,
-            super::wire::request_header_allowed,
-        ))
+        // Contents only for the headers that will actually cross.
+        // `HostFrame::request` filters through the same allowlist, so a
+        // `Cookie` or `Authorization` a direct `run` caller happens to be
+        // holding is dropped before the frame is built and never reaches the
+        // guest — counting its bytes here refused a request that would have
+        // cost nothing, and made the public API stricter than the adapter that
+        // is merely its politest caller. The entry itself is still charged;
+        // see `DROPPED_PAIR_BYTES` for why the two halves separate.
+        .saturating_add(header_pairs(&request.headers))
         .saturating_add(pairs(&request.path_params))
 }
 
@@ -4331,6 +4351,47 @@ path = "/hello/greet"
             .run(&allowed_heavy)
             .result
             .expect_err("oversized allowlisted metadata must still be refused");
+        assert!(
+            matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn a_header_the_frame_drops_still_costs_its_place_in_the_list() {
+        // Not charging a dropped header's *contents* is right — they never
+        // cross. Not charging it at all left the count unbounded, which is a
+        // different resource: the list is walked once for the ceiling, once to
+        // price the encoding, and once to filter it out, all before a permit is
+        // taken and before the guest spends any fuel. So a million empty
+        // `Cookie` pairs passed a byte ceiling for free and bought three
+        // unbounded scans per request, per concurrent caller.
+        let host = host(guests::HELLO);
+
+        // Still admitted: bulk in a dropped header is bulk that costs the guest
+        // nothing, and refusing it would make withholding a credential into a
+        // reason to fail the request.
+        let mut one_huge_cookie = get("/hello/greet");
+        one_huge_cookie.headers =
+            vec![("cookie".to_owned(), "s=".repeat(MAX_REQUEST_METADATA_BYTES))];
+        assert!(
+            host.run(&one_huge_cookie).result.is_ok(),
+            "one large dropped header must still be served",
+        );
+
+        // Refused: the same total, spread across entries instead of into one
+        // value. Nothing here reaches the guest either, but the host walks
+        // every one of them to establish that.
+        let many_empty_cookies: Vec<(String, String)> =
+            std::iter::repeat_with(|| ("cookie".to_owned(), String::new()))
+                .take(MAX_REQUEST_METADATA_BYTES / DROPPED_PAIR_BYTES + 1)
+                .collect();
+        let mut swarm = get("/hello/greet");
+        swarm.headers = many_empty_cookies;
+        let err = host
+            .run(&swarm)
+            .result
+            .expect_err("an unbounded list of dropped headers must be refused");
         assert!(
             matches!(err, SandboxFailure::RequestMetadataBudget { .. }),
             "{err:?}",

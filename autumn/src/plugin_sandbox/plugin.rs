@@ -440,6 +440,35 @@ async fn serve(
     }
 }
 
+/// Charge `bytes` against a request's running metadata total, refusing before
+/// the caller clones anything more if the ceiling is crossed.
+///
+/// Three call sites charge into one running total — the URI, an allowlisted
+/// header, and a dropped header's entry — and each must refuse at the same
+/// point, so the charge and the refusal live together rather than being
+/// repeated beside each one.
+fn charge_metadata(
+    plugin: &str,
+    running: &mut usize,
+    bytes: usize,
+    over: &'static str,
+) -> Result<(), Box<Response>> {
+    *running = running.saturating_add(bytes);
+    if *running > super::host::MAX_REQUEST_METADATA_BYTES {
+        tracing::warn!(
+            plugin,
+            over,
+            max_request_metadata_bytes = super::host::MAX_REQUEST_METADATA_BYTES,
+            "request metadata over the sandbox ceiling; refusing before cloning it"
+        );
+        return Err(Box::new(sandbox_error(
+            plugin,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        )));
+    }
+    Ok(())
+}
+
 /// Turn an axum request into the frame the guest will see, or the response the
 /// caller gets instead.
 ///
@@ -468,30 +497,25 @@ async fn read_request(
     // in-process caller could hand `mounted_router` a megabyte of query string
     // and have it duplicated, and held for the whole body-read deadline, before
     // the ceiling that exists to refuse it ever ran.
-    let mut metadata = parts
-        .method
-        .as_str()
-        .len()
-        .saturating_add(path_str.len())
-        .saturating_add(query_str.len())
-        .saturating_add(pattern.len())
-        .saturating_add(
-            params
-                .iter()
-                .map(|(name, value)| super::host::metadata_pair_bytes(name, value))
-                .fold(0usize, usize::saturating_add),
-        );
-    if metadata > super::host::MAX_REQUEST_METADATA_BYTES {
-        tracing::warn!(
-            plugin,
-            max_request_metadata_bytes = super::host::MAX_REQUEST_METADATA_BYTES,
-            "request URI metadata over the sandbox ceiling; refusing before cloning it"
-        );
-        return Err(Box::new(sandbox_error(
-            plugin,
-            StatusCode::PAYLOAD_TOO_LARGE,
-        )));
-    }
+    let mut metadata = 0usize;
+    charge_metadata(
+        plugin,
+        &mut metadata,
+        parts
+            .method
+            .as_str()
+            .len()
+            .saturating_add(path_str.len())
+            .saturating_add(query_str.len())
+            .saturating_add(pattern.len())
+            .saturating_add(
+                params
+                    .iter()
+                    .map(|(name, value)| super::host::metadata_pair_bytes(name, value))
+                    .fold(0usize, usize::saturating_add),
+            ),
+        "uri",
+    )?;
 
     let path = path_str.to_owned();
     let query = query_str.to_owned();
@@ -507,30 +531,33 @@ async fn read_request(
     // from the same function the ceiling counts with, so the two agree.
     let mut headers: Vec<(String, String)> = Vec::new();
     for (name, value) in &parts.headers {
-        // Filtered before it is charged, because it is filtered before it is
-        // forwarded: `HostFrame::request` drops everything outside this
-        // allowlist, so counting the rest measured bytes no guest will ever
-        // see. A request carrying 256 KiB of `Cookie` — headers this sandbox
-        // promises to withhold silently — would otherwise be refused outright,
-        // turning a confidentiality guarantee into an availability one.
+        // A dropped header is charged for its entry but not its contents.
+        // `HostFrame::request` drops everything outside this allowlist, so
+        // counting the rest measured bytes no guest will ever see: a request
+        // carrying 256 KiB of `Cookie` — headers this sandbox promises to
+        // withhold silently — would be refused outright, turning a
+        // confidentiality guarantee into an availability one. But skipping it
+        // free leaves the *count* unbounded, and the count is what this loop
+        // and the two walks inside `run` each pay per entry. See
+        // `DROPPED_PAIR_BYTES`.
         if !super::wire::request_header_allowed(name.as_str()) {
+            charge_metadata(
+                plugin,
+                &mut metadata,
+                super::host::DROPPED_PAIR_BYTES,
+                "dropped-headers",
+            )?;
             continue;
         }
         let Ok(value) = value.to_str() else {
             continue;
         };
-        metadata = metadata.saturating_add(super::host::metadata_pair_bytes(name.as_str(), value));
-        if metadata > super::host::MAX_REQUEST_METADATA_BYTES {
-            tracing::warn!(
-                plugin,
-                max_request_metadata_bytes = super::host::MAX_REQUEST_METADATA_BYTES,
-                "request headers over the sandbox metadata ceiling; refusing before cloning them"
-            );
-            return Err(Box::new(sandbox_error(
-                plugin,
-                StatusCode::PAYLOAD_TOO_LARGE,
-            )));
-        }
+        charge_metadata(
+            plugin,
+            &mut metadata,
+            super::host::metadata_pair_bytes(name.as_str(), value),
+            "headers",
+        )?;
         headers.push((name.as_str().to_owned(), value.to_owned()));
     }
 
