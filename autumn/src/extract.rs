@@ -96,6 +96,59 @@ pub struct Json<T>(pub T);
 
 impl_extractor_deref!(Json);
 
+/// CSV response type.
+///
+/// Wraps an iterable of [`CsvSchema`](crate::data::csv::CsvSchema) items and
+/// serializes them as a CSV response with `Content-Type: text/csv`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::CsvSchema;
+/// use autumn_web::extract::Csv;
+///
+/// struct Item { id: i32 }
+/// impl CsvSchema for Item {
+///     fn csv_columns() -> &'static [&'static str] { &["id"] }
+///     fn to_csv_record(&self) -> Vec<String> { vec![self.id.to_string()] }
+/// }
+///
+/// #[get("/export.csv")]
+/// async fn export() -> Csv<Vec<Item>> {
+///     Csv(vec![Item { id: 1 }])
+/// }
+/// ```
+#[cfg(feature = "csv")]
+pub struct Csv<T>(pub T);
+
+#[cfg(feature = "csv")]
+impl_extractor_deref!(Csv);
+
+#[cfg(feature = "csv")]
+impl<T> IntoResponse for Csv<T>
+where
+    T: IntoIterator,
+    T::Item: crate::data::csv::CsvSchema,
+{
+    fn into_response(self) -> Response {
+        let mut out = Vec::new();
+        if let Err(err) = crate::data::csv::export_csv(self.0, &mut out) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to export CSV: {err}"),
+            )
+                .into_response();
+        }
+
+        (
+            [(http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            out,
+        )
+            .into_response()
+    }
+}
+
 impl<S, T> FromRequest<S> for Json<T>
 where
     S: Send + Sync,
@@ -1605,5 +1658,48 @@ mod trusted_proxy_extractor_tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"/admin/posts");
+    }
+
+    #[cfg(feature = "csv")]
+    #[tokio::test]
+    async fn csv_into_response_formats_data_and_sets_headers() {
+        use super::Csv;
+        use crate::data::csv::CsvSchema;
+        use axum::response::IntoResponse;
+        use http::header::CONTENT_TYPE;
+
+        struct Sample {
+            id: i32,
+            val: String,
+        }
+
+        impl CsvSchema for Sample {
+            fn csv_columns() -> &'static [&'static str] {
+                &["id", "val"]
+            }
+            fn to_csv_record(&self) -> Vec<String> {
+                vec![self.id.to_string(), self.val.clone()]
+            }
+        }
+
+        let data = vec![
+            Sample {
+                id: 1,
+                val: "A".to_string(),
+            },
+            Sample {
+                id: 2,
+                val: "B".to_string(),
+            },
+        ];
+        let res = Csv(data).into_response();
+
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            res.headers().get(CONTENT_TYPE).unwrap(),
+            "text/csv; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"id,val\n1,A\n2,B\n");
     }
 }
