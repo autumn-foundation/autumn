@@ -4214,12 +4214,19 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
         let Some(tier) = entry.as_array() else {
             return Some(FleetTopology::malformed());
         };
-        tiers.push(
-            tier.iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect(),
-        );
+        // Queue names must be strings. Dropping a non-string with `filter_map`
+        // is the worst variant of the same silent-pass bug: `tiers = [[1]]`
+        // collapses to an EMPTY tier, which `has_unpinned_tier` reads as a tier
+        // that drains everything — so coverage becomes total and the check
+        // passes unconditionally on a document the app refuses to boot with.
+        let mut names = Vec::with_capacity(tier.len());
+        for name in tier {
+            let Some(name) = name.as_str() else {
+                return Some(FleetTopology::malformed());
+            };
+            names.push(name.to_owned());
+        }
+        tiers.push(names);
     }
     if tiers.is_empty() {
         return None;
@@ -14585,6 +14592,12 @@ foo = "bar"
             "[jobs.fleet]\ntiers = 3\n",
             // Mixed: one well-formed tier and one that is not.
             "[jobs.fleet]\ntiers = [[\"critical\"], \"bulk\"]\n",
+            // A non-string queue name. `[[1]]` is the dangerous one: dropping
+            // the entry leaves an EMPTY tier, which reads as "drains
+            // everything" and would make the check pass unconditionally.
+            "[jobs.fleet]\ntiers = [[1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\", 1]]\n",
+            "[jobs.fleet]\ntiers = [[\"critical\"], [[\"bulk\"]]]\n",
         ] {
             let table: toml::Table = toml::from_str(doc).expect("parse toml");
             let fleet = resolve_fleet_topology(Some(&table)).unwrap_or_else(|| {
@@ -14622,6 +14635,31 @@ foo = "bar"
                 "the typed config must reject it too: {doc}"
             );
         }
+
+        // The specific hazard for `[[1]]`: silently dropping the non-string
+        // leaves an empty tier, and an empty tier is a *legitimate* declaration
+        // meaning "unpinned, drains everything" — so the check would have
+        // reported total coverage and passed. Pin that an empty tier really does
+        // mean that, which is why the non-string case can never be allowed to
+        // decay into one.
+        let unpinned = FleetTopology {
+            tiers: vec![Vec::new()],
+            malformed: false,
+        };
+        assert!(unpinned.has_unpinned_tier());
+        assert_eq!(
+            check_queue_coverage_topology(
+                ProcessRole::Worker,
+                &["critical".to_string(), "bulk".to_string()],
+                &[],
+                &[],
+                Some(&unpinned),
+            )
+            .status,
+            CheckStatus::Pass,
+            "an empty tier means 'drains everything' — so a malformed tier must never \
+             be allowed to collapse into one",
+        );
 
         // `[jobs.fleet]` itself not a table is the same class of mistake.
         let table: toml::Table =
