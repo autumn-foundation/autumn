@@ -26966,14 +26966,35 @@ mod tests {
              ({ledger_inserts} ledger vs {history_inserts} history)"
         );
         assert!(history_inserts > 0, "sanity: history writes are emitted");
-        // Each append reads the record's chain head first.
-        assert_eq!(
-            generated
-                .matches("SELECT seq, hash FROM _autumn_ledger_revisions")
-                .count(),
-            ledger_inserts,
-            "each append must read the chain head it links onto"
-        );
+        // Each append reads the record's chain head *and* its out-of-band
+        // high-water mark, then raises the mark (#2323). Same parity argument as
+        // above: these are emitted from the one token builder, so a count that
+        // drifts from `ledger_inserts` means some write path lost a statement —
+        // and a path that appends a revision without raising the mark leaves
+        // `HighWaterBehind` on every record it touches.
+        //
+        // Both fragments are unique to the *append* path. The head-read SQL
+        // itself is not: `__autumn_ledger_settled_state` reads the same chain
+        // head for `ledger_pin`, so counting that would drift by the number of
+        // backend arms in a reader and turn this into a brittle magic number.
+        // The clock alias is only ever selected by an append, and only an append
+        // writes the mark.
+        for (fragment, what) in [
+            (
+                "AS db_now",
+                "read the database clock, the chain head and the mark in one statement",
+            ),
+            (
+                "INSERT INTO _autumn_ledger_high_water",
+                "raise the high-water mark it just moved past",
+            ),
+        ] {
+            assert_eq!(
+                generated.matches(fragment).count(),
+                ledger_inserts,
+                "each append must {what} ({fragment})"
+            );
+        }
     }
 
     #[test]
