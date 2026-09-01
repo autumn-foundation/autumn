@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS _autumn_ledger_high_water (
     table_name  TEXT   NOT NULL,
     tenant_key  TEXT   NOT NULL,
     record_id   BIGINT NOT NULL,
-    high_seq    BIGINT NOT NULL,
+    -- See the Postgres copy: a mark below sequence 1 names no revision, and the
+    -- append would raise it over an accusation `ledger_verify` had made.
+    high_seq    BIGINT NOT NULL CHECK (high_seq >= 1),
     head_hash   TEXT   NOT NULL,
     recorded_at TEXT   NOT NULL,
     PRIMARY KEY (table_name, tenant_key, record_id)

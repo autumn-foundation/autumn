@@ -2072,6 +2072,94 @@ async fn a_write_after_a_wholly_erased_chain_leaves_permanent_evidence() {
     assert_eq!(broken.seq, 1);
 }
 
+/// A mark below sequence 1 names no revision, so the append would allocate as
+/// though it were absent and then raise the mark over the top of it — laundering
+/// the accusation `ledger_verify` had already made. Both schemas forbid the row,
+/// and the writer refuses it even where the constraint has been dropped.
+#[tokio::test]
+async fn a_non_positive_high_water_mark_is_refused_rather_than_overwritten() {
+    let pool = boot_pool("lg_mark_non_positive").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    // The schema is the first lock: the row cannot be written at all.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        let refused = diesel::sql_query(
+            "INSERT INTO _autumn_ledger_high_water \
+             (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
+             VALUES ('lg_invoices', '', 424242, 0, 'planted', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&mut *conn)
+        .await;
+        assert!(
+            refused.is_err(),
+            "CHECK (high_seq >= 1) must make a non-positive mark unrepresentable"
+        );
+    }
+
+    // The writer is the second, for a database whose constraint was dropped.
+    // SQLite cannot drop a CHECK in place, so rebuild the table without it.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "ALTER TABLE _autumn_ledger_high_water RENAME TO _hw_old; \
+             CREATE TABLE _autumn_ledger_high_water ( \
+                 table_name TEXT NOT NULL, tenant_key TEXT NOT NULL, \
+                 record_id BIGINT NOT NULL, high_seq BIGINT NOT NULL, \
+                 head_hash TEXT NOT NULL, recorded_at TEXT NOT NULL, \
+                 PRIMARY KEY (table_name, tenant_key, record_id)); \
+             INSERT INTO _autumn_ledger_high_water SELECT * FROM _hw_old; \
+             DROP TABLE _hw_old;",
+        )
+        .await
+        .expect("rebuild the mark table without its CHECK");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 0 \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("plant a non-positive mark");
+    }
+
+    // `ledger_verify` sees it, so an ordinary write must not erase it.
+    assert!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .is_some(),
+        "a mark below the chain head is reported"
+    );
+    assert!(
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "the append must refuse rather than allocate past the mark and raise it"
+    );
+    assert_eq!(
+        repo.ledger_revisions(id).await.expect("revisions").len(),
+        3,
+        "nothing was written"
+    );
+    assert!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .is_some(),
+        "and the accusation survives"
+    );
+}
+
 /// A mark *behind* the head is the mixed-version rolling-deploy case — a
 /// pre-#2323 node appends without raising the mark — so it must NOT refuse. It
 /// is reported, and the record's next write heals it.

@@ -35,7 +35,13 @@ CREATE TABLE IF NOT EXISTS _autumn_ledger_high_water (
     table_name  TEXT        NOT NULL,
     tenant_key  TEXT        NOT NULL,
     record_id   BIGINT      NOT NULL,
-    high_seq    BIGINT      NOT NULL,
+    -- A mark always names a real revision, and sequence numbers start at 1. A
+    -- row below that is not merely meaningless: the append allocates from
+    -- `max(chain head, mark)`, so a `high_seq` of 0 or less contributes nothing,
+    -- and the write that follows would raise the mark over the top of an
+    -- accusation `ledger_verify` had already made. Make the state
+    -- unrepresentable rather than merely refused (the writer refuses it too).
+    high_seq    BIGINT      NOT NULL CHECK (high_seq >= 1),
     head_hash   TEXT        NOT NULL,
     recorded_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (table_name, tenant_key, record_id)

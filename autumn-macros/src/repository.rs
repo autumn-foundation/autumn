@@ -2515,6 +2515,32 @@ fn ledger_append_ts(
             // ordinary traffic launders away — the mark's instant carries no hash
             // of its own, so rewriting only that field would otherwise be
             // reported once and then quietly erased by the next append.
+            // A mark names a real revision, so its sequence number starts at 1.
+            // Below that it contributes nothing to the `max` below — the append
+            // would allocate as if no mark existed and then raise the mark over
+            // the top of it, erasing an accusation `ledger_verify` had already
+            // made (`MissingRevision` beside an empty chain, `HighWaterBehind`
+            // beside a live one). Both schemas carry a `CHECK (high_seq >= 1)`
+            // so the row cannot be written in the first place; this is the
+            // second lock on the same door, for a database whose constraint was
+            // dropped.
+            if __lg_state.mark_seq.is_some_and(|seq| seq < 1) {
+                ::core::result::Result::<(), ::autumn_web::AutumnError>::Err(
+                    ::autumn_web::AutumnError::internal_server_error(
+                        ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                            table: #table_name_ts.to_string(),
+                            record_id: __lg_record_id,
+                            detail: "the record's high-water mark carries a sequence \
+                                     number below 1, which names no revision. Appending \
+                                     would allocate as though the mark were absent and \
+                                     then overwrite it — run `ledger_verify`, and check \
+                                     whether the mark table's CHECK constraint is still \
+                                     in place"
+                                .to_string(),
+                        },
+                    ),
+                )?;
+            }
             if __lg_state.mark_seq == __lg_state.head_seq
                 && (__lg_state.mark_hash.as_deref() != __lg_state.head_hash.as_deref()
                     || __lg_state.mark_recorded_at != __lg_state.head_recorded_at)
