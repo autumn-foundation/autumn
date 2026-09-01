@@ -2277,6 +2277,189 @@ mod tests {
         );
     }
 
+    /// A header value is not required to be UTF-8: `obs-text` is legal inside
+    /// a `quoted-string`, so one stray byte in a `Digest` username used to
+    /// discard *every* component of the header — including parameter values
+    /// that are plain ASCII and independently parseable. The handler extracts
+    /// those, echoes them and binds them, and nothing in the echo set matched.
+    #[test]
+    fn a_non_utf8_header_byte_does_not_hide_the_ascii_components() {
+        // `Digest username="<0xff>alice", response="deadbeef", nonce=cafebabe`
+        let mut credential = br#"username=""#.to_vec();
+        credential.push(0xFF);
+        credential
+            .extend_from_slice(br#"alice", response="deadbeef", nonce=cafebabe, qop=auth"#);
+        let mut header = b"Digest ".to_vec();
+        header.extend_from_slice(&credential);
+        let (_request, values) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                axum::http::HeaderValue::from_bytes(&header).expect("obs-text is legal"),
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(&credential),
+            "the credential after the scheme is still retained whole, as bytes"
+        );
+        assert!(
+            values.contains(b"deadbeef"),
+            "an ASCII param value must survive a non-UTF-8 byte elsewhere in the header"
+        );
+        assert!(
+            values.contains(b"cafebabe"),
+            "an unquoted param value after the non-UTF-8 one is still found"
+        );
+        assert!(
+            values.contains(b"auth"),
+            "every remaining param value is recorded, as before"
+        );
+        assert!(
+            values.contains(b"\xffalice".as_slice()),
+            "the non-UTF-8 param value itself is retained as bytes, for bind masking"
+        );
+        assert!(
+            !values.contains(b"username"),
+            "param names are not values and must stay out of the echo set"
+        );
+
+        // The point of all of it: what the handler actually extracted is
+        // masked out of a bind and out of the outcome text.
+        let mut binds = vec![
+            BindValue::Value(b"deadbeef".to_vec()),
+            BindValue::Value(b"\xffalice".to_vec()),
+            BindValue::Value(b"unrelated".to_vec()),
+        ];
+        mask_binds(&mut binds, &values);
+        assert_eq!(
+            binds.first(),
+            Some(&BindValue::Masked),
+            "a bind byte-equal to an ASCII param value is masked"
+        );
+        assert_eq!(
+            binds.get(1),
+            Some(&BindValue::Masked),
+            "a bind byte-equal to the non-UTF-8 param value is masked too"
+        );
+        assert_eq!(
+            binds.get(2),
+            Some(&BindValue::Value(b"unrelated".to_vec())),
+            "unrelated binds are untouched"
+        );
+        assert_eq!(
+            mask_echoes("response deadbeef rejected", &values),
+            format!("response {FILTERED_PLACEHOLDER} rejected"),
+            "the extracted param value is scrubbed from the outcome"
+        );
+
+        // The same gap closed for cookies: one obs-text cookie must not take
+        // the session token beside it down with it.
+        let mut cookie = b"pref=".to_vec();
+        cookie.push(0xFF);
+        cookie.extend_from_slice(b"dark; session=sess-abcdef");
+        let (_request, jar) = redact(
+            Request::get("/").header(
+                header::COOKIE,
+                axum::http::HeaderValue::from_bytes(&cookie).expect("obs-text is legal"),
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            jar.contains(b"sess-abcdef"),
+            "an ASCII cookie value must survive a non-UTF-8 cookie beside it"
+        );
+        assert!(
+            jar.contains(b"\xffdark".as_slice()),
+            "the non-UTF-8 cookie value is retained as bytes"
+        );
+    }
+
+    /// Percent-encoding a cookie value is a common convention — Autumn itself
+    /// percent-decodes its own `autumn_time_zone` cookie before use — so a
+    /// handler holds `abc/def` where the wire carried `abc%2Fdef`. Recording
+    /// only the wire spelling matches neither the bind nor the echo.
+    ///
+    /// `mask_raw_urlencoded` already records both spellings for form and query
+    /// values; cookie values follow it, staying whole-token-only.
+    #[test]
+    fn cookie_values_record_both_percent_spellings() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "session=abc%2Fdef; theme=dark"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+
+        assert!(
+            values.contains(b"abc%2Fdef"),
+            "the on-the-wire spelling is still recorded"
+        );
+        assert!(
+            values.contains(b"abc/def"),
+            "the percent-decoded spelling is what a decoding handler holds"
+        );
+        assert!(
+            values.contains(b"dark"),
+            "a value with nothing to decode is recorded exactly once, unchanged"
+        );
+
+        let mut binds = vec![
+            BindValue::Value(b"abc/def".to_vec()),
+            BindValue::Value(b"abc%2Fdef".to_vec()),
+        ];
+        mask_binds(&mut binds, &values);
+        assert_eq!(
+            binds.first(),
+            Some(&BindValue::Masked),
+            "a bind carrying the decoded spelling is masked"
+        );
+        assert_eq!(
+            binds.get(1),
+            Some(&BindValue::Masked),
+            "a bind carrying the raw spelling is masked"
+        );
+        assert_eq!(
+            mask_echoes("cookie abc/def was rejected", &values),
+            format!("cookie {FILTERED_PLACEHOLDER} was rejected"),
+            "the decoded spelling is scrubbed where it stands as a whole token"
+        );
+
+        // Decoding stays whole-token-only, like every other cookie value: it
+        // must not shred a word that merely contains it.
+        assert_eq!(
+            mask_echoes("darkness check failed", &values),
+            "darkness check failed",
+            "the decoded spellings inherit the whole-token classification"
+        );
+
+        // `Set-Cookie` carries one cookie then attributes, and the decoded
+        // spelling follows the same one-pair rule.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "session=a%2Fb; Path=%2Fadmin; Max-Age=0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(set_cookie.contains(b"a/b"), "the cookie value decodes");
+        assert!(
+            !set_cookie.contains(b"/admin"),
+            "an attribute value is not a secret, decoded or not"
+        );
+
+        // A percent-escape that decodes to bytes which are not UTF-8 is still
+        // recorded: a bind carrying them is exactly the echo this exists for.
+        let (_request, binary) = redact(
+            Request::get("/").header(header::COOKIE, "session=raw%FFtail"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            binary.contains(b"raw\xfftail".as_slice()),
+            "a decoded value that is not UTF-8 is still recorded, for bind masking"
+        );
+    }
+
     /// The same bytes can arrive both ways — a filtered body password the
     /// client also sent as a `Digest` parameter. The request carried it in its
     /// own right, so it needs full substring masking either way round.
