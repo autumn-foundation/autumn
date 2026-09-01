@@ -1707,6 +1707,16 @@ pub use maud::html;
 /// ```
 pub use crate::extract::Json;
 
+/// CSV request body extractor and response type.
+///
+/// When used as a handler parameter, deserializes the request body as a CSV list of records.
+/// When returned from a handler, serializes the value as CSV with
+/// `Content-Type: text/csv; charset=utf-8`.
+///
+/// Requires the `csv` feature.
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
+
 /// Path extractor.
 ///
 /// Extract typed path parameters from the URL.
