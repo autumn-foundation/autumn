@@ -1661,13 +1661,18 @@ fn skip_const_expr(wasm: &[u8], mut at: usize, limit: usize) -> Option<usize> {
         match opcode {
             // end
             0x0b => return Some(at),
-            // i32.const / i64.const: one signed LEB128
-            0x41 | 0x42 => at = sleb128(wasm, at)?.1,
+            // i32.const / i64.const: one signed LEB128. `ref.null` (0xd0)
+            // takes the same step: the format writes a heap type as a signed
+            // LEB too. Every heap type this engine accepts fits one byte —
+            // `funcref` is 0x70, `externref` 0x6f, and wasmi enables neither
+            // function-references nor the GC proposal's concrete type
+            // references, so a type index cannot appear here — which makes
+            // reading the LEB identical to reading the byte today, and keeps
+            // this walk in step if that ever stops being true.
+            0x41 | 0x42 | 0xd0 => at = sleb128(wasm, at)?.1,
             // f32.const / f64.const: raw little-endian bits
             0x43 => at = at.checked_add(4)?,
             0x44 => at = at.checked_add(8)?,
-            // ref.null: one heap type byte
-            0xd0 => at = at.checked_add(1)?,
             // ref.func / global.get: one unsigned LEB128
             0xd2 | 0x23 => at = leb128(wasm, at)?.1,
             // extended-const arithmetic: no immediates. wasmi enables the
@@ -2100,7 +2105,15 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
         // `segments` by itself. That is the whole difference from a walk that
         // gives up and silently takes its bounds check with it: here the
         // refusal is unconditional and the walk's findings cannot matter.
-        let within_segment_ceiling = segments <= MAX_INIT_SEGMENTS;
+        //
+        // It rejects on `init_bytes` by itself too, and that is the other half:
+        // a single element segment holding tens of millions of function
+        // indices keeps `segments` at one and clears the count ceiling, so the
+        // count alone let the walk run over every item on the way to a refusal
+        // the byte ceiling had already decided. Both counters gate the walk
+        // because either one alone refuses the module.
+        let within_segment_ceiling =
+            segments <= MAX_INIT_SEGMENTS && bytes <= MAX_INIT_SECTION_BYTES;
         if id == ELEMENT_SECTION && within_segment_ceiling {
             // The table section precedes this one in a well-formed module, so
             // the minimums are known by the time the segments are read.
@@ -4777,6 +4790,120 @@ path = "/hello/greet"
             imports[0].starts_with("not_wasi::"),
             "the entry must still say what is imported: {}",
             &imports[0][..imports[0].len().min(64)],
+        );
+    }
+
+    #[test]
+    fn one_oversized_element_section_is_not_walked_before_it_is_refused() {
+        // The count ceiling and the byte ceiling each refuse a module on their
+        // own, so the walk should be skipped when *either* is exceeded. Only
+        // the count gated it — and a single segment keeps the count at one, so
+        // the walk ran over the section on the way to a refusal the byte
+        // ceiling had already decided.
+        //
+        // Observable through what the walk reports. The segment here overflows
+        // its table, so a walk that runs finds `Some(..)`; a walk that is
+        // skipped leaves `None`. The module is refused either way, which is
+        // exactly why the verdict cannot be the thing this test looks at.
+        let mut wasm = Vec::from(b"\0asm\x01\0\0\0".as_slice());
+        // One table, funcref, minimum 1 — so five elements written at offset 0
+        // is an overflow the walk would report.
+        wasm.extend_from_slice(&[TABLE_SECTION, 0x04, 0x01, 0x70, 0x00, 0x01]);
+
+        let body_len = MAX_INIT_SECTION_BYTES + 1;
+        wasm.push(ELEMENT_SECTION);
+        let mut size = body_len;
+        while size >= 0x80 {
+            let low = u8::try_from(size & 0x7f).expect("masked to seven bits");
+            wasm.push(low | 0x80);
+            size >>= 7;
+        }
+        wasm.push(u8::try_from(size).expect("the loop leaves under 0x80"));
+        let before_body = wasm.len();
+        // count = 1; then an active segment: table 0, offset `i32.const 0`,
+        // five function indices. The rest of the section is padding the walk
+        // never reads — it is there only to carry the section over the byte
+        // ceiling.
+        wasm.extend_from_slice(&[0x01, 0x00, 0x41, 0x00, 0x0b, 0x05, 0, 0, 0, 0, 0]);
+        wasm.resize(before_body + body_len, 0);
+
+        let shape = module_shape(&wasm).expect("the header walk must not fail");
+        assert_eq!(
+            shape.segments, 1,
+            "the count ceiling is not what refuses it"
+        );
+        assert!(
+            shape.init_bytes > MAX_INIT_SECTION_BYTES,
+            "the fixture should be over the byte ceiling",
+        );
+        assert!(
+            shape.element_overflow.is_none(),
+            "the segment walk ran on a section the byte ceiling already refuses: {:?}",
+            shape.element_overflow,
+        );
+
+        let err =
+            refuse_unbounded_shape(&wasm).expect_err("an oversized init section must be refused");
+        assert!(
+            matches!(
+                err,
+                SandboxLoadError::InstantiationTooExpensive {
+                    what: "bytes of data and element sections",
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn the_engine_refuses_a_heap_type_this_walk_would_have_to_guess_at() {
+        // `skip_const_expr` reads `ref.null`'s heap type as a signed LEB rather
+        // than a byte. Today that is the same one byte for every heap type the
+        // engine accepts — this test is what says so, and what would notice if
+        // it stopped being true.
+        //
+        // A non-minimal encoding of `funcref` (0xf0 0x7f decodes to -16, the
+        // same value as 0x70) is the case a byte-wide read would desynchronise
+        // on. wasmi refuses it outright, so no such module ever reaches
+        // instantiation: the walk cannot be led out of step by it, and the
+        // load-time bounds check cannot be skipped through it.
+        let mut module = Vec::from(b"\0asm\x01\0\0\0".as_slice());
+        module.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type () -> ()
+        module.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one function
+        module.extend_from_slice(&[0x04, 0x04, 0x01, 0x70, 0x00, 0x01]); // table funcref, min 1
+        module.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]); // memory, min 1
+        module.extend_from_slice(&[0x07, 0x13, 0x02, 0x06]);
+        module.extend_from_slice(b"memory");
+        module.extend_from_slice(&[0x02, 0x00, 0x06]);
+        module.extend_from_slice(b"_start");
+        module.extend_from_slice(&[0x00, 0x00]);
+        let code = [0x0a, 0x05, 0x01, 0x03, 0x00, 0x01, 0x0b];
+
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        let engine = wasmi::Engine::new(&config);
+
+        // The minimal form compiles, which is what makes the comparison mean
+        // something: the fixture is well formed apart from the heap type.
+        let mut minimal = module.clone();
+        minimal.extend_from_slice(&[
+            0x09, 0x09, 0x01, 0x04, 0x41, 0x00, 0x0b, 0x01, 0xd0, 0x70, 0x0b,
+        ]);
+        minimal.extend_from_slice(&code);
+        wasmi::Module::new(&engine, &minimal[..]).expect("the minimal heap type compiles");
+
+        // The non-minimal form does not.
+        let mut non_minimal = module;
+        non_minimal.extend_from_slice(&[
+            0x09, 0x0a, 0x01, 0x04, 0x41, 0x00, 0x0b, 0x01, 0xd0, 0xf0, 0x7f, 0x0b,
+        ]);
+        non_minimal.extend_from_slice(&code);
+        let err = wasmi::Module::new(&engine, &non_minimal[..])
+            .expect_err("a non-minimal heap type must not compile");
+        assert!(
+            err.to_string().contains("heap type"),
+            "expected the engine to name the heap type: {err}",
         );
     }
 
