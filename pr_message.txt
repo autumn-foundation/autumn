@@ -1,0 +1,13 @@
+⚒️ Forge: Refactor SelectSpec parsing using FromStr
+
+🚰 Smell:
+The `parse_select_specs` function in `autumn-cli/src/generate/admin.rs` contained business logic mixed with string parsing inside a mutable `for` loop, which violated Forge's readability guidelines and didn't use idiomatic Rust traits.
+
+✨ Solution:
+Extracted the string parsing logic into an idiomatic `std::str::FromStr` implementation for the `SelectSpec` struct. Refactored `parse_select_specs` to use a clean `.iter().map(|t| t.parse()).collect()` iterator chain.
+
+🧼 Benefit:
+Improves readability and separation of concerns by moving parsing logic out of the business layer and into a standardized trait, making the `parse_select_specs` function trivial.
+
+🛡️ Verification:
+Ran `cargo clippy -p autumn-cli --bin autumn -- -D warnings`, `cargo test -p autumn-cli --bin autumn`, and `cargo fmt --all`. Tests passed. No runtime logic was changed.
