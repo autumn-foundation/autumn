@@ -1,0 +1,18 @@
+👹 Havoc: Fix presence event ordering race condition
+
+🧨 **The Trigger:**
+Concurrent connection `track` (Join) and `drop` (Leave) operations on the same key could release the internal presence state `Mutex` before publishing their respective events to the broadcast channel. This allowed a `Leave` event from an expiring connection to be published *after* a `Join` event from a new connection, even though the internal state reflected the new connection as active. Clients would process the `Leave` last and incorrectly display the user as offline.
+
+📉 **The Stack Trace:**
+```
+thread 'presence_event_ordering_race' panicked at autumn/tests/loom_models.rs:417:17:
+assertion `left == right` failed: state is 1 (present) but last event is Leave
+  left: "Leave"
+ right: "Join"
+```
+
+🧪 **Reproduction:**
+Run `_LOOM_SHOW_BUG=1 RUSTFLAGS="--cfg loom_models" cargo test -p autumn-web --test loom_models presence_event_ordering_race`.
+
+😈 **Comment:**
+You assumed that releasing the lock early was a clever performance optimization. You were wrong. Event emission must be strictly serialized with the state mutation it represents. Welcome to the wonderful world of distributed state.
