@@ -117,6 +117,118 @@ site**.
 leaf expires within 30 days — so an approaching expiry surfaces in CI or a
 pre-deploy check rather than at the moment the cert lapses.
 
+### What behaves the same under TLS
+
+Turning on `[server.tls]` changes the transport, not the app. The framework
+probes (`/health`, `/live`, `/ready`, `/startup`), `/actuator/health`, the
+inbound request timeout (`[server.timeouts]`), SSE streams, `wss://` WebSockets,
+and graceful shutdown of an in-flight request all behave exactly as they do over
+plain HTTP — including that an SSE body still streams incrementally rather than
+being buffered, and that a stream is still exempt from the request deadline.
+
+That parity is enforced, not asserted: `autumn/tests/integration/tls_app_surface.rs`
+serves the *same* router twice — once over the TLS listener, once over plain TCP
+— and requires each probe response to match on status, body, and content type;
+it also drives a `wss://` echo, an SSE stream, a timed-out handler, and a
+shutdown drain over TLS on every CI run.
+
+Two things do differ, both by construction:
+
+- **`[server.tls]` cannot be combined with `server.unix_socket`.** Direct TLS
+  terminates on `host:port`; configuring both is a startup error.
+- **In-place upgrades (`SIGUSR2` handoff) do not apply to a TLS build.** A
+  handoff passes the listening socket to a successor process, and a successor
+  that terminates TLS cannot adopt a plaintext listener whose clients are
+  mid-connection. So a TLS build never offers its socket for handoff (the signal
+  logs `in-place upgrade refused` and the running app carries on), and a TLS
+  build handed an inherited socket exits at startup rather than failing every
+  connection. Restart the process to deploy a new build.
+
+### Serving HTTPS from the release image
+
+`autumn release init` generates a Dockerfile whose builder runs a bare
+`cargo build --release` (or `autumn build --embed` with `--embed`). Neither
+passes `--features`, so the `tls` feature has to be a **default** feature of
+your app for the image to link the TLS stack:
+
+```toml
+[features]
+default = ["flash", "tls"]
+tls = ["autumn-web/tls"]
+```
+
+Mount the certificate and key into the container and point `[server.tls]` at
+them with the environment (no `autumn.toml` edit needed — the runtime
+materializes the section from these vars), and re-point the image's own
+HEALTHCHECK at `https://`:
+
+```bash
+docker run -d \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
+  -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
+  -p 443:3000 \
+  my-app
+```
+
+**Mount the whole `/etc/letsencrypt` tree, at the same path**, not just the
+`live/<domain>` directory. certbot's `live/*.pem` are *relative symlinks* into
+`../../archive/<domain>/`, so a bind mount of `live/<domain>` alone leaves every
+target outside the mount: the container resolves them under `/etc/archive`,
+finds nothing, and the app fails fast on an unreadable certificate instead of
+serving HTTPS. Mounting the tree at the identical path keeps the symlinks valid
+and lets a renewal — which writes a new `archive/` file and re-points the
+symlink — be picked up by the poller, since the mtime it stats is the
+symlink's target.
+
+With a certificate that is *not* symlinked (a corporate or vendor PEM), any
+directory works:
+
+```bash
+docker run -d \
+  -v /srv/tls:/etc/autumn/tls:ro \
+  -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
+  -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_INSECURE=1 \
+  -p 443:3000 \
+  my-app
+```
+
+Both health-check variables matter. `AUTUMN_HEALTHCHECK_URL` re-points the
+generated `HEALTHCHECK`, which defaults to `http://localhost:3000/health`: a
+plain-HTTP probe against an HTTPS listener marks the container **unhealthy**
+forever — and in the generated `docker-compose.yml`, anything waiting on
+`condition: service_healthy` then never starts.
+
+`AUTUMN_HEALTHCHECK_INSECURE=1` lets that probe skip certificate verification.
+It is needed because the probe is a loopback call to the container's own
+listener while your certificate is issued to the app's *public* hostname, so it
+can never validate as `localhost`. Set it only with a loopback URL — it applies
+to whatever URL you configure, and unset (the default) the probe always
+verifies. The opt-in is deliberate rather than inferred from the URL: `user@`,
+`#fragment`, and lookalike hostnames all make a URL *read* as loopback while
+curl resolves it somewhere else, so a scheme/host parser in the probe would
+quietly stop verifying certificates for a remote endpoint.
+
+Mount the key read-only and keep it `0600` on the host, owned by a user the
+container's `autumn` user (uid 10001) can read. (certbot's `archive/` is
+`0700 root` by default, so either run the container as a user that can read it
+or relax the group permission for the app's user — a certificate the app cannot
+open is a fail-fast boot error naming the path, not a silent fallback.) Because
+the certificate lives on a bind mount, a host-side `certbot renew` rewrites the
+files the container polls — the hot reload works exactly as it does outside a
+container, with no image rebuild and no restart.
+
+CI exercises this path on every change to the deployment scaffold: the
+`https-target` job in `.github/workflows/release-image-boot.yml` builds the
+generated image with `tls` on, boots it with a self-signed test certificate,
+and requires an HTTPS `/health` + `/actuator/health` 200 (validated with
+`--cacert`), that plain HTTP on the same port does *not* answer, and that the
+container's own HEALTHCHECK reaches `healthy`.
+
 ### Renewing with certbot
 
 `certbot` pairs cleanly with direct TLS because it writes renewed certificates
