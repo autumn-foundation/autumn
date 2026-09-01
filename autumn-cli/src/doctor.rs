@@ -5440,6 +5440,9 @@ pub enum AcmeCaRootData {
     /// No `ca_root_path` configured — the ACME client uses the platform's trust
     /// store, which is what Let's Encrypt needs.
     NotConfigured,
+    /// No `ca_root_path` configured, but the directory is a CUSTOM one whose
+    /// root the platform trust store probably does not carry.
+    MissingForPrivateDirectory,
     /// The key is present but is not a TOML string, so the runtime's
     /// `Option<PathBuf>` deserialization rejects it and the server will not boot.
     Malformed {
@@ -5493,18 +5496,21 @@ pub enum AcmeCaRootData {
 /// single authorization is created, and the app serves nothing but the
 /// self-signed placeholder. That is a Fail, caught here rather than in
 /// production.
-#[must_use]
-pub fn check_acme_ca_root_impl(data: &AcmeCaRootData) -> CheckResult {
+/// Grade the `ca_root_path` outcomes that CANNOT work until the operator
+/// changes something — a value the server refuses to boot on, or a file that
+/// yields no usable trust anchor. Split out of
+/// [`check_acme_ca_root_impl`] to keep both functions readable; the seam is
+/// "can this configuration ever succeed as written?".
+fn check_acme_ca_root_failure(data: &AcmeCaRootData) -> CheckResult {
     match data {
-        AcmeCaRootData::NotConfigured => CheckResult {
+        AcmeCaRootData::Malformed { value } => CheckResult {
             name: "acme_ca_root",
-            status: CheckStatus::Pass,
-            detail: Some(
-                "no ca_root_path configured; the ACME client uses the platform trust store \
-                 (correct for Let's Encrypt staging and production)"
-                    .into(),
-            ),
-            hint: None,
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path is {value}, not a string; the server will not \
+                 start with this value"
+            )),
+            hint: Some("Set ca_root_path to a quoted path, e.g. \"config/ca-root.pem\""),
         },
         AcmeCaRootData::Blank => CheckResult {
             name: "acme_ca_root",
@@ -5519,20 +5525,73 @@ pub fn check_acme_ca_root_impl(data: &AcmeCaRootData) -> CheckResult {
                  root that signs your ACME directory's HTTPS certificate",
             ),
         },
+        AcmeCaRootData::Unreadable { path, reason } => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path {path} cannot be read ({reason}); the ACME \
+                 client would trust no roots at all and every order would fail its TLS handshake"
+            )),
+            hint: Some(
+                "Point ca_root_path at the PEM root that signs your ACME directory's HTTPS \
+                 certificate, or remove it to use the platform trust store",
+            ),
+        },
+        AcmeCaRootData::NotACertificate { path, reason } => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] ca_root_path {path} yields no usable trust anchor ({reason})"
+            )),
+            hint: Some(
+                "ca_root_path must be a PEM file whose first section is the ACME directory's \
+                 root certificate (a `-----BEGIN CERTIFICATE-----` block)",
+            ),
+        },
+        // The advisory outcomes are graded by the caller.
+        AcmeCaRootData::NotConfigured
+        | AcmeCaRootData::MissingForPrivateDirectory
+        | AcmeCaRootData::Usable
+        | AcmeCaRootData::ExtraCertificatesIgnored { .. }
+        | AcmeCaRootData::UnneededForPublicDirectory { .. } => {
+            unreachable!("advisory ca_root_path outcomes are graded by check_acme_ca_root_impl")
+        }
+    }
+}
+
+#[must_use]
+pub fn check_acme_ca_root_impl(data: &AcmeCaRootData) -> CheckResult {
+    match data {
+        AcmeCaRootData::NotConfigured => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no ca_root_path configured; the ACME client uses the platform trust store \
+                 (correct for Let's Encrypt staging and production)"
+                    .into(),
+            ),
+            hint: None,
+        },
+        AcmeCaRootData::MissingForPrivateDirectory => CheckResult {
+            name: "acme_ca_root",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "[server.tls.acme] sets a custom directory but no ca_root_path, so the ACME \
+                 client falls back to the platform trust store; unless that directory's root is \
+                 installed host-wide, the TLS handshake to it fails and every order dies before \
+                 an authorization is created"
+                    .into(),
+            ),
+            hint: Some(
+                "Point ca_root_path at the PEM root that signs your ACME directory's HTTPS \
+                 certificate, or install it in the host trust store",
+            ),
+        },
         AcmeCaRootData::Usable => CheckResult {
             name: "acme_ca_root",
             status: CheckStatus::Pass,
             detail: Some("ca_root_path holds a usable trust anchor for the ACME directory".into()),
             hint: None,
-        },
-        AcmeCaRootData::Malformed { value } => CheckResult {
-            name: "acme_ca_root",
-            status: CheckStatus::Fail,
-            detail: Some(format!(
-                "[server.tls.acme] ca_root_path is {value}, not a string; the server will not \
-                 start with this value"
-            )),
-            hint: Some("Set ca_root_path to a quoted path, e.g. \"config/ca-root.pem\""),
         },
         AcmeCaRootData::ExtraCertificatesIgnored { path, certificates } => CheckResult {
             name: "acme_ca_root",
@@ -5561,30 +5620,19 @@ pub fn check_acme_ca_root_impl(data: &AcmeCaRootData) -> CheckResult {
                  or a Pebble test server reached via a custom directory",
             ),
         },
-        AcmeCaRootData::Unreadable { path, reason } => CheckResult {
-            name: "acme_ca_root",
-            status: CheckStatus::Fail,
-            detail: Some(format!(
-                "[server.tls.acme] ca_root_path {path} cannot be read ({reason}); the ACME \
-                 client would trust no roots at all and every order would fail its TLS handshake"
-            )),
-            hint: Some(
-                "Point ca_root_path at the PEM root that signs your ACME directory's HTTPS \
-                 certificate, or remove it to use the platform trust store",
-            ),
-        },
-        AcmeCaRootData::NotACertificate { path, reason } => CheckResult {
-            name: "acme_ca_root",
-            status: CheckStatus::Fail,
-            detail: Some(format!(
-                "[server.tls.acme] ca_root_path {path} yields no usable trust anchor ({reason})"
-            )),
-            hint: Some(
-                "ca_root_path must be a PEM file whose first section is the ACME directory's \
-                 root certificate (a `-----BEGIN CERTIFICATE-----` block)",
-            ),
-        },
+        failure => check_acme_ca_root_failure(failure),
     }
+}
+
+/// Whether `directory_label` names a custom (non-Let's Encrypt) ACME directory.
+///
+/// `acme_directory_label` renders the built-ins as `staging` / `production` and
+/// every custom URL as `custom-{hash}`, so anything else is custom by
+/// construction. Kept as one predicate because two branches of
+/// [`resolve_acme_ca_root_data`] depend on the same distinction and must not
+/// drift apart.
+fn is_custom_directory(directory_label: &str) -> bool {
+    !matches!(directory_label, "staging" | "production")
 }
 
 /// Read and validate the configured `ca_root_path` into an [`AcmeCaRootData`].
@@ -5608,7 +5656,17 @@ fn resolve_acme_ca_root_data(
         };
     }
     let Some(path) = path else {
-        return AcmeCaRootData::NotConfigured;
+        // A custom directory is served under a root the platform store almost
+        // never carries — the very handshake failure `ca_root_path` exists to
+        // fix. Grading that Pass would let `doctor --strict` bless a config in
+        // which every order dies before an authorization is created. Warn, not
+        // Fail: installing the root host-wide is a legitimate alternative that
+        // doctor cannot see from here.
+        return if is_custom_directory(directory_label) {
+            AcmeCaRootData::MissingForPrivateDirectory
+        } else {
+            AcmeCaRootData::NotConfigured
+        };
     };
     // Mirror `AcmeConfig::validate()`, which rejects a blank path before boot —
     // otherwise this reports "cannot be read" with an empty path in the message.
@@ -5666,7 +5724,7 @@ fn resolve_acme_ca_root_data(
     // `ca_root_path` entirely, so reporting "trim the bundle down to its root"
     // would hand the operator a fix that preserves — and, once the file really
     // does contain only that unrelated root, guarantees — the failure.
-    if matches!(directory_label, "staging" | "production") {
+    if !is_custom_directory(directory_label) {
         return AcmeCaRootData::UnneededForPublicDirectory {
             path: rendered,
             directory: directory_label.to_owned(),
@@ -10267,6 +10325,18 @@ pub struct Vault {
     }
 
     #[test]
+    fn acme_ca_root_unset_against_a_custom_directory_warns() {
+        // The symmetric case to `acme_ca_root_with_a_public_directory_warns`:
+        // a private directory whose root is not configured (and not installed
+        // host-wide) fails every order at the TLS handshake, so grading it Pass
+        // would let `doctor --strict` bless a dead deployment.
+        let r = check_acme_ca_root_impl(&AcmeCaRootData::MissingForPrivateDirectory);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert_eq!(r.name, "acme_ca_root");
+        assert!(r.hint.unwrap().contains("ca_root_path"));
+    }
+
+    #[test]
     fn acme_ca_root_unset_passes() {
         // Let's Encrypt (staging and production) serves its directory under a
         // publicly-trusted certificate, so the platform trust store is right.
@@ -10349,9 +10419,16 @@ pub struct Vault {
     fn acme_ca_root_resolver_matches_what_the_runtime_accepts() {
         let dir = tempfile::tempdir().expect("tempdir");
 
+        // Unset against a BUILT-IN directory is the correct, quiet default.
+        assert_eq!(
+            resolve_acme_ca_root_data(None, None, "production"),
+            AcmeCaRootData::NotConfigured
+        );
+        // Unset against a CUSTOM directory is the failure this whole feature
+        // exists to prevent, so it must not grade Pass.
         assert_eq!(
             resolve_acme_ca_root_data(None, None, "custom-abc"),
-            AcmeCaRootData::NotConfigured
+            AcmeCaRootData::MissingForPrivateDirectory
         );
         assert!(matches!(
             resolve_acme_ca_root_data(None, Some("123"), "custom-abc"),
