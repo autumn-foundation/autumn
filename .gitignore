@@ -30,3 +30,9 @@ examples/*/static/css/autumn.css
 target/
 benchmarks/runtime/results/
 benchmarks/runtime/load/results/
+
+# The workspace SBOM `scripts/check-sbom.sh` regenerates at the repo root. It
+# is a build product of the source tree, not a source file: checking it in
+# would create a second copy to keep in step, and the release gate rebuilds and
+# re-verifies it on every run anyway.
+sbom.cdx.json

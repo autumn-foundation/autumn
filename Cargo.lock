@@ -478,6 +478,7 @@ dependencies = [
  "diesel",
  "diesel_migrations",
  "directories",
+ "flate2",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.12.1",

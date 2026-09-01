@@ -46,6 +46,7 @@ mod schema_pull_sqlite;
 mod seed_model_linking;
 #[cfg(unix)]
 mod serve;
+mod supply_chain;
 mod tauri_mobile_thin_client;
 mod test_command;
 mod upgrade_codemod;
