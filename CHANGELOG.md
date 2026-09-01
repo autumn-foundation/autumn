@@ -524,6 +524,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ACME config: `autumn doctor` and the runtime now reject the same two
+  spellings (#1874):** two low-severity parity gaps let `autumn doctor
+  --strict` bless an `autumn.toml` the server refuses to boot on, and let one
+  malformed value through both. A **string-typed `renew_before_days`**
+  (`renew_before_days = "30"`, and likewise a float, a bool, a negative, or an
+  out-of-`u32`-range integer) was read by doctor's `as_integer()` chain as
+  *absent* and silently defaulted to 30, while the runtime's typed
+  deserialization rejects it — doctor now records the value the operator
+  actually wrote and reports an `acme_config` **Fail** naming it, exactly as it
+  already did for `http_challenge_port` and `directory`. A
+  **whitespace-padded domain** (`domains = [" app.example.com "]`) passed
+  `AcmeConfig::validate()`, which trims only for its blank and wildcard checks
+  but stores the entry untrimmed — and the untrimmed string is what becomes the
+  certificate's SAN and the ACME order's `Identifier::Dns`, so the padded name
+  was requested as-is and failed mid-issuance with an opaque CA error. Both
+  `validate()` and doctor now reject it at startup with a message naming the
+  entry, its index, and the trimmed spelling to use. Neither gap was a security,
+  denial-of-service, or CA-rate-limit issue: each was already caught fail-fast
+  at boot or at first issuance, just later and less legibly than it should have
+  been.
+
 - **CI now rejects colliding migration versions:** app, framework and plugin
   migrations are applied into one shared version space — diesel keys
   `__diesel_schema_migrations` on the 14-digit version and

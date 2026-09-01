@@ -6855,6 +6855,22 @@ impl AcmeConfig {
                      List explicit hostnames instead"
                 ));
             }
+            // The checks above read `trimmed`, but the entry is stored — and used —
+            // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
+            // the placeholder key's `CertId`, and the ACME order's
+            // `Identifier::Dns`. A padded ` app.example.com ` is therefore a
+            // different identifier than the hostname the operator meant, and the
+            // failure surfaces as an opaque CA rejection mid-issuance. Reject the
+            // padding here instead of silently trimming, so the config file says
+            // exactly what will be requested.
+            if domain != trimmed {
+                return Err(format!(
+                    "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
+                     trailing whitespace: the entry is used verbatim as the certificate's SAN and \
+                     as the ACME order's DNS identifier, so the padded value would be requested \
+                     as-is. Write it as `{trimmed}`"
+                ));
+            }
         }
         Ok(())
     }
@@ -14461,6 +14477,71 @@ path = "/healthz"
         cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("blank entries"), "got: {err}");
+    }
+
+    // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
+    // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
+    // but the UNTRIMMED value is what is stored, so the padded string reached the
+    // placeholder/CSR builder and the ACME `Identifier::Dns` order. The CA then
+    // rejects (or mis-issues) an identifier that is not the hostname the operator
+    // meant, with a far less actionable error than a boot-time rejection.
+    #[test]
+    fn validate_acme_whitespace_padded_domain_rejected() {
+        for padded in [
+            " app.example.com",
+            "app.example.com ",
+            "\tapp.example.com\n",
+        ] {
+            let mut cfg = tls_static(None, None);
+            cfg.acme = Some(acme_cfg(&[padded], "ops@example.com"));
+            let err = cfg
+                .validate()
+                .expect_err("a whitespace-padded domain must be rejected");
+            assert!(
+                err.contains("whitespace"),
+                "message must name the problem: {err}"
+            );
+            assert!(
+                err.contains("app.example.com"),
+                "message must name the offending entry: {err}"
+            );
+        }
+
+        // A padded entry is rejected even when a well-formed one precedes it, and
+        // the message points at the right index.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", " www.example.com "],
+            "ops@example.com",
+        ));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("index 1"),
+            "message must name the index: {err}"
+        );
+
+        // The already-trimmed spelling of the same name still passes.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // The padded-domain rule must not shadow the two more specific per-entry
+    // rules: a whitespace-only entry is still reported as blank, and a padded
+    // wildcard is still reported as a wildcard (the deeper problem, and the
+    // message operators already get today).
+    #[test]
+    fn validate_acme_padded_domain_rule_does_not_shadow_blank_or_wildcard() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(err.contains("#1620"), "got: {err}");
     }
 
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral

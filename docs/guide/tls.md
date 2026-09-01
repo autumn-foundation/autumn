@@ -345,12 +345,12 @@ Fields:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `domains` | required | One or more non-wildcard domains to issue for. |
+| `domains` | required | One or more non-wildcard domains to issue for. Each entry is used **verbatim** as the certificate's SAN and as the ACME order's DNS identifier, so an entry with leading or trailing whitespace is rejected at startup rather than requested as-is. |
 | `contact_email` | required | Contact address registered with the ACME account. |
 | `directory` | Let's Encrypt **staging** | ACME directory. Built-in endpoints are the bare strings `"staging"` (default) and `"production"`. A private CA / Pebble uses the inline table `{ custom = { url = "https://your-ca.example/dir" } }` — a bare URL string is **not** accepted (see below). |
 | `cache_dir` | `config/acme` | Where the account key and issued certificate are cached. |
 | `http_challenge_port` | `80` | Port the HTTP-01 challenge (and HTTP→HTTPS redirect) listens on. |
-| `renew_before_days` | `30` | Renew this many days before expiry (must be `< 90`). |
+| `renew_before_days` | `30` | Renew this many days before expiry (a whole number, unquoted, and `< 90`). |
 | `ca_root_path` | unset | PEM root that signs the **ACME directory's own HTTPS certificate**. Only needed for a private CA / Pebble; see below. |
 
 > **Staging is the default — switch to production deliberately.** When
