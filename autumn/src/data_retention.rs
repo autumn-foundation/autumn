@@ -701,12 +701,18 @@ async fn apply_archive_purge(
 ///   `docs/guide/data-retention.md`.
 ///
 /// - **`experiment_assignments`** matches only assignments belonging to an
-///   experiment that has been `concluded` or `archived`, or whose experiment
-///   row is gone. A sticky assignment is what keeps an actor on one variant
-///   while an experiment runs: deleting it re-buckets the actor through the
-///   *current* weights, which silently contaminates a running experiment's
-///   results and can also admit the actor into a sibling experiment in the
-///   same exclusion group.
+///   `archived` experiment, or one whose experiment row is gone. A sticky
+///   assignment is what keeps an actor on one variant while an experiment
+///   runs: deleting it re-buckets the actor through the *current* weights,
+///   which silently contaminates a running experiment's results and can also
+///   admit the actor into a sibling experiment in the same exclusion group.
+///
+///   The boundary is restartability, not "finished". `ExperimentService::start`
+///   restores a `draft` or `concluded` experiment to `running` and refuses only
+///   `archived`, so `concluded` assignments are still live data — a sweep
+///   followed by a restart re-buckets every returning actor. A deleted
+///   experiment row is safe for the same reason in reverse: nothing can restart
+///   it, so nothing can read those assignments again.
 #[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
 #[must_use]
 const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str, &'static str)> {
@@ -728,7 +734,19 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
         RetentionDataset::JobTracking => Some(("autumn_job_tracking", "updated_at < $1")),
         RetentionDataset::ExperimentAssignments => Some((
             "autumn_experiment_assignments",
-            "assigned_at < $1 AND NOT EXISTS (                  SELECT 1 FROM autumn_experiments e                  WHERE e.name = autumn_experiment_assignments.experiment                    AND e.state IN ('draft', 'running')              )",
+            // Only `archived` is terminal. `ExperimentService::start` restores
+            // a `draft` OR `concluded` experiment to `running` and refuses only
+            // `archived` — so a concluded experiment's sticky assignments are
+            // still live data (#1605 review round 13). Sweeping them and then
+            // restarting re-buckets every returning actor through the current
+            // weights, which is the precise corruption this predicate was
+            // written to avoid; the original set just drew the line at the
+            // wrong state.
+            //
+            // Assignments whose experiment row is gone entirely are still
+            // swept: a deleted experiment cannot be restarted, so nothing can
+            // re-read them.
+            "assigned_at < $1 AND NOT EXISTS (                  SELECT 1 FROM autumn_experiments e                  WHERE e.name = autumn_experiment_assignments.experiment                    AND e.state IN ('draft', 'running', 'concluded')              )",
         )),
         RetentionDataset::Idempotency
         | RetentionDataset::WebhookReplay
@@ -1250,6 +1268,43 @@ mod tests {
              grow forever despite a configured window: {predicate}"
         );
         assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
+    }
+
+    #[test]
+    fn experiment_assignments_protect_every_restartable_state() {
+        let (table, predicate) = stale_row_predicate(RetentionDataset::ExperimentAssignments)
+            .expect("experiment_assignments is sweepable");
+        assert_eq!(table, "autumn_experiment_assignments");
+        assert_eq!(
+            states_in(predicate),
+            vec!["concluded", "draft", "running"],
+            "an assignment may only be swept once its experiment can never run \
+             again. `ExperimentService::start` restores draft OR concluded to \
+             running and refuses only archived, so all three belong in the \
+             protected set — dropping `concluded` (as this predicate originally \
+             did) lets a restart re-bucket every returning actor: {predicate}"
+        );
+        assert!(
+            !states_in(predicate).contains(&"archived".to_owned()),
+            "archived is the one terminal state and must stay collectable: {predicate}"
+        );
+    }
+
+    /// The sorted set of `'quoted'` state literals named by a predicate's
+    /// `e.state IN (...)` clause.
+    fn states_in(predicate: &str) -> Vec<String> {
+        let needle = "e.state IN (";
+        let start = predicate
+            .find(needle)
+            .map(|at| at + needle.len())
+            .expect("predicate names a state set");
+        let end = start + predicate[start..].find(')').expect("closing paren");
+        let mut states: Vec<String> = predicate[start..end]
+            .split(',')
+            .map(|state| state.trim().trim_matches('\'').to_owned())
+            .collect();
+        states.sort();
+        states
     }
 
     /// The sorted set of `'quoted'` status literals named by a predicate's

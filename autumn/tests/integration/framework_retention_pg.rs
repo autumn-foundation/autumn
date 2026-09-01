@@ -774,17 +774,30 @@ async fn a_sweep_never_deletes_a_live_ttl_uniqueness_token() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn a_sweep_keeps_assignments_for_a_running_experiment() {
+async fn a_sweep_keeps_assignments_for_any_restartable_experiment() {
     // A sticky assignment is what keeps an actor on one variant while an
     // experiment runs. Deleting it re-buckets that actor through the current
     // weights, contaminating the results, and can admit them into a sibling
     // experiment in the same exclusion group.
+    //
+    // The line is restartability, not "finished" (#1605 review round 13).
+    // `ExperimentService::start` restores a `draft` OR `concluded` experiment
+    // to `running` and refuses only `archived`, so a concluded experiment's
+    // assignments are still live data — sweeping them and then restarting
+    // re-buckets every returning actor.
     let (pool, _url, _container) = start_pg().await;
     insert_experiment(&pool, "live", "running").await;
+    insert_experiment(&pool, "planned", "draft").await;
     insert_experiment(&pool, "finished", "concluded").await;
+    insert_experiment(&pool, "shelved", "archived").await;
     insert_assignment_for(&pool, "live", "actor-live", 400).await;
+    insert_assignment_for(&pool, "planned", "actor-planned", 400).await;
     insert_assignment_for(&pool, "finished", "actor-finished", 400).await;
-    // No `autumn_experiments` row at all — the experiment is gone.
+    // Archived is the one terminal state: `start` refuses it, so nothing can
+    // ever re-read these assignments.
+    insert_assignment_for(&pool, "shelved", "actor-shelved", 400).await;
+    // No `autumn_experiments` row at all — the experiment is gone, so it
+    // cannot be restarted either.
     insert_assignment_for(&pool, "orphan", "actor-orphan", 400).await;
 
     let state = state_with(&pool, config_with_windows());
@@ -805,8 +818,13 @@ async fn a_sweep_keeps_assignments_for_a_running_experiment() {
             "SELECT actor AS value FROM autumn_experiment_assignments ORDER BY actor"
         )
         .await,
-        vec!["actor-live".to_owned()],
-        "only a running experiment's assignments survive"
+        vec![
+            "actor-finished".to_owned(),
+            "actor-live".to_owned(),
+            "actor-planned".to_owned(),
+        ],
+        "every restartable experiment keeps its assignments; only the archived \
+         experiment's and the orphan's are swept"
     );
 }
 

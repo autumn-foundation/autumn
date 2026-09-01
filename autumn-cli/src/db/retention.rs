@@ -307,6 +307,16 @@ fn format_window(secs: Option<u64>) -> String {
 /// countable, or what went wrong.
 fn format_rows(report: &RetentionDatasetReport, mode: RetentionMode) -> String {
     if let Some(error) = report.error.as_deref() {
+        // A failure AFTER some batches committed is the case that matters here
+        // (#1605 review round 13). The engine deliberately threads the running
+        // count into its error paths so a partial purge is not reported as
+        // zero — and this formatter, the default human-readable output, was
+        // dropping exactly that. An operator would read "error: ..." and have
+        // no way to know rows were already gone, which is the one fact they
+        // need before retrying or restoring.
+        if report.rows_removed > 0 {
+            return format!("removed {}, then error: {error}", report.rows_removed);
+        }
         return format!("error: {error}");
     }
     if mode == RetentionMode::Purge && !report.dry_run {
@@ -649,6 +659,45 @@ mod tests {
         let table = format_report(&[failed], RetentionMode::Report);
 
         assert!(table.contains("error: connection refused"), "{table}");
+    }
+
+    #[test]
+    fn a_partial_purge_reports_what_it_removed_before_it_failed() {
+        // #1605 review round 13. The engine threads the running count into its
+        // error paths so a partial purge is not reported as zero; this
+        // formatter is the default human-readable output and was discarding it,
+        // leaving an operator unable to tell that data was already deleted.
+        let mut partial = report("job_history");
+        partial.error = Some("statement timeout".to_owned());
+        partial.rows_removed = 4_812;
+        partial.dry_run = false;
+
+        let table = format_report(&[partial], RetentionMode::Purge);
+
+        assert!(
+            table.contains("4812"),
+            "the rows already deleted must survive into the failure line: {table}"
+        );
+        assert!(
+            table.contains("statement timeout"),
+            "the failure itself must still be reported: {table}"
+        );
+    }
+
+    #[test]
+    fn an_error_with_nothing_removed_stays_a_plain_error() {
+        let mut failed = report("job_history");
+        failed.error = Some("connection refused".to_owned());
+        failed.rows_removed = 0;
+        failed.dry_run = false;
+
+        let table = format_report(&[failed], RetentionMode::Purge);
+
+        assert!(table.contains("error: connection refused"), "{table}");
+        assert!(
+            !table.contains("removed 0"),
+            "a purge that deleted nothing must not imply it removed rows: {table}"
+        );
     }
 
     #[test]

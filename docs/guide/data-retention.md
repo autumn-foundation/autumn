@@ -138,12 +138,19 @@ one guards an invariant another subsystem depends on:
   triage window, or leave it unset.
 
 - **`experiment_assignments`** matches only assignments belonging to an
-  experiment that has been **concluded or archived**, or whose experiment row
-  is gone. A sticky assignment is what keeps an actor on one variant while an
-  experiment runs: deleting it re-buckets that actor through the *current*
-  weights, which contaminates a running experiment's results and can also
-  admit them into a sibling experiment in the same exclusion group. So a
-  window here trims finished experiments and never disturbs a live one.
+  **archived** experiment, or one whose experiment row is gone. A sticky
+  assignment is what keeps an actor on one variant while an experiment runs:
+  deleting it re-buckets that actor through the *current* weights, which
+  contaminates a running experiment's results and can also admit them into a
+  sibling experiment in the same exclusion group.
+
+  The line is **restartability**, not whether an experiment has finished.
+  `ExperimentService::start` restores a `draft` *or* `concluded` experiment to
+  `running` and refuses only `archived` — so a concluded experiment's
+  assignments are still live data, and sweeping them before a restart would
+  re-bucket every returning actor. If you want a concluded experiment's
+  assignments collected, archive it: that is the state the API treats as
+  terminal, and it is the state this sweep treats as collectable.
 
 - **`job_tracking`** and **`commit_hooks`** have no such entanglement:
   tracking records are already invisible to reads past their expiry, and a
