@@ -253,6 +253,32 @@ pub(super) fn guest_text(text: &str) -> String {
     out
 }
 
+/// What one recorded denial can hold, at its worst.
+///
+/// [`guest_text`] bounds a detail at `DETAIL_EXCERPT` *characters*, and
+/// escaping is where characters become bytes: `escape_debug` writes an
+/// unprintable scalar as `\u{10ffff}`, ten bytes for one character. So the byte
+/// bound is ten times the character bound, with room beside it for the
+/// truncation marker and the operation and capability names.
+const DENIAL_RECORD_BYTES: usize = DETAIL_EXCERPT * 10 + 256;
+
+/// Host buffers a request holds no matter what its manifest declares.
+///
+/// [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::manifest::ResourceLimits::request_footprint_bytes)
+/// scales every other term with a ceiling the manifest names. These do not
+/// scale with anything, which is why they were missed: the stderr budget the
+/// state holds for the whole request, the scratch buffer an `fd_write` or
+/// `fd_read` allocates while that budget is still resident, and the denial
+/// ledger beside them. Fixed per request is still per request, and multiplied
+/// by a concurrency near the product ceiling it is tens of megabytes the
+/// advertised bound did not know about.
+pub const FIXED_HOST_BUFFER_BYTES: usize = STDERR_BUDGET_BYTES
+    .saturating_add(HOST_IO_CHUNK_BYTES)
+    .saturating_add(MAX_DENIALS.saturating_mul(DENIAL_RECORD_BYTES))
+    // Slack for the bookkeeping around them — the frame's own scalars, the
+    // outcome struct, the excerpt built from the stderr budget when it is read.
+    .saturating_add(4096);
+
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
 /// The ceiling is enforced here, not only in the Axum adapter. The adapter
@@ -4873,7 +4899,7 @@ path = "/hello/greet"
         let fixed = u128::from(MAX_TABLE_ELEMENTS) * 16
             + MAX_GLOBALS as u128 * 16
             + MAX_FUNCTIONS as u128 * 32
-            + 4096;
+            + FIXED_HOST_BUFFER_BYTES as u128;
         let charged_for_metadata = bare.request_footprint_bytes().saturating_sub(fixed);
         assert_eq!(
             charged_for_metadata,

@@ -287,7 +287,14 @@ impl ResourceLimits {
             // as globals: per-instance storage the product would not otherwise
             // know about.
             .saturating_add(crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32)
-            .saturating_add(4096)
+            // The host buffers that do not scale with any ceiling this manifest
+            // names, and were therefore left to a flat 4 KiB of slack that did
+            // not cover them: the 64 KiB stderr budget held for the whole
+            // request, the 64 KiB scratch an `fd_write` allocates while that
+            // budget is still resident, and the bounded denial ledger. Fixed
+            // per request is still per request — at a concurrency near this
+            // product's own ceiling they are tens of megabytes.
+            .saturating_add(crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128)
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
@@ -1283,6 +1290,55 @@ max_concurrency = 8
     }
 
     #[test]
+    fn the_footprint_counts_the_host_buffers_that_scale_with_nothing() {
+        // Every other term scales with a ceiling the manifest names, so a
+        // reviewer reading the manifest can see it. These do not scale with
+        // anything, which is how they went missing: the stderr budget the state
+        // holds for the whole request, and the scratch buffer an `fd_write`
+        // allocates while that budget is still resident. A flat 4 KiB of slack
+        // stood in for them and was two orders of magnitude short.
+        //
+        // Fixed per request is still per request. At a concurrency near this
+        // product's own 1 GiB ceiling the difference is tens of megabytes of
+        // host memory the advertised bound did not account for.
+        use crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES;
+
+        // A manifest that declares nothing: every scaling term is zero, so what
+        // is left is exactly the fixed cost and nothing can hide inside it.
+        let bare = ResourceLimits {
+            memory_bytes: 0,
+            max_request_body_bytes: 0,
+            max_response_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        let scaling = u128::from(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS) * 16
+            + crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8
+            + crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16
+            + crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32;
+        assert_eq!(
+            bare.request_footprint_bytes() - scaling,
+            FIXED_HOST_BUFFER_BYTES as u128,
+        );
+
+        // And the constant is really the buffers, not a number that drifted
+        // away from them: it covers the stderr budget and one I/O chunk with
+        // the denial ledger still to fit, and it is not back to the order of
+        // the flat slack it replaced. Both are known at compile time, so they
+        // are checked there — a term that stopped covering the buffers should
+        // not build, rather than fail a test somebody has to run.
+        const {
+            assert!(
+                FIXED_HOST_BUFFER_BYTES >= 64 * 1024 + 64 * 1024,
+                "the fixed term no longer covers the stderr budget and one I/O chunk",
+            );
+            assert!(
+                FIXED_HOST_BUFFER_BYTES > 4096 * 16,
+                "the fixed term is back to standing in for the buffers rather than counting them",
+            );
+        }
+    }
+
+    #[test]
     fn the_footprint_counts_every_buffer_a_request_holds_at_once() {
         // The request body is buffered, cloned into the frame, and
         // base64-expanded into the NDJSON line that becomes the guest's stdin —
@@ -1298,9 +1354,10 @@ max_concurrency = 8
         let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8;
         let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         let functions = crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32;
+        let fixed = crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + globals + functions + 4096
+            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + globals + functions + fixed
         );
     }
 
@@ -1321,9 +1378,10 @@ max_concurrency = 8
         let metadata = crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8;
         let globals = crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16;
         let functions = crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32;
+        let fixed = crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128;
         assert_eq!(
             limits.request_footprint_bytes(),
-            5 * 1_000_000 + tables + metadata + globals + functions + 4096,
+            5 * 1_000_000 + tables + metadata + globals + functions + fixed,
             "the response term must cover the line, the base64 copy and the decode at once"
         );
     }

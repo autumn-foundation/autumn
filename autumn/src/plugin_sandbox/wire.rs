@@ -142,10 +142,34 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
 ///
 /// A bare prefix match would also accept `/hellofoo` for prefix `/hello`, so
 /// the character after the prefix has to be a separator or nothing at all.
+///
+/// Two of the refusals below exist because the client normalises the target
+/// before following it, and a check that reads the bytes as sent is answering a
+/// different question than the one that matters: percent-encoded double-dot
+/// segments (`%2e%2e`) and ASCII tabs or newlines, which the client removes
+/// outright.
 fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
     // A backslash is a path separator to some clients but not to this check,
     // so a target carrying one is refused rather than guessed at.
     if target.contains('\\') {
+        return false;
+    }
+    // A client *deletes* every ASCII tab and newline from a URL before it
+    // parses it — the URL Standard says so in as many words ("Remove all ASCII
+    // tab or newline from input") — so a target carrying one does not say here
+    // what it will say there. `/hello/<TAB>../admin` walks below as the
+    // ordinary segment `<TAB>..`, which climbs nothing; the client removes the
+    // tab, resolves `/hello/../admin`, and arrives at `/admin`. HTTP permits a
+    // tab in a field value, so the header validator does not stop it either,
+    // and a 307/308 then carries the client's credentials to a path this
+    // plugin was never mounted on.
+    //
+    // Refused rather than stripped and re-checked: two normalisations that have
+    // to agree is the shape of the next bypass, and no legitimate redirect
+    // needs a control character. The whole C0 range goes, not just the three
+    // that are deleted — the parser also trims leading and trailing controls,
+    // so none of them mean here what they mean at the client.
+    if target.chars().any(|ch| ch.is_ascii_control()) {
         return false;
     }
     let Some(rest) = target.strip_prefix(prefix) else {
@@ -653,6 +677,53 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
 mod tests {
 
     #[test]
+    fn a_redirect_cannot_hide_its_climb_behind_characters_the_client_deletes() {
+        // The cases above are refused because of what they say. This one is
+        // refused because of what it will say *later*: the URL Standard has the
+        // client remove every ASCII tab and newline from the input before
+        // parsing it, so the target the guest sends and the target the client
+        // resolves are not the same string.
+        //
+        // `<TAB>..` walks as an ordinary segment name — it climbs nothing, and
+        // a check reading the bytes as sent has no reason to object. Delete the
+        // tab, as every browser does, and it is `..`. HTTP allows a tab in a
+        // field value, so nothing upstream objects either, and a 307/308
+        // preserves the method, body and cookies on the way to `/admin`.
+        //
+        // Asserted as an equivalence rather than a bare refusal, so the test
+        // says why: the smuggled form and the plain form are the same redirect.
+        let plain = "/hello/../admin";
+        for smuggled in [
+            "/hello/\t../admin",
+            "/hello/\n../admin",
+            "/hello/\r../admin",
+            "/hello/.\t./admin",
+            "/hello\t/../admin",
+        ] {
+            let as_the_client_sees_it: String = smuggled
+                .chars()
+                .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
+                .collect();
+            assert_eq!(
+                as_the_client_sees_it, plain,
+                "the fixture must be the same redirect once the client strips it",
+            );
+            assert!(
+                !redirect_target_allowed(smuggled, "/hello"),
+                "{smuggled:?} was accepted, and resolves to {plain} at the client",
+            );
+        }
+
+        // The plain form was already refused; this is the floor the above is
+        // measured against, so a change that stopped refusing it cannot make
+        // the assertions above pass vacuously.
+        assert!(!redirect_target_allowed(plain, "/hello"));
+
+        // And a target with no control characters is unaffected.
+        assert!(redirect_target_allowed("/hello/greet?page=2", "/hello"));
+    }
+
+    #[test]
     fn a_redirect_may_not_leave_the_plugin_s_own_prefix() {
         // `Location` is the one allowed header that makes the *client* act, and
         // it acts with the user's credentials. A 307/308 preserves the method,
@@ -669,6 +740,10 @@ mod tests {
             "/hello/%2e./admin",          // and the other half
             "/helloworld",                // prefix match that is not a segment
             "/hello\\..\\admin",          // backslash as a separator
+            "/hello/\t../admin",          // the climb, hidden behind a tab
+            "/hello/\n../admin",          // and a line feed
+            "/hello/\r../admin",          // and a carriage return
+            "/hello/.\t./admin",          // the tab inside the segment itself
         ] {
             let response = SandboxResponse {
                 status: 307,
