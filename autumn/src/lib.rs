@@ -498,6 +498,10 @@ pub use seo::SeoRouteDefaults;
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
+/// URLs — see [`redis_tls::open_client`] (issue #2172).
+#[cfg(feature = "redis")]
+pub mod redis_tls;
 /// Pluggable error reporting: catch handler panics and route panics + 5xx
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///

@@ -14,10 +14,6 @@ categories = ["web-programming", "web-programming::http-server"]
 [dependencies]
 autumn-web = { version = "0.7.0", path = "../autumn", features = ["redis"] }
 redis = { workspace = true }
-# Installs the process-wide rustls `CryptoProvider` `redis`'s `tokio-rustls-comp`
-# needs for `rediss://` URLs — see the comment in `RedisCache::connect`. Pinned
-# to the same version/feature set `autumn`'s own rustls call sites use.
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

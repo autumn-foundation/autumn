@@ -513,6 +513,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any bind equal to it, which drops that column from replay's comparison. The
   spelling that actually arrived is still recorded however short, exactly as
   before.
+- **`rediss://` no longer panics at startup, in any Redis-backed subsystem
+  (#2172):** `redis`'s `tokio-rustls-comp` builds its TLS `ClientConfig`
+  through `rustls::ClientConfig::builder()`, which *panics* rather than
+  erroring when no process-level `CryptoProvider` is installed — and rustls
+  can only resolve one implicitly while exactly one of its `ring`/`aws-lc-rs`
+  features is on, which Cargo's whole-graph feature unification can break from
+  any dependency (`telemetry-otlp` alone is enough). Only `autumn-cache-redis`
+  guarded against this; sessions, channels, the Redis job queue, job tracking,
+  idempotency, webhook replay and Redis rate limiting each opened their own
+  unguarded client. Since the `azure-container-apps` release target provisions
+  a Redis Cache with `non_ssl_port_enabled = false` — it can only ever hand the
+  app a `rediss://` URL — pointing any of those subsystems at it crashed the
+  app on boot.
+
+  Every Redis client the framework opens now goes through
+  `autumn_web::redis_tls::open_client`, which installs `ring` once,
+  idempotently, and only when the URL is a TLS one — decided by asking the
+  `redis` crate to parse it and checking whether it resolved to a TLS address,
+  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
+  accepts are all covered without a scheme list to keep in sync. (The previous
+  `starts_with("rediss://")` check had already missed both.) A plaintext
+  `redis://` URL deliberately does **not** claim the process-wide default, so
+  it cannot pre-empt an application that installs `aws-lc-rs` for something
+  else, and an already-installed provider is always kept rather than replaced.
+  `autumn-cache-redis` now delegates to the same guard instead of carrying its
+  own copy, and a source scan in each crate keeps a future subsystem from
+  re-opening the hole with a bare `redis::Client::open`.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
@@ -1389,6 +1416,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count proves it), so it's unused slack, not extra allocator work — see
   `form_render_alloc_gate.rs` for the full explanation and its updated
   ceiling.
+
+- **`[compression]`-enabled apps no longer pay an extra ingress box level for
+  it (#2371):** every other config-gated member of `apply_middleware`'s
+  single merged `Router::layer` tuple composes in via a plain
+  `tower::util::option_layer`, but `CompressionLayer` changes the response
+  body type, which `option_layer`'s `Either` cannot absorb (both of its
+  branches must share one `Response` type) — so `apply_compression_middleware`
+  kept its own standalone `Router::layer` call, the one member of the ingress
+  stack #2198 didn't fold in. That call boxes the whole downstream stack in a
+  fresh `BoxCloneSyncService` that every request above it deep-clones, the
+  same quadratic-per-layer cost #2193/#2198 fixed for the rest of the stack.
+  Compression now folds into the merged tuple too, paired with
+  `NormalizeBodyLayer` — the same body-type-adapter the tuple already uses
+  elsewhere — so `option_layer`'s two branches agree on a `Response` type
+  again. Compression is off by default, so this is a pure win for the apps
+  that turn it on and a no-op otherwise, confirmed by
+  `middleware_stack_depth.rs`'s `compression_enabled_does_not_deepen_the_framework_cascade`
+  (traversal count no longer moves when `[compression] enabled = true` is
+  toggled) alongside the unmoved default-feature `INGRESS_TRAVERSAL_WINDOW`
+  gate. `AssetCacheControlLayer`, the event-bus/oauth tuple, and the
+  outermost `SecurityHeadersLayer` remain separate `Router::layer` calls —
+  each has a genuine ordering/scope constraint (route-mount timing,
+  dev-profile-only middleware injected between it and the rest of the stack,
+  and MCP-dispatch-clone timing respectively) that folding would change the
+  behavior of, not just its cost.
+- **scaffolded form helpers build their `-field`/`-error` id suffix by direct
+  string concatenation instead of `format!`:** `text_input`, `password_input`,
+  `textarea_input`, `number_input`, `checkbox_input`, `date_input` each built
+  `let wrapper_id = format!("{field_html}-field");` and (when the field has an
+  error) `format!("{field_html}-error")` — a fixed two-part concatenation of
+  already-`&str` pieces, but routed through `format!`'s `Arguments`/
+  `fmt::Write` dispatch and an unsized `String::new()` that grows via
+  reallocation as the pieces land, rather than a single up-front
+  `String::with_capacity`. Profiling the committed
+  `autumn/benches/form_render.rs` workload showed `alloc::fmt::format::format_inner`
+  and `core::fmt::write` alone at 2.46%/2.00% of the release-build
+  instruction count, plus a further ~4% in the `String`-growth machinery
+  (`RawVecInner::finish_grow`/`reserve::do_reserve_and_handle`) those two
+  calls' unsized starting buffer drove. A new private `concat_suffix(base,
+  suffix)` helper (`String::with_capacity(base.len() + suffix.len())` plus
+  two `push_str` calls) replaces all 12 call sites (2 per helper × 6
+  helpers); output is byte-for-byte unchanged (verified by the unchanged 209
+  `form`/`nested_form` lib tests).
+
+  Measured with the committed `autumn/benches/form_render.rs` harness and the
+  existing `autumn/tests/form_render_alloc_gate.rs` allocation gate (both the
+  same 12-field workload), `valgrind --tool=callgrind`, before and after on
+  the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 159,827,570 | 138,424,533 | **-13.39%** |
+  | `alloc::fmt::format::format_inner` instructions | 3,928,400 (2.46%) | 0 (eliminated) | **-100%** |
+  | `core::fmt::write` instructions | 3,202,591 (2.00%) | 0 (eliminated) | **-100%** |
+  | Allocation blocks (200 renders) | 20,800 | 18,000 | **-13.5%** |
+  | Allocation bytes (200 renders) | 4,604,600 | 4,565,600 | -0.85% |
+
+  Clears the impact floor two ways independently: >=5% instruction reduction
+  on the realistic, directly-exercised bench workload, and >=10% allocation-
+  block reduction per the gate. The block-count drop is larger than the
+  12-call-site count alone would suggest — `format!`'s unsized starting
+  buffer apparently cost more than one allocation for some of these calls
+  once it had to grow, not just the final `String`.
 
 ## [0.7.0] - 2026-08-23
 
