@@ -78,7 +78,10 @@ pub struct ManifestEntry {
 ```
 
 - `render_static_routes` reads `response.headers()[CONTENT_TYPE]`, keeps it when
-  it is valid visible ASCII and non-empty, and stores it on the entry.
+  it is non-empty after trimming and every byte is visible ASCII or a horizontal
+  tab (legal OWS around media-type parameters), and stores it on the entry. The
+  screen is shared verbatim with the serve path, so the manifest can never hold
+  a value that would be discarded at request time.
 - `StaticFileLayer::resolve_entry` returns `ResolvedStatic { file_path,
   content_type }`; `resolve` stays as the file-path-only shorthand.
 - `static_gen::resolved_content_type(recorded, route, file) -> HeaderValue`
