@@ -1163,7 +1163,7 @@ telemetry-otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
-redis = ["dep:redis"]
+redis = ["dep:redis", "dep:rustls"]
 i18n = []
 storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
@@ -1203,7 +1203,7 @@ tracing-opentelemetry = "0.32.1"
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
-redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
+redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.20", features = ["derive"] }

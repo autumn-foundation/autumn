@@ -1257,23 +1257,53 @@ mod tests {
     /// Examples get copied, so the wrong pattern must not survive here.
     #[test]
     fn redis_clients_are_opened_through_the_shared_tls_guard() {
-        // Split so the needle does not match this test's own source line.
-        let needle = concat!("redis::Client::", "open(");
-        let offenders: Vec<_> = include_str!("live_events.rs")
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
+        // Split so the needles do not match this declaration. Deliberately
+        // unqualified: `redis` is a direct dependency of this example, so
+        // `use redis::Client;` + `Client::open(..)` is a one-line edit away
+        // and a `redis::`-qualified needle would not see it.
+        let needles = [concat!("Client::", "open("), concat!("build_with", "_tls(")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        assert!(!files.is_empty(), "no sources under {}", src.display());
+        files.sort();
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            for (index, line) in source.lines().enumerate() {
                 let trimmed = line.trim_start();
-                !trimmed.starts_with("//") && line.contains(needle)
-            })
-            .map(|(index, line)| format!("live_events.rs:{}: {}", index + 1, line.trim()))
-            .collect();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&src).unwrap_or(&file).display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
         assert!(
             offenders.is_empty(),
             "use `autumn_web::redis_tls::open_client` so a `rediss://` URL \
              cannot panic inside rustls (#2172):\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     use std::collections::VecDeque;

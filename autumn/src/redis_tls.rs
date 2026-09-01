@@ -27,11 +27,15 @@
 ///
 /// Answered by asking the `redis` crate to parse the URL and reporting
 /// whether it resolved to a TLS address, rather than by matching schemes
-/// here. That distinction matters: the first cut of this check lived in
-/// `autumn-cache-redis` as `starts_with("rediss://")`, which silently missed
-/// Valkey's `valkeys://` and any case variant the URL parser accepts. Reusing
-/// `redis`'s own scheme table means a scheme it learns to treat as TLS is
-/// covered the day the dependency is bumped, with nothing to keep in sync.
+/// here. The check this replaces (in `autumn-cache-redis`) matched
+/// `rediss`/`valkeys` case-insensitively by hand — correct for the schemes
+/// `redis` treats as TLS *today*, but a second copy of a table owned by a
+/// dependency, which only stays correct for as long as someone remembers to
+/// re-check it on every bump. Reusing `redis`'s own parser means there is
+/// nothing to keep in sync, and it settles the surrounding cases for free: a
+/// prefix lookalike (`redisstore://`), a `unix://` socket, and input `redis`
+/// cannot parse at all are each classified the same way the connector will
+/// classify them, because it is the same code.
 ///
 /// A plain `redis://`/`valkey://` URL never touches TLS, so it must **not**
 /// claim the process-wide default: doing so could pre-empt a later, unrelated
@@ -66,12 +70,63 @@ pub fn ensure_tls_crypto_provider(url: &str) {
     }
 }
 
+/// A copy of `url` with any password in its userinfo replaced by `***`,
+/// for logging.
+///
+/// A managed Redis hands out its credential *inside* the URL — the
+/// `azure-container-apps` target's generated
+/// `rediss://:<access-key>@<name>.redis.cache.windows.net:6380` is the shape
+/// this framework's own docs tell operators to configure — so a diagnostic
+/// that echoes the configured URL verbatim writes that key into whatever log
+/// sink the app ships to. Anything that logs a Redis URL must log this
+/// instead.
+///
+/// Deliberately textual rather than a re-parse: this also runs on the failure
+/// path for URLs `redis` has just refused to parse, and a redaction that
+/// returns nothing for malformed input is worse than one that leaves a
+/// malformed string alone.
+///
+/// It over-redacts rather than under-redacts, which is the whole point on that
+/// failure path. An Azure access key is 44 characters of base64 whose alphabet
+/// includes `/`; pasted into a URL without percent-encoding, that `/` ends the
+/// authority early, which is *why* the URL failed to parse — and an
+/// authority-scoped search for the userinfo would then find no `@`, and hand
+/// the untouched key straight to the log. So when the authority holds no `@`,
+/// the search widens to the whole remainder: mistaking a path segment for a
+/// credential costs an ugly log line, missing a credential costs the
+/// credential.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    // Userinfo is everything before the LAST `@` in the authority, since a
+    // password may itself contain one. The authority runs to the first `/`,
+    // `?` or `#` — but for a URL that failed to parse, that terminator may
+    // itself be an un-encoded character *inside* the password, so fall back to
+    // the last `@` anywhere in the remainder rather than concluding there is
+    // no credential to hide.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@').or_else(|| rest.rfind('@')) else {
+        return url.to_owned();
+    };
+    // `rest_from_at` keeps the `@` and everything after it (host, port, path).
+    let (userinfo, rest_from_at) = rest.split_at(at);
+    let userinfo = match userinfo.split_once(':') {
+        Some((user, _)) => format!("{user}:***"),
+        // A bare username carries no secret; inventing a `:***` would imply
+        // a password that is not there.
+        None => userinfo.to_owned(),
+    };
+    format!("{scheme}://{userinfo}{rest_from_at}")
+}
+
 /// Open a Redis client, installing the rustls `CryptoProvider` first when
 /// `url` is a TLS (`rediss://` / `valkeys://`) endpoint.
 ///
-/// The only sanctioned way to build a [`redis::Client`] in this crate — a
-/// unit test scans `src/` to keep it that way. See the module docs for why a
-/// bare `redis::Client::open` is a latent startup panic (#2172).
+/// The only sanctioned way to build a [`redis::Client`] in this crate's
+/// `src/`, which a unit test scans to keep it that way. See the module docs
+/// for why a bare `redis::Client::open` is a latent startup panic (#2172).
 ///
 /// # Errors
 ///
@@ -86,7 +141,9 @@ pub fn open_client(url: &str) -> redis::RedisResult<redis::Client> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{open_client, url_needs_tls_crypto_provider};
+    use super::{
+        ensure_tls_crypto_provider, open_client, redact_url, url_needs_tls_crypto_provider,
+    };
 
     use rusty_fork::rusty_fork_test;
 
@@ -152,6 +209,95 @@ mod tests {
         assert!(open_client("not a redis url").is_err());
     }
 
+    #[test]
+    fn redact_url_hides_the_password_but_keeps_the_endpoint_readable() {
+        // The shape `autumn release init --target azure-container-apps`
+        // generates: no username, the access key as the password.
+        assert_eq!(
+            redact_url("rediss://:s3cr3t-key@cache.redis.cache.windows.net:6380"),
+            "rediss://:***@cache.redis.cache.windows.net:6380"
+        );
+        assert_eq!(
+            redact_url("redis://user:s3cr3t@host:6379/0"),
+            "redis://user:***@host:6379/0"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_urls_without_a_password_alone() {
+        assert_eq!(
+            redact_url("redis://127.0.0.1:6379/"),
+            "redis://127.0.0.1:6379/"
+        );
+        // A bare username is not a secret.
+        assert_eq!(
+            redact_url("redis://user@host:6379"),
+            "redis://user@host:6379"
+        );
+        assert_eq!(
+            redact_url("unix:///run/redis.sock"),
+            "unix:///run/redis.sock"
+        );
+        assert_eq!(redact_url("garbage"), "garbage");
+        assert_eq!(redact_url(""), "");
+    }
+
+    #[test]
+    fn redact_url_is_not_fooled_by_an_at_sign_in_the_password() {
+        // The LAST `@` in the authority separates userinfo from host, so a
+        // password containing one still redacts whole.
+        assert_eq!(
+            redact_url("rediss://user:p@ss@host:6380/0"),
+            "rediss://user:***@host:6380/0"
+        );
+    }
+
+    #[test]
+    fn redact_url_hides_a_key_whose_own_slash_broke_the_url() {
+        // The regression this helper exists for. An Azure access key is
+        // base64, whose alphabet includes `/`. Pasted un-encoded, that `/`
+        // terminates the authority early — which is exactly why `redis`
+        // rejects the URL and why the log line that leaks it gets reached.
+        // An authority-scoped search would find no `@` here and hand the key
+        // to the log verbatim; widening to the last `@` in the remainder
+        // hides it.
+        let leaked = "rediss://:8kQz+Ab/CdEfGh=@my-cache.redis.cache.windows.net:6380";
+        let redacted = redact_url(leaked);
+        assert!(
+            !redacted.contains("8kQz+Ab") && !redacted.contains("CdEfGh"),
+            "the access key survived redaction: {redacted}"
+        );
+        assert!(redacted.contains("my-cache.redis.cache.windows.net"));
+    }
+
+    #[test]
+    fn redact_url_handles_query_and_fragment_authority_terminators() {
+        assert_eq!(
+            redact_url("rediss://user:secret@host:6380/0?foo=bar"),
+            "rediss://user:***@host:6380/0?foo=bar"
+        );
+        assert_eq!(
+            redact_url("rediss://user:secret@host:6380/0#insecure"),
+            "rediss://user:***@host:6380/0#insecure"
+        );
+    }
+
+    #[test]
+    fn redact_url_over_redacts_rather_than_leaking() {
+        // An `@` in the path of a credential-free URL makes the widened
+        // search treat the text before it as userinfo. Over-redaction is the
+        // deliberate trade: an ugly log line beats a leaked key. Nothing is
+        // rewritten when there is no colon to hide a password behind.
+        assert_eq!(redact_url("redis://host/a@b"), "redis://host/a@b");
+        assert_eq!(redact_url("redis://host:6379/db@1"), "redis://host:***@1");
+    }
+
+    /// The `redis::Client` constructors that can reach rustls. `open` is the
+    /// one every subsystem uses; `build_with_tls` is a second, equally
+    /// panic-prone door into `ClientConfig::builder()`. Split so the needles
+    /// do not match this declaration.
+    const NEEDLES: [&str; 2] = [concat!("Client::", "open("), concat!("build_with", "_tls(")];
+
     /// Recursively collect every `.rs` file under `dir`.
     fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read_dir") {
@@ -172,9 +318,13 @@ mod tests {
     /// because the failure mode is a *missing* call: a new Redis-backed
     /// subsystem that opens its own client is exactly the regression #2172
     /// describes, and no runtime test of the subsystems that exist today can
-    /// see it. It also covers the two sites a runtime test cannot reach
-    /// cheaply — `job::start_redis_runtime` (needs a live `AppState`) and
-    /// `session::resolve_backend_plan`'s URL validation.
+    /// see it. It is also the only coverage for the two sites a runtime test
+    /// cannot reach cheaply — `job::start_redis_runtime` (needs a live
+    /// `AppState`) and `webhook::validate_redis_replay_config` (private).
+    ///
+    /// A substring scan cannot see through an alias (`use redis::Client as
+    /// C; C::open(..)`); it catches the shapes anyone actually writes, and
+    /// the forked scenarios below cover the constructors that exist.
     #[test]
     fn no_redis_client_is_opened_outside_the_tls_guard() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -201,7 +351,7 @@ mod tests {
                 if trimmed.starts_with("//") || trimmed.starts_with('*') {
                     continue;
                 }
-                if line.contains("Client::open(") {
+                if NEEDLES.iter().any(|needle| line.contains(needle)) {
                     offenders.push(format!(
                         "{}:{}: {}",
                         file.strip_prefix(&src).unwrap_or(&file).display(),
@@ -214,7 +364,7 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "these sites open a Redis client directly instead of through \
+            "these sites build a Redis client directly instead of through \
              `crate::redis_tls::open_client`, so a `rediss://` URL reaches \
              rustls with no process-level CryptoProvider installed and panics \
              at startup (#2172):\n{}",
@@ -339,6 +489,48 @@ mod tests {
                 let _ = crate::security::rate_limit::RateLimitLayer::from_config(&config);
             });
             assert_provider_installed("the Redis rate-limit backend");
+        }
+
+        /// Config validation touches the `rediss://` URL *before* any store
+        /// is built — `AppBuilder` calls this at startup — so it is the
+        /// earliest place the panic can land, and the one a store-level test
+        /// would never reach.
+        #[test]
+        fn session_config_validation_installs_the_tls_provider() {
+            assert_no_provider_yet();
+            let mut config = crate::session::SessionConfig {
+                backend: crate::session::SessionBackend::Redis,
+                ..Default::default()
+            };
+            config.redis.url = Some(TLS_URL.to_owned());
+            let _ = config.backend_plan(None);
+            assert_provider_installed("session config validation");
+        }
+
+        /// The documented promise that an application's own provider is
+        /// never replaced. Installs a deliberately crippled `ring` (one
+        /// cipher suite), then asserts the guard leaves it alone — a
+        /// refactor to an unconditional install, or to
+        /// `install_default().expect(..)`, fails here.
+        #[test]
+        fn an_application_installed_provider_is_never_replaced() {
+            assert_no_provider_yet();
+            let mut provider = rustls::crypto::ring::default_provider();
+            provider.cipher_suites.truncate(1);
+            provider
+                .install_default()
+                .expect("fresh process: nothing installed yet");
+
+            ensure_tls_crypto_provider(TLS_URL);
+
+            let installed = rustls::crypto::CryptoProvider::get_default()
+                .expect("a provider is installed");
+            assert_eq!(
+                installed.cipher_suites.len(),
+                1,
+                "the guard replaced the application's own CryptoProvider \
+                 instead of keeping it"
+            );
         }
 
         /// The negative half of the guarantee: a plaintext `redis://` URL

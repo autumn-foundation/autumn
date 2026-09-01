@@ -472,6 +472,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report a divergence against unchanged code; and outbound request and response
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
+- **`autumn_web::redis_tls` (new public module):** `open_client` is the
+  Redis client constructor every Autumn subsystem now uses — it installs the
+  rustls `CryptoProvider` a `rediss://` URL needs before rustls can be asked
+  to resolve one. `ensure_tls_crypto_provider` exposes just that step for code
+  that builds a client another way, and `redact_url` masks the password in a
+  Redis URL before it is logged. `redis` is re-exported as
+  `autumn_web::reexports::redis` so callers can name the returned
+  `redis::Client` without adding their own dependency. Issue #2172.
+
 ### Fixed
 
 - **`rediss://` no longer panics at startup, in any Redis-backed subsystem
@@ -492,15 +501,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::redis_tls::open_client`, which installs `ring` once,
   idempotently, and only when the URL is a TLS one — decided by asking the
   `redis` crate to parse it and checking whether it resolved to a TLS address,
-  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
-  accepts are all covered without a scheme list to keep in sync. (The previous
-  `starts_with("rediss://")` check had already missed both.) A plaintext
+  rather than by keeping a second copy of that crate's scheme table. So
+  `rediss://`, Valkey's `valkeys://` and every case variant the URL parser
+  accepts are covered with nothing to re-check on a dependency bump, and
+  prefix lookalikes (`redisstore://`), `unix://` sockets and unparseable input
+  are classified exactly as the connector will classify them. A plaintext
   `redis://` URL deliberately does **not** claim the process-wide default, so
   it cannot pre-empt an application that installs `aws-lc-rs` for something
   else, and an already-installed provider is always kept rather than replaced.
   `autumn-cache-redis` now delegates to the same guard instead of carrying its
-  own copy, and a source scan in each crate keeps a future subsystem from
-  re-opening the hole with a bare `redis::Client::open`.
+  own copy, the `reddit-clone` example is wired through it too (examples get
+  copied), and a source scan in each of the three crates keeps a future
+  subsystem from re-opening the hole with a bare `redis::Client::open`.
+
+  Redis URLs are no longer logged verbatim. A managed Redis carries its access
+  key *inside* the URL, and the rate-limit backend echoed the configured URL
+  into a `WARN` on both of its fallback-to-memory paths — writing that key to
+  whatever log sink the app ships to. `autumn_web::redis_tls::redact_url`
+  masks the password, and deliberately over-redacts rather than under-redacts:
+  an Azure access key is base64, whose alphabet includes `/`, and an
+  un-encoded `/` is exactly what makes such a URL fail to parse and reach that
+  log line in the first place.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
