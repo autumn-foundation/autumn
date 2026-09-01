@@ -31,10 +31,10 @@
 //! handler makes outside the cell's API are out of scope by design. This is a
 //! safe-Rust accounting cell, not a bounding allocator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
@@ -43,6 +43,11 @@ use std::time::{Duration, Instant};
 /// scratch entries against the quota, so a tenant storing many tiny entries
 /// cannot amplify its footprint past the configured cap via map growth.
 const SCRATCH_ENTRY_OVERHEAD: usize = std::mem::size_of::<(String, Vec<u8>)>() + 16;
+
+/// Maximum lifecycle tombstones examined by one mutating registry operation.
+/// This amortizes cleanup so high-cardinality in-flight traffic cannot turn a
+/// cache miss into a scan of every live accounting domain under the write lock.
+const LIFECYCLE_SWEEP_BUDGET: usize = 16;
 
 /// Error returned when a charge would exceed a tenant's soft memory quota.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,7 +485,7 @@ pub struct TenantCellRegistry {
 }
 
 struct RegistryInner {
-    cells: RwLock<HashMap<String, Arc<TenantCell>>>,
+    state: RwLock<RegistryState>,
     global_tracked: Arc<AtomicUsize>,
     /// Maximum number of resident cells; least-recently-used cells are evicted
     /// once the count exceeds this. `0` disables the bound (unlimited).
@@ -496,6 +501,20 @@ struct RegistryInner {
     /// the touched cell's `last_access_seq`, giving LRU eviction a unique,
     /// tie-free ordering so the just-inserted cell is never the victim.
     seq: AtomicU64,
+}
+
+/// Registry residency and tenant accounting lifetimes deliberately have
+/// different boundaries. `resident` is the bounded scratch cache; `lifecycle`
+/// retains a weak tombstone after eviction so a later request cannot create a
+/// second accounting domain while an old request still owns the first one.
+#[derive(Default)]
+struct RegistryState {
+    resident: HashMap<String, Arc<TenantCell>>,
+    lifecycle: HashMap<String, Weak<TenantCellInner>>,
+    /// Non-resident lifecycle records awaiting bounded, round-robin cleanup.
+    lifecycle_candidates: VecDeque<String>,
+    /// Deduplicates `lifecycle_candidates` across repeated evictions.
+    queued_lifecycles: HashSet<String>,
 }
 
 impl fmt::Debug for TenantCellRegistry {
@@ -529,7 +548,7 @@ impl TenantCellRegistry {
     pub fn with_limits(max_cells: usize, idle_ttl: Option<Duration>) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
-                cells: RwLock::new(HashMap::new()),
+                state: RwLock::new(RegistryState::default()),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
@@ -564,7 +583,7 @@ impl TenantCellRegistry {
     pub fn get(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
         let guard = self
             .inner
-            .cells
+            .state
             .read()
             .expect("tenant cell registry lock poisoned");
         // Refresh the access time/sequence WHILE the read guard is still held,
@@ -574,7 +593,7 @@ impl TenantCellRegistry {
         // lock wait can never stamp the cell. `touch` is relaxed atomic
         // `fetch_max` stores through the shared `&Arc<TenantCell>`, safe under
         // the read lock.
-        if let Some(cell) = guard.get(tenant_id) {
+        if let Some(cell) = guard.resident.get(tenant_id) {
             cell.touch(self.now_millis(), self.next_seq());
             return Some(Arc::clone(cell));
         }
@@ -608,10 +627,10 @@ impl TenantCellRegistry {
         {
             let guard = self
                 .inner
-                .cells
+                .state
                 .read()
                 .expect("tenant cell registry lock poisoned");
-            if let Some(cell) = guard.get(tenant_id) {
+            if let Some(cell) = guard.resident.get(tenant_id) {
                 // Capture `now` here, under the guard and immediately before the
                 // touch, so a timestamp taken before a lock wait can never stamp
                 // a fresh access time as stale.
@@ -620,20 +639,39 @@ impl TenantCellRegistry {
                 return Arc::clone(cell);
             }
         }
-        let mut cells = self
+        let mut state = self
             .inner
-            .cells
+            .state
             .write()
             .expect("tenant cell registry lock poisoned");
         // Another writer may have inserted between dropping the read lock and
         // taking the write lock.
-        if let Some(cell) = cells.get(tenant_id) {
+        if let Some(cell) = state.resident.get(tenant_id) {
             let cell = Arc::clone(cell);
             // Fresh `now` under the write guard, right before the touch.
             cell.touch(self.now_millis(), self.next_seq());
             cell.set_quota_bytes(quota_bytes);
             return cell;
         }
+        // An eviction only removes cache residency. If an in-flight request
+        // still owns the former cell, resurrect that exact cell (and therefore
+        // its quota counter and scratch map) rather than minting a second
+        // accounting domain for the tenant.
+        if let Some(inner) = state.lifecycle.get(tenant_id).and_then(Weak::upgrade) {
+            let cell = Arc::new(TenantCell { inner });
+            // Use one clock sample for both the touch and TTL enforcement. A
+            // second sample could cross a millisecond boundary and immediately
+            // evict a freshly resurrected cell when the configured TTL is zero.
+            let now = self.now_millis();
+            cell.touch(now, self.next_seq());
+            cell.set_quota_bytes(quota_bytes);
+            state
+                .resident
+                .insert(tenant_id.to_string(), Arc::clone(&cell));
+            self.enforce_limits_locked(&mut state, now);
+            return cell;
+        }
+        state.lifecycle.remove(tenant_id);
         let cell = Arc::new(TenantCell::new(
             tenant_id.to_string(),
             quota_bytes,
@@ -647,61 +685,118 @@ impl TenantCellRegistry {
         // Stamp the new cell's access sequence BEFORE enforcing limits, so it
         // holds the greatest sequence and is never chosen as the LRU victim.
         cell.touch(now, self.next_seq());
-        cells.insert(tenant_id.to_string(), Arc::clone(&cell));
+        state
+            .lifecycle
+            .insert(tenant_id.to_string(), Arc::downgrade(&cell.inner));
+        state
+            .resident
+            .insert(tenant_id.to_string(), Arc::clone(&cell));
         // Enforce eviction limits while we already hold the write lock. The
         // just-touched new cell has the newest access time and the greatest
         // access sequence, so it is never the idle or LRU victim.
-        self.enforce_limits_locked(&mut cells, now);
-        drop(cells);
+        self.enforce_limits_locked(&mut state, now);
+        drop(state);
         cell
     }
 
-    /// Evict idle and over-capacity cells from an already write-locked map.
+    /// Evict idle and over-capacity cells and sweep expired lifecycle records
+    /// from already write-locked registry state.
     ///
-    /// Must be called while holding the `cells` write lock; it never re-locks,
+    /// Must be called while holding the `state` write lock; it never re-locks,
     /// so it is safe to invoke from inside [`get_or_create`]'s miss branch.
     /// Removal is a plain `HashMap::remove`, which drops only the registry's
     /// strong reference — any outstanding `Arc<TenantCell>` (e.g. one held by an
     /// in-flight request) stays valid and reclaims deterministically on drop.
-    fn enforce_limits_locked(&self, cells: &mut HashMap<String, Arc<TenantCell>>, now: u64) {
+    fn enforce_limits_locked(&self, state: &mut RegistryState, now: u64) {
         if let Some(ttl) = self.inner.idle_ttl {
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-            cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
+            let expired_ids: Vec<_> = state
+                .resident
+                .iter()
+                .filter(|(_, cell)| now.saturating_sub(cell.last_access_millis()) > ttl_millis)
+                .map(|(tenant_id, _)| tenant_id.clone())
+                .collect();
+            for tenant_id in expired_ids {
+                state.resident.remove(&tenant_id);
+                Self::enqueue_lifecycle_candidate_locked(state, tenant_id);
+            }
         }
         let max_cells = self.inner.max_cells;
         if max_cells > 0 {
-            while cells.len() > max_cells {
+            while state.resident.len() > max_cells {
                 // Evict the least-recently-used cell, chosen by the smallest
                 // access *sequence*. The sequence is globally unique and
                 // monotonic, so there are no ties (unlike millisecond
                 // timestamps) and the just-inserted cell — which drew the
                 // greatest sequence above — is never the victim.
-                let Some(victim) = cells
+                let Some(victim) = state
+                    .resident
                     .iter()
                     .min_by_key(|(_, cell)| cell.last_access_seq())
                     .map(|(key, _)| key.clone())
                 else {
                     break;
                 };
-                cells.remove(&victim);
+                state.resident.remove(&victim);
+                Self::enqueue_lifecycle_candidate_locked(state, victim);
+            }
+        }
+        Self::sweep_lifecycle_candidates_locked(state);
+    }
+
+    fn enqueue_lifecycle_candidate_locked(state: &mut RegistryState, tenant_id: String) {
+        if state.queued_lifecycles.insert(tenant_id.clone()) {
+            state.lifecycle_candidates.push_back(tenant_id);
+        }
+    }
+
+    /// Examine a fixed number of non-resident records. Live domains rotate to
+    /// the back; dead domains and records made resident again leave the queue.
+    fn sweep_lifecycle_candidates_locked(state: &mut RegistryState) {
+        for _ in 0..LIFECYCLE_SWEEP_BUDGET {
+            let Some(tenant_id) = state.lifecycle_candidates.pop_front() else {
+                break;
+            };
+            state.queued_lifecycles.remove(&tenant_id);
+            if state.resident.contains_key(&tenant_id) {
+                continue;
+            }
+            let alive = state
+                .lifecycle
+                .get(&tenant_id)
+                .is_some_and(|lifecycle| lifecycle.upgrade().is_some());
+            if alive {
+                Self::enqueue_lifecycle_candidate_locked(state, tenant_id);
+            } else {
+                state.lifecycle.remove(&tenant_id);
             }
         }
     }
 
-    /// Evict `tenant_id`'s cell, removing it from the registry and returning it.
-    /// When the returned handle (and any outstanding request references) drop,
-    /// the cell's owned memory is deterministically reclaimed.
+    /// Evict `tenant_id`'s cell from the resident cache and return it.
+    ///
+    /// Teardown is deferred while this returned handle or an outstanding
+    /// request owns the cell. A weak tenant-keyed tombstone remains during that
+    /// time, and [`get_or_create`](Self::get_or_create) resurrects the same cell
+    /// rather than creating an independent quota or scratch domain.
     ///
     /// # Panics
     ///
     /// Panics if the registry lock is poisoned.
     #[must_use = "the evicted cell is returned so it (and its memory) can be dropped"]
     pub fn evict(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
-        self.inner
-            .cells
+        let mut state = self
+            .inner
+            .state
             .write()
-            .expect("tenant cell registry lock poisoned")
-            .remove(tenant_id)
+            .expect("tenant cell registry lock poisoned");
+        let removed = state.resident.remove(tenant_id);
+        if removed.is_some() {
+            Self::enqueue_lifecycle_candidate_locked(&mut state, tenant_id.to_string());
+        }
+        Self::sweep_lifecycle_candidates_locked(&mut state);
+        drop(state);
+        removed
     }
 
     /// Evict every resident cell whose most recent access is older than `ttl`
@@ -719,17 +814,29 @@ impl TenantCellRegistry {
     #[must_use]
     pub fn evict_idle_older_than(&self, ttl: Duration) -> usize {
         let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-        let mut cells = self
+        let mut state = self
             .inner
-            .cells
+            .state
             .write()
             .expect("tenant cell registry lock poisoned");
         // Read the clock under the write guard, so a `now` captured before a
         // lock wait cannot age out a cell another thread just touched.
         let now = self.now_millis();
-        let before = cells.len();
-        cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
-        before - cells.len()
+        let before = state.resident.len();
+        let expired_ids: Vec<_> = state
+            .resident
+            .iter()
+            .filter(|(_, cell)| now.saturating_sub(cell.last_access_millis()) > ttl_millis)
+            .map(|(tenant_id, _)| tenant_id.clone())
+            .collect();
+        for tenant_id in expired_ids {
+            state.resident.remove(&tenant_id);
+            Self::enqueue_lifecycle_candidate_locked(&mut state, tenant_id);
+        }
+        let removed = before - state.resident.len();
+        Self::sweep_lifecycle_candidates_locked(&mut state);
+        drop(state);
+        removed
     }
 
     /// The configured maximum number of resident cells (`0` = unbounded).
@@ -752,9 +859,29 @@ impl TenantCellRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner
-            .cells
+            .state
             .read()
             .expect("tenant cell registry lock poisoned")
+            .resident
+            .len()
+    }
+
+    /// Number of tenant accounting lifecycle records, including resident cells
+    /// and evicted domains still owned by in-flight work.
+    ///
+    /// Expired weak records are removed incrementally by future mutating registry
+    /// operations, so cleanup work per operation remains bounded under churn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn accounting_domain_count(&self) -> usize {
+        self.inner
+            .state
+            .read()
+            .expect("tenant cell registry lock poisoned")
+            .lifecycle
             .len()
     }
 
@@ -764,7 +891,9 @@ impl TenantCellRegistry {
         self.len() == 0
     }
 
-    /// Total bytes tracked across every resident cell.
+    /// Total bytes tracked across every live accounting domain, whether its
+    /// cell is resident or temporarily held only by in-flight work after
+    /// eviction.
     #[must_use]
     pub fn total_tracked_bytes(&self) -> usize {
         self.inner.global_tracked.load(Ordering::Relaxed)
