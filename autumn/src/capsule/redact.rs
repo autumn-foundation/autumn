@@ -897,11 +897,26 @@ fn redact_headers(
 /// Deliberately narrow: the token after a standard auth scheme, and each
 /// cookie value. Cookie *names* are not retained — they are ordinary words
 /// (`session`, `theme`) that would shred unrelated prose.
+///
+/// Everything below parses **bytes**, never text, and that is the whole point
+/// rather than a detail. A header value is not required to be UTF-8 —
+/// `obs-text` is legal inside a `quoted-string` — so gating the parse on
+/// `from_utf8` meant one stray byte in a `Digest` username discarded every
+/// *other* component of the header, including parameter values that are plain
+/// ASCII and independently parseable. A byte-oriented handler extracts those,
+/// echoes them and binds them regardless, and nothing matched. This is the
+/// same class as the `Basic` case in [`record_basic_credentials`], where
+/// requiring the decoded `user:password` to be UTF-8 discarded an ASCII
+/// password because of a byte in the username beside it.
+///
+/// Nothing downstream has to change for that: [`RedactedValues`] is
+/// byte-keyed, [`mask_binds`] compares any bytes, and [`mask_echoes`] already
+/// skips the needles it cannot represent as text — free-form text masking is
+/// the one place valid UTF-8 is genuinely required, and a value that is not
+/// UTF-8 cannot appear in a message to be masked out of anyway.
 fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
-    let Ok(text) = std::str::from_utf8(value) else {
-        return;
-    };
-    let trimmed = text.trim();
+    // `OWS` is SP and HTAB, so ASCII trimming is exactly the header grammar.
+    let trimmed = value.trim_ascii();
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and
     // reading `password: not valid` as a scheme and a credential would put
@@ -923,11 +938,11 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // read as one. The rest of the value is kept whole, so a credential that
     // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
     // stays intact.
-    if is_authorization && let Some((scheme, credential)) = trimmed.split_once(' ') {
-        let credential = credential.trim();
+    if is_authorization && let Some((scheme, credential)) = split_once_byte(trimmed, b' ') {
+        let credential = credential.trim_ascii();
         if is_auth_scheme(scheme) && !credential.is_empty() {
-            values.insert(credential.as_bytes());
-            if scheme.eq_ignore_ascii_case("basic") {
+            values.insert(credential);
+            if scheme.eq_ignore_ascii_case(b"basic") {
                 record_basic_credentials(credential, values);
             }
             // A `token68` is one opaque blob, not a `name=value` list — its
@@ -956,21 +971,83 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // failed` into `[FILTERED]ness check failed`, and replay, which scrubs
     // with the same set but produces the static message, would call that a
     // mismatch.
-    if is_cookie && trimmed.contains('=') {
-        let pairs: Vec<&str> = if name == "set-cookie" {
-            trimmed.split(';').take(1).collect()
+    if is_cookie && trimmed.contains(&b'=') {
+        let pairs: Vec<&[u8]> = if name == "set-cookie" {
+            trimmed.split(|byte| *byte == b';').take(1).collect()
         } else {
-            trimmed.split(';').collect()
+            trimmed.split(|byte| *byte == b';').collect()
         };
         for pair in pairs {
-            if let Some((_, cookie_value)) = pair.split_once('=') {
-                let cookie_value = cookie_value.trim().trim_matches('"');
-                if !cookie_value.is_empty() {
-                    values.insert_whole_token_only(cookie_value.as_bytes());
-                }
+            if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
+                let cookie_value = trim_ascii_quotes(cookie_value.trim_ascii());
+                record_cookie_value(cookie_value, values);
             }
         }
     }
+}
+
+/// Retain both spellings of a cookie value: the one on the wire, and the one
+/// a handler that percent-decodes holds.
+///
+/// Percent-encoding a cookie value is a common convention, and **Autumn
+/// itself follows it** — `time_zone.rs` percent-decodes its own
+/// `autumn_time_zone` cookie before parsing it. An application doing the same
+/// with `session=abc%2Fdef` holds `abc/def`, which matches neither the whole
+/// header value nor the raw component, so recording only the wire spelling
+/// leaves exactly the bytes the handler echoes unmasked.
+///
+/// This is the rule [`mask_raw_urlencoded`] already applies to form and query
+/// values, and applying it here is strictly the *safer* half of that
+/// precedent: those spellings go in as direct inserts and get full substring
+/// masking, whereas a cookie's stay whole-token-only.
+///
+/// Decoding is deliberately byte-oriented and leaves `+` literal. A cookie
+/// value is not form-encoded, so `+` is a `+` — the same choice `time_zone`'s
+/// own decoder makes — and a `%XX` escape that decodes to bytes which are not
+/// UTF-8 is still exactly what a byte-oriented handler binds.
+fn record_cookie_value(cookie_value: &[u8], values: &mut RedactedValues) {
+    if cookie_value.is_empty() {
+        return;
+    }
+    values.insert_whole_token_only(cookie_value);
+    let decoded: std::borrow::Cow<'_, [u8]> = percent_encoding::percent_decode(cookie_value).into();
+    if decoded.as_ref() != cookie_value {
+        values.insert_whole_token_only(decoded.as_ref());
+    }
+}
+
+/// Split on the first occurrence of `delimiter`, as [`str::split_once`] does
+/// for text.
+///
+/// Written with [`slice::get`] rather than indexing or `split_at` so the
+/// request-path panic gate's `indexing_slicing` denial holds and no arithmetic
+/// can overflow.
+fn split_once_byte(bytes: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == delimiter)?;
+    let head = bytes.get(..index)?;
+    let tail = bytes.get(index.saturating_add(1)..)?;
+    Some((head, tail))
+}
+
+/// Strip every leading and trailing `"`, as `str::trim_matches('"')` does.
+fn trim_ascii_quotes(bytes: &[u8]) -> &[u8] {
+    let mut trimmed = bytes;
+    while let Some(rest) = trimmed.strip_prefix(b"\"") {
+        trimmed = rest;
+    }
+    while let Some(rest) = trimmed.strip_suffix(b"\"") {
+        trimmed = rest;
+    }
+    trimmed
+}
+
+/// Strip every trailing `byte`, as `str::trim_end_matches` does.
+fn trim_ascii_end_matches(bytes: &[u8], byte: u8) -> &[u8] {
+    let mut trimmed = bytes;
+    while let Some(rest) = trimmed.strip_suffix(&[byte]) {
+        trimmed = rest;
+    }
+    trimmed
 }
 
 /// Retain each value of an RFC 7235 auth-param list, not only the list.
@@ -989,20 +1066,20 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
 /// to make for schemes. So every value is retained, but as whole-token-only,
 /// which is what keeps `qop=auth` from masking the middle of *authentication*
 /// in every later failure.
-fn record_auth_params(credential: &str, values: &mut RedactedValues) {
+fn record_auth_params(credential: &[u8], values: &mut RedactedValues) {
     for param in split_auth_params(credential) {
-        let Some((name, value)) = param.split_once('=') else {
+        let Some((name, value)) = split_once_byte(&param, b'=') else {
             continue;
         };
         // An auth-param name is a token. This rejects the `=` padding of a
         // `token68` credential, whose tail is not a name and whose value is
         // empty anyway.
-        if !is_auth_scheme(name.trim()) {
+        if !is_auth_scheme(name.trim_ascii()) {
             continue;
         }
-        let value = unquote_auth_param(value.trim());
+        let value = unquote_auth_param(value.trim_ascii());
         if !value.is_empty() {
-            values.insert_whole_token_only(value.as_bytes());
+            values.insert_whole_token_only(&value);
         }
     }
 }
@@ -1013,10 +1090,13 @@ fn record_auth_params(credential: &str, values: &mut RedactedValues) {
 /// `token68` is `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`:
 /// padding only ever trails. That is what tells it apart from an auth-param
 /// list, whose `=` signs sit between a name and a value.
-fn is_token68(credential: &str) -> bool {
-    let unpadded = credential.trim_end_matches('=');
+///
+/// Takes anything byte-shaped so the parser can hand it a `&[u8]` slice of a
+/// header value while a test can still name a literal.
+fn is_token68(credential: impl AsRef<[u8]>) -> bool {
+    let unpadded = trim_ascii_end_matches(credential.as_ref(), b'=');
     !unpadded.is_empty()
-        && unpadded.bytes().all(|byte| {
+        && unpadded.iter().copied().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
         })
 }
@@ -1031,27 +1111,32 @@ fn is_token68(credential: &str) -> bool {
 /// Escapes are *tracked* but not resolved: a `\"` must not be mistaken for the
 /// end of the quoted string, yet the backslashes have to survive into
 /// [`unquote_auth_param`], which is the only place that can tell a syntactic
-/// boundary quote from a literal one. Returns owned strings because the panic
+/// boundary quote from a literal one. Returns owned buffers because the panic
 /// gate denies the index arithmetic a borrowing split would need.
-fn split_auth_params(credential: &str) -> Vec<String> {
+///
+/// Walks bytes rather than `char`s. Every delimiter it looks for is ASCII and
+/// a UTF-8 continuation byte is never one, so this is identical to the `char`
+/// walk on text that happens to be valid — and unlike it, a value carrying
+/// `obs-text` still comes out whole.
+fn split_auth_params(credential: &[u8]) -> Vec<Vec<u8>> {
     let mut params = Vec::new();
-    let mut current = String::new();
+    let mut current: Vec<u8> = Vec::new();
     let mut quoted = false;
     let mut escaped = false;
-    for character in credential.chars() {
+    for byte in credential.iter().copied() {
         if escaped {
-            current.push(character);
+            current.push(byte);
             escaped = false;
-        } else if character == '\\' && quoted {
-            current.push(character);
+        } else if byte == b'\\' && quoted {
+            current.push(byte);
             escaped = true;
-        } else if character == '"' {
+        } else if byte == b'"' {
             quoted = !quoted;
-            current.push(character);
-        } else if character == ',' && !quoted {
+            current.push(byte);
+        } else if byte == b',' && !quoted {
             params.push(std::mem::take(&mut current));
         } else {
-            current.push(character);
+            current.push(byte);
         }
     }
     params.push(current);
@@ -1069,23 +1154,22 @@ fn split_auth_params(credential: &str) -> Vec<String> {
 /// and a bind byte-equal to what the handler extracted then matches.
 ///
 /// An unquoted value (`qop=auth`) is a token and is returned as it stands.
-fn unquote_auth_param(value: &str) -> String {
-    let mut characters = value.chars();
-    if characters.next() != Some('"') {
-        return value.to_owned();
-    }
-    let mut unquoted = String::new();
+fn unquote_auth_param(value: &[u8]) -> Vec<u8> {
+    let Some(inner) = value.strip_prefix(b"\"") else {
+        return value.to_vec();
+    };
+    let mut unquoted = Vec::new();
     let mut escaped = false;
-    for character in characters {
+    for byte in inner.iter().copied() {
         if escaped {
-            unquoted.push(character);
+            unquoted.push(byte);
             escaped = false;
-        } else if character == '\\' {
+        } else if byte == b'\\' {
             escaped = true;
-        } else if character == '"' {
+        } else if byte == b'"' {
             break;
         } else {
-            unquoted.push(character);
+            unquoted.push(byte);
         }
     }
     unquoted
@@ -1112,7 +1196,7 @@ fn unquote_auth_param(value: &str) -> String {
 /// holds that password regardless; the echo set is byte-keyed, so a bind equal
 /// to it is masked either way, and only free-form text masking — which needs
 /// valid UTF-8 to search — quietly skips what it cannot represent.
-fn record_basic_credentials(credential: &str, values: &mut RedactedValues) {
+fn record_basic_credentials(credential: &[u8], values: &mut RedactedValues) {
     // Not Base64: nothing to split, and the Base64 itself is already in the
     // set.
     let Ok(decoded) = STANDARD.decode(credential) else {
@@ -1133,9 +1217,13 @@ fn record_basic_credentials(credential: &str, values: &mut RedactedValues) {
 
 /// Whether `word` is a syntactically valid authorization scheme — an RFC 7235
 /// token.
-fn is_auth_scheme(word: &str) -> bool {
+///
+/// Takes anything byte-shaped: the parser hands it a `&[u8]` slice of a header
+/// value that need not be UTF-8, while a test can still name a `&str` literal.
+fn is_auth_scheme(word: impl AsRef<[u8]>) -> bool {
+    let word = word.as_ref();
     !word.is_empty()
-        && word.bytes().all(|b| {
+        && word.iter().copied().all(|b| {
             b.is_ascii_alphanumeric()
                 || matches!(
                     b,
@@ -2287,8 +2375,7 @@ mod tests {
         // `Digest username="<0xff>alice", response="deadbeef", nonce=cafebabe`
         let mut credential = br#"username=""#.to_vec();
         credential.push(0xFF);
-        credential
-            .extend_from_slice(br#"alice", response="deadbeef", nonce=cafebabe, qop=auth"#);
+        credential.extend_from_slice(br#"alice", response="deadbeef", nonce=cafebabe, qop=auth"#);
         let mut header = b"Digest ".to_vec();
         header.extend_from_slice(&credential);
         let (_request, values) = redact(

@@ -474,6 +474,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Failure capsules: credential components no longer miss the spelling the
+  handler holds (#2212):** `record_credential_components` records the secret
+  *inside* a masked header — the token after an auth scheme, each auth-param
+  value, each cookie value — so the echo set matches what a handler actually
+  extracted rather than only the whole header line. Two spellings escaped it.
+
+  The parser began by requiring the whole header value to be UTF-8, so a
+  single `obs-text` byte — legal inside a `quoted-string`, and reachable with
+  a perfectly valid header — skipped **every** component, including parameters
+  that were plain ASCII and independently parseable. A byte-oriented `Digest`
+  handler extracted `response="deadbeef"` from
+  `Digest username="<0xff>alice", response="deadbeef"`, echoed it into an
+  error and bound it, and nothing in the echo set matched. The parser now
+  works on bytes throughout: the scheme split, `is_auth_scheme` and
+  `is_token68`, and the quoted-string walk in `split_auth_params` /
+  `unquote_auth_param`. Same class as the `Basic` case fixed earlier, where
+  requiring the decoded `user:password` to be UTF-8 discarded an ASCII
+  password because of a byte in the username beside it.
+
+  A `Cookie` value was recorded exactly as it arrived, so `session=abc%2Fdef`
+  contributed `abc%2Fdef` and nothing else. Percent-encoding cookie values is
+  a common convention that Autumn itself follows — the `autumn_time_zone`
+  cookie is percent-decoded before use — so an application doing the same
+  holds `abc/def`, which matched neither the whole header nor the recorded
+  component. Cookie values now join the echo set under both spellings, the way
+  `mask_raw_urlencoded` already did for form and query values, and stay
+  whole-token-only so a `theme=dark` cookie still cannot shred *darkness* in
+  an unrelated failure.
+
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
   `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app
