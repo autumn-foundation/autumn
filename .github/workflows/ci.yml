@@ -145,6 +145,27 @@ jobs:
         # queueing behind ~20 minutes of workspace clippy in `lint` — and a
         # clippy failure can't stop it from running.
         run: ./scripts/check-migration-guides.sh
+      - name: Migration version gate
+        # Framework, plugin and app migrations share one version space: diesel
+        # keys `__diesel_schema_migrations` on the 14-digit version and
+        # `autumn_migration_checksums` makes it a PRIMARY KEY, so two
+        # migrations claiming one version are not two migrations — the loser
+        # silently never runs. Hand-written `YYYYMMDD000000` names collide by
+        # construction, which is how `examples/reddit-clone` ended up with
+        # `20260513000001` and `20260702000001` hand-bumped off framework
+        # versions, and how `00000000000000` came to be shared by the
+        # framework, the starters, the benchmark app and eight examples.
+        #
+        # The generators already mint a full YYYYMMDDHHMMSS
+        # (`autumn generate migration`, `autumn schema diff
+        # --write-migration`); this gate is here because they get bypassed by
+        # hand-created directories. Pre-existing offenders are grandfathered
+        # in scripts/migration-version-baseline.txt and are deliberately NOT
+        # renamed — they have already been applied to real databases.
+        #
+        # Shares this docs-only job for the same reason as the gate above: no
+        # toolchain, no cache, reports in seconds.
+        run: ./scripts/check-migration-versions.sh
       - name: Skill version marker gate
         # The `autumn-web` agent skill annotates each API with the release it
         # arrived in. Those markers are hand-maintained and drifted badly

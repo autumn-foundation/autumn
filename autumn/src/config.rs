@@ -125,6 +125,15 @@
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
+//! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
+//! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
+//! | `AUTUMN_RETENTION__COMMIT_HOOKS` | `retention.commit_hooks` | duration `String` |
+//! | `AUTUMN_RETENTION__JOB_TRACKING` | `retention.job_tracking` | duration `String` |
+//! | `AUTUMN_RETENTION__IDEMPOTENCY` | `retention.idempotency` | duration `String` |
+//! | `AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS` | `retention.experiment_assignments` | duration `String` |
+//! | `AUTUMN_RETENTION__WEBHOOK_REPLAY` | `retention.webhook_replay` | duration `String` |
+//! | `AUTUMN_RETENTION__SESSIONS` | `retention.sessions` | duration `String` |
+//! | `AUTUMN_RETENTION__AUDIT_ARCHIVES` | `retention.audit_archives` | duration `String` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
 //! | `AUTUMN_SCHEDULER__KEY_PREFIX` | `scheduler.key_prefix` | `String` |
@@ -1338,6 +1347,17 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// Unified data-retention policy for framework-owned data
+    /// (`[retention]` section in `autumn.toml`, issue #1605).
+    ///
+    /// One retention window per framework-owned dataset (job history, job
+    /// tracking, idempotency records, experiment assignments, webhook replay
+    /// markers, sessions, audit archives). Every window is unset by default,
+    /// which preserves today's behavior exactly. See [`RetentionConfig`] and
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 /// Opt-in TLS termination at the deploy-managed reverse proxy (`[deploy.tls]`
@@ -2592,6 +2612,249 @@ impl ProcessRole {
 #[must_use]
 pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
     role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
+}
+
+/// `[retention]` — one retention window per framework-owned dataset
+/// (issue #1605).
+///
+/// Autumn creates and fills tables and stores the application never asked
+/// for: the job queue and its tracking records, idempotency replay records,
+/// sticky experiment assignments, webhook replay markers, sessions, and audit
+/// archives. Being batteries-included means owning their lifecycle. This
+/// section is the single place an operator declares how long each of those
+/// datasets is kept; the framework then enforces it on a recurring in-process
+/// sweep with no external cron.
+///
+/// Every window defaults to `None`, which means **exactly today's behavior**
+/// for that dataset — nothing is swept and no sweep task is even registered
+/// unless at least one window is set.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [retention]
+/// sweep_interval         = "1h"    # how often the sweep runs (default "1h")
+/// job_history            = "90d"   # terminal rows in `autumn_jobs`
+/// commit_hooks           = "30d"   # terminal `#[after_commit]` hook rows
+/// job_tracking           = "7d"    # `autumn_job_tracking` records
+/// idempotency            = "2d"    # stored idempotency responses
+/// experiment_assignments = "365d"  # `autumn_experiment_assignments`
+/// webhook_replay         = "3d"    # inbound webhook replay markers
+/// sessions               = "30d"   # server-side session records
+/// audit_archives         = "400d"  # JSONL audit archive entries
+/// ```
+///
+/// Durations use the same syntax as `#[scheduled(every = ...)]`: `s`/`m`/`h`/
+/// `d`, optionally compound (`"1h 30m"`).
+///
+/// See `docs/guide/data-retention.md` for the full dataset table, the
+/// precedence rule against `jobs.tracking.ttl_secs` / `idempotency.ttl_secs`,
+/// and the `autumn db retention` CLI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// How often the framework retention sweep runs. Default: `"1h"`.
+    ///
+    /// Only consulted when at least one dataset window is set — with none set
+    /// no sweep task is registered at all.
+    #[serde(default = "default_retention_sweep_interval")]
+    pub sweep_interval: String,
+
+    /// Terminal (`completed`/`failed`/`discarded`) rows in `autumn_jobs`,
+    /// measured from `finished_at`. Unset (default): job history is kept
+    /// forever.
+    ///
+    /// Live rows — enqueued, running, or retrying — are never touched
+    /// regardless of age, and neither is a row still holding a
+    /// `#[job(unique, unique_for_ms = ...)]` dedup key. Note that `failed` is
+    /// also the dead-letter state a `autumn jobs retry` replays from, so a
+    /// window here bounds how long a dead letter stays replayable; see
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub job_history: Option<String>,
+
+    /// Terminal rows in the `#[after_commit]` hook queue,
+    /// `autumn_repository_commit_hooks`, measured from `finished_at`. Unset
+    /// (default): kept forever.
+    #[serde(default)]
+    pub commit_hooks: Option<String>,
+
+    /// `autumn_job_tracking` progress/result records, measured from
+    /// `updated_at`. Unset (default): rows live until their
+    /// `jobs.tracking.ttl_secs` expiry, which the existing sweep already
+    /// enforces.
+    ///
+    /// When both are set the **shorter** bound wins; see
+    /// `docs/guide/data-retention.md`.
+    #[serde(default)]
+    pub job_tracking: Option<String>,
+
+    /// Stored idempotency-key responses, measured from when they were
+    /// written. Unset (default): records live for `idempotency.ttl_secs`.
+    ///
+    /// Idempotency backends expire their own records, so this window is
+    /// enforced by capping the record TTL at write time rather than by a
+    /// sweep. When both are set the **shorter** bound wins.
+    #[serde(default)]
+    pub idempotency: Option<String>,
+
+    /// Sticky `autumn_experiment_assignments` rows, measured from
+    /// `assigned_at`. Unset (default): assignments are kept forever.
+    #[serde(default)]
+    pub experiment_assignments: Option<String>,
+
+    /// Inbound webhook replay markers, measured from when they were
+    /// recorded. Unset (default): markers live for the endpoint's
+    /// `replay_window_secs`.
+    ///
+    /// Enforced by capping the marker TTL, as for [`Self::idempotency`].
+    #[serde(default)]
+    pub webhook_replay: Option<String>,
+
+    /// Server-side session records, measured from their last write. Unset
+    /// (default): the session backend's own expiry applies (which, for the
+    /// in-memory store, is no expiry at all).
+    #[serde(default)]
+    pub sessions: Option<String>,
+
+    /// Entries in the JSONL audit archive, measured from each event's
+    /// `timestamp`. Unset (default): audit archives are kept forever.
+    ///
+    /// Enforced by rewriting the archive file in place (atomically), so it
+    /// only applies to sinks that support purging — today
+    /// [`crate::audit::JsonlFileAuditSink`].
+    #[serde(default)]
+    pub audit_archives: Option<String>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval: default_retention_sweep_interval(),
+            job_history: None,
+            commit_hooks: None,
+            job_tracking: None,
+            idempotency: None,
+            experiment_assignments: None,
+            webhook_replay: None,
+            sessions: None,
+            audit_archives: None,
+        }
+    }
+}
+
+fn default_retention_sweep_interval() -> String {
+    "1h".to_owned()
+}
+
+impl RetentionConfig {
+    /// Every `(config key, window)` pair, in the order the CLI reports them.
+    ///
+    /// The single source of truth that keeps the config surface, the dataset
+    /// registry in [`crate::data_retention`], the CLI report, and the docs
+    /// table from drifting apart: adding a field here without adding the
+    /// matching dataset fails a test in `crate::data_retention`.
+    #[must_use]
+    pub fn windows(&self) -> [(&'static str, Option<&str>); 8] {
+        [
+            ("job_history", self.job_history.as_deref()),
+            ("commit_hooks", self.commit_hooks.as_deref()),
+            ("job_tracking", self.job_tracking.as_deref()),
+            ("idempotency", self.idempotency.as_deref()),
+            (
+                "experiment_assignments",
+                self.experiment_assignments.as_deref(),
+            ),
+            ("webhook_replay", self.webhook_replay.as_deref()),
+            ("sessions", self.sessions.as_deref()),
+            ("audit_archives", self.audit_archives.as_deref()),
+        ]
+    }
+
+    /// `true` when at least one dataset declares a retention window.
+    ///
+    /// When this is `false` no sweep task is registered and no framework
+    /// behavior changes — AC #1's "leaving a dataset unset preserves today's
+    /// behavior exactly", enforced structurally rather than by each sweeper
+    /// remembering to check.
+    #[must_use]
+    pub fn any_window_configured(&self) -> bool {
+        self.windows().iter().any(|(_, window)| window.is_some())
+    }
+
+    /// The configured window for one dataset key, already parsed.
+    ///
+    /// Returns `None` both when the dataset is unset and when its value does
+    /// not parse — [`Self::validate`] rejects the latter at boot, so a
+    /// running app never reaches this with an unparseable value.
+    #[must_use]
+    pub fn window(&self, key: &str) -> Option<std::time::Duration> {
+        self.windows()
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, window)| window)
+            .and_then(crate::task::parse_duration)
+    }
+
+    /// How often the sweep runs, already parsed. Falls back to one hour when
+    /// unparseable ([`Self::validate`] rejects that at boot).
+    #[must_use]
+    pub fn sweep_interval_duration(&self) -> std::time::Duration {
+        crate::task::parse_duration(&self.sweep_interval)
+            .unwrap_or(std::time::Duration::from_secs(3_600))
+    }
+
+    /// Validate every declared window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when a window (or the sweep
+    /// interval) is not a valid duration string, or resolves to zero — a zero
+    /// window would purge a dataset the instant it was written, which is
+    /// never what an operator means and is not something to guess at.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (key, window) in self.windows() {
+            let Some(raw) = window else { continue };
+            // One message, not two: `parse_duration` already returns `None`
+            // for a syntactically valid but zero total ("0s"), so a separate
+            // "resolves to zero" branch would be unreachable. State what is
+            // required — valid *and* non-zero — and why zero is refused.
+            let Some(parsed) = crate::task::parse_duration(raw) else {
+                return Err(ConfigError::Validation(format!(
+                    "retention.{key} = {raw:?} is not a valid non-zero duration: use a \
+                     string like \"90d\", \"12h\", or \"1h 30m\". A zero window would \
+                     purge the dataset as soon as it is written; remove the key entirely \
+                     to keep today's behavior (see docs/guide/data-retention.md)"
+                )));
+            };
+            // The sweep binds its cutoff as `NOW() - make_interval(secs => $1)`
+            // with a `u32`-representable value. Rejecting anything larger here
+            // keeps the configured window and the window the database actually
+            // applies identical — silently clamping would delete rows the
+            // report claimed were still inside the policy. 136 years is far
+            // past any real retention policy, so this only ever catches a typo.
+            if parsed.as_secs() > u64::from(u32::MAX) {
+                return Err(ConfigError::Validation(format!(
+                    "retention.{key} = {raw:?} is longer than the maximum supported \
+                     retention window ({} years). Remove the key entirely to keep the \
+                     data forever, which is what a window that long means in practice \
+                     (see docs/guide/data-retention.md)",
+                    u64::from(u32::MAX) / (365 * 86_400)
+                )));
+            }
+        }
+
+        // Only meaningful once something is actually swept, but validated
+        // unconditionally so a typo is caught the first time it is written
+        // rather than the first time a window is added next to it.
+        if crate::task::parse_duration(&self.sweep_interval).is_none() {
+            return Err(ConfigError::Validation(format!(
+                "retention.sweep_interval = {:?} is not a valid non-zero duration: use a \
+                 string like \"1h\" or \"30m\" (see docs/guide/data-retention.md)",
+                self.sweep_interval
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Scheduled task coordination runtime configuration.
@@ -4240,6 +4503,11 @@ impl AutumnConfig {
         self.database.validate()?;
         self.cors.validate()?;
         self.scheduler.validate()?;
+        // #1605: reject an unparseable or zero retention window at boot rather
+        // than silently skipping the dataset it names — a policy an operator
+        // believes is enforced but isn't is worse than no policy.
+        self.retention.validate()?;
+        self.validate_retention_against_replay_protection()?;
         // Framework state (autumn_jobs, scheduler advisory locks) lives on
         // the control topology and is never sharded. Sharded apps that use a
         // Postgres-backed jobs or scheduler backend therefore need a control
@@ -4281,6 +4549,98 @@ impl AutumnConfig {
         // ever gets a chance to apply. The "prod profile + memory backend"
         // warning lives in `build_session_layer` for the same reason.
         Ok(())
+    }
+
+    /// Reject a `retention.webhook_replay` window shorter than any configured
+    /// endpoint's replay-rejection window (issue #1605).
+    ///
+    /// A retention window is a *compliance* knob. Letting it silently shorten
+    /// the lifetime of a replay marker would weaken a *security* control
+    /// through a door nobody would think to look behind: once the marker is
+    /// gone, a captured request replayed after that point is accepted again.
+    /// Fail closed and name the knob to lower instead
+    /// (`replay_window_secs`), rather than quietly reducing replay
+    /// protection.
+    ///
+    /// Endpoints registered in code rather than in `autumn.toml` are not
+    /// visible here; `docs/guide/data-retention.md` states the same rule for
+    /// them.
+    fn validate_retention_against_replay_protection(&self) -> Result<(), ConfigError> {
+        let Some(window) = self.retention.window("webhook_replay") else {
+            return Ok(());
+        };
+        for endpoint in &self.security.webhooks.endpoints {
+            if !endpoint.replay_protection {
+                continue;
+            }
+            let replay = std::time::Duration::from_secs(endpoint.replay_window_secs);
+            if window < replay {
+                return Err(ConfigError::Validation(format!(
+                    "retention.webhook_replay ({window_secs}s) is shorter than the \
+                     replay_window_secs ({replay_secs}s) of webhook endpoint {name:?}: \
+                     expiring replay markers early would silently weaken replay \
+                     protection. Lower that endpoint's replay_window_secs instead, or \
+                     widen retention.webhook_replay (see \
+                     docs/guide/data-retention.md).",
+                    window_secs = window.as_secs(),
+                    replay_secs = endpoint.replay_window_secs,
+                    name = endpoint.name,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tighten the TTL-native subsystem knobs to their `[retention]` window
+    /// (issue #1605).
+    ///
+    /// The `idempotency` and `sessions` datasets are expired by their own
+    /// storage rather than by a sweep, so their retention window is enforced
+    /// by writing records with a shorter lifetime. Applying the cap once, to
+    /// the loaded config, means every derived lifetime inherits it: the
+    /// idempotency layer's TTL, and the session cookie's `Max-Age` together
+    /// with the Redis session TTL.
+    ///
+    /// Note that capping `sessions` shortens how long a signed-in user stays
+    /// signed in — see `docs/guide/data-retention.md`.
+    ///
+    /// **`job_tracking` is deliberately not capped here.** It is
+    /// sweep-enforced, and the sweep honours a GDPR legal hold on
+    /// `autumn_job_tracking` while `job.rs`'s independent `expires_at`
+    /// cleanup cannot — capping `jobs.tracking.ttl_secs` would let that
+    /// cleanup delete, on exactly the retention schedule, the very rows the
+    /// retention report says are being preserved under hold.
+    ///
+    /// Always a `min`, so this can only ever *shorten* a lifetime — there is
+    /// no configuration in which declaring `[retention]` causes data to be
+    /// kept longer than it is today — and it is idempotent, so calling it
+    /// twice is harmless.
+    ///
+    /// Called on the loaded config during boot; apps do not call this
+    /// directly.
+    pub fn apply_retention_caps(&mut self) {
+        // `job_tracking` is capped only when its records do NOT live in
+        // `autumn_job_tracking`. Under `jobs.backend = "postgres"` the sweep
+        // enforces the window and a GDPR legal hold can stop it, so capping
+        // the TTL there would let the job runner's independent `expires_at`
+        // cleanup delete held rows on exactly the retention schedule. Under
+        // any other backend (redis, or the in-memory fallback) there is no
+        // table to sweep and the record's TTL is the only bound there is —
+        // leaving it uncapped would claim a window nothing enforces.
+        let cap_job_tracking = self.jobs.backend != "postgres";
+        let caps: [(&str, &mut u64); 3] = [
+            ("idempotency", &mut self.idempotency.ttl_secs),
+            ("sessions", &mut self.session.max_age_secs),
+            ("job_tracking", &mut self.jobs.tracking.ttl_secs),
+        ];
+        for (key, target) in caps {
+            if key == "job_tracking" && !cap_job_tracking {
+                continue;
+            }
+            if let Some(window) = self.retention.window(key) {
+                *target = (*target).min(window.as_secs());
+            }
+        }
     }
 
     /// Apply environment variable overrides to the loaded config.
@@ -4344,6 +4704,17 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
+    /// # Retention (issue #1605)
+    /// - `AUTUMN_RETENTION__SWEEP_INTERVAL` → `retention.sweep_interval` (duration `String`)
+    /// - `AUTUMN_RETENTION__JOB_HISTORY` → `retention.job_history` (duration `String`)
+    /// - `AUTUMN_RETENTION__COMMIT_HOOKS` → `retention.commit_hooks` (duration `String`)
+    /// - `AUTUMN_RETENTION__JOB_TRACKING` → `retention.job_tracking` (duration `String`)
+    /// - `AUTUMN_RETENTION__IDEMPOTENCY` → `retention.idempotency` (duration `String`)
+    /// - `AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS` → `retention.experiment_assignments` (duration `String`)
+    /// - `AUTUMN_RETENTION__WEBHOOK_REPLAY` → `retention.webhook_replay` (duration `String`)
+    /// - `AUTUMN_RETENTION__SESSIONS` → `retention.sessions` (duration `String`)
+    /// - `AUTUMN_RETENTION__AUDIT_ARCHIVES` → `retention.audit_archives` (duration `String`)
+    ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` -> `security.webhooks.replay.redis.url` (`String`)
@@ -4387,6 +4758,7 @@ impl AutumnConfig {
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
+        self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
@@ -5280,6 +5652,60 @@ impl AutumnConfig {
                 ),
             }
         }
+    }
+
+    /// `AUTUMN_RETENTION__*` overrides for the unified retention policy
+    /// (issue #1605).
+    ///
+    /// Each window uses [`parse_env_option_string`], so an empty value is the
+    /// documented way to *clear* a window `autumn.toml` declared — restoring
+    /// today's behavior for that one dataset without editing the file.
+    fn apply_retention_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_RETENTION__SWEEP_INTERVAL",
+            &mut self.retention.sweep_interval,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__JOB_HISTORY",
+            &mut self.retention.job_history,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__COMMIT_HOOKS",
+            &mut self.retention.commit_hooks,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__JOB_TRACKING",
+            &mut self.retention.job_tracking,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__IDEMPOTENCY",
+            &mut self.retention.idempotency,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS",
+            &mut self.retention.experiment_assignments,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__WEBHOOK_REPLAY",
+            &mut self.retention.webhook_replay,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__SESSIONS",
+            &mut self.retention.sessions,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__AUDIT_ARCHIVES",
+            &mut self.retention.audit_archives,
+        );
     }
 
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -12138,6 +12564,151 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    // ── [retention] unified framework-owned data retention (issue #1605) ──
+
+    #[test]
+    fn retention_config_defaults_leave_every_dataset_unset() {
+        // AC #1: "Leaving a dataset unset preserves today's behavior exactly."
+        // The only way to guarantee that is for every window to default to
+        // None, and for the whole section to report itself as unconfigured.
+        let config = AutumnConfig::default();
+        assert!(
+            config.retention.job_history.is_none(),
+            "job_history must default to unset"
+        );
+        assert!(config.retention.job_tracking.is_none());
+        assert!(config.retention.idempotency.is_none());
+        assert!(config.retention.experiment_assignments.is_none());
+        assert!(config.retention.webhook_replay.is_none());
+        assert!(config.retention.sessions.is_none());
+        assert!(config.retention.audit_archives.is_none());
+        assert!(
+            !config.retention.any_window_configured(),
+            "a default config must register no retention sweep at all"
+        );
+        assert_eq!(
+            config.retention.sweep_interval, "1h",
+            "the sweep cadence has a documented default even when no window is set"
+        );
+    }
+
+    #[test]
+    fn retention_toml_deserializes_every_dataset_window() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [retention]
+            sweep_interval = "30m"
+            job_history = "90d"
+            job_tracking = "7d"
+            idempotency = "2d"
+            experiment_assignments = "365d"
+            webhook_replay = "3d"
+            sessions = "30d"
+            audit_archives = "400d"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.retention.sweep_interval, "30m");
+        assert_eq!(config.retention.job_history.as_deref(), Some("90d"));
+        assert_eq!(config.retention.job_tracking.as_deref(), Some("7d"));
+        assert_eq!(config.retention.idempotency.as_deref(), Some("2d"));
+        assert_eq!(
+            config.retention.experiment_assignments.as_deref(),
+            Some("365d")
+        );
+        assert_eq!(config.retention.webhook_replay.as_deref(), Some("3d"));
+        assert_eq!(config.retention.sessions.as_deref(), Some("30d"));
+        assert_eq!(config.retention.audit_archives.as_deref(), Some("400d"));
+        assert!(config.retention.any_window_configured());
+        config.validate().expect("a well-formed section validates");
+    }
+
+    #[test]
+    fn env_override_retention_windows() {
+        let env = MockEnv::new()
+            .with("AUTUMN_RETENTION__SWEEP_INTERVAL", "15m")
+            .with("AUTUMN_RETENTION__JOB_HISTORY", "45d")
+            .with("AUTUMN_RETENTION__JOB_TRACKING", "2d")
+            .with("AUTUMN_RETENTION__IDEMPOTENCY", "12h")
+            .with("AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS", "180d")
+            .with("AUTUMN_RETENTION__WEBHOOK_REPLAY", "1d")
+            .with("AUTUMN_RETENTION__SESSIONS", "14d")
+            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.retention.sweep_interval, "15m");
+        assert_eq!(config.retention.job_history.as_deref(), Some("45d"));
+        assert_eq!(config.retention.job_tracking.as_deref(), Some("2d"));
+        assert_eq!(config.retention.idempotency.as_deref(), Some("12h"));
+        assert_eq!(
+            config.retention.experiment_assignments.as_deref(),
+            Some("180d")
+        );
+        assert_eq!(config.retention.webhook_replay.as_deref(), Some("1d"));
+        assert_eq!(config.retention.sessions.as_deref(), Some("14d"));
+        assert_eq!(config.retention.audit_archives.as_deref(), Some("365d"));
+    }
+
+    #[test]
+    fn env_override_retention_empty_value_clears_a_window() {
+        // An empty env value is the documented way to *unset* a window that
+        // autumn.toml declared, restoring today's behavior for that dataset
+        // without editing the file (matches parse_env_option_string).
+        let env = MockEnv::new().with("AUTUMN_RETENTION__JOB_HISTORY", "");
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("90d".to_owned());
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.retention.job_history.is_none());
+    }
+
+    #[test]
+    fn retention_validate_rejects_an_unparseable_window() {
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("ninety days".to_owned());
+        let error = config
+            .validate()
+            .expect_err("an unparseable duration must fail boot, not be ignored");
+        let message = error.to_string();
+        assert!(
+            message.contains("retention.job_history"),
+            "the error must name the offending key: {message}"
+        );
+    }
+
+    #[test]
+    fn retention_validate_rejects_a_zero_window() {
+        // "0s" would purge everything the instant it is written — almost
+        // certainly a typo, and never something to guess at.
+        let mut config = AutumnConfig::default();
+        config.retention.sessions = Some("0s".to_owned());
+        let error = config.validate().expect_err("a zero window must fail boot");
+        assert!(error.to_string().contains("retention.sessions"), "{error}");
+    }
+
+    #[test]
+    fn retention_validate_rejects_an_unparseable_sweep_interval() {
+        let mut config = AutumnConfig::default();
+        config.retention.job_history = Some("30d".to_owned());
+        config.retention.sweep_interval = "whenever".to_owned();
+        let error = config.validate().expect_err("bad cadence must fail boot");
+        assert!(
+            error.to_string().contains("retention.sweep_interval"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn retention_validate_accepts_a_default_config() {
+        // The whole point of AC #1: an app that never mentions [retention]
+        // must be entirely unaffected, validation included.
+        AutumnConfig::default()
+            .validate()
+            .expect("an unconfigured [retention] section must validate");
     }
 
     #[test]

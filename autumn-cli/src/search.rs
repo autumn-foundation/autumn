@@ -86,8 +86,9 @@ pub fn is_started_marker(line: &str) -> bool {
 ///
 /// `Command` inherits the parent process's environment by default, so any of
 /// these left over in the CLI's own environment (e.g. from a wrapping script,
-/// or a previous `autumn migrate`/`autumn task run ...`/`autumn replay ...`
-/// invocation in the same shell) would silently hijack `autumn search
+/// or a previous `autumn migrate`/`autumn task run ...`/`autumn replay ...`/
+/// `autumn db retention --purge` invocation in the same shell) would silently
+/// hijack `autumn search
 /// reindex` into a completely different — and potentially mutating — mode,
 /// since every one of them is dispatched earlier than server startup in
 /// `AppBuilder::run`.
@@ -101,6 +102,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
         "AUTUMN_RUN_TASK",
         "AUTUMN_MIGRATE",
         "AUTUMN_RETENTION_DRY_RUN",
+        "AUTUMN_DB_RETENTION",
         "AUTUMN_REPLAY_CAPSULE",
     ] {
         command.env_remove(var);
@@ -308,6 +310,7 @@ mod tests {
             "AUTUMN_RUN_TASK",
             "AUTUMN_MIGRATE",
             "AUTUMN_RETENTION_DRY_RUN",
+            "AUTUMN_DB_RETENTION",
             "AUTUMN_REPLAY_CAPSULE",
         ];
         let mut command = Command::new("true");
@@ -317,6 +320,21 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "these competing one-shot vars survived: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn an_inherited_framework_retention_purge_cannot_hijack_a_reindex() {
+        // AUTUMN_DB_RETENTION=purge is dispatched long before SearchPlugin
+        // consumes AUTUMN_SEARCH_BACKFILL at server startup, so an inherited
+        // value would turn `autumn search reindex` into a destructive sweep of
+        // every framework-owned dataset (#1605).
+        let mut command = Command::new("true");
+        command.env("AUTUMN_DB_RETENTION", "purge");
+        clear_competing_one_shot_env(&mut command);
+        assert!(
+            still_set(&command, &["AUTUMN_DB_RETENTION"]).is_empty(),
+            "an inherited AUTUMN_DB_RETENTION=purge must never survive into a reindex"
         );
     }
 

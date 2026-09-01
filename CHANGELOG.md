@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One retention policy for every table Autumn creates (#1605):** every
+  deployed Autumn app accumulated framework-owned data forever by default —
+  job history, tracking records, idempotency responses, experiment
+  assignments, webhook replay markers, sessions, audit archives. Retention
+  existed only piecemeal (`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`),
+  so "keep operational data 90 days" meant discovering each subsystem's
+  private knob, finding there often wasn't one, and hand-writing cron jobs
+  against undocumented tables. A new `[retention]` section in `autumn.toml`
+  declares a window per dataset, and Autumn enforces it on a recurring,
+  fleet-coordinated in-process sweep — no external cron:
+
+  ```toml
+  [retention]
+  job_history            = "90d"
+  job_tracking           = "7d"
+  experiment_assignments = "365d"
+  audit_archives         = "400d"
+  ```
+
+  Postgres-backed datasets are swept in bounded batches against the database's
+  own clock; TTL-native stores (idempotency, webhook replay, sessions) have
+  their record TTL *capped* at the window; the JSONL audit archive is rewritten
+  atomically without the stale entries, keeping any line it cannot parse. The
+  pre-existing `jobs.tracking.ttl_secs` / `idempotency.ttl_secs` knobs keep
+  working unchanged: the documented rule is that the **shorter** bound wins, so
+  adding `[retention]` can never cause data to be kept longer than it is today.
+  Leaving a dataset unset registers no sweep task at all.
+
+  Data under a GDPR legal hold (`ModelRegistration::retain`) is never removed —
+  the hold vetoes the whole dataset rather than filtering rows — and every real
+  sweep writes an audit record carrying the dataset, the cutoff timestamp and
+  the rows removed, including one that removed nothing and one a hold blocked.
+  `autumn db retention [--dry-run|--purge] [--dataset X] [--json]` reports the
+  effective window per dataset, which setting produced it, how it is enforced,
+  and how many rows are eligible right now; it runs inside your app binary so
+  the report and the enforcement come from one code path. A
+  `retention.webhook_replay` window shorter than a configured endpoint's
+  `replay_window_secs` fails boot rather than silently weakening replay
+  protection. See
+  [Data Retention for Framework-Owned Data](docs/guide/data-retention.md).
+
+  **Breaking:** `autumn_web::audit::AuditEvent` gains a `metadata:
+  BTreeMap<String, String>` field so a sweep record can carry its dataset,
+  cutoff and row count. Only code that constructs or destructures `AuditEvent`
+  *by struct literal* is affected — `AuditEvent::new(...)` is unchanged, the
+  field is `#[serde(default)]`, and archives written before this release still
+  deserialize. `AuditSink::purge_before` is a *provided* method, so existing
+  sinks keep compiling untouched. See the
+  [migration guide](docs/migrations/next.md).
+
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
   at either surface. Its own releases were body-only GitHub Releases with no
@@ -513,6 +563,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+
+- **CI now rejects colliding migration versions:** app, framework and plugin
+  migrations are applied into one shared version space — diesel keys
+  `__diesel_schema_migrations` on the 14-digit version and
+  `autumn_migration_checksums` makes it a `PRIMARY KEY` — so two migrations
+  claiming one version are not two migrations: the loser silently never runs.
+  Hand-written day-granularity names (`YYYYMMDD000000`) collide by
+  construction, because every author who types a date pads the same six zeros.
+  The damage was already in the tree: `examples/reddit-clone` carries
+  `20260513000001` and `20260702000001`, hand-bumped by one off framework
+  versions, and `00000000000000` was shared by the framework, the starters, the
+  benchmark app and eight examples. A new gate
+  (`scripts/check-migration-versions.sh`, run in the `Migration guide coverage`
+  job) fails a migration whose time component is `000000`, whose digits are not
+  a real UTC timestamp (`20260530300000` has hour 30), whose name is not
+  `<14 digits>_<snake_case>`, or whose version is already claimed. The
+  generators already did the right thing — `autumn generate migration` and
+  `autumn schema diff --write-migration` mint a full `YYYYMMDDHHMMSS` from the
+  clock — so this closes the hand-created-directory bypass rather than adding a
+  new convention. Pre-existing offenders are grandfathered in
+  `scripts/migration-version-baseline.txt` and deliberately **not** renamed:
+  they have already been applied to real databases, and renaming one makes the
+  framework consider it unapplied and run it again.
+- **Failure capsules: credential components no longer miss the spelling the
+  handler holds (#2212):** `record_credential_components` records the secret
+  *inside* a masked header — the token after an auth scheme, each auth-param
+  value, each cookie value — so the echo set matches what a handler actually
+  extracted rather than only the whole header line. Two spellings escaped it.
+
+  The parser began by requiring the whole header value to be UTF-8, so a
+  single `obs-text` byte — legal inside a `quoted-string`, and reachable with
+  a perfectly valid header — skipped **every** component, including parameters
+  that were plain ASCII and independently parseable. A byte-oriented `Digest`
+  handler extracted `response="deadbeef"` from
+  `Digest username="<0xff>alice", response="deadbeef"`, echoed it into an
+  error and bound it, and nothing in the echo set matched. The parser now
+  works on bytes throughout: the scheme split, `is_auth_scheme` and
+  `is_token68`, and the quoted-string walk in `split_auth_params` /
+  `unquote_auth_param`. Same class as the `Basic` case fixed earlier, where
+  requiring the decoded `user:password` to be UTF-8 discarded an ASCII
+  password because of a byte in the username beside it.
+
+  A `Cookie` value was recorded exactly as it arrived, so `session=abc%2Fdef`
+  contributed `abc%2Fdef` and nothing else. Percent-encoding cookie values is
+  a common convention that Autumn itself follows — the `autumn_time_zone`
+  cookie is percent-decoded before use — so an application doing the same
+  holds `abc/def`, which matched neither the whole header nor the recorded
+  component. Cookie values now join the echo set under both spellings, and
+  stay whole-token-only so a `theme=dark` cookie still cannot shred *darkness*
+  in an unrelated failure. Unlike the form and query values
+  `mask_raw_urlencoded` records both spellings for, a cookie value is not
+  form-encoded: `+` stays a `+` rather than folding to a space, matching
+  Autumn's own cookie decoder.
+
+  The decoded spelling — an inference about what a handler holds, rather than
+  something the request carried — is only recorded once it is at least four
+  bytes and not all whitespace. `%2F`, `%3D`, `%30` and `%20` decode to `/`,
+  `=`, `0` and a space, and a one-byte needle masked as a whole token would
+  rewrite `failed at /`, `x = y` and `status 0` in the outcome while blanking
+  any bind equal to it, which drops that column from replay's comparison. The
+  spelling that actually arrived is still recorded however short, exactly as
+  before.
+- **`rediss://` no longer panics at startup, in any Redis-backed subsystem
+  (#2172):** `redis`'s `tokio-rustls-comp` builds its TLS `ClientConfig`
+  through `rustls::ClientConfig::builder()`, which *panics* rather than
+  erroring when no process-level `CryptoProvider` is installed — and rustls
+  can only resolve one implicitly while exactly one of its `ring`/`aws-lc-rs`
+  features is on, which Cargo's whole-graph feature unification can break from
+  any dependency (`telemetry-otlp` alone is enough). Only `autumn-cache-redis`
+  guarded against this; sessions, channels, the Redis job queue, job tracking,
+  idempotency, webhook replay and Redis rate limiting each opened their own
+  unguarded client. Since the `azure-container-apps` release target provisions
+  a Redis Cache with `non_ssl_port_enabled = false` — it can only ever hand the
+  app a `rediss://` URL — pointing any of those subsystems at it crashed the
+  app on boot.
+
+  Every Redis client the framework opens now goes through
+  `autumn_web::redis_tls::open_client`, which installs `ring` once,
+  idempotently, and only when the URL is a TLS one — decided by asking the
+  `redis` crate to parse it and checking whether it resolved to a TLS address,
+  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
+  accepts are all covered without a scheme list to keep in sync. (The previous
+  `starts_with("rediss://")` check had already missed both.) A plaintext
+  `redis://` URL deliberately does **not** claim the process-wide default, so
+  it cannot pre-empt an application that installs `aws-lc-rs` for something
+  else, and an already-installed provider is always kept rather than replaced.
+  `autumn-cache-redis` now delegates to the same guard instead of carrying its
+  own copy, and a source scan in each crate keeps a future subsystem from
+  re-opening the hole with a bare `redis::Client::open`.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
@@ -1439,6 +1578,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count proves it), so it's unused slack, not extra allocator work — see
   `form_render_alloc_gate.rs` for the full explanation and its updated
   ceiling.
+
+- **`[compression]`-enabled apps no longer pay an extra ingress box level for
+  it (#2371):** every other config-gated member of `apply_middleware`'s
+  single merged `Router::layer` tuple composes in via a plain
+  `tower::util::option_layer`, but `CompressionLayer` changes the response
+  body type, which `option_layer`'s `Either` cannot absorb (both of its
+  branches must share one `Response` type) — so `apply_compression_middleware`
+  kept its own standalone `Router::layer` call, the one member of the ingress
+  stack #2198 didn't fold in. That call boxes the whole downstream stack in a
+  fresh `BoxCloneSyncService` that every request above it deep-clones, the
+  same quadratic-per-layer cost #2193/#2198 fixed for the rest of the stack.
+  Compression now folds into the merged tuple too, paired with
+  `NormalizeBodyLayer` — the same body-type-adapter the tuple already uses
+  elsewhere — so `option_layer`'s two branches agree on a `Response` type
+  again. Compression is off by default, so this is a pure win for the apps
+  that turn it on and a no-op otherwise, confirmed by
+  `middleware_stack_depth.rs`'s `compression_enabled_does_not_deepen_the_framework_cascade`
+  (traversal count no longer moves when `[compression] enabled = true` is
+  toggled) alongside the unmoved default-feature `INGRESS_TRAVERSAL_WINDOW`
+  gate. `AssetCacheControlLayer`, the event-bus/oauth tuple, and the
+  outermost `SecurityHeadersLayer` remain separate `Router::layer` calls —
+  each has a genuine ordering/scope constraint (route-mount timing,
+  dev-profile-only middleware injected between it and the rest of the stack,
+  and MCP-dispatch-clone timing respectively) that folding would change the
+  behavior of, not just its cost.
+- **scaffolded form helpers build their `-field`/`-error` id suffix by direct
+  string concatenation instead of `format!`:** `text_input`, `password_input`,
+  `textarea_input`, `number_input`, `checkbox_input`, `date_input` each built
+  `let wrapper_id = format!("{field_html}-field");` and (when the field has an
+  error) `format!("{field_html}-error")` — a fixed two-part concatenation of
+  already-`&str` pieces, but routed through `format!`'s `Arguments`/
+  `fmt::Write` dispatch and an unsized `String::new()` that grows via
+  reallocation as the pieces land, rather than a single up-front
+  `String::with_capacity`. Profiling the committed
+  `autumn/benches/form_render.rs` workload showed `alloc::fmt::format::format_inner`
+  and `core::fmt::write` alone at 2.46%/2.00% of the release-build
+  instruction count, plus a further ~4% in the `String`-growth machinery
+  (`RawVecInner::finish_grow`/`reserve::do_reserve_and_handle`) those two
+  calls' unsized starting buffer drove. A new private `concat_suffix(base,
+  suffix)` helper (`String::with_capacity(base.len() + suffix.len())` plus
+  two `push_str` calls) replaces all 12 call sites (2 per helper × 6
+  helpers); output is byte-for-byte unchanged (verified by the unchanged 209
+  `form`/`nested_form` lib tests).
+
+  Measured with the committed `autumn/benches/form_render.rs` harness and the
+  existing `autumn/tests/form_render_alloc_gate.rs` allocation gate (both the
+  same 12-field workload), `valgrind --tool=callgrind`, before and after on
+  the same machine:
+
+  | | before | after | delta |
+  | --- | ---: | ---: | ---: |
+  | Instructions (3,000-iteration run) | 159,827,570 | 138,424,533 | **-13.39%** |
+  | `alloc::fmt::format::format_inner` instructions | 3,928,400 (2.46%) | 0 (eliminated) | **-100%** |
+  | `core::fmt::write` instructions | 3,202,591 (2.00%) | 0 (eliminated) | **-100%** |
+  | Allocation blocks (200 renders) | 20,800 | 18,000 | **-13.5%** |
+  | Allocation bytes (200 renders) | 4,604,600 | 4,565,600 | -0.85% |
+
+  Clears the impact floor two ways independently: >=5% instruction reduction
+  on the realistic, directly-exercised bench workload, and >=10% allocation-
+  block reduction per the gate. The block-count drop is larger than the
+  12-call-site count alone would suggest — `format!`'s unsized starting
+  buffer apparently cost more than one allocation for some of these calls
+  once it had to grow, not just the final `String`.
 
 ## [0.7.0] - 2026-08-23
 

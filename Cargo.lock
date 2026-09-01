@@ -453,7 +453,6 @@ version = "0.7.0"
 dependencies = [
  "autumn-web",
  "redis",
- "rustls",
  "serde",
  "serde_json",
  "testcontainers",
