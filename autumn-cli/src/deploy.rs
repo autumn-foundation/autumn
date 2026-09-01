@@ -2593,23 +2593,49 @@ fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpl
 /// profile override file — so a profile that sets or clears the key wins, and
 /// a stray `capacity.lock` nobody points at is never shipped.
 fn configured_capacity_contract(dirs: &[PathBuf], profile: &str) -> Option<String> {
-    fn read_key(path: &Path) -> Option<Option<String>> {
-        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-        let server = parsed.get("server")?;
-        // Present-but-empty clears the key, matching the env override.
-        server
-            .get("capacity_contract")
-            .map(|value| value.as_str().map(str::to_owned).filter(|s| !s.is_empty()))
+    /// What one config layer says about `[server] capacity_contract`.
+    ///
+    /// The three states are distinct and all matter: a layer that is silent
+    /// must not override an earlier one, while a layer that sets the key to
+    /// the empty string deliberately *clears* it — matching how the
+    /// `AUTUMN_SERVER__CAPACITY_CONTRACT` env override behaves.
+    enum LayerValue {
+        Silent,
+        Cleared,
+        Set(String),
     }
 
-    let mut configured = first_dir_with_file(dirs, "autumn.toml").and_then(|p| read_key(&p))?;
+    fn read_key(path: &Path) -> LayerValue {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return LayerValue::Silent;
+        };
+        let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+            return LayerValue::Silent;
+        };
+        match parsed
+            .get("server")
+            .and_then(|server| server.get("capacity_contract"))
+            .and_then(toml::Value::as_str)
+        {
+            None => LayerValue::Silent,
+            Some("") => LayerValue::Cleared,
+            Some(value) => LayerValue::Set(value.to_owned()),
+        }
+    }
+
+    let mut configured = match first_dir_with_file(dirs, "autumn.toml").map(|p| read_key(&p)) {
+        Some(LayerValue::Set(value)) => Some(value),
+        _ => None,
+    };
 
     let normalized =
         autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
     for name in autumn_web::config::profile_override_file_lookup_names(&normalized, profile) {
         if let Some(local) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) {
-            if let Some(override_value) = read_key(&local) {
-                configured = override_value;
+            match read_key(&local) {
+                LayerValue::Set(value) => configured = Some(value),
+                LayerValue::Cleared => configured = None,
+                LayerValue::Silent => {}
             }
             break;
         }

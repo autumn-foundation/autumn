@@ -193,10 +193,10 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
 
     let candidate = build_contract(&knee, shapes, calibration);
 
-    match committed {
-        Some(committed) => check(opts, &committed, &candidate),
-        None => write(opts, &candidate),
-    }
+    committed.map_or_else(
+        || write(opts, &candidate),
+        |committed| check(opts, &committed, &candidate),
+    )
 }
 
 /// The workload this run should drive.
