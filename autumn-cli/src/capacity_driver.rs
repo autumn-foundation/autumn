@@ -453,16 +453,19 @@ fn child_env(profile: &str) -> Vec<(String, String)> {
         "127.0.0.1,localhost".to_owned(),
     );
 
-    // The driver speaks plain HTTP to a reserved TCP port, so a profile that
-    // terminates TLS in-process or binds a unix socket would leave it probing
-    // a listener that is not there — a 60s wait and no measurement. Clear both
-    // for the calibration child rather than teaching the driver two more
-    // transports. The cost this omits (TLS handshake and record framing) is a
-    // per-connection cost the keep-alive ladder would barely see anyway, and
-    // the guide says so.
-    env.push(("AUTUMN_SERVER__TLS__CERT_PATH".to_owned(), String::new()));
-    env.push(("AUTUMN_SERVER__TLS__KEY_PATH".to_owned(), String::new()));
+    // The driver speaks plain HTTP to a reserved TCP port, so a profile binding
+    // a unix socket would leave it probing a listener that is not there.
+    // Clearing this one is safe: the override reads an empty value as "unset".
     env.push(("AUTUMN_SERVER__UNIX_SOCKET".to_owned(), String::new()));
+
+    // TLS is deliberately NOT cleared the same way. `apply_env_overrides`
+    // materializes `server.tls` from the *presence* of either TLS variable and
+    // stores the empty string as a path, so setting them to "" would switch
+    // TLS *on* — with empty certificate paths — for every app, including the
+    // overwhelming majority that configure none. That would break plain
+    // `autumn calibrate` everywhere in order to serve the rare in-process-TLS
+    // case. A profile that terminates TLS itself is reported by the readiness
+    // timeout instead, which names it as the likely cause.
 
     env
 }
@@ -586,7 +589,11 @@ fn boot(
     }
     stop_child(&mut child);
     Err(format!(
-        "the app did not answer {ready_path} with a success status within 60s"
+        "the app did not answer {ready_path} with a success status within 60s.\n\n  \
+         Calibration drives plain HTTP over a TCP port. If this profile terminates TLS \
+         in-process\n  (`[server.tls]` or ACME), the app is listening but not speaking \
+         what the driver speaks —\n  calibrate under a profile that does not, with \
+         `--profile <name>`."
     ))
 }
 

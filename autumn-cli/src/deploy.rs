@@ -2605,9 +2605,16 @@ fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpl
 ///
 /// A key present but empty clears the setting, matching the env override.
 fn configured_capacity_contract(dirs: &[PathBuf], profile: &str) -> Option<String> {
-    let base_path = first_dir_with_file(dirs, "autumn.toml")?;
-    let mut merged: toml::Value =
-        toml::from_str(&std::fs::read_to_string(&base_path).ok()?).ok()?;
+    // The base file is OPTIONAL, exactly as it is for the runtime loader: a
+    // deployment may legitimately ship only `autumn-prod.toml`. Requiring it
+    // here would skip the contract for such a deployment while
+    // `manifest_uploads_in` still uploaded the profile file that references
+    // it — the config would name a contract that is not in the release, and
+    // admission would fall open.
+    let mut merged = first_dir_with_file(dirs, "autumn.toml")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
 
     let canonical =
         autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
@@ -6185,6 +6192,25 @@ mod tests {
         let uploads = manifest_uploads_in(&dirs, "prod");
         let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
         assert_eq!(names, vec!["autumn.toml", "capacity.lock"]);
+    }
+
+    #[test]
+    fn manifest_uploads_read_the_contract_from_a_profile_only_manifest() {
+        // A deployment may ship only `autumn-prod.toml`. The runtime loads it
+        // regardless, and `manifest_uploads_in` uploads it — so the contract it
+        // names has to travel too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\ncapacity_contract = \"capacity.lock\"\n",
+        )
+        .expect("write sibling");
+        std::fs::write(dir.path().join("capacity.lock"), "version = 1\n").expect("write contract");
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn-prod.toml", "capacity.lock"]);
     }
 
     #[test]
