@@ -938,7 +938,7 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
     SweepFailure {
         cutoff: None,
         removed,
-        error: crate::AutumnError::internal_server_error_msg(message),
+        error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
 
@@ -954,7 +954,7 @@ fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> Swee
     SweepFailure {
         cutoff: Some(cutoff),
         removed,
-        error: crate::AutumnError::internal_server_error_msg(message),
+        error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
 
@@ -965,7 +965,10 @@ fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> Swee
 struct SweepFailure {
     cutoff: Option<DateTime<Utc>>,
     removed: u64,
-    error: crate::AutumnError,
+    /// Boxed to keep the `Err` variant of this module's sweep `Result`s small:
+    /// `AutumnError` is wide enough that carrying it inline trips
+    /// `clippy::result_large_err` on every function that returns one.
+    error: Box<crate::AutumnError>,
 }
 
 /// Resolve `NOW() - window` **on the database server**.
