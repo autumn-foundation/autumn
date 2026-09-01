@@ -1532,7 +1532,7 @@ fn const_i32(wasm: &[u8], at: usize, limit: usize) -> Option<(Option<u64>, usize
     // The proposal's grammar is a fold over constants, so a handful of slots is
     // more than any real offset needs; a deeper expression is reported as
     // unevaluable rather than growing a stack for an untrusted module.
-    let mut stack = [0i32; 8];
+    let mut stack = [0i32; 16];
     let mut depth = 0usize;
     let mut evaluable = true;
     let mut at = at;
@@ -1685,6 +1685,12 @@ enum DataSectionEnd {
     /// The walk succeeded and found no active write to measure: every segment
     /// is passive, so nothing is copied at instantiation.
     NothingActive,
+    /// The walk succeeded, and an active segment's offset could not be
+    /// evaluated — an expression past the evaluator's stack, or one reading a
+    /// global this walk has not tracked. The segment *is* copied in at
+    /// instantiation; this simply cannot say where, which is the one thing the
+    /// bounds check needs to know.
+    ActiveUnevaluable,
     /// The furthest byte an active segment writes.
     Furthest(u64),
 }
@@ -1697,7 +1703,7 @@ impl DataSectionEnd {
     /// nothing is how a segment past the end of memory got admitted.
     const fn contribution(&self) -> u64 {
         match *self {
-            Self::Unreadable => u64::MAX,
+            Self::Unreadable | Self::ActiveUnevaluable => u64::MAX,
             Self::NothingActive => 0,
             Self::Furthest(end) => end,
         }
@@ -1717,6 +1723,11 @@ fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> DataSectio
 fn walk_data_section(wasm: &[u8], start: usize, section_end: usize) -> Option<DataSectionEnd> {
     let (count, mut at) = leb128(wasm, start)?;
     let mut furthest: Option<u64> = None;
+    // An active segment whose offset this cannot evaluate is not the same as no
+    // active segment at all, and reading it as one was a bounds check that
+    // silently did not run: the bytes are copied in regardless of whether this
+    // could work out where.
+    let mut active_unevaluable = false;
     for _ in 0..count {
         let (flags, next) = leb128(wasm, at)?;
         at = next;
@@ -1738,10 +1749,17 @@ fn walk_data_section(wasm: &[u8], start: usize, section_end: usize) -> Option<Da
         if at > section_end {
             return None;
         }
-        if let Some(offset) = offset {
-            let segment_end = offset.checked_add(len as u64)?;
-            furthest = Some(furthest.map_or(segment_end, |f: u64| f.max(segment_end)));
+        match (active, offset) {
+            (true, Some(offset)) => {
+                let segment_end = offset.checked_add(len as u64)?;
+                furthest = Some(furthest.map_or(segment_end, |f: u64| f.max(segment_end)));
+            }
+            (true, None) => active_unevaluable = true,
+            (false, _) => {}
         }
+    }
+    if active_unevaluable {
+        return Some(DataSectionEnd::ActiveUnevaluable);
     }
     Some(furthest.map_or(DataSectionEnd::NothingActive, DataSectionEnd::Furthest))
 }
@@ -4080,6 +4098,68 @@ path = "/hello/greet"
             "the denial detail carries the guest's whole header: {} bytes",
             logged.detail.len()
         );
+    }
+
+    #[test]
+    fn an_active_offset_this_cannot_evaluate_is_refused_rather_than_skipped() {
+        // The extended-const fix closed the door where the *walk* failed. This
+        // is the other door: the walk succeeds, and an active segment's offset
+        // cannot be evaluated. The old code reported that as "no active write
+        // to measure" — indistinguishable from a passive-only section — so the
+        // segment was copied in at instantiation with nothing having checked
+        // where it lands.
+        //
+        // The expression below is flat rather than folded: every operand is
+        // pushed before any add runs, so it is the *stack* that is exceeded,
+        // not the parser. wasmi compiles it happily.
+        let mut operands = String::new();
+        for _ in 0..24 {
+            operands.push_str("i32.const 0 ");
+        }
+        let mut adds = String::new();
+        for _ in 0..24 {
+            adds.push_str("i32.add ");
+        }
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (data (offset i32.const 65536 {operands} {adds}) "xx")
+  (func (export "_start") (nop))
+)"#
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let mut config = wasmi::Config::default();
+        config.consume_fuel(true);
+        wasmi::Module::new(&wasmi::Engine::new(&config), &wasm[..])
+            .expect("wasmi compiles a deep extended-const offset; the finding depends on it");
+
+        let shape = module_shape(&wasm).expect("the section still walks cleanly");
+        assert_eq!(
+            shape.data_end,
+            u64::MAX,
+            "an offset that cannot be evaluated must be treated as one that cannot fit",
+        );
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("an active segment with an unevaluable offset must be refused");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
+            "{err:?}",
+        );
+
+        // And the refusal is about *active* segments, not about the evaluator
+        // giving up: the same unevaluable expression on a passive segment is
+        // copied by nothing at instantiation, so it still loads.
+        let passive = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data "passive, and its offset is not a question")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &passive)
+            .expect("a passive segment must still load");
     }
 
     #[test]

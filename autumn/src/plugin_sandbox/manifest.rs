@@ -803,12 +803,44 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
 /// failure detail is evidence and has to survive to be read.
 pub(super) const fn is_display_reordering(ch: char) -> bool {
     matches!(ch,
-        '\u{061C}'                          // Arabic letter mark
+        // Unicode's format class (general category Cf), which is the class this
+        // is really asking about. Enumerated rather than queried because the
+        // standard library exposes no general-category predicate — `is_control`
+        // answers for Cc only, and `is_whitespace` for the separators, so a
+        // format character passes both.
+        //
+        // Listing selected ranges was not enough and the gap was invisible in
+        // the most literal sense: U+00AD SOFT HYPHEN renders as nothing at all,
+        // so `/hello/ad\u{00AD}min` reads as `/hello/admin` on the consent
+        // screen while mounting a path that is not it.
+        '\u{00AD}'                          // soft hyphen
+        | '\u{0600}'..='\u{0605}'            // Arabic number signs
+        | '\u{061C}'                         // Arabic letter mark
+        | '\u{06DD}'                         // Arabic end of ayah
+        | '\u{070F}'                         // Syriac abbreviation mark
+        | '\u{0890}'..='\u{0891}'            // Arabic pound and piastre marks
+        | '\u{08E2}'                         // Arabic disputed end of ayah
+        | '\u{180E}'                         // Mongolian vowel separator
         | '\u{200B}'..='\u{200F}'            // zero-width, LRM/RLM
         | '\u{202A}'..='\u{202E}'            // bidi embedding and override
         | '\u{2060}'..='\u{2064}'            // word joiner and invisibles
         | '\u{2066}'..='\u{2069}'            // bidi isolates
+        | '\u{206A}'..='\u{206F}'            // deprecated shaping and digit forms
         | '\u{FEFF}'                         // zero-width no-break space
+        | '\u{FFF9}'..='\u{FFFB}'            // interlinear annotation
+        | '\u{110BD}'                        // Kaithi number sign
+        | '\u{110CD}'                        // Kaithi number sign above
+        | '\u{13430}'..='\u{1343F}'          // Egyptian hieroglyph formats
+        | '\u{1BCA0}'..='\u{1BCA3}'          // Duployan shorthand formats
+        | '\u{1D173}'..='\u{1D17A}'          // musical notation formats
+        | '\u{E0001}'                        // deprecated language tag
+        | '\u{E0020}'..='\u{E007F}'          // tag characters
+        // Not Cf, but display-altering by definition and just as invisible: the
+        // variation selectors and the combining grapheme joiner.
+        | '\u{034F}'                         // combining grapheme joiner
+        | '\u{180B}'..='\u{180D}'            // Mongolian free variation selectors
+        | '\u{FE00}'..='\u{FE0F}'            // variation selectors 1-16
+        | '\u{E0100}'..='\u{E01EF}'          // variation selectors 17-256
     )
 }
 
@@ -1184,6 +1216,63 @@ max_concurrency = 8
             ),
             "an escape sequence in a route path must be refused"
         );
+    }
+
+    #[test]
+    fn an_invisible_format_character_in_a_route_is_refused_like_a_visible_one() {
+        // The predicate listed the bidi and zero-width ranges and stopped
+        // there, which left the most literally invisible case through: U+00AD
+        // SOFT HYPHEN renders as nothing, and neither `is_control` (Cc only)
+        // nor `is_whitespace` claims it. `/hello/ad\u{00AD}min` therefore reads
+        // as `/hello/admin` on the consent screen while mounting a path that is
+        // not it — the same substitution the bidi overrides buy, with no
+        // reordering needed.
+        //
+        // The whole format class is covered now, so this walks the classes
+        // rather than the one character that was reported.
+        for (ch, what) in [
+            ('\u{00AD}', "soft hyphen"),
+            ('\u{200B}', "zero-width space"),
+            ('\u{200E}', "left-to-right mark"),
+            ('\u{2062}', "invisible times"),
+            ('\u{206F}', "nominal digit shapes"),
+            ('\u{FEFF}', "zero-width no-break space"),
+            ('\u{FFF9}', "interlinear annotation anchor"),
+            ('\u{034F}', "combining grapheme joiner"),
+            ('\u{FE0F}', "variation selector-16"),
+            ('\u{E0041}', "tag latin capital A"),
+        ] {
+            assert!(
+                !ch.is_control() && !ch.is_whitespace(),
+                "{what} is caught by an earlier check, so it does not test this one",
+            );
+            assert!(
+                is_display_reordering(ch),
+                "{what} (U+{:04X}) is display-altering and was admitted",
+                ch as u32,
+            );
+
+            let src = valid_toml().replace(
+                r#"path = "/hello/greet""#,
+                &format!(r#"path = "/hello/ad{ch}min""#),
+            );
+            assert!(
+                matches!(
+                    SandboxManifest::parse(&src),
+                    Err(ManifestError::InvalidRoutePath { .. })
+                ),
+                "a route path carrying {what} must be refused",
+            );
+        }
+
+        // And ordinary text is unaffected — a path is allowed to be non-ASCII,
+        // it is only allowed not to lie about what it is.
+        for ch in ['é', 'ß', '日', '🦀'] {
+            assert!(
+                !is_display_reordering(ch),
+                "{ch:?} is ordinary text and must not be refused",
+            );
+        }
     }
 
     #[test]
