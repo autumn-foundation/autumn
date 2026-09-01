@@ -1625,12 +1625,13 @@ async fn a_transaction_time_floor_far_ahead_of_the_database_refuses_the_write() 
     assert_eq!(broken.kind, LedgerBreak::MissingRevision);
 }
 
-/// While the head revision is still there, its own instant — which its hash
-/// covers — is the floor, and the mark's is ignored entirely. So rewriting the
-/// mark's instant cannot steer a later revision's transaction time at all.
+/// Rewriting *only* the mark's instant is a mark rewrite like any other: it is
+/// what `ledger_verify` calls `HighWaterMismatch`, so the write path refuses it
+/// on exactly the same condition. Anything verify can see must not be something
+/// an ordinary write erases.
 #[tokio::test]
-async fn a_rewritten_mark_instant_cannot_steer_the_next_revisions_time() {
-    let pool = boot_pool("lg_txn_time_mark_ignored").await;
+async fn a_rewritten_mark_instant_is_refused_like_any_other_mark_rewrite() {
+    let pool = boot_pool("lg_txn_time_mark_rewrite").await;
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
 
@@ -1645,7 +1646,72 @@ async fn a_rewritten_mark_instant_cannot_steer_the_next_revisions_time() {
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
-        .expect("rewrite the mark's instant");
+        .expect("rewrite the mark's instant, leaving seq and hash alone");
+    }
+
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("reported")
+            .kind,
+        LedgerBreak::HighWaterMismatch
+    );
+
+    assert!(
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(11),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "the append must refuse rather than overwrite the mark and launder the \
+         accusation away"
+    );
+
+    // Still reported afterwards, and nothing was written.
+    assert_eq!(repo.ledger_revisions(id).await.expect("revisions").len(), 3);
+    assert_eq!(
+        repo.ledger_verify(id)
+            .await
+            .expect("verify")
+            .broken
+            .expect("still reported")
+            .kind,
+        LedgerBreak::HighWaterMismatch
+    );
+}
+
+/// While the head revision is present its own instant — which its hash covers —
+/// is the floor, and the mark's is ignored. Shown in the one state where a
+/// disagreeing mark still writes: a mark *behind* the head, which is what a
+/// pre-#2323 node in a mixed-version fleet leaves.
+#[tokio::test]
+async fn a_mark_behind_the_head_cannot_steer_the_next_revisions_time() {
+    let pool = boot_pool("lg_txn_time_mark_ignored").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(45));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET high_seq = 2, \
+             head_hash = (SELECT hash FROM _autumn_ledger_revisions \
+                          WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2), \
+             recorded_at = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("leave the mark behind, carrying a bogus instant");
     }
 
     repo.update(
@@ -1656,7 +1722,7 @@ async fn a_rewritten_mark_instant_cannot_steer_the_next_revisions_time() {
         },
     )
     .await
-    .expect("update");
+    .expect("a mark behind the head must not block writes");
 
     let head = repo
         .ledger_revisions(id)
@@ -1670,6 +1736,7 @@ async fn a_rewritten_mark_instant_cannot_steer_the_next_revisions_time() {
          revision that carries a hashed one is still there: {} >= {ahead}",
         head.recorded_at
     );
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
 }
 
 /// The as-of guarantee that rests on it: a transaction-time query at `t` is

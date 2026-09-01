@@ -2476,9 +2476,13 @@ fn ledger_append_ts(
             // appending would destroy the evidence, allow where the evidence
             // survives the append.**
             //
-            //   * mark gone beside a live chain, and mark naming a different
-            //     revision at the head's own sequence number — the append would
-            //     overwrite the mark and the disagreement with it. Refuse.
+            //   * mark gone beside a live chain, and mark describing a different
+            //     revision (a different hash *or* a different instant) at the
+            //     head's own sequence number — the append would overwrite the
+            //     mark and the disagreement with it. Refuse. The second test is
+            //     kept identical to the one `head_versus_mark` reports
+            //     `HighWaterMismatch` on, so nothing verify can see is something
+            //     an ordinary write can erase.
             //   * mark *behind* the head — legitimate: a pre-#2323 node in a
             //     mixed-version fleet appends without raising the mark. Allow;
             //     the write heals it, as `HighWaterBehind`'s docs promise.
@@ -2505,8 +2509,15 @@ fn ledger_append_ts(
                     ),
                 )?;
             }
+            // Deliberately the same condition `head_versus_mark` reports
+            // `HighWaterMismatch` on, `recorded_at` included. Anything verify
+            // calls a mismatch and the writer overwrites anyway is an accusation
+            // ordinary traffic launders away — the mark's instant carries no hash
+            // of its own, so rewriting only that field would otherwise be
+            // reported once and then quietly erased by the next append.
             if __lg_state.mark_seq == __lg_state.head_seq
-                && __lg_state.mark_hash.as_deref() != __lg_state.head_hash.as_deref()
+                && (__lg_state.mark_hash.as_deref() != __lg_state.head_hash.as_deref()
+                    || __lg_state.mark_recorded_at != __lg_state.head_recorded_at)
             {
                 ::core::result::Result::<(), ::autumn_web::AutumnError>::Err(
                     ::autumn_web::AutumnError::internal_server_error(
@@ -2514,10 +2525,11 @@ fn ledger_append_ts(
                             table: #table_name_ts.to_string(),
                             record_id: __lg_record_id,
                             detail: "the high-water mark and the chain head carry the \
-                                     same sequence number but different hashes; one of \
-                                     the two was rewritten out of band. Appending here \
-                                     would settle the disagreement in the writer's \
-                                     favour and erase it — run `ledger_verify` instead"
+                                     same sequence number but describe different \
+                                     revisions; one of the two was rewritten out of \
+                                     band. Appending here would settle the disagreement \
+                                     in the writer's favour and erase it — run \
+                                     `ledger_verify` instead"
                                 .to_string(),
                         },
                     ),
