@@ -292,6 +292,15 @@ workspace already does, and what the route macros emit. Field access, pattern
 matching with a `..` rest, and deserialization of an older routes dump are all
 unaffected: the two `RouteInfo` fields are `#[serde(default)]`.
 
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical (end the literal with `..Default::default()`), but a rewrite
+cannot tell an exhaustive struct literal that *wants* to name every field from
+one that simply predates these three, and appending a rest pattern to the wrong
+literal would silently paper over a genuinely missing value on a later field
+addition. Direct struct-literal construction of all three types is rare outside
+the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
+normally deserialized from `autumn.toml`.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the
