@@ -161,7 +161,9 @@ pub(super) fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&st
 /// build the response.
 ///
 /// A recorded value is used only if, after trimming, it is non-empty and every
-/// byte is visible ASCII or a tab (see [`is_legal_content_type_byte`]).
+/// byte is visible ASCII (`0x20`–`0x7e`) or a horizontal tab — tab is legal OWS
+/// around media-type parameters, so rejecting it would send a declared
+/// `application/rss+xml;\tprofile="x"` back to the derivation.
 /// `HeaderValue::from_str` alone is not a sufficient filter: it accepts any byte
 /// `>= 0x20` except DEL, so `"   "` and
 /// `"text/htmlé"` pass it. Either would produce a `Content-Type` the compression
