@@ -38,7 +38,7 @@ const COMMIT_HOOKS_DDL: &str =
 const UNIQUENESS_DDL: &str =
     include_str!("../../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
 const RETENTION_INDEX_DDL: &str =
-    include_str!("../../migrations/20260831000000_retention_sweep_indexes/up.sql");
+    include_str!("../../migrations/20260831191622_retention_sweep_indexes/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {

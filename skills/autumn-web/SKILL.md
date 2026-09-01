@@ -130,6 +130,18 @@ my-app/
 └── autumn-dev.toml    # legacy profile file; [profile.dev] also works
 ```
 
+> **Never hand-create a directory under `migrations/`.** Run `autumn generate
+> migration <Name>` (or `autumn schema diff --write-migration`) and put your SQL
+> in the `up.sql`/`down.sql` it creates — including when you are writing every
+> line of that SQL yourself. The generator's job is picking the version.
+>
+> App, framework and plugin migrations share one version space, keyed on the
+> 14-digit prefix, so a hand-typed `20260831000000` collides with whatever
+> anyone else authored that day and one of the two silently never runs. The
+> generator mints a full `YYYYMMDDHHMMSS` from the clock. CI rejects a `000000`
+> time component, a version that isn't a real UTC timestamp, and any duplicate
+> (`scripts/check-migration-versions.sh`).
+
 ## Cargo.toml
 
 ```toml

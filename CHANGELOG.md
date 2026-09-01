@@ -430,6 +430,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI now rejects colliding migration versions:** app, framework and plugin
+  migrations are applied into one shared version space — diesel keys
+  `__diesel_schema_migrations` on the 14-digit version and
+  `autumn_migration_checksums` makes it a `PRIMARY KEY` — so two migrations
+  claiming one version are not two migrations: the loser silently never runs.
+  Hand-written day-granularity names (`YYYYMMDD000000`) collide by
+  construction, because every author who types a date pads the same six zeros.
+  The damage was already in the tree: `examples/reddit-clone` carries
+  `20260513000001` and `20260702000001`, hand-bumped by one off framework
+  versions, and `00000000000000` was shared by the framework, the starters, the
+  benchmark app and eight examples. A new gate
+  (`scripts/check-migration-versions.sh`, run in the `Migration guide coverage`
+  job) fails a migration whose time component is `000000`, whose digits are not
+  a real UTC timestamp (`20260530300000` has hour 30), whose name is not
+  `<14 digits>_<snake_case>`, or whose version is already claimed. The
+  generators already did the right thing — `autumn generate migration` and
+  `autumn schema diff --write-migration` mint a full `YYYYMMDDHHMMSS` from the
+  clock — so this closes the hand-created-directory bypass rather than adding a
+  new convention. Pre-existing offenders are grandfathered in
+  `scripts/migration-version-baseline.txt` and deliberately **not** renamed:
+  they have already been applied to real databases, and renaming one makes the
+  framework consider it unapplied and run it again.
+
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
   `HEALTHCHECK` to `curl -f http://localhost:3000/health`, so an image whose app
