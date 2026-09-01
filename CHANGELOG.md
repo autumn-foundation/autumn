@@ -546,6 +546,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/migration-version-baseline.txt` and deliberately **not** renamed:
   they have already been applied to real databases, and renaming one makes the
   framework consider it unapplied and run it again.
+- **Failure capsules: credential components no longer miss the spelling the
+  handler holds (#2212):** `record_credential_components` records the secret
+  *inside* a masked header — the token after an auth scheme, each auth-param
+  value, each cookie value — so the echo set matches what a handler actually
+  extracted rather than only the whole header line. Two spellings escaped it.
+
+  The parser began by requiring the whole header value to be UTF-8, so a
+  single `obs-text` byte — legal inside a `quoted-string`, and reachable with
+  a perfectly valid header — skipped **every** component, including parameters
+  that were plain ASCII and independently parseable. A byte-oriented `Digest`
+  handler extracted `response="deadbeef"` from
+  `Digest username="<0xff>alice", response="deadbeef"`, echoed it into an
+  error and bound it, and nothing in the echo set matched. The parser now
+  works on bytes throughout: the scheme split, `is_auth_scheme` and
+  `is_token68`, and the quoted-string walk in `split_auth_params` /
+  `unquote_auth_param`. Same class as the `Basic` case fixed earlier, where
+  requiring the decoded `user:password` to be UTF-8 discarded an ASCII
+  password because of a byte in the username beside it.
+
+  A `Cookie` value was recorded exactly as it arrived, so `session=abc%2Fdef`
+  contributed `abc%2Fdef` and nothing else. Percent-encoding cookie values is
+  a common convention that Autumn itself follows — the `autumn_time_zone`
+  cookie is percent-decoded before use — so an application doing the same
+  holds `abc/def`, which matched neither the whole header nor the recorded
+  component. Cookie values now join the echo set under both spellings, and
+  stay whole-token-only so a `theme=dark` cookie still cannot shred *darkness*
+  in an unrelated failure. Unlike the form and query values
+  `mask_raw_urlencoded` records both spellings for, a cookie value is not
+  form-encoded: `+` stays a `+` rather than folding to a space, matching
+  Autumn's own cookie decoder.
+
+  The decoded spelling — an inference about what a handler holds, rather than
+  something the request carried — is only recorded once it is at least four
+  bytes and not all whitespace. `%2F`, `%3D`, `%30` and `%20` decode to `/`,
+  `=`, `0` and a space, and a one-byte needle masked as a whole token would
+  rewrite `failed at /`, `x = y` and `status 0` in the outcome while blanking
+  any bind equal to it, which drops that column from replay's comparison. The
+  spelling that actually arrived is still recorded however short, exactly as
+  before.
+- **`rediss://` no longer panics at startup, in any Redis-backed subsystem
+  (#2172):** `redis`'s `tokio-rustls-comp` builds its TLS `ClientConfig`
+  through `rustls::ClientConfig::builder()`, which *panics* rather than
+  erroring when no process-level `CryptoProvider` is installed — and rustls
+  can only resolve one implicitly while exactly one of its `ring`/`aws-lc-rs`
+  features is on, which Cargo's whole-graph feature unification can break from
+  any dependency (`telemetry-otlp` alone is enough). Only `autumn-cache-redis`
+  guarded against this; sessions, channels, the Redis job queue, job tracking,
+  idempotency, webhook replay and Redis rate limiting each opened their own
+  unguarded client. Since the `azure-container-apps` release target provisions
+  a Redis Cache with `non_ssl_port_enabled = false` — it can only ever hand the
+  app a `rediss://` URL — pointing any of those subsystems at it crashed the
+  app on boot.
+
+  Every Redis client the framework opens now goes through
+  `autumn_web::redis_tls::open_client`, which installs `ring` once,
+  idempotently, and only when the URL is a TLS one — decided by asking the
+  `redis` crate to parse it and checking whether it resolved to a TLS address,
+  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
+  accepts are all covered without a scheme list to keep in sync. (The previous
+  `starts_with("rediss://")` check had already missed both.) A plaintext
+  `redis://` URL deliberately does **not** claim the process-wide default, so
+  it cannot pre-empt an application that installs `aws-lc-rs` for something
+  else, and an already-installed provider is always kept rather than replaced.
+  `autumn-cache-redis` now delegates to the same guard instead of carrying its
+  own copy, and a source scan in each crate keeps a future subsystem from
+  re-opening the hole with a bare `redis::Client::open`.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
@@ -1423,6 +1489,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `form_render_alloc_gate.rs` for the full explanation and its updated
   ceiling.
 
+- **`[compression]`-enabled apps no longer pay an extra ingress box level for
+  it (#2371):** every other config-gated member of `apply_middleware`'s
+  single merged `Router::layer` tuple composes in via a plain
+  `tower::util::option_layer`, but `CompressionLayer` changes the response
+  body type, which `option_layer`'s `Either` cannot absorb (both of its
+  branches must share one `Response` type) — so `apply_compression_middleware`
+  kept its own standalone `Router::layer` call, the one member of the ingress
+  stack #2198 didn't fold in. That call boxes the whole downstream stack in a
+  fresh `BoxCloneSyncService` that every request above it deep-clones, the
+  same quadratic-per-layer cost #2193/#2198 fixed for the rest of the stack.
+  Compression now folds into the merged tuple too, paired with
+  `NormalizeBodyLayer` — the same body-type-adapter the tuple already uses
+  elsewhere — so `option_layer`'s two branches agree on a `Response` type
+  again. Compression is off by default, so this is a pure win for the apps
+  that turn it on and a no-op otherwise, confirmed by
+  `middleware_stack_depth.rs`'s `compression_enabled_does_not_deepen_the_framework_cascade`
+  (traversal count no longer moves when `[compression] enabled = true` is
+  toggled) alongside the unmoved default-feature `INGRESS_TRAVERSAL_WINDOW`
+  gate. `AssetCacheControlLayer`, the event-bus/oauth tuple, and the
+  outermost `SecurityHeadersLayer` remain separate `Router::layer` calls —
+  each has a genuine ordering/scope constraint (route-mount timing,
+  dev-profile-only middleware injected between it and the rest of the stack,
+  and MCP-dispatch-clone timing respectively) that folding would change the
+  behavior of, not just its cost.
 - **scaffolded form helpers build their `-field`/`-error` id suffix by direct
   string concatenation instead of `format!`:** `text_input`, `password_input`,
   `textarea_input`, `number_input`, `checkbox_input`, `date_input` each built
