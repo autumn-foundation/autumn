@@ -830,3 +830,64 @@ fn a_window_at_the_supported_maximum_is_accepted() {
         .validate()
         .expect_err("one second past the boundary is not");
 }
+
+// ── The report never claims enforcement the backend cannot deliver ───────
+
+#[tokio::test]
+async fn the_memory_session_store_is_reported_as_unenforced() {
+    // Regression (#1605 Codex round 5): `session.backend = "memory"` is the
+    // default, and `MemoryStore` is a plain map with no expiry — capping
+    // `session.max_age_secs` bounds only the browser cookie. Presenting that
+    // as backend-TTL enforcement would be a compliance report asserting a
+    // policy nothing applies.
+    let mut config = AutumnConfig::default();
+    config.retention.sessions = Some("1h".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("sessions"),
+        },
+    )
+    .await
+    .expect("run");
+
+    let skipped = reports[0].skipped.as_deref().expect("a note is reported");
+    assert!(
+        skipped.contains("NOT enforced"),
+        "the memory store must be reported as unenforced: {skipped}"
+    );
+    assert!(
+        skipped.contains("redis"),
+        "the note must say how to fix it: {skipped}"
+    );
+}
+
+#[tokio::test]
+async fn a_redis_session_backend_reports_write_time_enforcement() {
+    let mut config = AutumnConfig::default();
+    config.session.backend = autumn_web::session::SessionBackend::Redis;
+    config.retention.sessions = Some("1h".to_owned());
+    let state = autumn_web::AppState::for_test();
+    state.insert_extension(config);
+
+    let reports = autumn_web::data_retention::run_retention(
+        &state,
+        &autumn_web::data_retention::RetentionRunOptions {
+            dry_run: true,
+            dataset: Some("sessions"),
+        },
+    )
+    .await
+    .expect("run");
+
+    let skipped = reports[0].skipped.as_deref().expect("a note is reported");
+    assert!(skipped.contains("enforced at write time"), "{skipped}");
+    assert!(
+        !skipped.contains("NOT enforced"),
+        "a store that does expire records must not be reported as unenforced: {skipped}"
+    );
+}

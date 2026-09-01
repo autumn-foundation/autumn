@@ -910,6 +910,10 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
         .find(|r| r.dataset == "job_history")
         .expect("reported");
     assert!(job_history.error.is_some(), "{job_history:?}");
+    assert!(
+        job_history.truncated,
+        "a failed pass certainly did not drain the table: {job_history:?}"
+    );
     let assignments = reports
         .iter()
         .find(|r| r.dataset == "experiment_assignments")

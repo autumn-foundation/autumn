@@ -187,10 +187,13 @@ already guarantees the marker's own window is within the retention window.
 >   custom store keeps its server-side rows until *it* expires them. The
 >   report's `sessions` note states this; treat the window as a cookie bound
 >   plus a contract your store has to honour.
-> - **The in-memory session and idempotency stores are development backends.**
->   The in-memory session store has no expiry at all; run Redis (or a custom
+> - **The in-memory session store has no expiry at all**, so with the default
+>   `session.backend = "memory"` a `sessions` window bounds only the browser
+>   cookie. The report says so in as many words — `NOT enforced` — rather
+>   than presenting it as backend-TTL enforcement. Run Redis (or a custom
 >   `SessionStore` that honours the window) in production, as the session
->   guide already recommends.
+>   guide already recommends. The in-memory idempotency store is likewise a
+>   development backend.
 
 **`archive rewrite`** — the JSONL audit archive is rewritten without the stale
 entries: filtered into a sibling temp file that inherits the archive's

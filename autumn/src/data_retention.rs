@@ -580,17 +580,10 @@ async fn run_one_dataset(
             // with and age out under it, so enforcement is complete only once
             // the previous TTL has elapsed. Claiming otherwise would make the
             // report assert a bound the data does not yet satisfy.
-            report.skipped = Some(format!(
-                "enforced at write time: records are stored with a TTL capped at {}s by the \
-                 backend, not deleted by this sweep. Records written before this window was \
-                 set keep their original TTL until it elapses{}",
+            report.skipped = Some(backend_ttl_note(
+                dataset,
+                config,
                 effective.window.map_or(0, |window| window.as_secs()),
-                if dataset == RetentionDataset::Sessions {
-                    ", and a custom SessionStore installed with \
-                     AppBuilder::with_session_store must apply the window itself"
-                } else {
-                    ""
-                }
             ));
         }
         RetentionEnforcement::ArchiveRewrite => {
@@ -600,6 +593,44 @@ async fn run_one_dataset(
 
     report.duration_ms = elapsed_ms(started);
     report
+}
+
+/// The report note for a `backend ttl` dataset: what the window means here,
+/// and — importantly — where it does *not* hold.
+///
+/// A write-time cap cannot reach a record that already exists, and the
+/// in-memory session store records no expiry at all, so claiming plain
+/// "enforced by the backend" would present an unenforced policy as an
+/// enforced one. Each caveat is named rather than left to the guide.
+fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_secs: u64) -> String {
+    // `session.backend = "memory"` is the default, and `MemoryStore` is a
+    // plain `HashMap` with no expiry: capping `session.max_age_secs` shortens
+    // only the browser cookie while the server-side record lives as long as
+    // the process. That is not retention, and the report must not call it
+    // that.
+    if dataset == RetentionDataset::Sessions
+        && config.session.backend == crate::session::SessionBackend::Memory
+    {
+        return format!(
+            "NOT enforced: the in-memory session store keeps records for the life of the \
+             process, so this {window_secs}s window bounds only the session cookie. Set \
+             session.backend = \"redis\" (or install a SessionStore that applies the \
+             window) to bound the server-side records"
+        );
+    }
+
+    let mut note = format!(
+        "enforced at write time: records are stored with a TTL capped at {window_secs}s by \
+         the backend, not deleted by this sweep. Records written before this window was set \
+         keep their original TTL until it elapses"
+    );
+    if dataset == RetentionDataset::Sessions {
+        note.push_str(
+            ", and a custom SessionStore installed with AppBuilder::with_session_store must \
+             apply the window itself",
+        );
+    }
+    note
 }
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {
@@ -732,14 +763,22 @@ async fn apply_sweep(
             report.rows_removed = swept.removed;
             report.truncated = swept.truncated;
         }
-        Err((removed, error)) => {
+        Err(failure) => {
             // Batches are separate autocommit statements, so whatever earlier
             // ones deleted is permanently gone. Report it alongside the
             // failure rather than auditing a real deletion as zero, and mark
             // the pass truncated — it certainly did not drain the table.
-            report.rows_removed = removed;
+            //
+            // The cutoff comes with it once the database resolved one: those
+            // deletes used *that* boundary, and leaving the provisional
+            // app-clock value in place would have the audit record name a
+            // different one under clock skew.
+            if let Some(cutoff) = failure.cutoff {
+                report.cutoff = Some(cutoff.to_rfc3339());
+            }
+            report.rows_removed = failure.removed;
             report.truncated = true;
-            report.error = Some(error.to_string());
+            report.error = Some(failure.error.to_string());
         }
     }
 }
@@ -800,7 +839,7 @@ async fn sweep_postgres(
     dataset: RetentionDataset,
     window: Duration,
     dry_run: bool,
-) -> Result<SweptDataset, (u64, crate::AutumnError)> {
+) -> Result<SweptDataset, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     let Some((table, predicate)) = stale_row_predicate(dataset) else {
@@ -850,7 +889,13 @@ async fn sweep_postgres(
         // `removed`, not 0: each batch is its own autocommit statement, so
         // everything earlier batches deleted is permanently gone even though
         // this one failed.
-        .map_err(|e| sweep_failed(removed, format!("retention sweep of {table} failed: {e}")))?;
+        .map_err(|e| {
+            sweep_failed_at(
+                cutoff,
+                removed,
+                format!("retention sweep of {table} failed: {e}"),
+            )
+        })?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
         // Stop only on a batch that deleted *nothing*, not merely fewer than
         // `SWEEP_BATCH_ROWS`. A short batch does not mean the table is
@@ -883,11 +928,38 @@ async fn sweep_postgres(
 /// Pair an error with the rows the pass had already deleted when it hit that
 /// error, so no failure path can silently drop the count.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
-fn sweep_failed(removed: u64, message: String) -> (u64, crate::AutumnError) {
-    (
+fn sweep_failed(removed: u64, message: String) -> SweepFailure {
+    SweepFailure {
+        cutoff: None,
         removed,
-        crate::AutumnError::internal_server_error_msg(message),
-    )
+        error: crate::AutumnError::internal_server_error_msg(message),
+    }
+}
+
+/// As [`sweep_failed`], for a failure that happened *after* the database
+/// resolved the cutoff.
+///
+/// The committed deletes used that cutoff, so the report and the audit record
+/// must state it — not the provisional app-clock value `run_one_dataset`
+/// seeded, which under clock skew names a different deletion boundary from
+/// the one actually applied.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> SweepFailure {
+    SweepFailure {
+        cutoff: Some(cutoff),
+        removed,
+        error: crate::AutumnError::internal_server_error_msg(message),
+    }
+}
+
+/// A sweep pass that failed, carrying everything the pass still has to
+/// report: the cutoff the database applied (once known), the rows earlier
+/// autocommit batches already deleted, and the error itself.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+struct SweepFailure {
+    cutoff: Option<DateTime<Utc>>,
+    removed: u64,
+    error: crate::AutumnError,
 }
 
 /// Resolve `NOW() - window` **on the database server**.
@@ -902,7 +974,7 @@ async fn resolve_cutoff(
     conn: &mut diesel_async::AsyncPgConnection,
     table: &str,
     window: Duration,
-) -> Result<DateTime<Utc>, (u64, crate::AutumnError)> {
+) -> Result<DateTime<Utc>, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -948,7 +1020,7 @@ async fn count_stale(
     predicate: &str,
     cutoff: DateTime<Utc>,
     removed_so_far: u64,
-) -> Result<u64, (u64, crate::AutumnError)> {
+) -> Result<u64, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -965,7 +1037,8 @@ async fn count_stale(
     .await
     .map(|row| u64::try_from(row.count).unwrap_or(0))
     .map_err(|e| {
-        sweep_failed(
+        sweep_failed_at(
+            cutoff,
             removed_so_far,
             format!("retention count for {table} failed: {e}"),
         )
