@@ -203,9 +203,21 @@ use autumn_web::static_gen::{ManifestEntry, StaticManifest};
 let entry = ManifestEntry::new("about/index.html")
     .with_revalidate(Some(3600))
     .with_content_type(Some("text/html; charset=utf-8".to_owned()));
-// `new` stamps `generated_at` and `autumn_version` for you.
+// `new` stamps `generated_at` (Unix-epoch seconds) and `autumn_version` for
+// you; chain `.with_generated_at(fixed)` to pin a reproducible timestamp.
 let manifest = StaticManifest::new(routes);
 ```
+
+Exhaustive *destructuring* is sealed too, not just literals — `let
+ManifestEntry { file, revalidate } = entry;` now fails with E0638. Add `..` to
+the pattern (`let ManifestEntry { file, revalidate, .. } = entry;`) or read the
+fields directly.
+
+The on-disk JSON is unaffected in both directions: an existing `dist/` loads
+with `content_type` absent and keeps its previous derived types, and a manifest
+written by this release still carries every key a pre-#1832 runtime requires, so
+a rollback or a rolling deploy sharing one `dist/` volume keeps serving
+statically.
 
 **Automation:** `manual` — the rewrite is not a rename or an import move. A
 struct literal has to become a constructor call plus a variable number of

@@ -10492,6 +10492,112 @@ enabled = true
         );
     }
 
+    /// The other half of the two-entry font carve-out: WOFF **v1** is
+    /// pre-compressed too, and `COMPRESSION_EXCLUDED_CONTENT_TYPES` lists
+    /// `font/woff` separately from `font/woff2`. Without this, deleting the
+    /// `font/woff` line leaves the suite green.
+    #[tokio::test]
+    async fn ssg_woff_font_is_not_compressed_and_keeps_mime() {
+        let mut bytes = b"wOFF".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+
+        // Both paths: the legacy derivation from the file name, and a manifest
+        // that recorded `font/woff` at generation time.
+        for (label, recorded) in [("derived", None), ("recorded", Some("font/woff"))] {
+            let tmp =
+                create_ssg_dist_with_types(&[("/inter", "fonts/inter.woff", &bytes, recorded)]);
+            let dist = tmp.path().join("dist");
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/inter")
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("font/woff"),
+                "{label}: woff asset must keep its font/woff MIME type"
+            );
+            assert_eq!(
+                response.headers().get(http::header::CONTENT_ENCODING),
+                None,
+                "{label}: pre-compressed woff font must not be re-compressed"
+            );
+        }
+    }
+
+    /// The carve-out is deliberately narrow: raw SFNT fonts (`.ttf`/`.otf`) are
+    /// *not* pre-compressed and must keep being gzipped. Nothing else in the
+    /// repo defends this, so "tidying" the exclusion list into a `font/` prefix
+    /// match would silently stop compressing them — this is the test that says
+    /// no.
+    #[tokio::test]
+    async fn ssg_raw_sfnt_fonts_stay_compressible() {
+        // Highly compressible padding, well past the size floor.
+        let mut bytes = vec![0u8, 1, 0, 0];
+        bytes.extend(std::iter::repeat_n(b'A', 4096));
+
+        for (route, file, expected) in [
+            ("/inter-ttf", "fonts/inter.ttf", "font/ttf"),
+            ("/inter-otf", "fonts/inter.otf", "font/otf"),
+        ] {
+            let tmp = create_ssg_dist(&[(route, file, &bytes)]);
+            let dist = tmp.path().join("dist");
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "{route} must keep its raw-font MIME type"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "{route}: raw SFNT fonts are uncompressed data and must still be \
+                 gzipped — only WOFF/WOFF2 embed their own compression"
+            );
+        }
+    }
+
     /// A manifest-backed asset served from a nested path with a multi-dot file
     /// name (`assets/js/app.min.js`) resolves to the JavaScript MIME type. The
     /// middleware derives the type from the file name alone, so neither the
@@ -11251,10 +11357,16 @@ enabled = true
                 format!("User-agent: *\nDisallow:\n{}", "# note\n".repeat(128)),
             )
         }
+        // Bodies are padded past the compression size floor throughout, so the
+        // `Content-Encoding` assertions below turn on the recorded *type* and
+        // never on the body being too small to bother with.
         async fn sitemap() -> impl axum::response::IntoResponse {
             (
                 [(http::header::CONTENT_TYPE, "application/xml")],
-                "<?xml version=\"1.0\"?><urlset/>".to_owned(),
+                format!(
+                    "<?xml version=\"1.0\"?><urlset>{}</urlset>",
+                    "<url><loc>https://example.com/</loc></url>".repeat(16)
+                ),
             )
         }
         async fn release_notes() -> impl axum::response::IntoResponse {
@@ -11266,7 +11378,7 @@ enabled = true
         async fn feed() -> impl axum::response::IntoResponse {
             (
                 [(http::header::CONTENT_TYPE, "application/rss+xml")],
-                "<rss/>".to_owned(),
+                format!("<rss><channel>{}</channel></rss>", "<item/>".repeat(64)),
             )
         }
         // Slug says `.txt`, handler says JSON. No derivation from the route or
@@ -11274,8 +11386,27 @@ enabled = true
         async fn notes() -> impl axum::response::IntoResponse {
             (
                 [(http::header::CONTENT_TYPE, "application/json")],
-                r#"{"notes":[]}"#.to_owned(),
+                format!(
+                    r#"{{"notes":[{}]}}"#,
+                    r#""note","#.repeat(32).trim_end_matches(',')
+                ),
             )
+        }
+        // The third #1819 case, on the recorded path: a slug whose final
+        // segment contains dots and an `@` but which is plain HTML.
+        async fn profile() -> impl axum::response::IntoResponse {
+            axum::response::Html(format!(
+                "<html><body>{}</body></html>",
+                "Alice. ".repeat(128)
+            ))
+        }
+        // The behaviour change the changelog calls out as breaking, proven at
+        // the served-header level and not just in the manifest: an
+        // *extensionless* route returning a bare `String` declares
+        // `text/plain; charset=utf-8`, and that is now what is served — where
+        // the pre-#1832 heuristic assumed `text/html` from `about/index.html`.
+        async fn about() -> impl axum::response::IntoResponse {
+            "About us. ".repeat(128)
         }
 
         fn meta(path: &'static str, name: &'static str) -> crate::static_gen::StaticRouteMeta {
@@ -11293,7 +11424,9 @@ enabled = true
             .route("/sitemap.xml", axum::routing::get(sitemap))
             .route("/posts/release.v1", axum::routing::get(release_notes))
             .route("/feed", axum::routing::get(feed))
-            .route("/notes.txt", axum::routing::get(notes));
+            .route("/notes.txt", axum::routing::get(notes))
+            .route("/users/alice@example.com", axum::routing::get(profile))
+            .route("/about", axum::routing::get(about));
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let dist = tmp.path().join("dist");
@@ -11305,6 +11438,8 @@ enabled = true
                 meta("/posts/release.v1", "release_notes"),
                 meta("/feed", "feed"),
                 meta("/notes.txt", "notes"),
+                meta("/users/alice@example.com", "profile"),
+                meta("/about", "about"),
             ],
             &dist,
         )
@@ -11319,16 +11454,22 @@ enabled = true
             "posts/release.v1/index.html",
             "feed/index.html",
             "notes.txt/index.html",
+            "users/alice@example.com/index.html",
+            "about/index.html",
         ] {
             assert!(dist.join(file).is_file(), "{file} must have been generated");
         }
 
+        // Route, recorded/served type, and whether the type makes the body
+        // compressible — the recorded type's whole transport consequence.
         let expected = [
-            ("/robots.txt", "text/plain; charset=utf-8"),
-            ("/sitemap.xml", "application/xml"),
-            ("/posts/release.v1", "text/html; charset=utf-8"),
-            ("/feed", "application/rss+xml"),
-            ("/notes.txt", "application/json"),
+            ("/robots.txt", "text/plain; charset=utf-8", true),
+            ("/sitemap.xml", "application/xml", true),
+            ("/posts/release.v1", "text/html; charset=utf-8", true),
+            ("/feed", "application/rss+xml", true),
+            ("/notes.txt", "application/json", true),
+            ("/users/alice@example.com", "text/html; charset=utf-8", true),
+            ("/about", "text/plain; charset=utf-8", true),
         ];
 
         // The build recorded the intended type for every route. This is the
@@ -11337,7 +11478,7 @@ enabled = true
         // rather than a restatement of the old heuristic.
         let manifest =
             crate::static_gen::StaticManifest::load(&dist.join("manifest.json")).expect("manifest");
-        for (route, content_type) in expected {
+        for (route, content_type, _) in expected {
             assert_eq!(
                 manifest.routes[route].content_type.as_deref(),
                 Some(content_type),
@@ -11345,7 +11486,7 @@ enabled = true
             );
         }
 
-        for (route, content_type) in expected {
+        for (route, content_type, compressible) in expected {
             let router = try_build_router_with_static(
                 Vec::new(),
                 &compression_enabled_config(),
@@ -11372,6 +11513,15 @@ enabled = true
                     .and_then(|v| v.to_str().ok()),
                 Some(content_type),
                 "{route} must be served as the type its handler declared at build time"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    == Some("gzip"),
+                compressible,
+                "{route}: the recorded type must drive compression negotiation"
             );
         }
     }

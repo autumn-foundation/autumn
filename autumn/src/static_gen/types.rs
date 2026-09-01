@@ -108,7 +108,10 @@ impl std::fmt::Debug for StaticRouteMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct StaticManifest {
-    /// ISO-8601 timestamp of when the build ran.
+    /// When the build ran: Unix-epoch seconds as a decimal string (e.g.
+    /// `"1774555920"`). Stamped by [`StaticManifest::new`]; override it with
+    /// [`with_generated_at`](StaticManifest::with_generated_at) to pin a
+    /// reproducible build.
     pub generated_at: String,
     /// Autumn framework version that produced this manifest.
     pub autumn_version: String,
@@ -136,7 +139,17 @@ pub struct ManifestEntry {
     /// supported way to map a route straight at a file, and requiring an
     /// explicit `"revalidate": null` made the shortest such entry fail to
     /// parse (which silently disables the whole static layer).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Deliberately *not* `skip_serializing_if`: making reads lenient is
+    /// backward compatible, but dropping the key from what `autumn build`
+    /// **writes** is not. A pre-#1832 runtime has no `#[serde(default)]` here,
+    /// so an omitted key is a hard `missing field` error for it — which fails
+    /// `StaticManifest::load`, returns `None` from `StaticFileLayer::new`, and
+    /// silently serves every pre-rendered page dynamically. That would break a
+    /// rollback, or a rolling deploy where old and new replicas share one
+    /// `dist/` volume. `content_type` is safe to skip because it is a *new*
+    /// key an old runtime ignores; `revalidate` is an existing required one.
+    #[serde(default)]
     pub revalidate: Option<u64>,
     /// The `Content-Type` the route's handler declared when this page was
     /// generated (#1832).
@@ -223,11 +236,11 @@ impl StaticManifest {
         }
     }
 
-    /// Override the build timestamp `new` stamped.
+    /// Override the build timestamp [`new`](Self::new) stamped.
     ///
-    /// Sealing the struct would otherwise remove the ability to write a
-    /// manifest with a fixed `generated_at`, which a reproducible-build tool
-    /// needs.
+    /// [`new`](Self::new) stamps the current time, which a reproducible-build
+    /// tool must be able to pin. This is the chainable way to do that; the
+    /// field stays `pub`, so assigning it through a `mut` binding also works.
     #[must_use]
     pub fn with_generated_at(mut self, generated_at: impl Into<String>) -> Self {
         self.generated_at = generated_at.into();
@@ -400,6 +413,30 @@ mod tests {
         assert!(
             !json.contains("content_type"),
             "absent Content-Type must not be written to the manifest, got {json}"
+        );
+    }
+
+    /// A manifest written by *this* Autumn must stay loadable by a **pre-#1832**
+    /// runtime, which declares `revalidate` with no `#[serde(default)]` and so
+    /// treats a missing key as a hard error. Omitting it would fail
+    /// `StaticManifest::load` there, `StaticFileLayer::new` would return `None`,
+    /// and every pre-rendered page would silently serve dynamically — breaking
+    /// a rollback or a rolling deploy sharing one `dist/`.
+    #[test]
+    fn manifest_entry_always_writes_revalidate_for_older_runtimes() {
+        let json =
+            serde_json::to_string(&ManifestEntry::new("about/index.html")).expect("serialize");
+        assert!(
+            json.contains("\"revalidate\""),
+            "revalidate must stay present in written manifests for pre-#1832 \
+             runtimes that require the key, got {json}"
+        );
+
+        // The half that *is* safe to omit: `content_type` is a new key an older
+        // runtime ignores, so skipping it costs nothing.
+        assert!(
+            !json.contains("content_type"),
+            "absent content_type must still be omitted, got {json}"
         );
     }
 

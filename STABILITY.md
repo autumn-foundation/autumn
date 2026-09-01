@@ -484,17 +484,28 @@ generator relies on instead of generating its own login/signup.
 `static_gen::ManifestEntry` gained a public `content_type` field, and both it
 and `static_gen::StaticManifest` became `#[non_exhaustive]` — so an existing
 `ManifestEntry { file, revalidate }` or `StaticManifest { .. }` literal stops
-compiling (E0063/E0639). Sealing them is the point: the manifest format is
+compiling (E0063/E0639), as does an exhaustive destructuring pattern such as
+`let ManifestEntry { file, revalidate } = entry;` (E0638). Sealing them is the
+point: the manifest format is
 expected to keep growing, and after this release a new field is additive rather
 than breaking. Only code that reads or writes `dist/manifest.json` itself is
 affected; ordinary `#[static_get]` applications are not. See
 [`docs/migrations/next.md`](docs/migrations/next.md).
 
-The JSON format itself is compatible in both directions: `content_type` is
+The JSON format itself is compatible in both directions. `content_type` is
 `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a new runtime
 reads an old manifest (the field defaults to absent, and the pre-#1832
 derivation runs unchanged), and an old runtime reads a new one (no
 `deny_unknown_fields`, so the extra key is ignored).
+
+`revalidate` gained `#[serde(default)]` — a hand-written entry may now omit it —
+but deliberately **not** `skip_serializing_if`. Leniency in what a new runtime
+*reads* is backward compatible; dropping a key from what `autumn build` *writes*
+is not. A pre-#1832 runtime declares `revalidate` with no default, so a missing
+key is a hard `missing field` error there: `StaticManifest::load` fails,
+`StaticFileLayer::new` returns `None`, and every pre-rendered page silently
+serves dynamically. Keeping the key written preserves rollback and rolling
+deploys that share one `dist/` volume.
 
 ### New public items
 
@@ -502,11 +513,17 @@ derivation runs unchanged), and an old runtime reads a new one (no
 |------|----------|-------|
 | `ManifestEntry::new` / `with_revalidate` / `with_content_type` | `autumn_web::static_gen` | The construction path that survives future fields |
 | `ManifestEntry::content_type` | `autumn_web::static_gen` | `Option<String>`; `None` means "nothing recorded", not "unknown type" |
-| `StaticManifest::new` | `autumn_web::static_gen` | Stamps `generated_at` and `autumn_version` |
+| `StaticManifest::new` | `autumn_web::static_gen` | Stamps `generated_at` (Unix-epoch seconds as a decimal string) and `autumn_version` |
+| `StaticManifest::with_generated_at` | `autumn_web::static_gen` | Pins the build timestamp `new` stamped, for reproducible builds |
 | `StaticFileLayer::resolve_entry` → `ResolvedStatic` | `autumn_web::static_gen` | Returns the file path plus the ready-to-serve `Content-Type`; `resolve` remains the file-path-only shorthand |
 | `resolved_content_type` | `autumn_web::static_gen` | The decision function, public so an app serving `dist/` itself can match Autumn's behaviour exactly |
 
-`ResolvedStatic` is `#[non_exhaustive]` from the start.
+`ResolvedStatic` is `#[non_exhaustive]` from the start, and has no public
+constructor — it is a return type, not something downstream code builds.
+
+`resolved_content_type` returns an `http::HeaderValue`, so `http` is now part of
+`autumn-web`'s public API surface here; it is re-exported as
+`autumn_web::reexports::http` (`autumn_web::http` is the HTTP *client* module).
 
 ## Pre-1.0 notes
 

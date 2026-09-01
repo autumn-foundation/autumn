@@ -90,14 +90,20 @@ pub struct ResolvedStatic {
 /// CR/LF and NUL are rejected by both checks, so header injection is impossible
 /// either way.
 ///
-/// Serving and ISR must agree on this, which is why it is one function. The
-/// serve path ignores an unusable value and derives instead; if the ISR check
-/// still treated that same value as authoritative, no handler response could
-/// ever match it and every regeneration would be refused forever — a
-/// hand-written or tampered manifest would freeze the route rather than merely
-/// having its bad value ignored.
+/// Serving, ISR **and generation** must agree on this, which is why it is one
+/// function. The serve path ignores an unusable value and derives instead; if
+/// the ISR check still treated that same value as authoritative, no handler
+/// response could ever match it and every regeneration would be refused forever
+/// — a hand-written or tampered manifest would freeze the route rather than
+/// merely having its bad value ignored. Generation
+/// ([`build::recorded_content_type`](super::build)) screens through the same
+/// function so the manifest can never carry a value the serve path will
+/// discard: `HeaderValue::to_str` accepts a horizontal tab, which is legal OWS
+/// between header parameters, so `application/rss+xml;\tprofile="…"` would
+/// otherwise be recorded, silently ignored at serve time, and the route served
+/// as the `text/html` its `feed/index.html` file name derives.
 #[must_use]
-fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&str> {
+pub(super) fn usable_recorded_content_type(recorded: Option<&str>) -> Option<&str> {
     recorded
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.bytes().all(|b| (0x20..0x7f).contains(&b)))
@@ -505,6 +511,12 @@ fn normalize_content_type(value: &str) -> Vec<String> {
     let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
 
     let mut parameters: Vec<String> = segments
+        // An empty segment carries no meaning, so a trailing or doubled `;`
+        // must not make two otherwise-identical types compare unequal. Without
+        // this, a handler that re-emits `text/html; charset=utf-8;` would be
+        // refused by the ISR check forever against a recorded
+        // `text/html; charset=utf-8`, freezing the route until the next build.
+        .filter(|segment| !segment.trim().is_empty())
         .map(|segment| {
             let segment = segment.trim();
             let Some((name, raw_value)) = segment.split_once('=') else {
@@ -748,6 +760,39 @@ mod tests {
         // No manifest.json at all
         let layer = StaticFileLayer::new(tmp.path());
         assert!(layer.is_none(), "should return None without manifest.json");
+    }
+
+    /// A manifest that is *present but unparseable* also disables static
+    /// serving — but unlike the absent case it is a misconfiguration, so
+    /// `StaticFileLayer::new` warns rather than failing silently. Absent stays
+    /// quiet: that is simply an app with no static build.
+    #[test]
+    fn layer_returns_none_for_an_unparseable_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("manifest.json"), "{ not json").expect("write");
+        assert!(
+            StaticFileLayer::new(tmp.path()).is_none(),
+            "an unparseable manifest must disable static serving, not panic"
+        );
+
+        // A manifest carrying a key this runtime does not know still loads —
+        // the forward-compatibility STABILITY.md promises for an older runtime
+        // reading a manifest written by a newer Autumn.
+        std::fs::write(
+            tmp.path().join("manifest.json"),
+            r#"{"generated_at":"1","autumn_version":"0.0.0","routes":{
+                "/about":{"file":"about/index.html","revalidate":null,
+                          "content_type":"text/html","future_field":42}}}"#,
+        )
+        .expect("write");
+        let layer = StaticFileLayer::new(tmp.path()).expect("unknown keys must be ignored");
+        assert_eq!(
+            layer
+                .resolve_entry("/about")
+                .expect("resolves")
+                .content_type,
+            "text/html"
+        );
     }
 
     #[test]
@@ -1044,10 +1089,14 @@ mod tests {
     fn resolved_content_type_recorded_overrides_route_extension() {
         let ct = resolved_content_type(
             Some("application/manifest+json"),
-            "/site.webmanifest",
-            Path::new("site.webmanifest/index.html"),
+            "/feed.xml",
+            Path::new("feed.xml/index.html"),
         );
-        assert_eq!(ct, "application/manifest+json");
+        assert_eq!(
+            ct, "application/manifest+json",
+            "`.xml` is a recognized asset extension deriving `application/xml`; \
+             the recorded value must beat it"
+        );
     }
 
     /// An empty recorded value is not a `Content-Type`; it must not produce an
@@ -1130,6 +1179,31 @@ mod tests {
     /// dangerous direction: a recorded `boundary=Aa` matching a regenerated
     /// `boundary=aa` lets ISR overwrite the body while every request still
     /// advertises the old boundary, making the multipart response undecodable.
+    /// An empty parameter segment carries no meaning. Treating one as a real
+    /// parameter would make a handler that re-emits `text/html; charset=utf-8;`
+    /// compare unequal to the recorded `text/html; charset=utf-8`, so
+    /// `regenerate_page` would refuse every regeneration and the route would
+    /// serve stale content until the next `autumn build` — the frozen-route
+    /// failure this comparison exists to avoid.
+    #[test]
+    fn content_type_equivalent_ignores_empty_parameter_segments() {
+        assert!(content_type_equivalent(
+            "text/html; charset=utf-8",
+            "text/html; charset=utf-8;"
+        ));
+        assert!(content_type_equivalent(
+            "text/html; charset=utf-8",
+            "text/html;;charset=utf-8"
+        ));
+        assert!(content_type_equivalent("text/html", "text/html; "));
+
+        // Still not a licence to ignore a real parameter.
+        assert!(!content_type_equivalent(
+            "text/html;",
+            "text/html; charset=utf-8"
+        ));
+    }
+
     #[test]
     fn content_type_equivalent_preserves_parameter_value_case_and_spacing() {
         assert!(!content_type_equivalent(
@@ -1149,6 +1223,35 @@ mod tests {
             r#"multipart/form-data; boundary="a;b""#,
             r#"MULTIPART/FORM-DATA;  boundary="a;b""#
         ));
+    }
+
+    /// Bites the quote/escape tracking in `split_unquoted_semicolons`
+    /// specifically. Without it, `boundary="a;b"` splits into `boundary="a` and
+    /// the tail `b"`, which has no `=` and is therefore *lowercased* as a
+    /// malformed segment — so `…"a;b"` and `…"a;B"` would compare **equal** and
+    /// ISR would overwrite a multipart body while every request still
+    /// advertised the old boundary.
+    #[test]
+    fn content_type_equivalent_tracks_quotes_and_escapes_in_parameter_values() {
+        assert!(
+            !content_type_equivalent(
+                r#"multipart/mixed; boundary="a;b""#,
+                r#"multipart/mixed; boundary="a;B""#
+            ),
+            "case inside a quoted value is significant even across a quoted `;`"
+        );
+        assert!(
+            !content_type_equivalent(
+                r#"multipart/mixed; boundary="a\";c""#,
+                r#"multipart/mixed; boundary="a\";C""#
+            ),
+            "an escaped quote does not end the quoted string, so the `;` after \
+             it is still part of the value"
+        );
+
+        // A malformed segment with no `=` has no value to protect, so it *is*
+        // case-folded — the branch the quoted cases above must not reach.
+        assert!(content_type_equivalent("text/html; FOO", "text/html; foo"));
     }
 
     /// A manifest whose recorded type the serve path refuses to honour must not

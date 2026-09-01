@@ -140,9 +140,12 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 /// Returns `None` when:
 ///
 /// - the handler declared no `Content-Type`;
-/// - the value is empty or blank, or its bytes are not visible ASCII (an opaque
-///   `HeaderValue` cannot survive a JSON round-trip and be re-emitted as the
-///   same header); or
+/// - the value is not one the serve path would honour — empty or blank after
+///   trimming, or carrying any byte outside visible ASCII (`0x20`–`0x7e`). The
+///   screen is
+///   [`usable_recorded_content_type`](super::middleware::usable_recorded_content_type),
+///   shared verbatim with the serve path so the manifest never stores a value
+///   that would be discarded at request time; or
 /// - the value is one of [`GENERIC_RETURN_TYPE_DEFAULTS`] *and* the route's own
 ///   final segment carries a recognized asset extension that disagrees with it.
 ///
@@ -190,18 +193,22 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 /// rather than the manifest carrying a value that is wrong, unusable, or merely
 /// an artifact of the return type.
 ///
-/// A `HeaderValue` is already free of CR/LF and control bytes, so a value that
-/// passes here is header-legal by construction. The serve path re-validates
-/// anyway, because a manifest on disk can be edited after the fact.
+/// A value that passes the shared screen is header-legal by construction — it is
+/// visible ASCII, so `HeaderValue::from_str` cannot reject it. The serve path
+/// re-validates anyway, because a manifest on disk can be edited after the fact.
+/// Note that `HeaderValue::to_str` alone would *not* be enough: it also accepts
+/// a horizontal tab, which is legal OWS between header parameters, so
+/// `application/rss+xml;\tprofile="…"` would be recorded and then ignored.
 fn recorded_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<String> {
-    let value = headers
+    let raw = headers
         .get(axum::http::header::CONTENT_TYPE)?
         .to_str()
-        .ok()?
-        .trim();
-    if value.is_empty() {
-        return None;
-    }
+        .ok()?;
+    // Screen through the exact predicate the serve path applies, so the
+    // manifest can never carry a value that is silently discarded at request
+    // time (which would fall back to a derivation the recorded value was meant
+    // to replace).
+    let value = super::middleware::usable_recorded_content_type(Some(raw))?;
 
     if GENERIC_RETURN_TYPE_DEFAULTS.contains(&value)
         && let Some(from_extension) = crate::assets::content_type_for_opt(url)
@@ -805,6 +812,40 @@ mod tests {
         );
     }
 
+    /// `HeaderValue::to_str` accepts a horizontal tab, which is legal OWS
+    /// between header parameters — but the serve path's screen rejects it. If
+    /// generation used the looser check, the manifest would carry a value no
+    /// request could ever use: `/feed` would be silently served as the
+    /// `text/html` its `feed/index.html` file name derives, under `nosniff`.
+    /// Generation and serving must screen identically.
+    #[tokio::test]
+    async fn skips_content_type_the_serve_path_would_discard() {
+        fn tabbed_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                let mut response = axum::response::Response::new(axum::body::Body::from("<rss/>"));
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_bytes(b"application/rss+xml;\tprofile=\"x\"")
+                        .expect("tab is a legal HeaderValue byte"),
+                );
+                response
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(tabbed_router(), &[test_meta("/feed", "feed")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert!(
+            manifest.routes["/feed"].content_type.is_none(),
+            "a value the serve path would discard must not be recorded, got {:?}",
+            manifest.routes["/feed"].content_type
+        );
+    }
+
     /// Pins the behaviour change the changelog documents: a handler returning a
     /// bare `String` declares `text/plain`, and that is now what gets recorded
     /// (and therefore served), instead of the `text/html` the old serve-time
@@ -927,13 +968,40 @@ mod tests {
         );
     }
 
-    /// And the guard must not swallow an extensionless route: `/about` has no
-    /// extension to prefer, so the declared `text/plain` is the only signal
-    /// there is and is recorded (see `records_text_plain_for_bare_string_handler`).
-    /// A route whose declared generic default *agrees* with its extension is
-    /// likewise unaffected in outcome.
+    /// The guard fires only when the extension-derived type **disagrees** with
+    /// the generic default. `/notes.txt` returning a bare `String` declares
+    /// `text/plain; charset=utf-8`, which is exactly what `.txt` derives, so
+    /// there is nothing to protect and the value is recorded.
+    ///
+    /// This is the assertion that distinguishes the `from_extension != value`
+    /// comparison from a blanket "generic default on any recognized extension →
+    /// record nothing": under the blanket rule this route would record `None`.
     #[tokio::test]
-    async fn generic_default_matching_the_extension_is_harmless() {
+    async fn generic_default_agreeing_with_the_extension_is_recorded() {
+        fn plain_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async { "hello".to_owned() }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(plain_router(), &[test_meta("/notes.txt", "notes")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/notes.txt"].content_type.as_deref(),
+            Some("text/plain; charset=utf-8"),
+            "a generic default that agrees with the route extension has nothing \
+             to clobber, so it must be recorded rather than dropped"
+        );
+    }
+
+    /// And the guard must not swallow a route whose extension is outside the
+    /// asset table: `.bin` derives nothing, so there is no preference to honour
+    /// and the declared value stands.
+    #[tokio::test]
+    async fn generic_default_is_recorded_for_an_unrecognized_extension() {
         fn bytes_router() -> axum::Router {
             axum::Router::new().fallback(axum::routing::get(|| async { vec![0u8, 1, 2, 3] }))
         }
@@ -944,8 +1012,6 @@ mod tests {
             .await
             .expect("render");
 
-        // `.bin` is not in the asset table, so there is no extension to prefer
-        // and the declared value stands.
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
         assert_eq!(
             manifest.routes["/data.bin"].content_type.as_deref(),
