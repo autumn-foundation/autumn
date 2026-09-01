@@ -22,9 +22,71 @@
 //!
 //! See issue #2172.
 
+/// Whether `url` needs the rustls `CryptoProvider` installed before a client
+/// built from it can connect.
+///
+/// Answered by asking the `redis` crate to parse the URL and reporting
+/// whether it resolved to a TLS address, rather than by matching schemes
+/// here. That distinction matters: the first cut of this check lived in
+/// `autumn-cache-redis` as `starts_with("rediss://")`, which silently missed
+/// Valkey's `valkeys://` and any case variant the URL parser accepts. Reusing
+/// `redis`'s own scheme table means a scheme it learns to treat as TLS is
+/// covered the day the dependency is bumped, with nothing to keep in sync.
+///
+/// A plain `redis://`/`valkey://` URL never touches TLS, so it must **not**
+/// claim the process-wide default: doing so could pre-empt a later, unrelated
+/// attempt elsewhere in the process to install a different provider (e.g.
+/// `aws-lc-rs`) for something that actually needs one. A URL `redis` cannot
+/// parse at all is likewise not TLS — [`open_client`] is about to reject it
+/// with that same parse error.
+#[must_use]
+pub fn url_needs_tls_crypto_provider(url: &str) -> bool {
+    use redis::IntoConnectionInfo as _;
+
+    url.into_connection_info()
+        .is_ok_and(|info| matches!(info.addr(), redis::ConnectionAddr::TcpTls { .. }))
+}
+
+/// Install `ring` as the process-wide default `CryptoProvider` if `url` is a
+/// TLS Redis URL and nothing has installed one yet.
+///
+/// Call this before handing a URL to any Redis client constructor this module
+/// does not own — [`open_client`] already does it for you. Idempotent and
+/// safe to race: an existing provider is always kept, because the requirement
+/// is only that *a* default exists before rustls looks for one, and silently
+/// replacing an application's deliberate choice would be worse than the panic
+/// this prevents.
+pub fn ensure_tls_crypto_provider(url: &str) {
+    if url_needs_tls_crypto_provider(url) && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        // Errors only if another thread won the race to install one, which
+        // satisfies the requirement just as well. `ring` matches the backend
+        // every other rustls call site in this workspace already pins.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// Open a Redis client, installing the rustls `CryptoProvider` first when
+/// `url` is a TLS (`rediss://` / `valkeys://`) endpoint.
+///
+/// The only sanctioned way to build a [`redis::Client`] in this crate — a
+/// unit test scans `src/` to keep it that way. See the module docs for why a
+/// bare `redis::Client::open` is a latent startup panic (#2172).
+///
+/// # Errors
+///
+/// Returns the `redis` crate's parse error when `url` is not a valid Redis
+/// connection URL. No connection is attempted here.
+pub fn open_client(url: &str) -> redis::RedisResult<redis::Client> {
+    ensure_tls_crypto_provider(url);
+    redis::Client::open(url)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    use super::{open_client, url_needs_tls_crypto_provider};
 
     use rusty_fork::rusty_fork_test;
 
@@ -34,6 +96,61 @@ mod tests {
     const TLS_URL: &str = "rediss://127.0.0.1:16380/";
     /// The plaintext counterpart, for the negative scenario.
     const PLAIN_URL: &str = "redis://127.0.0.1:16379/";
+
+    #[test]
+    fn plain_redis_urls_do_not_claim_the_process_wide_tls_provider() {
+        assert!(!url_needs_tls_crypto_provider("redis://127.0.0.1:6379/"));
+        assert!(!url_needs_tls_crypto_provider(
+            "redis://user:pass@host:6379/0"
+        ));
+        assert!(!url_needs_tls_crypto_provider("valkey://127.0.0.1:6379/"));
+        assert!(!url_needs_tls_crypto_provider("unix:///run/redis.sock"));
+        // Unparseable input is not TLS: `open_client` is about to reject it.
+        assert!(!url_needs_tls_crypto_provider(""));
+        assert!(!url_needs_tls_crypto_provider("not a redis url"));
+        assert!(!url_needs_tls_crypto_provider("https://example.com"));
+    }
+
+    #[test]
+    fn rediss_urls_claim_the_tls_provider() {
+        assert!(url_needs_tls_crypto_provider("rediss://127.0.0.1:6380/"));
+        assert!(url_needs_tls_crypto_provider(
+            "rediss://user:pass@cache.redis.cache.windows.net:6380/0"
+        ));
+    }
+
+    #[test]
+    fn valkeys_urls_also_claim_the_tls_provider() {
+        // Regression: `redis::Client::open` (via the `url` crate, which
+        // lowercases the scheme while parsing) treats both `rediss://` and
+        // Valkey's `valkeys://` as TLS — a literal `starts_with("rediss://")`
+        // check missed `valkeys://` entirely, so such a connection could
+        // reach `ClientConfig::builder()` with no provider installed.
+        assert!(url_needs_tls_crypto_provider("valkeys://127.0.0.1:6380/"));
+    }
+
+    #[test]
+    fn tls_scheme_matching_is_case_insensitive() {
+        // Regression: a literal `starts_with("rediss://")` also missed a
+        // case-variant scheme such as `REDISS://` — valid per URL parsing
+        // (schemes are normalized to lowercase) and accepted the same way by
+        // `redis::Client::open`, but invisible to a case-sensitive check.
+        assert!(url_needs_tls_crypto_provider("REDISS://127.0.0.1:6380/"));
+        assert!(url_needs_tls_crypto_provider("Valkeys://127.0.0.1:6380/"));
+    }
+
+    #[test]
+    fn a_scheme_that_merely_starts_with_a_tls_scheme_is_not_tls() {
+        // `redisstore://` shares the `rediss` prefix but is not a Redis
+        // scheme at all; a prefix match would have claimed the provider for
+        // it. `redis`'s parser rejects it outright, so it is not TLS.
+        assert!(!url_needs_tls_crypto_provider("redisstore://host:6379/"));
+    }
+
+    #[test]
+    fn open_client_rejects_a_malformed_url_without_panicking() {
+        assert!(open_client("not a redis url").is_err());
+    }
 
     /// Recursively collect every `.rs` file under `dir`.
     fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -63,7 +180,11 @@ mod tests {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         rust_sources(&src, &mut files);
-        assert!(!files.is_empty(), "no sources found under {}", src.display());
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
         files.sort();
 
         let mut offenders = Vec::new();
@@ -104,7 +225,6 @@ mod tests {
     /// Run `body` inside a Tokio runtime: the lazy `ConnectionManager`s these
     /// constructors build need a reactor context to spawn their background
     /// reconnect task onto, even though they never dial.
-    #[cfg(feature = "redis")]
     fn in_runtime(body: impl FnOnce()) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -115,7 +235,6 @@ mod tests {
 
     /// Assert that a fresh process starts with no provider — otherwise every
     /// assertion below would pass vacuously.
-    #[cfg(feature = "redis")]
     fn assert_no_provider_yet() {
         assert!(
             rustls::crypto::CryptoProvider::get_default().is_none(),
@@ -124,8 +243,7 @@ mod tests {
         );
     }
 
-    /// The `#[must_use]`-shaped assertion each TLS scenario ends on.
-    #[cfg(feature = "redis")]
+    /// The assertion every TLS scenario ends on.
     fn assert_provider_installed(subsystem: &str) {
         assert!(
             rustls::crypto::CryptoProvider::get_default().is_some(),
@@ -139,14 +257,15 @@ mod tests {
     // Each scenario runs in its own forked process: installing a
     // `CryptoProvider` is a one-shot process-global side effect, so a second
     // in-process assertion would pass no matter which subsystem installed it.
-    #[cfg(feature = "redis")]
     rusty_fork_test! {
         #[test]
         fn session_store_installs_the_tls_provider() {
             assert_no_provider_yet();
             in_runtime(|| {
-                let mut config = crate::session::SessionConfig::default();
-                config.backend = crate::session::SessionBackend::Redis;
+                let mut config = crate::session::SessionConfig {
+                    backend: crate::session::SessionBackend::Redis,
+                    ..Default::default()
+                };
                 config.redis.url = Some(TLS_URL.to_owned());
                 let _ = crate::session_redis::RedisStore::from_config(&config);
             });
@@ -160,8 +279,10 @@ mod tests {
         fn channels_backend_installs_the_tls_provider() {
             assert_no_provider_yet();
             in_runtime(|| {
-                let mut config = crate::config::ChannelConfig::default();
-                config.backend = crate::config::ChannelBackend::Redis;
+                let mut config = crate::config::ChannelConfig {
+                    backend: crate::config::ChannelBackend::Redis,
+                    ..Default::default()
+                };
                 config.redis.url = Some(TLS_URL.to_owned());
                 let _ = crate::channels::Channels::from_config(
                     &config,
@@ -210,8 +331,10 @@ mod tests {
         fn rate_limit_backend_installs_the_tls_provider() {
             assert_no_provider_yet();
             in_runtime(|| {
-                let mut config = crate::security::RateLimitConfig::default();
-                config.backend = crate::security::RateLimitBackend::Redis;
+                let mut config = crate::security::RateLimitConfig {
+                    backend: crate::security::RateLimitBackend::Redis,
+                    ..Default::default()
+                };
                 config.redis.url = Some(TLS_URL.to_owned());
                 let _ = crate::security::rate_limit::RateLimitLayer::from_config(&config);
             });
@@ -227,8 +350,10 @@ mod tests {
         fn a_plaintext_redis_url_leaves_the_process_provider_unset() {
             assert_no_provider_yet();
             in_runtime(|| {
-                let mut config = crate::session::SessionConfig::default();
-                config.backend = crate::session::SessionBackend::Redis;
+                let mut config = crate::session::SessionConfig {
+                    backend: crate::session::SessionBackend::Redis,
+                    ..Default::default()
+                };
                 config.redis.url = Some(PLAIN_URL.to_owned());
                 let _ = crate::session_redis::RedisStore::from_config(&config);
             });
