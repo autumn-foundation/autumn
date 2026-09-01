@@ -40,8 +40,11 @@ fn bulk_handler(
 ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
     Box::pin(async move {
         BULK_STARTED.fetch_add(1, Ordering::SeqCst);
-        // Slow: hold the shared slot long enough to demonstrate the flood.
-        sleep(Duration::from_millis(800)).await;
+        // Slow: hold the shared slot long enough to demonstrate the flood. The
+        // gap between this and the deadline below is the whole detection band,
+        // so keep it wide — the backlog is abandoned at shutdown, never drained,
+        // so a longer sleep costs no wall clock.
+        sleep(Duration::from_millis(3000)).await;
         Ok(())
     })
 }
@@ -155,8 +158,8 @@ async fn reserved_queue_is_served_promptly_under_flood() {
         .expect("enqueue critical job");
 
     // It must be served from `critical`'s reserved slot almost immediately —
-    // well before the 800ms bulk jobs would free the shared slot.
-    let critical_started = timeout(Duration::from_millis(600), async {
+    // well before the 3s bulk jobs would free the shared slot.
+    let critical_started = timeout(Duration::from_millis(1500), async {
         loop {
             if CRITICAL_STARTED.load(Ordering::SeqCst) >= 1 {
                 break;
@@ -181,6 +184,12 @@ async fn reserved_queue_is_served_promptly_under_flood() {
 static CAPPED_RUNNING: AtomicUsize = AtomicUsize::new(0);
 static CAPPED_PEAK: AtomicUsize = AtomicUsize::new(0);
 static CAPPED_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+// The uncapped control queue: without it, `peak == BULK_CAP` is also what a
+// process with only BULK_CAP workers produces, so the test would prove nothing
+// about the cap.
+static FREE_RUNNING: AtomicUsize = AtomicUsize::new(0);
+static FREE_PEAK: AtomicUsize = AtomicUsize::new(0);
+static FREE_COMPLETED: AtomicUsize = AtomicUsize::new(0);
 
 /// The cap under test, and the worker count it must stay below.
 const BULK_CAP: usize = 2;
@@ -208,17 +217,48 @@ fn capped_job_info() -> JobInfo {
     info
 }
 
+fn free_handler(
+    _state: AppState,
+    _payload: Value,
+) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+    Box::pin(async move {
+        let running = FREE_RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+        FREE_PEAK.fetch_max(running, Ordering::SeqCst);
+        sleep(Duration::from_millis(250)).await;
+        FREE_RUNNING.fetch_sub(1, Ordering::SeqCst);
+        FREE_COMPLETED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+}
+
+fn free_job_info() -> JobInfo {
+    let mut info = JobInfo::new("cap_free", 1, 10, free_handler);
+    info.queue = "free".to_string();
+    info
+}
+
 /// Redis config with 4 workers where `bulk` is capped at 2 concurrent jobs.
 fn concurrency_cap_config(url: &str) -> JobConfig {
     JobConfig {
         backend: "redis".to_owned(),
         workers: CAP_WORKERS,
-        queues: JobQueuesConfig::weighted_specs(vec![JobQueue {
-            name: "bulk".to_string(),
-            weight: 1,
-            concurrency: Some(BULK_CAP),
-            reserved: None,
-        }]),
+        queues: JobQueuesConfig::weighted_specs(vec![
+            JobQueue {
+                name: "bulk".to_string(),
+                weight: 1,
+                concurrency: Some(BULK_CAP),
+                reserved: None,
+            },
+            // Uncapped control: proves the pool really has more than `BULK_CAP`
+            // slots, so `bulk`'s peak is the cap doing its job rather than the
+            // process simply not having more workers to give.
+            JobQueue {
+                name: "free".to_string(),
+                weight: 1,
+                concurrency: None,
+                reserved: None,
+            },
+        ]),
         redis: JobRedisConfig {
             url: Some(url.to_owned()),
             ..Default::default()
@@ -245,6 +285,9 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
     CAPPED_RUNNING.store(0, Ordering::SeqCst);
     CAPPED_PEAK.store(0, Ordering::SeqCst);
     CAPPED_COMPLETED.store(0, Ordering::SeqCst);
+    FREE_RUNNING.store(0, Ordering::SeqCst);
+    FREE_PEAK.store(0, Ordering::SeqCst);
+    FREE_COMPLETED.store(0, Ordering::SeqCst);
 
     let container = RedisImage::default()
         .start()
@@ -259,7 +302,7 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
     let state = AppState::for_test().with_profile("dev");
     let shutdown = tokio_util::sync::CancellationToken::new();
     job::start_runtime(
-        vec![capped_job_info()],
+        vec![capped_job_info(), free_job_info()],
         &state,
         &shutdown,
         &concurrency_cap_config(&url),
@@ -271,23 +314,28 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
         job::enqueue("cap_capped_bulk", serde_json::json!({}))
             .await
             .expect("enqueue capped job");
+        job::enqueue("cap_free", serde_json::json!({}))
+            .await
+            .expect("enqueue uncapped control job");
     }
 
-    let drained = timeout(Duration::from_secs(30), async {
+    let drained = timeout(Duration::from_secs(60), async {
         loop {
-            if CAPPED_COMPLETED.load(Ordering::SeqCst) >= CAP_JOB_COUNT {
+            if CAPPED_COMPLETED.load(Ordering::SeqCst) >= CAP_JOB_COUNT
+                && FREE_COMPLETED.load(Ordering::SeqCst) >= CAP_JOB_COUNT
+            {
                 break;
             }
-            // Sample the peak while the backlog drains, not only at the end.
             sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
     assert!(
         drained.is_ok(),
-        "a capped queue must still drain its whole backlog, not deadlock ({} of {CAP_JOB_COUNT} \
-         completed)",
+        "a capped queue must still drain its whole backlog, not deadlock ({} capped and {} \
+         uncapped of {CAP_JOB_COUNT} each completed)",
         CAPPED_COMPLETED.load(Ordering::SeqCst),
+        FREE_COMPLETED.load(Ordering::SeqCst),
     );
 
     let peak = CAPPED_PEAK.load(Ordering::SeqCst);
@@ -299,9 +347,20 @@ async fn concurrency_cap_bounds_in_flight_jobs_below_the_worker_count() {
     // Guard against the cap "passing" because the queue never got going: with a
     // backlog of 8 and a cap of 2, at least 2 must have overlapped.
     assert!(
-        peak >= 2,
+        peak >= BULK_CAP,
         "expected the capped queue to use its full allowance of {BULK_CAP}, saw a peak of {peak} \
          — the test would not distinguish a cap from a stalled queue",
+    );
+    // The control: `peak <= BULK_CAP` alone is also what a process with only
+    // BULK_CAP workers would produce. The uncapped queue exceeding the cap is
+    // what establishes the shared pool really is larger, so `bulk`'s ceiling is
+    // the configured cap and not the worker count.
+    let free_peak = FREE_PEAK.load(Ordering::SeqCst);
+    assert!(
+        free_peak > BULK_CAP,
+        "the uncapped `free` queue peaked at {free_peak}, not above the {BULK_CAP} cap — so \
+         this run never proved the process had more than {BULK_CAP} slots to withhold, and \
+         `bulk`'s peak of {peak} says nothing about the cap",
     );
 
     shutdown.cancel();
@@ -322,16 +381,30 @@ static METRIC_FLOOD_RAN: AtomicUsize = AtomicUsize::new(0);
 /// flood phase run long.
 const METRIC_SAMPLES: usize = 20;
 
-/// Flood depth. Deep enough that `bulk`'s single shared slot (300ms per job)
-/// cannot drain it while the loaded phase samples, so the phase really is
-/// "one queue fully saturated by slow jobs".
+/// Baseline samples discarded before computing the baseline p95. The first
+/// samples run while both workers' Redis connections are still establishing and
+/// the container is warming, and `p95` over 20 samples is the second-largest —
+/// so two cold samples land exactly on the p95 index and inflate the budget.
+const METRIC_WARMUP_SAMPLES: usize = 5;
+
+/// How long each flood job holds `bulk`'s single shared slot. This is the signal:
+/// with the reservation removed, a `critical` job waits roughly one of these, so
+/// the budget below must stay well under it or the test cannot tell a working
+/// reservation from a broken one.
+const METRIC_FLOOD_SLEEP: Duration = Duration::from_millis(3000);
+
+/// Flood depth. Deep enough that `bulk`'s single shared slot cannot drain it
+/// while the loaded phase samples, so the phase really is "one queue fully
+/// saturated by slow jobs".
 const METRIC_FLOOD_JOBS: usize = 40;
 
 /// Absolute floor on the allowed loaded p95, so the assertion does not become
 /// impossibly tight when the unloaded baseline is near zero. Ordinary scheduler
-/// and Redis round-trip noise lives well under this; the starvation the issue
-/// describes is seconds of flood, orders of magnitude above it.
-const METRIC_FLOOR: Duration = Duration::from_millis(250);
+/// and Redis round-trip noise — including the 1s stale-claim maintenance tick
+/// sharing this test's current-thread runtime — lives well under this, while it
+/// stays far below `METRIC_FLOOD_SLEEP`, so the detection band is wide in both
+/// directions.
+const METRIC_FLOOR: Duration = Duration::from_millis(500);
 
 fn metric_critical_handler(
     _state: AppState,
@@ -352,7 +425,7 @@ fn metric_flood_handler(
 ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
     Box::pin(async move {
         METRIC_FLOOD_RAN.fetch_add(1, Ordering::SeqCst);
-        sleep(Duration::from_millis(300)).await;
+        sleep(METRIC_FLOOD_SLEEP).await;
         Ok(())
     })
 }
@@ -441,10 +514,13 @@ async fn reserved_queue_p95_latency_stays_within_twice_its_unloaded_baseline() {
     )
     .expect("worker runtime should start");
 
-    // Phase 1 — unloaded baseline.
+    // Phase 1 — unloaded baseline, after discarding warm-up samples.
     let mut baseline = Vec::with_capacity(METRIC_SAMPLES);
-    for _ in 0..METRIC_SAMPLES {
-        baseline.push(sample_critical_latency().await);
+    for i in 0..(METRIC_WARMUP_SAMPLES + METRIC_SAMPLES) {
+        let sample = sample_critical_latency().await;
+        if i >= METRIC_WARMUP_SAMPLES {
+            baseline.push(sample);
+        }
     }
     let baseline_p95 = p95(baseline);
 
@@ -472,24 +548,36 @@ async fn reserved_queue_p95_latency_stays_within_twice_its_unloaded_baseline() {
     }
     let loaded_p95 = p95(loaded);
 
-    // The flood must still have been in flight throughout, or the "loaded"
-    // phase measured an idle queue and the metric means nothing. `bulk` gets one
-    // shared slot and each job holds it for 300ms, so an undrained backlog at
-    // this point means the queue was saturated for the whole sampling window.
-    let flood_started = METRIC_FLOOD_RAN.load(Ordering::SeqCst);
-    assert!(
-        (1..METRIC_FLOOD_JOBS).contains(&flood_started),
-        "the flood should have been saturating `bulk` throughout the loaded phase, but \
-         {flood_started} of {METRIC_FLOOD_JOBS} flood jobs had started — 0 means it never \
-         got going, {METRIC_FLOOD_JOBS} means the backlog drained and the tail of the \
-         phase was measured idle",
-    );
-
     let allowed = (baseline_p95 * 2).max(METRIC_FLOOR);
+    // A self-calibrating budget can calibrate itself right past the signal: if
+    // the baseline is noisy enough that 2x it reaches one flood job, the
+    // assertion below would pass even with `reserved` removed. Refuse to draw a
+    // conclusion from a measurement that cannot distinguish the two.
+    assert!(
+        allowed < METRIC_FLOOD_SLEEP,
+        "baseline p95 {baseline_p95:?} is too noisy to measure against a \
+         {METRIC_FLOOD_SLEEP:?} flood job — a budget of {allowed:?} would pass even with \
+         the reservation removed, so this run proves nothing",
+    );
     assert!(
         loaded_p95 <= allowed,
         "p95 enqueue-to-start on the dedicated-capacity queue was {loaded_p95:?} under flood \
          but the unloaded baseline p95 was {baseline_p95:?} (budget {allowed:?})",
+    );
+
+    // Asserted *after* the metric, deliberately: a broken reservation makes each
+    // sample cost about one flood job, which is long enough for the backlog to
+    // drain — so checking saturation first would fail here and report the wrong
+    // cause for a real regression. `bulk` gets one shared slot, so an undrained
+    // backlog means the queue was saturated for the whole sampling window.
+    let flood_started = METRIC_FLOOD_RAN.load(Ordering::SeqCst);
+    assert!(
+        (1..METRIC_FLOOD_JOBS).contains(&flood_started),
+        "the flood should have been saturating `bulk` throughout the loaded phase, but \
+         {flood_started} of {METRIC_FLOOD_JOBS} flood jobs had started (loaded p95 \
+         {loaded_p95:?}, baseline {baseline_p95:?}) — 0 means it never got going, \
+         {METRIC_FLOOD_JOBS} means the backlog drained and the tail of the phase was \
+         measured idle",
     );
 
     shutdown.cancel();

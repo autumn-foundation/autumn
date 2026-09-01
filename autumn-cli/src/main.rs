@@ -3752,9 +3752,20 @@ fn run_command(command: Commands) {
                     // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                     // the child pick its default (combined) or read its own env.
                     role: role.map(|r| r.as_str().to_owned()),
-                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). Empty leaves
-                    // the variable untouched so the child reads `[jobs] pin`.
-                    pin,
+                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
+                    // at all leaves the variable untouched so the child reads
+                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
+                    // stay distinguishable from that, so presence is carried by
+                    // the `Option`, not by the list being non-empty. Normalized
+                    // here (trim, drop blanks) so the recorded pin and the pin
+                    // the app parses are the same list.
+                    pin: (!pin.is_empty()).then(|| {
+                        pin.iter()
+                            .map(|q| q.trim())
+                            .filter(|q| !q.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    }),
                 },
             );
         }

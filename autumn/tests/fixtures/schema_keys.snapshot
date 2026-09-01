@@ -182,6 +182,10 @@ idempotency.redis.url
 idempotency.ttl_secs
 jobs
 jobs.backend
+jobs.fleet
+jobs.fleet.declared_queues
+jobs.fleet.manifest
+jobs.fleet.tiers
 jobs.initial_backoff_ms
 jobs.max_attempts
 jobs.pin

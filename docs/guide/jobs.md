@@ -478,7 +478,8 @@ the `[jobs.queues]` config **and** any queues declared solely via
 boot.
 
 `autumn doctor` reports coverage as a `jobs_queue_coverage` check. What that
-check can *prove* depends on how much of the deployment you have declared.
+check can *prove* — report only, or fail the run — depends on how much of the
+deployment you have declared.
 
 **Without a declared topology it only reports.** Doctor is config-only and
 per-process: it sees **one** process, so it cannot know what sibling worker
@@ -492,7 +493,7 @@ would false-positive on a valid deployment, so the check passes and prints what
 this tier claims, which configured queues it does not claim, and any pinned
 queues absent from `[jobs.queues]`.
 
-**Declare the fleet topology and `--strict` can hard-fail.** Give doctor every
+**Declare the fleet topology and doctor can hard-fail.** Give doctor every
 worker tier's pin under `[jobs.fleet]` and it reasons about the *union* of what
 the fleet drains instead of one process, which makes a zero-coverage gap
 provable:
@@ -504,24 +505,44 @@ bulk = { weight = 1, concurrency = 4 }
 default = 2
 
 [jobs.fleet]
-# One entry per worker tier, each holding that tier's `jobs.pin`.
+# One entry per worker tier, each holding that tier's `jobs.pin`. This must list
+# EVERY tier you actually run — see the warning below.
 # An empty entry (`[]`) is an unpinned tier that drains every queue.
-tiers = [["critical"], ["bulk", "default"]]
+tiers = [["critical"], ["bulk", "default", "thumbnails"]]
 
 # Optional — teach doctor about queues declared in code but absent from
-# `[jobs.queues]`, so they count toward coverage too. Either point at a jobs
-# manifest the app emits (a TOML file with a `queues = [...]` array)…
-manifest = "target/autumn-jobs.toml"
-# …or list them inline.
+# `[jobs.queues]` (here, a `#[job(queue = "thumbnails")]`), so they count toward
+# coverage too. List them inline…
 declared_queues = ["thumbnails"]
 ```
 
-With that declared, `autumn doctor --strict` **fails** when some queue that must
-be drained is claimed by no tier anywhere, naming the uncovered queues. It stays
-zero-false-positive by construction: a tier with an empty pin drains everything
-(coverage is total), and `manifest`/`declared_queues` only *add* to the set of
-queues that must be covered, so an incomplete declaration can never manufacture
-a failure — it just returns the check to reporting-only for what it cannot see.
+…or, better, point at a manifest the app emits, which is the ground-truth set
+rather than a list you maintain by hand. Generate it with
+`autumn jobs manifest <path>` (it runs your app binary to dump the queues it
+really drains) and reference it instead of `declared_queues` — when both are
+set, `manifest` wins and `declared_queues` is never read:
+
+```toml
+[jobs.fleet]
+tiers = [["critical"], ["bulk", "default", "thumbnails"]]
+manifest = "target/jobs-manifest.toml"
+```
+
+With a topology declared, `autumn doctor` **fails** — exit 1, in every mode, not
+only under `--strict` — when some queue that must be drained is claimed by no
+tier anywhere, naming the uncovered queues. (`--strict` escalates *warnings*; a
+failed check is fatal regardless.)
+
+`manifest` and `declared_queues` can only *add* to the set of queues that must
+be covered, so an incomplete or missing manifest never manufactures a failure —
+it just leaves doctor blind to the queues it did not see.
+
+> **`tiers` must be exhaustive.** It is the one input where under-declaring is
+> unsafe: doctor can only reason about the tiers you list, so omitting a tier
+> that really runs — especially an unpinned one, which would make coverage
+> total — reports a gap that does not exist. Treat `[jobs.fleet] tiers` as the
+> checked-in description of the whole fleet, and update it when you add or
+> remove a worker tier.
 
 `[jobs.fleet]` is purely declarative. A running process never acts on it — it
 describes the *other* tiers, which no single process can observe — so it changes
@@ -544,12 +565,13 @@ addition to the existing per-job-type gauges under `jobs`:
 }
 ```
 
-On durable backends (Postgres/Redis) with multiple processes, these per-queue
-gauges — like the existing per-job-type gauges — reflect enqueue/start events
-observed in the local process, so an enqueue-only `web` replica shows work it
-doesn't drain; treat them as per-process approximations. Authoritative
-cluster-wide queue depth is tracked as future work (composes with the metrics
-in #1378).
+On the durable backends (Postgres/Redis) these gauges are **not** per-process
+approximations: a periodic survey of the durable store wholesale-replaces this
+process's local enqueue marks each tick (#1752), so an enqueue-only `web`
+replica reports the true shared backlog, and a queue absent from the latest
+survey resets to `depth` 0 rather than leaking a stale one. On the in-process
+`local` backend there is only one process, so the local marks *are* the whole
+picture.
 
 > Still out of scope (separate follow-up): per-job-instance dynamic priority at
 > enqueue time.

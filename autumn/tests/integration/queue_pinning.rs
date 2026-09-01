@@ -211,46 +211,9 @@ mod postgres_backend {
     use autumn_web::AppState;
     use autumn_web::config::{JobConfig, JobQueuesConfig};
     use autumn_web::job;
-    use diesel::Connection as _;
-    use diesel::PgConnection;
-    use diesel::connection::SimpleConnection as _;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
     use diesel_async::{AsyncPgConnection, RunQueryDsl as _};
-
-    /// The crate's whole migration set, discovered at run time and applied in
-    /// timestamp order — the same thing a real app does at boot.
-    ///
-    /// Deliberately not a hand-picked `include_str!` list. A list that misses
-    /// one jobs migration produces a table the claim query errors against on
-    /// every poll, and `pg_claim_next_job` swallows that error — the worker then
-    /// looks like it is "correctly not claiming", so the pinning assertion would
-    /// pass for entirely the wrong reason. (That is not hypothetical: the first
-    /// draft of this test hand-picked three migrations, omitted
-    /// `add_pending_unique_key_to_jobs`, and the pinned worker claimed nothing
-    /// at all.) Applying everything keeps the fixture honest as migrations land.
-    fn all_migrations() -> Vec<String> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let mut found: Vec<(String, String)> = std::fs::read_dir(&dir)
-            .expect("read migrations dir")
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                let name = path.file_name()?.to_string_lossy().into_owned();
-                let sql = std::fs::read_to_string(path.join("up.sql")).ok()?;
-                Some((name, sql))
-            })
-            .collect();
-        assert!(
-            found.iter().any(|(_, sql)| sql.contains("autumn_jobs")),
-            "no autumn_jobs migration found under {} — the fixture would build a \
-             table the claim query cannot use",
-            dir.display()
-        );
-        // Migration directories are timestamp-prefixed, so name order is apply
-        // order.
-        found.sort_by(|a, b| a.0.cmp(&b.0));
-        found.into_iter().map(|(_, sql)| sql).collect()
-    }
 
     #[derive(diesel::QueryableByName)]
     struct CountRow {
@@ -302,10 +265,17 @@ mod postgres_backend {
         let port = container.get_host_port_ipv4(5432).await.expect("port");
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-        let mut sync_conn = PgConnection::establish(&url).expect("db connection");
-        for ddl in all_migrations() {
-            sync_conn.batch_execute(&ddl).expect("migration");
-        }
+        // Apply the crate's whole embedded migration set, exactly as a real app
+        // does at boot — deliberately not a hand-picked `include_str!` list. A
+        // list that misses one jobs migration produces a table the claim query
+        // errors against on every poll, and `pg_claim_next_job` swallows that
+        // error, so the worker would look like it is "correctly not claiming"
+        // and this test would pass for entirely the wrong reason. (Not
+        // hypothetical: the first draft picked three migrations, omitted
+        // `add_pending_unique_key_to_jobs`, and the pinned worker claimed
+        // nothing at all.)
+        autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+            .expect("apply framework migrations");
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let pool = Pool::builder(manager).max_size(8).build().expect("pool");
 

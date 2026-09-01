@@ -1788,8 +1788,12 @@ subset of queues — all config-only, no app-code change:
   comma-separated) makes a `worker`-role process claim *only* those queues,
   preserving weighted/strict order within the subset; empty/unset drains every
   queue. A worker leaving a configured queue uncovered logs a startup `WARN`
-  (an `ERROR` if it would claim nothing); `autumn doctor --strict` reports
-  coverage informationally (`jobs_queue_coverage`) without failing (issue #1623).
+  (an `ERROR` if it would claim nothing). `autumn doctor`'s
+  `jobs_queue_coverage` check reports informationally when no fleet topology is
+  declared; declare every tier's pin under `[jobs.fleet] tiers` and it hard-fails
+  (exit 1, in every mode — not only `--strict`) on a queue drained by no tier
+  (issues #1623, #1756). `autumn serve --pin <queues>` sets the pin as a flag,
+  forwarding `AUTUMN_JOBS__PIN`, and `serve restart` restores it.
 - **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
   with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
   per-job-type gauges (per-process approximations on multi-process backends).

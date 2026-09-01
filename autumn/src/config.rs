@@ -3419,12 +3419,16 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
 ///
 /// ```toml
 /// [jobs.fleet]
-/// # One entry per worker tier, each holding that tier's `jobs.pin`.
+/// # One entry per worker tier, each holding that tier's `jobs.pin`. Must list
+/// # every tier actually running: doctor can only reason about declared tiers,
+/// # so omitting one reports a coverage gap that does not exist.
 /// # An empty entry is an *unpinned* tier that drains every queue.
-/// tiers = [["critical"], ["bulk", "default"]]
+/// tiers = [["critical"], ["bulk", "default", "thumbnails"]]
 /// # Optional: where the compiled `#[job(queue = "…")]` set comes from, so the
 /// # check also covers queues declared in code but absent from `[jobs.queues]`.
-/// manifest = "target/autumn-jobs.toml"
+/// # `manifest` (emitted by `autumn jobs manifest <path>`) wins when both are
+/// # set. Every queue they name must be covered by some tier above.
+/// manifest = "target/jobs-manifest.toml"
 /// declared_queues = ["thumbnails"]
 /// ```
 ///
