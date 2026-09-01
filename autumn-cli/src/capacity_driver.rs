@@ -107,30 +107,45 @@ pub struct CalibrateOptions<'a> {
 }
 
 /// Run `autumn calibrate`, returning the process exit code.
-pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
-    eprintln!("\u{1F342} autumn calibrate\n");
+/// Everything a calibration run needs before it can build or boot: the
+/// committed contract (in `--check` mode) and the workload resolved against it.
+///
+/// Split out of [`run`] because it is the phase with all the early exits, and
+/// because in `--check` mode its result decides what gets *compiled* — the
+/// committed contract's profile and feature selection, not this invocation's
+/// defaults.
+struct Prepared {
+    committed: Option<CapacityContract>,
+    calibration: Calibration,
+}
 
-    // Resolved before anything is built or booted: in `--check` mode the
-    // committed contract's own profile, feature selection and workload are
-    // what this run must reproduce, and all three change what gets compiled
-    // and what the route graph looks like.
+fn prepare(opts: &CalibrateOptions<'_>) -> Result<Prepared, String> {
     let committed = if opts.check {
-        match CapacityContract::load(opts.contract_path) {
-            Ok(contract) => Some(contract),
-            Err(error) => {
-                eprintln!(
-                    "\u{2717} {error}\n\n  Run `autumn calibrate` to record a contract before \
-                     gating against one."
-                );
-                return 1;
-            }
-        }
+        Some(CapacityContract::load(opts.contract_path).map_err(|error| {
+            format!(
+                "{error}\n\n  Run `autumn calibrate` to record a contract before gating \
+                 against one."
+            )
+        })?)
     } else {
         None
     };
+    let calibration = resolve_calibration(opts, committed.as_ref())?;
+    Ok(Prepared {
+        committed,
+        calibration,
+    })
+}
 
-    let calibration = match resolve_calibration(opts, committed.as_ref()) {
-        Ok(calibration) => calibration,
+/// Run `autumn calibrate`, returning the process exit code.
+pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
+    eprintln!("\u{1F342} autumn calibrate\n");
+
+    let Prepared {
+        committed,
+        calibration,
+    } = match prepare(opts) {
+        Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("\u{2717} {error}");
             return 1;
