@@ -14370,6 +14370,47 @@ foo = "bar"
         assert!(fleet.has_unpinned_tier());
     }
 
+    /// Anti-drift guard (#1623). `doctor` reads `[jobs.fleet]` out of the merged
+    /// raw TOML table (it needs profile-aware merging the typed loader doesn't
+    /// give it), while the app boots the same file through
+    /// `autumn_web::config::JobFleetConfig`. Two readers, one spelling: if either
+    /// side renames a key, the app rejects a topology doctor accepts (or the
+    /// reverse), and the AC6 hard-fail silently stops covering real deployments.
+    /// So parse one document both ways and require the same answer.
+    #[test]
+    fn doctor_and_app_agree_on_the_fleet_topology_spelling() {
+        const DOC: &str = "[jobs.fleet]\n\
+                           tiers = [[\"critical\"], [\"bulk\", \"default\"], []]\n\
+                           manifest = \"target/autumn-jobs.toml\"\n\
+                           declared_queues = [\"thumbnails\"]\n";
+
+        let table: toml::Table = toml::from_str(DOC).expect("parse toml");
+        let doctor_view = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        let app_view: autumn_web::config::JobFleetConfig = toml::from_str::<toml::Table>(DOC)
+            .expect("parse toml")
+            .get("jobs")
+            .and_then(|j| j.get("fleet"))
+            .cloned()
+            .expect("jobs.fleet present")
+            .try_into()
+            .expect("app config accepts the same [jobs.fleet] doctor reads");
+
+        assert_eq!(
+            doctor_view.tiers, app_view.tiers,
+            "doctor and the app must read the same `tiers` from one autumn.toml",
+        );
+        assert_eq!(
+            resolve_declared_queues_from_sources(|_| None, Some(&table)),
+            app_view.declared_queues,
+            "doctor and the app must read the same `declared_queues`",
+        );
+        assert_eq!(
+            app_view.manifest.as_deref(),
+            Some("target/autumn-jobs.toml"),
+            "the app must accept the `manifest` key doctor resolves",
+        );
+    }
+
     #[test]
     fn resolve_fleet_topology_absent_is_none() {
         let table: toml::Table =

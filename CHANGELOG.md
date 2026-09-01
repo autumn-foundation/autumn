@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pin a worker tier to queues from the command line, and let `doctor` prove
+  fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
+  and `jobs.pin` already existed, but pinning could only be spelled in
+  `autumn.toml` or `AUTUMN_JOBS__PIN`, and the `[jobs.fleet]` topology that lets
+  `autumn doctor --strict` hard-fail on an uncovered queue was undocumented and
+  not part of the config schema — declaring it warned as an unknown key (and
+  failed boot under `server.strict_config_enforce_all`).
+
+  `autumn serve` now takes `--pin`, repeatable and comma-separated, forwarded to
+  the app as `AUTUMN_JOBS__PIN` and restored by `autumn serve restart` so a bare
+  restart can't silently turn a pinned worker tier into an unpinned one:
+
+  ```bash
+  autumn serve --role worker --pin critical
+  ```
+
+  `[jobs.fleet]` (`tiers`, `manifest`, `declared_queues`) is now a first-class,
+  validated config section. It is purely declarative — no process acts on it at
+  runtime — and an app that declares nothing keeps today's behavior exactly. See
+  [Background Jobs](docs/guide/jobs.md#per-queue-worker-pools-caps-and-pinning).
+
+  Also adds the end-to-end coverage the acceptance criteria asked for: a pinned
+  worker never claims an out-of-subset queue on **both** the Postgres and Redis
+  backends, a per-queue `concurrency` cap bounds in-flight jobs below the worker
+  count, and p95 enqueue-to-start latency on a queue with dedicated capacity
+  stays within 2x its unloaded baseline while another queue floods.
+
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
   job history, tracking records, idempotency responses, experiment

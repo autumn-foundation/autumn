@@ -449,6 +449,14 @@ pin = ["critical"]
 AUTUMN_JOBS__PIN=bulk,default
 ```
 
+```bash
+# Or as a flag, when one image is started under several roles from a script.
+# `--pin` is repeatable and comma-separated, and sets `AUTUMN_JOBS__PIN` for the
+# app process; `autumn serve restart` restores it.
+autumn serve --role worker --pin critical
+autumn serve --role worker --pin bulk --pin default
+```
+
 A pinned process **never** claims jobs from queues outside its subset, on both
 the Postgres and Redis backends. Weighted/strict ordering is preserved *within*
 the pinned subset. An empty/unset `pin` (the default) keeps today's behavior:
@@ -469,23 +477,59 @@ the `[jobs.queues]` config **and** any queues declared solely via
 `#[job(queue = "…")]` — and diagnoses a genuinely uncovered queue loudly at
 boot.
 
-`autumn doctor --strict` **does not fail** on queue coverage — it reports
-coverage **informationally** (a `jobs_queue_coverage` line that always passes).
-It prints what the pinned tier claims, which configured queues it does not
-claim, and any pinned queues absent from `[jobs.queues]`. Why it can only
-report, not enforce: doctor is **config-only and per-process**. It sees only
-**one** process, so it cannot know what sibling worker tiers drain — a multi-tier
-deployment where each pinned tier omits queues covered by other tiers (one
-process `AUTUMN_JOBS__PIN=critical`, another `AUTUMN_JOBS__PIN=bulk,default`) is
-legitimate. And it inspects only `[jobs.queues]` (plus the implicit `default`
-queue), so it cannot see a queue declared solely via `#[job(queue = "…")]`,
-which the runtime appends to the effective schedule and drains. Any hard-fail
-doctor asserted on coverage would therefore false-positive on a valid
-deployment, which is exactly why enforcement lives in the runtime warning above.
+`autumn doctor` reports coverage as a `jobs_queue_coverage` check. What that
+check can *prove* depends on how much of the deployment you have declared.
 
-Ensuring every queue is drained by some tier remains the operator's
-responsibility: make sure some process (an unpinned worker tier, or one pinned
-to those queues) covers every queue you enqueue to.
+**Without a declared topology it only reports.** Doctor is config-only and
+per-process: it sees **one** process, so it cannot know what sibling worker
+tiers drain — a multi-tier deployment where each pinned tier omits queues
+covered by other tiers (one process `AUTUMN_JOBS__PIN=critical`, another
+`AUTUMN_JOBS__PIN=bulk,default`) is perfectly legitimate. It also inspects only
+`[jobs.queues]` (plus the implicit `default` queue), so it cannot see a queue
+declared solely via `#[job(queue = "…")]`, which the runtime appends to the
+effective schedule and drains. Any hard-fail asserted from that vantage point
+would false-positive on a valid deployment, so the check passes and prints what
+this tier claims, which configured queues it does not claim, and any pinned
+queues absent from `[jobs.queues]`.
+
+**Declare the fleet topology and `--strict` can hard-fail.** Give doctor every
+worker tier's pin under `[jobs.fleet]` and it reasons about the *union* of what
+the fleet drains instead of one process, which makes a zero-coverage gap
+provable:
+
+```toml
+[jobs.queues]
+critical = { weight = 4, reserved = 2 }
+bulk = { weight = 1, concurrency = 4 }
+default = 2
+
+[jobs.fleet]
+# One entry per worker tier, each holding that tier's `jobs.pin`.
+# An empty entry (`[]`) is an unpinned tier that drains every queue.
+tiers = [["critical"], ["bulk", "default"]]
+
+# Optional — teach doctor about queues declared in code but absent from
+# `[jobs.queues]`, so they count toward coverage too. Either point at a jobs
+# manifest the app emits (a TOML file with a `queues = [...]` array)…
+manifest = "target/autumn-jobs.toml"
+# …or list them inline.
+declared_queues = ["thumbnails"]
+```
+
+With that declared, `autumn doctor --strict` **fails** when some queue that must
+be drained is claimed by no tier anywhere, naming the uncovered queues. It stays
+zero-false-positive by construction: a tier with an empty pin drains everything
+(coverage is total), and `manifest`/`declared_queues` only *add* to the set of
+queues that must be covered, so an incomplete declaration can never manufacture
+a failure — it just returns the check to reporting-only for what it cannot see.
+
+`[jobs.fleet]` is purely declarative. A running process never acts on it — it
+describes the *other* tiers, which no single process can observe — so it changes
+no runtime behavior, and an app that declares nothing keeps today's behavior.
+
+Absent that declaration, ensuring every queue is drained by some tier remains
+the operator's responsibility: make sure some process (an unpinned worker tier,
+or one pinned to those queues) covers every queue you enqueue to.
 
 ### Observability
 
