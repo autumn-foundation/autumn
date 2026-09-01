@@ -527,6 +527,15 @@ path = "tests/config_alloc_gate.rs"
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
 
+# Allocation gate for the sandbox's request-header canonicalisation: a header
+# the allowlist drops must not be cloned on its way to being discarded. The
+# function's output is identical either way, so this has to be judged on
+# allocations. Own binary for the same `allocation-counter` global-allocator
+# reason as `config_alloc_gate` above.
+[[test]]
+name = "sandbox_header_alloc_gate"
+path = "tests/sandbox_header_alloc_gate.rs"
+
 # Allocation gate for the scaffolded form-render helpers on the same 12-field
 # workload as `benches/form_render.rs` (Bolt follow-up to #2295/#2298, looking
 # at the per-field `error_id` allocation). Own binary for the same

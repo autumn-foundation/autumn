@@ -672,10 +672,19 @@ pub(crate) enum GuestFrame {
 /// changed.
 #[must_use]
 pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    // Filtered before the clone, not after. Cloning first and discarding on the
+    // next step duplicated every byte of headers that never reach the guest —
+    // and once the metadata ceiling stopped charging for those headers (rightly,
+    // since they are dropped) nothing else stood between a direct
+    // `SandboxHost::run` caller and an arbitrarily large `Cookie` being copied
+    // in full before being thrown away. `filter_map` also lower-cases once
+    // rather than twice, and clones only what survives.
     let mut out: Vec<(String, String)> = headers
         .iter()
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .filter(|(name, _)| request_header_allowed(name))
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            request_header_allowed(&name).then(|| (name, value.clone()))
+        })
         .collect();
     out.sort_by(|(left, _), (right, _)| left.cmp(right));
     out
