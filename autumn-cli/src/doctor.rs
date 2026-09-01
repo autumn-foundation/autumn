@@ -4247,6 +4247,12 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
 ///    maintains by hand (the MVP path when no manifest is emitted).
 ///
+/// A manifest that reads and parses wins outright, **including** when its
+/// `queues` array is empty — that is the app answering "no job-declared queues",
+/// not failing to answer. Only a manifest that says nothing at all (absent path,
+/// unreadable, unparseable, or no `queues` array) falls through to the inline
+/// list.
+///
 /// Returns an empty `Vec` when neither is present; an unknown declared set only
 /// shrinks the needed set, so it can never cause a false failure.
 fn resolve_declared_queues(table: Option<&toml::Table>) -> Vec<String> {
@@ -4267,23 +4273,27 @@ where
     };
 
     // 1. A jobs manifest the app emits: TOML `queues = [...]`.
+    //
+    // A manifest that reads and parses is authoritative even when its `queues`
+    // array is EMPTY — that is the app stating it declares no
+    // `#[job(queue = "…")]` queues beyond the configured set, which is a real
+    // answer, not a missing one. Falling through to `declared_queues` there
+    // would let a stale hand-maintained entry manufacture a coverage failure
+    // against the ground truth, and would contradict the documented precedence
+    // ("manifest wins when both are set").
+    //
+    // The fall-through is reserved for a manifest that genuinely says nothing:
+    // absent path, unreadable file, unparseable TOML, or no `queues` array.
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
         && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
+        && let Some(queues) = manifest.get("queues").and_then(toml::Value::as_array)
     {
-        let queues: Vec<String> = manifest
-            .get("queues")
-            .and_then(toml::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !queues.is_empty() {
-            return queues;
-        }
+        return queues
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect();
     }
 
     // 2. Inline declared-queues list (MVP).
@@ -14713,6 +14723,36 @@ foo = "bar"
             declared_from_manifest,
             vec!["critical".to_string(), "email".to_string()]
         );
+
+        // An EMPTY manifest array is the app answering "no job-declared queues",
+        // not failing to answer, so it wins over a stale inline list. Falling
+        // through here would let that stale entry manufacture a coverage failure
+        // against the ground truth — and would contradict the documented
+        // precedence.
+        let empty_manifest = resolve_declared_queues_from_sources(
+            |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
+            Some(&with_manifest),
+        );
+        assert!(
+            empty_manifest.is_empty(),
+            "an empty manifest must win over declared_queues, got {empty_manifest:?}",
+        );
+
+        // A manifest that genuinely says nothing DOES fall through: unreadable
+        // file, unparseable TOML, or no `queues` array at all.
+        for (label, read) in [
+            ("unreadable", None::<String>),
+            ("unparseable", Some("this is not toml =".to_string())),
+            ("no queues key", Some("other = 1\n".to_string())),
+        ] {
+            let fell_through =
+                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest));
+            assert_eq!(
+                fell_through,
+                vec!["stale".to_string()],
+                "a manifest that says nothing ({label}) must fall through to declared_queues",
+            );
+        }
 
         // No `[jobs.fleet]` → empty.
         let none: toml::Table =
