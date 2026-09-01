@@ -252,8 +252,20 @@ const DETAIL_EXCERPT: usize = 512;
 /// one thing, but a failure detail is evidence, and evidence that tried
 /// something is worth keeping in a legible form.
 pub(super) fn guest_text(text: &str) -> String {
-    let mut out = String::with_capacity(text.len().min(DETAIL_EXCERPT));
-    for (kept, ch) in text.chars().enumerate() {
+    bounded_guest_text(text.chars(), text.len())
+}
+
+/// The bound-and-escape rule itself, over characters rather than a `&str`.
+///
+/// Taking a `&str` means the whole string already exists, which is fine when it
+/// does and is the entire problem when it does not: an import's operation is
+/// `module::name`, and joining those two before bounding them copies a name an
+/// artifact may have spent most of its 64 MiB on, in order to say it is
+/// refused. `hint` is only a capacity, and it is capped, so a caller cannot
+/// turn it into the allocation this exists to avoid.
+fn bounded_guest_text(chars: impl Iterator<Item = char>, hint: usize) -> String {
+    let mut out = String::with_capacity(hint.min(DETAIL_EXCERPT));
+    for (kept, ch) in chars.enumerate() {
         if kept == DETAIL_EXCERPT {
             out.push_str(" … (truncated)");
             break;
@@ -265,6 +277,20 @@ pub(super) fn guest_text(text: &str) -> String {
         }
     }
     out
+}
+
+/// An import's `module::name`, bounded and escaped without ever being joined.
+///
+/// Written down here rather than left to the review surface. The surface does
+/// excerpt it — but that excerpt runs after this string exists, and the copy is
+/// the cost, not the printing. `MAX_IMPORTS` bounds how many names a module may
+/// declare and nothing bounded how long one may be, so a single import was
+/// enough to make refusing an artifact as expensive as accepting it.
+fn import_operation(module: &str, name: &str) -> String {
+    bounded_guest_text(
+        module.chars().chain("::".chars()).chain(name.chars()),
+        module.len().saturating_add(name.len()).saturating_add(2),
+    )
 }
 
 /// What one recorded denial can hold, at its worst.
@@ -851,17 +877,26 @@ impl fmt::Display for SandboxLoadError {
                 write!(f, "the manifest is not one this host will serve: {detail}")
             }
             Self::Wasm(detail) => write!(f, "the plugin module could not be loaded: {detail}"),
-            Self::ForbiddenImports(denials) => write!(
-                f,
-                "the plugin imports {count} host function(s) the sandbox does not provide, so it \
-                 is refused before it runs: {list}",
-                count = denials.len(),
-                list = denials
-                    .iter()
-                    .map(|denial| denial.operation.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            Self::ForbiddenImports(denials) => {
+                // Written straight through rather than cloned into a `Vec` and
+                // joined. Each operation is already bounded, so the clone was
+                // not unbounded — but it was a second full copy of every name
+                // on the path that exists to refuse the artifact cheaply, and
+                // the joined string was a third.
+                write!(
+                    f,
+                    "the plugin imports {count} host function(s) the sandbox does not provide, \
+                     so it is refused before it runs: ",
+                    count = denials.len(),
+                )?;
+                for (written, denial) in denials.iter().enumerate() {
+                    if written > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&denial.operation)?;
+                }
+                Ok(())
+            }
             Self::FuelBelowFixedCharges {
                 fuel,
                 instantiation,
@@ -2260,7 +2295,7 @@ fn forbidden_imports(module: &Module) -> Vec<CapabilityDenial> {
     module
         .imports()
         .filter_map(|import| {
-            let operation = format!("{}::{}", import.module(), import.name());
+            let operation = import_operation(import.module(), import.name());
             if import.module() != WASI {
                 return Some((operation, "the sandbox defines no such host module"));
             }
@@ -4594,6 +4629,58 @@ path = "/hello/greet"
         .expect("the fixture is valid WAT");
         SandboxHost::from_module(manifest_with(ResourceLimits::default()), &single)
             .expect("a single-memory module must still load");
+    }
+
+    #[test]
+    fn a_long_import_name_is_not_copied_whole_in_order_to_refuse_it() {
+        // `MAX_IMPORTS` bounds how many names a module may declare; nothing on
+        // this side bounded how long one may be. wasmparser caps a single name
+        // at 100 KB, so this is not module-sized — but `MAX_DENIALS` is 64, and
+        // the denial copied the whole name, `Display` cloned it again, and the
+        // join built a third copy. That is megabytes of host memory to refuse
+        // one artifact, repeatable, in the process trying to reject it.
+        //
+        // Observable in what comes out: a bounded operation cannot be longer
+        // than the bound, however long the name was.
+        let huge = "z".repeat(99_000);
+        let wat = format!(
+            r#"(module
+  (import "not_wasi" "{huge}" (func))
+  (memory (export "memory") 1)
+  (func (export "_start") (nop))
+)"#
+        );
+        let wasm = wat::parse_str(&wat).expect("the fixture is valid WAT");
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("an import the sandbox does not provide must be refused");
+        let SandboxLoadError::ForbiddenImports(denials) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(denials.len(), 1);
+        assert!(
+            denials[0].operation.len() <= DENIAL_RECORD_BYTES,
+            "the denial carries {} bytes of a {}-byte name — it was copied whole \
+             in order to reject it",
+            denials[0].operation.len(),
+            huge.len(),
+        );
+        assert!(
+            denials[0].operation.starts_with("not_wasi::"),
+            "the operation must still say what was imported: {}",
+            &denials[0].operation[..denials[0].operation.len().min(64)],
+        );
+
+        // And rendering the error does not rebuild it either. `Display` is what
+        // `autumn plugin package`/`inspect` call before excerpting, so a copy
+        // made here lands in the process trying to refuse the artifact.
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() <= DENIAL_RECORD_BYTES.saturating_mul(2),
+            "rendering the refusal produced {} bytes from a {}-byte name",
+            rendered.len(),
+            huge.len(),
+        );
     }
 
     #[test]
