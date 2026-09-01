@@ -50,6 +50,53 @@ images use.
 
 ---
 
+## HTTPS with no certificate work (`[server.tls.acme]`)
+
+If you run the binary yourself on a VPS — no `autumn deploy`, no reverse proxy —
+the app can obtain and renew its own Let's Encrypt certificate. Point DNS at the
+box, add the section below, and build with the `acme` feature; that is the whole
+happy path:
+
+```toml
+# autumn.toml
+[server]
+host = "0.0.0.0"           # the default, 127.0.0.1, is loopback-only
+port = 443                 # ACME wraps THIS listener in TLS; the default is 3000
+
+[server.tls.acme]
+domains = ["app.example.com"]
+contact_email = "ops@example.com"
+directory = "production"   # default is Let's Encrypt STAGING — validate there first
+```
+
+The `[server]` block is not optional here. ACME terminates TLS on the listener
+`server.host`/`server.port` already binds, and only the challenge listener binds
+`:80` on its own — so at the defaults you would serve HTTPS on `127.0.0.1:3000`,
+where neither Let's Encrypt nor your visitors can reach it, and the HTTP→HTTPS
+redirect would point at that unreachable port.
+
+On first boot the app answers the ACME HTTP-01 challenge on `:80` (which also
+redirects plain HTTP to HTTPS), serves the issued certificate on `:443`, caches
+it plus the account key under `config/acme`, and renews in the background well
+before expiry with no restart and no dropped connections. It needs inbound
+TCP/80 and TCP/443, and the privilege to bind them
+(`CAP_NET_BIND_SERVICE`). Run `autumn doctor --online` first: it grades DNS,
+port reachability, and the stored certificate.
+
+**Opting out** is the absence of the section. With no `[server.tls]` and no
+`[server.tls.acme]`, the app serves plain HTTP on `server.port` and TLS is
+somebody else's job — a reverse proxy (nginx, Caddy, a cloud load balancer), or
+kamal-proxy if you use `autumn deploy` (see the note under
+[`autumn deploy`](#push-button-deploy-to-your-own-server-autumn-deploy) — do not
+combine the two). In-process ACME is a **single-host** feature: behind a load
+balancer the CA's challenge can land on a replica that never published the
+token. Terminate TLS at the proxy for multi-replica deployments.
+
+Full reference, including the private-CA / Pebble setup and the renewal
+internals: [TLS & HTTPS guide](./tls.md).
+
+---
+
 ## Push-button deploy to your own server (`autumn deploy`)
 
 `autumn deploy` takes a fresh project to a live, zero-downtime service on a
@@ -1474,6 +1521,7 @@ rust:1.88.0-bookworm (chef stage)
                        /usr/local/bin/myapp     ← your binary (assets + locales embedded)
                        /app/migrations/         ← SQL migration files (one-shot migrate job)
                        /app/autumn.toml         ← production config (host=0.0.0.0)
+                       /usr/share/autumn/sbom.cdx.json  ← CycloneDX inventory
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/myapp"]
@@ -1491,6 +1539,13 @@ Key design decisions:
 - **Explicit migration ownership** -- migrations run once through
   `AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate` before web replicas roll.
   The web image starts only the server, so replicas do not race schema changes.
+- **Supply chain, on by default** -- the image carries a CycloneDX SBOM at
+  `/usr/share/autumn/sbom.cdx.json` (advertised by the `io.autumn.sbom.path`
+  label), the binary is compiled through `cargo-auditable` so it can report its
+  own crate versions with no source tree, and Tailwind is fetched through
+  `autumn setup`, whose download is SHA-256 verified. The generated cloud
+  deploy workflows additionally attest each pushed image and its SBOM. See
+  [Verify what you're running](supply-chain.md).
 - **`autumn.production.toml.example` is copied as `/app/autumn.toml`** so the
   binary binds to `0.0.0.0` (all interfaces) instead of the dev default
   `127.0.0.1`. Override any value at runtime via `AUTUMN_*` environment

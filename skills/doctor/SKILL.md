@@ -171,7 +171,17 @@ probes, gated behind the CLI `acme` feature:
   to this host (`Matches` = pass, `PartialMatch` = warn, `ResolvesElsewhere` =
   fail).
 
-Offline stored-cert expiry is also graded. See issue #1858.
+Two checks are graded **offline**, so they run without `--online`:
+
+- `acme_stored_cert` — the cached leaf's expiry.
+- `acme_ca_root` — the configured `[server.tls.acme] ca_root_path`, validated
+  through the same `CertificateDer::from_pem_file` + `RootCertStore::add` pair
+  the runtime uses. Fails on a blank, unreadable, or unusable file (that state
+  can only produce failed orders); warns when the file is a bundle — only its
+  first certificate becomes a trust anchor — or when it is set alongside a
+  publicly-trusted Let's Encrypt directory.
+
+See issue #1858.
 
 ## Deploy preflight checks (unreleased — trunk-dev, issues #1607/#1621)
 

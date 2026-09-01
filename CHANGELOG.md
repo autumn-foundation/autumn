@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SBOMs and signed provenance for framework and app releases (#1615):**
+  Autumn could not answer "what exactly is in this artifact, and who built it?"
+  at either surface. Its own releases were body-only GitHub Releases with no
+  SBOM and no attestation, and the production image from `autumn release init`
+  shipped no inventory and `curl`ed the Tailwind binary with no integrity check
+  — while `autumn setup` had been SHA-256-verifying the very same download for
+  the dev loop all along.
+
+  A new `autumn sbom` generates a deterministic CycloneDX 1.5 document from
+  `cargo metadata`: no wall-clock timestamp, a `serialNumber` derived from the
+  document's own content rather than randomly generated, components sorted and
+  de-duplicated. Same source tree, same bytes. That determinism is what makes
+  it a gate rather than a formality — `autumn sbom --verify` regenerates and
+  reports a component-level diff (`unexpected component: backdoor@6.6.6`), and
+  `--expect-version` ties the document to the version being released.
+  `scripts/check-sbom.sh` runs both as the publish gate's new `sbom` job, and
+  the same `--verify` runs *again* in `prepare-release` against the artifact
+  after it has travelled through the artifact store — the point where a
+  substitution or truncation could actually happen. The file that run checks is
+  the one attached to the release as `autumn-<tag>.cdx.json`.
+
+  Every release asset — the SBOM, each CLI archive, each `.sha256` — now
+  carries a keyless SLSA build-provenance attestation, published before the
+  asset is uploaded so an attestation failure stops the release rather than
+  leaving unattested assets on a live one. One documented command verifies
+  them: `gh attestation verify <asset> --repo autumn-foundation/autumn`.
+
+  Scaffolded apps get the same posture by default. The release Dockerfile
+  compiles through `cargo auditable`, so the shipped binary reports the exact
+  crate versions inside it with no source tree and no lockfile (`autumn sbom
+  --binary /usr/local/bin/my-app`, reading ELF, Mach-O and PE); it obtains
+  Tailwind through the checksum-verifying `autumn setup`; and it bakes a
+  CycloneDX SBOM into the image at `/usr/share/autumn/sbom.cdx.json` behind an
+  OCI label. `autumn build` grows `--auditable` so the embedded single-binary
+  path is instrumented too. The `autumn new` Dockerfile's own unverified
+  download is verified as well, and now detects its architecture instead of
+  hardcoding `linux-x64` — which had been silently installing an unrunnable
+  binary on arm64. The generated AWS/GCP/Azure deploy workflows attest each
+  pushed image and its SBOM against the image digest, as the last steps in the
+  job so a Sigstore hiccup can never block a deploy whose image is already
+  pushed.
+
+  The in-image SBOM step is emitted only once the `autumn-cli` version the
+  Dockerfile pins can actually run `autumn sbom`. The pin is the scaffolding
+  CLI's own version, which between a merge and the next release is an
+  already-published version predating the subcommand — emitting it anyway would
+  make every `docker build` fail. Until then the image is merely SBOM-less, not
+  broken; the auditable binary, the verified Tailwind download and the image
+  provenance attestation are all active immediately.
+
+  `docs/guide/supply-chain.md` walks both surfaces end to end, including the
+  negative case — tamper with one byte and watch verification fail — because a
+  check nobody has seen fail is not a check.
 - **One-command plugin install — `autumn plugin add` / `autumn plugin list`
   (#1606):** Autumn had a real plugin seam (the `Plugin` trait, first-party
   plugin crates, a crates.io naming convention, an author-facing
@@ -38,6 +91,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<Name>Plugin` is derived from the naming convention and printed, because
   nothing outside that crate can verify it. A CI gate installs every first-party
   plugin into a fresh `autumn new` scaffold and requires a green `cargo check`.
+
+- **ACME provisioning against a private CA, and an end-to-end proof of the whole
+  flow (#1608):** `[server.tls.acme] directory = { custom = { url = "..." } }`
+  was documented for a private CA or a [Pebble](https://github.com/letsencrypt/pebble)
+  test server, but the ACME client verified the directory against the platform
+  trust store only, so unless that root was installed host-wide the TLS
+  handshake failed and every order died before an authorization was created. A
+  new `ca_root_path` names the PEM root that signs the ACME directory's *own*
+  HTTPS certificate; it replaces the client's trust anchors for the ACME control
+  plane only (never for what browsers accept from your site) and is unnecessary
+  for Let's Encrypt, whose staging and production API endpoints are both
+  publicly trusted. `autumn doctor` grades it as `acme_ca_root`, failing on a
+  path that is blank, unreadable, or yields no usable anchor — validated through
+  the very `CertificateDer::from_pem_file` + `RootCertStore::add` pair the
+  runtime uses — and warning when the file is a bundle (only its first
+  certificate is ever installed) or is pinned against a public Let's Encrypt
+  directory.
+
+  This closes the gap that kept the order flow itself untested: with a reachable
+  private directory, `autumn/tests/integration/acme_end_to_end.rs` now drives a
+  real `instant-acme` client over real TLS against an in-process fake CA
+  (`acme_fake_ca.rs` — no Docker, no network), which validates HTTP-01 against
+  the app's own challenge listener, checks the finalize CSR's SANs against the
+  order's identifiers, and issues from its own root with a caller-chosen
+  validity window. The suite covers first-boot issuance and the HTTP→HTTPS
+  redirect, a **forced near-expiry certificate rotating with no restart while a
+  connection opened before the swap keeps serving**, a restart reusing the
+  stored account and certificate instead of re-registering or re-ordering, and a
+  failed order landing in both `/actuator/health` and the error-reporting seam.
+  A new merge-blocking CI lane runs the suite on every push, alongside the
+  direct-TLS lane #1603 added, and `acme` joins the gated clippy feature set —
+  which is what puts `autumn/src/acme/**` under `-D warnings` for the first
+  time, since `--all-targets` lints only what the enabled features compile.
+
+  Also fixes a latent panic on this path: `ca_root_path` reaches
+  `rustls::ClientConfig::builder()`, which panics rather than erroring when it
+  cannot resolve a process-level `CryptoProvider` — the state any app reaches as
+  soon as a dependency enables `aws-lc-rs` alongside autumn's `ring`
+  (`telemetry-otlp` alone is enough). Building the ACME client now installs
+  `ring` as the default when nothing has set one, keeping any provider the
+  application chose deliberately.
 
 - **Personal data that cannot reach a JSON response by accident (#1654):**
   Autumn's protections for sensitive data were all *name*-based and ran at
