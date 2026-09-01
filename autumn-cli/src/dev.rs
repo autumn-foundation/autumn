@@ -927,6 +927,11 @@ fn start_server(
     // server starts, so an inherited flag would turn every hot-reload restart
     // into a manifest dump that exits cleanly and never serves.
     command.env_remove(crate::data_flow::DUMP_ENV);
+    // Same reasoning, worse outcome (#1605): `AUTUMN_DB_RETENTION=report|purge`
+    // is dispatched before the server starts, so an inherited one would make
+    // every hot-reload restart enforce the retention policy and exit -- deleting
+    // data on each save rather than merely failing to serve.
+    crate::db::retention::clear_inherited_one_shot_env(&mut command);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());

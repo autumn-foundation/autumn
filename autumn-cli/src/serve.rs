@@ -621,6 +621,17 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // print the data-flow manifest and exit 0 -- a `serve` that reports success
     // and serves nothing (#1654 review round 5).
     cmd.env_remove(crate::data_flow::DUMP_ENV);
+    // Same hazard, sharper consequence (#1605). `AUTUMN_DB_RETENTION=report|purge`
+    // is the internal one-shot mode behind `autumn db retention`, and it is
+    // dispatched in `AppBuilder::run` *before* the server binds a listener. One
+    // left over in the launching shell -- from an earlier `autumn db retention
+    // --purge` in the same terminal, or a wrapping script -- would make
+    // `autumn serve` enforce the retention policy and exit instead of serving.
+    // Unlike a stray manifest dump, that silently DELETES data. The companion
+    // knobs go too: they are inert without the mode variable, but leaving a
+    // half-set internal protocol in a server's environment invites the next
+    // mode check to trip over it.
+    crate::db::retention::clear_inherited_one_shot_env(&mut cmd);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -2081,6 +2092,32 @@ mod tests {
             "the flag must be explicitly removed (present with a None value), not \
              merely absent from the overrides -- absent means inherited: {entry:?}"
         );
+    }
+
+    #[test]
+    fn base_command_clears_an_inherited_retention_mode() {
+        // #1605 review round 10. `AUTUMN_DB_RETENTION=purge` is the internal
+        // one-shot mode behind `autumn db retention`, dispatched in
+        // `AppBuilder::run` before the server binds a listener. Inherited from
+        // the launching shell it turns `autumn serve` into a destructive purge
+        // that exits 0 -- the data-flow hazard above, except it deletes data.
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        for var in [
+            "AUTUMN_DB_RETENTION",
+            "AUTUMN_DB_RETENTION_DATASET",
+            "AUTUMN_RETENTION_DRY_RUN",
+        ] {
+            let entry = cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(var));
+            assert_eq!(
+                entry,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly removed (present with a None value), not \
+                 merely absent from the overrides -- absent means inherited",
+            );
+        }
     }
 
     #[test]

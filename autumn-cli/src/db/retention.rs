@@ -31,6 +31,36 @@ const RETENTION_MODE_ENV: &str = "AUTUMN_DB_RETENTION";
 /// The env var carrying `--dataset`.
 const RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
 
+/// Every env var in this command's internal one-shot protocol.
+///
+/// `AUTUMN_RETENTION_DRY_RUN` predates this command (`autumn retention`, see
+/// `crate::retention`) but is listed here because it selects the same family
+/// of pre-server modes and must be cleared with the rest.
+const RETENTION_ONE_SHOT_ENV: [&str; 3] = [
+    RETENTION_MODE_ENV,
+    RETENTION_DATASET_ENV,
+    "AUTUMN_RETENTION_DRY_RUN",
+];
+
+/// Strip the retention one-shot protocol from a command that is about to start
+/// a *server* (#1605 review round 10).
+///
+/// `Command` inherits the parent's environment, and `AppBuilder::run`
+/// dispatches `AUTUMN_DB_RETENTION` before the server binds a listener. An
+/// operator who ran `autumn db retention --purge` earlier in the same shell --
+/// or any wrapper that exports it -- would otherwise have the next `autumn
+/// serve` or `autumn dev` in that terminal silently enforce the retention
+/// policy and exit instead of serving. That is the data-flow-dump hazard
+/// `serve::base_command` already guards, except this one deletes rows.
+///
+/// Lives beside the constants that define the protocol so a fourth variable
+/// cannot be added without this list seeing it.
+pub fn clear_inherited_one_shot_env(command: &mut std::process::Command) {
+    for var in RETENTION_ONE_SHOT_ENV {
+        command.env_remove(var);
+    }
+}
+
 /// What the operator asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionMode {
@@ -632,5 +662,35 @@ mod tests {
     fn dry_run_header_says_would_remove() {
         let table = format_report(&[report("job_history")], RetentionMode::DryRun);
         assert!(table.contains("Would remove"), "{table}");
+    }
+
+    #[test]
+    fn clear_inherited_one_shot_env_removes_every_retention_mode_var() {
+        // #1605 review round 10. `AppBuilder::run` dispatches
+        // `AUTUMN_DB_RETENTION` before a server binds a listener, and
+        // `Command` inherits the parent environment — so an `AUTUMN_DB_RETENTION=purge`
+        // left in the shell by an earlier `autumn db retention --purge` turned
+        // the next `autumn serve`/`autumn dev` into a silent destructive purge
+        // that exited 0. `serve::base_command` and `dev::start_server` both call
+        // this; `start_server` spawns directly and has no builder to assert on,
+        // so this is where that path is covered.
+        let mut command = std::process::Command::new("true");
+        for var in RETENTION_ONE_SHOT_ENV {
+            command.env(var, "purge");
+        }
+
+        clear_inherited_one_shot_env(&mut command);
+
+        for var in RETENTION_ONE_SHOT_ENV {
+            let entry = command
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(var));
+            assert_eq!(
+                entry,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly REMOVED (present with a None value); \
+                 merely absent from the overrides means it is inherited",
+            );
+        }
     }
 }
