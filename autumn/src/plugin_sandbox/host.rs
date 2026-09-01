@@ -1667,11 +1667,18 @@ fn sleb128(wasm: &[u8], at: usize) -> Option<(i64, usize)> {
 /// The furthest byte the data section's *active* segments write to.
 ///
 /// `None` when nothing in the section can be evaluated — a passive-only
-/// section, or offsets that are not plain constants. Returning `None`
-/// rather than refusing keeps this from mis-refusing a module whose
-/// offsets this walk simply cannot read.
-fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<u64> {
+/// section. The two `None`s are different answers and the caller treats them
+/// differently: the outer one means the walk failed and the bounds check did
+/// not happen, so the module is refused; the inner one means the walk
+/// succeeded and there was no active write to measure — a passive-only
+/// section copies nothing at instantiation — so there is nothing to refuse.
+fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<Option<u64>> {
     let (count, mut at) = leb128(wasm, start)?;
+    // `None` means "walked the whole section and found no active write to
+    // measure" — a passive-only section, or active offsets this cannot
+    // evaluate. It is wrapped so the caller can tell that apart from the outer
+    // `None` this returns when the walk itself fails: one is a module with
+    // nothing to check, the other is a check that did not happen.
     let mut furthest: Option<u64> = None;
     for _ in 0..count {
         let (flags, next) = leb128(wasm, at)?;
@@ -1699,7 +1706,7 @@ fn data_section_end(wasm: &[u8], start: usize, section_end: usize) -> Option<u64
             furthest = Some(furthest.map_or(segment_end, |f: u64| f.max(segment_end)));
         }
     }
-    furthest
+    Some(furthest)
 }
 
 /// Section ids for the element and data sections.
@@ -1841,7 +1848,13 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             // for one to read, so such a module fails to link for its own
             // reasons rather than being mis-refused here.
             match data_section_end(wasm, after_size, end) {
-                Some(seen) => data_end = data_end.max(seen),
+                Some(Some(seen)) => data_end = data_end.max(seen),
+                // Walked the whole section and found no active write to
+                // measure: every segment is passive, so nothing is copied at
+                // instantiation and there is nothing that could be out of
+                // bounds. Distinct from the case below, and conflating the two
+                // refused a module that was perfectly runnable.
+                Some(None) => {}
                 // The walk lost the thread — a malformed section, or an opcode
                 // a later proposal added that this does not know. Either way
                 // the bounds check below did not run, and silently not running
@@ -4043,6 +4056,70 @@ path = "/hello/greet"
             logged.detail.len() < 1_024,
             "the denial detail carries the guest's whole header: {} bytes",
             logged.detail.len()
+        );
+    }
+
+    #[test]
+    fn a_passive_only_data_section_is_not_a_walk_that_failed() {
+        // `data_section_end` has two ways of saying nothing: the walk failed,
+        // or the walk succeeded and there was no active write to measure. The
+        // fail-closed fallback added for extended-const offsets read both as
+        // the first and refused a module that was perfectly runnable — a
+        // passive segment is copied only by an explicit `memory.init`, never at
+        // instantiation, so it cannot be out of bounds there.
+        //
+        // The three outcomes are pinned together here because the bug was
+        // exactly their collapse into two.
+        let passive_only = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data "passive bytes")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        let shape = module_shape(&passive_only).expect("the section walks cleanly");
+        assert_eq!(
+            shape.data_end, 0,
+            "a passive segment measures nothing, so it must contribute nothing",
+        );
+        SandboxHost::from_module(manifest_with(ResourceLimits::default()), &passive_only)
+            .expect("a passive-only module must still load");
+
+        // An active segment beside it is still measured, so "nothing to
+        // measure" cannot become "measure nothing".
+        let mixed = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data "passive bytes")
+  (data (offset (i32.const 16)) "active")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        let shape = module_shape(&mixed).expect("the section walks cleanly");
+        assert_eq!(
+            shape.data_end, 22,
+            "the active segment's end must survive the passive one beside it",
+        );
+
+        // And an active segment past the memory is still refused, so the
+        // assertions above cannot be satisfied by simply never refusing.
+        let out_of_bounds = wat::parse_str(
+            r#"(module
+  (memory (export "memory") 1)
+  (data "passive bytes")
+  (data (offset (i32.const 65535)) "spills")
+  (func (export "_start") (nop))
+)"#,
+        )
+        .expect("the fixture is valid WAT");
+        let err =
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &out_of_bounds)
+                .expect_err("an active segment past the end of memory must be refused");
+        assert!(
+            matches!(err, SandboxLoadError::SegmentOutOfBounds { .. }),
+            "{err:?}",
         );
     }
 
