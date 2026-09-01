@@ -2,7 +2,10 @@
 FROM rust:{{rust_version}}-bookworm AS chef
 WORKDIR /app
 
-RUN cargo install cargo-chef --locked
+# Version-pinned like every other tool this image installs, so a `docker build`
+# resolves the same cargo-chef today and next month (issue #1615).
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install --locked cargo-chef --version "${CARGO_CHEF_VERSION}"
 
 FROM chef AS planner
 COPY . .
@@ -11,9 +14,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Stage 2: builder ──────────────────────────────────────────────────────────
 FROM chef AS builder
 
-ARG TAILWIND_VERSION=v4.1.4
 ARG AUTUMN_CLI_VERSION={{autumn_cli_version}}
 ARG DIESEL_CLI_VERSION={{diesel_cli_version}}
+ARG CARGO_AUDITABLE_VERSION=0.7.5
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libpq-dev pkg-config \
@@ -23,25 +26,39 @@ RUN apt-get update \
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Download Tailwind CSS for asset compilation; detect arch for ARM64/x86_64 support.
-RUN mkdir -p target/autumn \
-    && arch=$(uname -m) \
-    && if [ "$arch" = "x86_64" ]; then suffix="linux-x64"; \
-       elif [ "$arch" = "aarch64" ]; then suffix="linux-arm64"; \
-       else echo "Unsupported architecture: $arch" && exit 1; fi \
-    && curl -fsSL \
-        -o target/autumn/tailwindcss \
-        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-${suffix}" \
-    && chmod +x target/autumn/tailwindcss
-
 # Install the Autumn + Diesel CLIs. The Autumn CLI is used at build time for
-# embedded single-binary builds and in the runtime for the one-shot migration
-# job; Diesel CLI is used by that migration job.
+# embedded single-binary builds, for Tailwind setup and SBOM generation below,
+# and in the runtime for the one-shot migration job and for reading the SBOM
+# back out of the shipped binary; Diesel CLI is used by that migration job.
+# `--locked` on both makes cargo honour each crate's published Cargo.lock, so
+# the CLI you get is the one its authors tested rather than whatever resolves
+# today.
 RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
-RUN cargo install diesel_cli \
+RUN cargo install --locked diesel_cli \
     --version "${DIESEL_CLI_VERSION}" \
     --no-default-features \
     --features postgres
+
+# `cargo-auditable` embeds the exact resolved dependency list into the
+# compiled binary (a `.dep-v0` section), so a deployed image can answer "which
+# crate versions are actually in you?" with no source tree and no lockfile —
+# see docs/guide/supply-chain.md.
+#
+# It is reached through the `cargo auditable` SUBCOMMAND (which the build step
+# below uses), never by pointing RUSTC_WORKSPACE_WRAPPER at the binary:
+# cargo-auditable only enters wrapper mode when `CARGO_AUDITABLE_ORIG_ARGS` is
+# set, and only `cargo auditable` itself sets it. Wired up any other way it
+# exits 1 on cargo's first `rustc -vV` probe and the build dies before anything
+# compiles.
+RUN cargo install --locked cargo-auditable --version "${CARGO_AUDITABLE_VERSION}"
+
+# Tailwind CSS for asset compilation. `autumn setup` downloads the pinned
+# release for this architecture and verifies its SHA-256 against the
+# `sha256sums.txt` published with that release, refusing to install on a
+# mismatch — the same verified path the dev loop uses. Do NOT replace this with
+# a bare `curl` of the binary: that is an unverified executable download into
+# the image (issue #1615).
+RUN autumn setup
 
 # Git/build provenance passthrough. The build context excludes `/.git` (see
 # .dockerignore), so the generated build.rs cannot shell out to git here.
@@ -67,7 +84,7 @@ ENV AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA} \
 
 COPY . .
 {{build_step}}
-
+{{sbom_generate_step}}
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
@@ -87,10 +104,24 @@ COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
 {{static_copy}}COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
-# Use the production config example as the runtime autumn.toml.
+{{sbom_runtime_copy}}# Use the production config example as the runtime autumn.toml.
 # It sets host = "0.0.0.0" and leaves migration ownership to an explicit
 # one-shot primary-role job.
 COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /app/autumn.toml
+
+# Standard OCI metadata plus a pointer to the in-image SBOM, so a scanner can
+# find the inventory knowing nothing about autumn.
+#
+# These two ARGs are RE-DECLARED here on purpose: a `docker build --build-arg`
+# value is scoped to the stage that declares it, so the builder stage's
+# AUTUMN_BUILD_* declarations above are not visible in this stage and the
+# labels would render empty without these lines. Same defaults, same
+# `--build-arg` flags — nothing extra for the caller to pass.
+ARG AUTUMN_BUILD_GIT_SHA=
+ARG AUTUMN_BUILD_TIMESTAMP=
+LABEL org.opencontainers.image.title="{{project_name}}" \
+      org.opencontainers.image.revision="${AUTUMN_BUILD_GIT_SHA}" \
+      org.opencontainers.image.created="${AUTUMN_BUILD_TIMESTAMP}"{{sbom_labels}}
 
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000

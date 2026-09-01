@@ -1,6 +1,6 @@
 //! Tailwind CSS CLI download and verification for `autumn setup`.
 //!
-//! Downloads the correct platform-specific Tailwind CSS v4.1.0 standalone binary,
+//! Downloads the correct platform-specific Tailwind CSS standalone binary,
 //! verifies its SHA-256 checksum against the `sha256sums.txt` file published with
 //! each release, and installs it to `target/autumn/tailwindcss`.
 
@@ -11,7 +11,14 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 /// Pinned Tailwind CSS release version.
-const TAILWIND_VERSION: &str = "v4.1.0";
+///
+/// This is now the single pin for BOTH surfaces: the dev loop (`autumn setup`)
+/// and the production image, whose generated Dockerfile calls `autumn setup`
+/// rather than curling the binary itself (issue #1615). Keep it in step with
+/// `TAILWIND_VERSION` in `templates/Dockerfile.tmpl`, which the `autumn new`
+/// image still pins directly — a `repo_hygiene`-style test would otherwise be
+/// the only thing standing between the two surfaces and a silent version skew.
+const TAILWIND_VERSION: &str = "v4.1.4";
 
 /// Base URL for Tailwind CSS release assets.
 const RELEASE_BASE_URL: &str = "https://github.com/tailwindlabs/tailwindcss/releases/download";

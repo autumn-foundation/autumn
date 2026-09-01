@@ -685,9 +685,42 @@ impl AcmeRenewalTask {
         Ok((csr.der().to_vec(), key_pair.serialize_pem()))
     }
 
+    /// Build an ACME account builder whose HTTP client trusts the right roots.
+    ///
+    /// Calls [`ensure_default_crypto_provider`] first — see there for why a
+    /// missing process default is a panic rather than an error.
+    ///
+    /// With no `ca_root_path` the client verifies the directory against the
+    /// platform trust store, which is what Let's Encrypt (staging and production
+    /// alike — both API endpoints carry publicly-trusted certificates) needs. A
+    /// private CA or a Pebble test server serves its directory under a root the
+    /// host does not know, so `ca_root_path` replaces the trust anchors with
+    /// that root; without it the client cannot complete the TLS handshake and
+    /// every order fails.
+    ///
+    /// Both the register and the restore path go through here, so a restart
+    /// against a private directory works exactly like a first boot.
+    fn account_builder(&self) -> Result<instant_acme::AccountBuilder, String> {
+        ensure_default_crypto_provider();
+        self.config.ca_root_path.as_ref().map_or_else(
+            || {
+                instant_acme::Account::builder()
+                    .map_err(|e| format!("failed to build ACME client: {e}"))
+            },
+            |path| {
+                instant_acme::Account::builder_with_root(path).map_err(|e| {
+                    format!(
+                        "failed to build ACME client with [server.tls.acme] ca_root_path {}: {e}",
+                        path.display()
+                    )
+                })
+            },
+        )
+    }
+
     /// Load the persisted ACME account, or register a fresh one and persist it.
     async fn load_or_register_account(&self) -> Result<instant_acme::Account, String> {
-        use instant_acme::{Account, AccountCredentials, NewAccount};
+        use instant_acme::{AccountCredentials, NewAccount};
 
         let directory_url = crate::acme::directory_url(&self.config.directory);
 
@@ -699,8 +732,8 @@ impl AcmeRenewalTask {
         {
             let credentials: AccountCredentials = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("stored ACME account is corrupt: {e}"))?;
-            let account = Account::builder()
-                .map_err(|e| format!("failed to build ACME client: {e}"))?
+            let account = self
+                .account_builder()?
                 .from_credentials(credentials)
                 .await
                 .map_err(|e| format!("failed to restore ACME account: {e}"))?;
@@ -709,8 +742,8 @@ impl AcmeRenewalTask {
 
         let contact = format!("mailto:{}", self.config.contact_email.trim());
         let contacts = [contact.as_str()];
-        let (account, credentials) = Account::builder()
-            .map_err(|e| format!("failed to build ACME client: {e}"))?
+        let (account, credentials) = self
+            .account_builder()?
             .create(
                 &NewAccount {
                     contact: &contacts,
@@ -733,6 +766,37 @@ impl AcmeRenewalTask {
     }
 }
 
+/// Pin the process-level rustls `CryptoProvider` to `ring` if nothing has set one.
+///
+/// `instant-acme` builds its HTTPS transport through `rustls::ClientConfig::builder()`,
+/// which resolves its provider from process-global state. That call does not
+/// return an error when it cannot resolve one — it **panics**:
+///
+/// ```text
+/// Could not automatically determine the process-level CryptoProvider from Rustls
+/// crate features. Call CryptoProvider::install_default() before this point ...
+/// ```
+///
+/// rustls resolves implicitly only while exactly ONE of its `ring` /
+/// `aws-lc-rs` features is enabled. Autumn pins `ring` everywhere, but Cargo
+/// unifies features across the whole graph, so any dependency that turns on
+/// `aws-lc-rs` makes the choice ambiguous and every ACME order panics. That is
+/// not hypothetical or test-only: enabling `telemetry-otlp` alone is enough, and
+/// so are `testcontainers`/`bollard` and `postgresql_embedded`.
+///
+/// Installing is process-wide and one-shot. If a provider is already installed —
+/// by an earlier call, or by the application itself — we keep it: the
+/// requirement is only that *a* default exists before rustls looks for one, and
+/// silently replacing an application's deliberate choice would be worse than
+/// the panic this prevents.
+fn ensure_default_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Errors only if another thread won the race to install one, which
+        // satisfies the requirement just as well.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 /// Current UNIX time in seconds.
 fn now_unix() -> i64 {
     default_now_unix()
@@ -744,6 +808,24 @@ mod tests {
     use crate::actuator::HealthStatus;
 
     const DAY: i64 = 86_400;
+
+    /// `instant-acme` reaches `rustls::ClientConfig::builder()`, which PANICS
+    /// rather than erroring when it cannot resolve a process-level provider —
+    /// which is what happens as soon as any dependency enables `aws-lc-rs`
+    /// alongside autumn's `ring` (`telemetry-otlp` alone is enough). Building an
+    /// ACME client must therefore always leave a default installed.
+    #[test]
+    fn building_an_acme_client_guarantees_a_process_crypto_provider() {
+        ensure_default_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no process-level CryptoProvider installed; every ACME order would panic"
+        );
+        // Idempotent: a second call keeps the existing provider rather than
+        // failing or replacing it.
+        ensure_default_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn needs_renewal_matrix() {
@@ -982,6 +1064,7 @@ mod tests {
             cache_dir: store_dir.path().to_path_buf(),
             http_challenge_port: 80,
             renew_before_days: 30,
+            ca_root_path: None,
         };
         let task = AcmeRenewalTask {
             resolver,
@@ -1083,6 +1166,7 @@ mod tests {
             cache_dir: store_dir.path().to_path_buf(),
             http_challenge_port: 80,
             renew_before_days: 30,
+            ca_root_path: None,
         };
         let task = AcmeRenewalTask {
             resolver,

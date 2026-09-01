@@ -4,13 +4,34 @@ WORKDIR /app
 
 ARG TAILWIND_VERSION=v4.1.4
 
+# Tailwind CSS standalone CLI, checksum-verified. Two things matter here:
+#
+#   * The architecture is detected, not assumed — an arm64 build that pulled
+#     `linux-x64` would install a binary it cannot execute.
+#   * The binary is verified against the `sha256sums.txt` published with that
+#     Tailwind release, and the build FAILS on a mismatch. An unverified
+#     executable download into a build image is exactly the hole issue #1615
+#     closes; `autumn setup` does the same verification for the dev loop.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p target/autumn \
-    && curl -fsSL \
-        -o target/autumn/tailwindcss \
-        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64" \
+    && arch="$(uname -m)" \
+    && case "$arch" in \
+         x86_64) asset="tailwindcss-linux-x64" ;; \
+         aarch64) asset="tailwindcss-linux-arm64" ;; \
+         *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+       esac \
+    && base="https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}" \
+    && curl -fsSL -o "target/autumn/$asset" "$base/$asset" \
+    && curl -fsSL -o target/autumn/sha256sums.txt "$base/sha256sums.txt" \
+    && (cd target/autumn \
+        && grep -E "[[:space:]][.]?/?${asset}\$" sha256sums.txt \
+             | sed "s|[.]/||" > expected.sha256 \
+        && test -s expected.sha256 \
+        && sha256sum -c expected.sha256) \
+    && mv "target/autumn/$asset" target/autumn/tailwindcss \
+    && rm -f target/autumn/sha256sums.txt target/autumn/expected.sha256 \
     && chmod +x target/autumn/tailwindcss
 
 COPY Cargo.toml autumn.toml build.rs tailwind.config.js ./
