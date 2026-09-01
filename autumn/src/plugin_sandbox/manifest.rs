@@ -789,7 +789,12 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
 /// Bidi overrides and isolates reorder a run; the zero-width and invisible
 /// characters hide a boundary. `char::is_control` catches neither, because
 /// these are formatting characters rather than control codes.
-const fn is_display_reordering(ch: char) -> bool {
+///
+/// Used by two surfaces an operator reads and a guest influences: route-path
+/// validation, which *refuses* them because a path must mean one thing; and
+/// [`guest_text`](super::host::guest_text), which *escapes* them because a
+/// failure detail is evidence and has to survive to be read.
+pub(super) const fn is_display_reordering(ch: char) -> bool {
     matches!(ch,
         '\u{061C}'                          // Arabic letter mark
         | '\u{200B}'..='\u{200F}'            // zero-width, LRM/RLM

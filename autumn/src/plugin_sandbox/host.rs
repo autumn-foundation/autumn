@@ -222,17 +222,29 @@ const DETAIL_EXCERPT: usize = 512;
 /// turns "the log says" into something a plugin controls.
 ///
 /// Control characters are escaped rather than dropped, so a detail that was
-/// trying to forge a line reads as one that tried. Everything printable —
-/// including non-ASCII — is kept: an author debugging a plugin that writes
-/// error text in their own language should be able to read it.
-fn guest_text(text: &str) -> String {
+/// trying to forge a line reads as one that tried. Real text is kept, including
+/// non-ASCII: an author debugging a plugin that writes error text in their own
+/// language should be able to read it.
+///
+/// `is_control` alone is not the line between those two, because it covers the
+/// C0/C1 codes and stops there. The Unicode formatting characters do the same
+/// job by other means — U+202E reverses the run that follows it, so a guest can
+/// make a denial record *display* as something other than what was recorded,
+/// which is the same forgery a newline attempts and just as available. They are
+/// escaped by the same predicate the consent screen refuses them with, so the
+/// two surfaces cannot disagree about what counts as display-altering.
+///
+/// Escaped rather than refused, unlike a route path: a path must mean exactly
+/// one thing, but a failure detail is evidence, and evidence that tried
+/// something is worth keeping in a legible form.
+pub(super) fn guest_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(DETAIL_EXCERPT));
     for (kept, ch) in text.chars().enumerate() {
         if kept == DETAIL_EXCERPT {
             out.push_str(" … (truncated)");
             break;
         }
-        if ch.is_control() {
+        if ch.is_control() || super::manifest::is_display_reordering(ch) {
             out.extend(ch.escape_debug());
         } else {
             out.push(ch);
@@ -3903,6 +3915,56 @@ path = "/hello/greet"
             logged.detail.len() < 1_024,
             "the denial detail carries the guest's whole header: {} bytes",
             logged.detail.len()
+        );
+    }
+
+    #[test]
+    fn a_bidi_override_cannot_reorder_the_record_it_appears_in() {
+        // `is_control` covers the C0/C1 codes and stops there, so the Unicode
+        // formatting characters went into the log verbatim. They do the same job
+        // as an ESC by other means: U+202E reverses everything after it, so a
+        // guest can write a detail that *reads* as a different record than the
+        // one the host wrote — including reading as though the denial were an
+        // allow. The operator reads that line to decide what happened.
+        //
+        // The consent screen already refuses these in a route path. A detail is
+        // evidence rather than a mount, so here they are escaped instead: the
+        // attempt survives, legibly, as an attempt.
+        let forged = guest_text("denied \u{202E}dewolla\u{202D} by policy");
+        assert!(
+            !forged.contains('\u{202E}') && !forged.contains('\u{202D}'),
+            "a bidi override reached the log verbatim: {forged:?}",
+        );
+        assert!(
+            forged.contains("\\u{202e}"),
+            "the attempt must survive as an escape, not be silently dropped: {forged:?}",
+        );
+        assert!(
+            forged.contains("denied") && forged.contains("by policy"),
+            "the host's own words must survive: {forged:?}",
+        );
+
+        // The whole family, not just the one character: isolates and the
+        // zero-width joiners hide a boundary rather than reversing a run, and
+        // the log is just as unreadable either way.
+        for ch in [
+            '\u{061C}', '\u{200B}', '\u{200E}', '\u{200F}', '\u{2060}', '\u{2066}', '\u{2069}',
+            '\u{FEFF}',
+        ] {
+            let out = guest_text(&format!("before{ch}after"));
+            assert!(
+                !out.contains(ch),
+                "U+{:04X} reached the log verbatim: {out:?}",
+                ch as u32,
+            );
+        }
+
+        // And ordinary non-ASCII is still kept — an author debugging a plugin
+        // that reports errors in their own language has to be able to read them.
+        let readable = guest_text("le module n'a pas démarré — 起動しませんでした");
+        assert!(
+            readable.contains("démarré") && readable.contains("起動しませんでした"),
+            "real text was escaped along with the formatting characters: {readable:?}",
         );
     }
 
