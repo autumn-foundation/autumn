@@ -1218,6 +1218,55 @@ async fn a_post_truncation_append_leaves_a_gap_verify_reports() {
     assert_eq!(broken.seq, 3);
 }
 
+/// `ledger_pin` is what an audit posture actually calls: the head and the mark
+/// from one statement, so a concurrent append cannot hand an auditor a head at
+/// `N` beside a mark at `N+1` and be read as a truncation.
+#[tokio::test]
+async fn ledger_pin_returns_the_head_and_the_mark_from_one_snapshot() {
+    let pool = boot_pool("lg_pin").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+
+    // A record with no chain yet: neither half exists, and that is not an error.
+    let empty = repo.ledger_pin(9_999).await.expect("pin");
+    assert!(empty.head.is_none() && empty.high_water.is_none());
+
+    let id = write_three_revisions(&repo).await;
+    let pin = repo.ledger_pin(id).await.expect("pin");
+    let head = pin.head.expect("a written record has a head");
+    let mark = pin.high_water.expect("and a mark");
+    assert_eq!(head.seq, 3);
+    assert_eq!(
+        mark.seq, head.seq,
+        "the pair agrees because it is one snapshot"
+    );
+    assert_eq!(mark.hash, head.hash);
+    assert_eq!(mark.recorded_at, head.recorded_at);
+
+    // The single-value accessors are the same statement projected.
+    assert_eq!(repo.ledger_head(id).await.expect("head"), Some(head));
+    assert_eq!(repo.ledger_high_water(id).await.expect("mark"), Some(mark));
+
+    // And it reports the truncation the mark exists for, in one read.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 3",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("lop off the newest revision");
+    }
+    let pin = repo.ledger_pin(id).await.expect("pin");
+    assert_eq!(pin.head.expect("head").seq, 2);
+    assert_eq!(
+        pin.high_water.expect("mark").seq,
+        3,
+        "the mark outlives the revision it names, and the pair shows it"
+    );
+}
+
 /// The mark is not a second source of truth to be believed: rolling it back,
 /// rewriting it or deleting it is itself what `ledger_verify` reports.
 #[tokio::test]

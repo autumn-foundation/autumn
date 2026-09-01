@@ -19015,8 +19015,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // against a stale head is indistinguishable from a truncated
                     // tail. This routine exists to produce trustworthy
                     // accusations, so it does not manufacture that one.
-                    let (settled_head, high_water) =
-                        self.__autumn_ledger_settled_state(record_id).await?;
+                    let ::autumn_web::ledger::LedgerPin {
+                        head: settled_head,
+                        high_water,
+                    } = self.__autumn_ledger_settled_state(record_id).await?;
                     let stable = settled_head.as_ref().map(|h| h.seq)
                         == revisions.last().map(|r| r.seq);
 
@@ -19174,10 +19176,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 pub async fn __autumn_ledger_settled_state(
                     &self,
                     record_id: i64,
-                ) -> ::autumn_web::AutumnResult<(
-                    ::core::option::Option<::autumn_web::ledger::LedgerHead>,
-                    ::core::option::Option<::autumn_web::ledger::LedgerHighWater>,
-                )> {
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerPin> {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
 
                     // Two indexed single-row lookups. Pinning a head is the
@@ -19256,18 +19255,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .map_err(::autumn_web::AutumnError::from)?
                             .into_iter()
                             .next()
-                            .map(|row| (
-                                row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
+                            .map(|row| ::autumn_web::ledger::LedgerPin {
+                                head: row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
                                     |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHead {
                                         record_id, seq, hash, recorded_at,
                                     },
                                 ),
-                                row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
+                                high_water: row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
                                     |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHighWater {
                                         record_id, seq, hash, recorded_at,
                                     },
                                 ),
-                            ))
+                            })
                         }},
                         sqlite => {{
                             #[derive(::autumn_web::reexports::diesel::QueryableByName)]
@@ -19311,23 +19310,49 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .map_err(::autumn_web::AutumnError::from)?
                             .into_iter()
                             .next()
-                            .map(|row| (
-                                row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
+                            .map(|row| ::autumn_web::ledger::LedgerPin {
+                                head: row.head_seq.zip(row.head_hash).zip(row.head_recorded_at).map(
                                     |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHead {
                                         record_id, seq, hash, recorded_at,
                                     },
                                 ),
-                                row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
+                                high_water: row.mark_seq.zip(row.mark_hash).zip(row.mark_recorded_at).map(
                                     |((seq, hash), recorded_at)| ::autumn_web::ledger::LedgerHighWater {
                                         record_id, seq, hash, recorded_at,
                                     },
                                 ),
-                            ))
+                            })
                         }},
                     };
-                    ::core::result::Result::Ok(
-                        settled.unwrap_or((::core::option::Option::None, ::core::option::Option::None)),
-                    )
+                    ::core::result::Result::Ok(settled.unwrap_or(
+                        ::autumn_web::ledger::LedgerPin {
+                            head: ::core::option::Option::None,
+                            high_water: ::core::option::Option::None,
+                        },
+                    ))
+                }
+
+                /// The record's chain head and high-water mark, from **one**
+                /// statement and one snapshot — what an audit posture pins
+                /// outside the database (issue #2323).
+                ///
+                /// Prefer this over calling
+                /// [`ledger_head`](Self::ledger_head) and
+                /// [`ledger_high_water`](Self::ledger_high_water) in
+                /// sequence. Those take a snapshot each, so an ordinary append
+                /// landing between them hands you a head at sequence `N`
+                /// beside a mark at `N+1` — which reads exactly like the
+                /// truncation the mark exists to expose. The two are only
+                /// meaningful as a pair; read them as one.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if either ledger table cannot be read.
+                pub async fn ledger_pin(
+                    &self,
+                    record_id: i64,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerPin> {
+                    self.__autumn_ledger_settled_state(record_id).await
                 }
 
                 /// The head of the record's chain, for pinning outside the
@@ -19346,7 +19371,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                 ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHead>> {
                     ::core::result::Result::Ok(
-                        self.__autumn_ledger_settled_state(record_id).await?.0,
+                        self.__autumn_ledger_settled_state(record_id).await?.head,
                     )
                 }
 
@@ -19372,7 +19397,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                 ) -> ::autumn_web::AutumnResult<::core::option::Option<::autumn_web::ledger::LedgerHighWater>> {
                     ::core::result::Result::Ok(
-                        self.__autumn_ledger_settled_state(record_id).await?.1,
+                        self.__autumn_ledger_settled_state(record_id).await?.high_water,
                     )
                 }
             }
@@ -26974,6 +26999,7 @@ mod tests {
             "ledger_verify",
             "ledger_head",
             "ledger_high_water",
+            "ledger_pin",
         ] {
             assert!(
                 generated.contains(method),

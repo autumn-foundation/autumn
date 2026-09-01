@@ -132,6 +132,9 @@ let head = repo.ledger_head(id).await?;
 
 // The out-of-band high-water mark this record's chain has reached.
 let mark = repo.ledger_high_water(id).await?;
+
+// Both at once, from one snapshot — what you pin outside the database.
+let pin = repo.ledger_pin(id).await?;
 ```
 
 `ledger_as_of` returns `None` when the record did not exist yet. Because a
@@ -307,10 +310,15 @@ together and then waiting for ordinary traffic would have the append quietly
 re-create both, which is the very laundering this feature exists to stop.
 
 ```rust
-// Both are cheap, and come from one statement; pin them together.
-let head = repo.ledger_head(id).await?;
-let mark = repo.ledger_high_water(id).await?;
+// One statement, one snapshot — the two are only meaningful as a pair.
+let pin = repo.ledger_pin(id).await?;
+notary.pin(id, pin.head, pin.high_water).await?;
 ```
+
+Read them with `ledger_pin`, not with `ledger_head` and `ledger_high_water` in
+sequence: those take a snapshot each, so an ordinary append landing between them
+hands an auditor a head at sequence `N` beside a mark at `N+1` — which reads
+exactly like the truncation the mark exists to expose.
 
 | Tamper with the mark | Reported | Next ordinary write |
 |---|---|---|
@@ -334,7 +342,8 @@ So the ceiling is unchanged: pin the head hash somewhere the database cannot
 reach. Treat that as required for an audit posture, not optional.
 
 ```rust
-if let Some(head) = repo.ledger_head(id).await? {
+let pin = repo.ledger_pin(id).await?;              // head and mark, one snapshot
+if let Some(head) = pin.head {
     notary.pin(id, head.seq, &head.hash).await?;   // append-only store, notary, …
 }
 ```
@@ -389,8 +398,9 @@ already holds their row locks — a `delete_many` over 1000 ids goes from a coup
 of statements to a few thousand. Chunk accordingly, or keep bulk writes off
 ledgered entities where throughput matters.
 
-`ledger_head` and `ledger_high_water` come from one statement over two indexed
-rows, so pinning both on a schedule is cheap. The mark table takes an in-place
+`ledger_pin` is one statement over two indexed rows — and `ledger_head` /
+`ledger_high_water` are that same statement projected — so pinning on a schedule
+is cheap. The mark table takes an in-place
 `UPDATE` per ledgered write — the ledger's only non-append-only write — so it
 produces one dead tuple per revision in a table whose primary key is its only
 index; nothing unusual for autovacuum, but worth knowing at high write rates.

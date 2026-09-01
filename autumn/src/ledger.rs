@@ -553,6 +553,29 @@ pub struct LedgerHighWater {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// A record's chain head and high-water mark, read together (issue #2323).
+///
+/// The two are what an audit posture pins outside the database, and they are
+/// only meaningful as a pair: the head hash is what a rewritten chain
+/// disagrees with, and the mark is what proves no revision is missing from the
+/// end. Reading them with two separate calls lets an ordinary append land in
+/// between, so an auditor can hold a head at sequence `N` beside a mark at
+/// `N+1` and read a concurrent write as a truncation. This type exists so the
+/// pair always comes from one statement, and one snapshot.
+///
+/// Either field is `None` for a record that has neither — one never written,
+/// or one predating the day its model was ledgered. A `high_water` of `None`
+/// beside a `Some` head is the state
+/// [`LedgerBreak::HighWaterMissing`] reports; this type does not judge, it
+/// reports what is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerPin {
+    /// The newest revision's sequence number and hash.
+    pub head: Option<LedgerHead>,
+    /// The out-of-band high-water mark.
+    pub high_water: Option<LedgerHighWater>,
+}
+
 /// What a verification knows about a record's
 /// [high-water mark](LedgerHighWater).
 ///

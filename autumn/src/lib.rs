@@ -366,7 +366,7 @@ pub mod ledger;
 // and a caller reaching for them is already inside that module.
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
-    LedgerHighWater, LedgerRevision, LedgerVerification, LedgeredRecord,
+    LedgerHighWater, LedgerPin, LedgerRevision, LedgerVerification, LedgeredRecord,
 };
 
 /// Automatic record version history for `#[repository]` writes.
