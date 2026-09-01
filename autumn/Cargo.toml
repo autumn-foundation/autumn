@@ -122,7 +122,12 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
-redis = ["dep:redis"]
+# `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
+# feature makes `rediss://` URLs reachable, and those panic inside
+# `rustls::ClientConfig::builder()` unless a process-level
+# `CryptoProvider` is installed first. `redis_tls` installs one — see
+# that module and issue #2172.
+redis = ["dep:redis", "dep:rustls"]
 i18n = []
 # Embed the app's `static/` tree (incl. the fingerprint manifest) and i18n
 # `locales`/`i18n` bundles into the release binary at compile time, so a single

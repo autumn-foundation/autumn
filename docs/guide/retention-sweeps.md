@@ -175,3 +175,7 @@ own [app-defined metrics](metrics.md).
 - The `gdpr` module (`autumn_web::gdpr`) — request-driven subject
   erasure/export. Retention sweeps are the opposite: proactive, scheduled,
   and app-declared rather than triggered by a user request.
+- [Data Retention for Framework-Owned Data](data-retention.md) — the
+  counterpart for Autumn's *own* tables and stores (job history, idempotency,
+  experiment assignments, webhook replay, sessions, audit archives), declared
+  in one `[retention]` config section rather than per repository.

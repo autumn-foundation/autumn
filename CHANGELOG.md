@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One retention policy for every table Autumn creates (#1605):** every
+  deployed Autumn app accumulated framework-owned data forever by default —
+  job history, tracking records, idempotency responses, experiment
+  assignments, webhook replay markers, sessions, audit archives. Retention
+  existed only piecemeal (`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`),
+  so "keep operational data 90 days" meant discovering each subsystem's
+  private knob, finding there often wasn't one, and hand-writing cron jobs
+  against undocumented tables. A new `[retention]` section in `autumn.toml`
+  declares a window per dataset, and Autumn enforces it on a recurring,
+  fleet-coordinated in-process sweep — no external cron:
+
+  ```toml
+  [retention]
+  job_history            = "90d"
+  job_tracking           = "7d"
+  experiment_assignments = "365d"
+  audit_archives         = "400d"
+  ```
+
+  Postgres-backed datasets are swept in bounded batches against the database's
+  own clock; TTL-native stores (idempotency, webhook replay, sessions) have
+  their record TTL *capped* at the window; the JSONL audit archive is rewritten
+  atomically without the stale entries, keeping any line it cannot parse. The
+  pre-existing `jobs.tracking.ttl_secs` / `idempotency.ttl_secs` knobs keep
+  working unchanged: the documented rule is that the **shorter** bound wins, so
+  adding `[retention]` can never cause data to be kept longer than it is today.
+  Leaving a dataset unset registers no sweep task at all.
+
+  Data under a GDPR legal hold (`ModelRegistration::retain`) is never removed —
+  the hold vetoes the whole dataset rather than filtering rows — and every real
+  sweep writes an audit record carrying the dataset, the cutoff timestamp and
+  the rows removed, including one that removed nothing and one a hold blocked.
+  `autumn db retention [--dry-run|--purge] [--dataset X] [--json]` reports the
+  effective window per dataset, which setting produced it, how it is enforced,
+  and how many rows are eligible right now; it runs inside your app binary so
+  the report and the enforcement come from one code path. A
+  `retention.webhook_replay` window shorter than a configured endpoint's
+  `replay_window_secs` fails boot rather than silently weakening replay
+  protection. See
+  [Data Retention for Framework-Owned Data](docs/guide/data-retention.md).
+
+  **Breaking:** `autumn_web::audit::AuditEvent` gains a `metadata:
+  BTreeMap<String, String>` field so a sweep record can carry its dataset,
+  cutoff and row count. Only code that constructs or destructures `AuditEvent`
+  *by struct literal* is affected — `AuditEvent::new(...)` is unchanged, the
+  field is `#[serde(default)]`, and archives written before this release still
+  deserialize. `AuditSink::purge_before` is a *provided* method, so existing
+  sinks keep compiling untouched. See the
+  [migration guide](docs/migrations/next.md).
+
 - **SSG records each route's intended `Content-Type` at generation time
   (#1832):** the static-first serve path used to reverse-engineer every cached
   response's MIME type at *request* time, from the route slug plus the served
@@ -534,6 +584,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
 ### Fixed
+
+- **CI now rejects colliding migration versions:** app, framework and plugin
+  migrations are applied into one shared version space — diesel keys
+  `__diesel_schema_migrations` on the 14-digit version and
+  `autumn_migration_checksums` makes it a `PRIMARY KEY` — so two migrations
+  claiming one version are not two migrations: the loser silently never runs.
+  Hand-written day-granularity names (`YYYYMMDD000000`) collide by
+  construction, because every author who types a date pads the same six zeros.
+  The damage was already in the tree: `examples/reddit-clone` carries
+  `20260513000001` and `20260702000001`, hand-bumped by one off framework
+  versions, and `00000000000000` was shared by the framework, the starters, the
+  benchmark app and eight examples. A new gate
+  (`scripts/check-migration-versions.sh`, run in the `Migration guide coverage`
+  job) fails a migration whose time component is `000000`, whose digits are not
+  a real UTC timestamp (`20260530300000` has hour 30), whose name is not
+  `<14 digits>_<snake_case>`, or whose version is already claimed. The
+  generators already did the right thing — `autumn generate migration` and
+  `autumn schema diff --write-migration` mint a full `YYYYMMDDHHMMSS` from the
+  clock — so this closes the hand-created-directory bypass rather than adding a
+  new convention. Pre-existing offenders are grandfathered in
+  `scripts/migration-version-baseline.txt` and deliberately **not** renamed:
+  they have already been applied to real databases, and renaming one makes the
+  framework consider it unapplied and run it again.
+- **Failure capsules: credential components no longer miss the spelling the
+  handler holds (#2212):** `record_credential_components` records the secret
+  *inside* a masked header — the token after an auth scheme, each auth-param
+  value, each cookie value — so the echo set matches what a handler actually
+  extracted rather than only the whole header line. Two spellings escaped it.
+
+  The parser began by requiring the whole header value to be UTF-8, so a
+  single `obs-text` byte — legal inside a `quoted-string`, and reachable with
+  a perfectly valid header — skipped **every** component, including parameters
+  that were plain ASCII and independently parseable. A byte-oriented `Digest`
+  handler extracted `response="deadbeef"` from
+  `Digest username="<0xff>alice", response="deadbeef"`, echoed it into an
+  error and bound it, and nothing in the echo set matched. The parser now
+  works on bytes throughout: the scheme split, `is_auth_scheme` and
+  `is_token68`, and the quoted-string walk in `split_auth_params` /
+  `unquote_auth_param`. Same class as the `Basic` case fixed earlier, where
+  requiring the decoded `user:password` to be UTF-8 discarded an ASCII
+  password because of a byte in the username beside it.
+
+  A `Cookie` value was recorded exactly as it arrived, so `session=abc%2Fdef`
+  contributed `abc%2Fdef` and nothing else. Percent-encoding cookie values is
+  a common convention that Autumn itself follows — the `autumn_time_zone`
+  cookie is percent-decoded before use — so an application doing the same
+  holds `abc/def`, which matched neither the whole header nor the recorded
+  component. Cookie values now join the echo set under both spellings, and
+  stay whole-token-only so a `theme=dark` cookie still cannot shred *darkness*
+  in an unrelated failure. Unlike the form and query values
+  `mask_raw_urlencoded` records both spellings for, a cookie value is not
+  form-encoded: `+` stays a `+` rather than folding to a space, matching
+  Autumn's own cookie decoder.
+
+  The decoded spelling — an inference about what a handler holds, rather than
+  something the request carried — is only recorded once it is at least four
+  bytes and not all whitespace. `%2F`, `%3D`, `%30` and `%20` decode to `/`,
+  `=`, `0` and a space, and a one-byte needle masked as a whole token would
+  rewrite `failed at /`, `x = y` and `status 0` in the outcome while blanking
+  any bind equal to it, which drops that column from replay's comparison. The
+  spelling that actually arrived is still recorded however short, exactly as
+  before.
+- **`rediss://` no longer panics at startup, in any Redis-backed subsystem
+  (#2172):** `redis`'s `tokio-rustls-comp` builds its TLS `ClientConfig`
+  through `rustls::ClientConfig::builder()`, which *panics* rather than
+  erroring when no process-level `CryptoProvider` is installed — and rustls
+  can only resolve one implicitly while exactly one of its `ring`/`aws-lc-rs`
+  features is on, which Cargo's whole-graph feature unification can break from
+  any dependency (`telemetry-otlp` alone is enough). Only `autumn-cache-redis`
+  guarded against this; sessions, channels, the Redis job queue, job tracking,
+  idempotency, webhook replay and Redis rate limiting each opened their own
+  unguarded client. Since the `azure-container-apps` release target provisions
+  a Redis Cache with `non_ssl_port_enabled = false` — it can only ever hand the
+  app a `rediss://` URL — pointing any of those subsystems at it crashed the
+  app on boot.
+
+  Every Redis client the framework opens now goes through
+  `autumn_web::redis_tls::open_client`, which installs `ring` once,
+  idempotently, and only when the URL is a TLS one — decided by asking the
+  `redis` crate to parse it and checking whether it resolved to a TLS address,
+  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
+  accepts are all covered without a scheme list to keep in sync. (The previous
+  `starts_with("rediss://")` check had already missed both.) A plaintext
+  `redis://` URL deliberately does **not** claim the process-wide default, so
+  it cannot pre-empt an application that installs `aws-lc-rs` for something
+  else, and an already-installed provider is always kept rather than replaced.
+  `autumn-cache-redis` now delegates to the same guard instead of carrying its
+  own copy, and a source scan in each crate keeps a future subsystem from
+  re-opening the hole with a bare `redis::Client::open`.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its

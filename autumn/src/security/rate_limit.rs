@@ -568,7 +568,7 @@ impl Limiter {
         #[cfg(feature = "redis")]
         if config.backend == RateLimitBackend::Redis {
             if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                match redis::Client::open(url) {
+                match crate::redis_tls::open_client(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
                             client,
@@ -2448,7 +2448,7 @@ mod tests {
     #[tokio::test]
     async fn redis_store_debug_format() {
         use super::super::config::RateLimitBackendFailure;
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let client = crate::redis_tls::open_client("redis://127.0.0.1/").unwrap();
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
             redis::aio::ConnectionManagerConfig::new(),

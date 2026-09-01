@@ -540,6 +540,48 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
 
+### Always generate — never hand-create the directory
+
+Reach for the generator even when you intend to write every line of SQL
+yourself. The one thing it does that you cannot easily do by hand is pick the
+version.
+
+Your app's migrations, the framework's, and every plugin's are applied into
+**one shared version space**. Diesel records what it has applied by the
+14-digit version in `__diesel_schema_migrations`, and Autumn's
+`autumn_migration_checksums` table makes that version a `PRIMARY KEY`. Two
+migrations claiming the same version are therefore not two migrations — one of
+them silently never runs, and you find out when a column you were sure you
+added isn't there.
+
+Hand-written versions collide because everyone reaches for the same number. A
+human typing a date pads it out to `20260831000000`; the next person to touch
+the tree that day types the identical string. The generators mint a full
+`YYYYMMDDHHMMSS` from the wall clock instead, so two authors collide only if
+they generate in the same second:
+
+```bash
+autumn generate migration BackfillSomething      # → 20260831191622_backfill_something
+autumn schema diff --write-migration --name x    # → same convention
+```
+
+If you have already created a directory by hand, rename it to a real
+timestamp before committing:
+
+```bash
+date -u +%Y%m%d%H%M%S
+```
+
+CI enforces this (`scripts/check-migration-versions.sh`): a migration whose
+time component is `000000`, whose digits aren't a real UTC timestamp, or whose
+version is already claimed by another migration fails the build.
+
+One caveat if you are fixing an existing migration: **never rename one that
+has already been applied.** The version is how the framework knows it ran, so
+renaming it makes the framework consider it unapplied and run it a second
+time. Migrations already in that state are grandfathered in
+`scripts/migration-version-baseline.txt` rather than corrected.
+
 ### Generated safety comments
 
 When `autumn generate migration` produces SQL that could be dangerous for a
