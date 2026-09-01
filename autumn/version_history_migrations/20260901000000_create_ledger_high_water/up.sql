@@ -31,7 +31,7 @@
 --                           -- `recorded_at` against, so transaction time is
 --                           -- non-decreasing along a chain by construction
 
-CREATE TABLE IF NOT EXISTS _autumn_ledger_chain_heads (
+CREATE TABLE IF NOT EXISTS _autumn_ledger_high_water (
     table_name  TEXT        NOT NULL,
     tenant_key  TEXT        NOT NULL,
     record_id   BIGINT      NOT NULL,
@@ -49,18 +49,17 @@ CREATE TABLE IF NOT EXISTS _autumn_ledger_chain_heads (
 --
 -- SHARE conflicts with the ROW EXCLUSIVE an INSERT takes, so a ledger append
 -- cannot commit between the SELECT below and this migration's own commit and
--- leave its record's mark one behind.
+-- leave its record's mark one behind. The cost is that every ledgered write in
+-- the application blocks until this transaction commits, so the backfill is
+-- written as a single `DISTINCT ON` pass over the revisions in index order
+-- rather than a correlated `MAX(seq)` probe per row: one sort, not one subquery
+-- per revision.
 LOCK TABLE _autumn_ledger_revisions IN SHARE MODE;
 
-INSERT INTO _autumn_ledger_chain_heads
+INSERT INTO _autumn_ledger_high_water
     (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at)
-SELECT r.table_name, COALESCE(r.tenant_id, ''), r.record_id, r.seq, r.hash, r.recorded_at
+SELECT DISTINCT ON (r.table_name, COALESCE(r.tenant_id, ''), r.record_id)
+       r.table_name, COALESCE(r.tenant_id, ''), r.record_id, r.seq, r.hash, r.recorded_at
 FROM _autumn_ledger_revisions r
-WHERE r.seq = (
-    SELECT MAX(inner_r.seq)
-    FROM _autumn_ledger_revisions inner_r
-    WHERE inner_r.table_name = r.table_name
-      AND COALESCE(inner_r.tenant_id, '') = COALESCE(r.tenant_id, '')
-      AND inner_r.record_id = r.record_id
-)
+ORDER BY r.table_name, COALESCE(r.tenant_id, ''), r.record_id, r.seq DESC
 ON CONFLICT DO NOTHING;

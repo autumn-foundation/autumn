@@ -6,4 +6,4 @@
 -- Revisions themselves are untouched; the evidence that no revision is missing
 -- from the end is what goes.
 
-DROP TABLE IF EXISTS _autumn_ledger_chain_heads;
+DROP TABLE IF EXISTS _autumn_ledger_high_water;

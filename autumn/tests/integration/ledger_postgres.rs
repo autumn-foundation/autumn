@@ -81,9 +81,8 @@ const LEDGER_UP: &str =
 /// The #2323 high-water marks, from the same shipped migration set.
 ///
 /// Applied after `LEDGER_UP` because its backfill reads the revisions table.
-const LEDGER_CHAIN_HEADS_UP: &str = include_str!(
-    "../../version_history_migrations/20260901000000_create_ledger_chain_heads/up.sql"
-);
+const LEDGER_HIGH_WATER_UP: &str =
+    include_str!("../../version_history_migrations/20260901000000_create_ledger_high_water/up.sql");
 
 /// A `ledgered` repository implies `versioned`, so both tables must exist.
 const VERSION_HISTORY_UP: &str =
@@ -116,7 +115,7 @@ async fn setup_pool() -> (
          )",
         VERSION_HISTORY_UP,
         LEDGER_UP,
-        LEDGER_CHAIN_HEADS_UP,
+        LEDGER_HIGH_WATER_UP,
     ] {
         conn.batch_execute(ddl)
             .await
@@ -460,7 +459,7 @@ async fn verify_detects_a_truncated_tail_on_postgres() {
 async fn resync_high_water_mark(pool: &Pool<AsyncPgConnection>, record_id: i64) {
     let mut conn = pool.get().await.expect("conn");
     diesel::sql_query(
-        "DELETE FROM _autumn_ledger_chain_heads \
+        "DELETE FROM _autumn_ledger_high_water \
          WHERE table_name = 'test_ledger_invoices' AND record_id = $1",
     )
     .bind::<diesel::sql_types::BigInt, _>(record_id)
@@ -468,7 +467,7 @@ async fn resync_high_water_mark(pool: &Pool<AsyncPgConnection>, record_id: i64) 
     .await
     .expect("clear the mark");
     diesel::sql_query(
-        "INSERT INTO _autumn_ledger_chain_heads \
+        "INSERT INTO _autumn_ledger_high_water \
          (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at) \
          SELECT table_name, COALESCE(tenant_id, ''), record_id, seq, hash, recorded_at \
          FROM _autumn_ledger_revisions \
@@ -484,7 +483,7 @@ async fn resync_high_water_mark(pool: &Pool<AsyncPgConnection>, record_id: i64) 
 /// The Postgres fork of #2323's headline case: delete the newest revision, then
 /// let an ordinary write land. The append must allocate past the gap rather than
 /// re-use the deleted sequence number — which on this tier means the
-/// `_autumn_ledger_chain_heads` primary key, the `ON CONFLICT … DO UPDATE …
+/// `_autumn_ledger_high_water` primary key, the `ON CONFLICT … DO UPDATE …
 /// WHERE` upsert and the `clock_timestamp()` chain-state read all behaving as
 /// the `SQLite` tier's do.
 #[tokio::test]
@@ -622,13 +621,22 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
         "four separate writes must not share one frozen transaction timestamp"
     );
 
-    // Push the record's floor an hour ahead, as a fast host clock would have,
-    // and let an ordinary write land behind it.
-    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::hours(1));
+    // The mark's instant is the floor only where it is the *only* floor: after
+    // the revision that carried the real instant is gone. Lop the head off and
+    // push the mark forward, as a fast host clock would have left it.
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(30));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
-            "UPDATE _autumn_ledger_chain_heads SET recorded_at = $1 \
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $1 AND seq = 4",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut conn)
+        .await
+        .expect("lop off the newest revision");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET recorded_at = $1 \
              WHERE table_name = 'test_ledger_invoices' AND record_id = $2",
         )
         .bind::<diesel::sql_types::Timestamptz, _>(ahead)
@@ -656,12 +664,214 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
         head.recorded_at
     );
     assert!(
-        repo.ledger_verify(created.id)
-            .await
-            .expect("verify")
-            .is_intact(),
-        "the clamped instant is the one that was hashed, so the chain still verifies"
+        revisions
+            .windows(2)
+            .all(|w| w[0].recorded_at <= w[1].recorded_at),
+        "still non-decreasing across the gap the deleted revision left"
     );
+    // The clamped instant is the one that was hashed *and* the one Postgres
+    // stored — a `TIMESTAMPTZ` round-trip that lost precision would surface here
+    // as a `HashMismatch` on an untampered revision.
+    assert_eq!(
+        head.compute_hash(),
+        head.hash,
+        "the stored transaction time must be the value that was hashed"
+    );
+}
+
+/// The floor is a clamp, not a ratchet: past the tolerated skew the Postgres arm
+/// refuses the write rather than hashing a far-future instant into the chain.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_poisoned_transaction_time_floor_refuses_the_write_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "PG-RATCHET".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+        })
+        .await
+        .expect("insert");
+    repo.update(
+        created.id,
+        &UpdateLedgerInvoice {
+            amount_cents: Patch::Set(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    let far = autumn_web::ledger::truncate_to_micros(now() + Duration::days(365 * 900));
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $1 AND seq = 2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut conn)
+        .await
+        .expect("lop off the newest revision");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_high_water SET recorded_at = $1 \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $2",
+        )
+        .bind::<diesel::sql_types::Timestamptz, _>(far)
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .execute(&mut conn)
+        .await
+        .expect("poison the record's transaction-time floor");
+    }
+
+    assert!(
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "a poisoned floor must refuse the write on this tier too"
+    );
+    assert!(
+        repo.ledger_revisions(created.id)
+            .await
+            .expect("revisions")
+            .iter()
+            .all(|r| r.recorded_at < far),
+        "nothing was written, so nothing was poisoned"
+    );
+}
+
+/// The Postgres fork of the write-path cross-checks: deleting the revision *and*
+/// the mark must not let ordinary traffic re-create both and launder the
+/// truncation away.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_append_refuses_to_re_create_a_deleted_mark_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "PG-RECREATE".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+        })
+        .await
+        .expect("insert");
+    repo.update(
+        created.id,
+        &UpdateLedgerInvoice {
+            amount_cents: Patch::Set(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        for sql in [
+            "DELETE FROM _autumn_ledger_revisions \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $1 AND seq = 2",
+            "DELETE FROM _autumn_ledger_high_water \
+             WHERE table_name = 'test_ledger_invoices' AND record_id = $1",
+        ] {
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::BigInt, _>(created.id)
+                .execute(&mut conn)
+                .await
+                .expect("cover both tables");
+        }
+    }
+
+    assert!(
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err(),
+        "an append over a chain whose mark is gone must refuse"
+    );
+    let broken = repo
+        .ledger_verify(created.id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("the missing mark is still reported");
+    assert_eq!(broken.kind, LedgerBreak::HighWaterMissing);
+}
+
+/// The Postgres `DISTINCT ON` backfill, over chains that already exist. Every
+/// other test's `setup_pool` applies the migration to an empty ledger, so this
+/// is the only place the backfill statement runs over data — and the only place
+/// the `LOCK TABLE` is exercised at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_migration_backfills_existing_chains_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool.clone());
+
+    let mut ids = Vec::new();
+    for n in 0..2 {
+        let created = repo
+            .save(&NewLedgerInvoice {
+                reference: format!("PG-PRE-{n}"),
+                amount_cents: 1,
+                amount_rate: 1.0,
+            })
+            .await
+            .expect("insert");
+        for step in 0..=n {
+            repo.update(
+                created.id,
+                &UpdateLedgerInvoice {
+                    amount_cents: Patch::Set(i64::from(step) + 2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        }
+        ids.push(created.id);
+    }
+
+    // Drop every mark, leaving exactly what a pre-#2323 ledger looks like, then
+    // re-apply the shipped migration: its DDL is `IF NOT EXISTS` and its
+    // backfill is `ON CONFLICT DO NOTHING`, so what runs is the backfill.
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute("DELETE FROM _autumn_ledger_high_water")
+            .await
+            .expect("un-mark every chain");
+        conn.batch_execute(LEDGER_HIGH_WATER_UP)
+            .await
+            .expect("apply the high-water migration over an existing ledger");
+    }
+
+    for id in &ids {
+        let mark = repo
+            .ledger_high_water(*id)
+            .await
+            .expect("mark")
+            .expect("the backfill must have marked this chain");
+        let head = repo.ledger_head(*id).await.expect("head").expect("head");
+        assert_eq!(mark.seq, head.seq);
+        assert_eq!(mark.hash, head.hash);
+        assert_eq!(mark.recorded_at, head.recorded_at);
+        assert!(repo.ledger_verify(*id).await.expect("verify").is_intact());
+    }
 }
 
 #[tokio::test]

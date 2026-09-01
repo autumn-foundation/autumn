@@ -12,9 +12,13 @@
 --     own instants, so stored and filter values share one encoding;
 --   * no `LOCK TABLE` — SQLite serializes writers on the database write lock, so
 --     no append can commit between the backfill's SELECT and this migration's
---     commit in the first place.
+--     commit in the first place;
+--   * the backfill uses a correlated `MAX(seq)` probe rather than the Postgres
+--     copy's `DISTINCT ON`, which SQLite does not have. The probe is served by
+--     `idx_autumn_ledger_revisions_chain`, and SQLite deployments are
+--     single-writer anyway, so the pass costs nobody else write availability.
 
-CREATE TABLE IF NOT EXISTS _autumn_ledger_chain_heads (
+CREATE TABLE IF NOT EXISTS _autumn_ledger_high_water (
     table_name  TEXT   NOT NULL,
     tenant_key  TEXT   NOT NULL,
     record_id   BIGINT NOT NULL,
@@ -24,7 +28,7 @@ CREATE TABLE IF NOT EXISTS _autumn_ledger_chain_heads (
     PRIMARY KEY (table_name, tenant_key, record_id)
 );
 
-INSERT INTO _autumn_ledger_chain_heads
+INSERT INTO _autumn_ledger_high_water
     (table_name, tenant_key, record_id, high_seq, head_hash, recorded_at)
 SELECT r.table_name, COALESCE(r.tenant_id, ''), r.record_id, r.seq, r.hash, r.recorded_at
 FROM _autumn_ledger_revisions r

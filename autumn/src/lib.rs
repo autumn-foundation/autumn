@@ -348,6 +348,10 @@ pub mod sync;
 ///
 /// See [`ledger`] module documentation for the full API (issue #1699).
 pub mod ledger;
+// The data types a caller handles. The two *evidence* enums the verification
+// entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
+// deliberately not re-exported: they are arguments to one `ledger::` function,
+// and a caller reaching for them is already inside that module.
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
     LedgerHighWater, LedgerRevision, LedgerVerification, LedgeredRecord,

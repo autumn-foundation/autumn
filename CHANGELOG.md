@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predecessor and matched the live row, so both the chain walk and the live-row
   cross-check reported intact and the deleted state left no trace.
 
-  A new framework table, `_autumn_ledger_chain_heads`, keeps a per-record
+  A new framework table, `_autumn_ledger_high_water`, keeps a per-record
   high-water mark where deleting a revision cannot reach it. Every append now
   allocates `max(chain head, high-water mark) + 1` and raises the mark in the
   same transaction, so the same attack allocates `N+1` and leaves a **permanent
@@ -27,24 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   erased* chain apart from a row that predates ledgering, which the first slice
   had to stay silent about.
 
-  The mark is cross-checked, never believed: `ledger_verify` compares it with
-  the chain in both directions, so rolling it back (`HighWaterBehind`),
-  rewriting it (`HighWaterMismatch`) or deleting its row (`HighWaterMissing`) is
-  itself the accusation. It raises the bar rather than closing the class — an
-  attacker with `DELETE` on one table usually has it on two — so pinning
-  `ledger_head` outside the database remains required for an audit posture.
-  `ledger_high_water` exports the mark beside it. The migration backfills a mark
-  for every chain that already exists, so adoption is a plain `autumn migrate`.
+  The mark is cross-checked, never believed — on both paths. `ledger_verify`
+  compares it with the chain in both directions, so rolling it back
+  (`HighWaterBehind`), rewriting it (`HighWaterMismatch`) or deleting its row
+  (`HighWaterMissing`) is itself the accusation; and an append that finds the two
+  in a state no framework code path can produce **refuses** rather than
+  overwriting the evidence. Without that second half, deleting a revision *and*
+  the mark and then waiting for ordinary traffic would have the append quietly
+  re-create both. A mark merely *behind* the head still writes: that is what a
+  pre-#2323 node in a mixed-version fleet leaves, and the next write heals it.
+  It raises the bar rather than closing the class — an attacker who can delete
+  revisions and rewrite the mark to agree with what survives is still invisible
+  from inside the database — so pinning `ledger_head` outside it remains
+  required for an audit posture. `ledger_high_water` exports the mark beside it,
+  from the same statement. The migration backfills a mark for every chain that
+  already exists, so adoption is a plain `autumn migrate` — run it *before*
+  rolling out the new binary.
 
   `recorded_at` no longer comes from the writing host's clock. It is read from
   the database (`clock_timestamp()` on Postgres, `strftime(…, 'now')` on SQLite)
   at the point the append has already read the record's chain head, and clamped
-  against the greater of the predecessor revision's instant and the mark's — so
-  transaction time is **non-decreasing along a chain by construction**, across
-  node clock skew and host clock steps alike, and an as-of query can no longer
-  be answered with a revision that was not yet current. A chain where it does
-  move backwards is now reported as `RecordedAtRegression` rather than walked
-  past in `seq` order. `LedgerBreak` is `#[non_exhaustive]` from here on.
+  against the chain's own floor — so transaction time is **non-decreasing along
+  a chain by construction**, across node clock skew and host clock steps alike,
+  and an as-of query is no longer answered by a revision recorded after the
+  instant asked about (up to the commit-visibility lag the guide documents). The
+  clamp is bounded: a floor more than an hour ahead of the database's clock
+  refuses the write instead of ratcheting the record's transaction time forward
+  for good. A chain where transaction time does move backwards is now reported
+  as `RecordedAtRegression`, ranked last so a chain written before this change
+  cannot mask a truncation. `LedgerBreak` is `#[non_exhaustive]` from here on,
+  and `autumn db scrub` refuses to empty one of the two ledger tables without
+  the other.
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"

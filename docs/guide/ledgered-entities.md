@@ -71,7 +71,7 @@ sequence number its chain has ever reached, kept where deleting a revision
 cannot reach it:
 
 ```sql
-CREATE TABLE _autumn_ledger_chain_heads (
+CREATE TABLE _autumn_ledger_high_water (
     table_name  TEXT        NOT NULL,
     tenant_key  TEXT        NOT NULL,   -- COALESCE(tenant_id, '')
     record_id   BIGINT      NOT NULL,
@@ -83,8 +83,15 @@ CREATE TABLE _autumn_ledger_chain_heads (
 ```
 
 Its migration backfills a mark for every chain that already exists, so adopting
-it is a plain `autumn migrate` with nothing to reconcile afterwards. See
-[Tamper evidence](#tamper-evidence) for what it buys.
+it is a plain `autumn migrate` with nothing to reconcile afterwards. On Postgres
+the backfill takes `LOCK TABLE _autumn_ledger_revisions IN SHARE MODE` for the
+length of one sorted pass over the revisions — that is what closes the race with
+a concurrent append, and it means ledgered writes block until the migration
+commits. Size that before running it against a very large ledger.
+
+Deploy order matters: apply the migration **before** rolling out the new binary.
+Code that expects the table and does not find it fails every ledgered write. See
+[Tamper evidence](#tamper-evidence) for what the table buys.
 
 `snapshot` is `TEXT`, not `JSONB`, on purpose. `JSONB` parses each number into
 `numeric` and re-renders it on output, so a float serde writes as `1e16` comes
@@ -282,8 +289,8 @@ write. The append read `N-1`, re-allocated `N`, chained cleanly onto its
 predecessor and matched the live row — so both the chain and the cross-check
 reported intact, and the deleted state left no trace.
 
-`_autumn_ledger_chain_heads` closes it. Every append allocates
-`max(chain head, high-water mark) + 1`, and the mark lives outside the deletable
+`_autumn_ledger_high_water` closes it. Every append allocates one past the
+greater of the chain head and the mark, and the mark lives outside the deletable
 revision rows and never decreases. The same attack now allocates `N+1` and leaves
 a **permanent gap** at `N` that `ledger_verify` reports as `MissingRevision` —
 whenever it runs, not only in the window before the next write. A *wholly* erased
@@ -291,24 +298,37 @@ chain is caught the same way: the mark outlives the rows, so an empty chain
 beside a surviving mark is reported rather than mistaken for a row that predates
 ledgering.
 
-The mark is never *authoritative*, only cross-checked. `ledger_verify` compares
-it with the chain in both directions and reports either side disagreeing:
+The mark is never *authoritative*, only cross-checked — on the read path **and**
+on the write path. `ledger_verify` compares it with the chain in both directions
+and reports either side disagreeing; and an append that finds the two in a state
+no framework code path can produce **refuses** rather than overwriting the
+evidence. That second half matters: without it, deleting a revision and the mark
+together and then waiting for ordinary traffic would have the append quietly
+re-create both, which is the very laundering this feature exists to stop.
 
 ```rust
-// Both are cheap single-row reads; pin them together.
+// Both are cheap, and come from one statement; pin them together.
 let head = repo.ledger_head(id).await?;
 let mark = repo.ledger_high_water(id).await?;
 ```
 
-| Tamper with the mark | Reported |
-|---|---|
-| Roll `high_seq` back so a truncation looks clean | `HighWaterBehind` |
-| Rewrite `head_hash` / `recorded_at` to match a forgery | `HighWaterMismatch` |
-| Delete the mark row so the old attack works again | `HighWaterMissing` |
+| Tamper with the mark | Reported | Next ordinary write |
+|---|---|---|
+| Roll `high_seq` back so a truncation looks clean | `HighWaterBehind` | **Allowed** — this is also what a pre-#2323 node in a mixed-version fleet leaves, so the write heals it |
+| Rewrite `head_hash` at the head's own sequence number | `HighWaterMismatch` | **Refused** — appending would settle the disagreement in the writer's favour |
+| Delete the mark row so the old attack works again | `HighWaterMissing` | **Refused** — the record's writes fail until an operator has looked |
+| Push `recorded_at` far into the future | `HighWaterMismatch` | **Refused** past an hour's skew; and while the head revision is present its own hashed instant is the floor, so the mark's cannot steer transaction time at all |
 
-What it does **not** do is close the class. An attacker with `DELETE` on the
-revisions table usually has it on this one too, and rewriting both consistently
-is still possible — it raises the bar rather than removing the ceiling.
+A refusal is a real write outage for that record, and it is meant to be: the
+alternative is a silent repair that destroys evidence. The recovery is to run
+`ledger_verify`, decide what happened, and — if the mark was lost rather than
+attacked — re-apply the high-water migration's backfill, which is idempotent.
+
+What none of this does is close the class. An attacker who can `DELETE` from the
+revisions table *and* `UPDATE` the mark to agree with what survives leaves a
+state that is internally consistent, and ordinary traffic then continues from it
+— the ledger cannot see that from inside the database. It raises the bar rather
+than removing the ceiling.
 
 So the ceiling is unchanged: pin the head hash somewhere the database cannot
 reach. Treat that as required for an audit posture, not optional.
@@ -369,8 +389,11 @@ already holds their row locks — a `delete_many` over 1000 ids goes from a coup
 of statements to a few thousand. Chunk accordingly, or keep bulk writes off
 ledgered entities where throughput matters.
 
-`ledger_head` and `ledger_high_water` are single indexed rows each, so pinning
-them on a schedule is cheap.
+`ledger_head` and `ledger_high_water` come from one statement over two indexed
+rows, so pinning both on a schedule is cheap. The mark table takes an in-place
+`UPDATE` per ledgered write — the ledger's only non-append-only write — so it
+produces one dead tuple per revision in a table whose primary key is its only
+index; nothing unusual for autovacuum, but worth knowing at high write rates.
 `ledger_revisions`, `ledger_as_of`, `ledger_diff` and `ledger_verify` read a
 record's whole chain (there is no pagination in this slice), and `ledger_verify`
 additionally reads the live row, the high-water mark, and re-reads the head — the
@@ -408,7 +431,24 @@ this slice.
   the supported form of it.
 - A revision written by a **pre-#2323 writer** during a rolling deploy does not
   raise the mark, so `ledger_verify` reports `HighWaterBehind` until that
-  record's next write re-establishes it. Migrate, then finish the deploy.
+  record's next write re-establishes it. Migrate, then finish the deploy. A
+  record *created* by such a writer is worse: it has a chain and no mark, so the
+  next new-code write refuses until the migration's backfill is re-applied.
+- A record whose transaction-time floor sits more than an hour ahead of the
+  database's own clock refuses further writes rather than clamping up to it.
+  Writing behind such a floor would hash a far-future instant into the chain —
+  correctly, so `ledger_verify` could not object — while every as-of query
+  quietly stopped returning the revision. The bound turns an irreversible silent
+  corruption into a loud stop.
+- Emptying `_autumn_ledger_revisions` without `_autumn_ledger_high_water` (or the
+  reverse) leaves every record reporting tampering. `autumn db scrub` refuses a
+  `[framework] purge` naming one without the other.
+- The mark table is *forgeable* by anyone who can `INSERT` into it: a mark
+  planted on a record that has no revisions makes `ledger_verify` report an
+  erased chain that never existed, and the record's first real write then starts
+  above sequence 1. That is the same access level that already allows forging
+  revisions outright, so it adds no new privilege — but it is a way to
+  manufacture a *false* accusation, not only to hide a true one.
 
 ## See also
 
