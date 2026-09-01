@@ -124,6 +124,26 @@ fn substitute_params(pattern: &str, params: &StaticParams) -> String {
     result
 }
 
+/// The `Content-Type` a rendered response declared, if it is something that can
+/// be stored in a JSON manifest and re-emitted as a header later (#1832).
+///
+/// Returns `None` when the handler declared no `Content-Type`, when the value is
+/// empty, or when its bytes are not valid UTF-8 — an opaque `HeaderValue` cannot
+/// survive a JSON round-trip. In all three cases nothing is recorded and the
+/// serve path keeps deriving the type, rather than the manifest carrying a value
+/// that would be dropped (or worse, mangled) on the way back out.
+///
+/// A `HeaderValue` is already guaranteed to be free of CR/LF and control bytes,
+/// so a value that passes here is header-legal by construction. The serve path
+/// re-validates anyway, because a manifest on disk can be edited after the fact.
+fn recorded_content_type(headers: &axum::http::HeaderMap) -> Option<String> {
+    let value = headers
+        .get(axum::http::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?;
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 /// Render all static routes and write them to `dist_dir`.
 ///
 /// Routes are rendered concurrently (up to `DEFAULT_CONCURRENCY` at a time)
@@ -216,6 +236,13 @@ pub async fn render_static_routes(
                     });
                 }
 
+                // #1832: capture the Content-Type the handler declared, before
+                // the response is consumed for its body. This is the one place
+                // the page's intended MIME type is actually known; recording it
+                // is what frees the serve path from re-deriving it from the
+                // route slug and the `<route>/index.html` file name.
+                let content_type = recorded_content_type(response.headers());
+
                 let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .map_err(|e| BuildError::BodyRead {
@@ -233,6 +260,7 @@ pub async fn render_static_routes(
                     ManifestEntry {
                         file: file_path,
                         revalidate,
+                        content_type,
                     },
                 ))
             }
@@ -355,6 +383,14 @@ mod tests {
         _router: axum::Router,
     ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
         Box::pin(async { vec![crate::static_params! { "slug" => "hello" }] })
+    }
+
+    /// Router whose handler declares `text/html; charset=utf-8`, the shape a
+    /// real `#[static_get]` page handler (returning `Markup`) produces.
+    fn html_router() -> axum::Router {
+        axum::Router::new().fallback(axum::routing::get(|uri: axum::http::Uri| async move {
+            axum::response::Html(format!("<h1>{}</h1>", uri.path()))
+        }))
     }
 
     fn echo_router() -> axum::Router {
@@ -570,6 +606,150 @@ mod tests {
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
         let entry = manifest.routes.get("/posts/hello").unwrap();
         assert_eq!(entry.revalidate, Some(3600));
+    }
+
+    // ── #1832: the intended Content-Type is captured at generation time ─────
+
+    /// A handler that declares `application/xml` has that exact type recorded
+    /// in the manifest, even though the page is stored as
+    /// `sitemap.xml/index.html` — the file name the serve-time heuristic used
+    /// to have to reverse-engineer.
+    #[tokio::test]
+    async fn records_handler_declared_content_type_in_manifest() {
+        fn xml_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    "<urlset/>",
+                )
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let result =
+            render_static_routes(xml_router(), &[test_meta("/sitemap.xml", "sitemap")], &dist)
+                .await;
+        assert!(result.is_ok(), "render failed: {:?}", result.err());
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let entry = manifest.routes.get("/sitemap.xml").expect("sitemap route");
+        assert_eq!(entry.file, "sitemap.xml/index.html");
+        assert_eq!(
+            entry.content_type.as_deref(),
+            Some("application/xml"),
+            "the handler's declared Content-Type must be recorded at generation time"
+        );
+    }
+
+    /// A type the serve-time extension heuristic could never produce
+    /// (`application/rss+xml` from an extensionless `/feed` route) round-trips
+    /// intact.
+    #[tokio::test]
+    async fn records_content_type_unreachable_by_extension_heuristic() {
+        fn rss_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/rss+xml")],
+                    "<rss/>",
+                )
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(rss_router(), &[test_meta("/feed", "feed")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/feed"].content_type.as_deref(),
+            Some("application/rss+xml")
+        );
+    }
+
+    /// A parameterized route records the declared type on every expanded page.
+    #[tokio::test]
+    async fn records_content_type_for_each_parameterized_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = StaticRouteMeta {
+            path: "/posts/{slug}",
+            name: "show_post",
+            revalidate: None,
+            params_fn: Some(slug_params_hello_world),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        };
+
+        render_static_routes(html_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        for route in ["/posts/hello", "/posts/world"] {
+            assert_eq!(
+                manifest.routes[route].content_type.as_deref(),
+                Some("text/html; charset=utf-8"),
+                "{route} must carry the declared Content-Type"
+            );
+        }
+    }
+
+    /// When the handler declares no `Content-Type` at all there is nothing
+    /// *intended* to record: the entry stays `None` so the serve path keeps
+    /// using its derivation rather than having a guess baked into the manifest.
+    #[tokio::test]
+    async fn records_no_content_type_when_handler_declares_none() {
+        fn bare_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(axum::body::Body::from("bare"))
+                    .unwrap()
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(bare_router(), &[test_meta("/bare", "bare")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert!(
+            manifest.routes["/bare"].content_type.is_none(),
+            "no declared type must record as None, not as a guess"
+        );
+    }
+
+    /// A `Content-Type` whose bytes are not visible ASCII cannot be written to
+    /// a JSON manifest and re-emitted as a header, so it is dropped rather than
+    /// recorded — the serve path falls back instead of carrying a broken value.
+    #[tokio::test]
+    async fn skips_non_ascii_content_type() {
+        fn opaque_router() -> axum::Router {
+            axum::Router::new().fallback(axum::routing::get(|| async {
+                let mut response = axum::response::Response::new(axum::body::Body::from("x"));
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_bytes(b"text/\xffhtml").unwrap(),
+                );
+                response
+            }))
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        render_static_routes(opaque_router(), &[test_meta("/weird", "weird")], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert!(
+            manifest.routes["/weird"].content_type.is_none(),
+            "a non-visible-ASCII Content-Type must not be recorded"
+        );
     }
 
     #[tokio::test]

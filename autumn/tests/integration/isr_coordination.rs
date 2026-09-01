@@ -165,10 +165,9 @@ fn static_file_layer_with_isr_coordinator_accepts_local() {
     let mut routes = HashMap::new();
     routes.insert(
         "/".to_owned(),
-        ManifestEntry {
-            file: "index.html".to_owned(),
-            revalidate: None,
-        },
+        // `ManifestEntry::new` is the non-breaking construction path (#1832):
+        // it keeps compiling as the entry gains fields.
+        ManifestEntry::new("index.html"),
     );
     let manifest = StaticManifest {
         generated_at: "2026-05-06T00:00:00Z".to_owned(),

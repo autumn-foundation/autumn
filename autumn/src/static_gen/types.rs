@@ -120,6 +120,73 @@ pub struct ManifestEntry {
     /// Optional ISR revalidation interval in seconds, copied from
     /// [`StaticRouteMeta::revalidate`].
     pub revalidate: Option<u64>,
+    /// The `Content-Type` the route's handler declared when this page was
+    /// generated (#1832).
+    ///
+    /// The static-first middleware serves this value verbatim, so the intended
+    /// MIME type never has to be reverse-engineered from the route slug and the
+    /// served file name. That reverse-engineering was the root cause of three
+    /// consecutive edge-case rounds on #1819: generated `.txt`/`.xml` routes are
+    /// stored as `robots.txt/index.html` (file name says HTML), while
+    /// dotted-slug pages like `/posts/release.v1` are HTML despite a
+    /// dot-suffixed route. Recording the type at the one place it is actually
+    /// known makes both misreadings impossible.
+    ///
+    /// `None` means "nothing recorded", which happens in two cases:
+    ///
+    /// - the manifest predates #1832 (an existing `dist/` that has not been
+    ///   rebuilt), or was written by hand; or
+    /// - the handler declared no `Content-Type`, so there was no *intended*
+    ///   type to record and a build-time guess would only bake in the same
+    ///   heuristic this field exists to remove.
+    ///
+    /// In both cases the serve path falls back to deriving the type from the
+    /// route extension and then the served file name — the pre-#1832 behaviour,
+    /// unchanged. See
+    /// [`resolved_content_type`](crate::static_gen::resolved_content_type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+impl ManifestEntry {
+    /// A manifest entry for `file` with no revalidation interval and no
+    /// recorded `Content-Type`.
+    ///
+    /// Prefer this over a struct literal: the entry has gained fields before
+    /// (`content_type` in #1832) and may gain more, and a literal has to be
+    /// updated every time while this constructor does not.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use autumn_web::static_gen::ManifestEntry;
+    ///
+    /// let entry = ManifestEntry::new("about/index.html")
+    ///     .with_content_type(Some("text/html; charset=utf-8".to_owned()));
+    /// assert_eq!(entry.file, "about/index.html");
+    /// ```
+    #[must_use]
+    pub fn new(file: impl Into<String>) -> Self {
+        Self {
+            file: file.into(),
+            revalidate: None,
+            content_type: None,
+        }
+    }
+
+    /// Set the ISR revalidation interval, in seconds.
+    #[must_use]
+    pub const fn with_revalidate(mut self, revalidate: Option<u64>) -> Self {
+        self.revalidate = revalidate;
+        self
+    }
+
+    /// Set the `Content-Type` recorded for this page at generation time.
+    #[must_use]
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
+        self
+    }
 }
 
 impl StaticManifest {
@@ -189,6 +256,7 @@ mod tests {
             ManifestEntry {
                 file: "index.html".to_owned(),
                 revalidate: None,
+                content_type: None,
             },
         );
         routes.insert(
@@ -196,6 +264,7 @@ mod tests {
             ManifestEntry {
                 file: "about/index.html".to_owned(),
                 revalidate: Some(3600),
+                content_type: None,
             },
         );
 
@@ -229,6 +298,88 @@ mod tests {
         let about_entry = loaded.routes.get("/about").expect("about route");
         assert_eq!(about_entry.file, "about/index.html");
         assert_eq!(about_entry.revalidate, Some(3600));
+    }
+
+    // ── #1832: intended Content-Type recorded at generation time ────────────
+
+    #[test]
+    fn manifest_entry_roundtrips_recorded_content_type() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/feed.xml".to_owned(),
+            ManifestEntry {
+                file: "feed.xml/index.html".to_owned(),
+                revalidate: None,
+                content_type: Some("application/rss+xml".to_owned()),
+            },
+        );
+        let manifest = StaticManifest {
+            generated_at: "2026-09-01T00:00:00Z".to_owned(),
+            autumn_version: "0.6.0".to_owned(),
+            routes,
+        };
+
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        let loaded: StaticManifest = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(
+            loaded.routes["/feed.xml"].content_type.as_deref(),
+            Some("application/rss+xml"),
+            "the recorded Content-Type must survive a manifest round-trip"
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_without_content_type_deserializes_to_none() {
+        // A `dist/` built by a pre-#1832 Autumn has no `content_type` key.
+        // It must keep loading, with the field defaulting to `None` so the
+        // serve path falls back to its derivation instead of failing.
+        let json = r#"{
+            "generated_at": "2026-03-27T12:00:00Z",
+            "autumn_version": "0.3.0",
+            "routes": {
+                "/about": { "file": "about/index.html", "revalidate": null }
+            }
+        }"#;
+
+        let loaded: StaticManifest = serde_json::from_str(json).expect("legacy manifest loads");
+        let entry = loaded.routes.get("/about").expect("about route");
+        assert_eq!(entry.file, "about/index.html");
+        assert!(
+            entry.content_type.is_none(),
+            "a legacy entry must default to no recorded Content-Type"
+        );
+    }
+
+    #[test]
+    fn manifest_entry_omits_absent_content_type_from_json() {
+        // Keep the on-disk manifest readable by older runtimes (and small):
+        // an entry with nothing recorded serializes without the key at all.
+        let entry = ManifestEntry {
+            file: "about/index.html".to_owned(),
+            revalidate: None,
+            content_type: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            !json.contains("content_type"),
+            "absent Content-Type must not be written to the manifest, got {json}"
+        );
+    }
+
+    #[test]
+    fn manifest_entry_builders_compose() {
+        let entry = ManifestEntry::new("feed.xml/index.html")
+            .with_revalidate(Some(600))
+            .with_content_type(Some("application/rss+xml".to_owned()));
+        assert_eq!(entry.file, "feed.xml/index.html");
+        assert_eq!(entry.revalidate, Some(600));
+        assert_eq!(entry.content_type.as_deref(), Some("application/rss+xml"));
+
+        let bare = ManifestEntry::new("index.html");
+        assert_eq!(bare.file, "index.html");
+        assert!(bare.revalidate.is_none());
+        assert!(bare.content_type.is_none());
     }
 
     #[test]

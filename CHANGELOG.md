@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SSG records each route's intended `Content-Type` at generation time
+  (#1832):** the static-first serve path used to reverse-engineer every cached
+  response's MIME type at *request* time, from the route slug plus the served
+  file name. Because `url_to_file_path` stores every non-root route as
+  `<route>/index.html`, both clues lie: `/sitemap.xml` lands at
+  `sitemap.xml/index.html`, whose file name says HTML. That guess needed three
+  consecutive corrections during review of #1819 — pre-compressed fonts,
+  generated `.txt`/`.xml` routes, and HTML pages whose slug merely contains a
+  dot (`/posts/release.v1`, `/users/alice@example.com`) — each round fixing a
+  case the previous one broke.
+
+  `render_static_routes` now records the `Content-Type` the handler declared on
+  each rendered page into a new optional `content_type` field on
+  `ManifestEntry`, and the static-first middleware serves that value directly
+  via the new `StaticFileLayer::resolve_entry`. The type is determined once,
+  where it is actually known, and never inferred again — which makes all three
+  edge cases impossible by construction and lets a route be served as a type no
+  file extension maps to (`application/rss+xml` from `/feed`, `text/calendar`
+  from `/calendar`), something the extension heuristic could never produce.
+
+  Existing `dist/` directories keep working untouched. `content_type` is
+  `#[serde(default)]`, so a manifest built before this change (or written by
+  hand) deserializes with the field absent, and `static_gen::resolved_content_type`
+  applies the pre-#1832 derivation byte-for-byte: recognized route extension,
+  then served file name, then `application/octet-stream`. Nothing is recorded
+  for a handler that declares no `Content-Type` either — a build-time guess
+  would only bake in the heuristic this change removes. That function also
+  rejects a recorded value that is not a legal header (a CR/LF injection
+  attempt from a tampered manifest) and falls back instead, returning a
+  `HeaderValue` so the request path cannot panic on a bad manifest.
+
+  Two API notes: `ManifestEntry` gained a public field, so struct literals need
+  `content_type` — the new `ManifestEntry::new(file)` plus `with_revalidate` /
+  `with_content_type` builders are the construction path that keeps compiling as
+  the entry evolves. And after a rebuild, a `#[static_get]` handler returning a
+  bare `String` is now served as the `text/plain; charset=utf-8` axum actually
+  declares, rather than the `text/html` the old heuristic assumed; this matches
+  what the same handler already served on the dynamic path. Return `Markup` or
+  `Html<String>` for HTML. ISR regeneration rewrites the file, not the manifest,
+  so a handler that starts declaring a different type logs a `WARN` pointing at
+  `autumn build` instead of drifting silently.
+
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
   at either surface. Its own releases were body-only GitHub Releases with no

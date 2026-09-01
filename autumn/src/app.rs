@@ -14516,6 +14516,7 @@ mod tests {
                 crate::static_gen::ManifestEntry {
                     file: "docs/index.html".to_owned(),
                     revalidate: None,
+                    content_type: None,
                 },
             )]),
         };

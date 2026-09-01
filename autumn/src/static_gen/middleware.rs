@@ -61,6 +61,74 @@ pub struct StaticFileLayer {
     isr_coordinator: Arc<dyn IsrCoordinator>,
 }
 
+/// A manifest hit: the file to serve and the `Content-Type` recorded for the
+/// route when it was generated (#1832).
+///
+/// Returned by [`StaticFileLayer::resolve_entry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStatic {
+    /// Absolute path of the generated file inside `dist/`.
+    pub file_path: PathBuf,
+    /// The `Content-Type` recorded in the manifest, or `None` when the manifest
+    /// records none (pre-#1832 build, hand-written manifest, or a handler that
+    /// declared no type).
+    pub content_type: Option<String>,
+}
+
+/// The `Content-Type` to serve for a manifest-backed response (#1832).
+///
+/// The single decision point for the static-first serve path:
+///
+/// 1. **The type recorded in the manifest**, when there is one and it is a legal
+///    header value. This is the intended type, captured at generation time from
+///    the handler's own response, so nothing has to be inferred.
+/// 2. Otherwise the **route extension**, but only when the final path segment
+///    ends in an extension [`crate::assets::content_type_for_opt`] recognizes.
+///    This is what keeps a generated `/robots.txt` (stored as
+///    `robots.txt/index.html`) from being mislabeled `text/html`, while a page
+///    whose slug merely *contains* a dot (`/posts/release.v1`,
+///    `/users/alice@example.com`) is left to step 3 rather than being mislabeled
+///    `application/octet-stream`.
+/// 3. Otherwise the **served file name**, which resolves every extensionless
+///    page (`/about` → `about/index.html` → `text/html`) and any hand-written
+///    manifest that maps a route straight at an extensioned file (`/logo` →
+///    `logo.png`).
+/// 4. Otherwise `application/octet-stream`.
+///
+/// Steps 2–4 are the pre-#1832 derivation, kept verbatim so an existing `dist/`
+/// keeps serving exactly as before until it is rebuilt.
+///
+/// Returns a [`HeaderValue`](http::HeaderValue) rather than a string so the
+/// caller cannot fail to build the response: a recorded value that is not
+/// header-legal (CR/LF injection or a control byte in a hand-edited or tampered
+/// manifest) is rejected here and falls through to the derivation, so a bad
+/// manifest can neither panic the request path nor inject a header.
+///
+/// The URL path is always `/`-delimited, so inspecting its last segment is
+/// unaffected by platform path separators.
+#[must_use]
+pub fn resolved_content_type(
+    recorded: Option<&str>,
+    route_path: &str,
+    file_path: &Path,
+) -> http::HeaderValue {
+    if let Some(recorded) = recorded.filter(|value| !value.is_empty())
+        && let Ok(value) = http::HeaderValue::from_str(recorded)
+    {
+        return value;
+    }
+
+    let derived = crate::assets::content_type_for_opt(route_path).unwrap_or_else(|| {
+        file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or("application/octet-stream", |name| {
+                crate::assets::content_type_for(name)
+            })
+    });
+    http::HeaderValue::from_static(derived)
+}
+
 impl StaticFileLayer {
     /// Try to load a `StaticFileLayer` from a `dist/` directory.
     ///
@@ -144,21 +212,55 @@ impl StaticFileLayer {
     /// triggers a background regeneration task (at most one at a time
     /// per route) and still returns the stale file path. The caller
     /// serves the stale content while regeneration happens.
+    ///
+    /// This is the file-path-only shorthand over
+    /// [`resolve_entry`](Self::resolve_entry); use that one when you also need
+    /// the `Content-Type` recorded for the route.
     #[must_use]
     pub fn resolve(&self, request_path: &str) -> Option<PathBuf> {
+        self.resolve_entry(request_path).map(|hit| hit.file_path)
+    }
+
+    /// Resolve a request path to the file to serve **and** the `Content-Type`
+    /// recorded for it at generation time (#1832).
+    ///
+    /// Same lookup and same ISR side effect as [`resolve`](Self::resolve); the
+    /// difference is that the recorded MIME type comes back with the path
+    /// instead of being thrown away, so the serve path never has to
+    /// reverse-engineer it from the route slug and the served file name.
+    ///
+    /// [`ResolvedStatic::content_type`] is `None` for a manifest that records
+    /// nothing; pass it to [`resolved_content_type`] to get the header value to
+    /// serve either way.
+    #[must_use]
+    pub fn resolve_entry(&self, request_path: &str) -> Option<ResolvedStatic> {
         let entry = self.manifest.routes.get(request_path)?;
         let file_path = self.dist_dir.join(&entry.file);
 
         // Check ISR staleness
         if let Some(revalidate) = entry.revalidate {
-            self.maybe_trigger_isr(request_path, &file_path, revalidate);
+            self.maybe_trigger_isr(
+                request_path,
+                &file_path,
+                revalidate,
+                entry.content_type.as_deref(),
+            );
         }
 
-        Some(file_path)
+        Some(ResolvedStatic {
+            file_path,
+            content_type: entry.content_type.clone(),
+        })
     }
 
     /// Check if a file is stale and trigger background regeneration if needed.
-    fn maybe_trigger_isr(&self, url_path: &str, file_path: &Path, revalidate_secs: u64) {
+    fn maybe_trigger_isr(
+        &self,
+        url_path: &str,
+        file_path: &Path,
+        revalidate_secs: u64,
+        recorded_content_type: Option<&str>,
+    ) {
         // Check file age
         let is_stale = file_mtime_age_secs(file_path).is_none_or(|age| age > revalidate_secs);
 
@@ -205,6 +307,7 @@ impl StaticFileLayer {
         let dest = file_path.to_owned();
         let in_flight = Arc::clone(&self.isr_state);
         let coordinator = Arc::clone(&self.isr_coordinator);
+        let expected_content_type = recorded_content_type.map(str::to_owned);
 
         tokio::spawn(async move {
             // RAII guard: clears the in_flight flag when this scope exits,
@@ -227,7 +330,8 @@ impl StaticFileLayer {
                 return; // _guard drops here, resetting in_flight
             }
 
-            let result = regenerate_page(&router, &url, &dest).await;
+            let result =
+                regenerate_page(&router, &url, &dest, expected_content_type.as_deref()).await;
 
             // Release distributed lock before the guard drops.
             coordinator.release(&url, &window_key).await;
@@ -285,6 +389,7 @@ async fn regenerate_page(
     router: &axum::Router,
     url: &str,
     dest: &Path,
+    expected_content_type: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::body::Body;
     use axum::http::Request;
@@ -306,6 +411,27 @@ async fn regenerate_page(
 
     if !response.status().is_success() {
         return Err(format!("Handler returned HTTP {} for {}", response.status(), url).into());
+    }
+
+    // #1832: the manifest's recorded Content-Type is a build-time property and
+    // is not rewritten by ISR. Regeneration runs the same handler, so the type
+    // should not move; if it has, the app changed without a rebuild and the
+    // served type is now stale. Surface that instead of letting it drift
+    // silently — a rebuild (`autumn build`) is the fix.
+    if let Some(expected) = expected_content_type
+        && let Some(actual) = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        && actual != expected
+    {
+        tracing::warn!(
+            route = url,
+            manifest_content_type = expected,
+            handler_content_type = actual,
+            "ISR: handler now declares a different Content-Type than the manifest records; \
+             the recorded type is still served — re-run `autumn build` to refresh the manifest"
+        );
     }
 
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -360,6 +486,7 @@ mod tests {
             ManifestEntry {
                 file: "index.html".to_owned(),
                 revalidate: None,
+                content_type: None,
             },
         );
         routes.insert(
@@ -367,6 +494,7 @@ mod tests {
             ManifestEntry {
                 file: "about/index.html".to_owned(),
                 revalidate: Some(3600),
+                content_type: None,
             },
         );
 
@@ -402,6 +530,7 @@ mod tests {
             ManifestEntry {
                 file: "posts/hello/index.html".to_owned(),
                 revalidate: None,
+                content_type: None,
             },
         );
         routes.insert(
@@ -409,6 +538,7 @@ mod tests {
             ManifestEntry {
                 file: "posts/world/index.html".to_owned(),
                 revalidate: None,
+                content_type: None,
             },
         );
 
@@ -439,6 +569,7 @@ mod tests {
             ManifestEntry {
                 file: "about/index.html".to_owned(),
                 revalidate: Some(revalidate),
+                content_type: None,
             },
         );
 
@@ -662,7 +793,7 @@ mod tests {
 
         let router = axum::Router::new().fallback(axum::routing::get(|| async { "new content" }));
 
-        let result = regenerate_page(&router, "/test", &dest).await;
+        let result = regenerate_page(&router, "/test", &dest, None).await;
         assert!(result.is_ok(), "regeneration failed: {:?}", result.err());
 
         let content = std::fs::read_to_string(&dest).unwrap();
@@ -681,7 +812,7 @@ mod tests {
         let router = axum::Router::new()
             .fallback(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error") });
 
-        let result = regenerate_page(&router, "/test", &dest).await;
+        let result = regenerate_page(&router, "/test", &dest, None).await;
         assert!(result.is_err());
 
         // Original file should be untouched
@@ -741,6 +872,167 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "<h1>About (stale)</h1>"
+        );
+    }
+
+    // ── #1832: Content-Type recorded at generation time ─────────────────────
+
+    /// The recorded type wins outright — including a type the serve-time
+    /// extension heuristic can never produce from an extensionless route.
+    #[test]
+    fn resolved_content_type_prefers_recorded_value() {
+        let ct = resolved_content_type(
+            Some("application/rss+xml"),
+            "/feed",
+            Path::new("feed/index.html"),
+        );
+        assert_eq!(ct, "application/rss+xml");
+    }
+
+    /// A recorded type overrides what the route extension would have said, so a
+    /// route may be generated with a type its slug does not advertise.
+    #[test]
+    fn resolved_content_type_recorded_overrides_route_extension() {
+        let ct = resolved_content_type(
+            Some("application/manifest+json"),
+            "/site.webmanifest",
+            Path::new("site.webmanifest/index.html"),
+        );
+        assert_eq!(ct, "application/manifest+json");
+    }
+
+    /// An empty recorded value is not a `Content-Type`; it must not produce an
+    /// empty header.
+    #[test]
+    fn resolved_content_type_ignores_empty_recorded_value() {
+        let ct = resolved_content_type(Some(""), "/about", Path::new("about/index.html"));
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    /// A hand-edited manifest carrying CR/LF must never reach the response:
+    /// it falls back rather than injecting a header (and never panics).
+    #[test]
+    fn resolved_content_type_rejects_header_illegal_recorded_value() {
+        for bad in [
+            "text/html\r\nX-Injected: yes",
+            "text/html\nX-Injected: yes",
+            "text/html\u{7f}",
+            "text/html\0",
+        ] {
+            let ct = resolved_content_type(Some(bad), "/about", Path::new("about/index.html"));
+            assert_eq!(
+                ct, "text/html; charset=utf-8",
+                "header-illegal recorded value {bad:?} must fall back"
+            );
+        }
+    }
+
+    /// With nothing recorded, the legacy derivation still applies — these are
+    /// the three edge cases #1819 needed three rounds to get right, and they
+    /// must keep working for manifests built before #1832.
+    #[test]
+    fn resolved_content_type_falls_back_to_route_extension() {
+        assert_eq!(
+            resolved_content_type(None, "/robots.txt", Path::new("robots.txt/index.html")),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            resolved_content_type(None, "/sitemap.xml", Path::new("sitemap.xml/index.html")),
+            "application/xml"
+        );
+    }
+
+    #[test]
+    fn resolved_content_type_falls_back_to_file_name_for_dotted_slugs() {
+        assert_eq!(
+            resolved_content_type(
+                None,
+                "/posts/release.v1",
+                Path::new("posts/release.v1/index.html")
+            ),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            resolved_content_type(
+                None,
+                "/users/alice@example.com",
+                Path::new("users/alice@example.com/index.html")
+            ),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn resolved_content_type_falls_back_to_file_name_for_extensionless_routes() {
+        assert_eq!(
+            resolved_content_type(None, "/about", Path::new("about/index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            resolved_content_type(None, "/inter", Path::new("fonts/inter.woff2")),
+            "font/woff2"
+        );
+    }
+
+    #[test]
+    fn resolved_content_type_last_resort_is_octet_stream() {
+        assert_eq!(
+            resolved_content_type(None, "/data", Path::new("data.bin")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resolved_content_type(None, "/data", Path::new("")),
+            "application/octet-stream"
+        );
+    }
+
+    /// `resolve_entry` surfaces the manifest's recorded type alongside the file
+    /// path, so the serve path never has to re-derive it.
+    #[test]
+    fn resolve_entry_surfaces_recorded_content_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir");
+        std::fs::write(dist.join("index.html"), "<h1>Home</h1>").expect("write");
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/".to_owned(),
+            ManifestEntry::new("index.html").with_content_type(Some("text/html".to_owned())),
+        );
+        routes.insert("/bare".to_owned(), ManifestEntry::new("bare/index.html"));
+        let manifest = StaticManifest {
+            generated_at: "2026-09-01T00:00:00Z".to_owned(),
+            autumn_version: "0.6.0".to_owned(),
+            routes,
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        let layer = StaticFileLayer::new(&dist).expect("layer");
+
+        let hit = layer.resolve_entry("/").expect("root resolves");
+        assert_eq!(hit.file_path, dist.join("index.html"));
+        assert_eq!(hit.content_type.as_deref(), Some("text/html"));
+
+        let bare = layer.resolve_entry("/bare").expect("bare resolves");
+        assert!(bare.content_type.is_none());
+
+        assert!(layer.resolve_entry("/missing").is_none());
+    }
+
+    /// `resolve` stays the file-path-only shorthand over the same lookup.
+    #[test]
+    fn resolve_agrees_with_resolve_entry() {
+        let dir = create_test_dist();
+        let dist = dir.path().join("dist");
+        let layer = StaticFileLayer::new(&dist).expect("layer");
+        assert_eq!(
+            layer.resolve("/"),
+            layer.resolve_entry("/").map(|hit| hit.file_path)
         );
     }
 }
