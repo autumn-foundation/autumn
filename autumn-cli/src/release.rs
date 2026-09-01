@@ -1369,6 +1369,136 @@ mod tests {
         );
     }
 
+    /// Extract the generated `HEALTHCHECK`'s shell command (everything after
+    /// `CMD`), with the Dockerfile line continuations left intact — `sh`
+    /// accepts them verbatim, so the string can be executed as-is.
+    fn healthcheck_command(dockerfile: &str) -> String {
+        let mut lines = dockerfile
+            .lines()
+            .skip_while(|line| !line.starts_with("HEALTHCHECK"));
+        let mut instruction = String::new();
+        for line in &mut lines {
+            instruction.push_str(line);
+            instruction.push('\n');
+            if !line.trim_end().ends_with('\\') {
+                break;
+            }
+        }
+        let cmd_at = instruction
+            .find("CMD ")
+            .unwrap_or_else(|| panic!("HEALTHCHECK has no CMD: {instruction}"));
+        instruction[cmd_at + 4..].to_owned()
+    }
+
+    /// Issue #1603 AC6: an image whose app terminates TLS itself
+    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// hardcoded to `http://` marks that container permanently unhealthy —
+    /// and in compose, `depends_on: condition: service_healthy` never
+    /// releases. The probe URL must therefore be overridable at runtime.
+    #[test]
+    fn dockerfile_healthcheck_url_is_overridable_for_direct_tls() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_URL"),
+            "HEALTHCHECK must honor $AUTUMN_HEALTHCHECK_URL so an HTTPS-terminating \
+             image can be probed over https://, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("http://localhost:3000/health"),
+            "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
+        );
+        assert!(
+            healthcheck.contains("AUTUMN_HEALTHCHECK_INSECURE"),
+            "an HTTPS-terminating image needs a way to skip verification on its own \
+             loopback probe, got: {healthcheck}"
+        );
+    }
+
+    /// The probe skips certificate verification only when the operator says so
+    /// with `AUTUMN_HEALTHCHECK_INSECURE`, never by inferring it from the URL:
+    /// `user@host`, `#fragment` and lookalike hostnames all yield URLs that
+    /// read as loopback but that curl resolves elsewhere, so a URL parser here
+    /// silently turns verification off for a remote endpoint.
+    ///
+    /// Runs the generated command under `sh` with `curl` stubbed out, so this
+    /// asserts the shell's real behavior rather than the template's text.
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_healthcheck_skips_verification_only_on_explicit_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let healthcheck = healthcheck_command(&content);
+
+        // `curl` becomes a shell function that echoes its arguments to stderr
+        // (stdout is redirected to /dev/null by the probe itself).
+        let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
+
+        // (url, insecure env, expect --insecure, expect this URL to be probed)
+        let cases: [(Option<&str>, Option<&str>, bool); 7] = [
+            // Default: today's plain-HTTP probe, verification on.
+            (None, None, false),
+            // An https URL alone is NOT enough — fail safe, not fail open.
+            (Some("https://localhost:3000/health"), None, false),
+            // The documented direct-TLS pairing.
+            (Some("https://localhost:3000/health"), Some("1"), true),
+            // Any non-empty value opts in; the value itself is not parsed.
+            (Some("https://localhost:3000/health"), Some("true"), true),
+            // An empty value is not an opt-in.
+            (Some("https://localhost:3000/health"), Some(""), false),
+            // URLs that a parser would have mistaken for loopback stay verified
+            // unless the operator opted in — curl resolves both remotely.
+            (
+                Some("https://localhost:3000@remote.example/health"),
+                None,
+                false,
+            ),
+            (
+                Some("https://remote.example#@localhost/health"),
+                None,
+                false,
+            ),
+        ];
+
+        for (url, insecure, expect_insecure) in cases {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&harness);
+            command.env_remove("AUTUMN_HEALTHCHECK_URL");
+            command.env_remove("AUTUMN_HEALTHCHECK_INSECURE");
+            if let Some(url) = url {
+                command.env("AUTUMN_HEALTHCHECK_URL", url);
+            }
+            if let Some(insecure) = insecure {
+                command.env("AUTUMN_HEALTHCHECK_INSECURE", insecure);
+            }
+            let output = command.output().expect("run the probe under sh");
+            let invocation = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                output.status.success(),
+                "the probe should exit 0 for {url:?}/{insecure:?}, got {:?}: {invocation}",
+                output.status
+            );
+            assert_eq!(
+                invocation.contains("--insecure"),
+                expect_insecure,
+                "certificate verification for url={url:?} insecure={insecure:?} must {} be \
+                 skipped; curl was called as: {invocation}",
+                if expect_insecure { "" } else { "NOT" }
+            );
+            // The probe must hit the URL it was given, verbatim.
+            let expected_url = url.unwrap_or("http://localhost:3000/health");
+            assert!(
+                invocation.contains(expected_url),
+                "the probe must request {expected_url}; curl was called as: {invocation}"
+            );
+        }
+    }
+
     #[test]
     fn dockerfile_exposes_port_3000() {
         let tmp = TempDir::new().unwrap();
