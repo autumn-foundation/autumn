@@ -571,11 +571,23 @@ async fn room_reaper_batch_profile() {
         profile.sweep_calls,
         profile.sweep_buffers,
     );
-    // No shape-specific assertions here on purpose: this harness runs
-    // UNCHANGED before and after the fix (baseline issues candidate_scan=1 +
-    // count_calls=N + up-to-N deletes; the batched fix issues a single
-    // statement and both `candidate_scan_calls` and `count_calls` go to 0).
-    // The printed statement-count summary above and the two EXPLAINs
-    // captured before the run are the committed evidence; the equivalence
-    // assertions above are what must hold in both worlds.
+    // This harness's role changes once the fix lands: it stops being a
+    // before/after measurement tool and becomes a CI regression guard for the
+    // batching itself. Assert the batched shape so a revert back to the
+    // per-candidate scan + COUNT(*) + DELETE loop fails CI even though the
+    // reap set (asserted above) would still be correct either way.
+    assert_eq!(
+        profile.candidate_scan_calls, 0,
+        "phase 2 must not issue a separate candidate-scan SELECT — the whole \
+         sweep is one statement"
+    );
+    assert_eq!(
+        profile.count_calls, 0,
+        "phase 2 must not issue a COUNT(*) per candidate — regression to the \
+         old N+1 loop"
+    );
+    assert_eq!(
+        phase2_statements, 1,
+        "phase 2 must be exactly one DELETE statement"
+    );
 }
