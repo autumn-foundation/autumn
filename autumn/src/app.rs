@@ -14508,14 +14508,11 @@ mod tests {
         std::fs::create_dir_all(dist.join("docs")).expect("mkdir");
         std::fs::write(dist.join("docs/index.html"), "<h1>Static Docs</h1>").expect("write");
 
-        let manifest = crate::static_gen::StaticManifest {
-            generated_at: "2026-03-27T00:00:00Z".to_owned(),
-            autumn_version: "0.2.0".to_owned(),
-            routes: HashMap::from([(
-                "/docs".to_owned(),
-                crate::static_gen::ManifestEntry::new("docs/index.html".to_owned()),
-            )]),
-        };
+        let manifest = crate::static_gen::StaticManifest::new(HashMap::from([(
+            "/docs".to_owned(),
+            crate::static_gen::ManifestEntry::new("docs/index.html".to_owned()),
+        )]))
+        .with_generated_at("2026-03-27T00:00:00Z");
         let json = serde_json::to_string(&manifest).expect("serialize");
         std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
 
@@ -14590,6 +14587,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    /// #1832 through the composed `build_router_with_static` stack rather than
+    /// the router tests' narrower helper: the manifest's recorded type must
+    /// survive the security-headers layer and arrive alongside
+    /// `X-Content-Type-Options: nosniff` — which is precisely why it has to be
+    /// right. `/feed` is extensionless and stored as `feed/index.html`, so both
+    /// legacy clues say `text/html`; only the recorded value makes it RSS.
+    #[tokio::test]
+    async fn build_router_serves_recorded_content_type_with_nosniff() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("feed")).expect("mkdir");
+        std::fs::write(dist.join("feed/index.html"), "<rss/>").expect("write");
+
+        let manifest = crate::static_gen::StaticManifest::new(HashMap::from([(
+            "/feed".to_owned(),
+            crate::static_gen::ManifestEntry::new("feed/index.html".to_owned())
+                .with_content_type(Some("application/rss+xml".to_owned())),
+        )]));
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        let config = AutumnConfig::default();
+        let router = crate::router::build_router_with_static(
+            Vec::new(),
+            &config,
+            AppState::for_test(),
+            Some(dist.as_path()),
+        );
+
+        let response = router
+            .oneshot(Request::builder().uri("/feed").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/rss+xml"),
+            "the recorded type must survive the full composed stack"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "nosniff is why the recorded type has to be correct: the browser \
+             will not second-guess it"
+        );
     }
 
     #[tokio::test]
