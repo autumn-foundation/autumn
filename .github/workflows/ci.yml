@@ -1149,16 +1149,25 @@ jobs:
               Start-Sleep -Milliseconds 500
             }
 
+            # Count restarts BEFORE the edit and require an INCREASE, rather
+            # than testing against a fixed number. An absolute threshold passes
+            # if `autumn dev` ever emitted a second start for an unrelated
+            # reason — and then the /health 200 below would be answered by the
+            # original, un-reloaded process. This is the assertion that makes
+            # the step mean what its name says.
+            $startsBefore = ([regex]::Matches((Read-DevLog), 'Starting server')).Count
+            Write-Host "restarts before the edit: $startsBefore"
+
             # Edit a watched source file. A comment is enough: it is a real
             # recompile, and it cannot change behaviour and mask a failure.
             Add-Content -Path "$app\src\main.rs" -Value "`n// tier1 journey edit`n"
 
             Wait-ForCount 'Changed:' 1 180 'the edit to be detected'
-            # A SECOND 'Starting server' — the restart after the rebuild. On
-            # Windows `autumn dev` stops the old binary BEFORE building, so this
-            # line only appears if the cooperative stop released the exe lock
-            # and the rebuild then relinked over it.
-            Wait-ForCount 'Starting server' 2 1800 'the rebuild and restart'
+            # One MORE 'Starting server' than before the edit — the restart after
+            # the rebuild. On Windows `autumn dev` stops the old binary BEFORE
+            # building, so this line only appears if the cooperative stop
+            # released the exe lock and the rebuild then relinked over it.
+            Wait-ForCount 'Starting server' ($startsBefore + 1) 1800 'the rebuild and restart'
 
             # The stop must have been cooperative. If the app had to be
             # force-stopped, its `on_shutdown` hook did not run and the managed
@@ -1186,6 +1195,9 @@ jobs:
               throw "the reloaded server never answered GET /health"
             }
             Write-Host "dev loop: edit -> cooperative stop -> rebuild -> restart -> 200 OK"
+            Write-Host "::group::autumn dev output"
+            Read-DevLog | Write-Host
+            Write-Host "::endgroup::"
           } finally {
             # Harness cleanup, not a product assertion: there is no supported way
             # to interrupt a foreground `autumn dev` from a non-interactive
@@ -1222,8 +1234,11 @@ jobs:
           # fails precisely when the policy is working.
           exit 0
 
-      - name: Upload journey logs on failure
-        if: failure()
+      - name: Upload journey logs
+        # `always()`, not `failure()`: a PASSING run's logs are what show the
+        # journey actually happened — a gate nobody can audit is a gate nobody
+        # should trust.
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: windows-tier1-logs
