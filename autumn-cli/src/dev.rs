@@ -110,6 +110,36 @@ const DEV_SHUTDOWN_SIGNAL_PREFIX: &str = "dev-shutdown.";
 )]
 const DEV_SHUTDOWN_SIGNAL_SUFFIX: &str = ".signal";
 
+/// Mirror of [`crate::serve::SERVE_READY_FILE_ENV`]; pinned to it by a test.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const SERVE_READY_FILE_ENV: &str = "AUTUMN_SERVE_READY_FILE";
+
+/// Filename parts of this dev session's ready file — the app writes its
+/// resolved drain budget here, and the dev loop's process id keeps two
+/// concurrent `autumn dev` runs from reading each other's.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DEV_READY_FILE_PREFIX: &str = "dev-ready.";
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DEV_READY_FILE_SUFFIX: &str = ".state";
+
 /// Headroom added to the app's own drain budget before `autumn dev` escalates
 /// to a hard kill.
 ///
@@ -189,11 +219,19 @@ fn recorded_child_stop_budget() -> Option<Duration> {
     }
 }
 
-/// The budget to stop the running child with.
+/// The budget to stop the running child with, most authoritative first.
 ///
-/// Prefers the value `recorded` when that child was spawned, and only resolves
-/// from config (`resolve_now`) when nothing was recorded. Split out as a pure
-/// function so the "must not re-read a just-edited config" rule is testable.
+/// 1. `reported` — what the app itself said its drain budget is. Beats anything
+///    the CLI can derive: an app using `AppBuilder::with_config_loader` can
+///    resolve a budget no amount of TOML/env reading reproduces.
+/// 2. `recorded` — resolved from config when this child was spawned. Used
+///    before the app has finished booting, and never re-read at stop time, so a
+///    just-edited (or half-saved) config cannot shorten the window the running
+///    child is actually using.
+/// 3. `resolve_now` — last resort, when neither is available.
+///
+/// Pure so those precedence rules are testable directly, including the one that
+/// matters most: with a budget already in hand, the config is not consulted.
 #[cfg_attr(
     unix,
     allow(
@@ -202,10 +240,11 @@ fn recorded_child_stop_budget() -> Option<Duration> {
     )
 )]
 fn stop_budget_for_running_child(
+    reported: Option<Duration>,
     recorded: Option<Duration>,
     resolve_now: impl FnOnce() -> Duration,
 ) -> Duration {
-    recorded.unwrap_or_else(resolve_now)
+    reported.or(recorded).unwrap_or_else(resolve_now)
 }
 
 /// This app's cooperative-stop budget, resolved from its own configuration.
@@ -1168,6 +1207,15 @@ fn start_server(
         // the child would still be draining on these numbers.
         record_child_stop_budget(resolve_cooperative_stop_budget(package));
     }
+    // Let the app tell us its own resolved drain budget rather than making the
+    // CLI guess — the seam `autumn serve` already uses, and the only way to see
+    // a budget a custom `with_config_loader` produced. Clear any stale file
+    // first so this child cannot be stopped on its predecessor's number.
+    #[cfg(not(unix))]
+    if let Some(ready) = dev_ready_file_path() {
+        let _ = std::fs::remove_file(ready);
+        command.env(SERVE_READY_FILE_ENV, ready);
+    }
 
     match command.spawn() {
         Ok(child) => Some(child),
@@ -1231,9 +1279,11 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
         *child = None;
         return;
     };
-    let budget = stop_budget_for_running_child(recorded_child_stop_budget(), || {
-        resolve_cooperative_stop_budget(package)
-    });
+    let budget = stop_budget_for_running_child(
+        dev_ready_file_path().and_then(child_reported_stop_budget),
+        recorded_child_stop_budget(),
+        || resolve_cooperative_stop_budget(package),
+    );
     match stop_child_cooperatively(child, signal_path, budget) {
         StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
         StopOutcome::Unreachable => eprintln!(
@@ -1584,6 +1634,50 @@ fn resolve_dev_shutdown_signal_path() -> Option<PathBuf> {
         "{DEV_SHUTDOWN_SIGNAL_PREFIX}{}{DEV_SHUTDOWN_SIGNAL_SUFFIX}",
         std::process::id()
     )))
+}
+
+/// This dev-loop session's ready file, resolved once — the path the app writes
+/// its resolved drain budget to.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn dev_ready_file_path() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let metadata = try_cargo_metadata()?;
+        let target = metadata["target_directory"].as_str()?;
+        Some(Path::new(target).join("autumn").join(format!(
+            "{DEV_READY_FILE_PREFIX}{}{DEV_READY_FILE_SUFFIX}",
+            std::process::id()
+        )))
+    })
+    .as_deref()
+}
+
+/// The stop budget the running child reported for itself, if it has booted.
+///
+/// The app writes its resolved *drain* budget (`prestop_grace_secs +
+/// shutdown_timeout_secs`) to this file at startup-complete; hooks run after the
+/// drain, so the same headroom still applies. A missing, blank, or unparseable
+/// file means "no report" — never a zero budget, which would hard-kill instantly.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn child_reported_stop_budget(ready_file: &Path) -> Option<Duration> {
+    let secs = std::fs::read_to_string(ready_file)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(cooperative_stop_budget(secs))
 }
 
 /// This dev-loop session's cooperative-shutdown file, resolved once.
@@ -2089,10 +2183,79 @@ mod tests {
     // same effect. Either way the `on_shutdown` hooks are skipped and the
     // managed cluster is orphaned, which is the bug this all exists to prevent.
 
+    // ── The child's OWN budget beats any CLI reconstruction (Codex round 5) ──
+    //
+    // An app using `AppBuilder::with_config_loader` can resolve a budget no
+    // amount of TOML/env reading reproduces. The runtime already solved this for
+    // `autumn serve`: the app writes its resolved drain budget to the file named
+    // by `AUTUMN_SERVE_READY_FILE`, and `signal_serve_ready`'s contract says why
+    // — so `stop` "waits for the budget the app will actually drain for ...
+    // instead of reconstructing it from TOML/env and risking a premature
+    // SIGKILL". `autumn dev` was doing exactly the reconstructing it warns about.
+
+    #[test]
+    fn a_child_reported_budget_beats_everything_the_cli_can_reconstruct() {
+        let budget = stop_budget_for_running_child(
+            Some(Duration::from_secs(360)),
+            Some(Duration::from_secs(61)),
+            || Duration::from_secs(95),
+        );
+        assert_eq!(budget, Duration::from_secs(360));
+    }
+
+    #[test]
+    fn the_recorded_budget_is_used_when_the_child_reported_nothing() {
+        // Stopped before it finished booting: no ready file yet, so the
+        // spawn-time estimate is the best available answer.
+        let budget = stop_budget_for_running_child(None, Some(Duration::from_secs(61)), || {
+            Duration::from_secs(95)
+        });
+        assert_eq!(budget, Duration::from_secs(61));
+    }
+
+    #[test]
+    fn resolving_is_the_last_resort() {
+        let budget = stop_budget_for_running_child(None, None, || Duration::from_secs(95));
+        assert_eq!(budget, Duration::from_secs(95));
+    }
+
+    #[test]
+    fn the_reported_budget_gets_the_same_hook_headroom() {
+        // The app reports its DRAIN budget (prestop + shutdown). Hooks run after
+        // the drain, so the headroom still applies — otherwise honouring the
+        // report would reintroduce the very orphan it prevents.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        std::fs::write(&ready, "300\n").unwrap();
+        assert_eq!(
+            child_reported_stop_budget(&ready),
+            Some(cooperative_stop_budget(300))
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_report_is_ignored_rather_than_misread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        assert_eq!(child_reported_stop_budget(&ready), None, "absent");
+        std::fs::write(&ready, "not-a-number").unwrap();
+        assert_eq!(child_reported_stop_budget(&ready), None, "junk");
+        std::fs::write(&ready, "  ").unwrap();
+        assert_eq!(child_reported_stop_budget(&ready), None, "blank");
+    }
+
+    #[test]
+    fn the_ready_file_env_var_is_the_one_the_runtime_reads() {
+        // `autumn/src/app.rs::signal_serve_ready` reads this exact name; a
+        // rename on either side silently returns `autumn dev` to guessing.
+        assert_eq!(SERVE_READY_FILE_ENV, "AUTUMN_SERVE_READY_FILE");
+        assert_eq!(SERVE_READY_FILE_ENV, crate::serve::SERVE_READY_FILE_ENV);
+    }
+
     #[test]
     fn the_stop_budget_uses_the_value_recorded_when_the_child_was_spawned() {
         let recorded = Some(Duration::from_secs(300));
-        let budget = stop_budget_for_running_child(recorded, || Duration::from_secs(95));
+        let budget = stop_budget_for_running_child(None, recorded, || Duration::from_secs(95));
         assert_eq!(budget, Duration::from_secs(300));
     }
 
@@ -2101,7 +2264,7 @@ mod tests {
         // Not just "returns the right number": it must not touch the config at
         // all, or a malformed save mid-edit could still influence the stop.
         let consulted = std::cell::Cell::new(false);
-        let _ = stop_budget_for_running_child(Some(Duration::from_secs(300)), || {
+        let _ = stop_budget_for_running_child(None, Some(Duration::from_secs(300)), || {
             consulted.set(true);
             Duration::from_secs(95)
         });
@@ -2116,7 +2279,7 @@ mod tests {
         // No child was spawned through `start_server` this session (or the
         // spawn predates the recording); resolving now is the best available
         // answer and is still better than a fixed constant.
-        let budget = stop_budget_for_running_child(None, || Duration::from_secs(95));
+        let budget = stop_budget_for_running_child(None, None, || Duration::from_secs(95));
         assert_eq!(budget, Duration::from_secs(95));
     }
 

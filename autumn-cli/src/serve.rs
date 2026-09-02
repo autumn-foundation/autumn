@@ -21,6 +21,16 @@ use std::time::Duration;
 /// `autumn_web::managed_pg::MANAGED_PG_DATA_DIR_ENV`; redefined here because the
 /// CLI doesn't build the `managed-pg` feature and so can't reference the const.
 pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+
+/// Environment variable naming the file an app writes when startup completes.
+///
+/// Its contents are the app's *resolved* graceful-drain budget in seconds
+/// (`prestop_grace_secs + shutdown_timeout_secs`) — see
+/// `autumn_web::app::signal_serve_ready`. Both `autumn serve` and `autumn dev`
+/// pass it, so a supervisor waits for the budget the app will ACTUALLY drain
+/// for, including one a custom `with_config_loader` resolved, instead of
+/// reconstructing it from TOML/env.
+pub const SERVE_READY_FILE_ENV: &str = "AUTUMN_SERVE_READY_FILE";
 /// Env var that makes the provider *attach* to an already-running cluster at the
 /// given URL instead of starting its own. Mirrors
 /// `autumn_web::managed_pg::MANAGED_PG_ATTACH_URL_ENV`.
@@ -701,7 +711,7 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
         cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
         // The app creates this file right after startup completes; the
         // supervisor polls it to detect readiness without an HTTP probe.
-        cmd.env("AUTUMN_SERVE_READY_FILE", paths.ready_file());
+        cmd.env(SERVE_READY_FILE_ENV, paths.ready_file());
     }
     if opts.bundled_pg
         && let Some(paths) = paths
