@@ -1,6 +1,6 @@
-error: agent authority: `finalize` is handed an effect handle, and what it does with it is another function's business — so `draft`'s effects cannot be proven.
+error: agent authority: `finalize` is handed the effect handle `repo`, and what it does with it is another function's business — so `draft`'s effects cannot be proven.
 
-       Move the effect into this handler, or declare the site with `#[agent_effect(..., reason = "...")]`. See docs/guide/agent-authority.md.
+       Move the effect into this handler, declare what the call does with `#[agent_effect(writes(Model), reason = "...")]`, or — if it is verified to perform none — discharge it with `#[agent_effect(none, reason = "...")]`. See docs/guide/agent-authority.md.
   --> tests/compile-fail/agent_authority_opaque_helper.rs:31:5
    |
 31 |     finalize(&repo, 1).await
