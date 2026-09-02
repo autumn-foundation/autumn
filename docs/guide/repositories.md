@@ -487,7 +487,7 @@ that repository** and any model-side `dependent` on the same model is inert. Tha
 is deliberate — the repository form exists precisely to override — but a silently
 ignored declaration is a trap, so debug builds emit a `tracing::warn!` naming the
 model when both are present. The warning rides the single-record delete path
-(`delete_by_id` / `destroy`) — an app whose only delete path is `delete_many`
+(`delete_by_id`) — an app whose only delete path is `delete_many`
 never sees it — and the check is a const-folded `if false` in release builds, so
 they pay nothing for it.
 
@@ -546,9 +546,12 @@ cascade returns a typed conflict instead of removing the row.
 
   The transaction always rolls back in full. A hook side effect that is not a
   commit hook does not. So if a `before_delete` hook reaches outside the database,
-  put the `restrict` on the leg you are deleting rather than a level below it, or
-  delete those parents one at a time.
-- **Both delete paths.** `delete_by_id` / `destroy` and the bulk `delete_many`
+  put the `restrict` on the leg you are deleting rather than a level below it —
+  that is the only placement the up-front probe covers. Deleting parents one at a
+  time closes the batch case but not the sibling-association one, since a single
+  parent's legs still run in order. Hoisting deeper probes into the up-front pass
+  is tracked in [#2427](https://github.com/autumn-foundation/autumn/issues/2427).
+- **Both delete paths.** `delete_by_id` and the bulk `delete_many`
   both run the cascade. On `delete_many` the ordering is the same — restrict
   probes for the whole batch first (a 409 rolls the entire batch back), then the
   children, then the bulk parent delete — so bulk-deleting parents neither
