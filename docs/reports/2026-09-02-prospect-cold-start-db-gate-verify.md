@@ -36,10 +36,12 @@ scheduled CI check with no other owner).
 - **Conditions:** measured by the existing `Cold-Start Onboarding Gate`
   workflow (`.github/workflows/cold-start-latency.yml`), 3 runs, no-DB
   `autumn new --daemon` shape, `ubuntu-latest` GitHub-hosted runner. The job
-  logs show `CARGO_INCREMENTAL=0` in the runtime environment, but neither the
-  workflow file nor `cold_start_driver::cold_build` sets it, so it comes from
-  a repo/org-level Actions variable outside this checkout — the local control
-  below does not set it and is not a full reproduction of that setting.
+  logs show `CARGO_INCREMENTAL=0` in the runtime environment; neither the
+  workflow file nor `cold_start_driver::cold_build` sets it directly, but the
+  preceding `Swatinem/rust-cache@v2.7.8` step documents exporting it. The
+  local control below sets `CARGO_INCREMENTAL=0` explicitly and clears
+  `target/debug/incremental/` for the same reason, to avoid crediting either
+  measurement with reused incremental work products.
 - **Time box:** same day (one investigation session); riskiest assumption
   first — whether the crate-level fix actually reduces end-to-end wall time,
   rather than building anything new.
@@ -67,8 +69,9 @@ scheduled CI check with no other owner).
   immediately preceding pre-fix run (32703733611, 2026-08-24).
 - One local, uncommitted control measurement in this sandbox: `cargo build -p
   autumn-macros` timed with `--features db` vs `--no-default-features`, deps
-  pre-warmed, only the `autumn-macros` unit's own fingerprint cleared between
-  runs — isolates the crate's self-compile cost the same way issue #2309 did.
+  pre-warmed, `CARGO_INCREMENTAL=0`, with the `autumn-macros` unit's
+  fingerprint *and* incremental work products cleared between runs — isolates
+  the crate's self-compile cost the same way issue #2309 did.
 - No stubs — this is a verification assay over existing CI history and a
   crate-level micro-benchmark, not a new prototype.
 
@@ -96,15 +99,18 @@ every `ColdStartHello`/`ColdStartDb` result that exceeds its budget,
 regardless of cause. No historical or per-dependency comparison backs it.
 
 **Control — isolated `autumn-macros` self-compile, this sandbox** (4-core,
-15GiB, rustc/cargo 1.94.1, deps pre-warmed, only the crate's own fingerprint
-cleared between the two measurements):
+15GiB, rustc/cargo 1.94.1, deps pre-warmed; `CARGO_INCREMENTAL=0` set
+explicitly — matching what `Swatinem/rust-cache`'s documented behavior
+exports in the CI workflow — and both the crate's fingerprint *and*
+`target/debug/incremental/autumn_macros-*` cleared between the two
+measurements, so neither run can reuse the other's rustc work products):
 
 | Build | Self-compile time |
 |---|---|
-| `cargo build -p autumn-macros --features db` (repository.rs + model.rs included) | 52.62s |
-| `cargo build -p autumn-macros --no-default-features` (db codegen excluded) | 1.15s |
+| `cargo build -p autumn-macros --features db` (repository.rs + model.rs included) | 54.80s |
+| `cargo build -p autumn-macros --no-default-features` (db codegen excluded) | 3.34s |
 
-The crate-level fix is real and large — a **~98% reduction (52.6s → 1.15s)**
+The crate-level fix is real and large — a **~94% reduction (54.8s → 3.34s)**
 in `autumn-macros`' own compile time, consistent with issue #2309's claim
 that `repository.rs`/`model.rs` dominate the crate. Feature wiring was
 verified correct by inspection: `autumn/Cargo.toml`'s `db` feature forwards
@@ -125,20 +131,23 @@ the workflow's creation, including the first run after the targeted fix
 merged. p95 105,371ms is still 75% over the 60,000ms budget.
 
 The interesting finding is *why*: the crate-level fix works exactly as
-designed (~51s saved, verified directly, in isolation), yet the net change in
-the full end-to-end build over the same week was only ~15s (120,422 →
-105,371ms). That gap is real, but this assay cannot attribute it to a
-specific cause — the two CI numbers span a week of unrelated commits and
+designed (~51.5s saved, verified directly and cleanly, in isolation), yet the
+net change in the full end-to-end build over the same week was only ~15s
+(120,422 → 105,371ms). That gap is real, but this assay cannot attribute it
+to a specific cause — the two CI numbers span a week of unrelated commits and
 runner-to-runner variance, and (per the correction above) CI's own diagnosis
 line is generic boilerplate, not a finding. The honest statement is: net
 improvement was far short of what the isolated fix predicts, and isolating
 why requires a controlled comparison this assay did not run — e.g. building
 the *same* commit with `autumn-macros` `db` on vs. off end-to-end, or a
-`cargo build --timings` bisection across 2026-08-26 → 2026-08-28 (candidate
-commits worth checking first, because they touch default features/deps in
-that window: `1fd6245` Ledgered entities, `61bdd9c` Web Push, `fec5221`
-zero-downtime in-place upgrades — unconfirmed, not evidence of cause). That
-bisection is the follow-up, not this verification.
+`cargo build --timings` bisection over the *full* comparison interval,
+`d1ecb361..ef61ae44` (2026-08-24 → 2026-08-31 — the two runs' actual commits,
+not a narrower guess). Candidate commits worth checking first, because they
+touch default features/deps in that window: `1fd6245` Ledgered entities
+(Aug 27), `61bdd9c` Web Push (Aug 27), `fec5221` zero-downtime in-place
+upgrades (Aug 29) — unconfirmed, not evidence of cause, and not necessarily
+exhaustive over the full interval. That bisection is the follow-up, not this
+verification.
 
 No open issue or PR is currently tracking this gap; #2309 remains open and
 accurately reflects unresolved state, but nobody has checked the merged fix
@@ -152,9 +161,10 @@ against real data since it landed four days before this assay.
 #   33404849157 (post-fix); job "Measure cold-start onboarding" logs contain
 #   the p50/p95/max table.
 
-# Local control (isolates autumn-macros' own compile cost):
-rm -rf target/debug/deps/libautumn_macros* target/debug/.fingerprint/autumn-macros-*
-cargo build -p autumn-macros --features db          # ~52.6s on 4c/15GiB
-rm -rf target/debug/deps/libautumn_macros* target/debug/.fingerprint/autumn-macros-*
-cargo build -p autumn-macros --no-default-features  # ~1.15s
+# Local control (isolates autumn-macros' own compile cost; CARGO_INCREMENTAL=0
+# and clearing target/debug/incremental/ matter — see Assay for why):
+rm -rf target/debug/deps/libautumn_macros* target/debug/.fingerprint/autumn-macros-* target/debug/incremental/autumn_macros-*
+CARGO_INCREMENTAL=0 cargo build -p autumn-macros --features db          # ~54.8s on 4c/15GiB
+rm -rf target/debug/deps/libautumn_macros* target/debug/.fingerprint/autumn-macros-* target/debug/incremental/autumn_macros-*
+CARGO_INCREMENTAL=0 cargo build -p autumn-macros --no-default-features  # ~3.3s
 ```
