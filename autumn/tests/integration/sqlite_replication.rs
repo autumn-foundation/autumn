@@ -191,6 +191,14 @@ impl Harness {
             .with_clock(Arc::clone(&self.clock) as Arc<dyn ClockSource>);
     }
 
+    /// Remove one object from the replica, the way a lifecycle rule or a stray
+    /// delete would.
+    fn delete_object(&self, key: &str) {
+        self.destination()
+            .delete(key)
+            .expect("delete replica object");
+    }
+
     /// Delete the database and every sidecar — the "the disk died" step.
     fn destroy_database(&mut self) {
         let conn = std::mem::replace(
@@ -546,6 +554,19 @@ fn tick_until_checkpointed(h: &mut Harness, base: i64) -> TickReport {
     panic!("the replicator never checkpointed an over-budget WAL");
 }
 
+/// Every segment key on the destination, in replication order.
+fn segment_keys_on(h: &Harness) -> Vec<String> {
+    let mut keys: Vec<(segment::SegmentRef, String)> = h
+        .destination()
+        .list(&format!("{}/generations/", h.root))
+        .expect("list")
+        .into_iter()
+        .filter_map(|k| segment::parse_segment_key(&k).map(|r| (r, k)))
+        .collect();
+    keys.sort_by_key(|entry| entry.0);
+    keys.into_iter().map(|(_, k)| k).collect()
+}
+
 fn generations_on(h: &Harness) -> std::collections::BTreeSet<String> {
     h.destination()
         .list(&format!("{}/generations/", h.root))
@@ -712,6 +733,55 @@ fn an_expired_generation_takes_a_fresh_base_snapshot_at_the_next_checkpoint() {
     h.destroy_database();
     let restored = h.restore_to(None);
     assert_eq!(values(&read_rows(&restored)), ["gen-one", "gen-two"]);
+}
+
+/// A replica missing its newest segments must be refused, not restored.
+///
+/// The chain walk catches a hole in the middle, because a later sequence
+/// exposes it. A missing *tail* leaves a perfectly contiguous prefix, so
+/// without the generation head a truncated replica restores "cleanly" — short
+/// of its newest commits — and periodic verification agrees with it. That is
+/// the silent case: an operator restores, sees a working database, and never
+/// learns which commits are gone.
+#[test]
+fn a_replica_missing_its_newest_segments_is_refused() {
+    let mut h = Harness::new();
+    prime(&mut h, 0);
+
+    insert(&mut h.conn, &["one"]);
+    assert_eq!(h.tick(1).expect("tick").segments, 1);
+    insert(&mut h.conn, &["two"]);
+    assert_eq!(h.tick(2).expect("tick").segments, 1);
+
+    // A latest restore is happy while the chain is whole.
+    h.destroy_database();
+    let restored = h.restore_to(None);
+    assert_eq!(values(&read_rows(&restored)), ["one", "two"]);
+    std::fs::remove_file(&restored).expect("clear the restore output");
+
+    // Now lose the newest segment the way a lifecycle rule or a stray delete
+    // would: the object goes, the head stays.
+    let newest = segment_keys_on(&h)
+        .into_iter()
+        .next_back()
+        .expect("a shipped segment");
+    h.delete_object(&newest);
+
+    let err = restore::restore(
+        h.destination().as_ref(),
+        &h.root,
+        None,
+        &h.replica_root
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("truncated.db"),
+    )
+    .expect_err("a truncated replica must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("missing its newest segments"),
+        "the refusal must name the truncation, got: {message}"
+    );
 }
 
 /// A host clock that steps backward must not hide the newest generation.

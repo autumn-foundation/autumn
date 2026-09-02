@@ -92,6 +92,15 @@ pub enum RestoreError {
         found_seq: u64,
     },
     /// A segment does not start where the previous one ended.
+    /// The replica is missing the newest segments its own head records.
+    TruncatedTail {
+        /// Generation the gap is in.
+        generation: String,
+        /// Newest (index, seq) the generation's head claims was sent.
+        head: (u32, u64),
+        /// Newest (index, seq) actually present, if any.
+        found: Option<(u32, u64)>,
+    },
     SegmentDiscontinuity {
         /// The generation.
         generation: String,
@@ -162,6 +171,23 @@ impl fmt::Display for RestoreError {
                  {expected_index}/{expected_seq} (next present segment is \
                  {found_index}/{found_seq}) — refusing to restore a replica with a \
                  hole in it."
+            ),
+            Self::TruncatedTail {
+                generation,
+                head,
+                found,
+            } => write!(
+                f,
+                "replica generation {generation} is missing its newest segments: its head \
+                 records (index {}, seq {}) as sent, but the newest present is {}.\n  \
+                 A contiguous run that stops short of the head is a truncated replica, not \
+                 a complete one — refusing rather than restoring without those commits.",
+                head.0,
+                head.1,
+                found.map_or_else(
+                    || "nothing".to_owned(),
+                    |(i, q)| format!("(index {i}, seq {q})")
+                )
             ),
             Self::SegmentDiscontinuity {
                 generation,
@@ -387,6 +413,35 @@ pub fn plan(
             seq: reference.seq,
             created_at: ms_to_utc(reference.created_ms),
         });
+    }
+
+    // A latest restore must reach the generation's own head. The chain walk
+    // above catches a hole in the middle — a later sequence exposes it — but a
+    // missing *tail* leaves a perfectly contiguous prefix, so a replica whose
+    // newest objects were lost (a lifecycle rule, a manual delete, a stale
+    // listing from an eventually-consistent endpoint) would restore "cleanly"
+    // without its newest commits, and periodic verification would agree.
+    //
+    // Only for a latest restore: a point-in-time restore stops short of the head
+    // by construction, which is the whole point of asking for one. A head that
+    // is absent (a replica written before this object existed) or older than
+    // what is present cannot fail the check — it can only under-claim.
+    if target.is_none() {
+        let head = match destination.get(&segment::head_key(root, &generation)) {
+            Ok(bytes) => serde_json::from_slice::<segment::GenerationHead>(&bytes).ok(),
+            Err(e) if e.is_not_found() => None,
+            Err(e) => return Err(RestoreError::from(e)),
+        };
+        if let Some(head) = head {
+            let found = segments.last().map(|s| (s.index, s.seq));
+            if found.is_none_or(|f| f < (head.index, head.seq)) {
+                return Err(RestoreError::TruncatedTail {
+                    generation,
+                    head: (head.index, head.seq),
+                    found,
+                });
+            }
+        }
     }
 
     let generation_started_at = ms_to_utc(generation_ms);

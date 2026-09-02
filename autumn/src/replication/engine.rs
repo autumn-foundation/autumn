@@ -445,6 +445,26 @@ impl Replicator {
         let mut header = header;
         let mut wal_len = wal_len;
         if self.needs_new_generation(header.as_ref(), wal_len) {
+            // Ship what the outgoing generation still owes before rotating.
+            //
+            // `start_generation` checkpoints, which folds every unshipped frame
+            // into the database file the new base snapshot copies. Those commits
+            // are not lost, but they leave the *old* generation's chain — so a
+            // point-in-time restore aimed just before the rollover would replay
+            // that chain and legitimately miss them. They would also stay
+            // offsite-less for the whole compress-and-upload of a full snapshot,
+            // which on a large database is minutes against an advertised
+            // ten-second objective.
+            //
+            // Shipping first closes both: the frames land in the generation that
+            // owns them, at the moment they were committed.
+            if self.state.is_some()
+                && let Some(pending) = header.as_ref()
+            {
+                let shipped = self.ship(&wal_path, pending, wal_len)?;
+                report.segments += shipped.0;
+                report.bytes += shipped.1;
+            }
             self.start_generation(&db)?;
             report.snapshot_taken = true;
             // The generation opened from a checkpointed database file, so the
@@ -869,6 +889,22 @@ impl Replicator {
             segment_header.created_ms,
         );
         self.destination.put(&key, &payload)?;
+
+        // Written after the segment it describes, never before: a head that
+        // runs ahead of the objects would fail an honest restore, while a head
+        // that lags one segment only under-claims, which a restore tolerates.
+        let head = segment::GenerationHead {
+            version: segment::LAYOUT_VERSION,
+            index: state.index,
+            seq: state.next_seq,
+            created_ms: segment_header.created_ms,
+        };
+        let head_body = serde_json::to_vec(&head).map_err(|e| ReplicationError::Io {
+            op: "encode the generation head",
+            detail: e.to_string(),
+        })?;
+        self.destination
+            .put(&segment::head_key(&root, &state.id), &head_body)?;
 
         let bytes = raw.len() as u64;
         state.shipped_offset = outcome.last_commit_end;

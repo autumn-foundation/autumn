@@ -403,9 +403,26 @@ pub fn build(
 
     let destination = build_destination(config, storage)?;
     let status = Arc::new(ReplicationStatus::new(destination.describe()));
+    // Every object this replicator writes hangs off the derived root, and every
+    // destination validates the keys it is handed. A prefix that makes the root
+    // unusable — `../archive`, `archive:sqlite` — therefore passes config
+    // validation and then fails *every* upload at runtime, with the app already
+    // serving and auto-checkpointing already disabled, so the WAL grows without
+    // bound while the operator is told replication is on. Fail closed here
+    // instead: the check is the destination's own, so it cannot drift from what
+    // the uploads will accept.
+    let root = segment::root_prefix(config.prefix.as_deref(), profile);
+    if let Err(e) = destination::validate_key(&root) {
+        return Err(SetupError::Config {
+            errors: vec![format!(
+                "[replication] prefix {:?} makes an unusable destination root {root:?}: {e}",
+                config.prefix.as_deref().unwrap_or_default()
+            )],
+        });
+    }
     let settings = ReplicationSettings {
         database_path,
-        root: segment::root_prefix(config.prefix.as_deref(), profile),
+        root,
         sync_interval: config.sync_interval(),
         snapshot_interval: Duration::from_secs(config.snapshot_interval_secs.max(1)),
         max_wal_bytes: config.max_wal_bytes,

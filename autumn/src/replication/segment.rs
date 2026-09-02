@@ -272,6 +272,37 @@ pub fn snapshot_key(root: &str, generation: &str) -> String {
     format!("{root}/generations/{generation}/{SNAPSHOT_OBJECT}")
 }
 
+/// Name of the object recording how far a generation has been replicated.
+///
+/// Rewritten after every segment upload. A generation's segment keys prove what
+/// *arrived*; only this says what was *sent*, which is the difference between a
+/// restore that is complete and one that merely looks contiguous.
+pub const HEAD_OBJECT: &str = "head.json";
+
+/// Key of one generation's replication head.
+#[must_use]
+pub fn head_key(root: &str, generation: &str) -> String {
+    format!("{root}/generations/{generation}/{HEAD_OBJECT}")
+}
+
+/// How far a generation has been replicated.
+///
+/// A missing *middle* segment is caught by the chain walk — a later sequence
+/// exposes the gap. A missing *tail* is invisible that way: the surviving
+/// prefix is perfectly contiguous, so a truncated replica restores "cleanly"
+/// without its newest commits. Recording the head makes the tail checkable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationHead {
+    /// Layout version of the object.
+    pub version: u32,
+    /// WAL index of the newest segment sent.
+    pub index: u32,
+    /// Sequence within that index of the newest segment sent.
+    pub seq: u64,
+    /// When that segment was sent.
+    pub created_ms: i64,
+}
+
 /// Key of a generation's snapshot metadata / commit marker.
 #[must_use]
 pub fn snapshot_meta_key(root: &str, generation: &str) -> String {

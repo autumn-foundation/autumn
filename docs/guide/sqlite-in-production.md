@@ -323,6 +323,14 @@ your replicas. Set `allow_shared_bucket = true` to opt in.
 | Setting | Default | What it bounds |
 | --- | --- | --- |
 | `rpo_secs` | `10` | Steady-state data loss if the machine dies right now. |
+
+> **One exception to the objective.** Opening a new generation compresses and
+> uploads a fresh base snapshot on the replication thread, and a commit made
+> *during* that upload is not offsite until it finishes — on a large database,
+> longer than `rpo_secs`. Everything committed before the rollover is shipped
+> first, so only that window is affected. `snapshot_interval_secs` (default one
+> hour) sets how often it happens.
+
 | `sync_interval_secs` | `rpo_secs / 2` | How often committed frames are shipped. Must not exceed `rpo_secs`. |
 | `snapshot_interval_secs` | `3600` | How long one generation runs before a fresh base snapshot. |
 | `max_wal_bytes` | `16777216` | WAL size that forces a checkpoint (and the next WAL index). |
