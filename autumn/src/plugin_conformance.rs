@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::plugin_contract::{PluginContract, SurfaceTier, surface};
 use crate::route_listing::{RouteInfo, RouteSource};
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -39,6 +40,10 @@ pub struct ConformanceConfig {
     /// `admin`, `debug`, `credential`, `operator`, `secret`, or `metrics` must
     /// appear here with a non-empty `auth_mechanism`, or the check fails.
     pub sensitive_routes: Vec<SensitiveRoute>,
+    /// The plugin's declared compatibility contract (issue #1601), when it has
+    /// one. Drives the `experimental-surface` check; without it that check is
+    /// skipped rather than assumed clean.
+    pub contract: Option<PluginContract>,
 }
 
 impl ConformanceConfig {
@@ -49,7 +54,21 @@ impl ConformanceConfig {
             expected_prefix: None,
             intentional_root_routes: Vec::new(),
             sensitive_routes: Vec::new(),
+            contract: None,
         }
+    }
+
+    /// Attach the plugin's declared contract so the `experimental-surface`
+    /// check can run.
+    ///
+    /// This is the same value the plugin returns from
+    /// [`Plugin::contract`](crate::plugin::Plugin::contract) — pass it straight
+    /// through rather than restating it, so the harness checks what the plugin
+    /// actually declares.
+    #[must_use]
+    pub fn contract(mut self, contract: PluginContract) -> Self {
+        self.contract = Some(contract);
+        self
     }
 
     /// Declare the expected route prefix (e.g. `"/admin"`).
@@ -567,12 +586,103 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 
 /// Run all conformance checks and return a `ConformanceReport`.
 ///
+/// Report which experimental plugin surfaces a plugin declares a dependency on
+/// (issue #1601).
+///
+/// This check **reports**; it does not gate. Building on experimental surface
+/// is a legitimate, informed choice — the point is that the choice is visible
+/// in the conformance report and in the release notes of whichever release
+/// changes that surface.
+///
+/// It does fail on two things, because both make the declaration meaningless:
+///
+/// - a name that is not in [`PLUGIN_SURFACES`](crate::plugin_contract::PLUGIN_SURFACES)
+///   at all (a typo, or a surface that has since been removed), and
+/// - a name that *is* in the registry but at the
+///   [`Stable`](crate::plugin_contract::SurfaceTier::Stable) tier — declaring a
+///   stable API as experimental misreports the plugin's actual exposure.
+///
+/// Without a contract on the config the check is `Skip`: an author who has not
+/// declared one has not claimed anything, and silently passing them would read
+/// as "verified stable-only".
+#[must_use]
+pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckResult {
+    let name = "experimental-surface".to_owned();
+
+    let Some(contract) = contract else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Skip,
+            message: "no plugin contract declared; implement `Plugin::contract` (and pass it to \
+                      `ConformanceConfig::contract`) to have experimental-surface use reported"
+                .to_owned(),
+            diagnostics: vec![],
+        };
+    };
+
+    if contract.experimental_surfaces.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "declares no dependency on experimental plugin surface".to_owned(),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut invalid = 0usize;
+    for declared in &contract.experimental_surfaces {
+        match surface(declared) {
+            None => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{declared}: not a known plugin surface — check the spelling against \
+                     `autumn_web::plugin_contract::PLUGIN_SURFACES`"
+                ));
+            }
+            Some(s) if s.tier == SurfaceTier::Stable => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{declared}: declared experimental, but it is a STABLE surface — drop the \
+                     declaration; it overstates this plugin's exposure"
+                ));
+            }
+            Some(s) => diagnostics.push(format!("{}: {}", s.name, s.note)),
+        }
+    }
+
+    if invalid > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!(
+                "{invalid} of {} declared experimental surface(s) could not be resolved against \
+                 the registry",
+                contract.experimental_surfaces.len()
+            ),
+            diagnostics,
+        };
+    }
+
+    CheckResult {
+        name,
+        status: CheckStatus::Pass,
+        message: format!(
+            "depends on {} experimental surface(s); these may change in any release",
+            contract.experimental_surfaces.len()
+        ),
+        diagnostics,
+    }
+}
+
 /// Checks run:
 /// 1. `route-attribution` — plugin routes carry `plugin:<name>` source
 /// 2. `route-prefix` — plugin routes live under `config.expected_prefix` (if set)
 /// 3. `route-collision` — no two routes share (method, path)
 /// 4. `sensitive-surfaces` — sensitive-named plugin routes are declared with auth
 /// 5. `duplicate-registration` — plugin routes are not registered more than once
+/// 6. `experimental-surface` — the plugin's declared use of experimental
+///    plugin-facing API (issue #1601), reported rather than gated
 #[must_use]
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();
@@ -598,6 +708,7 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
     ));
 
     checks.push(check_duplicate_registration(&config.plugin_name, routes));
+    checks.push(check_experimental_surface(config.contract.as_ref()));
 
     ConformanceReport {
         plugin_name: config.plugin_name.clone(),

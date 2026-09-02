@@ -184,6 +184,51 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-links.sh
+      - name: Plugin surface gate
+        # The declared plugin API surface (issue #1601) has a compiled half —
+        # the `plugin-contract` job below builds `autumn-plugin-reference`
+        # against the changed framework — and a documentary half this step
+        # guards: the docs table matching `PLUGIN_SURFACES`, the ratchet on the
+        # stable count, and the rule that a change to the declared surface
+        # updates `docs/migrations/next.md`'s "Plugin authors" section.
+        #
+        # `fetch-depth: 0` is NOT set on this job's checkout, so the merge-base
+        # diff needs the base ref fetched explicitly; without it the script says
+        # so and skips that one check rather than passing a surface change
+        # silently.
+        #
+        # Shares this docs-only job for the same reason as the gates above: no
+        # toolchain, no cache, reports in seconds. Self-tests first.
+        env:
+          BASE_REF: origin/${{ github.base_ref || 'trunk-dev' }}
+        run: |
+          git fetch --no-tags --depth=50 origin "${{ github.base_ref || 'trunk-dev' }}" || true
+          ./scripts/check-plugin-surface.sh
+
+  plugin-contract:
+    name: Plugin API contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Compile the pinned reference plugin against this framework
+        # `autumn-plugin-reference` calls every surface declared
+        # `SurfaceTier::Stable` in `autumn/src/plugin_contract.rs`. Removing,
+        # renaming, or re-signaturing one breaks THIS build — which is the
+        # whole gate (issue #1601): a plugin-surface break becomes a red check
+        # on the PR that causes it, instead of a broken build in somebody's
+        # plugin crate after they upgrade.
+        #
+        # Its own job rather than a step in `test`: it is a ~1 minute compile
+        # of one small crate, and the point is that it reports under its own
+        # name so "did this break plugins?" is answerable at a glance.
+        run: cargo test -p autumn-plugin-reference --all-features
+      - name: Check the flagship first-party plugin still builds
+        # The success metric in issue #1601 names both the reference plugin and
+        # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
+        # the admin plugin proves a real, non-trivial consumer of it.
+        run: cargo check -p autumn-admin-plugin --all-targets
 
   supply-chain:
     name: Supply chain (cargo-deny)

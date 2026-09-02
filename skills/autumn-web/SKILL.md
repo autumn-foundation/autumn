@@ -1489,6 +1489,53 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## The plugin API stability contract (unreleased, issue #1601)
+
+**When advising a plugin author, start here.** Autumn declares which
+plugin-facing APIs are stable and which are experimental, and a plugin declares
+which `autumn-web` versions it supports.
+
+The registry is `autumn_web::plugin_contract::PLUGIN_SURFACES`; the rendered
+table lives in [`docs/plugins.md`](../../docs/plugins.md#the-plugin-api-contract).
+**stable** follows [`STABILITY.md`](../../STABILITY.md)'s SemVer promise and a
+break ships with a migration-guide *Plugin authors* section; **experimental**
+(today: `AppBuilder::with_edge_kv`, `autumn_edge::host`) may change in any
+release, patch included.
+
+A plugin declares its range by implementing `Plugin::contract` — optional, and
+`None` (the default) keeps today's behaviour exactly:
+
+```rust
+fn contract(&self) -> Option<PluginContract> {
+    Some(
+        PluginContract::new(env!("CARGO_PKG_NAME"))
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .autumn_web("0.7")            // Cargo requirement: "0.7", ">=0.6, <0.9", "=0.7.1"
+            .uses_experimental("AppBuilder::with_edge_kv"),  // only if you actually do
+    )
+}
+```
+
+Three things to know before advising on it:
+
+- **A mismatch panics at registration**, not later, with a message naming both
+  versions and both remedies (`cargo update -p <plugin>`, or pin
+  `autumn-web = "<declared>"`). An unparseable requirement only warns at
+  runtime — but `autumn plugin-check` fails on it, which is where the author
+  sees it.
+- **`autumn plugin-check` gained two checks.** `plugin-contract` fails when the
+  plugin under check declares no usable range; `experimental-surface` *reports*
+  what it declares, failing only on a name that does not resolve to an
+  experimental entry in the registry. Both skip against a host binary built
+  before the contract existed. `--deny-experimental` turns the report into a
+  gate.
+- **The framework side is gated by compilation.** `autumn-plugin-reference`
+  calls every declared stable surface and is built by the `plugin-contract` CI
+  job, so a stable-surface break is a red check on the PR that causes it. Do
+  not add a registry entry without a matching call site there —
+  `scripts/check-plugin-surface.sh` fails on it, and on a `docs/plugins.md`
+  table that has drifted from the registry.
+
 ## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
 
 **Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**

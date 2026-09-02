@@ -41,7 +41,13 @@ use diesel;
 // via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::deadpool::Pool;
+/// The deadpool connection pool Autumn's database seam produces.
+///
+/// Re-exported so a plugin implementing
+/// [`DatabasePoolProvider`] — a stable plugin surface (issue #1601) — can name
+/// the type its `create_pool` returns without taking its own `diesel-async`
+/// dependency at a matching major.
+pub use diesel_async::pooled_connection::deadpool::Pool;
 use futures::FutureExt as _;
 use std::any::Any;
 use std::future::Future;

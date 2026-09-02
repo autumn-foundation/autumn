@@ -408,6 +408,54 @@ addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
 
+## Plugin authors
+
+This release **adds** plugin-facing surface and removes none, so no plugin that
+compiles today stops compiling. It is worth a read anyway: the surface a plugin
+may rely on is now declared, and declaring what your own plugin supports gets
+you a startup diagnostic instead of a mystery.
+
+See [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the full
+contract and [`STABILITY.md`](../../STABILITY.md#the-plugin-api-surface-issue-1601)
+for the policy.
+
+- **Stable surface changed:** none. Nothing was removed, renamed, or
+  re-signatured. The surface that already existed is now *declared* stable in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES` and compiled on every commit by
+  the pinned `autumn-plugin-reference` crate.
+- **Experimental surface changed:** none. `AppBuilder::with_edge_kv` and
+  `autumn_edge::host` are now labelled experimental, matching what
+  `STABILITY.md` already said about the edge capsule lane (issue #1790).
+- **New stable surface:**
+  - `Plugin::contract` — declare the `autumn-web` range your plugin supports.
+    Defaults to `None`, so implementing it is optional.
+  - `autumn_web::plugin_contract` — `PluginContract`, `PLUGIN_SURFACES`,
+    `SurfaceTier`, `evaluate`, `lockstep_range`, and the
+    `PLUGIN_CONTRACT_MARKER` dump protocol.
+  - `AppBuilder::plugin_contracts()` — the contracts declared by the plugins
+    mounted on a builder.
+  - `ConformanceConfig::contract(...)` and
+    `plugin_conformance::check_experimental_surface(...)` — the
+    `experimental-surface` check, runnable from your own test suite.
+  - `autumn_web::db::Pool` and `autumn_web::reexports::diesel_migrations` — so a
+    plugin implementing `DatabasePoolProvider` or shipping migrations through
+    `AppBuilder::plugin_migrations` can name what those seams need without
+    taking its own `diesel-async` / `diesel-migrations` dependency.
+- **Declared range to move to:** `autumn-web 0.7` — add
+  `.autumn_web("0.7")` to your `Plugin::contract` and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`. Adding it is optional; a
+  plugin that declares nothing keeps its current behaviour exactly.
+
+**New `autumn plugin-check` checks.** Two checks join the report:
+`plugin-contract` (fails when the plugin under check declares no usable
+`autumn-web` range) and `experimental-surface` (reports what the plugin
+declares, and fails only on a name that cannot be resolved against the
+registry). Both **skip** when the built binary predates the contract dump, so
+an older host app does not turn them red. If your CI runs
+`autumn plugin-check`, expect `plugin-contract` to fail until you implement
+`Plugin::contract` — that is the intended nudge, and
+`--deny-experimental` is available if you want experimental use gated too.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the

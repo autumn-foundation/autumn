@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A versioned stability contract for the plugin API (#1601):** Autumn shipped a
+  real plugin system — the `Plugin` trait, a conformance harness, a flagship
+  first-party plugin, authoring docs — and no compatibility contract to go with
+  it. Nothing said which plugin-facing APIs were stable, a plugin could not
+  state which `autumn-web` versions it supported, and no CI gate was specific to
+  the plugin surface, so every release was a potential silent break for anyone
+  building on it. Non-breaking: every new API is additive, and a plugin that
+  declares nothing behaves exactly as it does today.
+
+  Plugin-facing APIs are now declared `stable` or `experimental` in
+  `autumn_web::plugin_contract::PLUGIN_SURFACES`, with the SemVer promise each
+  tier carries written down in [`STABILITY.md`](STABILITY.md#the-plugin-api-surface-issue-1601)
+  and the table rendered in [the plugin guide](docs/plugins.md#the-plugin-api-contract).
+
+  A plugin declares the framework range it supports, and an excluded pairing
+  fails at registration naming both versions and both remedies:
+
+  ```rust
+  fn contract(&self) -> Option<PluginContract> {
+      Some(PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("0.7"))
+  }
+  ```
+
+  The framework side is gated by compilation: `autumn-plugin-reference` is a
+  pinned reference plugin that calls every declared stable surface, built by the
+  new `plugin-contract` CI job on every change — so removing, renaming, or
+  re-signaturing one is a red check on the PR that causes it. A stable entry
+  with no call site in that crate fails the same job, so the registry cannot
+  promise what nothing compiles.
+
+  `autumn plugin-check` gains two checks, `plugin-contract` and
+  `experimental-surface`, reading the contract the built binary dumps; both skip
+  on a binary that predates the dump. `--deny-experimental` turns the
+  experimental report into a gate for authors who want one. The migration-guide
+  template gains a **Plugin authors** section, and
+  `scripts/check-plugin-surface.sh` fails a change to the declared surface that
+  does not fill it in. <!-- migration-guide-gate: additive; the "Plugin authors"
+  section it adds is about the gate itself, not a break -->
+
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in

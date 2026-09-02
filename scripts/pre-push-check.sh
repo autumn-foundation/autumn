@@ -76,6 +76,16 @@ step "./scripts/check-panic-gate.sh   (self-test + manifest gate; no toolchain)"
 step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain)"
 ./scripts/check-determinism-gate.sh
 
+# ---------------------------------------------------------------------------
+# Mirrors ci.yml `migration-guides` job: `./scripts/check-plugin-surface.sh`.
+# Same reasoning as the two gates above — seconds, no toolchain, self-testing —
+# and it catches the two things a `cargo test -p <one-crate>` loop never will:
+# the docs table drifting from `PLUGIN_SURFACES`, and a plugin-surface change
+# landing with no "Plugin authors" section in `docs/migrations/next.md`.
+# ---------------------------------------------------------------------------
+step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no toolchain)"
+./scripts/check-plugin-surface.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"
