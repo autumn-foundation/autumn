@@ -6,12 +6,20 @@
 //! ```text
 //! {prefix}/{profile}/generations/{generation}/snapshot.db.gz   # byte-faithful base
 //! {prefix}/{profile}/generations/{generation}/snapshot.json    # commit marker + digest
-//! {prefix}/{profile}/generations/{generation}/segments/{seq:010}-{ms:013}.seg
+//! {prefix}/{profile}/generations/{generation}/segments/{index:05}-{seq:010}-{ms:013}.seg
 //! ```
 //!
-//! A **generation** is the lifetime of one WAL salt sequence: a base snapshot of
-//! the main database file plus the contiguous WAL byte ranges written on top of
-//! it. Its id is `{created_ms:013}-{salt1:08x}{salt2:08x}`, so a plain
+//! A **generation** is one base snapshot of the main database file plus every
+//! WAL byte range written on top of it. Within a generation, an **index** is the
+//! lifetime of one WAL salt sequence: the replicator's own checkpoint folds the
+//! current index into the database file and opens the next one at WAL offset `0`.
+//!
+//! That two-level shape is what keeps replication cheap on a busy database. A
+//! checkpoint is unavoidable — the `-wal` cannot grow forever — but re-uploading
+//! the whole database every time one fires would mean gigabytes of write
+//! amplification per hour. Instead a checkpoint costs one index bump, and a
+//! fresh base snapshot is taken only on the configured snapshot interval, which
+//! also bounds how much a restore has to replay. Its id is `{created_ms:013}-{salt1:08x}{salt2:08x}`, so a plain
 //! lexicographic listing is also chronological and the salt is recoverable from
 //! the key alone.
 //!
@@ -54,7 +62,6 @@ use std::fmt;
 use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 /// Version of the object layout and payload framing. Bumped only by a
 /// breaking change; restore refuses a version it does not understand.
@@ -66,8 +73,17 @@ pub const SNAPSHOT_OBJECT: &str = "snapshot.db.gz";
 /// Object name of a generation's commit marker / snapshot metadata.
 pub const SNAPSHOT_META_OBJECT: &str = "snapshot.json";
 
+/// Hard ceiling on the uncompressed size of one segment (1 GiB).
+///
+/// A segment is one WAL byte range between commits, so a real one is bounded by
+/// the replicator's checkpoint threshold — orders of magnitude below this. The
+/// ceiling exists so a crafted or corrupted header cannot make a restore (or the
+/// in-process verifier) allocate without bound.
+pub const MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Why a key or payload could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SegmentError {
     /// The payload has no JSON header line.
     MissingHeader,
@@ -102,7 +118,7 @@ impl fmt::Display for SegmentError {
             Self::BadHeader { detail } => write!(f, "segment header did not parse: {detail}"),
             Self::UnsupportedVersion { version } => write!(
                 f,
-                "segment layout version {version} is newer than this build understands \
+                "segment layout version {version} is not the one this build understands \
                  ({LAYOUT_VERSION}) — upgrade autumn before restoring"
             ),
             Self::Decompress { detail } => write!(f, "segment body did not decompress: {detail}"),
@@ -125,7 +141,11 @@ impl std::error::Error for SegmentError {}
 pub struct SegmentHeader {
     /// Layout version ([`LAYOUT_VERSION`]).
     pub version: u32,
-    /// Zero-based position of this segment inside its generation.
+    /// Zero-based WAL index inside the generation. Bumped by the replicator's
+    /// own checkpoint, which restarts the WAL at offset `0` under a new salt.
+    #[serde(default)]
+    pub index: u32,
+    /// Zero-based position of this segment inside its **index**.
     pub seq: u64,
     /// Byte offset into the `-wal` file this range starts at. Segment `0`
     /// starts at `0`, so it carries the 32-byte WAL header.
@@ -182,9 +202,14 @@ pub struct GenerationInfo {
 }
 
 /// A segment key parsed back into its ordering components.
+///
+/// Ordered by `(index, seq)` — replication order — so a plain sort of parsed
+/// keys is already replay order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SegmentRef {
-    /// Position inside the generation.
+    /// WAL index inside the generation.
+    pub index: u32,
+    /// Position inside that index.
     pub seq: u64,
     /// Milliseconds since the Unix epoch when the segment was shipped.
     pub created_ms: i64,
@@ -259,15 +284,15 @@ pub fn segments_prefix(root: &str, generation: &str) -> String {
     format!("{root}/generations/{generation}/segments/")
 }
 
-/// Key of one segment: `{seq:010}-{created_ms:013}.seg`.
+/// Key of one segment: `{index:05}-{seq:010}-{created_ms:013}.seg`.
 ///
-/// Both fields are zero-padded so a lexicographic listing is already in
+/// Every field is zero-padded so a lexicographic listing is already in
 /// replication order, and the shipping time is readable from the key — which is
 /// what lets a point-in-time restore choose segments without downloading them.
 #[must_use]
-pub fn segment_key(root: &str, generation: &str, seq: u64, created_ms: i64) -> String {
+pub fn segment_key(root: &str, generation: &str, index: u32, seq: u64, created_ms: i64) -> String {
     let ms = created_ms.max(0);
-    format!("{root}/generations/{generation}/segments/{seq:010}-{ms:013}.seg")
+    format!("{root}/generations/{generation}/segments/{index:05}-{seq:010}-{ms:013}.seg")
 }
 
 /// Parse the trailing file name of a segment key.
@@ -275,10 +300,17 @@ pub fn segment_key(root: &str, generation: &str, seq: u64, created_ms: i64) -> S
 pub fn parse_segment_key(key: &str) -> Option<SegmentRef> {
     let name = key.rsplit('/').next()?;
     let stem = name.strip_suffix(".seg")?;
-    let (seq, ms) = stem.split_once('-')?;
+    let mut parts = stem.split('-');
+    let index = parts.next()?.parse().ok()?;
+    let seq = parts.next()?.parse().ok()?;
+    let created_ms = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some(SegmentRef {
-        seq: seq.parse().ok()?,
-        created_ms: ms.parse().ok()?,
+        index,
+        seq,
+        created_ms,
     })
 }
 
@@ -295,11 +327,12 @@ pub fn generation_of_key(root: &str, key: &str) -> Option<String> {
 }
 
 /// Lowercase hex SHA-256 of `data`.
+///
+/// Re-exported from [`crate::sigv4`] so the whole crate hashes through one
+/// implementation.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+    crate::sigv4::sha256_hex(data)
 }
 
 /// Frame a WAL byte range into a segment payload: header line, `\n`, gzip body.
@@ -351,14 +384,28 @@ pub fn decode_segment(payload: &[u8]) -> Result<(SegmentHeader, Vec<u8>), Segmen
         serde_json::from_slice(head).map_err(|e| SegmentError::BadHeader {
             detail: e.to_string(),
         })?;
-    if header.version > LAYOUT_VERSION {
+    if header.version != LAYOUT_VERSION {
         return Err(SegmentError::UnsupportedVersion {
             version: header.version,
         });
     }
+    // A segment is one WAL byte range, bounded in practice by the checkpoint
+    // threshold. Refuse a header that claims more than any real segment can hold
+    // BEFORE inflating anything: the periodic verifier runs this inside the app
+    // process, so an unbounded inflate of a crafted object is an OOM of the whole
+    // app, not just a failed restore.
+    if header.uncompressed_len > MAX_SEGMENT_BYTES {
+        return Err(SegmentError::DigestMismatch {
+            expected_len: header.uncompressed_len,
+            actual_len: 0,
+        });
+    }
 
     let mut raw = Vec::new();
-    let mut decoder = flate2::read::GzDecoder::new(body);
+    let decoder = flate2::read::GzDecoder::new(body);
+    // One byte past the declared length: enough to notice the payload is longer
+    // than it claims, never enough to be a decompression bomb.
+    let mut decoder = std::io::Read::take(decoder, header.uncompressed_len.saturating_add(1));
     std::io::copy(&mut decoder, &mut raw).map_err(|e| SegmentError::Decompress {
         detail: e.to_string(),
     })?;
@@ -380,6 +427,7 @@ mod tests {
     fn header(seq: u64, start: u64, end: u64, raw: &[u8]) -> SegmentHeader {
         SegmentHeader {
             version: LAYOUT_VERSION,
+            index: 0,
             seq,
             start_offset: start,
             end_offset: end,
@@ -439,14 +487,28 @@ mod tests {
     fn segment_keys_sort_in_replication_order_and_round_trip() {
         let root = root_prefix(Some("db"), "prod");
         let generation = generation_id(1_000, 2);
-        let a = segment_key(&root, &generation, 9, 1_500);
-        let b = segment_key(&root, &generation, 10, 1_600);
+        let a = segment_key(&root, &generation, 0, 9, 1_500);
+        let b = segment_key(&root, &generation, 0, 10, 1_600);
+        let c = segment_key(&root, &generation, 1, 0, 1_700);
         assert!(a < b, "seq 9 must sort before seq 10 ({a} vs {b})");
+        assert!(
+            b < c,
+            "index 0 must sort before index 1 whatever the seq ({b} vs {c})"
+        );
         assert_eq!(
             parse_segment_key(&b),
             Some(SegmentRef {
+                index: 0,
                 seq: 10,
                 created_ms: 1_600
+            })
+        );
+        assert_eq!(
+            parse_segment_key(&c),
+            Some(SegmentRef {
+                index: 1,
+                seq: 0,
+                created_ms: 1_700
             })
         );
         assert_eq!(

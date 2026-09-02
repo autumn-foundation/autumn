@@ -4852,6 +4852,19 @@ impl AutumnConfig {
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
+        // A `[replication]` block that is switched on but cannot ship (no
+        // destination, both destinations, no credential indirection) must fail
+        // here — so `autumn check` and `autumn doctor` see it too — rather than
+        // only when the app itself boots (#1628).
+        if let Some(replication) = &self.replication {
+            let errors = replication.validation_errors();
+            if !errors.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "invalid [replication] configuration:\n  - {}",
+                    errors.join("\n  - ")
+                )));
+            }
+        }
         // Session backend validation deliberately lives in
         // `crate::session::build_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -6507,109 +6520,6 @@ impl AutumnConfig {
     /// destination honors the same `AUTUMN_*` env convention. When no offsite
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
-    /// Apply `AUTUMN_REPLICATION__*` overrides to the `[replication]` section
-    /// (issue #1628). Mirrors the `[backup.offsite]` convention: a *destination*
-    /// key materializes the section for an all-env deployment, while
-    /// optional-only keys never conjure a section that would then fail
-    /// validation.
-    fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Keys that express a real intent to configure a destination. A lone
-        // region/endpoint/prefix cannot replicate anywhere, so it must not
-        // materialize the section; `ENABLED=true` does, because it needs a
-        // destination to act on and the resulting validation error is the honest
-        // answer.
-        const DEST_KEYS: &[&str] = &[
-            "AUTUMN_REPLICATION__S3__BUCKET",
-            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
-            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
-            "AUTUMN_REPLICATION__PATH",
-        ];
-        // The S3 sub-section is materialized only by an S3 key, so a `path`
-        // deployment never grows an empty, invalid `[replication.s3]`.
-        const S3_KEYS: &[&str] = &[
-            "AUTUMN_REPLICATION__S3__BUCKET",
-            "AUTUMN_REPLICATION__S3__REGION",
-            "AUTUMN_REPLICATION__S3__ENDPOINT",
-            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
-            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
-            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
-        ];
-        let has_dest_key = DEST_KEYS.iter().any(|k| env.var(k).is_ok());
-        let enabled_truthy = env
-            .var("AUTUMN_REPLICATION__ENABLED")
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
-        if self.replication.is_none() && !has_dest_key && !enabled_truthy {
-            return;
-        }
-        let replication = self
-            .replication
-            .get_or_insert_with(|| Box::new(ReplicationConfig::default()));
-
-        parse_env_bool(env, "AUTUMN_REPLICATION__ENABLED", &mut replication.enabled);
-        parse_env(
-            env,
-            "AUTUMN_REPLICATION__RPO_SECS",
-            &mut replication.rpo_secs,
-        );
-        parse_env_option(
-            env,
-            "AUTUMN_REPLICATION__SYNC_INTERVAL_SECS",
-            &mut replication.sync_interval_secs,
-        );
-        parse_env(
-            env,
-            "AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS",
-            &mut replication.snapshot_interval_secs,
-        );
-        parse_env(
-            env,
-            "AUTUMN_REPLICATION__MAX_WAL_BYTES",
-            &mut replication.max_wal_bytes,
-        );
-        parse_env(
-            env,
-            "AUTUMN_REPLICATION__RETENTION_HOURS",
-            &mut replication.retention_hours,
-        );
-        parse_env(
-            env,
-            "AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS",
-            &mut replication.verify_interval_secs,
-        );
-        parse_env_option_string(env, "AUTUMN_REPLICATION__PREFIX", &mut replication.prefix);
-        parse_env_option_string(env, "AUTUMN_REPLICATION__PATH", &mut replication.path);
-        parse_env_bool(
-            env,
-            "AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET",
-            &mut replication.allow_shared_bucket,
-        );
-
-        if replication.s3.is_none() && !S3_KEYS.iter().any(|k| env.var(k).is_ok()) {
-            return;
-        }
-        let s3 = replication
-            .s3
-            .get_or_insert_with(ReplicationS3Config::default);
-        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__BUCKET", &mut s3.bucket);
-        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__REGION", &mut s3.region);
-        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__ENDPOINT", &mut s3.endpoint);
-        parse_env_option_string(
-            env,
-            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
-            &mut s3.access_key_id_env,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
-            &mut s3.secret_access_key_env,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
-            &mut s3.force_path_style,
-        );
-    }
-
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Keys that signal a genuine intent to CONFIGURE an offsite destination —
         // presence of any REQUIRED destination/credential key materializes the
@@ -6684,6 +6594,111 @@ impl AutumnConfig {
             env,
             "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
             &mut offsite.allow_shared_bucket,
+        );
+    }
+
+    /// Apply `AUTUMN_REPLICATION__*` overrides to the `[replication]` section
+    /// (issue #1628). Mirrors the `[backup.offsite]` convention: a *destination*
+    /// key materializes the section for an all-env deployment, while
+    /// optional-only keys never conjure a section that would then fail
+    /// validation.
+    fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Keys that express a real intent to configure a destination. A lone
+        // region/endpoint/prefix cannot replicate anywhere, so it must not
+        // materialize the section; `ENABLED=true` does, because it needs a
+        // destination to act on and the resulting validation error is the honest
+        // answer.
+        const DEST_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_REPLICATION__PATH",
+        ];
+        // Only a REQUIRED S3 key materializes the sub-section, exactly as
+        // `OFFSITE_DEST_KEYS` does for `[backup.offsite]`. A stray
+        // `AUTUMN_REPLICATION__S3__REGION` next to a `path` destination must not
+        // conjure an empty `[replication.s3]` — that would make the section
+        // "configures both s3 and path" and fail boot on an otherwise valid
+        // config. The optional keys are still APPLIED once a required one has
+        // materialized the sub-section.
+        const S3_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+        ];
+        let has_dest_key = DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let enabled_truthy = env
+            .var("AUTUMN_REPLICATION__ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.replication.is_none() && !has_dest_key && !enabled_truthy {
+            return;
+        }
+        let replication = self
+            .replication
+            .get_or_insert_with(|| Box::new(ReplicationConfig::default()));
+
+        parse_env_bool(env, "AUTUMN_REPLICATION__ENABLED", &mut replication.enabled);
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RPO_SECS",
+            &mut replication.rpo_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REPLICATION__SYNC_INTERVAL_SECS",
+            &mut replication.sync_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS",
+            &mut replication.snapshot_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__MAX_WAL_BYTES",
+            &mut replication.max_wal_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RETENTION_HOURS",
+            &mut replication.retention_hours,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS",
+            &mut replication.verify_interval_secs,
+        );
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PREFIX", &mut replication.prefix);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PATH", &mut replication.path);
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET",
+            &mut replication.allow_shared_bucket,
+        );
+
+        if replication.s3.is_none() && !S3_KEYS.iter().any(|k| env.var(k).is_ok()) {
+            return;
+        }
+        let s3 = replication
+            .s3
+            .get_or_insert_with(ReplicationS3Config::default);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__BUCKET", &mut s3.bucket);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__REGION", &mut s3.region);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__ENDPOINT", &mut s3.endpoint);
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            &mut s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            &mut s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
+            &mut s3.force_path_style,
         );
     }
 

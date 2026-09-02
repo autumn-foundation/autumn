@@ -3846,11 +3846,19 @@ impl AppBuilder {
             // inert and must not trip the distinct-destination guard (the same
             // rule #1619's offsite upload applies).
             #[cfg(feature = "storage")]
-            let storage_bucket = (config.storage.backend == crate::storage::StorageBackend::S3)
-                .then(|| config.storage.s3.bucket.clone())
+            let storage_destination = (config.storage.backend
+                == crate::storage::StorageBackend::S3)
+                .then(|| {
+                    config
+                        .storage
+                        .s3
+                        .bucket
+                        .clone()
+                        .map(|bucket| (bucket, config.storage.s3.endpoint.clone()))
+                })
                 .flatten();
             #[cfg(not(feature = "storage"))]
-            let storage_bucket: Option<String> = None;
+            let storage_destination: Option<(String, Option<String>)> = None;
             // The injected clock, not the wall clock: the replication health
             // indicator measures its startup grace from here, and a test that
             // freezes time must be able to move it (#1797).
@@ -3861,7 +3869,12 @@ impl AppBuilder {
                     &replication_config,
                     &database_url,
                     &profile,
-                    storage_bucket.as_deref(),
+                    storage_destination.as_ref().map(|(bucket, endpoint)| {
+                        crate::replication::StorageDestination {
+                            bucket,
+                            endpoint: endpoint.as_deref(),
+                        }
+                    }),
                     started_at,
                 )
             })
@@ -3887,6 +3900,8 @@ impl AppBuilder {
                     replication_worker = Some(runtime.replicator);
                 }
                 Ok(Err(crate::replication::SetupError::Disabled)) => {}
+                // A misconfigured durability story must not boot silently
+                // half-working.
                 // A misconfigured durability story must not boot silently
                 // half-working: the operator asked for replication and is not
                 // getting it, which is exactly the situation this feature exists
@@ -4624,7 +4639,14 @@ impl AppBuilder {
                 .name("autumn-sqlite-replication".to_owned())
                 .spawn(move || replicator.run(&replication_shutdown))
             {
+                // Serving on without the replicator is the worst of both worlds:
+                // the pool has already disabled auto-checkpointing for it, so the
+                // -wal would grow until the disk filled, and the operator would
+                // believe they were replicating. Fail loudly instead.
                 tracing::error!("Could not start the SQLite replication thread: {e}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
             }
         }
 
@@ -9470,11 +9492,11 @@ async fn setup_database(
 ) -> Result<DatabaseBootstrap, String> {
     // #1628: declare replication BEFORE any pool exists, so every pooled SQLite
     // connection is created with `wal_autocheckpoint = 0` and the replicator is
-    // the only component that ever checkpoints. Set unconditionally (including
-    // to `false`) so a restart that turns replication off restores the default.
-    crate::db::set_sqlite_replication_active(
-        config.replication.as_ref().is_some_and(|r| r.enabled),
-    );
+    // the only component that ever checkpoints. The flag latches on and is never
+    // cleared — see `set_sqlite_replication_active`.
+    if config.replication.as_ref().is_some_and(|r| r.enabled) {
+        crate::db::set_sqlite_replication_active();
+    }
     let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),

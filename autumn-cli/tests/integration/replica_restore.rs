@@ -73,8 +73,13 @@ fn run_autumn_ok(dir: &Path, args: &[&str]) -> (String, String) {
     (stdout, stderr)
 }
 
+/// A fixture instant, deliberately in the **past** (2023-11-14 + `secs`).
+///
+/// Anything that compares a replication timestamp against `Utc::now()` — lag,
+/// retention — must see these as history, so the suite's meaning cannot change
+/// on a calendar date.
 fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000 + secs, 0)
+    Utc.timestamp_opt(1_700_000_000 + secs, 0)
         .single()
         .expect("timestamp")
 }
@@ -161,16 +166,17 @@ fn a_fresh_box_restores_the_latest_state_with_one_command() {
     // Nothing here but the config file.
     assert!(!database.exists());
 
-    let (stdout, _) = run_autumn_ok(&machine_b, &["db", "replica", "status"]);
-    assert!(stdout.contains("generation"), "status output: {stdout}");
-    assert!(
-        stdout.contains("segments        2"),
-        "status output: {stdout}"
-    );
-    assert!(
-        stdout.contains("replication lag"),
-        "status output: {stdout}"
-    );
+    // `--json` rather than the padded table: this is the monitoring surface, and
+    // an assertion on column alignment would be a false failure waiting to happen.
+    let (stdout, _) = run_autumn_ok(&machine_b, &["db", "replica", "status", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("status JSON: {e}\n{stdout}"));
+    // One segment: the tick that opens a generation checkpoints first, so the
+    // first batch rides in the base snapshot rather than in a WAL segment.
+    assert_eq!(report["segments"], 1, "{report}");
+    assert!(report["generation"].is_string(), "{report}");
+    assert!(report["replication_lag_seconds"].is_number(), "{report}");
+    assert_eq!(report["rpo_seconds"], 10, "{report}");
 
     let (_, stderr) = run_autumn_ok(&machine_b, &["db", "replica", "restore"]);
     assert!(
@@ -215,10 +221,20 @@ fn overwriting_an_existing_database_needs_force() {
     let (_, stderr, code) = run_autumn(&machine_b, &["db", "replica", "restore"]);
     assert_ne!(code, Some(0), "a second restore must refuse: {stderr}");
     assert!(stderr.contains("already exists"), "{stderr}");
-    assert!(stderr.contains("--force"), "{stderr}");
+    assert!(stderr.contains("--overwrite"), "{stderr}");
 
-    // With --force it goes through, and the data is the same.
-    run_autumn_ok(&machine_b, &["db", "replica", "restore", "--force"]);
+    // `--force` alone is about the PROFILE, not about data: a recovery drill
+    // that always passes it must not silently destroy a live database.
+    let (_, stderr, code) = run_autumn(&machine_b, &["db", "replica", "restore", "--force"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "--force must not imply --overwrite: {stderr}"
+    );
+    assert!(stderr.contains("already exists"), "{stderr}");
+
+    // With --overwrite it goes through, and the data is the same.
+    run_autumn_ok(&machine_b, &["db", "replica", "restore", "--overwrite"]);
     assert_eq!(read_values(&database), ["before-1", "before-2", "after-1"]);
 }
 

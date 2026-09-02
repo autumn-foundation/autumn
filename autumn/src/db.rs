@@ -1278,22 +1278,62 @@ impl DatabaseTopology {
 static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Declare whether continuous replication is active, before any pool is built.
+/// The per-connection pragma batch a pooled `SQLite` connection is set up with.
 ///
-/// When set, every pooled `SQLite` connection is created with
-/// `PRAGMA wal_autocheckpoint = 0`, so `SQLite` never restarts the write-ahead log
-/// on its own. That matters twice over: an auto-checkpoint rewrites the **main
-/// database file**, which would tear a base snapshot the replicator is copying,
-/// and it restarts the WAL, which would force an expensive fresh generation on
-/// every 1000 pages. The replicator checkpoints deliberately instead, and only
-/// once everything in the WAL is already offsite.
-pub fn set_sqlite_replication_active(active: bool) {
-    SQLITE_REPLICATION_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+/// Pure over its two inputs so the decision is unit-testable without a pool, a
+/// database, or the process-global replication latch.
+///
+/// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
+///   WAL` and `synchronous` both write, and would fail connection setup with
+///   "attempt to write a readonly database", taking the whole pool 503.
+/// * When **replication is active** (#1628), `wal_autocheckpoint = 0` is added so
+///   the replicator is the only component that ever checkpoints. An
+///   auto-checkpoint rewrites the main database file, which would tear a base
+///   snapshot mid-copy, and restarts the WAL under a new salt, which would force
+///   an expensive fresh generation every 1000 pages.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+    if read_only {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA foreign_keys = ON;"
+    } else if replicating {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA wal_autocheckpoint = 0; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA foreign_keys = ON;"
+    } else {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA foreign_keys = ON;"
+    }
 }
 
-/// Whether [`set_sqlite_replication_active`] declared replication active.
-#[must_use]
-pub fn sqlite_replication_active() -> bool {
+/// Declare that continuous replication is active in this process.
+///
+/// Once set, every `SQLite` connection this process's pools create is given
+/// `PRAGMA wal_autocheckpoint = 0`, so `SQLite` never restarts the write-ahead
+/// log on its own. That matters twice over: an auto-checkpoint rewrites the
+/// **main database file**, which would tear a base snapshot the replicator is
+/// copying, and it restarts the WAL, which would force an expensive fresh
+/// generation every 1000 pages. The replicator checkpoints deliberately
+/// instead, and only once everything in the WAL is already offsite.
+///
+/// **Latch-only, and read per connection.** It can be turned on but never off,
+/// because the pragma is installed by a `custom_setup` callback that runs each
+/// time deadpool *creates* a connection — lazily, and again after a recycle —
+/// for the whole life of the process. A second app booted in the same process
+/// (the workspace's own consolidated test binary is exactly that) must not be
+/// able to clear the flag out from under a replicating app's pool and let its
+/// connections auto-checkpoint behind the replicator's back.
+pub(crate) fn set_sqlite_replication_active() {
+    SQLITE_REPLICATION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_sqlite_replication_active`] has been called in this process.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+pub(crate) fn sqlite_replication_active() -> bool {
     SQLITE_REPLICATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1539,28 +1579,10 @@ fn build_sqlite_pool(
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
-            let pragmas = if sqlite_target_is_read_only(&url) {
-                // Non-writing pragmas only — WAL + synchronous would write and
-                // fail on a read-only database.
-                "PRAGMA busy_timeout = 5000; \
-                 PRAGMA foreign_keys = ON;"
-            } else if sqlite_replication_active() {
-                // Continuous replication (#1628) makes the replicator the ONLY
-                // component allowed to checkpoint: an auto-checkpoint rewrites
-                // the main database file (tearing a base snapshot mid-copy) and
-                // restarts the WAL under a new salt. See
-                // `set_sqlite_replication_active`.
-                "PRAGMA busy_timeout = 5000; \
-                 PRAGMA journal_mode = WAL; \
-                 PRAGMA wal_autocheckpoint = 0; \
-                 PRAGMA synchronous = NORMAL; \
-                 PRAGMA foreign_keys = ON;"
-            } else {
-                "PRAGMA busy_timeout = 5000; \
-                 PRAGMA journal_mode = WAL; \
-                 PRAGMA synchronous = NORMAL; \
-                 PRAGMA foreign_keys = ON;"
-            };
+            let pragmas = sqlite_connection_pragmas(
+                sqlite_target_is_read_only(&url),
+                sqlite_replication_active(),
+            );
             conn.batch_execute(pragmas)
                 .await
                 .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
@@ -3453,6 +3475,30 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
+        // Continuous replication (#1628) needs the replicator to be the only
+        // component that ever checkpoints.
+        let plain = super::sqlite_connection_pragmas(false, false);
+        let replicating = super::sqlite_connection_pragmas(false, true);
+        assert!(!plain.contains("wal_autocheckpoint"));
+        assert!(replicating.contains("PRAGMA wal_autocheckpoint = 0"));
+        for pragmas in [plain, replicating] {
+            assert!(pragmas.contains("journal_mode = WAL"));
+            assert!(pragmas.contains("foreign_keys = ON"));
+            assert!(pragmas.contains("busy_timeout = 5000"));
+        }
+
+        // A read-only target still gets no writing pragmas — including under
+        // replication, which cannot apply to a database nothing writes to.
+        for replicating in [false, true] {
+            let read_only = super::sqlite_connection_pragmas(true, replicating);
+            assert!(!read_only.contains("journal_mode"));
+            assert!(!read_only.contains("wal_autocheckpoint"));
+            assert!(read_only.contains("foreign_keys = ON"));
+        }
+    }
+
     use super::*;
     use crate::config::DatabaseConfig;
     use std::sync::Arc;

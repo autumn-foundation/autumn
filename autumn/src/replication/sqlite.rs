@@ -32,7 +32,7 @@ use std::path::Path;
 
 use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
-use diesel::sql_types::Text;
+use diesel::sql_types::{Integer, Text};
 
 use super::wal;
 
@@ -45,6 +45,7 @@ const BUSY_TIMEOUT_MS: u32 = 1_000;
 
 /// A `SQLite` operation the replicator performs failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SqliteError {
     /// The database file could not be opened.
     Open {
@@ -90,6 +91,20 @@ struct IntegrityRow {
     integrity_check: String,
 }
 
+/// Row shape for `PRAGMA wal_checkpoint(...)`: `busy`, `log`, `checkpointed`.
+#[derive(QueryableByName)]
+struct CheckpointRow {
+    #[diesel(sql_type = Integer)]
+    busy: i32,
+}
+
+/// Row shape for `PRAGMA data_version`.
+#[derive(QueryableByName)]
+struct DataVersionRow {
+    #[diesel(sql_type = Integer)]
+    data_version: i32,
+}
+
 /// Open a private connection to `path` with a short busy timeout and
 /// auto-checkpointing disabled.
 ///
@@ -130,12 +145,15 @@ pub enum CheckpointOutcome {
     },
 }
 
-/// Run `PRAGMA wal_checkpoint(TRUNCATE)` and report whether the WAL is actually
-/// empty afterwards.
+/// Run `PRAGMA wal_checkpoint(TRUNCATE)` and report what it achieved.
 ///
 /// `SQLite` reports a blocked checkpoint as a *result row* rather than an error,
-/// so success is confirmed by the one signal that cannot lie: the size of the
-/// `-wal` file.
+/// so the pragma's own `busy` column is the authority — not the size of the
+/// `-wal` file afterwards. That distinction matters: on a busy database an app
+/// writer routinely starts the *next* WAL microseconds after a successful
+/// checkpoint, so a file-size check reports a perfectly good checkpoint as
+/// blocked, and the replicator would then re-upload a whole base snapshot it
+/// did not need.
 ///
 /// # Errors
 ///
@@ -144,17 +162,44 @@ pub fn checkpoint_truncate(
     conn: &mut SqliteConnection,
     db_path: &Path,
 ) -> Result<CheckpointOutcome, SqliteError> {
-    conn.batch_execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    let rows: Vec<CheckpointRow> = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .load(conn)
         .map_err(|e| SqliteError::Query {
             op: "wal_checkpoint(TRUNCATE)",
             detail: e.to_string(),
         })?;
-    let wal_bytes = std::fs::metadata(wal::wal_path(db_path)).map_or(0, |m| m.len());
-    if wal_bytes == 0 {
-        Ok(CheckpointOutcome::Truncated)
-    } else {
-        Ok(CheckpointOutcome::Busy { wal_bytes })
+    let blocked = rows.first().is_none_or(|row| row.busy != 0);
+    if blocked {
+        let wal_bytes = std::fs::metadata(wal::wal_path(db_path)).map_or(0, |m| m.len());
+        return Ok(CheckpointOutcome::Busy { wal_bytes });
     }
+    Ok(CheckpointOutcome::Truncated)
+}
+
+/// Read `PRAGMA data_version`, which changes whenever **another connection**
+/// commits (and never for this connection's own writes).
+///
+/// The replicator brackets its checkpoint with two reads of this counter: if it
+/// did not move, no other connection committed while the checkpoint was taken,
+/// which is exactly the proof that the checkpoint folded away nothing the
+/// replicator had not already shipped.
+///
+/// # Errors
+///
+/// Returns [`SqliteError::Query`] when the pragma fails.
+pub fn data_version(conn: &mut SqliteConnection) -> Result<i32, SqliteError> {
+    let rows: Vec<DataVersionRow> = diesel::sql_query("PRAGMA data_version")
+        .load(conn)
+        .map_err(|e| SqliteError::Query {
+            op: "data_version",
+            detail: e.to_string(),
+        })?;
+    rows.first()
+        .map(|row| row.data_version)
+        .ok_or_else(|| SqliteError::Query {
+            op: "data_version",
+            detail: "the pragma returned no rows".to_owned(),
+        })
 }
 
 /// Run `PRAGMA integrity_check` and fail unless `SQLite` answers exactly `ok`.

@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 /// status, a provider error code and a key — never a URL with credentials in it,
 /// never a header, never a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DestinationError {
     /// The object does not exist.
     NotFound {
@@ -173,7 +174,11 @@ pub fn validate_key(key: &str) -> Result<(), DestinationError> {
     if key.starts_with('/') {
         return Err(reject(format!("object key {key:?} must be relative")));
     }
-    if key.contains('\\') || key.contains('\0') {
+    // `\` and `:` are refused because a destination may be a directory: on
+    // Windows both are path syntax, and `PathBuf::push` of a segment carrying a
+    // drive prefix REPLACES the path rather than appending to it. Autumn never
+    // generates a key containing either.
+    if key.contains('\\') || key.contains('\0') || key.contains(':') {
         return Err(reject(format!(
             "object key {key:?} contains an illegal character"
         )));
@@ -187,6 +192,10 @@ pub fn validate_key(key: &str) -> Result<(), DestinationError> {
     }
     Ok(())
 }
+
+/// How deep the filesystem destination will walk when listing. Autumn's own
+/// layout is four levels; anything deeper is either a mistake or a planted tree.
+const MAX_LIST_DEPTH: usize = 16;
 
 /// A destination backed by a local directory.
 ///
@@ -236,23 +245,53 @@ impl FileDestination {
             std::fs::create_dir_all(parent)
                 .map_err(DestinationError::io("create key directory"))?;
         }
+        // Unpredictable, and created with O_EXCL. A destination directory can be
+        // shared (the module docs endorse an NFS or bind mount), and a staging
+        // name an attacker can predict is a staging name they can pre-create as a
+        // symlink — `File::create` would then write the object's bytes through it
+        // with this process's privileges.
         let mut staging = path.clone();
         let mut name = staging.file_name().unwrap_or_default().to_os_string();
-        name.push(format!(".tmp-{}", std::process::id()));
+        name.push(format!(".tmp-{:016x}", rand::random::<u64>()));
         staging.set_file_name(name);
 
         {
-            let mut file =
-                std::fs::File::create(&staging).map_err(DestinationError::io("create object"))?;
+            let mut file = std::fs::File::create_new(&staging)
+                .map_err(DestinationError::io("create object"))?;
             write_body(&mut file)?;
             file.sync_all()
                 .map_err(DestinationError::io("fsync object"))?;
         }
-        std::fs::rename(&staging, &path).map_err(DestinationError::io("publish object"))
+        std::fs::rename(&staging, &path).map_err(DestinationError::io("publish object"))?;
+        // Durability of the rename itself, which matters on the removable /
+        // network destinations this is meant for.
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     /// Walk `dir`, pushing every file's key (relative to the root) into `out`.
-    fn collect(&self, dir: &Path, out: &mut Vec<String>) -> Result<(), DestinationError> {
+    ///
+    /// Symlinks are skipped rather than listed: a symlink planted in a shared
+    /// destination would otherwise become an "object" whose `get` reads whatever
+    /// it points at. Recursion is depth-bounded for the same reason — a deep tree
+    /// planted there must not overflow the stack.
+    fn collect(
+        &self,
+        dir: &Path,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) -> Result<(), DestinationError> {
+        if depth > MAX_LIST_DEPTH {
+            return Err(DestinationError::Rejected {
+                detail: format!(
+                    "the destination directory nests deeper than {MAX_LIST_DEPTH} levels"
+                ),
+            });
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -264,8 +303,11 @@ impl FileDestination {
             let file_type = entry
                 .file_type()
                 .map_err(DestinationError::io("list objects"))?;
+            if file_type.is_symlink() {
+                continue;
+            }
             if file_type.is_dir() {
-                self.collect(&path, out)?;
+                self.collect(&path, depth.saturating_add(1), out)?;
             } else if let Ok(rel) = path.strip_prefix(&self.root) {
                 let key = rel
                     .components()
@@ -348,7 +390,7 @@ impl ReplicaDestination for FileDestination {
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
         let mut keys = Vec::new();
-        self.collect(&self.root.clone(), &mut keys)?;
+        self.collect(&self.root.clone(), 0, &mut keys)?;
         keys.retain(|k| k.starts_with(prefix));
         keys.sort();
         Ok(keys)
@@ -374,7 +416,9 @@ mod tests {
     #[test]
     fn validate_key_refuses_escapes() {
         assert!(validate_key("a/b/c.seg").is_ok());
-        for bad in ["", "/abs", "a//b", "a/./b", "a/../b", "..", "a\\b", "a\0b"] {
+        for bad in [
+            "", "/abs", "a//b", "a/./b", "a/../b", "..", "a\\b", "a\0b", "C:/x",
+        ] {
             assert!(validate_key(bad).is_err(), "key {bad:?} must be refused");
         }
     }

@@ -2108,8 +2108,8 @@ enum DbCommands {
     ///   # Fresh box, latest replicated state:
     ///   autumn db replica restore --profile prod
     ///
-    ///   # Point-in-time, just before the bad migration:
-    ///   autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force
+    ///   # Point-in-time, over the existing database:
+    ///   autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
     ///
     ///   # How fresh is the replica right now?
     ///   autumn db replica status
@@ -2147,18 +2147,29 @@ enum ReplicaCommands {
         #[arg(long, value_name = "RFC3339")]
         timestamp: Option<String>,
         /// Write the database here instead of the configured database.url.
+        ///
+        /// A restore to an explicit path writes nothing the app uses, so it is
+        /// not subject to the production guard (the overwrite guard still applies).
         #[arg(long, value_name = "PATH")]
         output: Option<std::path::PathBuf>,
-        /// Allow a restore against a non-dev/test profile, and allow
-        /// overwriting an existing database file.
+        /// Allow the restore against a non-dev/test (e.g. production) profile.
         #[arg(long)]
         force: bool,
+        /// Allow replacing a database file that already exists.
+        ///
+        /// Separate from `--force`, which is about the profile: a drill that
+        /// always passes `--force` must not silently also destroy a database.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Report the replica's current generation, segment count and lag.
     Status {
         /// Resolve the destination under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
+        /// Print the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Prove the replica restorable by restoring it into a scratch directory.
     Verify {
@@ -2177,13 +2188,15 @@ impl ReplicaCommands {
                 timestamp,
                 output,
                 force,
+                overwrite,
             } => db::replica::ReplicaCommand::Restore {
                 profile,
                 timestamp,
                 output,
                 force,
+                overwrite,
             },
-            Self::Status { profile } => db::replica::ReplicaCommand::Status { profile },
+            Self::Status { profile, json } => db::replica::ReplicaCommand::Status { profile, json },
             Self::Verify { profile } => db::replica::ReplicaCommand::Verify { profile },
         }
     }

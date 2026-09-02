@@ -21,9 +21,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_web::actuator::{HealthIndicatorRegistry, HealthStatus, IndicatorGroup};
 use autumn_web::replication::destination::{DestinationError, ReplicaDestination};
 use autumn_web::replication::{
-    FileDestination, ReplicationSettings, ReplicationStatus, Replicator, restore, segment,
+    FileDestination, HealthThresholds, ReplicationHealthIndicator, ReplicationSettings,
+    ReplicationStatus, Replicator, TickReport, restore, segment,
 };
 use chrono::{DateTime, TimeZone as _, Utc};
 use diesel::connection::SimpleConnection as _;
@@ -79,8 +81,13 @@ fn values(rows: &[Row]) -> Vec<String> {
     rows.iter().map(|r| r.v.clone()).collect()
 }
 
+/// A fixture instant, deliberately in the **past** (2023-11-14 + `secs`).
+///
+/// Anything that compares a replication timestamp against `Utc::now()` — lag,
+/// retention — must see these as history, so the suite's meaning cannot change
+/// on a calendar date.
 fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000 + secs, 0)
+    Utc.timestamp_opt(1_700_000_000 + secs, 0)
         .single()
         .expect("timestamp")
 }
@@ -176,11 +183,7 @@ impl Harness {
 fn ships_a_generation_and_restores_the_latest_state_on_a_fresh_path() {
     let mut h = Harness::new();
     insert(&mut h.conn, &["alpha", "beta"]);
-
-    let first = h.replicator.tick(at(0)).expect("first tick");
-    assert!(first.snapshot_taken, "the first tick opens a generation");
-    assert_eq!(first.segments, 1, "committed frames must ship immediately");
-    assert!(first.bytes > 0);
+    prime(&mut h, 0);
 
     insert(&mut h.conn, &["gamma"]);
     let second = h.replicator.tick(at(5)).expect("second tick");
@@ -188,7 +191,8 @@ fn ships_a_generation_and_restores_the_latest_state_on_a_fresh_path() {
         !second.snapshot_taken,
         "no new snapshot without a checkpoint"
     );
-    assert_eq!(second.segments, 1);
+    assert_eq!(second.segments, 1, "committed frames must ship immediately");
+    assert!(second.bytes > 0);
     assert_eq!(second.pending_bytes, 0, "everything committed is offsite");
 
     h.destroy_database();
@@ -270,9 +274,11 @@ fn a_point_in_time_before_the_window_is_refused_rather_than_rounded() {
 fn a_restore_plan_reports_the_instant_it_actually_lands_on() {
     let mut h = Harness::new();
     insert(&mut h.conn, &["a"]);
-    h.replicator.tick(at(100)).expect("tick");
+    prime(&mut h, 100);
     insert(&mut h.conn, &["b"]);
     h.replicator.tick(at(200)).expect("tick");
+    insert(&mut h.conn, &["c"]);
+    h.replicator.tick(at(300)).expect("tick");
 
     let plan = restore::plan(h.destination().as_ref(), &h.root, Some(at(250))).expect("plan");
     assert_eq!(plan.requested, Some(at(250)));
@@ -281,7 +287,7 @@ fn a_restore_plan_reports_the_instant_it_actually_lands_on() {
         at(200),
         "the restore lands on the last segment at or before the target"
     );
-    assert_eq!(plan.segments.len(), 2);
+    assert_eq!(plan.segments.len(), 1, "the later segment is excluded");
 }
 
 // ─── AC: refuses a replica that fails verification ───────────────────────────
@@ -289,6 +295,7 @@ fn a_restore_plan_reports_the_instant_it_actually_lands_on() {
 #[test]
 fn a_missing_segment_is_refused_instead_of_silently_truncating() {
     let mut h = Harness::new();
+    prime(&mut h, 0);
     insert(&mut h.conn, &["one"]);
     h.replicator.tick(at(10)).expect("tick");
     insert(&mut h.conn, &["two"]);
@@ -304,7 +311,7 @@ fn a_missing_segment_is_refused_instead_of_silently_truncating() {
         .expect("list");
     let middle = keys
         .iter()
-        .find(|k| k.contains("/segments/0000000001-"))
+        .find(|k| k.contains("/segments/00000-0000000001-"))
         .expect("segment 1 exists")
         .clone();
     destination.delete(&middle).expect("delete");
@@ -312,13 +319,14 @@ fn a_missing_segment_is_refused_instead_of_silently_truncating() {
     let err = restore::plan(destination.as_ref(), &h.root, None)
         .expect_err("a hole in the segment sequence must be refused");
     let rendered = format!("{err}");
-    assert!(rendered.contains("missing segment 1"), "{rendered}");
+    assert!(rendered.contains("missing segment 0/1"), "{rendered}");
     assert!(rendered.contains("hole in it"), "{rendered}");
 }
 
 #[test]
 fn a_tampered_segment_is_refused_by_its_digest() {
     let mut h = Harness::new();
+    prime(&mut h, 0);
     insert(&mut h.conn, &["one"]);
     h.replicator.tick(at(10)).expect("tick");
 
@@ -462,43 +470,148 @@ fn a_dead_destination_stalls_the_checkpoint_rather_than_dropping_data() {
     assert_eq!(values(&read_rows(&restored)), ["seed", "lost-if-broken"]);
 }
 
-#[test]
-fn a_checkpoint_rotates_the_generation_and_a_restore_spans_the_rotation() {
-    let mut h = Harness::new();
-    // A tiny WAL budget makes the checkpoint fire on the very next tick.
-    let mut tight = settings(&h.db);
-    tight.max_wal_bytes = 1;
-    h.replicator = Replicator::new(tight, h.destination(), Arc::clone(&h.status));
-
-    insert(&mut h.conn, &["gen-one"]);
-    let first = h.replicator.tick(at(0)).expect("tick");
-    assert!(
-        first.checkpointed,
-        "an over-budget WAL must be checkpointed"
+/// Run the tick that opens the first generation.
+///
+/// That tick checkpoints *before* it snapshots, so the base snapshot is never
+/// behind the WAL — which also means it ships no segment: everything written so
+/// far is already inside the database file it just copied.
+fn prime(h: &mut Harness, secs: i64) {
+    let report = h.replicator.tick(at(secs)).expect("priming tick");
+    assert!(report.snapshot_taken, "the first tick opens a generation");
+    assert_eq!(
+        report.segments, 0,
+        "a generation opens from a freshly checkpointed WAL, so it has nothing to ship"
     );
+}
 
-    insert(&mut h.conn, &["gen-two"]);
-    let second = h.replicator.tick(at(10)).expect("tick");
-    assert!(
-        second.snapshot_taken,
-        "a checkpointed WAL starts a fresh generation"
-    );
+/// Tick until the replicator actually checkpoints.
+///
+/// A checkpoint can be reported `Busy` for reasons outside this test's control
+/// (another connection momentarily holding a lock), and production treats that
+/// as normal and retries — so the test retries too rather than asserting a
+/// checkpoint on the first attempt.
+fn tick_until_checkpointed(h: &mut Harness, base: i64) -> TickReport {
+    for attempt in 0..20 {
+        let report = h
+            .replicator
+            .tick(at(base + attempt))
+            .unwrap_or_else(|e| panic!("tick failed: {e}"));
+        if report.checkpointed {
+            return report;
+        }
+    }
+    panic!("the replicator never checkpointed an over-budget WAL");
+}
 
-    let generations: std::collections::BTreeSet<String> = h
-        .destination()
+fn generations_on(h: &Harness) -> std::collections::BTreeSet<String> {
+    h.destination()
         .list(&format!("{}/generations/", h.root))
         .expect("list")
         .iter()
         .filter_map(|k| segment::generation_of_key(&h.root, k))
+        .collect()
+}
+
+#[test]
+fn a_checkpoint_opens_the_next_wal_index_without_re_uploading_the_database() {
+    let mut h = Harness::new();
+    // A tiny WAL budget makes the checkpoint fire on the very next tick, while
+    // the (default, one-hour) snapshot interval keeps the generation young.
+    let mut tight = settings(&h.db);
+    tight.max_wal_bytes = 1;
+    h.replicator = Replicator::new(tight, h.destination(), Arc::clone(&h.status));
+
+    prime(&mut h, 0);
+    insert(&mut h.conn, &["index-zero"]);
+    let first = tick_until_checkpointed(&mut h, 1);
+    assert!(
+        first.index_rotated,
+        "a young generation must survive a checkpoint"
+    );
+
+    insert(&mut h.conn, &["index-one"]);
+    let second = h.replicator.tick(at(30)).expect("tick");
+    assert!(
+        !second.snapshot_taken,
+        "re-uploading the whole database on every checkpoint is the write \
+         amplification this split exists to avoid"
+    );
+    assert_eq!(second.segments, 1);
+
+    assert_eq!(
+        generations_on(&h).len(),
+        1,
+        "a checkpoint must not open a new generation while the old one is young"
+    );
+    let indexes: std::collections::BTreeSet<u32> = h
+        .destination()
+        .list(&format!("{}/generations/", h.root))
+        .expect("list")
+        .iter()
+        .filter_map(|k| segment::parse_segment_key(k).map(|r| r.index))
         .collect();
     assert!(
-        generations.len() >= 2,
-        "expected at least two generations, got {generations:?}"
+        indexes.len() >= 2,
+        "expected segments in at least two WAL indexes, got {indexes:?}"
     );
 
     h.destroy_database();
     let restored = h.restore_to(None);
+    assert_eq!(values(&read_rows(&restored)), ["index-zero", "index-one"]);
+}
+
+#[test]
+fn an_expired_generation_takes_a_fresh_base_snapshot_at_the_next_checkpoint() {
+    let mut h = Harness::new();
+    let mut tight = settings(&h.db);
+    tight.max_wal_bytes = 1;
+    tight.snapshot_interval = Duration::from_secs(1);
+    h.replicator = Replicator::new(tight, h.destination(), Arc::clone(&h.status));
+
+    prime(&mut h, 0);
+    insert(&mut h.conn, &["gen-one"]);
+    let checkpoint = tick_until_checkpointed(&mut h, 1);
+    assert!(
+        !checkpoint.index_rotated,
+        "a generation past the snapshot interval must be replaced, not extended"
+    );
+
+    // The replacement base snapshot is taken on the next tick, from the database
+    // file the checkpoint just completed.
+    insert(&mut h.conn, &["gen-two"]);
+    let next = h.replicator.tick(at(3_600)).expect("tick");
+    assert!(next.snapshot_taken, "a fresh base snapshot must follow");
+    assert!(generations_on(&h).len() >= 2);
+
+    h.destroy_database();
+    let restored = h.restore_to(None);
     assert_eq!(values(&read_rows(&restored)), ["gen-one", "gen-two"]);
+}
+
+#[test]
+fn a_restore_spans_many_wal_indexes_in_one_generation() {
+    let mut h = Harness::new();
+    let mut tight = settings(&h.db);
+    tight.max_wal_bytes = 1; // checkpoint (and rotate the index) on every tick
+    h.replicator = Replicator::new(tight, h.destination(), Arc::clone(&h.status));
+
+    prime(&mut h, 0);
+    let mut expected = Vec::new();
+    for round in 0..6 {
+        let value = format!("row-{round}");
+        insert(&mut h.conn, &[&value]);
+        expected.push(value);
+        tick_until_checkpointed(&mut h, (round + 1) * 100);
+    }
+    assert_eq!(
+        generations_on(&h).len(),
+        1,
+        "six checkpoints must still be one generation"
+    );
+
+    h.destroy_database();
+    let restored = h.restore_to(None);
+    assert_eq!(values(&read_rows(&restored)), expected);
 }
 
 // ─── AC: safe against a live app ─────────────────────────────────────────────
@@ -512,16 +625,26 @@ fn replication_never_blocks_or_corrupts_a_live_writer() {
     h.replicator = Replicator::new(tight, h.destination(), Arc::clone(&h.status));
 
     let mut expected = Vec::new();
+    let mut checkpoints = 0;
     for round in 0..40 {
         let value = format!("row-{round}");
         insert(&mut h.conn, &[&value]);
         expected.push(value);
         // Interleave a replication tick with every write, the worst case for
         // contention on the single writer.
-        h.replicator
+        let report = h
+            .replicator
             .tick(at(round))
             .unwrap_or_else(|e| panic!("tick {round} failed: {e}"));
+        if report.checkpointed {
+            checkpoints += 1;
+        }
     }
+    assert!(
+        checkpoints > 0,
+        "the tight WAL budget should have forced checkpoints — with none, this test \
+         proves nothing about the contended path"
+    );
 
     // The live database is intact…
     assert_eq!(values(&read_rows(&h.db)), expected);
@@ -536,6 +659,7 @@ fn replication_never_blocks_or_corrupts_a_live_writer() {
 #[test]
 fn lag_and_generation_are_observable_to_the_operator() {
     let mut h = Harness::new();
+    prime(&mut h, 0);
     insert(&mut h.conn, &["a"]);
     h.replicator.tick(at(0)).expect("tick");
 
@@ -592,7 +716,8 @@ fn verification_actually_restores_and_fails_loudly_on_a_damaged_replica() {
 fn retention_prunes_expired_generations_but_keeps_the_window_floor() {
     let mut h = Harness::new();
     let mut short = settings(&h.db);
-    short.max_wal_bytes = 1; // rotate a generation on every tick
+    short.max_wal_bytes = 1; // checkpoint on every tick…
+    short.snapshot_interval = Duration::from_secs(1); // …and open a new generation
     short.retention = Duration::from_secs(60);
     h.replicator = Replicator::new(short, h.destination(), Arc::clone(&h.status));
 
@@ -601,6 +726,9 @@ fn retention_prunes_expired_generations_but_keeps_the_window_floor() {
         h.replicator
             .tick(at(round * 100))
             .unwrap_or_else(|e| panic!("tick {round} failed: {e}"));
+        h.replicator
+            .tick(at(round * 100 + 1))
+            .unwrap_or_else(|e| panic!("tick {round} rotation failed: {e}"));
     }
 
     let generations: std::collections::BTreeSet<String> = h
@@ -619,4 +747,408 @@ fn retention_prunes_expired_generations_but_keeps_the_window_floor() {
     h.destroy_database();
     let restored = h.restore_to(None);
     assert!(!read_rows(&restored).is_empty());
+}
+
+// ─── The loop itself: its own timer, and the shutdown flush ──────────────────
+
+/// A destination that takes its time, so "the upload does not block the writer"
+/// is an assertion rather than a hope.
+struct SlowDestination {
+    inner: FileDestination,
+    delay: Duration,
+}
+
+impl ReplicaDestination for SlowDestination {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn put(&self, key: &str, body: &[u8]) -> Result<(), DestinationError> {
+        std::thread::sleep(self.delay);
+        self.inner.put(key, body)
+    }
+    fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        std::thread::sleep(self.delay);
+        self.inner.put_file(key, path)
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, DestinationError> {
+        self.inner.get(key)
+    }
+    fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.inner.get_to_file(key, path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> Result<(), DestinationError> {
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn the_loop_ships_on_its_own_and_flushes_what_is_left_on_shutdown() {
+    let mut h = Harness::new();
+    let mut settings = settings(&h.db);
+    settings.sync_interval = Duration::from_millis(50);
+    let replicator = Replicator::new(settings, h.destination(), Arc::clone(&h.status));
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let worker = std::thread::spawn(move || replicator.run(&loop_shutdown));
+
+    // Wait for the loop to open a generation on its own timer, then write rows
+    // it has not seen and stop it immediately: only the shutdown flush can get
+    // them offsite.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while h.status.snapshot().generation.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replication loop never opened a generation"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    insert(&mut h.conn, &["written-just-before-shutdown"]);
+    shutdown.cancel();
+    worker
+        .join()
+        .expect("the replication thread must not panic");
+
+    let snapshot = h.status.snapshot();
+    assert!(snapshot.segments_shipped >= 1, "{snapshot:?}");
+    assert!(snapshot.last_success_at.is_some(), "{snapshot:?}");
+
+    h.destroy_database();
+    let restored = h.restore_to(None);
+    assert_eq!(
+        values(&read_rows(&restored)),
+        ["written-just-before-shutdown"],
+        "a clean shutdown must not drop the last committed transaction"
+    );
+}
+
+#[test]
+fn a_writer_on_another_thread_is_not_blocked_by_a_slow_upload() {
+    let mut h = Harness::with_destination(|dir| {
+        Arc::new(SlowDestination {
+            inner: FileDestination::new(dir.join("replica")).expect("destination"),
+            // Far longer than any write takes, so a writer that serialized
+            // behind uploads could not possibly finish inside the bound below.
+            delay: Duration::from_millis(120),
+        })
+    });
+    let db = h.db.clone();
+    let mut settings = settings(&h.db);
+    settings.sync_interval = Duration::from_millis(10);
+    // Checkpoint constantly: the one thing the replicator does that touches
+    // SQLite's write lock.
+    settings.max_wal_bytes = 4096;
+    let replicator = Replicator::new(settings, h.destination(), Arc::clone(&h.status));
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let worker = std::thread::spawn(move || replicator.run(&loop_shutdown));
+
+    // 40 writes on their own connection while the replicator uploads. Each
+    // upload sleeps 120 ms; if writes serialized behind them this could not
+    // finish in seconds.
+    let started = std::time::Instant::now();
+    let mut writer = open_app_db(&db);
+    let mut expected = Vec::new();
+    for round in 0..40 {
+        let value = format!("row-{round}");
+        sql_query(format!("INSERT INTO t (v) VALUES ('{value}')"))
+            .execute(&mut writer)
+            .unwrap_or_else(|e| panic!("write {round} was refused while replicating: {e}"));
+        expected.push(value);
+    }
+    let elapsed = started.elapsed();
+    drop(writer);
+
+    shutdown.cancel();
+    worker
+        .join()
+        .expect("the replication thread must not panic");
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "40 writes took {elapsed:?} — they were serialized behind the replicator's uploads"
+    );
+    assert_eq!(
+        values(&read_rows(&h.db)),
+        expected,
+        "the live database is intact"
+    );
+
+    h.destroy_database();
+    let restored = h.restore_to(None);
+    let restored_rows = values(&read_rows(&restored));
+    assert!(
+        expected.starts_with(&restored_rows) || restored_rows == expected,
+        "the replica must be a prefix of what was written, got {restored_rows:?}"
+    );
+    assert!(!restored_rows.is_empty(), "the replica must not be empty");
+}
+
+#[test]
+fn a_periodic_verification_records_its_outcome_in_the_operator_status() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, &["verified"]);
+    h.replicator.tick(at(0)).expect("tick");
+
+    let mut settings = settings(&h.db);
+    settings.sync_interval = Duration::from_millis(50);
+    settings.verify_interval = Some(Duration::from_millis(1));
+    let replicator = Replicator::new(settings, h.destination(), Arc::clone(&h.status));
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let worker = std::thread::spawn(move || replicator.run(&loop_shutdown));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while h.status.snapshot().last_verified_at.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the loop never recorded a verification: {:?}",
+            h.status.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    shutdown.cancel();
+    worker.join().expect("the verification must not panic");
+
+    let snapshot = h.status.snapshot();
+    assert!(snapshot.last_verified_at.is_some());
+    assert!(snapshot.last_verify_error.is_none(), "{snapshot:?}");
+}
+
+#[test]
+fn a_failed_verification_reaches_the_status_the_health_indicator_reads() {
+    let mut h = Harness::new();
+    insert(&mut h.conn, &["doomed"]);
+    let destination = h.destination();
+
+    let mut settings = settings(&h.db);
+    settings.sync_interval = Duration::from_millis(50);
+    settings.verify_interval = Some(Duration::from_millis(1));
+    let replicator = Replicator::new(settings, Arc::clone(&destination), Arc::clone(&h.status));
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let loop_shutdown = shutdown.clone();
+    let worker = std::thread::spawn(move || replicator.run(&loop_shutdown));
+
+    // Let the loop settle on a generation and verify it once, so the corruption
+    // below lands on the replica it is actually using.
+    let settled = std::time::Instant::now() + Duration::from_secs(30);
+    while h.status.snapshot().last_verified_at.is_none() {
+        assert!(
+            std::time::Instant::now() < settled,
+            "the loop never verified a healthy replica: {:?}",
+            h.status.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Now break the replica behind the replicator's back.
+    let snapshot_key = destination
+        .list(&format!("{}/generations/", h.root))
+        .expect("list")
+        .into_iter()
+        .find(|k| k.ends_with(segment::SNAPSHOT_OBJECT))
+        .expect("snapshot exists");
+    destination
+        .put(&snapshot_key, b"not a gzip stream at all")
+        .expect("put");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while h.status.snapshot().last_verify_error.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a broken replica never produced a verification failure: {:?}",
+            h.status.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    shutdown.cancel();
+    worker.join().expect("the verification must not panic");
+
+    // The health indicator turns that into a DOWN, which is what #1610's
+    // alerter escalates.
+    let indicator = ReplicationHealthIndicator::new(
+        Arc::clone(&h.status),
+        HealthThresholds {
+            lag_alert_after: Duration::from_secs(30),
+            startup_grace: Duration::from_secs(60),
+        },
+        Utc::now(),
+    );
+    let output = indicator.evaluate(&h.status.snapshot(), Utc::now());
+    assert_eq!(output.status, HealthStatus::Down);
+    assert!(output.details.contains_key("verification_error"));
+}
+
+#[test]
+fn the_replication_indicator_registers_and_reports_down_through_the_registry() {
+    // The registry is what `/actuator/health` serves and what #1610's alerter
+    // sweeps every cycle, so registration under the documented name — in the
+    // `HealthOnly` group, so a lagging replica never pulls the process out of
+    // the load balancer — is the joint that makes a verification failure
+    // alertable rather than merely visible.
+    let status = Arc::new(ReplicationStatus::new("file:///replicas"));
+    let indicator = Arc::new(ReplicationHealthIndicator::new(
+        Arc::clone(&status),
+        HealthThresholds {
+            lag_alert_after: Duration::from_secs(30),
+            startup_grace: Duration::from_secs(60),
+        },
+        Utc::now(),
+    ));
+    let registry = HealthIndicatorRegistry::new();
+    registry
+        .register(
+            autumn_web::replication::INDICATOR_NAME,
+            IndicatorGroup::HealthOnly,
+            indicator,
+        )
+        .expect("register the replication indicator");
+
+    status.record_tick_ok(0, Utc::now());
+    status.record_verification(Err("integrity check failed".to_owned()), Utc::now());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let results = runtime.block_on(registry.run_all());
+    let result = results
+        .iter()
+        .find(|r| r.name == autumn_web::replication::INDICATOR_NAME)
+        .expect("the indicator is registered under its documented name");
+    assert!(
+        !result.output.status.is_healthy(),
+        "a replica that failed verification must report non-healthy: {:?}",
+        result.output.status
+    );
+    assert_eq!(result.group, IndicatorGroup::HealthOnly);
+
+    // …and recovers once a verification succeeds again.
+    status.record_verification(Ok(()), Utc::now());
+    let recovered = runtime.block_on(registry.run_all());
+    assert!(
+        recovered.iter().all(|r| r.output.status.is_healthy()),
+        "the indicator must recover so the alerter can resolve the incident"
+    );
+}
+
+// ─── Point-in-time across generations, and the integrity backstop ───────────
+
+#[test]
+fn a_point_in_time_restore_picks_the_right_generation_out_of_several() {
+    let mut h = Harness::new();
+    let mut rotating = settings(&h.db);
+    rotating.max_wal_bytes = 1;
+    rotating.snapshot_interval = Duration::from_secs(1);
+    h.replicator = Replicator::new(rotating, h.destination(), Arc::clone(&h.status));
+
+    // Each round is 3600 s apart, so every round opens its own generation.
+    let mut expected_after = Vec::new();
+    for round in 0..4 {
+        let value = format!("row-{round}");
+        insert(&mut h.conn, &[&value]);
+        expected_after.push(value);
+        h.replicator
+            .tick(at(round * 3_600))
+            .unwrap_or_else(|e| panic!("tick {round} failed: {e}"));
+        // A second tick opens the replacement generation from the database file
+        // the checkpoint just completed.
+        h.replicator
+            .tick(at(round * 3_600 + 1))
+            .unwrap_or_else(|e| panic!("tick {round} rotation failed: {e}"));
+    }
+    assert!(
+        generations_on(&h).len() >= 3,
+        "this test needs several generations, got {:?}",
+        generations_on(&h)
+    );
+
+    h.destroy_database();
+
+    // A target inside the middle of the history must select the generation that
+    // opened at or before it, not simply the newest one.
+    let middle = h.restore_to(Some(at(2 * 3_600 + 60)));
+    let rows = values(&read_rows(&middle));
+    assert!(
+        rows.contains(&"row-0".to_owned()) && rows.contains(&"row-2".to_owned()),
+        "expected everything up to round 2, got {rows:?}"
+    );
+    assert!(
+        !rows.contains(&"row-3".to_owned()),
+        "a later round must not appear in an earlier point-in-time restore: {rows:?}"
+    );
+
+    let latest = h.restore_to(None);
+    assert_eq!(values(&read_rows(&latest)), expected_after);
+}
+
+#[test]
+fn a_snapshot_corrupted_together_with_its_digest_is_still_refused() {
+    use std::io::Write as _;
+
+    let mut h = Harness::new();
+    insert(&mut h.conn, &["one", "two", "three"]);
+    h.replicator.tick(at(0)).expect("tick");
+
+    let destination = h.destination();
+    let keys = destination
+        .list(&format!("{}/generations/", h.root))
+        .expect("list");
+    let snapshot_key = keys
+        .iter()
+        .find(|k| k.ends_with(segment::SNAPSHOT_OBJECT))
+        .expect("snapshot")
+        .clone();
+    let meta_key = keys
+        .iter()
+        .find(|k| k.ends_with(segment::SNAPSHOT_META_OBJECT))
+        .expect("marker")
+        .clone();
+
+    // Inflate the snapshot, corrupt its middle, re-gzip it, and rewrite the
+    // metadata so the SHA-256 and length still match — the one case digests
+    // cannot catch, and the reason `PRAGMA integrity_check` is a backstop.
+    let compressed = destination.get(&snapshot_key).expect("get snapshot");
+    let mut plain = Vec::new();
+    std::io::copy(
+        &mut flate2::read::GzDecoder::new(&compressed[..]),
+        &mut plain,
+    )
+    .expect("inflate");
+    let len = plain.len();
+    for byte in plain.iter_mut().skip(len / 2).take(1024) {
+        *byte ^= 0xFF;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&plain).expect("compress");
+    destination
+        .put(&snapshot_key, &encoder.finish().expect("finish"))
+        .expect("put snapshot");
+
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&destination.get(&meta_key).expect("get meta")).expect("parse");
+    meta["sha256"] = serde_json::Value::String(segment::sha256_hex(&plain));
+    meta["uncompressed_len"] = serde_json::Value::from(plain.len() as u64);
+    destination
+        .put(&meta_key, &serde_json::to_vec(&meta).expect("encode"))
+        .expect("put meta");
+
+    let output = h.replica_root.join("../corrupt.db");
+    let err = restore::restore(destination.as_ref(), &h.root, None, &output)
+        .expect_err("a corrupt database must be refused even when its digest matches");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("integrity") || rendered.contains("replay the WAL"),
+        "{rendered}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused restore must not publish the corrupt database"
+    );
 }

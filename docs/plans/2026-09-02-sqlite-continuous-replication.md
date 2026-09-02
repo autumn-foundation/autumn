@@ -102,18 +102,30 @@ once both call sites exist and are green.
 ### Remote layout
 
 ```text
-{prefix}/{profile}/generations/{gen_id}/snapshot-{ms:013}.db.gz
-{prefix}/{profile}/generations/{gen_id}/segments/{seq:010}-{ms:013}.seg
+{prefix}/{profile}/generations/{gen_id}/snapshot.db.gz
+{prefix}/{profile}/generations/{gen_id}/snapshot.json          # commit marker
+{prefix}/{profile}/generations/{gen_id}/segments/{index:05}-{seq:010}-{ms:013}.seg
 ```
 
-`gen_id` = `{created_ms:013}-{salt1:08x}{salt2:08x}` — lexicographically
-chronological. A segment payload is a JSON header line followed by the gzip'd
-raw WAL byte range; the header carries `seq`, `start_offset`, `end_offset`,
-`sha256`, `frame_count`, `commit_count`, `page_size`, `db_size_pages`,
-`created_at`.
+`gen_id` = `{created_ms:013}-{nonce:016x}` — lexicographically chronological. The
+salt is deliberately *not* in the id: a generation opens by snapshotting the
+database file, which happens before the first write reveals the new WAL's salt.
+Salt agreement is checked at restore time against each index's own segment 0.
 
-Segment `0` of a generation starts at offset `0`, so it contains the 32-byte WAL
-header — restore reassembles `snapshot.db` + `db-wal` from the objects alone.
+A segment payload is a JSON header line followed by the gzip'd raw WAL byte
+range; the header carries `index`, `seq`, `start_offset`, `end_offset`, `sha256`,
+`frame_count`, `commit_count`, `page_size`, `db_size_pages`, `created_at`.
+
+Segment `0` of each **index** starts at offset `0`, so it contains the 32-byte
+WAL header — restore reassembles `snapshot.db` + a `db-wal` per index from the
+objects alone.
+
+**Why two levels.** A generation is one base snapshot; an index is one WAL salt
+sequence within it. The `-wal` cannot grow forever, so the replicator must
+checkpoint — but treating every checkpoint as a new generation would re-upload
+the whole database each time `max_wal_bytes` is reached (gigabytes per hour on a
+busy database). A checkpoint therefore costs one index bump; a full base snapshot
+happens on `snapshot_interval`, which is also what bounds restore replay.
 
 ### Runtime
 
@@ -122,19 +134,21 @@ header — restore reassembles `snapshot.db` + `db-wal` from the objects alone.
 
 ```text
 tick (rpo/2, default 5 s):
-  read WAL header → salt changed or no generation? → checkpoint+snapshot → new generation
+  read WAL header → no generation, or an UNEXPECTED salt change → base snapshot
   scan frames from shipped_offset, validating the checksum chain
   ship [shipped_offset, last_commit_end) as one segment
   shipped_offset = last_commit_end; record lag
-  if (wal_len > max_wal_bytes or age > snapshot_interval) and shipped_offset == wal_len:
-      wal_checkpoint(TRUNCATE)   # next tick sees a new salt → new generation
+  if wal_len >= max_wal_bytes and shipped_offset == wal_len:
+      wal_checkpoint(TRUNCATE)
+      generation older than snapshot_interval ? new generation : next index
 ```
 
 ### Restore (CLI, `autumn db replica restore`)
 
 Pure planner (`replication::restore`) shared by the CLI and the in-process
 verifier: choose generation → select segments ≤ T → download → verify chain →
-write `db` + `db-wal` → `wal_checkpoint(TRUNCATE)` → `integrity_check` → publish.
+then, **index by index**, write `db-wal` beside the snapshot and
+`wal_checkpoint(TRUNCATE)` it in → `integrity_check` → publish.
 
 ### Observability & alerting
 

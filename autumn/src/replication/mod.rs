@@ -77,6 +77,7 @@ const STARTUP_GRACE: Duration = Duration::from_secs(120);
 
 /// Why replication could not be started.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SetupError {
     /// The `[replication]` section is absent or `enabled = false`.
     Disabled,
@@ -216,6 +217,60 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
     }
 }
 
+/// Strip `scheme://user:pass@` userinfo out of every URL embedded in `detail`.
+///
+/// Third-party error types (`reqwest`, `toml`) routinely quote the input that
+/// failed, and that input can be a URL with a password in it. Everything this
+/// feature prints — a tick error, a health-indicator detail, a CLI diagnostic —
+/// goes through here first.
+#[must_use]
+pub fn redact_credentials(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(scheme_at) = rest.find("://") {
+        let Some((before, after)) = rest.split_at_checked(scheme_at.saturating_add(3)) else {
+            break;
+        };
+        out.push_str(before);
+        // Userinfo, if any, ends at the first `@` before the next delimiter.
+        let boundary = after.find(['/', '?', '#', ' ']).unwrap_or(after.len());
+        if let Some(at) = after
+            .get(..boundary)
+            .and_then(|authority| authority.find('@'))
+        {
+            out.push_str("<redacted>@");
+            rest = after.get(at.saturating_add(1)..).unwrap_or("");
+        } else {
+            out.push_str(after.get(..boundary).unwrap_or(""));
+            rest = after.get(boundary..).unwrap_or("");
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The app's own blob-storage destination, for the distinct-destination guard.
+#[derive(Debug, Clone, Copy)]
+pub struct StorageDestination<'a> {
+    /// The bucket the app writes user blobs to.
+    pub bucket: &'a str,
+    /// Its endpoint, or `None` for AWS.
+    pub endpoint: Option<&'a str>,
+}
+
+/// Reduce an endpoint to a comparable `host[:port]`, so two spellings of the
+/// same destination compare equal and `None` (AWS) compares equal to itself.
+fn canonical_authority(endpoint: Option<&str>) -> Option<String> {
+    let endpoint = endpoint.map(str::trim).filter(|e| !e.is_empty())?;
+    let parsed = url::Url::parse(endpoint).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some(
+        parsed
+            .port()
+            .map_or_else(|| host.clone(), |port| format!("{host}:{port}")),
+    )
+}
+
 /// Read a credential from the environment variable config *names*.
 fn credential_from_env(var: Option<&String>, field: &str) -> Result<String, SetupError> {
     let name = var
@@ -243,7 +298,7 @@ fn credential_from_env(var: Option<&String>, field: &str) -> Result<String, Setu
 /// See [`SetupError`].
 pub fn build_destination(
     config: &ReplicationConfig,
-    storage_bucket: Option<&str>,
+    storage: Option<StorageDestination<'_>>,
 ) -> Result<Arc<dyn ReplicaDestination>, SetupError> {
     if let Some(path) = config.path.as_ref().filter(|p| !p.trim().is_empty()) {
         return Ok(Arc::new(FileDestination::new(path.trim())?));
@@ -261,7 +316,16 @@ pub fn build_destination(
         .ok_or_else(|| SetupError::Config {
             errors: vec!["[replication.s3] bucket is unset".to_owned()],
         })?;
-    if !config.allow_shared_bucket && storage_bucket.is_some_and(|other| other == bucket) {
+    // Bucket AND endpoint, matching #1619's `destinations_conflict`: the same
+    // bucket name at two different providers is not a collision, and a
+    // path-style vs virtual-hosted spelling of one endpoint is not a difference.
+    if !config.allow_shared_bucket
+        && storage.is_some_and(|storage| {
+            storage.bucket == bucket
+                && canonical_authority(storage.endpoint)
+                    == canonical_authority(s3.endpoint.as_deref())
+        })
+    {
         return Err(SetupError::SharedBucket {
             bucket: bucket.to_owned(),
         });
@@ -299,8 +363,8 @@ pub fn build_destination(
 
 /// Resolve `[replication]` into a ready-to-run [`ReplicationRuntime`].
 ///
-/// `storage_bucket` is the app's blob-storage bucket when it has one, used only
-/// for the distinct-destination guard.
+/// `storage` is the app's own blob-storage destination when it has one, used
+/// only for the distinct-destination guard.
 ///
 /// Must be called from a blocking thread (see [`build_destination`]).
 ///
@@ -313,7 +377,7 @@ pub fn build(
     config: &ReplicationConfig,
     database_url: &str,
     profile: &str,
-    storage_bucket: Option<&str>,
+    storage: Option<StorageDestination<'_>>,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<ReplicationRuntime, SetupError> {
     if !config.enabled {
@@ -325,12 +389,13 @@ pub fn build(
     }
     if !(database_url.starts_with("sqlite:") || database_url.starts_with("file:")) {
         return Err(SetupError::NotSqlite {
-            backend: "Postgres".to_owned(),
+            backend: crate::config::DatabaseBackend::detect(database_url)
+                .map_or_else(|| "an unrecognized backend".to_owned(), |b| b.to_string()),
         });
     }
     let database_path = database_file(database_url).ok_or(SetupError::InMemory)?;
 
-    let destination = build_destination(config, storage_bucket)?;
+    let destination = build_destination(config, storage)?;
     let status = Arc::new(ReplicationStatus::new(destination.describe()));
     let settings = ReplicationSettings {
         database_path,
@@ -508,17 +573,67 @@ mod tests {
             }),
             ..ReplicationConfig::default()
         };
+        let same = Some(StorageDestination {
+            bucket: "shared",
+            endpoint: None,
+        });
         assert!(matches!(
-            build_destination(&config, Some("shared")),
+            build_destination(&config, same),
             Err(SetupError::SharedBucket { .. })
         ));
+
+        // The same bucket NAME at a different provider is not a collision.
+        let elsewhere = Some(StorageDestination {
+            bucket: "shared",
+            endpoint: Some("https://minio.test:9000"),
+        });
+        assert!(matches!(
+            build_destination(&config, elsewhere),
+            Err(SetupError::MissingCredentialEnv { .. })
+        ));
+
         config.allow_shared_bucket = true;
         // Still fails, but on the credential env var — proving the bucket guard
         // is what was tripping before, not a missing credential.
         assert!(matches!(
-            build_destination(&config, Some("shared")),
+            build_destination(&config, same),
             Err(SetupError::MissingCredentialEnv { .. })
         ));
+    }
+
+    #[test]
+    fn credentials_are_stripped_from_any_embedded_url() {
+        let raw = "error sending request for url (https://KEY:SECRET@minio.test:9000/b/k)";
+        let redacted = redact_credentials(raw);
+        assert!(!redacted.contains("SECRET"), "{redacted}");
+        assert!(!redacted.contains("KEY"), "{redacted}");
+        assert!(redacted.contains("minio.test:9000/b/k"), "{redacted}");
+        // A URL without userinfo is left exactly as it was.
+        assert_eq!(
+            redact_credentials("failed for url (https://minio.test/b/k)"),
+            "failed for url (https://minio.test/b/k)"
+        );
+        assert_eq!(redact_credentials("no url here"), "no url here");
+        // Several URLs in one message are all covered.
+        let two = redact_credentials("a https://u:p@x.test/1 and b postgres://u2:p2@y.test/2");
+        assert!(!two.contains("p2"), "{two}");
+        assert!(
+            two.contains("x.test/1") && two.contains("y.test/2"),
+            "{two}"
+        );
+    }
+
+    #[test]
+    fn endpoint_spellings_of_one_destination_compare_equal() {
+        assert_eq!(canonical_authority(None), None);
+        assert_eq!(
+            canonical_authority(Some("https://MinIO.Test:9000")),
+            canonical_authority(Some("https://minio.test:9000/"))
+        );
+        assert_ne!(
+            canonical_authority(Some("https://minio.test:9000")),
+            canonical_authority(Some("https://minio.test:9001"))
+        );
     }
 
     #[test]

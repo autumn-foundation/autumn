@@ -333,7 +333,7 @@ mod tests {
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("timestamp")
+        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("timestamp")
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub fn shm_path(db: &Path) -> PathBuf {
 
 /// Why a `-wal` file could not be read as a WAL.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalError {
     /// Fewer than [`WAL_HEADER_SIZE`] bytes are present (an empty WAL included).
     TooShort {

@@ -33,19 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the machine is destroyed. Only complete transactions ship — a segment
   always ends on a commit boundary — and a checkpoint is attempted only once
   everything in the WAL is already offsite, so an unreachable destination costs
-  disk, never data. `[replication]` follows #1619's destination conventions
-  exactly: its own section, profile overlays, `AUTUMN_REPLICATION__*` overrides,
-  env-var-indirected credentials, and a refusal to share the app's blob-storage
-  bucket without `allow_shared_bucket = true`. A `path` destination replicates to
-  a directory (second disk, NFS/SSHFS mount, bind-mounted volume) instead.
+  disk, never data. Steady-state upload is the size of your *writes*, not of your
+  database: a checkpoint opens the next WAL index inside the current generation,
+  and a full base snapshot is taken once per `snapshot_interval_secs` (hourly by
+  default), which is also what bounds how much WAL a restore replays.
+
+  `[replication]` reuses #1619's destination conventions — its own config
+  section, profile overlays, `AUTUMN_REPLICATION__*` overrides, env-var-indirected
+  credentials, and a refusal to share the app's blob-storage bucket + endpoint
+  without `allow_shared_bucket = true`. A `path` destination replicates to a
+  directory (second disk, NFS/SSHFS mount, bind-mounted volume) instead.
 
   Recovery is one command on a fresh box that has only the binary, `autumn.toml`
   and the credentials:
 
   ```bash
-  autumn db replica status                                  # how fresh is it?
-  autumn db replica restore                                 # latest state
-  autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force
+  autumn db replica status                     # how fresh is it?
+  autumn db replica restore --force            # latest state, fresh box
+  autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force --overwrite
   ```
 
   Restore **refuses** rather than best-efforts: a hole in the segment sequence, a
@@ -54,8 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error — handing SQLite a damaged WAL would have looked like a clean restore
   that was merely missing the last few minutes. Nothing is published until those
   checks pass, and the same production guard / `--force` protocol as #1595
-  applies (plus `--force` to overwrite an existing database file, whatever the
-  profile).
+  applies — `--force` for the production-profile guard, and a separate
+  `--overwrite` to replace a database file that is already there, so a drill that
+  always passes `--force` cannot silently destroy one.
 
   Lag, the current generation and the last successful verification are on
   `/actuator/health` under the `sqlite-replication` indicator and in
@@ -64,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification failure or lag beyond three RPOs takes the indicator `DOWN`, which
   the existing #1610 alerter escalates on every configured channel. See
   [SQLite in production → Durability](docs/guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
+  **Breaking:** `AutumnConfig` gains a public `replication` field, so a
+  struct-literal construction needs `..AutumnConfig::default()` — see
+  [the migration guide](docs/migrations/next.md#config-autumnconfig-gains-a-replication-field).
 
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools

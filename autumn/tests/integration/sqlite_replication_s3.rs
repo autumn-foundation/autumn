@@ -121,7 +121,7 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
         );
 
         let at = |secs: i64| {
-            Utc.timestamp_opt(1_800_000_000 + secs, 0)
+            Utc.timestamp_opt(1_700_000_000 + secs, 0)
                 .single()
                 .expect("timestamp")
         };

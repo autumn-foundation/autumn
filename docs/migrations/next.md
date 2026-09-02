@@ -378,6 +378,46 @@ framework.
 
 ---
 
+### Config: `AutumnConfig` gains a `replication` field
+
+**Why:** Continuous SQLite replication (issue #1628) needs its own configuration
+section, and `AutumnConfig` has all-public fields with no `#[non_exhaustive]`, so
+adding one is a breaking change for anyone constructing the struct literally.
+Almost nobody does — `AutumnConfig::default()` and `..Default::default()` are the
+documented ways to build one, and both keep compiling.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    database: my_database_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub replication: Option<Box<ReplicationConfig>>`, `None` by
+default, so `..Default::default()` needs no other change. Nothing about an app
+that does not configure `[replication]` behaves differently.
+
+**Automation:** `manual` — a struct-literal expression can only be rewritten by
+knowing which fields the caller meant to leave defaulted, which a codemod cannot
+infer; the fix is the one-line `..AutumnConfig::default()` above.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -425,6 +465,20 @@ single most valuable section of the guide — keep it factual and short.
 - Default profile changes.
 
 If nothing changed, delete this section.
+
+### New: `[replication]` (continuous SQLite replication)
+
+Optional and off by default; an app that does not add the section is unaffected.
+Every key has an `AUTUMN_REPLICATION__*` environment override, and credentials
+are named by environment variable rather than inlined — the same posture as
+`[backup.offsite]`. See
+[SQLite in production → Durability](../guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
+When `[replication] enabled = true`, pooled SQLite connections are created with
+`PRAGMA wal_autocheckpoint = 0` so the replicator is the only component that
+checkpoints. That is a deliberate behaviour change for replicating apps and is
+described in the guide; apps without the section keep SQLite's default
+auto-checkpointing.
 
 ## Behavior changes
 

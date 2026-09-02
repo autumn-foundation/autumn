@@ -18,6 +18,24 @@
 //! The secret access key is used only to derive the signing key. Nothing in this
 //! module formats, logs, or returns it, and no type here holds it.
 
+// autumn-panic-gate: credential-handling module — production code path must be
+// panic-free. See CONTRIBUTING.md "Request-path panic gate". Justify exceptions
+// with #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::fmt::Write as _;
 
 use hmac::{Hmac, Mac};
@@ -49,14 +67,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// `HMAC-SHA256(key, data)`.
 ///
-/// # Panics
-///
-/// Never in practice: HMAC accepts a key of any length.
+/// HMAC accepts a key of any length, so the construction below cannot fail; the
+/// `Result` is folded rather than unwrapped so this stays panic-free under the
+/// module's deny block.
 #[must_use]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
+    HmacSha256::new_from_slice(key).map_or([0u8; 32], |mut mac| {
+        mac.update(data);
+        mac.finalize().into_bytes().into()
+    })
 }
 
 /// AWS URI-encode `s`.
@@ -92,8 +111,11 @@ pub fn signed_headers_list(headers: &[Header]) -> String {
         .join(";")
 }
 
-/// Build the canonical query string: `key=value` pairs, each side URI-encoded
-/// (slashes included), sorted by encoded key.
+/// Build the canonical query string.
+///
+/// `key=value` pairs, each side URI-encoded (slashes included), sorted by
+/// encoded key **and then value** — the `SigV4` ordering, which differs from a
+/// key-only sort only when one key appears twice.
 #[must_use]
 pub fn canonical_query(params: &[(&str, &str)]) -> String {
     let mut encoded: Vec<(String, String)> = params
@@ -110,7 +132,9 @@ pub fn canonical_query(params: &[(&str, &str)]) -> String {
 
 /// Build the `SigV4` canonical request string.
 ///
-/// `headers` MUST be sorted by lowercase name; each value is trimmed.
+/// `headers` MUST be sorted by lowercase name. Each value is trimmed and its
+/// internal runs of whitespace collapsed to a single space, as the `SigV4`
+/// specification requires ("convert sequential spaces to a single space").
 #[must_use]
 pub fn canonical_request(
     method: &str,
@@ -122,13 +146,18 @@ pub fn canonical_request(
     let canonical_headers: String = headers
         .iter()
         .fold(String::new(), |mut acc, (name, value)| {
-            let _ = writeln!(acc, "{name}:{}", value.trim());
+            let _ = writeln!(acc, "{name}:{}", collapse_whitespace(value));
             acc
         });
     let signed = signed_headers_list(headers);
     format!(
         "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload_hash}"
     )
+}
+
+/// Trim `value` and collapse each internal run of whitespace to one space.
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The credential scope: `{date}/{region}/{service}/aws4_request`.
@@ -207,6 +236,15 @@ mod tests {
             "list-type=2&prefix=a%2Fb"
         );
         assert_eq!(canonical_query(&[]), "");
+    }
+
+    #[test]
+    fn header_values_are_trimmed_and_internally_collapsed() {
+        let headers = vec![("x-test".to_owned(), "  a   b\tc  ".to_owned())];
+        assert!(
+            canonical_request("GET", "/", "", &headers, "H").contains("x-test:a b c\n"),
+            "SigV4 collapses sequential whitespace in a header value"
+        );
     }
 
     #[test]

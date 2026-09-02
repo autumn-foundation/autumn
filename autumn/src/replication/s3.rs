@@ -64,10 +64,24 @@ const SERVICE: &str = "s3";
 /// a healthy transfer.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Overall per-request timeout. Replication objects are small and a tick must
-/// not wedge the replication thread, so unlike the offsite-backup client (which
-/// streams multi-GB dumps) this one *does* cap total request duration.
+/// Overall timeout for a *small* request (metadata, a segment, a listing, a
+/// delete). Applied per request rather than on the client, so it does not also
+/// cap a base-snapshot upload, which is legitimately long.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Largest response body this client will read into memory. Replication
+/// responses are a segment, a small JSON document, or one page of a listing;
+/// anything larger is a hostile or broken endpoint, and the in-process verifier
+/// makes an unbounded read an OOM of the whole app.
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Largest error document read just to pull a `<Code>` out of it.
+const MAX_ERROR_DOCUMENT_BYTES: u64 = 64 * 1024;
+
+/// Longest provider error code kept for an error message. A real S3 error code
+/// is a short `CamelCase` token; truncating bounds a hostile endpoint's ability
+/// to flood or forge log lines.
+const MAX_ERROR_CODE_LEN: usize = 64;
 
 /// S3's single-`PutObject` ceiling.
 const MAX_SINGLE_PUT: u64 = 5 * 1024 * 1024 * 1024;
@@ -105,6 +119,22 @@ pub struct S3Settings {
     /// Path-style addressing (`{endpoint}/{bucket}/{key}`), required by most
     /// self-hosted and R2 endpoints.
     pub force_path_style: bool,
+}
+
+/// What a request carries. A base snapshot streams from disk; everything else
+/// is small enough to sign and send from memory.
+enum RequestBody<'a> {
+    /// No body (GET / DELETE).
+    Empty,
+    /// An in-memory body.
+    Bytes(Vec<u8>),
+    /// Stream this file, with the payload hash the caller computed for it.
+    File {
+        /// File to stream.
+        path: &'a Path,
+        /// Lowercase hex SHA-256 of its contents.
+        sha256_hex: &'a str,
+    },
 }
 
 /// An S3-compatible replica destination.
@@ -146,7 +176,15 @@ impl S3Destination {
         }
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            // No client-wide total timeout: a base snapshot upload is
+            // legitimately long. Small requests set their own below.
+            .timeout(None)
+            // A signature covers the path it was computed for, so a redirect is
+            // useless to us and dangerous: a same-host scheme downgrade would
+            // re-send the Authorization header in cleartext, and a 307 would
+            // replay the request BODY — a WAL segment, or the database itself —
+            // to whatever host the endpoint named.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| DestinationError::Rejected {
                 detail: format!("could not build the replication HTTP client: {e}"),
@@ -220,15 +258,16 @@ impl S3Destination {
         method: reqwest::Method,
         key: &str,
         query: &str,
-        body: Option<Vec<u8>>,
+        body: RequestBody<'_>,
     ) -> Result<reqwest::blocking::Response, DestinationError> {
         let now = (self.now)();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
-        let payload_hash = body.as_ref().map_or_else(
-            || sigv4::EMPTY_PAYLOAD_SHA256.to_owned(),
-            |bytes| sigv4::sha256_hex(bytes),
-        );
+        let payload_hash = match &body {
+            RequestBody::Empty => sigv4::EMPTY_PAYLOAD_SHA256.to_owned(),
+            RequestBody::Bytes(bytes) => sigv4::sha256_hex(bytes),
+            RequestBody::File { sha256_hex, .. } => (*sha256_hex).to_owned(),
+        };
         let host = self.host()?;
 
         let mut headers: Vec<sigv4::Header> = vec![
@@ -276,13 +315,28 @@ impl S3Destination {
             .header("x-amz-date", &amz_date)
             .header("x-amz-content-sha256", &payload_hash)
             .header(reqwest::header::AUTHORIZATION, authorization);
-        if let Some(bytes) = body {
-            request = request.body(bytes);
+        match body {
+            RequestBody::Empty => request = request.timeout(REQUEST_TIMEOUT),
+            RequestBody::Bytes(bytes) => {
+                request = request.timeout(REQUEST_TIMEOUT).body(bytes);
+            }
+            RequestBody::File { path, .. } => {
+                // Stream from disk: a base snapshot is a whole (gzipped)
+                // database, and buffering it would double the replicator's peak
+                // memory inside the app process. No total timeout for the same
+                // reason — the connect timeout still fails fast on a dead host.
+                let file = std::fs::File::open(path)
+                    .map_err(DestinationError::io("open the upload source"))?;
+                request = request.body(file);
+            }
         }
 
         let response = request.send().map_err(|e| DestinationError::Io {
             op,
-            detail: e.to_string(),
+            // reqwest's Display appends the request URL, which can carry
+            // userinfo on a misconfigured endpoint. `validate_endpoint` already
+            // refuses those, and this is the belt to that suspenders.
+            detail: super::redact_credentials(&e.to_string()),
         })?;
         let status = response.status();
         if status.is_success() {
@@ -293,7 +347,10 @@ impl S3Destination {
                 key: key.to_owned(),
             });
         }
-        let code = response.text().ok().as_deref().and_then(parse_error_code);
+        let code = read_bounded(response, MAX_ERROR_DOCUMENT_BYTES)
+            .ok()
+            .and_then(|bytes| parse_error_code(&String::from_utf8_lossy(&bytes)))
+            .map(|code| sanitize_error_code(&code));
         Err(DestinationError::Remote {
             op,
             status: status.as_u16(),
@@ -318,7 +375,46 @@ fn validate_endpoint(endpoint: &str) -> Result<(), DestinationError> {
             ),
         });
     }
+    // Credentials belong in the environment variables config NAMES, never in the
+    // endpoint: an endpoint string is logged at startup, printed by `autumn db
+    // replica status`, and stored in the health indicator's `destination` field.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DestinationError::Rejected {
+            detail: "the replication endpoint must not embed credentials; set \
+                     replication.s3.access_key_id_env / secret_access_key_env instead"
+                .to_owned(),
+        });
+    }
+    if url.scheme() == "http" {
+        tracing::warn!(
+            "the replication endpoint is plain http, so every replicated byte — the whole \
+             database — travels in cleartext. Use https unless the endpoint is on a trusted \
+             private network."
+        );
+    }
     Ok(())
+}
+
+/// Read at most `limit` bytes of a response body.
+fn read_bounded(
+    response: reqwest::blocking::Response,
+    limit: u64,
+) -> Result<Vec<u8>, DestinationError> {
+    use std::io::Read as _;
+    let mut buffer = Vec::new();
+    let mut reader = response.take(limit);
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(DestinationError::io("read the response body"))?;
+    Ok(buffer)
+}
+
+/// Keep a provider error code short and printable.
+fn sanitize_error_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(MAX_ERROR_CODE_LEN)
+        .collect()
 }
 
 impl ReplicaDestination for S3Destination {
@@ -345,25 +441,53 @@ impl ReplicaDestination for S3Destination {
                 ),
             });
         }
-        self.send("upload", reqwest::Method::PUT, key, "", Some(body.to_vec()))
-            .map(|_| ())
+        self.send(
+            "upload",
+            reqwest::Method::PUT,
+            key,
+            "",
+            RequestBody::Bytes(body.to_vec()),
+        )
+        .map(|_| ())
     }
 
     fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
-        let bytes = std::fs::read(path).map_err(DestinationError::io("read upload source"))?;
-        self.put(key, &bytes)
+        validate_key(key)?;
+        // Hashed and streamed rather than read into memory: this is a whole
+        // gzipped database, and buffering it would double the replicator's peak
+        // memory inside the app process.
+        let (sha256_hex, len) = sha256_file(path)?;
+        if len > MAX_SINGLE_PUT {
+            return Err(DestinationError::Rejected {
+                detail: format!(
+                    "replication object {key:?} is {len} bytes, above S3's single-upload \
+                     limit of {MAX_SINGLE_PUT}"
+                ),
+            });
+        }
+        self.send(
+            "upload",
+            reqwest::Method::PUT,
+            key,
+            "",
+            RequestBody::File {
+                path,
+                sha256_hex: &sha256_hex,
+            },
+        )
+        .map(|_| ())
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>, DestinationError> {
         validate_key(key)?;
-        let response = self.send("download", reqwest::Method::GET, key, "", None)?;
-        response
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| DestinationError::Io {
-                op: "download",
-                detail: e.to_string(),
-            })
+        let response = self.send(
+            "download",
+            reqwest::Method::GET,
+            key,
+            "",
+            RequestBody::Empty,
+        )?;
+        read_bounded(response, MAX_RESPONSE_BYTES)
     }
 
     fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
@@ -384,13 +508,13 @@ impl ReplicaDestination for S3Destination {
                 params.push(("continuation-token", t.as_str()));
             }
             let query = sigv4::canonical_query(&params);
-            let response = self.send("list", reqwest::Method::GET, "", &query, None)?;
-            let body = response.text().map_err(|e| DestinationError::Io {
-                op: "list",
-                detail: e.to_string(),
-            })?;
-            let (page, next) = parse_list_objects(&body)?;
-            keys.extend(page);
+            let response =
+                self.send("list", reqwest::Method::GET, "", &query, RequestBody::Empty)?;
+            let body = read_bounded(response, MAX_RESPONSE_BYTES)?;
+            let (page, next) = parse_list_objects(&String::from_utf8_lossy(&body))?;
+            // Never trust the endpoint's own filtering: a key outside the
+            // requested prefix has no business in this listing.
+            keys.extend(page.into_iter().filter(|key| key.starts_with(prefix)));
             let Some(next) = next else {
                 keys.sort();
                 return Ok(keys);
@@ -404,12 +528,42 @@ impl ReplicaDestination for S3Destination {
 
     fn delete(&self, key: &str) -> Result<(), DestinationError> {
         validate_key(key)?;
-        match self.send("delete", reqwest::Method::DELETE, key, "", None) {
+        match self.send(
+            "delete",
+            reqwest::Method::DELETE,
+            key,
+            "",
+            RequestBody::Empty,
+        ) {
             Ok(_) => Ok(()),
             Err(e) if e.is_not_found() => Ok(()),
             Err(e) => Err(e),
         }
     }
+}
+
+/// Streaming SHA-256 of a file, returning the digest and its length, so a
+/// multi-GB snapshot is hashed without being buffered.
+fn sha256_file(path: &Path) -> Result<(String, u64), DestinationError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).map_err(DestinationError::io("hash upload source"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(DestinationError::io("hash upload source"))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).unwrap_or(&[]);
+        hasher.update(chunk);
+        total = total.saturating_add(read as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), total))
 }
 
 /// Extract the first `<tag>…</tag>` body from an XML document.
@@ -613,5 +767,34 @@ mod tests {
             Some("NoSuchBucket")
         );
         assert_eq!(parse_error_code("not xml"), None);
+    }
+
+    #[test]
+    fn a_hostile_error_code_cannot_flood_or_forge_a_log_line() {
+        let hostile = format!("Ok\n2026-09-02 ERROR forged {}", "A".repeat(10_000));
+        let clean = sanitize_error_code(&hostile);
+        assert!(!clean.contains('\n'), "{clean}");
+        assert!(!clean.contains(' '), "{clean}");
+        assert!(clean.len() <= MAX_ERROR_CODE_LEN, "{}", clean.len());
+    }
+
+    #[test]
+    fn construction_refuses_an_endpoint_that_embeds_credentials() {
+        let err = S3Destination::new(
+            S3Settings {
+                bucket: "b".to_owned(),
+                region: "auto".to_owned(),
+                endpoint: Some("https://KEY:SECRET@minio.test:9000".to_owned()),
+                force_path_style: true,
+            },
+            S3Credentials {
+                access_key_id: "a".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .expect_err("must refuse");
+        let rendered = format!("{err}");
+        assert!(!rendered.contains("SECRET"), "{rendered}");
+        assert!(rendered.contains("access_key_id_env"), "{rendered}");
     }
 }

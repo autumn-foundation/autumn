@@ -38,13 +38,17 @@ pub enum ReplicaCommand {
         timestamp: Option<String>,
         /// Write the database here instead of the configured `database.url`.
         output: Option<PathBuf>,
-        /// Bypass the production guard and allow overwriting an existing file.
+        /// Bypass the production guard.
         force: bool,
+        /// Allow replacing a database file that already exists.
+        overwrite: bool,
     },
     /// Report what the destination holds and how fresh it is.
     Status {
         /// Profile overlay to resolve the destination through.
         profile: Option<String>,
+        /// Emit the report as JSON instead of a table.
+        json: bool,
     },
     /// Prove the replica restorable by restoring it into a scratch directory.
     Verify {
@@ -68,7 +72,7 @@ pub enum ReplicaError {
         /// What was passed.
         value: String,
     },
-    /// The restore target already exists and `--force` was not given.
+    /// The restore target already exists and `--overwrite` was not given.
     WouldOverwrite {
         /// The path that would be replaced.
         path: String,
@@ -105,8 +109,8 @@ impl std::fmt::Display for ReplicaError {
             ),
             Self::WouldOverwrite { path } => write!(
                 f,
-                "{path} already exists.\n  Re-run with --force to replace it (this \
-                 overwrites data), or pass --output to restore somewhere else."
+                "{path} already exists.\n  Re-run with --overwrite to replace it (this \
+                 destroys the data in it), or pass --output to restore somewhere else."
             ),
             Self::ProductionRefused { profile } => write!(
                 f,
@@ -132,13 +136,15 @@ pub fn run(command: &ReplicaCommand) {
             timestamp,
             output,
             force,
+            overwrite,
         } => run_restore(
             profile.as_deref(),
             timestamp.as_deref(),
             output.as_ref(),
             *force,
+            *overwrite,
         ),
-        ReplicaCommand::Status { profile } => run_status(profile.as_deref()),
+        ReplicaCommand::Status { profile, json } => run_status(profile.as_deref(), *json),
         ReplicaCommand::Verify { profile } => run_verify(profile.as_deref()),
     };
     if let Err(e) = result {
@@ -176,8 +182,10 @@ fn resolve(
             let toml_str = toml::to_string(table).map_err(|e| ReplicaError::Config {
                 detail: e.to_string(),
             })?;
+            // A TOML error quotes the offending line, and the merged config can
+            // carry a `database.url` with a password in it.
             toml::from_str::<AutumnConfig>(&toml_str).map_err(|e| ReplicaError::Config {
-                detail: e.to_string(),
+                detail: autumn_web::replication::redact_credentials(&e.to_string()),
             })?
         }
         None => AutumnConfig::default(),
@@ -202,21 +210,34 @@ impl Loaded {
         segment::root_prefix(self.replication.prefix.as_deref(), &self.profile)
     }
 
-    /// The app's blob-storage bucket, for the distinct-destination guard.
-    fn storage_bucket(&self) -> Option<String> {
-        // Only a genuinely S3-backed app has a blob-storage bucket to clash
-        // with; a leftover `[storage.s3]` bucket on the local backend is inert
-        // (the same rule `autumn db backup --upload` applies).
-        if self.config.storage.backend == autumn_web::storage::StorageBackend::S3 {
-            return self.config.storage.s3.bucket.clone();
+    /// The app's own blob-storage destination, for the distinct-destination
+    /// guard.
+    ///
+    /// Only a genuinely S3-backed app has one to clash with; a leftover
+    /// `[storage.s3]` bucket on the local backend is inert (the same rule
+    /// `autumn db backup --upload` applies).
+    fn storage_destination(&self) -> Option<(String, Option<String>)> {
+        if self.config.storage.backend != autumn_web::storage::StorageBackend::S3 {
+            return None;
         }
-        None
+        self.config
+            .storage
+            .s3
+            .bucket
+            .clone()
+            .map(|bucket| (bucket, self.config.storage.s3.endpoint.clone()))
     }
 
     fn destination(&self) -> Result<std::sync::Arc<dyn ReplicaDestination>, ReplicaError> {
+        let storage = self.storage_destination();
         autumn_web::replication::build_destination(
             &self.replication,
-            self.storage_bucket().as_deref(),
+            storage.as_ref().map(|(bucket, endpoint)| {
+                autumn_web::replication::StorageDestination {
+                    bucket,
+                    endpoint: endpoint.as_deref(),
+                }
+            }),
         )
         .map_err(|e| ReplicaError::Config {
             detail: e.to_string(),
@@ -232,6 +253,48 @@ impl Loaded {
             .as_deref())?;
         autumn_web::replication::database_file(url)
     }
+}
+
+/// Create an unpredictable, owner-only scratch directory under `base`.
+fn create_private_dir(base: &std::path::Path) -> Result<PathBuf, ReplicaError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    for _ in 0..8 {
+        let candidate = base.join(format!(".autumn-replica-verify-{:016x}", fastrand_u64()));
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(ReplicaError::Restore {
+                    detail: format!(
+                        "could not create a scratch directory under {}: {e}",
+                        base.display()
+                    ),
+                });
+            }
+        }
+    }
+    Err(ReplicaError::Restore {
+        detail: format!(
+            "could not find an unused scratch directory name under {}",
+            base.display()
+        ),
+    })
+}
+
+/// A non-cryptographic 64-bit value, good enough to make a scratch directory
+/// name unpredictable to another local process. `autumn-cli` does not depend on
+/// `rand`, and this needs no cryptographic strength — the directory is created
+/// with `O_EXCL`-equivalent semantics and mode 0700, so the name is a nuisance
+/// barrier, not the security boundary.
+fn fastrand_u64() -> u64 {
+    use std::hash::{BuildHasher as _, RandomState};
+    RandomState::new().hash_one(std::process::id())
 }
 
 /// Parse `--timestamp` as RFC 3339.
@@ -250,23 +313,30 @@ fn run_restore(
     timestamp: Option<&str>,
     output: Option<&PathBuf>,
     force: bool,
+    overwrite: bool,
 ) -> Result<(), ReplicaError> {
     let loaded = load(profile)?;
     let target = parse_timestamp(timestamp)?;
 
-    // Same production guard as `autumn db drop` / `autumn db restore` (#1595).
-    crate::db::guard_destructive_public(&loaded.profile, force).map_err(|()| {
-        ReplicaError::ProductionRefused {
-            profile: loaded.profile.clone(),
-        }
-    })?;
-
-    let destination = output
+    let explicit_output = output.is_some();
+    let destination_path = output
         .cloned()
-        .or_else(|| loaded.configured_database_file());
-    let destination_path = destination.ok_or(ReplicaError::NoOutput)?;
-    // Overwriting an existing database is destructive whatever the profile.
-    if destination_path.exists() && !force {
+        .or_else(|| loaded.configured_database_file())
+        .ok_or(ReplicaError::NoOutput)?;
+
+    // The production guard applies to writing over the app's OWN database — the
+    // destructive act (#1595). Restoring to an explicit `--output` writes nothing
+    // the app uses, so it is not gated; the overwrite guard below still is.
+    if !explicit_output {
+        crate::db::guard_destructive_public(&loaded.profile, force).map_err(|()| {
+            ReplicaError::ProductionRefused {
+                profile: loaded.profile.clone(),
+            }
+        })?;
+    }
+    // Replacing an existing database file is destructive whatever the profile,
+    // and needs its own opt-in: `--force` is about the profile, not about data.
+    if destination_path.exists() && !overwrite {
         return Err(ReplicaError::WouldOverwrite {
             path: destination_path.display().to_string(),
         });
@@ -307,39 +377,49 @@ fn run_restore(
     Ok(())
 }
 
-fn run_status(profile: Option<&str>) -> Result<(), ReplicaError> {
+fn run_status(profile: Option<&str>, json: bool) -> Result<(), ReplicaError> {
     let loaded = load(profile)?;
     let remote = loaded.destination()?;
     let root = loaded.root();
     eprintln!("  \u{2139} source: {}", remote.describe());
     eprintln!("  \u{2139} prefix: {root}");
 
-    match restore::plan(remote.as_ref(), &root, None) {
-        Ok(plan) => {
-            let now = Utc::now();
-            let lag = now
-                .signed_duration_since(plan.effective)
-                .num_seconds()
-                .max(0);
-            println!("generation      {}", plan.generation);
-            println!(
-                "opened          {}",
-                plan.generation_started_at.to_rfc3339()
-            );
-            println!("segments        {}", plan.segments.len());
-            println!("current as of   {}", plan.effective.to_rfc3339());
-            println!("replication lag {lag}s");
-            println!(
-                "retention       {} hour(s)",
-                loaded.replication.retention_hours
-            );
-            println!("rpo             {}s", loaded.replication.rpo_secs);
-            Ok(())
-        }
-        Err(e) => Err(ReplicaError::Restore {
-            detail: e.to_string(),
-        }),
+    let plan = restore::plan(remote.as_ref(), &root, None).map_err(|e| ReplicaError::Restore {
+        detail: e.to_string(),
+    })?;
+    let lag = Utc::now()
+        .signed_duration_since(plan.effective)
+        .num_seconds()
+        .max(0);
+    if json {
+        // Machine-readable on stdout: this is the monitoring surface, and an
+        // operator should not have to parse a padded table.
+        let report = serde_json::json!({
+            "generation": plan.generation,
+            "opened": plan.generation_started_at.to_rfc3339(),
+            "segments": plan.segments.len(),
+            "current_as_of": plan.effective.to_rfc3339(),
+            "replication_lag_seconds": lag,
+            "retention_hours": loaded.replication.retention_hours,
+            "rpo_seconds": loaded.replication.rpo_secs,
+        });
+        println!("{report}");
+        return Ok(());
     }
+    println!("generation      {}", plan.generation);
+    println!(
+        "opened          {}",
+        plan.generation_started_at.to_rfc3339()
+    );
+    println!("segments        {}", plan.segments.len());
+    println!("current as of   {}", plan.effective.to_rfc3339());
+    println!("replication lag {lag}s");
+    println!(
+        "retention       {} hour(s)",
+        loaded.replication.retention_hours
+    );
+    println!("rpo             {}s", loaded.replication.rpo_secs);
+    Ok(())
 }
 
 fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
@@ -348,16 +428,18 @@ fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
     let root = loaded.root();
     eprintln!("  \u{2139} source: {}", remote.describe());
 
-    let scratch = std::env::temp_dir().join(format!(
-        "autumn-replica-verify-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-    ));
+    // A verification restores the WHOLE database, so the scratch directory holds
+    // a complete copy of production data. It therefore goes next to where the
+    // database belongs (not a world-readable shared temp directory), under an
+    // unpredictable name, created 0700 so no other local user can read it.
+    let base = loaded
+        .configured_database_file()
+        .and_then(|db| db.parent().map(std::path::Path::to_path_buf))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let scratch = create_private_dir(&base)?;
     let result = restore::restore(remote.as_ref(), &root, None, &scratch.join("verified.db"));
-    let cleanup = std::fs::remove_dir_all(&scratch);
-    let _ = cleanup;
+    let _ = std::fs::remove_dir_all(&scratch);
 
     match result {
         Ok(outcome) => {
