@@ -18,12 +18,19 @@
 //! `idempotency_middleware::test_app_wide_generated_route_fails_closed_for_opaque_tenant_scope`).
 //! These tests hold the framework's own tenancy middleware to the same bar.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_web::config::AutumnConfig;
-use autumn_web::session::Session;
+use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
+use autumn_web::session::{
+    MemoryStore as SessionMemoryStore, Session, SessionConfig, SessionLayer, SessionStore,
+};
+use autumn_web::tenancy::tenancy_middleware;
 use autumn_web::test::TestApp;
-use autumn_web::{post, public, routes};
+use autumn_web::{AppState, post, public, routes};
+use axum::body::Body;
+use tower::ServiceExt as _;
 
 /// Sentinel-bearing mutation: the body names the tenant the request resolved
 /// to, so a replay across tenants is visible in the response text alone.
@@ -294,5 +301,88 @@ async fn session_tenancy_public_path_alias_stays_tenantless() {
         retry.text(),
         "logged-in-1",
         "a retry to an always-exempt public path must replay the cached login, not re-run it"
+    );
+}
+
+static MANUAL_COMPOSITION_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+async fn manual_composition_switch_handler(session: Session) -> String {
+    let calls = MANUAL_COMPOSITION_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.insert("tenant_id", "org-b").await;
+    format!("switched-{calls}")
+}
+
+/// `SessionLayer`, [`tenancy_middleware`] and [`IdempotencyLayer`] are all
+/// public building blocks an app can compose directly as plain tower layers
+/// instead of going through `AppBuilder` — exactly the pattern
+/// `idempotency_middleware.rs`'s own raw-router tests already use. That
+/// composition needs `with_tenancy_session_key` set explicitly (`AppBuilder`
+/// sets it automatically); this pins that it actually works when set, so the
+/// setter being `pub` isn't a dead knob nothing can reach.
+#[tokio::test]
+async fn manually_composed_stack_uses_finalized_tenant_after_switch() {
+    MANUAL_COMPOSITION_HANDLER_CALLS.store(0, Ordering::SeqCst);
+
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    "session".clone_into(&mut config.tenancy.source);
+
+    let state = AppState::for_test();
+    state.insert_extension(config);
+
+    let session_store = SessionMemoryStore::new();
+    let mut seed = std::collections::HashMap::new();
+    seed.insert("tenant_id".to_owned(), "org-a".to_owned());
+    session_store
+        .save("manual-session", seed)
+        .await
+        .expect("seeding the session store must succeed");
+
+    let idempotency_store: Arc<dyn IdempotencyStore> = Arc::new(MemoryIdempotencyStore::new(
+        std::time::Duration::from_secs(60),
+    ));
+
+    let app = axum::Router::new()
+        .route(
+            "/switch-org",
+            axum::routing::post(manual_composition_switch_handler),
+        )
+        .layer(IdempotencyLayer::new(idempotency_store))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenancy_middleware,
+        ))
+        .layer(
+            SessionLayer::new(session_store, SessionConfig::default())
+                .with_tenancy_session_key(Some(Arc::from("tenant_id"))),
+        );
+
+    let request = || {
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/switch-org")
+            .header("idempotency-key", "manual-switch-key")
+            .header("cookie", "autumn.sid=manual-session")
+            .body(Body::empty())
+            .expect("request must build")
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"switched-1");
+
+    let retry = app.oneshot(request()).await.unwrap();
+    assert_eq!(retry.status(), axum::http::StatusCode::OK);
+    let retry_body = axum::body::to_bytes(retry.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        &retry_body[..],
+        b"switched-1",
+        "a retry after an org switch must replay through a manually composed SessionLayer + \
+         tenancy_middleware + IdempotencyLayer stack too, not just AppBuilder's"
     );
 }

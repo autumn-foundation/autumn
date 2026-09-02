@@ -787,6 +787,16 @@ impl<S: SessionStore> SessionLayer<S> {
     /// Name of the session key `[tenancy] source = "session"` reads to
     /// resolve the tenant (`[tenancy] session_key`, e.g. `"tenant_id"`).
     ///
+    /// `AppBuilder` sets this automatically when `[tenancy] source ==
+    /// "session"`. An app that composes `SessionLayer`,
+    /// [`crate::tenancy::tenancy_middleware`] and
+    /// [`crate::idempotency::IdempotencyLayer`] directly as plain tower
+    /// layers, rather than through `AppBuilder`, must set it too if it also
+    /// uses session-sourced tenancy — otherwise this composition is
+    /// indistinguishable from one that doesn't use tenancy, and the deferred
+    /// idempotency alias falls back to the tenant captured before the handler
+    /// ran.
+    ///
     /// When set, a request that mutates this key — an org switch, a
     /// tenant-scoped login — has its deferred idempotency alias (see
     /// [`crate::idempotency::add_deferred_session_replay_key`]) keyed by the
@@ -795,7 +805,7 @@ impl<S: SessionStore> SessionLayer<S> {
     /// pre-mutation tenant's storage slot, misses the cached response, and
     /// re-executes the mutation.
     #[must_use]
-    pub(crate) fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
+    pub fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
         self.tenancy_session_key = key;
         self
     }

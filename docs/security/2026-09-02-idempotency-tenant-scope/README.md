@@ -207,3 +207,34 @@ path, tenancy disabled, or a non-session source) forces the override back to
 request to that path will compute. The org-switch case from the first
 follow-up is untouched: `/switch-org` is not a `public_paths` route, so its
 primary key already carries a tenant, and the override still applies.
+
+## Follow-up 3: the fix was unreachable outside `AppBuilder` (same day, pre-merge)
+
+A third Codex pass caught that `with_tenancy_session_key` — the setter Follow-up
+1 added — was `pub(crate)`. `SessionLayer`, [`tenancy_middleware`] and
+`IdempotencyLayer` are all public building blocks; `autumn/tests/integration/
+idempotency_middleware.rs`'s own tests already compose them directly as plain
+tower layers instead of going through `AppBuilder`
+(`test_session_rotation_replays_for_old_and_new_cookie_scopes` is exactly this
+shape). An app doing the same with session-sourced tenancy has no way to call
+a `pub(crate)` method, so its build silently keeps computing byte-identical
+keys to before Follow-up 1 — the original alias-staleness bug, fully intact,
+for a documented composition path `AppBuilder` isn't required for.
+
+**Reproduction:** with the setter left `pub(crate)`,
+`cargo check -p autumn-web --test integration_tests` fails outright —
+`error[E0624]: method \`with_tenancy_session_key\` is private` — because the
+integration test crate, like any external consumer, only sees `autumn-web`'s
+public API. See `session-alias-manual-composition-red.txt`. Green:
+`manually_composed_stack_uses_finalized_tenant_after_switch` in
+`autumn/tests/integration/idempotency_tenant_scope.rs`, composing
+`SessionLayer` + `tenancy_middleware` + `IdempotencyLayer` by hand (see
+`session-alias-manual-composition-green.txt`).
+
+**Fix:** `with_tenancy_session_key` is now `pub`, documented as the knob a
+manual composition must set for session-sourced tenancy, mirroring
+`SessionLayer`'s existing public builders (`with_entropy`,
+`with_signing_keys`). No existing signature changed — this is a pure addition,
+the same shape as those two methods.
+
+[`tenancy_middleware`]: ../../../autumn/src/tenancy.rs
