@@ -353,6 +353,7 @@ seo.robots.additional_rules
 seo.robots.allow_all
 seo.robots.sitemap_url
 server
+server.capacity_contract
 server.host
 server.max_concurrent_requests
 server.port
