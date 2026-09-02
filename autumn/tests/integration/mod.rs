@@ -223,6 +223,8 @@ mod problem_details;
 mod process_role_worker_gating;
 mod push_end_to_end;
 mod push_router;
+#[cfg(feature = "db")]
+mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]
