@@ -388,6 +388,20 @@ fn validate_endpoint(endpoint: &str) -> Result<(), DestinationError> {
             ),
         });
     }
+    // Same reasoning for a query or a fragment. `send` appends the canonical
+    // path to the endpoint string, so `https://host?tenant=a` becomes
+    // `https://host?tenant=a/bucket/key` on the wire while SigV4 signs
+    // `/bucket/key` with an empty canonical query: the server sees a different
+    // path and query than was signed, and every request 403s — after setup
+    // reported success.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(DestinationError::Rejected {
+            detail: format!(
+                "endpoint {endpoint:?} must be scheme + host[:port] only \
+                 (no query string or fragment)"
+            ),
+        });
+    }
     // Credentials belong in the environment variables config NAMES, never in the
     // endpoint: an endpoint string is logged at startup, printed by `autumn db
     // replica status`, and stored in the health indicator's `destination` field.

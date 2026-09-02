@@ -141,6 +141,16 @@ impl ReplicationStatus {
         });
     }
 
+    /// Record a tick that succeeded but left committed data un-shipped.
+    ///
+    /// Deliberately does not touch `last_success_at`: lag is measured from the
+    /// last moment the destination was actually caught up, so a run of slow
+    /// uploads that never drains the tail keeps lag growing instead of resetting
+    /// it on every tick.
+    pub fn record_tick_behind(&self, pending_bytes: u64) {
+        self.with(|s| s.pending_bytes = pending_bytes);
+    }
+
     /// Record a tick that completed with nothing left un-shipped.
     pub fn record_tick_ok(&self, pending_bytes: u64, at: DateTime<Utc>) {
         self.with(|s| {

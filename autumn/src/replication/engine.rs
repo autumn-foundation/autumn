@@ -479,10 +479,15 @@ impl Replicator {
             report.bytes = shipped.1;
         }
 
-        let pending = self
-            .state
-            .as_ref()
-            .map_or(0, |st| wal_len.saturating_sub(st.shipped_offset));
+        // Re-measured, never reused from the top of the tick. `wal_len` was
+        // sampled before an upload that can take seconds, so commits made during
+        // the transfer are absent from it — reporting that stale figure as
+        // `pending_bytes`, and stamping a fresh `last_success_at` beside it, made
+        // `/actuator/health` show near-zero lag while the destination was a whole
+        // transfer behind. A run of slow uploads could hold the indicator `Up`
+        // indefinitely past the configured RPO. (`maybe_checkpoint` already
+        // re-measures for the same reason; the status path did not.)
+        let (pending, caught_up) = self.settled_tail(&wal_path);
         report.pending_bytes = pending;
 
         // Read *after* anything this tick may have opened or shipped, never
@@ -509,8 +514,49 @@ impl Replicator {
             Err(e) => tracing::warn!(error = %e, "SQLite replica retention sweep failed"),
         }
 
-        self.status.record_tick_ok(pending, self.clock.now());
+        if caught_up {
+            self.status.record_tick_ok(pending, self.clock.now());
+        } else {
+            self.status.record_tick_behind(pending);
+        }
         Ok(report)
+    }
+
+    /// Re-measure the tail after this tick's uploads: `(pending_bytes, caught_up)`.
+    ///
+    /// Only a *committed* transaction counts as owed. Bytes from a write still
+    /// in flight are not data the destination is behind on, so treating any
+    /// non-zero tail as "behind" would trip the health indicator on every busy
+    /// database. Scanning tells the two apart.
+    ///
+    /// Every failure path answers "caught up". An unreadable or re-salted `-wal`
+    /// is not evidence that the replica is behind, and inventing lag from it
+    /// would raise an alarm nothing can clear; the tick's own error paths
+    /// already record genuine failures.
+    fn settled_tail(&self, wal_path: &Path) -> (u64, bool) {
+        let Some(state) = self.state.as_ref() else {
+            return (0, true);
+        };
+        let wal_len = std::fs::metadata(wal_path).map_or(0, |m| m.len());
+        let pending = wal_len.saturating_sub(state.shipped_offset);
+        if pending == 0 {
+            return (0, true);
+        }
+        let (Ok(Some(header)), Some(cursor)) = (read_wal_header(wal_path, wal_len), state.cursor)
+        else {
+            return (pending, true);
+        };
+        if state.salt != Some(header.salt()) {
+            return (pending, true);
+        }
+        let Ok(buffer) = read_range(wal_path, state.shipped_offset, wal_len) else {
+            return (pending, true);
+        };
+        let scan_at = usize::try_from(cursor.offset.saturating_sub(state.shipped_offset))
+            .unwrap_or(usize::MAX);
+        let committed = wal::scan_from(&header, &cursor, buffer.get(scan_at..).unwrap_or(&[]))
+            .is_ok_and(|outcome| outcome.last_commit_end > state.shipped_offset);
+        (pending, !committed)
     }
 
     /// Checkpoint the WAL when it is safe and due, returning whether it happened.
@@ -834,7 +880,25 @@ impl Replicator {
             return Ok((0, 0));
         }
 
-        let buffer = read_range(wal_path, state.shipped_offset, wal_len)?;
+        // Never read past what the decoder will accept. `decode_segment` refuses
+        // any `uncompressed_len` over `MAX_SEGMENT_BYTES` — a bound it needs,
+        // because the periodic verifier inflates segments inside the app process
+        // — but nothing capped the *write* side. After an outage, a long sync
+        // interval, or one enormous transaction, this read took the whole
+        // committed tail and published a segment that no restore could ever
+        // decode, while the tick went on to checkpoint the local WAL away: the
+        // generation is then unrestorable until the next base snapshot.
+        //
+        // Capping the window instead makes the scan below stop at the last commit
+        // that fits, and the next tick ships the rest. A single transaction
+        // larger than the cap ships nothing, which grows lag and trips the health
+        // indicator — loudly stuck rather than quietly unrestorable.
+        let window_end = wal_len.min(
+            state
+                .shipped_offset
+                .saturating_add(segment::MAX_SEGMENT_BYTES),
+        );
+        let buffer = read_range(wal_path, state.shipped_offset, window_end)?;
         let scan_at = usize::try_from(cursor.offset.saturating_sub(state.shipped_offset))
             .unwrap_or(usize::MAX);
         let outcome = wal::scan_from(header, &cursor, buffer.get(scan_at..).unwrap_or(&[]))?;
@@ -1047,9 +1111,37 @@ fn verify_replica(
         std::process::id(),
         rand::random::<u64>()
     ));
+    // Created here, owner-only, rather than left to `restore`'s `create_dir_all`:
+    // that lands 0755 under the usual umask, and what goes inside is a complete
+    // copy of production. On a host where the database file is protected but its
+    // parent directory is traversable, every verification would hand a readable
+    // snapshot to any other local user — and a crash would leave it there. The
+    // CLI verifier already creates its scratch directory this way.
+    if let Err(e) = create_private_dir(&scratch) {
+        return Err(RestoreError::Io {
+            op: "create the verification scratch directory",
+            detail: e.to_string(),
+        });
+    }
     let outcome = restore::restore(destination, root, None, &scratch.join("verified.db"));
     let _ = std::fs::remove_dir_all(&scratch);
     outcome
+}
+
+/// Create a directory only its owner can enter, on platforms that have modes.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// Read `PRAGMA journal_mode`.
