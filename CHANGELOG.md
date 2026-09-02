@@ -845,6 +845,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::reexports::redis` so callers can name the returned
   `redis::Client` without adding their own dependency. Issue #2172.
 
+### Security
+
+- **The idempotency cache is now partitioned by the resolved tenant:** an app
+  that turned on Autumn's multi-tenancy (`[tenancy] enabled = true`) *and*
+  `AppBuilder::idempotent()` shared one cache slot between tenants. The storage
+  key namespaced by method, request target and a cookie-session principal
+  digest — and for `header`, `subdomain` or `jwt` tenancy two requests from
+  different tenants differ in none of those (the tenant header and `Host` are
+  deliberately excluded from the key, and a token-authenticated API has no
+  cookie session). A request that resolved to tenant B, carrying the same
+  `Idempotency-Key` and body as an earlier tenant-A mutation, was answered with
+  **tenant A's stored response**: macro-generated routes replay *through* their
+  own guards, which check roles and scopes but never tenant identity, so the
+  handler — and every `tenant_scoped` repository predicate inside it — never
+  ran, and tenant B's own write was silently suppressed. The router already
+  forced the fail-closed replay path whenever an app resolved tenants in its own
+  `AppBuilder::layer`; the framework's own tenancy middleware was not covered by
+  that check. The key now carries the tenant as the tenancy middleware resolved
+  it (from the `CURRENT_TENANT` task-local, not from the wire, so a legitimate
+  same-tenant retry still replays). Apps that do not use tenancy compute
+  byte-identical keys to before, so no cached entry is invalidated on upgrade.
+  See `docs/security/2026-09-02-idempotency-tenant-scope/`.
+
 ### Fixed
 
 - **ACME config: `autumn doctor` and the runtime now reject the same two

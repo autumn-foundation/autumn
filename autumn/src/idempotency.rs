@@ -95,23 +95,61 @@ fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u
     hasher.update(b";");
 }
 
-/// Namespace the cache key by method, path, a stable principal digest, and the
-/// client-supplied idempotency key.
+/// The tenant Autumn's own tenancy middleware resolved for the in-flight
+/// request, if any.
+///
+/// Read from the [`CURRENT_TENANT`](crate::tenancy::CURRENT_TENANT) task-local
+/// rather than from a request header, which is what makes it safe to key on:
+/// the value is the framework's *resolution* under `[tenancy] source`
+/// (`header`, `subdomain`, `session`, `jwt`), not a string the client can
+/// restate at will. A legitimate retry from the same tenant therefore
+/// reproduces the same component and still finds its cached response, while a
+/// request that resolved to a different tenant lands in a different slot
+/// instead of replaying that tenant's stored mutation.
+///
+/// `None` — tenancy disabled, or a `[tenancy] public_paths` route the
+/// middleware exempts before it scopes anything — pushes no component at all,
+/// so every storage key an app without tenancy computes is byte-identical to
+/// the one it computed before this existed.
+fn current_tenant_scope() -> Option<String> {
+    crate::tenancy::CURRENT_TENANT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// Namespace the cache key by method, path, the resolved tenant, a stable
+/// principal digest, and the client-supplied idempotency key.
 ///
 /// Namespacing by method+path prevents cross-endpoint cache collisions (P2).
 /// Namespacing by session scope prevents cross-principal collisions (P1) for
-/// cookie-backed authenticated sessions. Request headers, including
-/// `Authorization`, are intentionally excluded: client-controlled headers must
-/// not let a retry force a fresh miss after a successful mutation. Opaque route
-/// layers that resolve tenants, bearer principals, or policy state must use the
-/// fail-closed replay path instead of storage-key partitioning. Each component
-/// is length-delimited inside a SHA-256 digest so raw `:` bytes in paths or
-/// client-controlled keys cannot synthesize another storage key.
+/// cookie-backed authenticated sessions, and namespacing by the
+/// framework-resolved tenant prevents them across tenants — for `header`,
+/// `subdomain` and `jwt` tenancy the two requests are otherwise
+/// indistinguishable to this key (same method, same target, and for a
+/// token-authenticated API the same empty session scope), so tenant B replaying
+/// tenant A's key would be served tenant A's stored response with the handler —
+/// and every `tenant_scoped` repository predicate inside it — never running.
+///
+/// Request headers, including `Authorization` *and* the configured tenant
+/// header, are intentionally excluded: client-controlled headers must not let a
+/// retry force a fresh miss after a successful mutation. That is exactly why
+/// the tenant is taken from the middleware's task-local resolution rather than
+/// from the wire. Opaque route layers that resolve their own tenants, bearer
+/// principals, or policy state must still use the fail-closed replay path
+/// instead of storage-key partitioning. Each component is length-delimited
+/// inside a SHA-256 digest so raw `:` bytes in paths or client-controlled keys
+/// cannot synthesize another storage key.
 #[derive(Clone)]
 struct StorageKeyContext {
     idempotency_key: String,
     method: Method,
     target: String,
+    /// Captured once, on the request path, while the tenancy middleware's
+    /// task-local scope is still established — the alias keys computed later
+    /// (see [`DeferredIdempotencyCommit::add_session_alias`]) must land in the
+    /// same tenant's namespace as the primary key.
+    tenant: Option<String>,
 }
 
 impl StorageKeyContext {
@@ -124,6 +162,7 @@ impl StorageKeyContext {
             idempotency_key,
             method: parts.method.clone(),
             target,
+            tenant: current_tenant_scope(),
         }
     }
 
@@ -133,6 +172,7 @@ impl StorageKeyContext {
             self.method.as_str(),
             &self.target,
             session_id,
+            self.tenant.as_deref(),
         )
     }
 }
@@ -142,6 +182,7 @@ fn build_storage_key(
     method: &str,
     target: &str,
     session_id: Option<&str>,
+    tenant: Option<&str>,
 ) -> String {
     let principal = principal_scope_digest(session_id);
     let mut hasher = sha2::Sha256::new();
@@ -149,6 +190,12 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
+    // Pushed only when a tenant was resolved, so an app that does not use
+    // tenancy keeps the exact keys it had before — no cache-wide miss, and no
+    // duplicate execution of a mutation retried across an upgrade.
+    if let Some(tenant) = tenant {
+        push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
+    }
     push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
     format!("v2:{}", hex_lower(hasher.finalize()))
 }
@@ -2061,6 +2108,39 @@ mod tests {
         push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
         push_storage_key_component(&mut hasher, "idempotency-key", idempotency_key.as_bytes());
         format!("v2:{}", hex_lower(hasher.finalize()))
+    }
+
+    /// An app that does not use tenancy must keep byte-identical storage keys,
+    /// so upgrading cannot turn an in-flight client retry into a second
+    /// execution of an already-committed mutation.
+    #[test]
+    fn storage_key_without_a_resolved_tenant_is_unchanged() {
+        assert_eq!(
+            build_storage_key("pay-once", "POST", "/payments", None, None),
+            expected_storage_key("POST", "/payments", None, "pay-once")
+        );
+    }
+
+    /// Two tenants sharing a key, a target and (for a token-authenticated API)
+    /// an empty session scope must not share a cache slot.
+    #[test]
+    fn storage_key_partitions_by_resolved_tenant() {
+        let tenant_a = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-a"));
+        let tenant_b = build_storage_key("pay-once", "POST", "/payments", None, Some("tenant-b"));
+        let untenanted = build_storage_key("pay-once", "POST", "/payments", None, None);
+
+        assert_ne!(tenant_a, tenant_b, "tenants must not share a storage key");
+        assert_ne!(tenant_a, untenanted);
+        assert_ne!(tenant_b, untenanted);
+    }
+
+    /// The tenant component is length-delimited like every other one, so a
+    /// tenant id carrying the separator cannot spell another tenant's slot.
+    #[test]
+    fn storage_key_tenant_component_is_length_delimited() {
+        let split = build_storage_key("pay-once", "POST", "/payments", None, Some("a:b"));
+        let shifted = build_storage_key("pay-once:a", "POST", "/payments", None, Some("b"));
+        assert_ne!(split, shifted);
     }
 
     #[test]
