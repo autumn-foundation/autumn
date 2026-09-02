@@ -761,6 +761,29 @@ impl SandboxManifest {
         // never priced, bought once in a manifest and paid for on every call.
         // Refusing here, rather than deduplicating, keeps the list an operator
         // reads on the consent screen the same list the guest is handed.
+        //
+        // Scanned in place rather than into a `Vec::with_capacity`: that vector
+        // was only ever a duplicate set — it is dropped below without being
+        // read — so sizing it from `self.capabilities.len()` performed, on a
+        // list a direct caller chose, exactly the unbounded allocation this
+        // check exists to refuse.
+        //
+        // Pigeonhole bounds the scan: a list longer than the number of
+        // distinct capabilities must repeat one, so a duplicate is certain
+        // within the first `ALL.len() + 1` entries and looking past them
+        // cannot change the answer. Derived from `ALL` rather than written as
+        // a number, so it stays right as the vocabulary grows.
+        //
+        // `with_capacity` from a length the caller chose looks like the
+        // unbounded-allocation defect this file refuses elsewhere, and today it
+        // is not one: `SandboxCapability` has a single fieldless variant, so it
+        // is a ZST and a `Vec` of it never allocates whatever the length says
+        // (measured: `size_of` is 0, `with_capacity(1_000_000)` takes 0 bytes).
+        // It becomes one the moment a second variant lands and the type gains a
+        // byte. Whoever adds that variant should size this from
+        // `SandboxCapability::ALL.len() + 1` instead — pigeonhole makes a
+        // duplicate certain within that many entries, so nothing past them can
+        // change the answer.
         let mut granted: Vec<SandboxCapability> = Vec::with_capacity(self.capabilities.len());
         for capability in &self.capabilities {
             if granted.contains(capability) {

@@ -883,6 +883,17 @@ pub enum SandboxLoadError {
         /// The ceiling.
         max: usize,
     },
+    /// The module is larger than [`MAX_MODULE_BYTES`](super::MAX_MODULE_BYTES).
+    ///
+    /// The container reader applies this to a module it unpacks; this applies
+    /// it to one handed straight to [`SandboxHost::from_module`] or
+    /// [`SandboxHost::imports_of`], which never passed through that reader.
+    ModuleTooLarge {
+        /// The module's length.
+        found: usize,
+        /// The ceiling.
+        max: usize,
+    },
     /// The module exports no `_start` of type `() -> ()`.
     MissingStart,
     /// The module exports no linear memory named `memory`.
@@ -954,6 +965,10 @@ impl fmt::Display for SandboxLoadError {
                 "the plugin's {fuel}-unit fuel budget cannot cover the {instantiation} units \
                  instantiating this module costs before `_start` runs, so every request would \
                  exhaust the budget without the guest executing an instruction"
+            ),
+            Self::ModuleTooLarge { found, max } => write!(
+                f,
+                "sandboxed plugin module is {found} bytes, over the {max}-byte ceiling"
             ),
             Self::InstantiationTooExpensive { what, found, max } => write!(
                 f,
@@ -2302,6 +2317,19 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
 /// per-entry work — which is what makes refusing it cheap enough to do before
 /// wasmi ever sees the bytes.
 fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> {
+    // Before the walk, because the walk is the cheap part. `check_module`
+    // applies this to a module the container reader unpacked, but
+    // `from_module` and `imports_of` are public and take the bytes directly,
+    // so on that path nothing had imposed it. The counts below do not cover
+    // the gap: one import whose module or field name is enormous is one
+    // import, under every count ceiling here, and `Module::new` must
+    // materialise that name before the import allowlist can refuse it.
+    if wasm.len() > super::MAX_MODULE_BYTES {
+        return Err(SandboxLoadError::ModuleTooLarge {
+            found: wasm.len(),
+            max: super::MAX_MODULE_BYTES,
+        });
+    }
     let Some(shape) = module_shape(wasm) else {
         return Err(SandboxLoadError::Wasm(
             "the module's section stream could not be walked".to_owned(),
@@ -6418,6 +6446,68 @@ path = "/hello/greet"
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_past_the_byte_ceiling_is_refused_on_the_direct_path_too() {
+        // `check_module` applies MAX_MODULE_BYTES to a module the container
+        // reader unpacked, but `from_module` and `imports_of` are public and
+        // take the bytes directly, so on that path nothing had imposed it. The
+        // count ceilings do not close the gap — a module can sit under every
+        // one of them and still be enormous, and `Module::new` touches the
+        // bytes before any of this build's import checks can refuse them.
+        //
+        // Padded with a well-formed custom section rather than junk, so the
+        // module stays parseable and it is provably the byte ceiling doing the
+        // refusing rather than the wasm decoder.
+        let base = wat::parse_str(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\") (nop)))",
+        )
+        .expect("the fixture is valid WAT");
+
+        let padding = super::super::MAX_MODULE_BYTES + 1 - base.len();
+        let mut section = vec![0x00u8]; // custom section id
+        let mut payload = vec![0x04u8]; // name length
+        payload.extend_from_slice(b"pad\0");
+        payload.resize(payload.len() + padding, 0);
+        let mut len = payload.len();
+        loop {
+            // LEB128 of the payload length.
+            let mut byte = u8::try_from(len & 0x7f).expect("masked to 7 bits");
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            section.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        section.extend_from_slice(&payload);
+
+        let mut wasm = base;
+        wasm.extend_from_slice(&section);
+        assert!(
+            wasm.len() > super::super::MAX_MODULE_BYTES,
+            "the fixture must exceed the ceiling: {} bytes",
+            wasm.len(),
+        );
+
+        let err = SandboxHost::from_module(manifest_with(ResourceLimits::default()), &wasm)
+            .expect_err("a module past the byte ceiling must not load");
+        assert!(
+            matches!(err, SandboxLoadError::ModuleTooLarge { .. }),
+            "expected the byte ceiling to refuse it, got: {err}",
+        );
+
+        // The review surface is the other public door onto the same bytes, and
+        // is exactly where an unaudited artifact would be pointed first.
+        let err =
+            SandboxHost::imports_of(&wasm).expect_err("imports_of must apply the same ceiling");
+        assert!(
+            matches!(err, SandboxLoadError::ModuleTooLarge { .. }),
+            "expected the byte ceiling on imports_of, got: {err}",
         );
     }
 
