@@ -146,6 +146,20 @@ pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
     std::process::exit(code);
 }
 
+/// The refusal printed when the daemon lifecycle is invoked on a non-Unix host.
+///
+/// Built from [`crate::platform`] so the tier name, the reason, and the policy
+/// link match `autumn doctor` and the published guide exactly. Compiled on every
+/// platform (not just the one that prints it) so its wording is covered by tests
+/// on Linux/macOS CI rather than only on a Windows runner.
+fn daemon_unsupported_message() -> String {
+    format!(
+        "autumn serve: {}\n  Plain `autumn serve` (foreground) is Tier 1 and runs \
+         natively here.",
+        crate::platform::tier_two_windows_error("autumn serve --daemon / stop / status / restart")
+    )
+}
+
 /// Non-Unix entry point. The background-daemon lifecycle (`--daemon`, `stop`,
 /// `status`, `restart`) is built on Unix domain sockets and POSIX signals and is
 /// not supported here, but a plain foreground `autumn serve` still works: it
@@ -153,11 +167,7 @@ pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
 #[cfg(not(unix))]
 fn run_non_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     if action.is_some() || opts.daemon {
-        eprintln!(
-            "autumn serve: daemon mode (--daemon, stop, status, restart) is \
-             currently supported on Unix only (Linux/macOS). Plain `autumn serve` \
-             runs the app in the foreground on this platform."
-        );
+        eprintln!("{}", daemon_unsupported_message());
         return 1;
     }
     // Plain foreground server: builds and runs on the configured transport,
@@ -1703,6 +1713,34 @@ fn remove_socket_if_not_live(_socket: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    //
+    // The daemon lifecycle is Unix domain sockets plus POSIX signals, so it is
+    // Tier 2 (WSL2). The refusal is compiled on every platform and tested here
+    // so the wording cannot rot on a host that never runs it.
+
+    #[test]
+    fn daemon_refusal_names_the_tier_the_reason_and_the_policy() {
+        let message = daemon_unsupported_message();
+        assert!(message.contains("Tier 2 (WSL2)"), "{message}");
+        assert!(message.contains("Unix domain sockets"), "{message}");
+        assert!(
+            message.contains(crate::platform::POLICY_DOC_URL),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn daemon_refusal_still_points_at_the_native_alternative() {
+        // Foreground `autumn serve` IS Tier 1, and a developer who just hit
+        // this wall needs to know that before reaching for WSL2.
+        let message = daemon_unsupported_message();
+        assert!(
+            message.contains("autumn serve") && message.contains("foreground"),
+            "{message}"
+        );
+    }
+
     use super::*;
 
     fn sample(transport: &str, address: &str, managed_pg: bool) -> AddrFile {

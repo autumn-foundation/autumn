@@ -817,3 +817,335 @@ jobs:
         # `--test-threads=1`: the suite installs a process-global panic hook
         # around the deliberately-panicking `/boom` handler.
         run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
+
+  windows-tier1:
+    name: Windows Tier 1 journey
+    needs: [lint]
+    runs-on: windows-latest
+    # This is the gate behind the platform-support policy (issue #1616, AC-3).
+    #
+    # `cargo test --workspace` on `windows-latest` (the `test` job above) proves
+    # the code COMPILES and its unit tests pass there. It proves nothing about
+    # the journey a Windows developer actually walks — scaffold a project, run
+    # `doctor`, run `setup`, edit a file and watch it rebuild, boot a managed
+    # Postgres cluster and shut it down again. Every Windows regression this
+    # repo has shipped (#1456, #1243, and the orphaned managed-Postgres cluster
+    # this job exists to prevent) lived in exactly that gap.
+    #
+    # Each phase is its own named step so a red run names the broken journey
+    # step in the Actions UI rather than requiring log spelunking. Keep it that
+    # way when adding phases.
+    #
+    # `needs: [lint]` mirrors the `test` job: no point burning a Windows runner
+    # on a branch that does not format or lint.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # The scaffold lives OUTSIDE the checkout. `scripts/check-quickstart.sh`
+      # refuses the opposite arrangement for a reason: a generated project
+      # nested under this repo inherits `.cargo/config.toml` and the workspace
+      # `[patch.crates-io]` by directory ancestry, which would silently change
+      # what the journey is testing.
+      JOURNEY_DIR: ${{ runner.temp }}\journey
+      # Pin the managed cluster's data dir instead of letting it resolve under
+      # `%LOCALAPPDATA%`, so the boot/shutdown assertions can look at a known
+      # path rather than re-deriving autumn's own resolution logic (which would
+      # make the test agree with a bug rather than catch one). Its *parent* is
+      # where the provider writes the cluster superuser password and published
+      # URL, so it stays in RUNNER_TEMP and out of any uploaded artifact.
+      AUTUMN_MANAGED_PG_DATA_DIR: ${{ runner.temp }}\tier1-pg
+      # Point the scaffold's build at the workspace target dir, which
+      # `rust-cache` restores. Without this the job cold-compiles the whole
+      # autumn-web dependency graph a second time on every run — the difference
+      # between a ~30 minute job and one that flirts with its own timeout.
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Build the CLI
+        run: cargo build -p autumn-cli --bin autumn
+
+      - name: "Journey: autumn new (managed Postgres)"
+        # `--bundled-pg` is the managed-Postgres starter — the Tier 1 journey
+        # the policy promises, not a reduced stand-in for it.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          New-Item -ItemType Directory -Force -Path $env:JOURNEY_DIR | Out-Null
+          Set-Location $env:JOURNEY_DIR
+          & $autumn new tier1_app --bundled-pg
+          if ($LASTEXITCODE -ne 0) { throw "autumn new failed with $LASTEXITCODE" }
+          if (-not (Test-Path "tier1_app\Cargo.toml")) { throw "scaffold produced no Cargo.toml" }
+          # Build the scaffold against THIS commit's autumn-web rather than the
+          # published crate, mirroring the workspace [patch.crates-io] override
+          # the generator-conformance suite uses. Without it this job would gate
+          # the last release instead of the pull request.
+          $webPath = ("$env:GITHUB_WORKSPACE\autumn" -replace '\\', '/')
+          Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[patch.crates-io]`nautumn-web = { path = `"$webPath`" }`n"
+
+      - name: "Journey: autumn doctor reports the platform tier"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+          # Grade the JSON, not the exit code: this scaffold legitimately warns
+          # (no database configured yet), and what this step gates is that the
+          # platform_support check RUNS and reports the tier — AC-4.
+          #
+          # No `2>&1`: merging stderr into the stream would let any subprocess
+          # noise turn a passing check into a JSON parse error.
+          $json = & $autumn doctor --json | Out-String
+          Write-Host $json
+          $report = $json | ConvertFrom-Json
+          $check = $report.checks | Where-Object { $_.name -eq 'platform_support' }
+          if (-not $check) { throw "doctor did not run the platform_support check" }
+          if ($check.detail -notmatch 'Tier 1') { throw "platform_support did not report Tier 1: $($check.detail)" }
+          if ($check.detail -notmatch 'Tier 2') { throw "platform_support did not report Tier 2: $($check.detail)" }
+          if ($check.detail -notmatch 'vcpkg') { throw "platform_support did not flag the vcpkg/OpenSSL prerequisite: $($check.detail)" }
+          # `doctor` is itself a Tier 1 command, and `--strict` must not reject a
+          # machine for being a Windows one.
+          # `CheckStatus` serializes lowercase (`#[serde(rename_all)]`).
+          # `doctor` is itself a Tier 1 command, and `--strict` must not reject a
+          # machine for being a Windows one — so this check has to Pass, not warn.
+          if ($check.status -ne 'pass') { throw "platform_support must pass so it cannot fail --strict: $($check.status)" }
+          # The GitHub pwsh wrapper appends `exit $LASTEXITCODE`, so a step that
+          # grades output rather than exit codes must reset it — otherwise the
+          # last native call decides the step result and the grading is moot.
+          exit 0
+
+      - name: "Journey: autumn setup"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+          & $autumn setup
+          if ($LASTEXITCODE -ne 0) { throw "autumn setup failed with $LASTEXITCODE" }
+
+      - name: "Journey: the app builds on Windows"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+          cargo build
+          if ($LASTEXITCODE -ne 0) { throw "the scaffolded app did not build" }
+          # Cargo does not fail on an unused `[patch.crates-io]` — it warns and
+          # builds against the registry. Without this assertion a version skew
+          # between the scaffold template and the workspace would silently turn
+          # this whole job into a gate on the last published release.
+          # `scripts/check-quickstart.sh` makes the same assertion.
+          $lock = Get-Content 'Cargo.lock' -Raw
+          if ($lock -match '(?ms)name = "autumn-web".*?source = "registry') {
+            throw "autumn-web resolved from crates.io — the [patch.crates-io] override did not take"
+          }
+
+      - name: "Journey: managed Postgres boots and shuts down cleanly"
+        # THE regression this whole target exists to prevent, tested at the
+        # runtime seam. The app is started exactly the way `autumn dev` starts
+        # it on Windows — with AUTUMN_SHUTDOWN_SIGNAL_FILE set — and stopped
+        # exactly the way `autumn dev` stops it: by creating that file. A clean
+        # shutdown means the app's `on_shutdown` hook ran, which means the
+        # managed cluster was stopped rather than orphaned. Before #1616 the
+        # only available stop was TerminateProcess, which skipped the hook and
+        # left a postmaster holding the data dir. The next step gates the same
+        # thing end-to-end through `autumn dev` itself.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "$env:GITHUB_WORKSPACE\target\debug\tier1_app.exe"
+          if (-not (Test-Path $app)) { throw "app binary not found at $app" }
+          $signal = "$env:JOURNEY_DIR\stop.signal"
+          Remove-Item -Force -ErrorAction SilentlyContinue $signal
+          $env:AUTUMN_SHUTDOWN_SIGNAL_FILE = $signal
+          $pidfile = "$env:AUTUMN_MANAGED_PG_DATA_DIR\postmaster.pid"
+
+          $proc = Start-Process -FilePath $app -PassThru `
+            -WorkingDirectory "$env:JOURNEY_DIR\tier1_app" `
+            -RedirectStandardOutput "$env:JOURNEY_DIR\app.out" `
+            -RedirectStandardError "$env:JOURNEY_DIR\app.err"
+
+          try {
+            # Boot: wait for the managed cluster's postmaster to claim the data
+            # dir. First boot provisions the cluster (initdb), so allow for it.
+            $deadline = (Get-Date).AddMinutes(8)
+            while (-not (Test-Path $pidfile)) {
+              if ($proc.HasExited) {
+                Get-Content "$env:JOURNEY_DIR\app.err" -ErrorAction SilentlyContinue
+                throw "the app exited (code $($proc.ExitCode)) before managed Postgres booted"
+              }
+              if ((Get-Date) -gt $deadline) { throw "managed Postgres did not boot within 8 minutes" }
+              Start-Sleep -Milliseconds 500
+            }
+            Write-Host "managed Postgres booted: $pidfile"
+
+            # Clean shutdown: request it the way `autumn dev` does. The budget
+            # is generous — a cold Windows `pg_ctl stop` under the provider's
+            # own 60s ceiling is not something to race.
+            New-Item -ItemType File -Path $signal -Force | Out-Null
+            if (-not $proc.WaitForExit(180000)) {
+              throw "the app ignored AUTUMN_SHUTDOWN_SIGNAL_FILE and did not drain"
+            }
+            if ($proc.ExitCode -ne 0) { throw "the app exited $($proc.ExitCode), not cleanly" }
+
+            # A cluster stopped through `pg_ctl` removes its own pidfile. A
+            # surviving one is the orphan this target forbids.
+            if (Test-Path $pidfile) {
+              throw "managed Postgres was left running: $pidfile still exists after shutdown"
+            }
+            # The data dir itself must survive — a "clean shutdown" that lost the
+            # developer's database would pass the check above for the wrong reason.
+            if (-not (Test-Path "$env:AUTUMN_MANAGED_PG_DATA_DIR\PG_VERSION")) {
+              throw "the managed cluster's data dir did not survive shutdown"
+            }
+            Write-Host "managed Postgres shut down cleanly and its data dir survived"
+          } finally {
+            # Never leave a postmaster holding the data dir for the next step:
+            # a second, unrelated-looking failure would mask this one's cause.
+            if (-not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(30000) | Out-Null }
+          }
+
+      - name: "Journey: autumn dev rebuilds, reloads, and stops the app cleanly"
+        # The end-to-end half of the same guarantee, through the real command.
+        # The assertions are deliberately about NEW output and a LIVE server
+        # after the reload: a whole-log substring match would be satisfied by
+        # the initial boot's own lines and would gate nothing.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          $app = "$env:JOURNEY_DIR\tier1_app"
+          $log = "$env:JOURNEY_DIR\dev.log"
+          $pidfile = "$env:AUTUMN_MANAGED_PG_DATA_DIR\postmaster.pid"
+
+          # `Start-Process` inherits the PROCESS working directory, not
+          # PowerShell's provider location, so `-WorkingDirectory` is required:
+          # without it `autumn dev` runs in the checkout root, finds no
+          # autumn.toml, and exits 1.
+          $dev = Start-Process -FilePath $autumn -ArgumentList 'dev' -PassThru `
+            -WorkingDirectory $app `
+            -RedirectStandardOutput "$env:JOURNEY_DIR\dev.out" `
+            -RedirectStandardError $log
+
+          function Read-DevLog {
+            $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
+            if ($null -eq $text) { '' } else { $text }
+          }
+
+          function Wait-ForCount($pattern, $atLeast, $timeoutSeconds, $what) {
+            $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              if ($dev.HasExited) {
+                Read-DevLog | Write-Host
+                throw "autumn dev exited ($($dev.ExitCode)) while waiting for $what"
+              }
+              if (([regex]::Matches((Read-DevLog), $pattern)).Count -ge $atLeast) { return }
+              Start-Sleep -Milliseconds 500
+            }
+            Read-DevLog | Write-Host
+            throw "timed out after ${timeoutSeconds}s waiting for $what"
+          }
+
+          try {
+            # The watcher is up and the first build has been served. Require the
+            # build to have been GREEN: `autumn dev` reaches the watch loop even
+            # after a failed initial build.
+            Wait-ForCount 'Watching for changes' 1 1800 'the initial build and watch'
+            if ((Read-DevLog) -match 'Initial build failed') { throw "the initial dev build failed" }
+            Wait-ForCount 'Starting server' 1 60 'the first server start'
+
+            # The managed cluster must be up under `autumn dev` too.
+            $deadline = (Get-Date).AddMinutes(5)
+            while (-not (Test-Path $pidfile)) {
+              if ((Get-Date) -gt $deadline) { throw "managed Postgres did not boot under autumn dev" }
+              Start-Sleep -Milliseconds 500
+            }
+
+            # Edit a watched source file. A comment is enough: it is a real
+            # recompile, and it cannot change behaviour and mask a failure.
+            Add-Content -Path "$app\src\main.rs" -Value "`n// tier1 journey edit`n"
+
+            Wait-ForCount 'Changed:' 1 180 'the edit to be detected'
+            # A SECOND 'Starting server' — the restart after the rebuild. On
+            # Windows `autumn dev` stops the old binary BEFORE building, so this
+            # line only appears if the cooperative stop released the exe lock
+            # and the rebuild then relinked over it.
+            Wait-ForCount 'Starting server' 2 1800 'the rebuild and restart'
+
+            # The stop must have been cooperative. If the app had to be
+            # force-stopped, its `on_shutdown` hook did not run and the managed
+            # cluster was orphaned — the exact #1616 regression. `autumn dev`
+            # says so out loud, so assert it did not have to.
+            if ((Read-DevLog) -match 'force-stopped') {
+              Read-DevLog | Write-Host
+              throw "autumn dev had to force-stop the app: shutdown hooks were skipped"
+            }
+
+            # The decisive assertion: the reloaded server actually answers. It
+            # can only do so if the previous instance released the cluster's
+            # data dir — an orphaned postmaster would hold it and the restarted
+            # app would exit at boot.
+            $deadline = (Get-Date).AddMinutes(3)
+            $served = $false
+            while (-not $served -and (Get-Date) -lt $deadline) {
+              try {
+                $r = Invoke-WebRequest 'http://127.0.0.1:3000/health' -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -eq 200) { $served = $true }
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $served) {
+              Read-DevLog | Write-Host
+              throw "the reloaded server never answered GET /health"
+            }
+            Write-Host "dev loop: edit -> cooperative stop -> rebuild -> restart -> 200 OK"
+          } finally {
+            # Harness cleanup, not a product assertion: there is no supported way
+            # to interrupt a foreground `autumn dev` from a non-interactive
+            # PowerShell step.
+            Stop-Process -Id $dev.Id -Force -ErrorAction SilentlyContinue
+            Get-Process -Name 'tier1_app' -ErrorAction SilentlyContinue | Stop-Process -Force
+            Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+
+      - name: "Policy: Tier 2 commands fail fast, not silently"
+        # AC-2's other half. A Tier 2 command on native Windows must exit
+        # non-zero with a message naming the tier and the policy — the failure
+        # mode this target exists to eliminate is the one where it half-works.
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
+          Set-Location "$env:JOURNEY_DIR\tier1_app"
+
+          $output = & $autumn serve --daemon 2>&1 | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -eq 0) { throw "autumn serve --daemon must not succeed on native Windows" }
+          if ($output -notmatch 'Tier 2') { throw "the daemon refusal did not name the tier: $output" }
+          if ($output -notmatch 'WSL2') { throw "the daemon refusal did not name WSL2: $output" }
+          if ($output -notmatch 'platform-support') { throw "the daemon refusal did not link the policy: $output" }
+
+          $output = & $autumn deploy check 2>&1 | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -eq 0) { throw "autumn deploy must not succeed on native Windows" }
+          if ($output -notmatch 'Tier 2') { throw "the deploy refusal did not name the tier: $output" }
+          if ($output -match 'failed to load configuration') { throw "the refusal must not masquerade as a config error: $output" }
+
+          # Both commands are SUPPOSED to exit non-zero, and the GitHub pwsh
+          # wrapper appends `exit $LASTEXITCODE` — so without this the step
+          # fails precisely when the policy is working.
+          exit 0
+
+      - name: Upload journey logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-tier1-logs
+          # Named files only. The cluster's superuser password
+          # (`.autumn-pg-superuser`) and its published URL (`.autumn-pg-url`)
+          # live beside the data dir; a broader glob would publish them.
+          path: |
+            ${{ runner.temp }}\journey\dev.log
+            ${{ runner.temp }}\journey\dev.out
+            ${{ runner.temp }}\journey\app.out
+            ${{ runner.temp }}\journey\app.err
+            ${{ runner.temp }}\tier1-pg\log\*
+          if-no-files-found: ignore

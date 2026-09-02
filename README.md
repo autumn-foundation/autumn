@@ -246,6 +246,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Data Classification](docs/guide/data-classification.md) — `#[classified]`: a personal-data column is carried as a taint on the *type*, so returning it from a JSON response without passing a declared declassification boundary is a compile error, and `autumn data-flow` emits the diffable manifest of which sinks each classified field can reach
 - [Compile-Time Query Budgets](docs/guide/query-budgets.md) — `#[query_budget(N)]`: the build fails when a handler's reachable paths can exceed its declared query count, catching N+1 regressions on every branch instead of only the ones a test exercises
 - [Signed Webhook Intake](docs/guide/signed-webhooks.md)
+- [Platform Support](docs/guide/platform-support.md) — the Windows tier policy: which commands run natively, which need WSL2, and the `windows-latest` CI job that gates the native journey
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
@@ -301,6 +302,22 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.
+
+## Platform support
+
+Develop on **macOS, Linux, or Windows**; deploy on **Linux**.
+
+On Windows the core journey — `autumn new`, `doctor`, `setup`, `dev`, `test`,
+foreground `serve`, and managed Postgres — is **Tier 1: works natively**, and a
+`windows-latest` CI job walks that whole journey on every pull request. The
+Unix-native slices — the `autumn serve --daemon` lifecycle, `autumn deploy`, and
+the bash contributor gate scripts — are **Tier 2: supported via WSL2**, and fail
+fast on native Windows with an error naming the policy rather than
+half-working.
+
+See [Platform support](docs/guide/platform-support.md) for the full
+command-by-command policy, the Windows prerequisites `autumn doctor` flags, and
+how to run the Tier 2 commands under WSL2.
 
 ## License
 

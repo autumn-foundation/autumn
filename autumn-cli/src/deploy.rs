@@ -66,6 +66,13 @@ pub enum DeployError {
     #[error("failed to load configuration: {0}")]
     Config(String),
 
+    /// `deploy` was invoked on a platform where it is not supported natively
+    /// (issue #1616). Its own variant rather than [`Self::Config`]: nothing is
+    /// wrong with the configuration, and prefixing this message with "failed to
+    /// load configuration" would send the operator to the wrong file.
+    #[error("{0}")]
+    UnsupportedPlatform(String),
+
     /// One or more preflight graders failed.
     #[error(
         "preflight failed: {0} check(s) did not pass — resolve the issues above and re-run \
@@ -1492,7 +1499,28 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 ///
 /// Returns [`DeployError::Config`] when the project config cannot be loaded and
 /// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
+/// The refusal for a native-Windows `autumn deploy`, or `None` on a supported
+/// host.
+///
+/// `deploy` shells out to `ssh`/`sh` and stages secrets through
+/// [`exec::stage_temp_file`], whose `chmod 0600` is `#[cfg(unix)]` — so a native
+/// Windows deploy would stage the environment file carrying the app's signing
+/// secret and database password without the owner-only mode the Unix path
+/// applies, relying on whatever the containing directory's ACLs happen to be.
+/// It is Tier 2 (WSL2) in the platform policy, and refusing up front is what
+/// keeps that from being a silent degradation (#1616).
+///
+/// Takes the OS family as a string so the Windows branch is covered by tests on
+/// every host.
+fn windows_deploy_refusal(os: &str) -> Option<String> {
+    (os == "windows").then(|| crate::platform::tier_two_windows_error("autumn deploy"))
+}
+
 pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployError> {
+    // Refuse before anything else: no config load, no SSH probe, no temp file.
+    if let Some(refusal) = windows_deploy_refusal(std::env::consts::OS) {
+        return Err(DeployError::UnsupportedPlatform(refusal));
+    }
     // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
     // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
     // the profile the deployed service will actually boot under (default `prod`).
@@ -4792,6 +4820,49 @@ fn remote_parent_dir(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    // ── Tier 2 fail-fast on Windows (issue #1616) ──────────────────────────
+    //
+    // `deploy` shells out to `ssh`/`sh` and stages secrets with Unix file modes
+    // (`exec::stage_temp_file` skips its `chmod 0600` off Unix), so a native
+    // Windows deploy would write a private key to disk world-readable. That is
+    // exactly the silent degradation the platform policy forbids.
+
+    #[test]
+    fn windows_deploys_are_refused_with_the_policy_message() {
+        let refusal = windows_deploy_refusal("windows").expect("windows must be refused");
+        assert!(refusal.contains("Tier 2 (WSL2)"), "{refusal}");
+        assert!(
+            refusal.contains(crate::platform::POLICY_DOC_URL),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn unix_deploys_are_not_refused() {
+        assert!(windows_deploy_refusal("linux").is_none());
+        assert!(windows_deploy_refusal("macos").is_none());
+    }
+
+    #[test]
+    fn the_refusal_is_an_error_so_it_exits_non_zero() {
+        // Fail *fast*: this must surface as an error the caller propagates,
+        // never a warning printed before the deploy proceeds anyway.
+        let err = DeployError::UnsupportedPlatform(windows_deploy_refusal("windows").unwrap());
+        assert!(err.to_string().contains("Tier 2 (WSL2)"));
+    }
+
+    #[test]
+    fn the_refusal_does_not_masquerade_as_a_config_failure() {
+        // `DeployError::Config` renders as "failed to load configuration: …",
+        // which would send the operator hunting through autumn.toml for a
+        // problem that is not there.
+        let err = DeployError::UnsupportedPlatform(windows_deploy_refusal("windows").unwrap());
+        assert!(
+            !err.to_string().contains("failed to load configuration"),
+            "{err}"
+        );
+    }
+
     use super::*;
 
     fn resolved_defaults() -> ResolvedDeployConfig {

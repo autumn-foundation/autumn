@@ -1830,6 +1830,158 @@ fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
     }
 }
 
+// ─── Platform support tier (issue #1616) ─────────────────────────────────────
+
+/// Report this platform's support tier, and on Windows the prerequisites and
+/// WSL2-only journeys a developer would otherwise discover by hitting them.
+///
+/// Takes the OS family as a string so the Windows branch is exercised by tests
+/// on every host — the branch that matters here is the one this CI never runs.
+/// Both branches read [`crate::platform::POLICY`], so doctor cannot describe a
+/// policy different from the one the commands enforce.
+#[must_use]
+pub fn check_platform_support_impl(os: &str) -> CheckResult {
+    use crate::platform::{SupportTier, WINDOWS_PREREQUISITES, commands_in_tier};
+
+    if os != "windows" {
+        return CheckResult {
+            name: "platform_support",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{os}: every autumn journey runs natively on this platform"
+            )),
+            hint: None,
+        };
+    }
+
+    let tier_one = commands_in_tier(SupportTier::Native).join(", ");
+    let tier_two = commands_in_tier(SupportTier::Wsl2).join(", ");
+    let prerequisites = WINDOWS_PREREQUISITES
+        .iter()
+        .map(|p| format!("{} needs {}", p.subject, p.requirement))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    CheckResult {
+        name: "platform_support",
+        // Pass, not Warn. Windows is a supported development platform and the
+        // Tier 2 journeys are documented with a working answer (WSL2), so
+        // nothing here is a defect. It matters concretely: `exit_code` treats
+        // any warning as a failure under `--strict`, so warning unconditionally
+        // would make `autumn doctor --strict` — itself a Tier 1 command — exit 1
+        // forever on every Windows machine.
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "windows: Tier 1 (native) — {tier_one}. Tier 2 (WSL2), run these from a \
+             WSL2 shell — {tier_two}. Prerequisites: {prerequisites}. Policy: \
+             docs/guide/platform-support.md"
+        )),
+        // `format_check_line` prints a hint only on warn/fail, so the pointer to
+        // the policy lives in the detail above rather than being silently
+        // dropped here.
+        hint: None,
+    }
+}
+
+#[cfg(test)]
+mod platform_support_tests {
+    use super::{CheckStatus, check_platform_support_impl};
+    use crate::platform::{SupportTier, WINDOWS_PREREQUISITES};
+
+    #[test]
+    fn windows_reports_tier_status_and_flags_prerequisites() {
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        // AC: doctor "reports the platform's tier status".
+        assert!(detail.contains("Tier 1"), "{detail}");
+        assert!(detail.contains("Tier 2"), "{detail}");
+        // AC: "flags known Windows-specific prerequisites (e.g. the
+        // vcpkg/OpenSSL requirement for `generate auth --passkeys`)".
+        assert!(detail.contains("vcpkg"), "{detail}");
+        assert!(detail.contains("--passkeys"), "{detail}");
+        for prerequisite in WINDOWS_PREREQUISITES {
+            assert!(
+                detail.contains(prerequisite.subject),
+                "prerequisite `{}` is not reported: {detail}",
+                prerequisite.subject
+            );
+        }
+    }
+
+    #[test]
+    fn windows_names_every_tier_two_command_so_nothing_is_a_surprise() {
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        for command in crate::platform::commands_in_tier(SupportTier::Wsl2) {
+            assert!(
+                detail.contains(command),
+                "Tier 2 command `{command}` missing from doctor output: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_platforms_pass_with_every_journey_native() {
+        for os in ["linux", "macos"] {
+            let result = check_platform_support_impl(os);
+            assert_eq!(result.status, CheckStatus::Pass, "{os} should pass");
+            let detail = result.detail.unwrap_or_default();
+            assert!(
+                detail.contains("natively"),
+                "{os} detail should say every journey is native: {detail}"
+            );
+            assert!(
+                !detail.contains("WSL2"),
+                "{os} must not mention WSL2: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_check_is_named_so_json_consumers_can_key_on_it() {
+        assert_eq!(
+            check_platform_support_impl("windows").name,
+            "platform_support"
+        );
+        assert_eq!(
+            check_platform_support_impl("linux").name,
+            "platform_support"
+        );
+    }
+
+    #[test]
+    fn windows_does_not_fail_doctor_strict() {
+        // Windows is a supported development platform, so `autumn doctor
+        // --strict` must not reject a machine for being a Windows one — and
+        // `doctor` is itself a Tier 1 command in this very policy.
+        //
+        // A `Warn` is not enough: `exit_code` treats ANY warning as a failure
+        // under `--strict`, so an always-warning check makes `--strict` exit 1
+        // forever on Windows. The tier is information, not a defect.
+        let result = check_platform_support_impl("windows");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let summary = super::compute_summary(std::slice::from_ref(&result));
+        assert_eq!(
+            super::exit_code(&summary, true),
+            0,
+            "platform_support must not fail `doctor --strict` on Windows"
+        );
+    }
+
+    #[test]
+    fn the_windows_detail_carries_the_policy_pointer_itself() {
+        // `format_check_line` prints a check's `hint` only on warn/fail, so a
+        // passing check's pointer to the guide has to live in the detail or it
+        // is never shown at all.
+        let detail = check_platform_support_impl("windows")
+            .detail
+            .expect("a detail line");
+        assert!(detail.contains("platform-support.md"), "{detail}");
+    }
+}
+
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -6771,6 +6923,13 @@ pub fn run(opts: DoctorOptions) {
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
+
+    // 0. Platform support tier (#1616). First, because it frames every check
+    // below: on Windows a developer needs to know which journeys are native
+    // before they read a warning about one that is not.
+    tasks.push(Box::new(|| {
+        check_platform_support_impl(std::env::consts::OS)
+    }));
 
     // 1. Rust toolchain
     tasks.push(Box::new(move || check_rust_toolchain(&msrv)));

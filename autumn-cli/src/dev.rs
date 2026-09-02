@@ -67,6 +67,87 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_STATE_FILE: &str = "live-reload.json";
 
+/// Environment variable naming the cooperative-shutdown file, mirrored from
+/// `autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV`.
+///
+/// Mirrored rather than imported at the definition site for symmetry with this
+/// module's other wire constants; `dev_shutdown_env_var_matches_the_runtime_constant`
+/// pins the two together so a rename on either side fails the build's tests
+/// rather than silently breaking the Windows dev loop.
+// The cooperative-stop machinery below is the NON-UNIX stop path (#1616), but it
+// is compiled and unit-tested on every platform on purpose: Windows is the one
+// platform this project's contributors and most of its CI never run
+// interactively, so logic that only compiled there would be logic nobody ever
+// exercised before a user did. `allow(dead_code)` on Unix is the price of that
+// coverage — the alternative is `cfg(not(unix))` guards that hide the code from
+// Linux CI entirely, which is how the orphaned-Postgres bug survived.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DEV_SHUTDOWN_SIGNAL_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE";
+
+/// Filename parts of the cooperative-shutdown file, written beside the
+/// live-reload state. The dev-loop process id goes between them — see
+/// [`resolve_dev_shutdown_signal_path`].
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DEV_SHUTDOWN_SIGNAL_PREFIX: &str = "dev-shutdown.";
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DEV_SHUTDOWN_SIGNAL_SUFFIX: &str = ".signal";
+
+/// How long a cooperatively-stopped app gets to drain before `autumn dev`
+/// escalates to a hard kill. Generous enough for an app that closes a database
+/// pool and stops a managed Postgres cluster, short enough not to stall a hot
+/// reload when the app is wedged.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How the dev loop's app child was stopped.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    /// The app drained and exited on its own, so its `on_shutdown` hooks ran —
+    /// including managed Postgres teardown.
+    Graceful,
+    /// The app did not exit within the budget and was force-killed. Its hooks
+    /// may not have run; the caller reports this rather than hiding it.
+    Escalated,
+    /// The request could not be delivered at all (the signal file was not
+    /// writable), so the app was force-killed without ever being asked. Kept
+    /// distinct from [`Self::Escalated`] so the warning blames the dev setup
+    /// rather than accusing the app of ignoring a request it never received.
+    Unreachable,
+    /// There was no child to stop.
+    NotRunning,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeEffect {
     Ignore,
@@ -942,6 +1023,17 @@ fn start_server(
     if show_config {
         command.env("AUTUMN_SHOW_CONFIG", "1");
     }
+    // Hand the app the cooperative-shutdown file so a stop can run its
+    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616). Clear any
+    // stale request first: a file left by a crashed `autumn dev` would drain
+    // this child the moment it boots. Only wired where it is the stop
+    // mechanism — on Unix `stop_server` signals, and an unset variable keeps
+    // the runtime's watcher inert.
+    #[cfg(not(unix))]
+    if let Some(signal_path) = dev_shutdown_signal_path() {
+        clear_cooperative_shutdown(signal_path);
+        command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
+    }
 
     match command.spawn() {
         Ok(child) => Some(child),
@@ -954,32 +1046,62 @@ fn start_server(
 
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
-    if let Some(proc) = child {
-        // Send SIGTERM on Unix for graceful shutdown
-        #[cfg(unix)]
-        {
-            if let Some(pid) = crate::process::validate_pid_for_kill(proc.id())
-                && let Err(e) = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGTERM,
-                )
-            {
-                eprintln!("  Warning: failed to send SIGTERM to process: {e}");
-            }
-            // Wait briefly for graceful shutdown before forcing
-            if crate::process::wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
-                let _ = proc.kill();
-                let _ = proc.wait();
-            }
-        }
+    #[cfg(unix)]
+    stop_server_unix(child);
+    #[cfg(not(unix))]
+    stop_server_cooperative(child);
+}
 
-        #[cfg(not(unix))]
+/// Unix stop: `SIGTERM`, then `SIGKILL` if the app misses its drain budget.
+/// This is the mechanism production uses, so the dev loop uses it too.
+#[cfg(unix)]
+fn stop_server_unix(child: &mut Option<Child>) {
+    if let Some(proc) = child {
+        if let Some(pid) = crate::process::validate_pid_for_kill(proc.id())
+            && let Err(e) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            )
         {
+            eprintln!("  Warning: failed to send SIGTERM to process: {e}");
+        }
+        // Wait briefly for graceful shutdown before forcing
+        if crate::process::wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
             let _ = proc.kill();
             let _ = proc.wait();
         }
     }
     *child = None;
+}
+
+/// Non-Unix stop: there is no `SIGTERM` here, and `Child::kill` is
+/// `TerminateProcess` — it skips the app's `on_shutdown` hooks, so a managed
+/// Postgres child was orphaned on every rebuild (#1616). Ask the app to drain
+/// through the file it watches, and force-kill only if it will not.
+#[cfg(not(unix))]
+fn stop_server_cooperative(child: &mut Option<Child>) {
+    let Some(signal_path) = dev_shutdown_signal_path() else {
+        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from this same
+        // cached value, so with no path the child was never told to watch
+        // anything. Waiting out the full budget for a request nobody can
+        // receive would make every rebuild slower than the hard kill this
+        // replaced — so kill directly, and say why.
+        if let Some(proc) = child.as_mut() {
+            let _ = proc.kill();
+            let _ = proc.wait();
+            eprintln!("{}", unreachable_warning("cargo metadata is unreadable"));
+        }
+        *child = None;
+        return;
+    };
+    match stop_child_cooperatively(child, signal_path, COOPERATIVE_STOP_TIMEOUT) {
+        StopOutcome::Escalated => eprintln!("{}", escalation_warning(COOPERATIVE_STOP_TIMEOUT)),
+        StopOutcome::Unreachable => eprintln!(
+            "{}",
+            unreachable_warning("the target directory is not writable")
+        ),
+        StopOutcome::Graceful | StopOutcome::NotRunning => {}
+    }
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
@@ -1291,6 +1413,179 @@ fn resolve_dev_reload_state_path() -> Result<PathBuf, String> {
         .join(DEV_RELOAD_STATE_FILE))
 }
 
+/// Where the cooperative-shutdown file lives: beside the live-reload state,
+/// inside the target directory, so it is swept by `cargo clean`.
+///
+/// Two properties matter and neither is incidental.
+///
+/// **Tolerant.** This resolves through [`try_cargo_metadata`], not
+/// [`resolve_target_directory`], which `exit(1)`s on unreadable metadata.
+/// `Cargo.toml` is a watched file, so a half-saved manifest is an ordinary
+/// dev-loop event — and on Windows the stop happens *before* the rebuild. An
+/// exit from inside the stop path would leave the app, and the managed Postgres
+/// cluster it owns, running with nobody left to reap them: the exact orphan this
+/// mechanism exists to prevent, through a new door.
+///
+/// **Unique per dev-loop process.** Two `autumn dev` instances in one workspace
+/// (`-p api` and `-p admin`) share a target directory. A shared signal file
+/// would let one instance's rebuild drain the other instance's app, and let one
+/// instance's cleanup delete the request the other is still waiting on.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn resolve_dev_shutdown_signal_path() -> Option<PathBuf> {
+    let metadata = try_cargo_metadata()?;
+    let target = metadata["target_directory"].as_str()?;
+    Some(Path::new(target).join("autumn").join(format!(
+        "{DEV_SHUTDOWN_SIGNAL_PREFIX}{}{DEV_SHUTDOWN_SIGNAL_SUFFIX}",
+        std::process::id()
+    )))
+}
+
+/// This dev-loop session's cooperative-shutdown file, resolved once.
+///
+/// Cached so the stop path never shells out to `cargo metadata`: a stop must be
+/// cheap, and must never fail for a reason unrelated to the child it is
+/// stopping.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn dev_shutdown_signal_path() -> Option<&'static Path> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(resolve_dev_shutdown_signal_path)
+        .as_deref()
+}
+
+/// Ask the running app to shut down gracefully by creating the file it watches.
+///
+/// The runtime keys off existence alone, so an empty file is the whole protocol.
+///
+/// # Errors
+///
+/// Returns the underlying IO error if the file (or its parent) cannot be created.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn request_cooperative_shutdown(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::create(path).map(|_| ())
+}
+
+/// Remove a shutdown request so the next child does not drain the moment it
+/// boots. Best-effort: a file that is already gone is the desired state.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn clear_cooperative_shutdown(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// The warning printed when a cooperative stop had to escalate to a hard kill.
+///
+/// Names the consequence, not just the timeout: #1616's whole complaint is that
+/// a skipped teardown was invisible.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn escalation_warning(timeout: Duration) -> String {
+    format!(
+        "  Warning: the app did not shut down within {}s and was force-stopped. \
+         Its shutdown hooks may not have run, so a managed Postgres cluster may \
+         still be running and holding its data dir; the next start recovers the \
+         cluster through crash recovery, which is slower than a clean stop.",
+        timeout.as_secs()
+    )
+}
+
+/// The warning printed when the shutdown request could not be delivered.
+///
+/// Distinct from [`escalation_warning`]: nothing is wrong with the app here, so
+/// telling the developer it "did not shut down in time" would send them hunting
+/// in the wrong place.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn unreachable_warning(error: &str) -> String {
+    format!(
+        "  Warning: could not write the shutdown-signal file ({error}), so the app \
+         was force-stopped without being asked to drain. Its shutdown hooks did \
+         not run, so a managed Postgres cluster may still be running and holding \
+         its data dir; the next start recovers the cluster through crash \
+         recovery, which is slower than a clean stop."
+    )
+}
+
+/// Stop `child` cooperatively: request a graceful shutdown via the signal file,
+/// wait up to `timeout` for it to drain, then force-kill if it has not.
+///
+/// This is the Windows stop path, but it is compiled on every platform so Linux
+/// CI exercises it. On Unix `stop_server` keeps using `SIGTERM`, which is the
+/// mechanism production uses and is strictly faster.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_child_cooperatively(
+    child: &mut Option<Child>,
+    signal_path: &Path,
+    timeout: Duration,
+) -> StopOutcome {
+    let Some(proc) = child.as_mut() else {
+        return StopOutcome::NotRunning;
+    };
+
+    let outcome = match request_cooperative_shutdown(signal_path) {
+        Err(_) => {
+            let _ = proc.kill();
+            let _ = proc.wait();
+            StopOutcome::Unreachable
+        }
+        Ok(()) if crate::process::wait_with_timeout(proc, timeout).is_ok() => StopOutcome::Graceful,
+        Ok(()) => {
+            let _ = proc.kill();
+            let _ = proc.wait();
+            StopOutcome::Escalated
+        }
+    };
+
+    // Always clear the request, on both paths: the next child must not inherit
+    // a stale signal and drain at boot.
+    clear_cooperative_shutdown(signal_path);
+    *child = None;
+    outcome
+}
+
 fn resolve_target_directory() -> Result<PathBuf, String> {
     let metadata = cargo_metadata();
     metadata["target_directory"]
@@ -1453,6 +1748,214 @@ pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    // ── Cooperative child shutdown (#1616) ─────────────────────────────────
+    //
+    // The Windows dev loop used to stop the app with `TerminateProcess`
+    // (`Child::kill`), which skips the app's `on_shutdown` hooks — so a managed
+    // Postgres child was orphaned on every rebuild. `stop_child_cooperatively`
+    // is the fix, and it is compiled on every platform so Linux CI actually
+    // exercises the logic Windows depends on. It writes the signal file
+    // autumn-web watches (`AUTUMN_SHUTDOWN_SIGNAL_FILE`), waits for the child
+    // to drain, and only then escalates.
+
+    fn signal_path(dir: &Path) -> PathBuf {
+        dir.join("dev-shutdown.signal")
+    }
+
+    #[test]
+    fn request_cooperative_shutdown_creates_the_file_the_runtime_watches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        request_cooperative_shutdown(&path).expect("signal file should be creatable");
+        assert!(path.exists(), "the runtime keys off existence alone");
+    }
+
+    #[test]
+    fn request_cooperative_shutdown_creates_missing_parent_directories() {
+        // The signal lives beside the live-reload state under `target/autumn`,
+        // which may not exist yet on a cold `autumn dev`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("autumn").join("stop.signal");
+        request_cooperative_shutdown(&path).expect("parents should be created");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn clear_cooperative_shutdown_removes_a_stale_signal() {
+        // A crashed `autumn dev` can leave the file behind; the next spawn must
+        // clear it or the fresh child would drain the moment it boots.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        std::fs::write(&path, b"stop").unwrap();
+        clear_cooperative_shutdown(&path);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn clear_cooperative_shutdown_is_a_no_op_when_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        clear_cooperative_shutdown(&signal_path(tmp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cooperative_stop_lets_a_child_that_honours_the_signal_exit_on_its_own() {
+        // Stands in for an Autumn app: polls for the signal file, then exits 0
+        // the way a drained app does. The outcome must be `Graceful` — that is
+        // the case where `on_shutdown` hooks (managed Postgres teardown) run.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+            path.display()
+        );
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .expect("spawn stand-in app"),
+        );
+
+        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_secs(10));
+        assert_eq!(outcome, StopOutcome::Graceful);
+        assert!(child.is_none(), "a stopped child must be reaped");
+        assert!(
+            !path.exists(),
+            "the signal must be cleared so the next child does not drain at boot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cooperative_stop_escalates_when_the_child_ignores_the_signal() {
+        // An app that hangs (or predates the signal) must still be stopped —
+        // degraded, but never silently: the caller reports the escalation.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn unresponsive app"),
+        );
+
+        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_millis(300));
+        assert_eq!(outcome, StopOutcome::Escalated);
+        assert!(child.is_none(), "escalation must still reap the child");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cooperative_stop_reports_unreachable_when_the_request_cannot_be_written() {
+        // If the signal file cannot be created, the app was never *asked* to
+        // stop. Reporting that as an escalation would blame the app for
+        // ignoring a request it never received — and would hide a broken dev
+        // setup behind a message about shutdown hooks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("nested").join("stop.signal");
+
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn app"),
+        );
+        let outcome = stop_child_cooperatively(&mut child, &path, Duration::from_millis(200));
+        assert_eq!(outcome, StopOutcome::Unreachable);
+        assert!(child.is_none(), "the child must still be stopped");
+    }
+
+    #[test]
+    fn unreachable_warning_blames_the_signal_file_not_the_app() {
+        let warning = unreachable_warning("permission denied");
+        assert!(warning.contains("permission denied"), "{warning}");
+        assert!(warning.contains("shutdown hooks"), "{warning}");
+        // It must NOT claim the app ignored anything.
+        assert!(!warning.contains("did not shut down within"), "{warning}");
+    }
+
+    #[test]
+    fn cooperative_stop_reports_not_running_without_a_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = None;
+        assert_eq!(
+            stop_child_cooperatively(&mut child, &path, Duration::from_secs(1)),
+            StopOutcome::NotRunning
+        );
+    }
+
+    #[test]
+    fn the_cooperative_stop_budget_outlasts_a_managed_postgres_teardown() {
+        // A managed cluster's `pg_ctl stop -m fast` plus pool drain routinely
+        // takes a few seconds on a cold Windows filesystem. Too short and every
+        // reload escalates (the bug this fixes); too long and a wedged app
+        // stalls the dev loop. Pin the budget so neither drifts in unnoticed.
+        assert!(COOPERATIVE_STOP_TIMEOUT >= Duration::from_secs(5));
+        assert!(COOPERATIVE_STOP_TIMEOUT <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn escalation_warning_names_the_consequence_not_just_the_timeout() {
+        // "silent degradation" is the thing #1616 forbids: if hooks were
+        // skipped, the developer has to be told what that means for them.
+        let warning = escalation_warning(Duration::from_secs(10));
+        assert!(warning.contains("10s"), "{warning}");
+        assert!(warning.contains("shutdown hooks"), "{warning}");
+        assert!(warning.contains("Postgres"), "{warning}");
+    }
+
+    #[test]
+    fn dev_shutdown_signal_path_sits_beside_the_live_reload_state() {
+        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
+        assert!(
+            path.parent()
+                .is_some_and(|p| p.ends_with(Path::new("target").join("autumn"))),
+            "unexpected directory: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn dev_shutdown_signal_path_is_unique_per_dev_loop_process() {
+        // Two `autumn dev` instances in one workspace share a target directory.
+        // A shared file would let one instance's rebuild drain the other's app.
+        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a file name");
+        assert!(name.starts_with(DEV_SHUTDOWN_SIGNAL_PREFIX), "{name}");
+        assert!(name.ends_with(DEV_SHUTDOWN_SIGNAL_SUFFIX), "{name}");
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "the file name must carry this process's id: {name}"
+        );
+    }
+
+    #[test]
+    fn dev_shutdown_signal_path_is_cached_across_calls() {
+        // The stop path reads this; resolving per stop would shell out to
+        // `cargo metadata` on every rebuild and could fail on a half-saved
+        // Cargo.toml — inside the stop, where a failure orphans the app.
+        assert_eq!(dev_shutdown_signal_path(), dev_shutdown_signal_path());
+    }
+
+    #[test]
+    fn dev_shutdown_env_var_matches_the_runtime_constant() {
+        assert_eq!(
+            DEV_SHUTDOWN_SIGNAL_ENV,
+            autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV,
+            "the CLI and the runtime must agree on the wire name"
+        );
+    }
+
     use super::*;
 
     // ── is_relevant_change tests ───────────────────────────────────
