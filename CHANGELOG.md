@@ -847,6 +847,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dependent cascades are documented where the guide already pointed, and the
+  `through =` rejection points at the offending key (#1702):** the repositories
+  guide had no dependent-cascade section at all, even though the counter-cache
+  guide sent readers there for it, and the macro-transparency guide still
+  described the cascade as **single-level with grandchildren unhandled** and as
+  `delete_by_id`-only — both untrue since the cascade became recursive (#1739)
+  and bulk-aware (#1740). `docs/guide/repositories.md` now carries the canonical
+  treatment: both declaration sites (`#[has_many(Child, dependent = <action>)]`
+  on the model, `dependent(PgChildRepository, fk = "...", on_delete = ...)` on
+  the repository as the escape hatch for children outside the
+  `Pg{Child}Repository` convention), the precedence rule between them, the four
+  actions, the transactional/ordering guarantees, and the rejected combinations;
+  `docs/guide/macro-transparency.md` is corrected and links to it. Alongside it,
+  a `dependent`/`on_delete` on a `through = <join_table>` association now spans
+  the `dependent` key itself rather than the association's target ident, so the
+  caret lands on the thing the error tells you to remove. The model-declared
+  `destroy` cascade on `#[has_one]` is now proven end to end, the precedence
+  between the two declaration sites is proven behaviourally, and the three directed
+  compile errors (`dependent` on `#[belongs_to]`, on a `through =` association,
+  and an unknown action) are pinned by trybuild fixtures.
+
 - **A NUL byte in a form field is a validation error, not a 500 (#2423):** a
   Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, but nothing between the
   form body and the `INSERT` could say so. An embedded NUL — which a real user
