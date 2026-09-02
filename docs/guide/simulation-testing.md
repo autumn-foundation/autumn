@@ -449,7 +449,7 @@ walks 48 virtual hours in checkpoints, and asserts the app's hot-rank decay
 curve through the ordinary [`Clock`] extractor rather than around it. It uses
 `always!` for the hard invariants and `sometimes!` for reachability, and it
 arranges two deliberately-separated input bands so that
-[`assert_all_sometimes_satisfied`](autumn_web::sim::assert_all_sometimes_satisfied)
+[`assert_all_sometimes_satisfied`](https://docs.rs/autumn-web/latest/autumn_web/sim/assert/fn.assert_all_sometimes_satisfied.html)
 holds at every seed — the pattern to copy when you want a single-run
 non-vacuity check rather than a sweep.
 

@@ -41,9 +41,10 @@ async fn main() {
 }
 ```
 
-A complete runnable version of this lives at
-[`examples/custom_config_loader`](../../examples/custom_config_loader). Run it
-with `cargo run -p custom-config-loader-example`.
+The snippet above is the whole integration — there is no hidden setup step.
+For the trait's full contract see
+[`ConfigLoader`](https://docs.rs/autumn-web/latest/autumn_web/config/trait.ConfigLoader.html)
+and [`with_config_loader`](https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.with_config_loader).
 
 **When to reach for it:** AWS Secrets Manager, Vault, Consul, an HTTP fetch,
 a JSON/YAML file, encrypted overlays, anything that's not five-layer TOML +

@@ -96,6 +96,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_attempts = 3`, the same before/after shape as the retry-storm example.
   See
   [Simulation Testing → Authored fault scenarios](docs/guide/simulation-testing.md).
+- **A markdown link gate for the docs corpus [no-plugin]:** `check-docs.sh`
+  gated rustdoc intra-doc links and `check-plugin-freshness.sh` gated the
+  `docs/guide/*.md` paths named from `skills/` and `agents/`, but nothing
+  checked the 383-file markdown corpus itself — so a guide could link to a
+  page that was renamed, never written, or lives one directory up, and
+  nothing noticed. `scripts/check-docs-links.sh` resolves every relative
+  link and heading anchor in tracked markdown and now runs in CI's docs-only
+  job. Its baseline found **19 broken links across 11 pages**, all fixed
+  here: five rustdoc paths pasted into `aggregates.md` as markdown targets
+  (they render as links to a directory that does not exist), three
+  `docs/design/` links off by one directory level, `authorization.md` and
+  `generators.md` pointing into `docs/api/` and `docs/reference/` trees that
+  have never existed, `tauri.md` pointing at a `managed-pg.md` that is
+  really `daemon.md`, two guides promising a `custom_config_loader` example
+  that is not in the workspace, and four heading anchors that no longer
+  match their headings. External links are deliberately out of scope
+  (network-flaky, and not fixable in this repo).
 
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
@@ -692,6 +709,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ACME config: `autumn doctor` and the runtime now reject the same two
+  spellings (#1874):** two low-severity parity gaps let `autumn doctor
+  --strict` bless an `autumn.toml` the server refuses to boot on. A
+  **non-integer `renew_before_days`** — a quoted `renew_before_days = "30"`, a
+  float, or a bool — was read by doctor's `as_integer()` chain as *absent* and
+  silently defaulted to 30, so the check passed while the runtime's typed
+  deserialization rejects the file at boot. Doctor now records the value the
+  operator actually wrote and reports an `acme_config` **Fail** naming it,
+  exactly as it already did for `http_challenge_port` and `directory`. (A
+  negative or out-of-`u32`-range integer already failed, having been clamped to
+  `u32::MAX` and caught by the `>= 90` rule; it now fails with a message about
+  the value rather than about the renewal window.) A
+  **whitespace-padded domain** (`domains = [" app.example.com "]`) passed
+  `AcmeConfig::validate()`, which trims only for its blank and wildcard checks
+  but stores the entry untrimmed — and the untrimmed string is what becomes the
+  certificate's SAN and the ACME order's `Identifier::Dns`, so the padded name
+  was requested as-is and failed mid-issuance with an opaque CA error. Both
+  `validate()` and doctor now reject it at startup with a message naming the
+  entry, its index, and the trimmed spelling to use. Neither gap was a security,
+  denial-of-service, or CA-rate-limit issue: each was already caught fail-fast
+  at boot or at first issuance, just later and less legibly than it should have
+  been.
+
 - **CI now rejects colliding migration versions:** app, framework and plugin
   migrations are applied into one shared version space — diesel keys
   `__diesel_schema_migrations` on the 14-digit version and
@@ -863,6 +903,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches any ambient runtime, closing both failure points. Verified against
   a real TLS-enabled Postgres server, on both a `current_thread` and
   `multi_thread` tokio runtime, called directly from an async body.
+- **Admin panel: a create/edit form that fails validation no longer discards
+  everything the admin typed:** `POST /{slug}` and `POST /{slug}/{id}` — the
+  only mutation UI the framework ships, used identically by every model in
+  every admin-plugin deployment — propagated a malformed field (e.g.
+  unparsable JSON) or a model-declared `AdminError::Validation` (e.g. a
+  uniqueness check) as a bare `AutumnError`. That renders as a generic error
+  response with no reference back to the form: a full-page navigation away,
+  a "Go to homepage" link as the only recovery step, and every value the
+  admin had entered gone. Both handlers now catch just that failure class and
+  re-render the same form (HTTP 422) with every submitted value still filled
+  in and the failure shown through the existing persistent, accessible flash
+  banner — no toast, no blank form. On update, the redisplayed form is
+  merged with the stored record so `create_only` fields (rendered read-only,
+  never resubmitted) keep showing their real value instead of going blank.
+  Other failure classes (missing pool, unknown model, database outage) are
+  unchanged and still render the generic error page.
 
 ### Added
 
