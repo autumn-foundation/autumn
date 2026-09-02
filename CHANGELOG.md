@@ -9,6 +9,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A proven capacity contract that travels with the build (#1733):** autumn
+  already shed load once too many requests were in flight, but the ceiling it
+  enforced was a hand-tuned guess in `autumn.toml`, and nothing told an operator
+  what a given binary could actually sustain before they deployed it. Capacity
+  planning was a spreadsheet and a hope. Now it is a lockfile:
+
+  ```sh
+  autumn calibrate          # measure → capacity.lock
+  autumn calibrate --check  # gate a rebuild against the committed contract
+  ```
+
+  `autumn calibrate` builds the app in release mode, reads its route graph back
+  through the same `AUTUMN_DUMP_ROUTES` pipeline `autumn routes` uses, boots it
+  with admission control switched off (so the run measures the app, not a
+  ceiling it was already carrying), and walks a seeded concurrency ladder. The
+  **saturation knee** — the last rung where more concurrency still bought
+  materially more throughput — becomes the recorded envelope:
+
+  ```toml
+  [envelope]
+  sustained_rps = 4210.5
+  p99_latency_ms = 18.42
+  saturation_concurrency = 64
+  admission_limit = 128
+
+  [[routes]]
+  method = "GET"
+  path = "/posts"
+  shape = "db-bound"
+  pools = ["db"]
+  ```
+
+  Each route's `shape` is derived **statically**, at macro-expansion time, from
+  the extractors its handler declares — a provable subset, so a route reading
+  `compute-bound` means "no pool proven", never "no pool touched". Committing
+  the contract makes `autumn calibrate --check` a CI gate that fails with a
+  human-readable diff when a rebuild leaves the envelope, and pointing
+  `[server] capacity_contract` at it makes the binary admit against its own
+  proven edge instead of a guess:
+
+  ```toml
+  [server]
+  capacity_contract = "capacity.lock"
+  ```
+
+  The contract also records the workload that produced it — profile, Cargo
+  features, seed, ladder, rung duration and repeat count — and `--check`
+  replays all of it rather than its own defaults, since an envelope only means
+  something next to the experiment behind it. Each rung is measured three times
+  and the median kept: a single sample per rung spread by up to 20% across
+  no-op rebuilds of an identical build on a shared runner, which is wider than
+  the regression tolerance itself. Setting
+  `[server] capacity_contract` also makes `autumn deploy` ship the contract
+  alongside the manifest that names it.
+
+  Both the gate and the runtime refuse to compare envelopes across host classes,
+  and every failure along the contract path (missing file, malformed document,
+  a contract from another machine, a recorded limit of `0`) degrades to
+  *unlimited* with a warning rather than to a ceiling — failing closed would
+  mean a typo'd path sheds every request on the way up. An explicit
+  `server.max_concurrent_requests` always wins, including an explicit `0`. See
+  [docs/guide/capacity-contracts.md](docs/guide/capacity-contracts.md).
+- **Authored, seeded fault scenarios you can commit as regression tests
+  (#1680):** the simulation harness could already inject faults, but only
+  *probabilistically* — `Chaos::db_transient_errors(0.05)` says "5% of
+  connection checkouts fail" and lets the seed pick which. That is the right
+  tool for a sweep hunting rare interleavings and the wrong one for proving a
+  fix, because the sentence a post-mortem produces is "the third connection
+  checkout failed while the second `send_invoice` execution was retrying", and
+  no rate reproduces that on purpose. A new `autumn_web::sim::FaultPlan`
+  authors that scenario by ordinal, attaches to a `TestApp` with no application
+  code changes, and hands back a serializable record of what happened:
+
+  ```rust
+  use autumn_web::sim::{FaultPlan, Sim};
+
+  #[sim_test]
+  async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
+      let plan = FaultPlan::from_seed(sim.seed)
+          .fail_db_checkout(3)           // 3rd checkout on any pool (1-based)
+          .fail_job("send_invoice", 2);  // 2nd execution of that job by name
+
+      sim.build(
+          TestApp::new()
+              .routes(routes![checkout])
+              .plugin(InvoiceJobPlugin)
+              .with_fault_plan(plan),
+      );
+
+      for _ in 0..5 {
+          sim.client().post("/checkout").send().await;
+      }
+      sim.run_to_idle().await;
+
+      let outcome = sim.client().fault_outcome().await;
+      assert_eq!(outcome.fired.len(), 2);
+      assert_eq!(outcome.server_errors[0].status, 503);
+      assert_eq!(outcome.final_state.db_checkouts, 5);
+
+      // Canonical JSON, byte-identical on every replay of this seed.
+      assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoices.json").trim_end());
+  }
+  ```
+
+  Two effect classes fire deterministically through the existing
+  `interceptor.rs` seams: database connection checkout (`fail_db_checkout`,
+  `fail_db_checkout_on("replica", 2)`) and job execution
+  (`fail_job_execution`, `fail_job("send_invoice", 2)`), each targetable by a
+  1-based ordinal on a global or per-target counter. `random_db_checkout_faults(2, 1..=8)`
+  derives ordinals from the plan's seed and resolves them into explicit entries
+  at builder-call time, so `plan.planned()` always describes the whole schedule
+  and an explicit-only plan draws no entropy at all. `only_between(from, to)`
+  confines faults to a half-open window of elapsed time measured on the app's
+  **injected** clock, so `Sim::advance` moves it and no wall-clock read leaks
+  in; an effect outside the window still consumes its ordinal and is recorded
+  as `suppressed` rather than silently vanishing.
+
+  `TestClient::fault_outcome().await` returns a `FaultOutcome` carrying the
+  seed, `fired` (effect, target, global and per-target ordinal, the injected
+  clock's `at` and `elapsed_ms`), `suppressed`, `unfired`, `server_errors`
+  projected from `reporting.rs`, and `final_state` seam totals. It is
+  `Serialize + Deserialize + PartialEq`, its `to_json_string()` is canonical
+  (declaration-order fields, no maps, no floats) and `fingerprint()` is an
+  FNV-1a 64 over it — so a scenario replayed 100× from one seed produces a
+  byte-identical record 100/100 times, which is exactly what the committed
+  determinism test asserts. The `async` on `fault_outcome` is load-bearing: it
+  settles autumn's detached error-report tasks with bounded cooperative yields
+  before snapshotting, without advancing the virtual clock.
+
+  A plan **composes** rather than replaces — it chains behind your own
+  `with_job_interceptor` / `with_db_interceptor`, the always-on job recorder,
+  transactional-DB isolation and `Sim::chaos`, with the injected failure
+  innermost so a user interceptor observes it exactly like a real handler
+  error. Attaching a plan also defaults the app's entropy to `SeededEntropy`
+  from the plan's seed (an explicit `with_entropy` still wins) and asserts the
+  settings replay depends on — one job worker, reporting at
+  `sample_rate = 1.0`, and failure capture off — instead of letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break reproducibility.
+
+  Scope is deliberately narrow: test-only (there is no production fault
+  injection), DB checkout and job execution only (use `Chaos::smtp_faults` for
+  SMTP), and `TestClient::perform_enqueued_jobs` bypasses the
+  `intercept_execute` seam so job faults require `Sim::run_to_idle`.
+  `autumn/tests/integration/sim_fault_plan.rs` is the worked proof: a
+  `charge_card` job whose scenario fails at `max_attempts = 1` and passes at
+  `max_attempts = 3`, the same before/after shape as the retry-storm example.
+  See
+  [Simulation Testing → Authored fault scenarios](docs/guide/simulation-testing.md).
+- **A markdown link gate for the docs corpus [no-plugin]:** `check-docs.sh`
+  gated rustdoc intra-doc links and `check-plugin-freshness.sh` gated the
+  `docs/guide/*.md` paths named from `skills/` and `agents/`, but nothing
+  checked the 383-file markdown corpus itself — so a guide could link to a
+  page that was renamed, never written, or lives one directory up, and
+  nothing noticed. `scripts/check-docs-links.sh` resolves every relative
+  link and heading anchor in tracked markdown and now runs in CI's docs-only
+  job. Its baseline found **19 broken links across 11 pages**, all fixed
+  here: five rustdoc paths pasted into `aggregates.md` as markdown targets
+  (they render as links to a directory that does not exist), three
+  `docs/design/` links off by one directory level, `authorization.md` and
+  `generators.md` pointing into `docs/api/` and `docs/reference/` trees that
+  have never existed, `tauri.md` pointing at a `managed-pg.md` that is
+  really `daemon.md`, two guides promising a `custom_config_loader` example
+  that is not in the workspace, and four heading anchors that no longer
+  match their headings. External links are deliberately out of scope
+  (network-flaky, and not fixable in this repo).
+
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
   job history, tracking records, idempotency responses, experiment
@@ -643,6 +810,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dev inspector's detail route (`{inspector_path}/requests/{id}`) is claimed
   alongside its index — both now derive from `inspector_endpoint_paths`, so the
   claim set cannot drift from what the router actually mounts.
+- **ACME config: `autumn doctor` and the runtime now reject the same two
+  spellings (#1874):** two low-severity parity gaps let `autumn doctor
+  --strict` bless an `autumn.toml` the server refuses to boot on. A
+  **non-integer `renew_before_days`** — a quoted `renew_before_days = "30"`, a
+  float, or a bool — was read by doctor's `as_integer()` chain as *absent* and
+  silently defaulted to 30, so the check passed while the runtime's typed
+  deserialization rejects the file at boot. Doctor now records the value the
+  operator actually wrote and reports an `acme_config` **Fail** naming it,
+  exactly as it already did for `http_challenge_port` and `directory`. (A
+  negative or out-of-`u32`-range integer already failed, having been clamped to
+  `u32::MAX` and caught by the `>= 90` rule; it now fails with a message about
+  the value rather than about the renewal window.) A
+  **whitespace-padded domain** (`domains = [" app.example.com "]`) passed
+  `AcmeConfig::validate()`, which trims only for its blank and wildcard checks
+  but stores the entry untrimmed — and the untrimmed string is what becomes the
+  certificate's SAN and the ACME order's `Identifier::Dns`, so the padded name
+  was requested as-is and failed mid-issuance with an opaque CA error. Both
+  `validate()` and doctor now reject it at startup with a message naming the
+  entry, its index, and the trimmed spelling to use. Neither gap was a security,
+  denial-of-service, or CA-rate-limit issue: each was already caught fail-fast
+  at boot or at first issuance, just later and less legibly than it should have
+  been.
 
 - **CI now rejects colliding migration versions:** app, framework and plugin
   migrations are applied into one shared version space — diesel keys
@@ -815,6 +1004,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches any ambient runtime, closing both failure points. Verified against
   a real TLS-enabled Postgres server, on both a `current_thread` and
   `multi_thread` tokio runtime, called directly from an async body.
+- **Admin panel: a create/edit form that fails validation no longer discards
+  everything the admin typed:** `POST /{slug}` and `POST /{slug}/{id}` — the
+  only mutation UI the framework ships, used identically by every model in
+  every admin-plugin deployment — propagated a malformed field (e.g.
+  unparsable JSON) or a model-declared `AdminError::Validation` (e.g. a
+  uniqueness check) as a bare `AutumnError`. That renders as a generic error
+  response with no reference back to the form: a full-page navigation away,
+  a "Go to homepage" link as the only recovery step, and every value the
+  admin had entered gone. Both handlers now catch just that failure class and
+  re-render the same form (HTTP 422) with every submitted value still filled
+  in and the failure shown through the existing persistent, accessible flash
+  banner — no toast, no blank form. On update, the redisplayed form is
+  merged with the stored record so `create_only` fields (rendered read-only,
+  never resubmitted) keep showing their real value instead of going blank.
+  Other failure classes (missing pool, unknown model, database outage) are
+  unchanged and still render the generic error page.
 
 ### Added
 

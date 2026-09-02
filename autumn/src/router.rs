@@ -3817,7 +3817,27 @@ fn build_load_shed_layer(
     config: &AutumnConfig,
     state: &AppState,
 ) -> Option<crate::middleware::LoadShedLayer> {
-    let limit = config.server.max_concurrent_requests.filter(|&n| n > 0)?;
+    // The ceiling is either hand-set or sourced from the committed capacity
+    // contract (#1733). `resolve_admission_limit` owns that precedence — and
+    // owns failing *open* on every contract problem, so a stale or missing
+    // lockfile can never shed every request on the way up.
+    let resolved = crate::capacity::resolve_configured_admission_limit(
+        config.server.max_concurrent_requests,
+        config.server.capacity_contract.as_deref(),
+    );
+    let limit = resolved.limit()?;
+    if matches!(resolved, crate::capacity::AdmissionLimit::Contract(_)) {
+        tracing::info!(
+            limit,
+            source = resolved.source(),
+            contract = config
+                .server
+                .capacity_contract
+                .as_deref()
+                .unwrap_or_default(),
+            "admission control sourced from the committed capacity contract"
+        );
+    }
     // Mirror CORS headers onto a shed 503 the same way the timeout middleware
     // does for the main stack (`mirror_cors = true` there): this layer sits
     // outside `CorsLayer` on direct routes, so without mirroring a

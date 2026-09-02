@@ -61,7 +61,7 @@ generated application CI. It is maintained on its own release train.
 
 - Autumn framework crate packaging, docs.rs build, and SemVer gate.
 - CLI commands shipped by `autumn-cli`.
-- Generated application smoke test (see [Downstream Smoke Test](#downstream-smoke-test)).
+- Generated application smoke test (see [Downstream Smoke Test](#6--downstream-smoke-test-smoke-job)).
 
 **Checks that belong in the Harvest repo:**
 

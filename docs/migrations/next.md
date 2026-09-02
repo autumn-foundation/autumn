@@ -378,6 +378,36 @@ framework.
 
 ---
 
+### Capacity contracts: three metadata structs gain fields
+
+Deploys can now carry a proven capacity contract (`autumn calibrate` →
+`capacity.lock` → `[server] capacity_contract`; see
+[the guide](../guide/capacity-contracts.md)). Nothing about existing behaviour
+changes — an app that configures no contract sheds exactly as before — but the
+feature adds fields to three public, non-`#[non_exhaustive]` structs, so
+**struct-literal construction** of them no longer compiles:
+
+* `openapi::ApiDoc` gains `pools: &'static [&'static str]` — the pool tags a
+  handler's declared extractors prove it holds.
+* `route_listing::RouteInfo` gains `resource_shape: ResourceShape` and
+  `pools: Vec<String>`.
+* `config::ServerConfig` gains `capacity_contract: Option<String>`.
+
+All three derive `Default`, so the fix is to end the literal with
+`..Default::default()` — which is what every construction site inside the
+workspace already does, and what the route macros emit. Field access, pattern
+matching with a `..` rest, and deserialization of an older routes dump are all
+unaffected: the two `RouteInfo` fields are `#[serde(default)]`.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical (end the literal with `..Default::default()`), but a rewrite
+cannot tell an exhaustive struct literal that *wants* to name every field from
+one that simply predates these three, and appending a rest pattern to the wrong
+literal would silently paper over a genuinely missing value on a later field
+addition. Direct struct-literal construction of all three types is rare outside
+the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
+normally deserialized from `autumn.toml`.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the

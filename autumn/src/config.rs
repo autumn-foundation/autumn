@@ -56,6 +56,7 @@
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
+//! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -5228,6 +5229,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SERVER__CAPACITY_CONTRACT",
+            &mut self.server.capacity_contract,
+        );
 
         // `[server.tls]` is a nested optional. Materialize it from the
         // environment when any of its keys are set (seeding an empty struct if
@@ -6543,6 +6549,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
 
+    /// Path to the committed capacity contract (`capacity.lock`) this deploy
+    /// should admit against (issue #1733).
+    ///
+    /// When set — and [`Self::max_concurrent_requests`] is *not* — the
+    /// load-shedding ceiling is sourced from the contract's proven envelope
+    /// instead of a hand-tuned guess, so the binary sheds at the edge someone
+    /// actually measured. Relative paths resolve against the process working
+    /// directory.
+    ///
+    /// An explicit `max_concurrent_requests` always wins, and every failure
+    /// along the contract path (missing file, malformed document, a contract
+    /// measured on a different host class) degrades to *unlimited* with a
+    /// warning rather than to a ceiling — see
+    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    ///
+    /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
+    #[serde(default)]
+    pub capacity_contract: Option<String>,
+
     /// Terminate HTTPS directly in the app process (issue #1603).
     ///
     /// When set, the server serves TLS on `host:port` using the configured
@@ -6853,6 +6878,22 @@ impl AcmeConfig {
                     "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
+                ));
+            }
+            // The checks above read `trimmed`, but the entry is stored — and used —
+            // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
+            // the placeholder key's `CertId`, and the ACME order's
+            // `Identifier::Dns`. A padded ` app.example.com ` is therefore a
+            // different identifier than the hostname the operator meant, and the
+            // failure surfaces as an opaque CA rejection mid-issuance. Reject the
+            // padding here instead of silently trimming, so the config file says
+            // exactly what will be requested.
+            if domain != trimmed {
+                return Err(format!(
+                    "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
+                     trailing whitespace: the entry is used verbatim as the certificate's SAN and \
+                     as the ACME order's DNS identifier, so the padded value would be requested \
+                     as-is. Write it as `{trimmed}`"
                 ));
             }
         }
@@ -8647,6 +8688,7 @@ impl Default for ServerConfig {
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
+            capacity_contract: None,
             tls: None,
         }
     }
@@ -14463,6 +14505,108 @@ path = "/healthz"
         assert!(err.contains("blank entries"), "got: {err}");
     }
 
+    // The `autumn doctor` grader FAILs a malformed `http_challenge_port` /
+    // `renew_before_days` (#1608, #1874) on the premise that the runtime's TYPED
+    // deserialization rejects the same spellings before boot. Pin that premise
+    // here: if a future lenient `deserialize_with` ever made the runtime accept
+    // `"30"`, doctor would start FAILing a file that boots fine — the same parity
+    // bug in the opposite direction, and today nothing would catch it.
+    #[test]
+    fn acme_numeric_fields_reject_non_integer_toml_values() {
+        for key in ["http_challenge_port", "renew_before_days"] {
+            for bad in ["\"30\"", "30.5", "true", "-1", "4294967296"] {
+                let src = format!(
+                    "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                     contact_email = \"ops@example.com\"\n{key} = {bad}\n"
+                );
+                assert!(
+                    toml::from_str::<AutumnConfig>(&src).is_err(),
+                    "{key} = {bad} must fail to deserialize"
+                );
+            }
+            // ... while the plain unquoted integer the doctor grader treats as
+            // valid really is accepted.
+            let src = format!(
+                "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
+                 contact_email = \"ops@example.com\"\n{key} = 45\n"
+            );
+            assert!(
+                toml::from_str::<AutumnConfig>(&src).is_ok(),
+                "{key} = 45 must deserialize"
+            );
+        }
+    }
+
+    // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
+    // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
+    // but the UNTRIMMED value is what is stored, so the padded string reached the
+    // placeholder/CSR builder and the ACME `Identifier::Dns` order. The CA then
+    // rejects (or mis-issues) an identifier that is not the hostname the operator
+    // meant, with a far less actionable error than a boot-time rejection.
+    #[test]
+    fn validate_acme_whitespace_padded_domain_rejected() {
+        for padded in [
+            " app.example.com",
+            "app.example.com ",
+            "\tapp.example.com\n",
+        ] {
+            let mut cfg = tls_static(None, None);
+            cfg.acme = Some(acme_cfg(&[padded], "ops@example.com"));
+            let err = cfg
+                .validate()
+                .expect_err("a whitespace-padded domain must be rejected");
+            assert!(
+                err.contains("whitespace"),
+                "message must name the problem: {err}"
+            );
+            assert!(
+                err.contains(&format!("`{padded}`")),
+                "message must echo the RAW padded entry, not only the trimmed \
+                 spelling it suggests: {err}"
+            );
+            assert!(
+                err.contains("`app.example.com`"),
+                "message must name the trimmed spelling to use: {err}"
+            );
+        }
+
+        // A padded entry is rejected even when a well-formed one precedes it, and
+        // the message points at the right index.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", " www.example.com "],
+            "ops@example.com",
+        ));
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("index 1"),
+            "message must name the index: {err}"
+        );
+
+        // The already-trimmed spelling of the same name still passes.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // The padded-domain rule must not shadow the two more specific per-entry
+    // rules: a whitespace-only entry is still reported as blank, and a padded
+    // wildcard is still reported as a wildcard (the deeper problem, and the
+    // message operators already get today).
+    #[test]
+    fn validate_acme_padded_domain_rule_does_not_shadow_blank_or_wildcard() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[" *.example.com "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("wildcard"), "got: {err}");
+        assert!(err.contains("#1620"), "got: {err}");
+    }
+
     // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
     // OS port the HTTP-01 validator (always port 80) can never reach, so every
     // issuance fails while the process stays up — `validate()` must reject it.
@@ -14528,6 +14672,40 @@ path = "/healthz"
             "ops@example.com",
         ));
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // ── server.capacity_contract (#1733) ───────────────────────────────
+
+    #[test]
+    fn server_config_defaults_capacity_contract_none() {
+        let config = AutumnConfig::default();
+        assert!(config.server.capacity_contract.is_none());
+    }
+
+    #[test]
+    fn capacity_contract_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server]
+            capacity_contract = "capacity.lock"
+            "#,
+        )
+        .expect("config with server.capacity_contract should parse");
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("capacity.lock")
+        );
+    }
+
+    #[test]
+    fn env_override_server_capacity_contract() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__CAPACITY_CONTRACT", "deploy/capacity.lock");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.server.capacity_contract.as_deref(),
+            Some("deploy/capacity.lock")
+        );
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────
