@@ -387,9 +387,16 @@ for f in files:
             continue
         if t.startswith("#"):
             # The fragment is URL-encoded too: `#caf%C3%A9` addresses `#café`.
+            # Compared exactly: fragments are case-sensitive, and GitHub's
+            # slugger always lowercases, so `#Section` never reaches the
+            # `id="section"` it was written for.
             frag = urllib.parse.unquote(t[1:])
-            if frag and frag.lower() not in anchors.get(f, ()):
-                defects.append(f"{f}: no such heading anchor in this page: `{t}`")
+            if frag and frag not in anchors.get(f, ()):
+                defects.append(
+                    f"{f}: no such heading anchor in this page: `{t}`"
+                    + (" (case: anchors are lowercase)"
+                       if frag.lower() in anchors.get(f, ()) else "")
+                )
             continue
         path, _, anchor = t.partition("#")
         path = path.split("?")[0]
@@ -410,8 +417,12 @@ for f in files:
             continue
         rel = os.path.relpath(resolved, root)
         anchor = urllib.parse.unquote(anchor)
-        if anchor and rel in anchors and anchor.lower() not in anchors[rel]:
-            defects.append(f"{f}: no such heading anchor in {rel}: `{t}`")
+        if anchor and rel in anchors and anchor not in anchors[rel]:
+            defects.append(
+                f"{f}: no such heading anchor in {rel}: `{t}`"
+                + (" (case: anchors are lowercase)"
+                   if anchor.lower() in anchors[rel] else "")
+            )
 
 print(f"corpus: {len(files)} tracked markdown files")
 for d in sorted(defects):
@@ -766,6 +777,21 @@ self_test() {
     >> "$c42/docs/guide/mail.md"
   git -C "$c42" commit -qam nested-quoted-fence
   check "nested quoted fence ends when its quote depth drops" fail "$c42"
+
+  # Fragments are case-sensitive and GitHub's slugger always lowercases, so
+  # `#Section` never reaches the `id="section"` it was written for.
+  local c43="$tmp/c43"; make_corpus "$c43"
+  printf '\n## Section\n' >> "$c43/docs/guide/jobs.md"
+  printf 'See [wrong](jobs.md#Section).\n' >> "$c43/docs/guide/mail.md"
+  git -C "$c43" commit -qam fragment-case
+  check "mixed-case fragment for a generated heading fails" fail "$c43"
+
+  # ...but an explicit HTML id keeps its own case, so an exact match resolves.
+  local c44="$tmp/c44"; make_corpus "$c44"
+  printf '\n<a id="MixedId"></a>\n' >> "$c44/docs/guide/jobs.md"
+  printf 'See [ok](jobs.md#MixedId).\n' >> "$c44/docs/guide/mail.md"
+  git -C "$c44" commit -qam html-anchor-case
+  check "explicit HTML id matches its own case" pass "$c44"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
