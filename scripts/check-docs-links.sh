@@ -58,13 +58,17 @@ import os, re, subprocess, sys, collections
 
 root = sys.argv[1]
 
+# NUL-delimited: a path containing whitespace (`docs/setup guide.md`) would
+# otherwise split into fragments, inflating the corpus count while silently
+# skipping the real file and every broken link in it. `-z` also stops git
+# from quoting and escaping unusual paths.
 files = [
     f
     for f in subprocess.run(
-        ["git", "ls-files", "*.md"], cwd=root, capture_output=True, text=True
-    ).stdout.split()
+        ["git", "ls-files", "-z", "*.md"], cwd=root, capture_output=True, text=True
+    ).stdout.split("\0")
     # Seed content for the wiki example app, resolved by that app's routes.
-    if "/content/" not in f
+    if f and "/content/" not in f
 ]
 
 # CommonMark also allows an angle-bracket destination — `[x](<target.md>)` —
@@ -72,7 +76,13 @@ files = [
 # captured; exactly one of the two groups matches per link. Without this, a
 # valid `(<target.md>)` is reported broken (the brackets end up in the path)
 # and a broken `(<missing file.md>)` is missed entirely.
-INLINE = re.compile(r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|([^)\s]+))(?:\s+"[^"]*")?\s*\)')
+# The bare form also permits balanced parentheses — `[x](guide(v2).md)` — so
+# stopping at the first `)` would check `guide(v2` and fail on a file that
+# exists. One level of nesting covers any realistic path.
+BARE = r'(?:[^()\s]|\([^()\s]*\))+'
+INLINE = re.compile(
+    r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|(' + BARE + r'))(?:\s+"[^"]*")?\s*\)'
+)
 REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
 
@@ -85,18 +95,35 @@ def link_targets(text):
 RUSTDOC = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$')
 
 
-FENCE = re.compile(r'^[ \t]*(`{3,}|~{3,})')
+FENCE = re.compile(r'^([ \t]*)(`{3,}|~{3,})')
+LIST_ITEM = re.compile(r'^([ \t]*)(?:[-*+]|\d{1,9}[.)])([ \t]+)(?=\S)')
+INDENT = re.compile(r'^[ \t]*')
+
+
+def column(s):
+    """Width of an indent string, counting tabs to CommonMark's 4-col stops."""
+    w = 0
+    for ch in s:
+        w = w + 4 - (w % 4) if ch == "\t" else w + 1
+    return w
 
 
 def strip_fences(text):
     """Drop fenced blocks so samples inside them are not read as live links.
 
     Scanned line by line rather than matched with an anchored regex, because
-    a fence's indentation is relative to its containing block: nested in a
-    list item it routinely sits at four or more columns, which no fixed
-    `^ {0,3}` prefix can express. This corpus uses 2- and 3-space fences in
-    176 places today; treating a markdown sample inside one as a live link
-    would fail this gate on text that renders as code.
+    a fence may be indented up to three columns past the start of its
+    containing block: nested in a list item it routinely sits at four or more
+    columns, which no fixed `^ {0,3}` prefix can express. This corpus uses 2-
+    and 3-space fences in 176 places today; treating a markdown sample inside
+    one as a live link would fail this gate on text that renders as code.
+
+    The bound matters as much as the allowance. At top level, a line indented
+    four or more columns is an *indented code block*, not a fence — so
+    accepting unlimited indentation would let a pair of such lines swallow the
+    live paragraph between them, hiding any broken link in it. So the innermost
+    open list item's content column is tracked, and a fence is recognised only
+    within three columns of it.
 
     A fence closes on the same character at least as long as the opener, so
     a ```` ``` ```` sample nested inside a ```` ```` ```` block stays inside it.
@@ -109,15 +136,29 @@ def strip_fences(text):
     opener around line 2479 went missing); balancing it is a separate change,
     not this gate's business.
     """
-    out, opener = [], None
+    out, opener, base = [], None, 0
     for line in text.splitlines():
         m = FENCE.match(line)
+        indent = column(m.group(1)) if m else None
         if opener is None:
-            if m:
-                opener = m.group(1)
+            # Track the innermost open list item: its content column is what
+            # a fence's three-column allowance is measured against. A non-blank
+            # line dedented past it closes the item.
+            item = LIST_ITEM.match(line)
+            if item:
+                base = column(item.group(0))
+            elif line.strip() and column(INDENT.match(line).group(0)) < base:
+                base = 0
+            if m and indent <= base + 3:
+                opener = m.group(2)
             else:
                 out.append(line)
-        elif m and m.group(1)[0] == opener[0] and len(m.group(1)) >= len(opener):
+        elif (
+            m
+            and indent <= base + 3
+            and m.group(2)[0] == opener[0]
+            and len(m.group(2)) >= len(opener)
+        ):
             opener = None
     return "\n".join(out)
 
@@ -327,6 +368,31 @@ self_test() {
   printf 'See [phantom](jobs.md#phantom-heading).\n' >> "$c12/docs/guide/mail.md"
   git -C "$c12" commit -qam phantom-anchor
   check "heading inside an indented fence is not an anchor" fail "$c12"
+
+  # A tracked path containing a space must stay one record. Split on
+  # whitespace it becomes two nonexistent fragments: the corpus count is
+  # inflated and the real file — with its broken link — is skipped in silence.
+  local c13="$tmp/c13"; make_corpus "$c13"
+  printf '# Setup\n\nSee [gone](does-not-exist.md).\n' > "$c13/docs/guide/setup guide.md"
+  git -C "$c13" add -A && git -C "$c13" commit -qm spaced-path
+  check "broken link in a path containing a space is caught" fail "$c13"
+
+  # At top level, four or more columns is an indented CODE block, not a fence.
+  # Treating those two lines as a fence pair would swallow the live paragraph
+  # between them and hide the broken link it carries.
+  local c14="$tmp/c14"; make_corpus "$c14"
+  printf '\n    ```\n\nA live paragraph with [bad](missing.md) in it.\n\n    ```\n' \
+    >> "$c14/docs/guide/mail.md"
+  git -C "$c14" commit -qam top-level-indented-code
+  check "top-level indented backticks do not hide a live link" fail "$c14"
+
+  # CommonMark allows balanced parentheses in a bare destination; stopping at
+  # the first `)` would check `guide(v2` and fail on a file that exists.
+  local c15="$tmp/c15"; make_corpus "$c15"
+  printf 'x\n' > "$c15/docs/guide/guide(v2).md"
+  printf 'See [guide](guide(v2).md).\n' >> "$c15/docs/guide/mail.md"
+  git -C "$c15" add -A && git -C "$c15" commit -qm balanced-parens
+  check "balanced parentheses in a destination resolve" pass "$c15"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
