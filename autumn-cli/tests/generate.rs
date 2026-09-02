@@ -8676,3 +8676,261 @@ fn controller_api_generates_json() {
         );
     }
 }
+
+// ── `autumn plugin add` / `autumn plugin list` (issue #1606) ────────────────
+
+/// Every first-party plugin the install catalog ships, in `plugin list` order.
+const FIRST_PARTY_PLUGINS: [&str; 5] = [
+    "autumn-admin-plugin",
+    "autumn-cache-redis",
+    "autumn-media-plugin",
+    "autumn-search",
+    "autumn-storage-s3",
+];
+
+/// Repoint every first-party plugin crate — and `autumn-web` itself — at this
+/// workspace, so a generated project resolves the versions under test rather
+/// than whatever is published on crates.io.
+fn patch_generated_cargo_toml_for_plugins(project_dir: &Path) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    content.push_str("\n[patch.crates-io]\n");
+    for crate_name in std::iter::once("autumn-web").chain(FIRST_PARTY_PLUGINS) {
+        // `autumn-web` lives in `autumn/`; the plugin crates are named after
+        // their own directories.
+        let dir = if crate_name == "autumn-web" {
+            "autumn"
+        } else {
+            crate_name
+        };
+        writeln!(
+            content,
+            "{crate_name} = {{ path = \"{}\" }}",
+            workspace_root
+                .join(dir)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        )
+        .unwrap();
+    }
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// AC #1: the listing names every first-party plugin, with a description and
+/// the version compatible with the app's `autumn-web`.
+#[test]
+fn plugin_list_shows_every_first_party_plugin() {
+    let (_tmp, project) = fresh_project("plugin-list");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--offline"]);
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(stdout.contains(plugin), "{plugin} missing from:\n{stdout}");
+    }
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
+    assert!(stdout.contains("autumn plugin add"), "{stdout}");
+}
+
+/// The same listing, machine-readable.
+#[test]
+fn plugin_list_json_is_parseable() {
+    let (_tmp, project) = fresh_project("plugin-list-json");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--json", "--offline"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let plugins = value["plugins"].as_array().expect("plugins array");
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(
+            plugins.iter().any(|p| p["name"] == plugin),
+            "{plugin} missing from {stdout}"
+        );
+    }
+}
+
+/// AC #2 (edits) + AC #4 (idempotency), without paying for a compile.
+#[test]
+fn plugin_add_writes_the_dependency_and_the_mount_then_is_idempotent() {
+    let (_tmp, project) = fresh_project("plugin-add");
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert!(stdout.contains("Installed autumn-admin-plugin"), "{stdout}");
+    assert!(stdout.contains("autumn generate admin"), "{stdout}");
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin ="), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".plugin(autumn_admin_plugin::AdminPlugin::new())"),
+        "{main_rs}"
+    );
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert!(stdout.contains("already installed"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_rs
+    );
+}
+
+/// AC #2: `--dry-run` reports the same edits without applying any of them.
+#[test]
+fn plugin_add_dry_run_changes_nothing() {
+    let (_tmp, project) = fresh_project("plugin-add-dry");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    run_autumn(
+        &project,
+        &[
+            "plugin",
+            "add",
+            "autumn-cache-redis",
+            "--dry-run",
+            "--offline",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #3: an incompatible `autumn-web` fails before any file is modified, and
+/// the diagnostic names both versions.
+#[test]
+fn plugin_add_refuses_an_incompatible_autumn_web_without_editing() {
+    let (_tmp, project) = fresh_project("plugin-add-incompat");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap().replace(
+        &format!("autumn-web = \"{}\"", env!("CARGO_PKG_VERSION")),
+        "autumn-web = \"0.1.0\"",
+    );
+    fs::write(&cargo_path, &cargo).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("0.1.0"), "{stderr}");
+    assert!(stderr.contains(env!("CARGO_PKG_VERSION")), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&cargo_path).unwrap(), cargo);
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #5: a `main.rs` whose builder chain cannot be found is left completely
+/// alone, and the command prints what to apply by hand.
+#[test]
+fn plugin_add_degrades_on_a_customized_main() {
+    let (_tmp, project) = fresh_project("plugin-add-custom");
+    let main_path = project.join("src/main.rs");
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    my_bootstrap().await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    // A refusal, not a result: it goes to stderr and exits 2 so a script
+    // cannot read "I changed nothing" as a successful install.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("autumn-admin-plugin = \""), "{stderr}");
+    assert!(stderr.contains("AdminPlugin::new()"), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #5, the shape that used to slip through: a `main.rs` that factors its
+/// builder into a helper. Splicing there mounts the plugin into a function the
+/// binary never calls — and for `autumn-storage-s3`, whose mount awaits, into a
+/// synchronous fn, which does not compile.
+#[test]
+fn plugin_add_degrades_when_the_builder_lives_in_a_helper() {
+    let (_tmp, project) = fresh_project("plugin-add-helper");
+    let main_path = project.join("src/main.rs");
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    build_app().run().await;\n}\n\n\
+                  fn build_app() -> autumn_web::app::AppBuilder {\n    autumn_web::app()\n        \
+                  .routes(routes![index])\n}\n";
+    fs::write(&main_path, custom).unwrap();
+
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-storage-s3", "--offline"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+}
+
+/// An unknown name is refused with a pointer at `plugin list`.
+#[test]
+fn plugin_add_rejects_an_unknown_crate() {
+    let (_tmp, project) = fresh_project("plugin-add-unknown");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "add", "tokio", "--offline"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+}
+
+/// The Success Metric for issue #1606: `autumn plugin add` for **every**
+/// first-party plugin against a fresh `autumn new` scaffold, each of which
+/// must then `cargo check` green — the machine proof that the generated mount
+/// compiles on the first try.
+///
+/// Ignored by default (it compiles five generated projects); run in CI by the
+/// `plugin-install` job in `.github/workflows/generator-conformance.yml`. The
+/// five projects share one `CARGO_TARGET_DIR` so the framework is built once
+/// rather than five times.
+#[test]
+#[ignore = "compiles generated projects against the local workspace (slow)"]
+fn plugin_add_first_party_scaffolds_cargo_check() {
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    for plugin in FIRST_PARTY_PLUGINS {
+        let (_tmp, project) = fresh_project(&plugin.replace('-', "_"));
+        patch_generated_cargo_toml_for_plugins(&project);
+
+        let (stdout, _) = run_autumn(&project, &["plugin", "add", plugin, "--offline"]);
+        assert!(stdout.contains(&format!("Installed {plugin}")), "{stdout}");
+
+        // Re-running must be a no-op, so the compile below is of a
+        // singly-installed project (AC #4).
+        let (stdout, _) = run_autumn(&project, &["plugin", "add", plugin, "--offline"]);
+        assert!(stdout.contains("already installed"), "{stdout}");
+
+        let check = Command::new("cargo")
+            .args(["check", "--all-targets"])
+            .current_dir(&project)
+            .env("CARGO_TARGET_DIR", shared_target.path())
+            .output()
+            .expect("failed to run cargo check");
+        assert!(
+            check.status.success(),
+            "`autumn plugin add {plugin}` produced a project that does not compile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr),
+        );
+    }
+}

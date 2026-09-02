@@ -3246,6 +3246,19 @@ impl AppBuilder {
             return;
         }
 
+        // ── Framework data-retention mode ───────────────────────────────
+        // When AUTUMN_DB_RETENTION=report|purge is set, report (or enforce)
+        // the unified `[retention]` policy over every framework-owned dataset
+        // and exit — never starting the HTTP server. Triggered by
+        // `autumn db retention` (issue #1605). Runs inside the app, not from
+        // the standalone CLI, so the report reflects the app's own resolved
+        // config, GDPR legal-hold registrations, and audit sinks — the same
+        // inputs the scheduled sweep uses.
+        if let Some(mode) = framework_retention_mode_from_env() {
+            self.run_framework_retention_mode(mode).await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -3408,6 +3421,27 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
+
+        // #1605: the unified framework-owned data-retention sweep. Registered
+        // here rather than alongside the `#[repository(..., retention(...))]`
+        // policies above because it is config-driven, and the config is only
+        // loaded now. `framework_retention_task` returns `None` unless at
+        // least one `[retention]` window is set, so an app that never
+        // mentions the section gets no extra scheduler loop — the structural
+        // form of "leaving a dataset unset preserves today's behavior
+        // exactly".
+        if let Some(retention_task) =
+            crate::data_retention::framework_retention_task(&config.retention)
+        {
+            tasks.push(retention_task);
+            // Re-validate: the merged-name check above ran before this task
+            // existed, and an app is free to declare a `#[scheduled]` fn
+            // named `autumn-retention-sweep`, which would otherwise spawn two
+            // loops competing for one coordination lock.
+            if let Err(error) = crate::task::validate_unique_scheduled_task_names(&tasks) {
+                panic!("{error}");
+            }
+        }
 
         // Process role selects which slice of the runtime this replica runs. A
         // split role (web/worker) requires a durable jobs backend the separate
@@ -4165,7 +4199,7 @@ impl AppBuilder {
         // Carries the cert/key reload wiring from the TLS bind path to the
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
-        let mut tls_reload_state: Option<TlsReloadState> = None;
+        let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
 
         // Carries the ACME challenge listener + renewal task wiring from the TLS
         // bind path to the sibling tasks spawned once `server_shutdown` exists.
@@ -4523,7 +4557,7 @@ impl AppBuilder {
         if let Some(reload) = tls_reload_state.take() {
             let reload_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
-                run_tls_cert_reload(reload, reload_shutdown).await;
+                reload.run(reload_shutdown).await;
             });
         }
 
@@ -6143,6 +6177,147 @@ impl AppBuilder {
         }
     }
 
+    /// Report or enforce the unified `[retention]` policy over every
+    /// framework-owned dataset, print the report as JSON, and exit
+    /// (issue #1605).
+    ///
+    /// Triggered by `AUTUMN_DB_RETENTION=report|purge` from `autumn db
+    /// retention`. Boots just enough context to answer honestly — the
+    /// resolved config, the database, and the app's own state initializers,
+    /// which is what installs the [`crate::gdpr::GdprRegistry`] a legal hold
+    /// lives in and the [`crate::audit::AuditLogger`] the sweep records
+    /// through — but no HTTP listener and no job/scheduler machinery.
+    ///
+    /// Running inside the app rather than from the standalone CLI is what
+    /// makes the report trustworthy: it calls the *same*
+    /// [`crate::data_retention::run_retention`] the scheduled sweep calls, so
+    /// what the CLI prints and what the app enforces cannot drift.
+    #[allow(clippy::too_many_lines)]
+    async fn run_framework_retention_mode(self, mode: FrameworkRetentionMode) {
+        let Self {
+            state_initializers,
+            audit_logger,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            ..
+        } = self;
+
+        let dataset_filter = framework_retention_dataset_from_env();
+        // Reject a mistyped `--dataset` before opening a connection: the
+        // registry is compile-time, so this needs no database at all.
+        if let Some(filter) = dataset_filter.as_deref()
+            && crate::data_retention::RetentionDataset::from_key(filter).is_none()
+        {
+            let known: Vec<&str> = crate::data_retention::RETENTION_DATASETS
+                .iter()
+                .map(|dataset| dataset.key())
+                .collect();
+            eprintln!(
+                "autumn db retention: unknown dataset {filter:?}; known datasets: {}",
+                known.join(", ")
+            );
+            std::process::exit(1);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+
+        #[cfg(feature = "db")]
+        let database = match setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("{error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            database.topology.as_ref(),
+            #[cfg(feature = "db")]
+            database.shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        // `AppBuilder::with_audit_sink(...)` installs its logger here, not via
+        // a state initializer. Skipping it would leave an on-demand purge with
+        // no audit record at all, and would make
+        // `--dataset audit_archives` a silent no-op for exactly the apps that
+        // use the first-class builder.
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
+        // The app's own state initializers are what install the GDPR registry
+        // a legal hold lives in. Skipping them would make `autumn db
+        // retention` report a sweep the running app would actually refuse.
+        run_state_initializers(state_initializers, &state);
+
+        let options = crate::data_retention::RetentionRunOptions {
+            dry_run: mode == FrameworkRetentionMode::Report,
+            dataset: dataset_filter.as_deref(),
+        };
+        // `process::exit` skips `on_shutdown`, so a managed-Postgres
+        // postmaster `setup_database` may have started must be stopped
+        // explicitly before every exit below.
+        match crate::data_retention::run_retention(&state, &options).await {
+            Ok(reports) => match serde_json::to_string(&reports) {
+                Ok(json) => {
+                    println!("{FRAMEWORK_RETENTION_JSON_PREFIX}{json}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    // A dataset that failed is reported in its own row rather
+                    // than aborting the run, but the command as a whole must
+                    // still exit non-zero so a scripted purge doesn't look
+                    // successful.
+                    let exit_code = i32::from(reports.iter().any(|r| r.error.is_some()));
+                    std::process::exit(exit_code);
+                }
+                Err(error) => {
+                    eprintln!("autumn db retention: failed to serialize report: {error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("autumn db retention: {error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        }
+    }
+
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
@@ -6903,6 +7078,63 @@ pub(crate) fn is_list_one_off_tasks_mode() -> bool {
 /// traffic is flipped to the new release.
 pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
+}
+
+/// The `autumn db retention` one-shot mode requested by
+/// `AUTUMN_DB_RETENTION`, if any (issue #1605).
+///
+/// `report` counts what is eligible and deletes nothing; `purge` enforces the
+/// policy immediately. Any other value is rejected loudly rather than
+/// defaulting to either — guessing wrong in one direction deletes data the
+/// operator did not ask to delete.
+pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMode> {
+    let raw = std::env::var(FRAMEWORK_RETENTION_ENV).ok()?;
+    match raw.trim() {
+        "" => None,
+        "report" => Some(FrameworkRetentionMode::Report),
+        "purge" => Some(FrameworkRetentionMode::Purge),
+        other => {
+            // Warn and fall through to a normal boot rather than exiting.
+            // This var is read on *every* start, so exiting here would let a
+            // stray value in a wrapping script or a shared environment take a
+            // production app down at boot. Mirrors `AUTUMN_ROLE`'s handling
+            // of an unrecognized value.
+            eprintln!(
+                "Warning: {FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" \
+                 or \"purge\"), ignoring"
+            );
+            None
+        }
+    }
+}
+
+/// The env var `autumn db retention` sets to select the one-shot mode.
+pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
+
+/// The env var `autumn db retention --dataset <key>` sets to narrow the run.
+pub(crate) const FRAMEWORK_RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
+
+/// Line prefix framing the framework retention report on stdout, matched
+/// verbatim by `autumn-cli/src/db/retention.rs`.
+pub(crate) const FRAMEWORK_RETENTION_JSON_PREFIX: &str = "AUTUMN_DB_RETENTION_REPORT=";
+
+/// What `autumn db retention` asked the app to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameworkRetentionMode {
+    /// Count what is eligible; delete nothing.
+    Report,
+    /// Enforce the policy now.
+    Purge,
+}
+
+/// The `--dataset` filter, if one was passed. Blank is treated as absent so a
+/// wrapping script exporting an empty value cannot turn into a not-found
+/// error.
+pub(crate) fn framework_retention_dataset_from_env() -> Option<String> {
+    std::env::var(FRAMEWORK_RETENTION_DATASET_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Whether `AUTUMN_RETENTION_DRY_RUN=1` requests the retention dry-run
@@ -7956,38 +8188,6 @@ enum BoundListener {
     Tls(crate::tls::TlsListener),
 }
 
-/// Current UNIX time in seconds, saturating on the (impossible) pre-epoch case.
-///
-/// Deliberately **real** time, not the injected clock: this is the reference
-/// instant TLS certificate validity is judged against
-/// ([`crate::tls::load_certified_key`]). A certificate's `notBefore`/`notAfter`
-/// are facts about the real world, so a test or simulation clock pinned to the
-/// sim epoch must never be able to declare a live certificate not-yet-valid (or
-/// an expired one fine). It also runs at bind time and on a `spawn_blocking`
-/// reload timer, neither of which is on a request path a sim drives.
-#[cfg(feature = "tls")]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "TLS certificate validity is judged against real wall time by \
-              design — see this function's doc comment. Injecting a virtual \
-              clock here would let a simulation misjudge a real certificate."
-)]
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
-/// State carried from the TLS bind path to the background reload task.
-#[cfg(feature = "tls")]
-struct TlsReloadState {
-    resolver: std::sync::Arc<crate::tls::ReloadableCertResolver>,
-    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    interval: std::time::Duration,
-}
-
 /// Bind a TLS-terminating listener over `tcp`, loading and validating the
 /// configured certificate and key (fail-fast on any problem).
 #[cfg(feature = "tls")]
@@ -7995,7 +8195,7 @@ fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, TlsReloadState), crate::tls::TlsError> {
+) -> Result<(crate::tls::TlsListener, crate::tls::CertReloader), crate::tls::TlsError> {
     let provider = crate::tls::crypto_provider();
     // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
     // static-cert mode (the only mode that reaches this function; ACME mode is
@@ -8008,24 +8208,26 @@ fn build_tls_listener(
         .key_path
         .as_deref()
         .expect("validated: static [server.tls] sets key_path");
-    let certified = crate::tls::load_certified_key(cert_path, key_path, &provider, now_unix())?;
-    let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(certified));
+    // One call, so the reload baseline is stat'd before the certificate is
+    // loaded: a renewal landing in that gap must read as a change on the next
+    // poll, not as the baseline (which would serve the superseded certificate
+    // until the following renewal).
+    let (resolver, reload) = crate::tls::CertReloader::load(
+        cert_path.to_path_buf(),
+        key_path.to_path_buf(),
+        std::sync::Arc::clone(&provider),
+        crate::tls::now_unix(),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
+    )?;
     let server_config = crate::tls::build_server_config(
         std::sync::Arc::clone(&provider),
         std::sync::Arc::clone(&resolver),
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
-    // at least one second, mirroring the reload-interval clamp below.
+    // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    let reload = TlsReloadState {
-        resolver,
-        provider,
-        cert_path: cert_path.to_path_buf(),
-        key_path: key_path.to_path_buf(),
-        // A zero interval would busy-loop; clamp to at least one second.
-        interval: std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
-    };
     Ok((listener, reload))
 }
 
@@ -8182,90 +8384,6 @@ fn make_acme_reporter(
 #[cfg(all(feature = "acme", not(feature = "reporting")))]
 fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {
     std::sync::Arc::new(|_message: String| {})
-}
-
-/// Modification times of the cert and key files, `None` for a file that could
-/// not be stat'd. Reloads trigger on any change to this pair.
-#[cfg(feature = "tls")]
-fn tls_file_mtimes(
-    cert: &std::path::Path,
-    key: &std::path::Path,
-) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
-    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    (mtime(cert), mtime(key))
-}
-
-/// Background task: poll the cert/key file mtimes and hot-swap the served
-/// certificate on change. Never breaks the listener — a failed reload keeps the
-/// previously loaded certificate and retries on the next tick.
-#[cfg(feature = "tls")]
-async fn run_tls_cert_reload(state: TlsReloadState, shutdown: tokio_util::sync::CancellationToken) {
-    // Stat and PEM-read the cert/key on a blocking thread — both touch the
-    // filesystem and must not run on a tokio worker. On a `JoinError` (the
-    // blocking pool shutting down) just skip the tick and retry next time.
-    let stat_mtimes = |cert: std::path::PathBuf, key: std::path::PathBuf| {
-        tokio::task::spawn_blocking(move || tls_file_mtimes(&cert, &key))
-    };
-
-    let mut last = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
-        Ok(mtimes) => mtimes,
-        Err(e) => {
-            tracing::warn!(error = %e, "TLS reload: initial mtime read failed; assuming unknown");
-            (None, None)
-        }
-    };
-    loop {
-        tokio::select! {
-            () = tokio::time::sleep(state.interval) => {}
-            () = shutdown.cancelled() => break,
-        }
-
-        let current = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
-            Ok(mtimes) => mtimes,
-            Err(e) => {
-                tracing::warn!(error = %e, "TLS reload: mtime read task failed; skipping tick");
-                continue;
-            }
-        };
-        if current == last {
-            continue;
-        }
-
-        let cert_path = state.cert_path.clone();
-        let key_path = state.key_path.clone();
-        let provider = std::sync::Arc::clone(&state.provider);
-        let loaded = tokio::task::spawn_blocking(move || {
-            crate::tls::load_certified_key(&cert_path, &key_path, &provider, now_unix())
-        })
-        .await;
-        let loaded = match loaded {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(error = %e, "TLS reload: load task failed; skipping tick");
-                continue;
-            }
-        };
-
-        match loaded {
-            Ok(next) => {
-                state.resolver.store(next);
-                // Only advance the baseline on a successful load, so a partial
-                // write observed mid-renewal is retried on the next tick.
-                last = current;
-                tracing::info!(
-                    cert = %state.cert_path.display(),
-                    "Reloaded TLS certificate after detecting a change on disk"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    cert = %state.cert_path.display(),
-                    "TLS certificate reload failed; keeping the previously loaded certificate"
-                );
-            }
-        }
-    }
 }
 
 /// Connection info for a Unix-domain-socket request.
@@ -8891,6 +9009,14 @@ async fn load_config_and_telemetry(
     {
         config.server.unix_socket = Some(forced);
     }
+
+    // #1605: tighten every TTL-native subsystem knob to its `[retention]`
+    // window before anything is built from the config, so the cap flows into
+    // the idempotency layer's TTL, the session cookie's Max-Age and Redis
+    // TTL, and `autumn_job_tracking.expires_at` without each of those sites
+    // having to know the policy exists. A pure `min`, so a config with no
+    // `[retention]` section is untouched.
+    config.apply_retention_caps();
 
     // 2. Initialize logging/telemetry via the installed provider, falling
     //    back to the default `tracing-subscriber + OTLP` initializer.
@@ -14622,17 +14748,11 @@ mod tests {
         std::fs::create_dir_all(dist.join("docs")).expect("mkdir");
         std::fs::write(dist.join("docs/index.html"), "<h1>Static Docs</h1>").expect("write");
 
-        let manifest = crate::static_gen::StaticManifest {
-            generated_at: "2026-03-27T00:00:00Z".to_owned(),
-            autumn_version: "0.2.0".to_owned(),
-            routes: HashMap::from([(
-                "/docs".to_owned(),
-                crate::static_gen::ManifestEntry {
-                    file: "docs/index.html".to_owned(),
-                    revalidate: None,
-                },
-            )]),
-        };
+        let manifest = crate::static_gen::StaticManifest::new(HashMap::from([(
+            "/docs".to_owned(),
+            crate::static_gen::ManifestEntry::new("docs/index.html".to_owned()),
+        )]))
+        .with_generated_at("2026-03-27T00:00:00Z");
         let json = serde_json::to_string(&manifest).expect("serialize");
         std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
 
@@ -14707,6 +14827,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    /// #1832 through the composed `build_router_with_static` stack rather than
+    /// the router tests' narrower helper: the manifest's recorded type must
+    /// survive the security-headers layer and arrive alongside
+    /// `X-Content-Type-Options: nosniff` — which is precisely why it has to be
+    /// right. `/feed` is extensionless and stored as `feed/index.html`, so both
+    /// legacy clues say `text/html`; only the recorded value makes it RSS.
+    #[tokio::test]
+    async fn build_router_serves_recorded_content_type_with_nosniff() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("feed")).expect("mkdir");
+        std::fs::write(dist.join("feed/index.html"), "<rss/>").expect("write");
+
+        let manifest = crate::static_gen::StaticManifest::new(HashMap::from([(
+            "/feed".to_owned(),
+            crate::static_gen::ManifestEntry::new("feed/index.html".to_owned())
+                .with_content_type(Some("application/rss+xml".to_owned())),
+        )]));
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        let config = AutumnConfig::default();
+        let router = crate::router::build_router_with_static(
+            Vec::new(),
+            &config,
+            AppState::for_test(),
+            Some(dist.as_path()),
+        );
+
+        let response = router
+            .oneshot(Request::builder().uri("/feed").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/rss+xml"),
+            "the recorded type must survive the full composed stack"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "nosniff is why the recorded type has to be correct: the browser \
+             will not second-guess it"
+        );
     }
 
     #[tokio::test]

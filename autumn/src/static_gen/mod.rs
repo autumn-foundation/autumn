@@ -85,7 +85,7 @@ pub use isr_coordinator::PostgresIsrCoordinator;
 pub use isr_coordinator::{
     IsrCoordinator, LocalIsrCoordinator, isr_advisory_lock_key, isr_window_key,
 };
-pub use middleware::StaticFileLayer;
+pub use middleware::{ResolvedStatic, StaticFileLayer, resolved_content_type};
 pub use types::{
     ManifestEntry, ParamsFn, StaticManifest, StaticParams, StaticRouteMeta, url_to_file_path,
 };

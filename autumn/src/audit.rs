@@ -44,6 +44,19 @@ pub struct AuditEvent {
     pub ip_address: Option<IpAddr>,
     /// Final action status.
     pub status: AuditStatus,
+    /// Additional, action-specific detail (issue #1605).
+    ///
+    /// Deliberately a flat `String → String` map rather than arbitrary JSON:
+    /// it keeps [`AuditEvent`] `Eq` and its serialization key-ordered and
+    /// deterministic, and it is the shape SIEM ingestion expects. Empty for
+    /// most events; a retention sweep uses it to carry the dataset, the
+    /// cutoff timestamp, and the number of rows removed (see
+    /// [`crate::data_retention`]).
+    ///
+    /// `#[serde(default)]`, so audit archives written before this field
+    /// existed still deserialize.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl AuditEvent {
@@ -63,7 +76,17 @@ impl AuditEvent {
             target_resource_id: target_resource_id.into(),
             ip_address,
             status,
+            metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Attach one key/value detail to this event, builder-style.
+    ///
+    /// Chainable; a repeated key overwrites the earlier value.
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -90,11 +113,104 @@ impl AuditError {
 
 type AuditWriteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>>;
 
+/// What a retention purge did (or would do) to one audit sink (issue #1605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditPurgeOutcome {
+    /// Entries removed — or, for a dry run, that *would* be removed.
+    pub entries_removed: u64,
+    /// `false` when this sink has no notion of purging, so a caller can tell
+    /// "nothing was old enough" apart from "this destination cannot be
+    /// pruned from here" (a SIEM forwarder, a broadcast channel).
+    pub supported: bool,
+}
+
+impl AuditPurgeOutcome {
+    /// A sink that cannot purge: nothing removed, support not claimed.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            entries_removed: 0,
+            supported: false,
+        }
+    }
+
+    /// A sink that purged (possibly zero) entries.
+    #[must_use]
+    pub const fn purged(entries_removed: u64) -> Self {
+        Self {
+            entries_removed,
+            supported: true,
+        }
+    }
+}
+
+/// What a purge across *every* sink of an [`AuditLogger`] did (issue #1605).
+///
+/// Separate from the per-sink [`AuditPurgeOutcome`] because a fan-out can
+/// partly succeed: entries removed by one sink stay removed even when a later
+/// sink fails, so both facts have to reach the caller together.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditPurgeSummary {
+    /// Entries removed across all sinks — or, for a dry run, that *would* be
+    /// removed. Counts work that really happened, even alongside
+    /// [`Self::errors`].
+    pub entries_removed: u64,
+    /// `true` when at least one sink could purge at all.
+    pub supported: bool,
+    /// One message per sink that failed. Empty on a fully successful purge.
+    pub errors: Vec<String>,
+}
+
+impl AuditPurgeSummary {
+    /// The failures joined into one human-readable message, or `None` when
+    /// every sink succeeded.
+    #[must_use]
+    pub fn error_message(&self) -> Option<String> {
+        if self.errors.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} audit sink(s) failed to purge: {}",
+            self.errors.len(),
+            self.errors.join(" | ")
+        ))
+    }
+}
+
+type AuditPurgeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AuditPurgeOutcome, AuditError>> + Send + 'a>>;
+
 /// A destination for append-only audit events.
 pub trait AuditSink: Send + Sync + 'static {
     /// Persist one audit event. Implementations must treat events as immutable,
     /// append-only records.
     fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_>;
+
+    /// Remove every entry older than `cutoff`, for the `audit_archives`
+    /// retention window (issue #1605).
+    ///
+    /// Append-only is the *write* contract; retention is a separate,
+    /// operator-declared bound that GDPR's storage-limitation principle can
+    /// require. A sweep that reaches here is itself audited, so the deletion
+    /// is not silent.
+    ///
+    /// When `dry_run` is `true` the sink counts what it would remove and
+    /// changes nothing.
+    ///
+    /// The default implementation reports
+    /// [`AuditPurgeOutcome::unsupported`], so existing sinks keep compiling
+    /// and destinations that genuinely cannot be pruned from inside the app
+    /// (a SIEM forwarder, a WebSocket channel) say so rather than silently
+    /// reporting zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] when the sink supports purging but the
+    /// underlying storage could not be read or rewritten.
+    fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
+        let _ = (cutoff, dry_run);
+        Box::pin(async { Ok(AuditPurgeOutcome::unsupported()) })
+    }
 }
 
 /// Shared audit writer that fans out to multiple sinks.
@@ -154,6 +270,38 @@ impl AuditLogger {
     pub fn is_enabled(&self) -> bool {
         !self.sinks.is_empty()
     }
+
+    /// Purge every sink of entries older than `cutoff`, summing what each one
+    /// removed (issue #1605).
+    ///
+    /// Infallible by design, unlike [`Self::write`]: a purge that partly
+    /// succeeded has *already deleted rows*, and returning only an error
+    /// would throw that count away — the retention report would then record
+    /// `rows_removed = 0` for entries that are genuinely gone, which is
+    /// exactly the kind of understatement a compliance trail must not
+    /// contain. The summary therefore carries both what was removed and what
+    /// failed, and the caller decides how to present them.
+    ///
+    /// `supported` is `true` when *at least one* sink could purge; a logger
+    /// whose sinks all forward elsewhere reports unsupported so the retention
+    /// report can say so instead of implying an empty archive.
+    ///
+    /// Every sink is attempted even after one fails, matching [`Self::write`].
+    pub async fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeSummary {
+        let mut summary = AuditPurgeSummary::default();
+        for sink in &self.sinks {
+            match sink.purge_before(cutoff, dry_run).await {
+                Ok(outcome) => {
+                    summary.entries_removed = summary
+                        .entries_removed
+                        .saturating_add(outcome.entries_removed);
+                    summary.supported |= outcome.supported;
+                }
+                Err(error) => summary.errors.push(error.message().to_owned()),
+            }
+        }
+        summary
+    }
 }
 
 /// Tracing-based sink that emits JSON fields on a dedicated `autumn.audit` target.
@@ -163,6 +311,21 @@ pub struct TracingAuditSink;
 impl AuditSink for TracingAuditSink {
     fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
+            // `metadata` is emitted as a field too (#1605): a SIEM
+            // consuming this target is exactly who the map is for, and
+            // dropping it would strip a retention record of its cutoff and
+            // row count — the only two facts that make the record useful.
+            // Serialized as JSON rather than `?event.metadata` so consumers
+            // get a parseable object instead of Rust `Debug` syntax; an
+            // empty map is omitted so ordinary events are unchanged.
+            let metadata = if event.metadata.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&event.metadata)
+                        .unwrap_or_else(|_| format!("{:?}", event.metadata)),
+                )
+            };
             tracing::info!(
                 target: "autumn.audit",
                 timestamp = %event.timestamp,
@@ -171,6 +334,7 @@ impl AuditSink for TracingAuditSink {
                 target_resource_id = %event.target_resource_id,
                 ip_address = ?event.ip_address,
                 status = ?event.status,
+                metadata = metadata.as_deref(),
                 "audit_event"
             );
             Ok(())
@@ -219,6 +383,139 @@ impl AuditSink for JsonlFileAuditSink {
                 .await
                 .map_err(|error| AuditError::new(format!("failed to sync audit file: {error}")))?;
             Ok(())
+        })
+    }
+
+    /// Rewrite the archive without entries older than `cutoff`.
+    ///
+    /// Reads the archive, filters it into a sibling temp file, `fsync`s that
+    /// file, then atomically renames it over the archive — so a crash
+    /// mid-purge leaves the original intact rather than a truncated archive.
+    /// The temp file inherits the archive's permissions before the rename, so
+    /// a hardened archive (`chmod 600` on a file carrying `actor_id` and
+    /// `ip_address`) does not come back world-readable.
+    ///
+    /// A line that does not decode as an [`AuditEvent`] is **kept**: a
+    /// retention sweep must never be the thing that silently discards a
+    /// record it merely failed to parse (a future schema, or a partial line
+    /// left by an earlier crash).
+    ///
+    /// # Concurrency and memory limits
+    ///
+    /// The sink's write lock serializes this against [`AuditSink::write`]
+    /// **within one process only**. It is not a file lock: a second process
+    /// appending to the same path (notably `autumn db retention --purge`,
+    /// which boots a second copy of the app, run against a live server) can
+    /// append between this read and this rename, and those events are lost.
+    /// Prefer the in-process scheduled sweep for a live deployment; see
+    /// `docs/guide/data-retention.md`.
+    ///
+    /// The archive is read into memory in full, and the kept lines are
+    /// buffered alongside it — peak usage is roughly twice the archive size.
+    /// Keep the JSONL archive rotated by external tooling if it can grow to a
+    /// size that matters on your host.
+    fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
+        Box::pin(async move {
+            let _guard = self.write_lock.lock().await;
+            let existing = match tokio::fs::read_to_string(&self.path).await {
+                Ok(contents) => contents,
+                // No archive yet is a successful no-op, not a failure: the
+                // sink creates the file lazily on first write.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(AuditPurgeOutcome::purged(0));
+                }
+                Err(error) => {
+                    return Err(AuditError::new(format!(
+                        "failed to read audit log file for purge: {error}"
+                    )));
+                }
+            };
+
+            let mut kept = String::with_capacity(existing.len());
+            let mut removed: u64 = 0;
+            for line in existing.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let stale = serde_json::from_str::<AuditEvent>(line)
+                    .is_ok_and(|event| event.timestamp < cutoff);
+                if stale {
+                    removed = removed.saturating_add(1);
+                } else {
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+            }
+
+            if dry_run || removed == 0 {
+                return Ok(AuditPurgeOutcome::purged(removed));
+            }
+
+            // A unique temp name per process and per call. A fixed one (e.g.
+            // `with_extension("…tmp")`) collides between two processes purging
+            // the same archive — and, because `with_extension` replaces the
+            // extension, between `audit.log` and `audit.jsonl` in one
+            // directory — and `File::create` truncates, so the loser's
+            // partial write gets renamed over the archive.
+            let temp_path = self.path.with_file_name(format!(
+                "{}.{}.{}.autumn-retention.tmp",
+                self.path.file_name().map_or_else(
+                    || "audit".to_owned(),
+                    |name| name.to_string_lossy().into_owned()
+                ),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos()),
+            ));
+            let mut temp = tokio::fs::File::create(&temp_path).await.map_err(|error| {
+                AuditError::new(format!("failed to create audit purge temp file: {error}"))
+            })?;
+            // Every failure after the file exists must remove it. Each sweep
+            // picks a fresh name, so leaking one per failed run would
+            // accumulate partial archives next to the archive itself —
+            // compounding exactly the quota or filesystem problem that is the
+            // likeliest cause of the failure.
+            macro_rules! cleanup_on_error {
+                ($result:expr, $context:literal) => {
+                    match $result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            return Err(AuditError::new(format!("{}: {error}", $context)));
+                        }
+                    }
+                };
+            }
+            // Carry the archive's own permissions across the rename — and
+            // fail if that cannot be done. An audit archive carries
+            // `actor_id` and `ip_address`, so an operator who hardened it to
+            // `0600` must not get a default-mode `0644` file renamed over it
+            // by a retention sweep. Refusing to replace the archive keeps the
+            // stale entries, which is strictly better than widening access to
+            // every entry that remains.
+            let metadata = cleanup_on_error!(
+                tokio::fs::metadata(&self.path).await,
+                "failed to read audit log permissions before purge"
+            );
+            cleanup_on_error!(
+                tokio::fs::set_permissions(&temp_path, metadata.permissions()).await,
+                "failed to preserve audit log permissions on the purge temp file"
+            );
+            cleanup_on_error!(
+                temp.write_all(kept.as_bytes()).await,
+                "failed to write audit purge temp file"
+            );
+            cleanup_on_error!(
+                temp.sync_data().await,
+                "failed to sync audit purge temp file"
+            );
+            drop(temp);
+            cleanup_on_error!(
+                tokio::fs::rename(&temp_path, &self.path).await,
+                "failed to replace audit log file"
+            );
+            Ok(AuditPurgeOutcome::purged(removed))
         })
     }
 }
@@ -297,6 +594,329 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    // ── Retention purge (issue #1605) ─────────────────────────────────────
+
+    /// Build a JSONL archive whose lines carry the given timestamps.
+    async fn archive_with_timestamps(
+        path: &std::path::Path,
+        timestamps: &[DateTime<Utc>],
+    ) -> JsonlFileAuditSink {
+        let sink = JsonlFileAuditSink::new(path);
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            let mut event = AuditEvent::new(
+                format!("actor-{index}"),
+                "auth.login",
+                format!("session-{index}"),
+                None,
+                AuditStatus::Success,
+            );
+            event.timestamp = *timestamp;
+            sink.write(event).await.expect("write archive line");
+        }
+        sink
+    }
+
+    #[test]
+    fn audit_event_metadata_defaults_to_empty() {
+        let event = AuditEvent::new("u1", "auth.login", "s1", None, AuditStatus::Success);
+        assert!(
+            event.metadata.is_empty(),
+            "an ordinary audit event carries no metadata"
+        );
+    }
+
+    #[test]
+    fn audit_event_with_metadata_round_trips_through_json() {
+        let event = AuditEvent::new(
+            "autumn:retention",
+            "retention.sweep",
+            "job_history",
+            None,
+            AuditStatus::Success,
+        )
+        .with_metadata("dataset", "job_history")
+        .with_metadata("cutoff", "2026-01-01T00:00:00Z")
+        .with_metadata("rows_removed", "12");
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: AuditEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, event);
+        assert_eq!(
+            decoded.metadata.get("rows_removed").map(String::as_str),
+            Some("12")
+        );
+    }
+
+    #[test]
+    fn audit_event_without_metadata_field_still_deserializes() {
+        // Archives written before #1605 have no `metadata` key; reading one
+        // back (for a purge, or by an operator's tooling) must still work.
+        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","actor_id":"u1",
+            "action":"auth.login","target_resource_id":"s1","ip_address":null,
+            "status":"success"}"#;
+        let decoded: AuditEvent = serde_json::from_str(legacy).expect("legacy line must decode");
+        assert!(decoded.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_removes_only_entries_older_than_the_cutoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.log");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let recent = Utc::now() - chrono::Duration::days(1);
+        let sink = archive_with_timestamps(&path, &[old, recent, old]).await;
+
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let outcome = sink.purge_before(cutoff, false).await.expect("purge");
+
+        assert!(outcome.supported);
+        assert_eq!(outcome.entries_removed, 2);
+        let content = tokio::fs::read_to_string(&path).await.expect("read back");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "only the recent entry survives: {content}");
+        assert!(lines[0].contains("session-1"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_dry_run_counts_without_writing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.log");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let sink = archive_with_timestamps(&path, &[old, old]).await;
+        let before = tokio::fs::read_to_string(&path).await.expect("read");
+
+        let outcome = sink
+            .purge_before(Utc::now(), true)
+            .await
+            .expect("dry-run purge");
+
+        assert_eq!(outcome.entries_removed, 2);
+        let after = tokio::fs::read_to_string(&path).await.expect("read");
+        assert_eq!(before, after, "a dry run must not touch the archive");
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_keeps_unparseable_lines() {
+        // Fail-safe: a line this build cannot decode (a future schema, a
+        // partially-written line after a crash) is kept, never silently
+        // discarded by a retention sweep.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.log");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let sink = archive_with_timestamps(&path, &[old]).await;
+        tokio::fs::write(
+            &path,
+            format!(
+                "{}not json at all
+",
+                tokio::fs::read_to_string(&path).await.unwrap()
+            ),
+        )
+        .await
+        .expect("append junk");
+
+        let outcome = sink.purge_before(Utc::now(), false).await.expect("purge");
+
+        assert_eq!(outcome.entries_removed, 1);
+        let content = tokio::fs::read_to_string(&path).await.expect("read back");
+        assert!(
+            content.contains("not json at all"),
+            "unparseable lines must survive: {content}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_purge_preserves_the_archive_permissions() {
+        // An audit archive carries `actor_id` and `ip_address`. An operator
+        // who hardened it to 0600 must not get a default-mode file renamed
+        // over it by a retention sweep.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("audit.jsonl");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let sink = archive_with_timestamps(&path, &[old, old, Utc::now()]).await;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .expect("harden the archive");
+
+        let outcome = sink
+            .purge_before(Utc::now() - chrono::Duration::days(30), false)
+            .await
+            .expect("purge");
+
+        assert_eq!(outcome.entries_removed, 2);
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .expect("archive still exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the rewritten archive must keep the mode the operator set"
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonl_sink_purge_on_a_missing_archive_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sink = JsonlFileAuditSink::new(tmp.path().join("never-written.log"));
+
+        let outcome = sink.purge_before(Utc::now(), false).await.expect("purge");
+
+        assert!(outcome.supported);
+        assert_eq!(outcome.entries_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn tracing_sink_emits_the_metadata_map() {
+        // Regression (#1605 Codex round 2): the tracing target is what a SIEM
+        // consumes, so silently dropping `metadata` would strip a retention
+        // record of its cutoff and row count.
+        use std::sync::Mutex as StdMutex;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        let event = AuditEvent::new(
+            "autumn:retention",
+            "retention.sweep",
+            "job_history",
+            None,
+            AuditStatus::Success,
+        )
+        .with_metadata("cutoff", "2026-06-01T00:00:00Z")
+        .with_metadata("rows_removed", "17");
+
+        with_default(subscriber, || {
+            futures::executor::block_on(TracingAuditSink.write(event)).expect("write");
+        });
+
+        let captured_bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let output = String::from_utf8_lossy(&captured_bytes).into_owned();
+        assert!(output.contains("rows_removed"), "{output}");
+        assert!(output.contains("2026-06-01T00:00:00Z"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_cannot_purge_reports_unsupported() {
+        let outcome = TracingAuditSink
+            .purge_before(Utc::now(), false)
+            .await
+            .expect("default purge");
+        assert!(!outcome.supported);
+        assert_eq!(outcome.entries_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn logger_purge_sums_across_sinks_and_reports_support() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let first = tmp.path().join("a.log");
+        let second = tmp.path().join("b.log");
+        archive_with_timestamps(&first, &[old, old]).await;
+        archive_with_timestamps(&second, &[old]).await;
+
+        let logger = AuditLogger::new()
+            .with_sink(Arc::new(TracingAuditSink))
+            .with_sink(Arc::new(JsonlFileAuditSink::new(&first)))
+            .with_sink(Arc::new(JsonlFileAuditSink::new(&second)));
+
+        let summary = logger.purge_before(Utc::now(), false).await;
+
+        assert_eq!(summary.entries_removed, 3);
+        assert!(
+            summary.supported,
+            "at least one sink supports purging, so the logger reports support"
+        );
+        assert!(summary.errors.is_empty());
+        assert_eq!(summary.error_message(), None);
+    }
+
+    #[tokio::test]
+    async fn logger_purge_with_no_purgeable_sinks_reports_unsupported() {
+        let logger = AuditLogger::new().with_sink(Arc::new(TracingAuditSink));
+        let summary = logger.purge_before(Utc::now(), false).await;
+        assert!(!summary.supported);
+        assert_eq!(summary.entries_removed, 0);
+        assert!(summary.errors.is_empty());
+    }
+
+    /// A sink that always fails to purge (but accepts writes).
+    struct UnpurgeableSink;
+
+    impl AuditSink for UnpurgeableSink {
+        fn write(&self, _event: AuditEvent) -> AuditWriteFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn purge_before(&self, _cutoff: DateTime<Utc>, _dry_run: bool) -> AuditPurgeFuture<'_> {
+            Box::pin(async { Err(AuditError::new("sink offline")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn logger_purge_keeps_what_succeeded_when_another_sink_fails() {
+        // A partial purge has already deleted those entries. Throwing the
+        // count away with the error would make the retention report record
+        // `rows_removed = 0` for entries that are genuinely gone — an
+        // understatement a compliance trail must not contain.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let old = Utc::now() - chrono::Duration::days(400);
+        let path = tmp.path().join("a.log");
+        archive_with_timestamps(&path, &[old, old]).await;
+
+        let logger = AuditLogger::new()
+            .with_sink(Arc::new(JsonlFileAuditSink::new(&path)))
+            .with_sink(Arc::new(UnpurgeableSink));
+
+        let summary = logger.purge_before(Utc::now(), false).await;
+
+        assert_eq!(
+            summary.entries_removed, 2,
+            "the successful sink's removals must survive the aggregated failure"
+        );
+        assert!(summary.supported);
+        assert_eq!(summary.errors.len(), 1);
+        let message = summary.error_message().expect("a failure is reported");
+        assert!(message.contains("sink offline"), "{message}");
+        assert!(message.contains("1 audit sink(s) failed"), "{message}");
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
 # Before migrating: configure the database (see the note below) and
 # create it if it does not exist yet:
-createdb my_app
+autumn db create
 autumn migrate
 autumn dev
 ```
@@ -46,8 +46,10 @@ One file edit belongs between `generate` and `migrate`: the generated
 Postgres so both `autumn migrate` and the running app can reach the
 database — without it, `autumn migrate` exits with `✗ No database URL found.`.
 `autumn migrate` runs migrations against that database but does not create
-it, hence the `createdb my_app` above (any equivalent, such as
-`CREATE DATABASE` in psql, works too):
+it, hence `autumn db create` above — it reads the same `url`/`primary_url`
+you just configured and creates that database, idempotently, with no extra
+tooling beyond what `autumn migrate` already needs (an external `createdb` or
+`CREATE DATABASE` in psql works too, if you have a Postgres client installed):
 
 ```toml
 [database]
@@ -539,6 +541,48 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Posts` as the table `posts`. If your name doesn't match `Add…To…` or
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
+
+### Always generate — never hand-create the directory
+
+Reach for the generator even when you intend to write every line of SQL
+yourself. The one thing it does that you cannot easily do by hand is pick the
+version.
+
+Your app's migrations, the framework's, and every plugin's are applied into
+**one shared version space**. Diesel records what it has applied by the
+14-digit version in `__diesel_schema_migrations`, and Autumn's
+`autumn_migration_checksums` table makes that version a `PRIMARY KEY`. Two
+migrations claiming the same version are therefore not two migrations — one of
+them silently never runs, and you find out when a column you were sure you
+added isn't there.
+
+Hand-written versions collide because everyone reaches for the same number. A
+human typing a date pads it out to `20260831000000`; the next person to touch
+the tree that day types the identical string. The generators mint a full
+`YYYYMMDDHHMMSS` from the wall clock instead, so two authors collide only if
+they generate in the same second:
+
+```bash
+autumn generate migration BackfillSomething      # → 20260831191622_backfill_something
+autumn schema diff --write-migration --name x    # → same convention
+```
+
+If you have already created a directory by hand, rename it to a real
+timestamp before committing:
+
+```bash
+date -u +%Y%m%d%H%M%S
+```
+
+CI enforces this (`scripts/check-migration-versions.sh`): a migration whose
+time component is `000000`, whose digits aren't a real UTC timestamp, or whose
+version is already claimed by another migration fails the build.
+
+One caveat if you are fixing an existing migration: **never rename one that
+has already been applied.** The version is how the framework knows it ran, so
+renaming it makes the framework consider it unapplied and run it a second
+time. Migrations already in that state are grandfathered in
+`scripts/migration-version-baseline.txt` rather than corrected.
 
 ### Generated safety comments
 
@@ -1138,7 +1182,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks

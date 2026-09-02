@@ -105,6 +105,15 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+// Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
+// sustains, and the admission limit it licenses. Ungated on purpose —
+// `route_listing` and `router` consult it on every boot.
+//
+// A plain comment, not a doc comment: an outer `///` block here merges with the
+// module's own `//!` docs, and the intra-doc links in those then resolve in the
+// crate root's scope instead of the module's (`-D rustdoc::broken_intra_doc_links`
+// catches it). The module documents itself.
+pub mod capacity;
 /// Deterministic replay capsules: record a failing request (redacted request,
 /// clock reads, database traffic, outcome) and replay it offline.
 ///
@@ -327,6 +336,18 @@ pub use repository::RepositoryError;
 #[cfg(feature = "db")]
 pub mod retention;
 
+// Unified retention policy for framework-owned data (issue #1605).
+//
+// Deliberately NOT gated on `db`, unlike `retention` above: three of the
+// datasets (idempotency, webhook replay, sessions) and the audit archive
+// exist in database-free builds too, and the policy surface — the dataset
+// registry, the effective-window rules, the CLI report — must be answerable
+// either way. A `//` comment, not `///`: an outer doc attribute here would
+// merge into the module's own `//!` header and make its unqualified
+// intra-doc links resolve in `lib.rs`'s scope instead of the module's,
+// breaking `scripts/check-docs.sh`.
+pub mod data_retention;
+
 /// Read-your-own-writes routing support.
 ///
 /// When `database.read_your_writes` is `request` or `session`, generated
@@ -498,6 +519,10 @@ pub use seo::SeoRouteDefaults;
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
+/// URLs — see [`redis_tls::open_client`] (issue #2172).
+#[cfg(feature = "redis")]
+pub mod redis_tls;
 /// Pluggable error reporting: catch handler panics and route panics + 5xx
 /// responses to configured [`ErrorReporter`](reporting::ErrorReporter)s.
 ///
@@ -1763,6 +1788,7 @@ pub use axum::extract::State;
 /// | `axum` | `autumn_web::reexports::axum` | Custom routers, middleware, extractors |
 /// | `diesel` | `autumn_web::reexports::diesel` | Raw Diesel queries, schema types |
 /// | `http` | `autumn_web::reexports::http` | HTTP types (`StatusCode`, `Method`, headers) |
+/// | `redis` | `autumn_web::reexports::redis` | Naming the `redis::Client` [`redis_tls::open_client`] returns (`redis` feature) |
 /// | `serde_json` | `autumn_web::reexports::serde_json` | JSON values and conversion helpers |
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
@@ -1776,6 +1802,12 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    /// Re-exported because [`crate::redis_tls::open_client`] returns a
+    /// `redis::Client`: without this, an app calling it cannot name the
+    /// returned type without adding its own `redis` dependency at a
+    /// compatible major.
+    #[cfg(feature = "redis")]
+    pub use redis;
     pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;

@@ -568,7 +568,7 @@ impl Limiter {
         #[cfg(feature = "redis")]
         if config.backend == RateLimitBackend::Redis {
             if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                match redis::Client::open(url) {
+                match crate::redis_tls::open_client(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
                             client,
@@ -585,7 +585,9 @@ impl Limiter {
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
-                                    url = %url,
+                                    // Redacted: a managed Redis carries its
+                                    // access key in the URL (#2172).
+                                    url = %crate::redis_tls::redact_url(url),
                                     "rate-limit Redis backend: failed to create \
                                      connection manager; falling back to memory"
                                 );
@@ -593,9 +595,14 @@ impl Limiter {
                         }
                     }
                     Err(err) => {
+                        // No `url` field here, redacted or otherwise: this arm
+                        // fires when the URL failed to PARSE, so its shape is
+                        // exactly what a redactor has least purchase on, and
+                        // the `redis` error text names the problem without
+                        // echoing the value. The key is not worth the
+                        // diagnostic (#2172).
                         tracing::warn!(
                             error = %err,
-                            url = %url,
                             "rate-limit Redis backend: invalid Redis URL; \
                              falling back to memory"
                         );
@@ -2448,7 +2455,7 @@ mod tests {
     #[tokio::test]
     async fn redis_store_debug_format() {
         use super::super::config::RateLimitBackendFailure;
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let client = crate::redis_tls::open_client("redis://127.0.0.1/").unwrap();
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
             redis::aio::ConnectionManagerConfig::new(),

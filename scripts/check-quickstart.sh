@@ -36,7 +36,7 @@
 #   scaffold-migrate the documented scaffold prerequisites + migrate
 #                    (docs/guide/generators.md): install the Diesel CLI if
 #                    missing, uncomment [database] in autumn.toml (using
-#                    $DATABASE_URL as the value), `createdb`, then
+#                    $DATABASE_URL as the value), `autumn db create`, then
 #                    `autumn migrate` with DB env stripped.
 #   scaffold-serve   `autumn dev` + poll `GET /posts` until 200 (DB config
 #                    comes from autumn.toml, not env).
@@ -258,37 +258,18 @@ configure_database() {
 }
 
 create_database() {
-  # The documented database-creation step (docs/guide/generators.md):
-  # `autumn migrate` runs migrations against the configured database but
-  # does not create it, and the published autumn-cli (0.5.0) has no
-  # `autumn db create` subcommand — the guide documents `createdb my_app`.
-  # Run exactly that, with connection parameters taken from the same URL
-  # written into autumn.toml (standing in for the user's local Postgres
-  # auth). The CI service container deliberately does NOT pre-create this
-  # database, so skipping this step fails the migrate phase — exactly as it
-  # fails for a fresh user.
-  local url="$DATABASE_URL" dbname rest cred hostport host port user pass
-  dbname="${url##*/}"; dbname="${dbname%%\?*}"
-  rest="${url#*://}"; rest="${rest%/*}"
-  if [[ "$rest" == *@* ]]; then
-    cred="${rest%@*}"; hostport="${rest##*@}"
-    user="${cred%%:*}"
-    if [[ "$cred" == *:* ]]; then pass="${cred#*:}"; else pass=""; fi
-  else
-    hostport="$rest"; user=""; pass=""
-  fi
-  host="${hostport%%:*}"
-  if [[ "$hostport" == *:* ]]; then port="${hostport#*:}"; else port=5432; fi
-  command -v createdb >/dev/null \
-    || fail "createdb (postgresql-client) is not on PATH — the documented database-creation step needs it"
-  if PGPASSWORD="$pass" createdb -h "$host" -p "$port" ${user:+-U "$user"} "$dbname" 2>"$state/createdb.err"; then
-    echo "created database '${dbname}' (documented 'createdb' step)"
-  elif grep -q "already exists" "$state/createdb.err"; then
-    echo "database '${dbname}' already exists — documented 'createdb' step skipped"
-  else
-    cat "$state/createdb.err" >&2 || true
-    fail "'createdb ${dbname}' (the documented database-creation step) failed — see the output above"
-  fi
+  # The documented database-creation step. autumn-cli gained a first-party
+  # `autumn db create` subcommand before the 0.7.0 release cut, and
+  # docs/guide/generators.md's "Five commands to a working CRUD app" now
+  # teaches that command (matching docs/guide/getting-started.md, which
+  # already did) instead of shelling out to the separately-installed
+  # `createdb` (postgresql-client) binary. Run it exactly as documented, in a
+  # clean shell so the database URL resolves from autumn.toml alone — the
+  # same realism `autumn migrate` gets below. The CI service container
+  # deliberately does NOT pre-create this database, so skipping this step
+  # fails the migrate phase — exactly as it fails for a fresh user.
+  (cd "$app_dir" && env "${db_env_strip[@]}" autumn db create) \
+    || fail "'autumn db create' failed with database.url configured in autumn.toml (docs/guide/generators.md scaffold path)"
 }
 
 

@@ -110,6 +110,11 @@ GATED_MODULES=(
   # ban enforce something rather than sit unreachable.
   autumn/src/session.rs:default
   autumn/src/middleware/request_id.rs:default
+  # The authored fault lane (#1680). Every fault timestamp and every window
+  # decision is read from the app's INJECTED clock — that is the whole point of
+  # `FaultPlan::only_between`, and a single `Utc::now()` here would make a
+  # replayed scenario's outcome record differ run to run.
+  autumn/src/sim/fault.rs:default
   # The embedded cluster control plane (#1762). Every node id comes from the
   # injected `Entropy`, every elapsed measurement and the boot incarnation come
   # from the injected `ClockSource` — the deterministic two-node suite in
@@ -125,10 +130,18 @@ GATED_MODULES=(
   # window on the injected `ClockSource`, so an upgrade's timing is as
   # reproducible under a virtual clock as the drain it replaces.
   autumn/src/upgrade.rs:default
+  # Direct HTTPS termination (#1603). `tls.rs::now_unix` is the module's one
+  # deliberate real-wall-time read — certificate validity is a fact about the
+  # real world, not about the injected clock — and the gate is what keeps a
+  # later off-seam read added beside it (in the bind path or the `CertReloader`
+  # poll loop) from shipping unlinted. NOTE: `autumn/src/acme/renewal.rs` has
+  # its own ungated `default_now_unix`; gating it needs an `--features acme`
+  # enforcing clippy lane, which does not exist yet.
+  autumn/src/tls.rs:tls
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=16
+MODULE_COUNT_FLOOR=18
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

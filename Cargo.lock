@@ -453,7 +453,6 @@ version = "0.7.0"
 dependencies = [
  "autumn-web",
  "redis",
- "rustls",
  "serde",
  "serde_json",
  "testcontainers",
@@ -478,6 +477,7 @@ dependencies = [
  "diesel",
  "diesel_migrations",
  "directories",
+ "flate2",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.12.1",
@@ -492,6 +492,7 @@ dependencies = [
  "proptest",
  "quote",
  "ratatui",
+ "rcgen",
  "reqwest 0.13.4",
  "rustls",
  "serde",

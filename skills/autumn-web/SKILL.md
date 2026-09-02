@@ -73,6 +73,7 @@ the framework almost certainly already generates or ships it:
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
+| A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.7.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
@@ -86,6 +87,7 @@ the framework almost certainly already generates or ships it:
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
+| Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -128,6 +130,18 @@ my-app/
 ├── autumn.toml
 └── autumn-dev.toml    # legacy profile file; [profile.dev] also works
 ```
+
+> **Never hand-create a directory under `migrations/`.** Run `autumn generate
+> migration <Name>` (or `autumn schema diff --write-migration`) and put your SQL
+> in the `up.sql`/`down.sql` it creates — including when you are writing every
+> line of that SQL yourself. The generator's job is picking the version.
+>
+> App, framework and plugin migrations share one version space, keyed on the
+> 14-digit prefix, so a hand-typed `20260831000000` collides with whatever
+> anyone else authored that day and one of the two silently never runs. The
+> generator mints a full `YYYYMMDDHHMMSS` from the clock. CI rejects a `000000`
+> time component, a version that isn't a real UTC timestamp, and any duplicate
+> (`scripts/check-migration-versions.sh`).
 
 ## Cargo.toml
 
@@ -293,6 +307,46 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
+
+**Declare the `Content-Type` on a `#[static_get]` route that is not HTML
+(unreleased, #1832).** `autumn build` records the type each handler's response
+declares into `dist/manifest.json`, and the static-first middleware serves that
+value verbatim — it no longer guesses from the route slug, which it had to do
+because every non-root route is stored as `<route>/index.html`. So the handler's
+own header is the whole contract:
+
+```rust
+#[static_get("/sitemap.xml")]
+async fn sitemap() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/xml")], build_sitemap())
+}
+
+#[static_get("/feed")]                       // extensionless — no extension to infer from
+async fn feed() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/rss+xml")], build_feed())
+}
+```
+
+Only a type you *declare* is recorded. axum attaches one to every response, but
+for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
+(`application/octet-stream`) it comes from the return type, not from you — so on
+a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
+exact values are ignored and the extension wins, which is what stops a `->
+String` stylesheet from being served as plain text and dropped by `nosniff`.
+The two are indistinguishable in the response, so if you genuinely want one of
+them on such a route, declare it distinctly (bare `text/plain`, or
+`application/octet-stream` with a parameter) and it is recorded; to force a
+download prefer `Content-Disposition: attachment`. Extensions outside Autumn's
+asset table (`.pdf`, `.zip`) are unaffected.
+
+Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a
+handler returning a bare `String` declares `text/plain; charset=utf-8`, which is
+what will now be served.
+A `dist/` built before this release records nothing and keeps its previous derived
+type until the next `autumn build`. ISR refuses a regeneration whose handler
+declares a *different* type than the manifest recorded, so a stale-but-correctly
+-typed page is served instead of fresh bytes under the wrong header — re-run
+`autumn build` after changing a route's type.
 
 **Route-level SEO defaults (issue #1182, 0.7.0):** declare
 per-page meta tag values once on the route with a `seo(...)` argument instead of
@@ -1421,6 +1475,49 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
+## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
+
+**Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
+One command adds the dependency at a version compatible with the app's
+`autumn-web`, mounts the plugin in the `autumn_web::app()` chain, and prints
+the post-install steps (config keys, follow-up generators):
+
+```bash
+autumn plugin list                      # name, description, compatible version
+autumn plugin list --json --offline     # machine-readable; skip the crates.io lookup
+autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
+autumn plugin add autumn-cache-redis --dry-run
+```
+
+`list` covers the five first-party crates (`autumn-admin-plugin`,
+`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`) plus community crates found on crates.io under the
+documented `autumn-plugin-<name>` convention.
+
+Four behaviours worth knowing before advising on it:
+
+- **Idempotent.** A second `add` reports "already installed" and changes
+  nothing. It also detects a mount written by hand behind a `use` import, so
+  it will not splice a second, default-constructed mount over a configured one.
+- **Version-gated before any write.** Installing into an app on an
+  incompatible `autumn-web` fails naming both versions, with the app
+  byte-identical. First-party plugins ship in lockstep with `autumn-web` and
+  the CLI, so the version installed is the CLI's — an app on an older line
+  needs the matching CLI, or `autumn upgrade`.
+- **It degrades rather than guessing.** If the `autumn_web::app()` chain
+  cannot be found unambiguously inside `async fn main` — a builder factored
+  into a helper, a one-line chain, two candidate lines — it writes *nothing*
+  and prints the dependency line and mount snippet on stderr, exiting 2. It
+  never leaves an app that does not compile.
+- **Community crates get the dependency only.** The `<Name>Plugin` mount is
+  derived from the naming convention and printed, not spliced: nothing outside
+  that crate can verify it exposes one.
+
+It writes no `features = [...]` onto the app's `autumn-web` dependency — each
+plugin crate already carries the features its mount needs and Cargo unifies
+them. `autumn plugin-check` is the separate, author-facing conformance gate;
+`autumn generate plugin` scaffolds a new plugin crate.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
@@ -1732,8 +1829,12 @@ subset of queues — all config-only, no app-code change:
   comma-separated) makes a `worker`-role process claim *only* those queues,
   preserving weighted/strict order within the subset; empty/unset drains every
   queue. A worker leaving a configured queue uncovered logs a startup `WARN`
-  (an `ERROR` if it would claim nothing); `autumn doctor --strict` reports
-  coverage informationally (`jobs_queue_coverage`) without failing (issue #1623).
+  (an `ERROR` if it would claim nothing). `autumn doctor`'s
+  `jobs_queue_coverage` check reports informationally when no fleet topology is
+  declared; declare every tier's pin under `[jobs.fleet] tiers` and it hard-fails
+  (exit 1, in every mode — not only `--strict`) on a queue drained by no tier
+  (issues #1623, #1756). `autumn serve --pin <queues>` sets the pin as a flag,
+  forwarding `AUTUMN_JOBS__PIN`, and `serve restart` restores it.
 - **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
   with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
   per-job-type gauges (per-process approximations on multi-process backends).
@@ -1828,6 +1929,31 @@ discord_severities = "all"
   success/error.
 
 (issue #1630). See `docs/guide/operator-alerts.md`.
+
+## Supply chain — SBOM + provenance (unreleased, issue #1615)
+
+Every autumn release asset carries a CycloneDX SBOM and a keyless SLSA
+build-provenance attestation, and `autumn release init` makes the same posture
+the default for a scaffolded app. Reach for this when asked "what is in this
+build?", "where did this binary come from?", or for compliance/audit evidence.
+
+- `autumn sbom` is deterministic on purpose — no wall-clock timestamp, and a
+  `serialNumber` derived from the document's content — so `--verify` can be a
+  real gate. Do not add a random serial or a timestamp.
+- `autumn sbom --binary <path>` answers "which crate versions are in this
+  binary?" with no source tree and no lockfile, reading the `.dep-v0` section
+  `cargo-auditable` embeds. A binary built without it gets an error naming the
+  fix, never an empty list.
+- The generated production Dockerfile compiles through `cargo auditable`,
+  fetches Tailwind via the checksum-verifying `autumn setup` (never a bare
+  `curl`), and bakes an SBOM at `/usr/share/autumn/sbom.cdx.json` behind the
+  `io.autumn.sbom.path` label.
+- Verify a published artifact with
+  `gh attestation verify <asset> --repo autumn-foundation/autumn`. Always pass
+  `--repo`: without it any repository's attestation would satisfy the check.
+
+See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
+negative case (tamper with a byte, watch verification fail).
 
 ## Observability defaults
 
@@ -1936,6 +2062,22 @@ max_concurrent_requests = 256   # unset/0 = unlimited
 Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
 sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
 and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
+
+The ceiling no longer has to be a guess. `autumn calibrate` measures what the
+build sustains and writes a committed `capacity.lock`; `autumn calibrate
+--check` gates rebuilds against it in CI, and pointing the runtime at it
+sources the ceiling from the proven envelope:
+
+```toml
+[server]
+capacity_contract = "capacity.lock"   # explicit max_concurrent_requests still wins
+```
+
+Each route in the contract also carries a resource shape (`db-bound`,
+`io-bound`, `compute-bound`) derived statically from the extractors its handler
+declares. Every contract failure — missing file, malformed document, a contract
+measured on a different host class — falls back to *unlimited*, never to a
+ceiling. See `docs/guide/capacity-contracts.md`.
 
 ## Sharding (0.6.0)
 
@@ -2173,7 +2315,11 @@ autumn canary status
 autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
+autumn calibrate                 # measure the capacity envelope -> capacity.lock
+autumn calibrate --check         # CI gate: fail when a rebuild leaves the envelope
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
+autumn plugin list
+autumn plugin add autumn-admin-plugin
 ```
 
 **(0.6.0)** CLI additions — absent from a 0.5.x `autumn-cli`, but present in
@@ -2195,6 +2341,7 @@ autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args t
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
+autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
@@ -2204,6 +2351,11 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
+autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
+autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
+autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
+autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (unreleased, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
 autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
 autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)
@@ -2215,6 +2367,8 @@ autumn deploy up --only web-2 --no-rollback   # narrow to a subset (repair lever
 autumn deploy rollback           # previous release; with `[deploy] hosts` the whole fleet, newest first (`--only <HOST>` for one)
 autumn deploy status --json --strict          # read-only per-host state + version/state drift; --strict exits non-zero on drift (#1621)
 autumn deploy maintenance on --message "…"    # maintenance mode on EVERY deploy host over SSH; `off` reverses (#1621)
+autumn plugin list               # installable plugins + the version compatible with this app's autumn-web; --json, --offline (#1606)
+autumn plugin add autumn-admin-plugin   # dependency + builder-chain mount + post-install steps; idempotent, version-gated, --dry-run (#1606)
 autumn data-flow                 # classified-data flow manifest: one row per `#[classified]` column and every sink a declared declassification boundary releases it to; empty reachable set = the column cannot leave the process (#1654)
 autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.json   # write it, and fail on drift from the committed copy so a new release edge is reviewed
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
@@ -2470,6 +2624,67 @@ database's statements run in one transaction.
 column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
 `--output DIR` re-dumps the scrubbed database as a fresh backup run. See
 `docs/guide/data-scrubbing.md`.
+
+### `[retention]` + `autumn db retention` (0.7.0, issue #1605)
+
+Autumn's *own* tables and stores grow forever by default. `[retention]` in
+`autumn.toml` declares one window per framework-owned dataset and the framework
+enforces it on a recurring, fleet-coordinated in-process sweep — no external
+cron. **This is separate from `#[repository(..., retention(...))]`, which covers
+*your* models**; reach for that one for app data and this one for Autumn's.
+
+```toml
+[retention]
+sweep_interval         = "1h"    # default
+job_history            = "90d"   # terminal rows in autumn_jobs
+commit_hooks           = "30d"   # terminal autumn_repository_commit_hooks rows
+job_tracking           = "7d"    # autumn_job_tracking
+idempotency            = "2d"    # stored Idempotency-Key responses
+experiment_assignments = "365d"  # autumn_experiment_assignments
+webhook_replay         = "3d"    # inbound replay markers
+sessions               = "30d"   # server-side session records
+audit_archives         = "400d"  # JSONL audit archive entries
+```
+
+Every window is unset by default, and unset registers **no sweep task at
+all** — an app that never writes `[retention]` behaves exactly as before.
+Each key has an `AUTUMN_RETENTION__*` env override; an empty value clears one.
+
+Three enforcement mechanisms, reported per dataset rather than conflated:
+`sweep` (batched `DELETE`, 500 rows/batch, cutoff resolved by the database's
+own clock, `truncated` reported when a run hits its per-run cap), `backend ttl`
+(the window *caps* the record's TTL at write time — idempotency, sessions), and
+`archive rewrite` (the JSONL audit archive rewritten atomically, keeping any
+line it cannot parse).
+
+**Precedence:** where a per-subsystem knob already exists
+(`jobs.tracking.ttl_secs`, `idempotency.ttl_secs`, `session.max_age_secs`, a
+webhook endpoint's `replay_window_secs`) the **shorter bound wins**. Those knobs
+keep their exact meaning; adding `[retention]` can never make data live longer
+than it does today. `retention.webhook_replay` shorter than a protected
+endpoint's `replay_window_secs` **fails boot** rather than weakening a security
+control through a compliance knob.
+
+**Safety rails the sweep enforces:** `job_history` matches only terminal rows
+(`completed`/`failed`/`discarded`) with a `finished_at`, and never one still
+holding a `#[job(unique, unique_for_ms = N)]` dedup key (deleting it would run
+the job twice); `experiment_assignments` only sweeps concluded/archived/orphaned
+experiments, never a running one's sticky assignments. Data whose table is
+registered under a GDPR legal hold (`ModelRegistration::retain`) is never
+removed — the hold vetoes the whole dataset. Every real sweep writes an audit
+record (`action = "retention.sweep"`) carrying the dataset, cutoff and rows
+removed.
+
+```bash
+autumn db retention                       # effective policy + rows eligible now
+autumn db retention --dry-run             # what a sweep would remove
+autumn db retention --purge --dataset job_history   # enforce now (--force outside dev/test)
+autumn db retention --json                # machine-readable, for CI/compliance
+```
+
+It compiles and runs the app binary, so the report reflects the app's own
+resolved config, GDPR registrations and audit sinks — report and enforcement
+share one code path. See `docs/guide/data-retention.md`.
 
 ### Offsite S3 backups (0.6.0, issue #1619)
 

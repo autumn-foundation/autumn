@@ -182,6 +182,10 @@ idempotency.redis.url
 idempotency.ttl_secs
 jobs
 jobs.backend
+jobs.fleet
+jobs.fleet.declared_queues
+jobs.fleet.manifest
+jobs.fleet.tiers
 jobs.initial_backoff_ms
 jobs.max_attempts
 jobs.pin
@@ -247,6 +251,16 @@ resilience.circuit_breaker.defaults.minimum_sample_count
 resilience.circuit_breaker.defaults.open_duration_secs
 resilience.circuit_breaker.defaults.sample_window_secs
 resilience.circuit_breaker.hosts
+retention
+retention.audit_archives
+retention.commit_hooks
+retention.experiment_assignments
+retention.idempotency
+retention.job_history
+retention.job_tracking
+retention.sessions
+retention.sweep_interval
+retention.webhook_replay
 role
 scheduler
 scheduler.backend
@@ -343,6 +357,7 @@ seo.robots.additional_rules
 seo.robots.allow_all
 seo.robots.sitemap_url
 server
+server.capacity_contract
 server.host
 server.max_concurrent_requests
 server.port
@@ -354,6 +369,7 @@ server.timeouts
 server.timeouts.request_timeout_ms
 server.tls
 server.tls.acme
+server.tls.acme.ca_root_path
 server.tls.acme.cache_dir
 server.tls.acme.contact_email
 server.tls.acme.directory

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
@@ -6,6 +8,8 @@ mod assets;
 mod build;
 mod cache_audit;
 mod canary;
+mod capacity;
+mod capacity_driver;
 mod capsule;
 mod check;
 mod cold_start_driver;
@@ -37,6 +41,7 @@ mod new;
 mod overload_driver;
 mod paths;
 mod pg;
+mod plugin;
 mod plugin_check;
 mod process;
 mod release;
@@ -44,6 +49,8 @@ mod replay;
 mod retention;
 mod routes;
 mod routes_audit;
+mod rust_source;
+mod sbom;
 mod scaling_driver;
 mod schema;
 mod search;
@@ -332,6 +339,37 @@ pub enum SearchSubcommands {
     },
 }
 
+/// `autumn plugin ...` — consumer-facing plugin discovery and install
+/// (issue #1606). The author-facing conformance gate stays at
+/// `autumn plugin-check`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum PluginSubcommands {
+    /// List installable plugins with the version compatible with this app.
+    ///
+    /// Covers every first-party plugin plus community crates discoverable on
+    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Do not query crates.io; list the first-party catalog only.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    Add {
+        /// Plugin crate name, e.g. `autumn-admin-plugin`.
+        name: String,
+        /// Print what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not query crates.io. First-party plugins install normally;
+        /// a community crate cannot have its version resolved and is refused.
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
 /// Subcommands for `autumn jobs`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum JobsSubcommands {
@@ -522,6 +560,16 @@ enum Commands {
         /// Errors when the project has no `#[edge]` routes.
         #[arg(long)]
         edge: bool,
+        /// Compile through `cargo auditable`, embedding the resolved dependency
+        /// list into the binary.
+        ///
+        /// The binary can then report exactly which crate versions are inside
+        /// it with no source tree and no lockfile — `autumn sbom --binary
+        /// <path>`. Requires `cargo-auditable` on PATH (`cargo install
+        /// --locked cargo-auditable`); the production Dockerfile `autumn
+        /// release init` generates installs it and passes this flag.
+        #[arg(long)]
+        auditable: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -559,12 +607,90 @@ enum Commands {
         /// combined (default) does both.
         #[arg(long, value_enum)]
         role: Option<ServeRole>,
+        /// Pin this process to a subset of job queues (issue #1623). Repeatable
+        /// and comma-separated: `--pin critical,default` or `--pin critical
+        /// --pin default`. A pinned process never claims jobs from queues
+        /// outside the subset, on every backend. Forwarded to the app binary as
+        /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
+        /// own config (the default: drain every configured queue).
+        #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
+        pin: Vec<String>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
         /// Re-download even if the binary already exists
         #[arg(long)]
         force: bool,
+    },
+    /// Generate or verify a `CycloneDX` Software Bill of Materials.
+    ///
+    /// With no flags, reads `cargo metadata` for the project in the current
+    /// directory and writes a deterministic `CycloneDX` 1.5 document to stdout.
+    ///
+    ///   autumn sbom --output sbom.cdx.json
+    ///     Write the SBOM for this source tree to a file.
+    ///
+    ///   autumn sbom --verify sbom.cdx.json --locked
+    ///     Regenerate from the source tree and fail if the file drifted. This
+    ///     is the release gate: it reports which components were added,
+    ///     removed, or changed rather than a byte diff.
+    ///
+    ///   autumn sbom --binary /usr/local/bin/my-app
+    ///     Report the exact crate versions compiled into a binary, using the
+    ///     dependency list cargo-auditable embeds — no source tree, no
+    ///     lockfile, no network. See docs/guide/supply-chain.md.
+    Sbom {
+        /// Path to a `Cargo.toml` to describe (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+        /// Write the SBOM here instead of stdout.
+        #[arg(long, short, value_name = "FILE", conflicts_with = "verify")]
+        output: Option<PathBuf>,
+        /// Regenerate and compare against this SBOM; exit non-zero if it drifted.
+        #[arg(long, value_name = "FILE")]
+        verify: Option<PathBuf>,
+        /// Read the embedded dependency list out of an already-compiled binary.
+        ///
+        /// Mutually exclusive with every flag that only means something when
+        /// reading a source tree — a compiled binary has no manifest, no
+        /// lockfile and no feature set to resolve.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["manifest_path", "locked", "all_features", "verify"]
+        )]
+        binary: Option<PathBuf>,
+        /// Pass `--locked` to `cargo metadata`, failing if `Cargo.lock` is stale.
+        #[arg(long)]
+        locked: bool,
+        /// Resolve with every optional feature enabled.
+        ///
+        /// Off by default: the default feature set is what a build actually
+        /// links, so it is what the document should describe.
+        #[arg(long, conflicts_with = "binary")]
+        all_features: bool,
+        /// Extra Cargo features to enable, comma-separated.
+        ///
+        /// Pass the same features the binary was built with, so the SBOM
+        /// describes the crates that are actually linked. The generated
+        /// production Dockerfile does this for `embed-assets` builds.
+        #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
+        features: Option<String>,
+        /// Restrict resolution to one target triple.
+        ///
+        /// Without it the document lists target-specific dependencies for
+        /// every platform — the whole `windows-*` family in a Linux image.
+        /// The generated production Dockerfile passes the builder's host
+        /// triple. Leave unset for a source release consumed on every
+        /// platform, which is why it is not the default.
+        #[arg(long, value_name = "TRIPLE", conflicts_with = "binary")]
+        filter_platform: Option<String>,
+        /// Require the SBOM's top-level component to be exactly this version.
+        ///
+        /// The release gate passes the tag being released, so an SBOM that is
+        /// internally consistent but describes the wrong source tree still fails.
+        #[arg(long, value_name = "VERSION")]
+        expect_version: Option<String>,
     },
     /// Pin, vendor, and integrity-verify JS dependencies
     Assets {
@@ -1240,12 +1366,38 @@ enum Commands {
         action: SearchSubcommands,
     },
 
+    /// Discover and install Autumn plugins.
+    ///
+    /// `list` shows every installable plugin with the version compatible with
+    /// this app (querying crates.io for community crates unless `--offline`);
+    /// `add` writes the dependency, mounts the plugin in the
+    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    ///
+    /// Writing a plugin instead? `autumn generate plugin`. Auditing one you
+    /// wrote? `autumn plugin-check`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin list
+    ///   autumn plugin list --json --offline
+    ///   autumn plugin add autumn-admin-plugin
+    ///   autumn plugin add autumn-cache-redis --dry-run
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// The plugin subcommand to run.
+        #[command(subcommand)]
+        action: PluginSubcommands,
+    },
+
     /// Run conformance checks against a plugin's route contributions.
     ///
     /// Compiles the application (debug profile), introspects its route table,
     /// and verifies that the named plugin satisfies five checks: installability,
     /// route attribution, route prefix, route collision, and sensitive-surface
     /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// This is the AUTHOR-facing gate. To discover and install a plugin as a
+    /// consumer, use `autumn plugin list` / `autumn plugin add`.
     ///
     /// # Examples
     ///
@@ -1373,6 +1525,77 @@ enum Commands {
     #[command(name = "data-flow")]
     DataFlow(DataFlowArgs),
 
+    /// Derive and enforce this build's capacity contract (issue #1733).
+    ///
+    /// Builds the app in release mode, reads its route graph, walks a seeded
+    /// concurrency ladder against it, and records the saturation envelope in
+    /// `capacity.lock`. With `--check`, compares a rebuild against the
+    /// committed contract instead of writing one — the CI gate.
+    Calibrate {
+        /// Package to calibrate (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to calibrate (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Path of the capacity contract to write, or to check against.
+        #[arg(long, default_value = autumn_web::capacity::CONTRACT_FILE_NAME, value_name = "PATH")]
+        contract: String,
+        /// Gate mode: fail with a diff when this build regresses beyond
+        /// tolerance versus the committed contract. Writes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Autumn profile to calibrate under — the configuration the contract
+        /// will govern.
+        /// [default: prod; with --check, the committed contract's own profile]
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Cargo features for the calibrated build (repeatable; comma- or
+        /// space-separated inside one). Measure the binary you deploy.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Build the calibrated binary with `--all-features`.
+        #[arg(long)]
+        all_features: bool,
+        /// Build the calibrated binary with `--no-default-features`.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Drive load against these paths instead of the discovered ones
+        /// (repeatable). Use when a route needs query parameters or headers
+        /// the driver cannot invent.
+        #[arg(long = "target", value_name = "PATH")]
+        targets: Vec<String>,
+        /// Seed for the request profile, so a calibration is replayable.
+        /// [default: 1733; with --check, the committed contract's own seed]
+        #[arg(long, value_name = "SEED")]
+        seed: Option<u64>,
+        /// Concurrency ladder to walk (comma-separated).
+        /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
+        #[arg(long, value_delimiter = ',', value_name = "N")]
+        concurrency: Vec<usize>,
+        /// Milliseconds to hold each rung of the ladder.
+        /// [default: 2000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        rung_ms: Option<u64>,
+        /// Milliseconds of discarded warmup before the ladder.
+        /// [default: 1000; with --check, the committed value]
+        #[arg(long, value_name = "MS")]
+        warmup_ms: Option<u64>,
+        /// Measurements per rung; the median is recorded. Raise it on a noisy
+        /// machine.
+        /// [default: 3; with --check, the committed value]
+        #[arg(long, value_name = "N")]
+        runs: Option<u32>,
+        /// Fractional sustained-throughput drop `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_RPS_TOLERANCE, value_name = "FRACTION")]
+        tolerance_rps: f64,
+        /// Fractional P99-latency rise `--check` tolerates.
+        #[arg(long, default_value_t = crate::capacity::DEFAULT_P99_TOLERANCE, value_name = "FRACTION")]
+        tolerance_p99: f64,
+        /// Also emit the measured contract as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -1809,6 +2032,67 @@ enum DbCommands {
         #[arg(long)]
         allow_source_overwrite: bool,
     },
+    /// Report, dry-run, or enforce the retention policy for framework-owned data.
+    ///
+    /// Autumn creates and fills persistent stores your app never asked for —
+    /// the job queue and its tracking records, idempotency replay records,
+    /// sticky experiment assignments, webhook replay markers, sessions, audit
+    /// archives. This reports every one of them: the retention window in
+    /// effect, which setting produced it, how it is enforced, and how many
+    /// rows are eligible for purge right now.
+    ///
+    /// Windows are declared in the `[retention]` section of `autumn.toml` and
+    /// are enforced automatically on a recurring in-process sweep — this
+    /// command is for inspecting the policy and for running it on demand, not
+    /// a cron replacement.
+    ///
+    /// Runs your application binary (compiling it first if needed) so the
+    /// report reflects the app's own resolved config, GDPR legal holds, and
+    /// audit sinks.
+    ///
+    /// # Examples
+    ///
+    ///   # What is kept, and how much is eligible right now:
+    ///   autumn db retention
+    ///
+    ///   # What a sweep would delete, without deleting it:
+    ///   autumn db retention --dry-run
+    ///
+    ///   # Enforce the policy now, for one dataset:
+    ///   autumn db retention --purge --dataset `job_history`
+    #[command(verbatim_doc_comment)]
+    Retention {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Restrict to one dataset. Rejected up front if it is not one of the
+        /// framework-owned dataset keys, so a typo cannot silently sweep
+        /// nothing.
+        #[arg(long, value_name = "DATASET", value_parser = RETENTION_DATASET_KEYS)]
+        dataset: Option<String>,
+        /// Report what a sweep would remove, without removing anything.
+        #[arg(long, conflicts_with = "purge")]
+        dry_run: bool,
+        /// Enforce the configured policy immediately.
+        ///
+        /// Deletes data. Against a non-dev/test profile this additionally
+        /// requires `--force`, the same guard `autumn db drop` and
+        /// `autumn db scrub` apply.
+        #[arg(long)]
+        purge: bool,
+        /// Allow `--purge` against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Print the raw JSON report instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
@@ -1839,9 +2123,11 @@ impl DbCommands {
             | Self::Backup { .. }
             | Self::Restore { .. }
             | Self::Scrub { .. }
+            | Self::Retention { .. }
             | Self::Offsite(_) => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/offsite are dispatched before into_command"
+                    "db pull/backup/restore/scrub/retention/offsite are dispatched before \
+                     into_command"
                 )
             }
         }
@@ -3497,6 +3783,7 @@ fn run_command(command: Commands) {
             embed,
             features,
             edge,
+            auditable,
         } => build::run(
             debug,
             embed,
@@ -3504,6 +3791,7 @@ fn run_command(command: Commands) {
             package.as_deref(),
             bin.as_deref(),
             features.as_deref(),
+            auditable,
         ),
         Commands::Dev {
             package,
@@ -3516,6 +3804,7 @@ fn run_command(command: Commands) {
             bundled_pg,
             package,
             role,
+            pin,
         } => {
             let action = action.map(|a| match a {
                 ServeCommands::Stop => serve::ServeAction::Stop,
@@ -3536,6 +3825,20 @@ fn run_command(command: Commands) {
                     // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                     // the child pick its default (combined) or read its own env.
                     role: role.map(|r| r.as_str().to_owned()),
+                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
+                    // at all leaves the variable untouched so the child reads
+                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
+                    // stay distinguishable from that, so presence is carried by
+                    // the `Option`, not by the list being non-empty. Normalized
+                    // here (trim, drop blanks) so the recorded pin and the pin
+                    // the app parses are the same list.
+                    pin: (!pin.is_empty()).then(|| {
+                        pin.iter()
+                            .map(|q| q.trim())
+                            .filter(|q| !q.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    }),
                 },
             );
         }
@@ -3649,6 +3952,24 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+            }),
+            DbCommands::Retention {
+                package,
+                bin,
+                profile,
+                dataset,
+                dry_run,
+                purge,
+                force,
+                json,
+            } => db::retention::run(&db::retention::RetentionOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                profile: &profile,
+                mode: db_retention_mode(dry_run, purge),
+                dataset: dataset.as_deref(),
+                force,
+                json,
             }),
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
@@ -3899,6 +4220,27 @@ fn run_command(command: Commands) {
             model: model.as_deref(),
         }),
         Commands::Setup { force } => setup::run(force),
+        Commands::Sbom {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        } => sbom::run(&sbom::SbomOptions {
+            manifest_path,
+            output,
+            verify,
+            binary,
+            locked,
+            all_features,
+            features,
+            filter_platform,
+            expect_version,
+        }),
         Commands::Assets { action } => match action {
             AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
             AssetsCommands::List => assets::run_list(),
@@ -3939,6 +4281,53 @@ fn run_command(command: Commands) {
                 features,
                 release: args.release,
             });
+        }
+        Commands::Calibrate {
+            package,
+            bin,
+            contract,
+            check,
+            profile,
+            features,
+            all_features,
+            no_default_features,
+            targets,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            runs,
+            tolerance_rps,
+            tolerance_p99,
+            json,
+        } => {
+            let exit_code = capacity_driver::run(&capacity_driver::CalibrateOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                contract_path: &contract,
+                check,
+                profile,
+                named_features: !features.is_empty() || all_features || no_default_features,
+                features: routes::CargoFeatures {
+                    features,
+                    all: all_features,
+                    no_default: no_default_features,
+                },
+                targets,
+                seed,
+                concurrency,
+                rung_ms,
+                warmup_ms,
+                runs,
+                tolerances: capacity::Tolerances {
+                    rps: tolerance_rps,
+                    p99: tolerance_p99,
+                },
+                json,
+            });
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Commands::Routes {
             package,
@@ -4181,6 +4570,31 @@ fn run_command(command: Commands) {
                 });
             }
         },
+        Commands::Plugin { action } => {
+            let root = std::path::Path::new(".");
+            let code = match action {
+                PluginSubcommands::List { json, offline } => {
+                    plugin::run_list(&plugin::ListOptions {
+                        root,
+                        json,
+                        offline,
+                    })
+                }
+                PluginSubcommands::Add {
+                    name,
+                    dry_run,
+                    offline,
+                } => plugin::run_add(&plugin::AddOptions {
+                    root,
+                    name: &name,
+                    dry_run,
+                    offline,
+                }),
+            };
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::PluginCheck {
             package,
             bin,
@@ -4370,6 +4784,39 @@ fn run_replay_command(
         features,
         no_default_features,
     });
+}
+
+/// Map the `--dry-run` / `--purge` flags onto a [`db::retention::RetentionMode`]
+/// (issue #1605).
+///
+/// Neither flag means "report": the default is always read-only. Clap already
+/// rejects passing both, but the ordering here makes the safe direction the
+/// fallback rather than a coincidence — a future flag-handling change can only
+/// ever fail towards *not* deleting.
+/// The valid `autumn db retention --dataset` values, mirroring
+/// `autumn_web::data_retention::RETENTION_DATASETS` (issue #1605).
+///
+/// A clap `value_parser` so a typo is rejected before the app binary is even
+/// compiled, rather than after a full build-and-boot round trip.
+const RETENTION_DATASET_KEYS: [&str; 8] = [
+    "job_history",
+    "commit_hooks",
+    "job_tracking",
+    "idempotency",
+    "experiment_assignments",
+    "webhook_replay",
+    "sessions",
+    "audit_archives",
+];
+
+const fn db_retention_mode(dry_run: bool, purge: bool) -> db::retention::RetentionMode {
+    if purge {
+        db::retention::RetentionMode::Purge
+    } else if dry_run {
+        db::retention::RetentionMode::DryRun
+    } else {
+        db::retention::RetentionMode::Report
+    }
 }
 
 fn run_task_command(
@@ -5474,6 +5921,159 @@ mod tests {
     }
 
     #[test]
+    fn parse_sbom_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "sbom"]).unwrap();
+        let Commands::Sbom {
+            output,
+            verify,
+            binary,
+            locked,
+            manifest_path,
+            expect_version,
+            all_features,
+            features,
+            filter_platform,
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(output.is_none());
+        assert!(verify.is_none());
+        assert!(binary.is_none());
+        assert!(manifest_path.is_none());
+        assert!(expect_version.is_none());
+        assert!(
+            !locked,
+            "--locked must be opt-in so a stale app lockfile still builds"
+        );
+        assert!(
+            !all_features,
+            "the default feature set is what a build actually links, so it is \
+             what the document describes by default"
+        );
+        assert!(features.is_none());
+        assert!(
+            filter_platform.is_none(),
+            "a source release is consumed on every platform, so no filter by default"
+        );
+    }
+
+    #[test]
+    fn parse_sbom_filter_platform() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "sbom",
+            "--filter-platform",
+            "aarch64-unknown-linux-gnu",
+        ])
+        .unwrap();
+        let Commands::Sbom {
+            filter_platform, ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(
+            filter_platform.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn parse_sbom_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--features", "embed-assets"]).unwrap();
+        let Commands::Sbom { features, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_output_and_locked() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--output", "sbom.cdx.json", "--locked"])
+            .unwrap();
+        let Commands::Sbom { output, locked, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(output.unwrap().to_str().unwrap(), "sbom.cdx.json");
+        assert!(locked);
+    }
+
+    #[test]
+    fn parse_sbom_expect_version() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--expect-version", "0.7.0"]).unwrap();
+        let Commands::Sbom { expect_version, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(expect_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn parse_sbom_verify() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--verify", "sbom.cdx.json"]).unwrap();
+        let Commands::Sbom { verify, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(verify.unwrap().to_str().unwrap(), "sbom.cdx.json");
+    }
+
+    #[test]
+    fn parse_sbom_binary() {
+        let cli =
+            Cli::try_parse_from(["autumn", "sbom", "--binary", "/usr/local/bin/app"]).unwrap();
+        let Commands::Sbom { binary, .. } = cli.command else {
+            panic!("expected Sbom command");
+        };
+        assert_eq!(binary.unwrap().to_str().unwrap(), "/usr/local/bin/app");
+    }
+
+    #[test]
+    fn sbom_rejects_verifying_and_writing_at_once() {
+        // Both would be silently contradictory: `--verify` never writes.
+        assert!(
+            Cli::try_parse_from(["autumn", "sbom", "--verify", "a.json", "--output", "b.json"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_combined_with_source_tree_flags() {
+        // Each of these only means something when resolving a manifest; with
+        // `--binary` they would be silently ignored.
+        for flag in [
+            vec!["--locked"],
+            vec!["--all-features"],
+            vec!["--features", "embed-assets"],
+            vec!["--filter-platform", "x86_64-unknown-linux-gnu"],
+            vec!["--verify", "sbom.cdx.json"],
+        ] {
+            let mut args = vec!["autumn", "sbom", "--binary", "app"];
+            args.extend(flag.iter().copied());
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "`autumn sbom --binary` must reject {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sbom_rejects_a_binary_and_a_manifest_at_once() {
+        // `--binary` reads a compiled artifact; a manifest path is meaningless
+        // there and would quietly be ignored.
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "sbom",
+                "--binary",
+                "app",
+                "--manifest-path",
+                "Cargo.toml"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn new_rejects_removed_wasm_flag() {
         assert!(Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).is_err());
     }
@@ -5543,6 +6143,22 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_auditable() {
+        // The production Dockerfile passes this so the shipped binary carries
+        // its own dependency list (issue #1615).
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--auditable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                embed: true,
+                auditable: true,
+                ..
             }
         ));
     }
@@ -5559,6 +6175,7 @@ mod tests {
                 embed: false,
                 features: None,
                 edge: false,
+                auditable: false,
             }
         ));
     }
@@ -5718,6 +6335,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #1623, AC3: a worker-role process must be pinnable to a subset of
+    /// queues "via config/flags". `autumn serve --pin` is the flag half; it
+    /// accepts a comma-separated list (matching `AUTUMN_JOBS__PIN`, which it
+    /// forwards) and may be repeated.
+    #[test]
+    fn serve_parses_pin_as_a_comma_separated_list() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "--role",
+            "worker",
+            "--pin",
+            "critical,default",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "default".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_pin_can_be_repeated() {
+        let cli =
+            Cli::try_parse_from(["autumn", "serve", "--pin", "critical", "--pin", "bulk"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "bulk".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    /// AC4: an app that configures nothing new keeps today's behavior, so a bare
+    /// `autumn serve` must produce an empty pin (the CLI then leaves
+    /// `AUTUMN_JOBS__PIN` untouched and the child reads its own config).
+    #[test]
+    fn serve_pin_defaults_to_empty() {
+        let cli = Cli::try_parse_from(["autumn", "serve"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => assert!(pin.is_empty()),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
@@ -6424,6 +7088,89 @@ mod tests {
             panic!("expected db offsite list");
         };
         assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    // ── autumn db retention tests (issue #1605) ────────────────────────────
+
+    #[test]
+    fn parse_db_retention_defaults_to_a_read_only_report() {
+        let cli = Cli::try_parse_from(["autumn", "db", "retention"]).unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "dev");
+        assert_eq!(dataset, None);
+        assert!(!dry_run);
+        assert!(!purge, "the bare command must never delete anything");
+        assert!(!json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Report
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_with_dataset_and_purge() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "retention",
+            "--purge",
+            "--dataset",
+            "job_history",
+            "--profile",
+            "prod",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Retention {
+            profile,
+            dataset,
+            dry_run,
+            purge,
+            json,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db retention");
+        };
+        assert_eq!(profile, "prod");
+        assert_eq!(dataset.as_deref(), Some("job_history"));
+        assert!(!dry_run);
+        assert!(purge);
+        assert!(json);
+        assert_eq!(
+            db_retention_mode(dry_run, purge),
+            db::retention::RetentionMode::Purge
+        );
+    }
+
+    #[test]
+    fn parse_db_retention_dry_run_conflicts_with_purge() {
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "retention", "--dry-run", "--purge"]).is_err(),
+            "--dry-run and --purge are contradictory and must not both be accepted"
+        );
+    }
+
+    #[test]
+    fn db_retention_mode_falls_back_to_report() {
+        assert_eq!(
+            db_retention_mode(false, false),
+            db::retention::RetentionMode::Report
+        );
+        assert_eq!(
+            db_retention_mode(true, false),
+            db::retention::RetentionMode::DryRun
+        );
     }
 
     // ── autumn db scrub tests (issue #1602) ────────────────────────────────
@@ -7609,6 +8356,71 @@ mod tests {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
     }
 
+    // ── autumn plugin (list/add) tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_list_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(!json);
+                assert!(!offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_json_and_offline() {
+        let cli = Cli::try_parse_from(["autumn", "plugin", "list", "--json", "--offline"]).unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::List { json, offline },
+            } => {
+                assert!(json);
+                assert!(offline);
+            }
+            _ => panic!("expected plugin list"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_add_requires_a_name() {
+        assert!(Cli::try_parse_from(["autumn", "plugin", "add"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_add_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Add { name, dry_run, .. },
+            } => {
+                assert_eq!(name, "autumn-admin-plugin");
+                assert!(dry_run);
+            }
+            _ => panic!("expected plugin add"),
+        }
+    }
+
+    /// `autumn plugin-check` predates `autumn plugin` and must keep working
+    /// as its own top-level command.
+    #[test]
+    fn plugin_and_plugin_check_are_distinct_commands() {
+        let check =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        assert!(matches!(check.command, Commands::PluginCheck { .. }));
+    }
+
     // ── autumn plugin-check tests ──────────────────────────────────────────
 
     #[test]
@@ -8762,6 +9574,78 @@ mod tests {
         };
         assert_eq!(example, "examples/todo-app");
         assert_eq!(runs, 10);
+    }
+
+    // ── autumn calibrate (#1733) ────────────────────────────────────
+
+    #[test]
+    fn parse_calibrate_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "calibrate"]).unwrap();
+        let Commands::Calibrate {
+            contract,
+            check,
+            seed,
+            concurrency,
+            rung_ms,
+            warmup_ms,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert_eq!(contract, "capacity.lock");
+        assert!(
+            !check,
+            "calibrate writes a contract unless --check is passed"
+        );
+        // Unspecified, so `--check` can replay whatever the committed
+        // contract recorded rather than this invocation's defaults.
+        assert_eq!(seed, None);
+        assert!(concurrency.is_empty());
+        assert_eq!(rung_ms, None);
+        assert_eq!(warmup_ms, None);
+        assert!((tolerance_rps - capacity::DEFAULT_RPS_TOLERANCE).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_calibrate_check_mode_with_custom_ladder_and_tolerances() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "calibrate",
+            "--check",
+            "-p",
+            "blog",
+            "--contract",
+            "deploy/capacity.lock",
+            "--concurrency",
+            "1,8,64,256",
+            "--tolerance-rps",
+            "0.1",
+            "--tolerance-p99",
+            "0.3",
+        ])
+        .unwrap();
+        let Commands::Calibrate {
+            package,
+            contract,
+            check,
+            concurrency,
+            tolerance_rps,
+            tolerance_p99,
+            ..
+        } = cli.command
+        else {
+            panic!("expected calibrate");
+        };
+        assert!(check);
+        assert_eq!(package.as_deref(), Some("blog"));
+        assert_eq!(contract, "deploy/capacity.lock");
+        assert_eq!(concurrency, vec![1, 8, 64, 256]);
+        assert!((tolerance_rps - 0.1).abs() < f64::EPSILON);
+        assert!((tolerance_p99 - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

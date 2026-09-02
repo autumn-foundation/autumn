@@ -1,6 +1,10 @@
 #[cfg(feature = "maud")]
 mod a11y;
 mod access_log;
+#[cfg(feature = "acme")]
+mod acme_end_to_end;
+#[cfg(feature = "acme")]
+mod acme_fake_ca;
 mod acting_as_integration;
 mod after_commit_integration;
 mod alerts;
@@ -114,6 +118,9 @@ mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
+mod framework_retention;
+#[cfg(feature = "db")]
+mod framework_retention_pg;
 mod graceful_shutdown_contract;
 mod health_indicator_integration;
 mod hooks_lifecycle;
@@ -220,6 +227,7 @@ mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
+mod queue_pinning;
 mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;
@@ -291,6 +299,8 @@ mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
+mod sim_fault_plan;
+mod sim_fault_plan_pg;
 mod sim_job_clock;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
@@ -317,7 +327,11 @@ mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
+mod tls_app_surface;
+#[cfg(feature = "tls")]
 mod tls_serving;
+#[cfg(feature = "tls")]
+mod tls_support;
 mod transactional_test_integration;
 #[cfg(all(feature = "db", feature = "i18n"))]
 mod translatable_model;

@@ -57,6 +57,17 @@ pub struct ServeOptions {
     /// `"worker"`, or `"combined"`). `None` leaves the child to resolve its own
     /// role from its environment/config (defaulting to combined).
     pub role: Option<String>,
+    /// Job queues this process is pinned to, forwarded to the app binary via
+    /// `AUTUMN_JOBS__PIN` (issue #1623, AC3).
+    ///
+    /// `None` (the default) leaves the variable untouched, so the child resolves
+    /// `[jobs] pin` from its own config/environment — today's behavior: drain
+    /// every configured queue. `Some(queues)` forwards them. `Some(vec![])` is
+    /// **explicitly unpinned**: the app keys off the variable's *presence*, so an
+    /// empty `AUTUMN_JOBS__PIN` clears a `[jobs] pin` set in `autumn.toml`. That
+    /// distinction has to survive here, or `serve restart` silently re-pins a
+    /// daemon that was deliberately started unpinned.
+    pub pin: Option<Vec<String>>,
 }
 
 /// How long to wait for a freshly-spawned daemon to become reachable.
@@ -209,12 +220,32 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                 .role
                 .clone()
                 .or_else(|| recorded_mode.as_ref().and_then(|m| m.role.clone()));
+            // Same for the queue pin (#1623), with the same precedence
+            // `keep_profile` uses just above: an explicit `--pin` on *this*
+            // restart wins (spelled `autumn serve --pin critical restart` — like
+            // `--role`, it is an argument of `serve`, not of `restart`), then the
+            // restart shell's own `AUTUMN_JOBS__PIN`, and only then what the
+            // running daemon recorded.
+            //
+            // Consulting the live environment before the recording matters:
+            // without it, re-pointing a tier by exporting a new
+            // `AUTUMN_JOBS__PIN` and running `restart` would be silently
+            // overridden by the pin recorded at the daemon's original start —
+            // and re-recorded, making the stale pin sticky forever. Restoring
+            // the recording is still what stops a bare `restart` from turning a
+            // pinned worker tier into an unpinned one that drains every queue.
+            let keep_pin = resolve_restart_pin(
+                opts.pin.clone(),
+                env_pin(),
+                recorded_mode.as_ref().and_then(|m| m.pin.clone()),
+            );
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
                 release: keep_release,
                 profile: keep_profile,
                 role: keep_role,
+                pin: keep_pin,
                 ..opts.clone()
             };
             // Stop using the *recovered* mode, not the bare restart flags: when
@@ -621,6 +652,17 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // print the data-flow manifest and exit 0 -- a `serve` that reports success
     // and serves nothing (#1654 review round 5).
     cmd.env_remove(crate::data_flow::DUMP_ENV);
+    // Same hazard, sharper consequence (#1605). `AUTUMN_DB_RETENTION=report|purge`
+    // is the internal one-shot mode behind `autumn db retention`, and it is
+    // dispatched in `AppBuilder::run` *before* the server binds a listener. One
+    // left over in the launching shell -- from an earlier `autumn db retention
+    // --purge` in the same terminal, or a wrapping script -- would make
+    // `autumn serve` enforce the retention policy and exit instead of serving.
+    // Unlike a stray manifest dump, that silently DELETES data. The companion
+    // knobs go too: they are inert without the mode variable, but leaving a
+    // half-set internal protocol in a server's environment invites the next
+    // mode check to trip over it.
+    crate::db::retention::clear_inherited_one_shot_env(&mut cmd);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -661,6 +703,14 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // needs no special-casing — just forward the role the app reads at startup.
     if let Some(role) = &opts.role {
         cmd.env("AUTUMN_ROLE", role);
+    }
+    // Queue pinning (#1623, AC3). The app already reads a comma-separated
+    // `AUTUMN_JOBS__PIN` in `Config::apply_jobs_env_overrides`, so the flag
+    // forwards that exact spelling rather than inventing a second one. An empty
+    // pin leaves the variable untouched (AC4): the child then reads `[jobs] pin`
+    // from its own config, and an inherited `AUTUMN_JOBS__PIN` still applies.
+    if let Some(pin) = &opts.pin {
+        cmd.env("AUTUMN_JOBS__PIN", pin.join(","));
     }
     // Restore an explicit profile (set by `restart`) so the relaunched daemon
     // loads the same config as the original even when the restart shell didn't
@@ -1046,6 +1096,11 @@ struct ModeFile {
     /// role (or for mode files written before this field existed).
     #[serde(default)]
     role: Option<String>,
+    /// The job queues (`AUTUMN_JOBS__PIN`) the daemon was pinned to, recorded so
+    /// `restart` can restore them. `None` when the daemon ran unpinned (or for
+    /// mode files written before this field existed).
+    #[serde(default)]
+    pin: Option<Vec<String>>,
 }
 
 /// Write the `serve.mode` marker (`0600`). Best-effort.
@@ -1057,6 +1112,10 @@ fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
         // `AUTUMN_ROLE` an env-selected daemon inherited, so a later bare
         // `restart` recovers it instead of dropping back to combined.
         role: effective_role_from(opts.role.clone(), std::env::var("AUTUMN_ROLE").ok()),
+        // Persist the *effective* queue pin for the same reason (#1623): a bare
+        // `restart` must not silently relaunch a pinned worker tier as an
+        // unpinned one that drains everything.
+        pin: effective_pin_from(opts.pin.clone(), std::env::var("AUTUMN_JOBS__PIN").ok()),
     };
     let Ok(toml) = toml::to_string(&mode) else {
         return;
@@ -1411,6 +1470,65 @@ fn effective_role_from(explicit: Option<String>, env_value: Option<String>) -> O
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
     })
+}
+
+/// Parse an `AUTUMN_JOBS__PIN` value the way the app does
+/// (`Config::apply_jobs_env_overrides`): split on commas, trim, drop blanks — so
+/// the CLI and the app never disagree about which queues a daemon was pinned to.
+fn parse_pin_value(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `AUTUMN_JOBS__PIN` in *this* process's environment, if the variable is
+/// set at all. `Some(vec![])` for a present-but-empty value — the app treats
+/// that as an explicit unpin, not as an absent variable.
+fn env_pin() -> Option<Vec<String>> {
+    std::env::var("AUTUMN_JOBS__PIN")
+        .ok()
+        .map(|v| parse_pin_value(&v))
+}
+
+/// The queue pin a `restart` relaunches with (issue #1623): the explicit `--pin`
+/// on *this* restart, else the restart shell's own `AUTUMN_JOBS__PIN`, else what
+/// the running daemon recorded in `serve.mode`.
+///
+/// The live environment has to come before the recording: without it,
+/// re-pointing a worker tier by exporting a new `AUTUMN_JOBS__PIN` and running
+/// `restart` is silently overridden by the pin captured at the daemon's original
+/// start — and then re-recorded, making the stale pin permanent. Restoring the
+/// recording is still what stops a bare `restart` from turning a pinned tier into
+/// an unpinned one that drains every queue.
+fn resolve_restart_pin(
+    explicit: Option<Vec<String>>,
+    env: Option<Vec<String>>,
+    recorded: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    explicit.or(env).or(recorded)
+}
+
+/// The effective queue pin to record for `restart` recovery (issue #1623): the
+/// explicit `--pin` when given, else the `AUTUMN_JOBS__PIN` the daemon selected
+/// via its environment.
+///
+/// `None` means no pin was chosen at all, so a later `restart` leaves the
+/// variable alone and the child reads `[jobs] pin` from its config. `Some(vec![])`
+/// means the daemon was *explicitly* unpinned — the app keys off the variable's
+/// presence, so `AUTUMN_JOBS__PIN=` clears a `[jobs] pin` from `autumn.toml`.
+/// Collapsing those two into `None` would let a bare `restart` bring back a
+/// config pin the operator had deliberately overridden.
+///
+/// Separated from the env read so the precedence/normalization is unit-testable
+/// without mutating the process environment.
+fn effective_pin_from(
+    explicit: Option<Vec<String>>,
+    env_value: Option<String>,
+) -> Option<Vec<String>> {
+    explicit.or_else(|| env_value.map(|v| parse_pin_value(&v)))
 }
 
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
@@ -2050,6 +2168,7 @@ mod tests {
             bundled_pg: false,
             profile: None,
             role: role.map(str::to_owned),
+            pin: None,
         }
     }
 
@@ -2084,6 +2203,32 @@ mod tests {
     }
 
     #[test]
+    fn base_command_clears_an_inherited_retention_mode() {
+        // #1605 review round 10. `AUTUMN_DB_RETENTION=purge` is the internal
+        // one-shot mode behind `autumn db retention`, dispatched in
+        // `AppBuilder::run` before the server binds a listener. Inherited from
+        // the launching shell it turns `autumn serve` into a destructive purge
+        // that exits 0 -- the data-flow hazard above, except it deletes data.
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        for var in [
+            "AUTUMN_DB_RETENTION",
+            "AUTUMN_DB_RETENTION_DATASET",
+            "AUTUMN_RETENTION_DRY_RUN",
+        ] {
+            let entry = cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(var));
+            assert_eq!(
+                entry,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly removed (present with a None value), not \
+                 merely absent from the overrides -- absent means inherited",
+            );
+        }
+    }
+
+    #[test]
     fn base_command_forwards_role_env() {
         for role in ["web", "worker", "combined"] {
             let opts = serve_opts_with_role(Some(role));
@@ -2106,6 +2251,170 @@ mod tests {
             cmd.get_envs()
                 .all(|(k, _)| k != std::ffi::OsStr::new("AUTUMN_ROLE")),
             "no --role must leave AUTUMN_ROLE unset for the app binary",
+        );
+    }
+
+    fn serve_opts_with_pin(pin: &[&str]) -> ServeOptions {
+        ServeOptions {
+            pin: Some(pin.iter().map(|s| (*s).to_owned()).collect()),
+            ..serve_opts_with_role(Some("worker"))
+        }
+    }
+
+    /// Issue #1623, AC3: `autumn serve --pin critical,default` must reach the app
+    /// binary. The app reads the pin from `AUTUMN_JOBS__PIN` (comma-separated,
+    /// `Config::apply_jobs_env_overrides`), so the CLI forwards it in that exact
+    /// spelling rather than inventing a second one.
+    #[test]
+    fn base_command_forwards_pin_env() {
+        let opts = serve_opts_with_pin(&["critical", "default"]);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        assert_eq!(
+            env_value(&cmd, "AUTUMN_JOBS__PIN").as_deref(),
+            Some("critical,default"),
+            "serve --pin must forward AUTUMN_JOBS__PIN as a comma-separated list",
+        );
+    }
+
+    /// AC4: an app that configures nothing new keeps today's behavior. With no
+    /// `--pin` the CLI must leave `AUTUMN_JOBS__PIN` entirely alone, so the child
+    /// resolves `jobs.pin` from its own config/environment.
+    #[test]
+    fn base_command_omits_pin_env_by_default() {
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        assert!(
+            cmd.get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("AUTUMN_JOBS__PIN")),
+            "no --pin must leave AUTUMN_JOBS__PIN unset for the app binary",
+        );
+    }
+
+    /// A `serve --pin` start must persist the pin into `serve.mode` so a bare
+    /// `serve restart` recovers it, mirroring the `--role` path. Dropping it
+    /// would silently relaunch a pinned worker tier as an unpinned one — exactly
+    /// the starvation #1623 exists to prevent.
+    #[test]
+    fn write_mode_file_persists_pin_for_restart_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("dirs");
+        let opts = serve_opts_with_pin(&["critical"]);
+        write_mode_file(&paths, &opts);
+
+        let contents = std::fs::read_to_string(paths.mode_file()).expect("read mode file");
+        let recovered: ModeFile = toml::from_str(&contents).expect("parse mode file");
+        assert_eq!(
+            recovered.pin.as_deref(),
+            Some(["critical".to_owned()].as_slice()),
+            "restart must recover the persisted --pin",
+        );
+    }
+
+    /// Regression for the review finding on the restart path: re-pointing a
+    /// worker tier by exporting a new `AUTUMN_JOBS__PIN` and running
+    /// `serve restart` must take the new pin, not be overridden by the one
+    /// recorded when the daemon first started (which would also be re-recorded,
+    /// making the stale pin permanent). Mirrors `keep_profile`'s precedence.
+    #[test]
+    fn restart_precedence_prefers_the_flag_then_the_live_env_then_the_recording() {
+        let recorded = Some(vec!["critical".to_owned()]);
+        let live_env = Some(vec!["bulk".to_owned(), "default".to_owned()]);
+        let flag = Some(vec!["reports".to_owned()]);
+
+        assert_eq!(
+            resolve_restart_pin(flag.clone(), live_env.clone(), recorded.clone()),
+            flag,
+            "an explicit --pin on this restart wins",
+        );
+        assert_eq!(
+            resolve_restart_pin(None, live_env.clone(), recorded.clone()),
+            live_env,
+            "otherwise the restart shell's own AUTUMN_JOBS__PIN wins over the recording — \
+             without this, re-pointing a tier by exporting a new pin is overridden by the \
+             one captured at the daemon's original start, and then re-recorded",
+        );
+        assert_eq!(
+            resolve_restart_pin(None, None, recorded.clone()),
+            recorded,
+            "and only with neither does the recorded pin come back, so a bare restart never \
+             turns a pinned tier into an unpinned one",
+        );
+        assert_eq!(
+            resolve_restart_pin(None, None, None),
+            None,
+            "nothing anywhere leaves AUTUMN_JOBS__PIN untouched for the child",
+        );
+        // An explicit unpin is a real choice at every layer, not an absent one.
+        assert_eq!(
+            resolve_restart_pin(None, Some(Vec::new()), recorded),
+            Some(Vec::new()),
+            "an explicitly-empty live pin must not fall through to the recording",
+        );
+    }
+
+    #[test]
+    fn mode_file_pin_defaults_none_for_legacy_files() {
+        // Mode files written before the `pin` field omit it; parsing must not
+        // fail and must default to None (the daemon ran unpinned).
+        let legacy = "release = true\nprofile = \"prod\"\nrole = \"worker\"\n";
+        let parsed: ModeFile = toml::from_str(legacy).expect("parse legacy mode file");
+        assert_eq!(parsed.pin, None);
+    }
+
+    /// Precedence mirrors `effective_role_from`: an explicit `--pin` wins, else
+    /// the `AUTUMN_JOBS__PIN` the daemon inherited is recorded so a later bare
+    /// `serve restart` from a shell without it still relaunches pinned. Blank
+    /// and whitespace-only entries are dropped exactly as the app's own env
+    /// parser drops them, so the two never disagree about what was pinned.
+    #[test]
+    fn effective_pin_prefers_flag_then_env() {
+        assert_eq!(
+            effective_pin_from(Some(vec!["critical".to_owned()]), Some("bulk".to_owned())),
+            Some(vec!["critical".to_owned()]),
+            "an explicit --pin must win over an inherited AUTUMN_JOBS__PIN",
+        );
+        assert_eq!(
+            effective_pin_from(None, Some(" critical , , default ".to_owned())),
+            Some(vec!["critical".to_owned(), "default".to_owned()]),
+            "an inherited AUTUMN_JOBS__PIN is split/trimmed like the app parses it",
+        );
+        assert_eq!(
+            effective_pin_from(None, None),
+            None,
+            "no flag and no env records no pin",
+        );
+    }
+
+    /// The app keys off the *presence* of `AUTUMN_JOBS__PIN`, so a
+    /// present-but-empty value is an explicit unpin that clears a `[jobs] pin`
+    /// from `autumn.toml`. Recording that as "no pin" would let a bare
+    /// `serve restart` bring the config pin back and silently change which
+    /// queues the daemon drains.
+    #[test]
+    fn an_explicitly_empty_pin_is_recorded_as_unpinned_not_as_absent() {
+        assert_eq!(
+            effective_pin_from(None, Some(String::new())),
+            Some(Vec::new()),
+            "a present-but-empty AUTUMN_JOBS__PIN means explicitly unpinned",
+        );
+        assert_eq!(
+            effective_pin_from(None, Some("  ,  ".to_owned())),
+            Some(Vec::new()),
+            "a present all-blank AUTUMN_JOBS__PIN is likewise an explicit unpin",
+        );
+
+        // …and it must round-trip through the command as an empty variable, not
+        // as an absent one.
+        let opts = ServeOptions {
+            pin: Some(Vec::new()),
+            ..serve_opts_with_role(Some("worker"))
+        };
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        assert_eq!(
+            env_value(&cmd, "AUTUMN_JOBS__PIN").as_deref(),
+            Some(""),
+            "an explicit unpin must set AUTUMN_JOBS__PIN to the empty string, not leave it unset",
         );
     }
 

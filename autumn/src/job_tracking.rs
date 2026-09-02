@@ -1384,13 +1384,15 @@ impl JobTrackingStore for RedisJobTrackingStore {
 /// `None` when no URL is configured or it fails to parse; the connection
 /// manager itself connects lazily, so this never blocks on Redis being up.
 #[cfg(feature = "redis")]
-fn build_redis_tracking_store(config: &crate::config::JobConfig) -> Option<RedisJobTrackingStore> {
+pub(crate) fn build_redis_tracking_store(
+    config: &crate::config::JobConfig,
+) -> Option<RedisJobTrackingStore> {
     let url = config
         .redis
         .url
         .clone()
         .filter(|url| !url.trim().is_empty())?;
-    let client = redis::Client::open(url).ok()?;
+    let client = crate::redis_tls::open_client(&url).ok()?;
     let connection = redis::aio::ConnectionManager::new_lazy_with_config(
         client,
         redis::aio::ConnectionManagerConfig::new(),

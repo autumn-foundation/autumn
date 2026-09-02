@@ -1100,6 +1100,23 @@ fn fast_escape(input: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Build `"{base}{suffix}"` by direct, exactly-sized concatenation instead of
+/// `format!`. `format!("{base}{suffix}")` drives an unsized `String::new()`
+/// through the `Arguments`/`fmt::Write` machinery — arguments are boxed into
+/// a `[ArgumentV1]`, each piece is dispatched through `Display::fmt`, and the
+/// output `String` grows via reallocation as pieces land rather than being
+/// sized up front. For the fixed two-part `-field`/`-error` id suffixes every
+/// scaffolded input helper builds once per render, that dispatch is pure
+/// overhead: both parts are already `&str`, so one `String::with_capacity`
+/// plus two `push_str` calls produces the identical bytes.
+#[cfg(feature = "maud")]
+fn concat_suffix(base: &str, suffix: &str) -> String {
+    let mut s = String::with_capacity(base.len().saturating_add(suffix.len()));
+    s.push_str(base);
+    s.push_str(suffix);
+    s
+}
+
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
 /// - Sets `name` and `id` to `field`
@@ -1120,8 +1137,8 @@ pub fn text_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
@@ -1411,8 +1428,8 @@ pub fn password_input<T: Serialize>(
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
@@ -1454,8 +1471,8 @@ pub fn textarea_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
@@ -1919,8 +1936,8 @@ pub fn checkbox_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let checked = changeset.field_value(field).as_deref() == Some("true");
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
@@ -1968,8 +1985,8 @@ pub fn number_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
@@ -2401,8 +2418,8 @@ pub fn date_input<T: Serialize>(
     let has_errors = !errors.is_empty();
     let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
     let field_html = fast_escape(field);
-    let error_id = has_errors.then(|| format!("{field_html}-error"));
-    let wrapper_id = format!("{field_html}-field");
+    let error_id = has_errors.then(|| concat_suffix(&field_html, "-error"));
+    let wrapper_id = concat_suffix(&field_html, "-field");
     let field_pe = maud::PreEscaped(field_html.as_ref());
     let wrapper_pe = maud::PreEscaped(&wrapper_id);
     let aria_pe = maud::PreEscaped(error_id.as_deref().unwrap_or(""));
