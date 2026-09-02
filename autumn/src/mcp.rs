@@ -3536,6 +3536,97 @@ mod tests {
     }
 
     #[test]
+    fn render_effects_caps_the_list_and_marks_the_truncation() {
+        use crate::agent_authority::{Effect, EffectKind, EffectProvenance};
+
+        const fn effect(subject: &'static str) -> Effect {
+            Effect {
+                kind: EffectKind::Write,
+                subject,
+                location: "mcp.rs:0",
+                provenance: EffectProvenance::Syntactic,
+            }
+        }
+        // One over the cap, so the elision is exercised rather than the
+        // boundary being silently the whole list.
+        const EFFECTS: [Effect; MAX_AUDITED_EFFECTS + 1] =
+            [effect("Refund"); MAX_AUDITED_EFFECTS + 1];
+
+        let rendered = render_effects(&EFFECTS);
+        assert_eq!(
+            rendered.matches("write:Refund").count(),
+            MAX_AUDITED_EFFECTS,
+            "an oversized effect set is capped, not spilled into every row: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(",\u{2026}"),
+            "the cap must be visible in the row, not silent: {rendered}"
+        );
+        assert_eq!(render_effects(&EFFECTS[..1]), "write:Refund");
+        assert_eq!(render_effects(&[]), "");
+    }
+
+    #[test]
+    fn only_a_completed_stream_and_an_intact_body_count_as_success() {
+        // The disposition is the half of the verdict the status line cannot
+        // supply: a streaming tool answers `200` before it has done anything,
+        // and a buffered one can answer `200` and then fail to hand its body
+        // over (issue #1691 review rounds 1 and 2).
+        assert!(Disposition::Settled.is_success());
+        assert!(Disposition::Stream(StreamState::Completed).is_success());
+        assert!(!Disposition::Stream(StreamState::Aborted).is_success());
+        assert!(!Disposition::Stream(StreamState::Errored).is_success());
+        assert!(!Disposition::Buffered(BufferedFailure::Overflow).is_success());
+        assert!(!Disposition::Buffered(BufferedFailure::BodyError).is_success());
+
+        // Each failing ending names itself in exactly one metadata key, so a
+        // sink can tell the three stream endings apart from a lost body.
+        assert_eq!(
+            Disposition::Stream(StreamState::Aborted).stream_state(),
+            Some("aborted")
+        );
+        assert_eq!(Disposition::Stream(StreamState::Aborted).result(), None);
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::Overflow).result(),
+            Some("body_overflow")
+        );
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::BodyError).result(),
+            Some("body_error")
+        );
+        assert_eq!(
+            Disposition::Buffered(BufferedFailure::Overflow).stream_state(),
+            None
+        );
+        assert_eq!(Disposition::Settled.stream_state(), None);
+        assert_eq!(Disposition::Settled.result(), None);
+    }
+
+    #[tokio::test]
+    async fn a_length_limit_anywhere_in_the_source_chain_is_an_overflow() {
+        // `to_bytes` collects through `http_body_util::Limited`, which reports
+        // the cap as a `LengthLimitError` *nested* inside the error it hands
+        // back. Classifying on the outer type alone would record every overflow
+        // as a generic `body_error` — so the error under test is produced by the
+        // very call the buffered path makes, not by a hand-built stand-in.
+        let overflow = axum::body::to_bytes(axum::body::Body::from(vec![0_u8; 32]), 8)
+            .await
+            .expect_err("a body past the cap must not collect");
+        assert_eq!(
+            BufferedFailure::classify(&overflow),
+            BufferedFailure::Overflow
+        );
+        assert_eq!(BufferedFailure::Overflow.as_str(), "body_overflow");
+
+        let other = axum::Error::new(std::io::Error::other("peer went away"));
+        assert_eq!(
+            BufferedFailure::classify(&other),
+            BufferedFailure::BodyError
+        );
+        assert_eq!(BufferedFailure::BodyError.as_str(), "body_error");
+    }
+
+    #[test]
     fn read_only_hint_is_unaffected_by_the_authority() {
         // `readOnlyHint` is a statement about the HTTP verb, not about how hard
         // the effect is to undo — the two hints must not be conflated.

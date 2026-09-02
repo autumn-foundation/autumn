@@ -23,6 +23,12 @@
 //!    not enforced).
 //! 7. `Extension<AgentInvocation>` is readable inside the handler, so an
 //!    application can thread the correlation id into its own records.
+//! 8. The outcome describes what actually happened, never the status line
+//!    alone: a buffered body that overflows the tool-result cap is a `Failure`
+//!    carrying `result`, and a `200` behind it is recorded as the fact it is.
+//! 9. A streaming tool's outcome is written when the *projection* ends —
+//!    `completed`, `errored` or (from the drop guard, when the client hangs up)
+//!    `aborted` — never from the `200` that opened the stream.
 
 #![cfg(feature = "mcp")]
 
@@ -280,6 +286,22 @@ async fn slow_refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         Some((Ok(Event::default().data(format!("refund {n}"))), n + 1))
     });
+    Sse::new(stream)
+}
+
+/// A governed streaming tool whose body fails part-way through: one good frame,
+/// then a transport error on the stream itself.
+///
+/// The handler still answers `200` — the failure exists only *inside* the body,
+/// which is exactly the ending a status-line outcome could never see (issue
+/// #1691 review round 1).
+#[get("/api/broken-feed")]
+#[api_doc(mcp, stream, summary = "Stream refund events, then fail")]
+async fn broken_refund_feed() -> Sse<impl Stream<Item = Result<Event, std::io::Error>>> {
+    let stream = futures::stream::iter(vec![
+        Ok(Event::default().data("refund 1")),
+        Err(std::io::Error::other("the refund feed went away")),
+    ]);
     Sse::new(stream)
 }
 
@@ -928,6 +950,72 @@ async fn a_streaming_tool_is_audited_without_disturbing_its_stream() {
         meta(outcome, "stream_state"),
         "completed",
         "the handler's body ended normally"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_mid_flight_is_recorded_as_errored() {
+    // The other way a `200` lies: the handler opened its stream, emitted part of
+    // its output, and then the body itself errored. The projection reaches a
+    // terminal state on its own here — no client had to go away — so the outcome
+    // is recorded inline rather than by the drop guard, and it must still be a
+    // `Failure` (issue #1691 review round 1).
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![broken_refund_feed], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    let resp = client
+        .post("/mcp")
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "broken_refund_feed",
+                "arguments": {},
+                "_meta": { "progressToken": "tok-1" },
+            },
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // Whatever the handler managed to emit before failing still reaches the
+    // agent: a broken stream is audited as a failure, not censored.
+    let body = resp.text();
+    assert!(
+        body.contains("refund 1"),
+        "the frames that did arrive must still be projected: {body}"
+    );
+
+    let events = sink.agent_events();
+    assert_eq!(
+        events.len(),
+        2,
+        "a failed stream is still exactly one attempt and one outcome: {events:#?}"
+    );
+
+    let outcome = &events[1];
+    assert_eq!(outcome.action, "agent.tool.broken_refund_feed");
+    assert_eq!(meta(outcome, "phase"), "outcome");
+    assert_eq!(
+        outcome.status,
+        AuditStatus::Failure,
+        "a stream that broke part-way through did not deliver the action"
+    );
+    assert_eq!(meta(outcome, "stream_state"), "errored");
+    assert_eq!(
+        meta(outcome, "http_status"),
+        "200",
+        "the status the handler answered with is still recorded as the fact it is"
+    );
+    assert_eq!(
+        meta(outcome, "correlation_id"),
+        meta(&events[0], "correlation_id"),
+        "the failure still joins to its attempt"
     );
 }
 

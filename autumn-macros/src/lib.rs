@@ -1251,7 +1251,13 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   not enforce them.
 /// * Anything opaque — a helper handed the handle, a `format!`-built URL, a
 ///   `tokio::spawn` that detaches the effect from the request it is audited
-///   under — is reported, never assumed effect-free.
+///   under — is reported, never assumed effect-free. A helper is opaque
+///   whether it is free (`wipe(repo)`) or associated (`Billing::wipe(repo)`):
+///   an associated function is another function's business too, and a static
+///   finder that really only reads (`Post::find_published(&mut db)`) is
+///   discharged with `#[agent_effect(none, reason = "…")]` rather than
+///   assumed. A local alias for an effect verb (`let schedule =
+///   NotifyFinanceJob::enqueue;`) is classified against the path it names.
 ///
 /// # Escape hatch
 ///
