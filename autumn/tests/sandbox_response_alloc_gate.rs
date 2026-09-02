@@ -25,11 +25,21 @@
 
 #![cfg(feature = "plugin-sandbox")]
 
-use autumn_web::plugin_sandbox::SandboxResponse;
+use autumn_web::plugin_sandbox::{OwnedRoutes, SandboxResponse};
 
 /// Big enough that one copy cannot hide in the noise, and far below any
 /// ceiling so the value is examined rather than refused for its size first.
 const VALUE_BYTES: usize = 512 * 1024;
+
+/// A plugin that serves everything beneath its prefix.
+///
+/// The redirect fixture below has to stay *permitted* — the whole point is that
+/// the value survives the check, so nothing about the outcome reveals what
+/// answering cost. A narrower route set would have it refused, and the gate
+/// would be measuring the refusal path instead.
+fn owns_the_prefix() -> OwnedRoutes {
+    OwnedRoutes::from_paths(["/hello", "/hello/{*rest}"])
+}
 
 const fn response(headers: Vec<(String, String)>) -> SandboxResponse {
     SandboxResponse {
@@ -53,14 +63,20 @@ fn deciding_a_redirect_stays_in_the_prefix_does_not_copy_the_path() {
 
     // Warm-up outside the windows: whatever the first call sets up, neither
     // measurement should be charged for.
-    drop(small_response.clone().sanitize("/hello"));
+    drop(
+        small_response
+            .clone()
+            .sanitize("/hello", &owns_the_prefix()),
+    );
 
     let baseline = allocation_counter::measure(|| {
-        let out = small_response.clone().sanitize("/hello");
+        let out = small_response
+            .clone()
+            .sanitize("/hello", &owns_the_prefix());
         std::hint::black_box(&out);
     });
     let measured = allocation_counter::measure(|| {
-        let out = long_response.clone().sanitize("/hello");
+        let out = long_response.clone().sanitize("/hello", &owns_the_prefix());
         std::hint::black_box(&out);
     });
 

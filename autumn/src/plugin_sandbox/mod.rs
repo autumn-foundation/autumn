@@ -69,7 +69,7 @@ pub use manifest::{
 };
 pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
 pub use wire::{
-    ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS,
+    ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,
     SandboxRequest, SandboxResponse, WireError, request_header_allowed, response_header_allowed,
 };
 

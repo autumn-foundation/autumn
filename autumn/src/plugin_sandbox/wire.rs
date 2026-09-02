@@ -158,7 +158,7 @@ pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
 /// different question than the one that matters: percent-encoded double-dot
 /// segments (`%2e%2e`) and ASCII tabs or newlines, which the client removes
 /// outright.
-fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
+fn redirect_target_allowed(target: &str, prefix: &str, owned: &OwnedRoutes) -> bool {
     // A backslash is a path separator to some clients but not to this check,
     // so a target carrying one is refused rather than guessed at.
     if target.contains('\\') {
@@ -200,7 +200,55 @@ fn redirect_target_allowed(target: &str, prefix: &str) -> bool {
     // No segment may climb out of the prefix. The query and fragment are not
     // path, so stop before them.
     let path = rest.split(['?', '#']).next().unwrap_or_default();
-    !path.split('/').any(is_double_dot_segment)
+    if path.split('/').any(is_double_dot_segment) {
+        return false;
+    }
+    // And the target must be a route this plugin actually serves. Staying under
+    // the prefix is not the same as being the plugin's to name — see
+    // [`OwnedRoutes`].
+    owned.owns(target.split(['?', '#']).next().unwrap_or_default())
+}
+
+/// The paths a plugin declared, matched the way the router matches them.
+///
+/// A prefix is not an ownership boundary. The router deliberately admits an
+/// application route under a plugin's prefix — disjoint siblings mount cleanly,
+/// and `try_build_router_allows_declared_plugin_routes_that_do_not_collide`
+/// pins that — so "under the prefix" and "served by this plugin" are different
+/// sets, and a redirect target checked only against the first can name a route
+/// the *application* owns.
+///
+/// That matters because a redirect is the one response a plugin returns that
+/// makes the client act: a 307 or 308 replays the user's method, body and
+/// cookies at whatever it names. A guest holding no session capability could
+/// therefore have a browser re-issue an authenticated request against a trusted
+/// handler, chosen by the guest. The manifest is the mount, so the routes it
+/// declares are exactly the ones a redirect may name.
+///
+/// Built once per host rather than per response: the paths are fixed at load,
+/// and the manifest validator has already proved they insert without
+/// conflicting.
+pub struct OwnedRoutes(matchit::Router<()>);
+
+impl OwnedRoutes {
+    /// Build the matcher from a manifest's declared paths.
+    #[must_use]
+    pub fn from_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut router = matchit::Router::new();
+        for path in paths {
+            // Two methods on one path is one template, and the validator has
+            // already refused a genuine conflict — so a repeat here is expected
+            // and the insert error is the right thing to drop.
+            drop(router.insert(path, ()));
+        }
+        Self(router)
+    }
+
+    /// Does this plugin serve this exact path?
+    #[must_use]
+    fn owns(&self, path: &str) -> bool {
+        self.0.at(path).is_ok()
+    }
 }
 
 /// Is this path segment a "double-dot segment" — one that climbs a level?
@@ -524,7 +572,7 @@ impl SandboxResponse {
     /// reaching for `Set-Cookie` is a thing an operator wants in their log,
     /// not something to silently drop.
     #[must_use]
-    pub fn sanitize(mut self, prefix: &str) -> (Self, Vec<String>) {
+    pub fn sanitize(mut self, prefix: &str, owned: &OwnedRoutes) -> (Self, Vec<String>) {
         let mut denied = Vec::new();
         self.headers.retain(|(name, value)| {
             // Matched against the borrowed name. Lower-casing first copied every
@@ -546,7 +594,9 @@ impl SandboxResponse {
             // redirect a plugin genuinely needs (its own routes) and takes away
             // the one it must not have. An absolute URL is refused by the same
             // rule, which closes the open-redirect half as well.
-            if name.eq_ignore_ascii_case("location") && !redirect_target_allowed(value, prefix) {
+            if name.eq_ignore_ascii_case("location")
+                && !redirect_target_allowed(value, prefix, owned)
+            {
                 denied.push(denied_excerpt(name));
                 return false;
             }
@@ -751,6 +801,83 @@ pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String,
 #[cfg(test)]
 mod tests {
 
+    /// A plugin that serves everything beneath its prefix.
+    ///
+    /// The redirect tests below are about control characters, trimming and
+    /// climbing — rules that hold before ownership is ever consulted. Giving
+    /// them a plugin that owns the whole prefix keeps them measuring what they
+    /// were written to measure; ownership has its own test.
+    fn any_route_under_hello() -> OwnedRoutes {
+        OwnedRoutes::from_paths(["/hello", "/hello/{*rest}"])
+    }
+
+    /// The route set the sanitation tests mount against: what a hello plugin
+    /// declares, and nothing the application might also serve under `/hello`.
+    fn hello_routes() -> OwnedRoutes {
+        OwnedRoutes::from_paths(["/hello", "/hello/greet", "/hello/items/{id}"])
+    }
+
+    #[test]
+    fn a_redirect_may_only_name_a_route_the_plugin_serves() {
+        // Staying under the prefix is not the same as being the plugin's to
+        // name. The router deliberately lets an application route sit under a
+        // plugin's prefix — disjoint siblings mount cleanly, and
+        // `try_build_router_allows_declared_plugin_routes_that_do_not_collide`
+        // pins exactly that — so `/hello/other` can belong to the application
+        // while `/hello` is the plugin's prefix.
+        //
+        // A 307 replays the user's method, body and cookies at whatever it
+        // names. A guest that could name an application route would have the
+        // browser re-issue an authenticated request against a trusted handler
+        // of the guest's choosing, holding no session capability itself.
+        let application_owned = SandboxResponse {
+            status: 307,
+            headers: vec![("location".to_owned(), "/hello/other".to_owned())],
+            body: Vec::new(),
+        };
+        let (clean, denied) = application_owned.sanitize("/hello", &hello_routes());
+        assert!(
+            clean.headers.is_empty(),
+            "a redirect to a route the plugin does not serve must be stripped",
+        );
+        assert_eq!(denied, vec!["location".to_owned()], "and recorded");
+
+        // Its own routes stay: a plugin redirecting within what it serves is
+        // the case this rule exists to keep working.
+        for target in [
+            "/hello",
+            "/hello/greet",
+            "/hello/greet?x=1",
+            "/hello/items/7",
+        ] {
+            let own = SandboxResponse {
+                status: 307,
+                headers: vec![("location".to_owned(), target.to_owned())],
+                body: Vec::new(),
+            };
+            let (clean, denied) = own.sanitize("/hello", &hello_routes());
+            assert_eq!(
+                clean.headers.len(),
+                1,
+                "the plugin's own route {target} must remain a legal redirect",
+            );
+            assert!(denied.is_empty(), "{target} was denied");
+        }
+
+        // And the rules this one sits behind still hold on their own: outside
+        // the prefix, and climbing out of it, are refused before ownership is
+        // ever consulted.
+        for target in ["/admin", "/hello/../admin", "/hello/%2e%2e/admin"] {
+            let escaping = SandboxResponse {
+                status: 307,
+                headers: vec![("location".to_owned(), target.to_owned())],
+                body: Vec::new(),
+            };
+            let (clean, _) = escaping.sanitize("/hello", &hello_routes());
+            assert!(clean.headers.is_empty(), "{target} must still be refused");
+        }
+    }
+
     #[test]
     fn a_denied_header_name_is_not_copied_whole_to_be_thrown_away() {
         // `sanitize` lower-cased every name before deciding anything, so a name
@@ -770,7 +897,7 @@ mod tests {
             headers: vec![(huge.clone(), "v".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = response.sanitize("/hello");
+        let (clean, denied) = response.sanitize("/hello", &hello_routes());
 
         assert!(
             clean.headers.is_empty(),
@@ -796,7 +923,7 @@ mod tests {
             headers: vec![("SET-COOKIE".to_owned(), "v".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = shouted.sanitize("/hello");
+        let (clean, denied) = shouted.sanitize("/hello", &hello_routes());
         assert!(
             clean.headers.is_empty(),
             "a shouted name must still be refused"
@@ -814,7 +941,7 @@ mod tests {
             headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
             body: Vec::new(),
         };
-        let (clean, denied) = fine.sanitize("/hello");
+        let (clean, denied) = fine.sanitize("/hello", &hello_routes());
         assert_eq!(clean.headers.len(), 1, "an allowed header must survive");
         assert!(denied.is_empty(), "nothing was denied");
     }
@@ -841,20 +968,32 @@ mod tests {
                 "the fixture must be the same redirect once the client trims it",
             );
             assert!(
-                !redirect_target_allowed(smuggled, "/hello"),
+                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello()),
                 "{smuggled:?} was accepted, and resolves outside the prefix at the client",
             );
         }
 
         // The plain form was already refused, so the assertions above cannot
         // pass vacuously.
-        assert!(!redirect_target_allowed("/hello/..", "/hello"));
+        assert!(!redirect_target_allowed(
+            "/hello/..",
+            "/hello",
+            &any_route_under_hello()
+        ));
 
         // A space is refused anywhere rather than only at the ends, so there is
         // one rule here instead of a second normalisation that has to agree
         // with the client's. A legitimate target percent-encodes it.
-        assert!(!redirect_target_allowed("/hello/a b", "/hello"));
-        assert!(redirect_target_allowed("/hello/a%20b", "/hello"));
+        assert!(!redirect_target_allowed(
+            "/hello/a b",
+            "/hello",
+            &any_route_under_hello()
+        ));
+        assert!(redirect_target_allowed(
+            "/hello/a%20b",
+            "/hello",
+            &any_route_under_hello()
+        ));
     }
 
     #[test]
@@ -890,7 +1029,7 @@ mod tests {
                 "the fixture must be the same redirect once the client strips it",
             );
             assert!(
-                !redirect_target_allowed(smuggled, "/hello"),
+                !redirect_target_allowed(smuggled, "/hello", &any_route_under_hello()),
                 "{smuggled:?} was accepted, and resolves to {plain} at the client",
             );
         }
@@ -898,10 +1037,18 @@ mod tests {
         // The plain form was already refused; this is the floor the above is
         // measured against, so a change that stopped refusing it cannot make
         // the assertions above pass vacuously.
-        assert!(!redirect_target_allowed(plain, "/hello"));
+        assert!(!redirect_target_allowed(
+            plain,
+            "/hello",
+            &any_route_under_hello()
+        ));
 
         // And a target with no control characters is unaffected.
-        assert!(redirect_target_allowed("/hello/greet?page=2", "/hello"));
+        assert!(redirect_target_allowed(
+            "/hello/greet?page=2",
+            "/hello",
+            &any_route_under_hello()
+        ));
     }
 
     #[test]
@@ -933,7 +1080,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, denied) = response.sanitize("/hello");
+            let (clean, denied) = response.sanitize("/hello", &hello_routes());
             assert!(
                 !clean
                     .headers
@@ -960,7 +1107,7 @@ mod tests {
                 headers: vec![("location".to_owned(), target.to_owned())],
                 body: Vec::new(),
             };
-            let (clean, _) = response.sanitize("/hello");
+            let (clean, _) = response.sanitize("/hello", &hello_routes());
             assert!(
                 clean
                     .headers
@@ -1136,7 +1283,7 @@ mod tests {
             ],
             body: vec![],
         };
-        let (clean, denied) = response.sanitize("/hello");
+        let (clean, denied) = response.sanitize("/hello", &hello_routes());
         assert_eq!(denied, vec!["set-cookie".to_owned()]);
         assert_eq!(
             clean.headers,
@@ -1162,7 +1309,7 @@ mod tests {
                 headers: vec![(name.to_owned(), "x".to_owned())],
                 body: vec![],
             };
-            let (clean, denied) = response.sanitize("/hello");
+            let (clean, denied) = response.sanitize("/hello", &hello_routes());
             assert_eq!(denied, vec![name.to_owned()], "{name} must be stripped");
             assert!(clean.headers.is_empty());
         }

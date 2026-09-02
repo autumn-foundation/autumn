@@ -1059,6 +1059,12 @@ pub struct SandboxHost {
     /// is only ever the binding constraint on a direct caller, which is the
     /// one it exists for.
     permits: Semaphore,
+    /// The paths this plugin declared, as the router matches them.
+    ///
+    /// Built once here because a redirect may only name a route the plugin
+    /// serves, and rebuilding the matcher per response would be a per-request
+    /// allocation for a set fixed at load. See [`OwnedRoutes`].
+    owned_routes: super::wire::OwnedRoutes,
     /// What one instantiation of this module costs, in fuel. Bounded at load by
     /// [`MAX_INIT_SEGMENTS`] and [`MAX_INIT_SECTION_BYTES`]; charged per request
     /// so the declared CPU ceiling prices it — see [`SandboxHost::run`].
@@ -1211,6 +1217,9 @@ impl SandboxHost {
             module,
             permits: Semaphore::new(manifest.limits.max_concurrency),
             instantiation_fuel: instantiation,
+            owned_routes: super::wire::OwnedRoutes::from_paths(
+                manifest.routes.iter().map(|route| route.path.as_str()),
+            ),
             manifest,
         })
     }
@@ -1362,7 +1371,7 @@ impl SandboxHost {
             let failure = SandboxFailure::FuelExhausted {
                 budget: limits.fuel,
             };
-            return finish(store, limits, prefix, Err(failure));
+            return finish(store, limits, prefix, &self.owned_routes, Err(failure));
         };
         if let Err(err) = store.set_fuel(left) {
             return SandboxOutcome::refused(
@@ -1389,6 +1398,7 @@ impl SandboxHost {
                     store,
                     limits,
                     prefix,
+                    &self.owned_routes,
                     Err(instantiation_failure(&err, limits)),
                 );
             }
@@ -1402,6 +1412,7 @@ impl SandboxHost {
                 store,
                 limits,
                 &self.manifest.prefix,
+                &self.owned_routes,
                 Err(SandboxFailure::NoAnswer),
             );
         };
@@ -1417,7 +1428,7 @@ impl SandboxHost {
             (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        finish(store, limits, prefix, result)
+        finish(store, limits, prefix, &self.owned_routes, result)
     }
 }
 
@@ -1429,6 +1440,10 @@ fn finish(
     // The plugin's declared prefix, which bounds where its response may
     // redirect a client. See `SandboxResponse::sanitize`.
     prefix: &str,
+    // And the routes it actually serves, which is the narrower question a
+    // redirect target has to answer — an application route may sit under the
+    // prefix. See `OwnedRoutes`.
+    owned: &super::wire::OwnedRoutes,
     result: Result<SandboxResponse, SandboxFailure>,
 ) -> SandboxOutcome {
     let fuel_used = store
@@ -1458,7 +1473,7 @@ fn finish(
 
     let result = match result {
         Ok(response) => {
-            let (response, denied) = response.sanitize(prefix);
+            let (response, denied) = response.sanitize(prefix, owned);
             for name in denied {
                 // The name is the guest's, so it is as long and as hostile as
                 // the guest cares to make it — bounded only by the stdout line
