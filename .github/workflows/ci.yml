@@ -677,6 +677,7 @@ jobs:
             --test sqlite_dependent_destroy \
             --test sqlite_commit_hook_worker \
             --test sim_chaos \
+            --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
