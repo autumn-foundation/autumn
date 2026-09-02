@@ -1268,6 +1268,35 @@ impl DatabaseTopology {
     }
 }
 
+/// Whether continuous `SQLite` replication (#1628) is active in this process.
+///
+/// Process-global on purpose. The per-connection pragma batch below is installed
+/// by a `custom_setup` callback that has no access to `AutumnConfig`, and
+/// replication is inherently a single-process, single-database concern — #1614's
+/// `SQLite` tier is single-host and single-writer, and continuous replication
+/// *depends* on exactly one component being allowed to checkpoint.
+static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare whether continuous replication is active, before any pool is built.
+///
+/// When set, every pooled `SQLite` connection is created with
+/// `PRAGMA wal_autocheckpoint = 0`, so `SQLite` never restarts the write-ahead log
+/// on its own. That matters twice over: an auto-checkpoint rewrites the **main
+/// database file**, which would tear a base snapshot the replicator is copying,
+/// and it restarts the WAL, which would force an expensive fresh generation on
+/// every 1000 pages. The replicator checkpoints deliberately instead, and only
+/// once everything in the WAL is already offsite.
+pub fn set_sqlite_replication_active(active: bool) {
+    SQLITE_REPLICATION_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_sqlite_replication_active`] declared replication active.
+#[must_use]
+pub fn sqlite_replication_active() -> bool {
+    SQLITE_REPLICATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn build_pool(
     url: &str,
     pool_size: usize,
@@ -1514,6 +1543,17 @@ fn build_sqlite_pool(
                 // Non-writing pragmas only — WAL + synchronous would write and
                 // fail on a read-only database.
                 "PRAGMA busy_timeout = 5000; \
+                 PRAGMA foreign_keys = ON;"
+            } else if sqlite_replication_active() {
+                // Continuous replication (#1628) makes the replicator the ONLY
+                // component allowed to checkpoint: an auto-checkpoint rewrites
+                // the main database file (tearing a base snapshot mid-copy) and
+                // restarts the WAL under a new salt. See
+                // `set_sqlite_replication_active`.
+                "PRAGMA busy_timeout = 5000; \
+                 PRAGMA journal_mode = WAL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 PRAGMA synchronous = NORMAL; \
                  PRAGMA foreign_keys = ON;"
             } else {
                 "PRAGMA busy_timeout = 5000; \

@@ -3823,6 +3823,89 @@ impl AppBuilder {
             }
         }
 
+        // Continuous SQLite replication (#1628). Resolved here, next to the other
+        // indicator registrations, so lag and verification are baked into
+        // `/actuator/health` — and so an indicator that stays non-healthy past
+        // the grace period is escalated by the existing #1610 alerter with no
+        // bespoke alert condition of its own. The destination is built on a
+        // BLOCKING thread: its HTTP client must never be constructed inside the
+        // async runtime. The loop itself is spawned at bind time below.
+        #[cfg(feature = "db")]
+        let mut replication_worker: Option<crate::replication::Replicator> = None;
+        #[cfg(feature = "db")]
+        if let Some(replication_config) = config.replication.clone() {
+            let database_url = config
+                .database
+                .primary_url
+                .clone()
+                .or_else(|| config.database.url.clone())
+                .unwrap_or_default();
+            let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
+            // Only a genuinely S3-backed app has a blob-storage bucket to clash
+            // with; a leftover `[storage.s3]` bucket on the local backend is
+            // inert and must not trip the distinct-destination guard (the same
+            // rule #1619's offsite upload applies).
+            #[cfg(feature = "storage")]
+            let storage_bucket = (config.storage.backend == crate::storage::StorageBackend::S3)
+                .then(|| config.storage.s3.bucket.clone())
+                .flatten();
+            #[cfg(not(feature = "storage"))]
+            let storage_bucket: Option<String> = None;
+            // The injected clock, not the wall clock: the replication health
+            // indicator measures its startup grace from here, and a test that
+            // freezes time must be able to move it (#1797).
+            let started_at = state.clock().now();
+
+            let built = tokio::task::spawn_blocking(move || {
+                crate::replication::build(
+                    &replication_config,
+                    &database_url,
+                    &profile,
+                    storage_bucket.as_deref(),
+                    started_at,
+                )
+            })
+            .await;
+
+            match built {
+                Ok(Ok(runtime)) => {
+                    tracing::info!(
+                        database = %runtime.settings.database_path.display(),
+                        destination = %runtime.status.snapshot().destination,
+                        prefix = %runtime.settings.root,
+                        sync_interval_secs = runtime.settings.sync_interval.as_secs(),
+                        "continuous SQLite replication is enabled"
+                    );
+                    if let Err(e) = state.health_indicator_registry.register(
+                        crate::replication::INDICATOR_NAME,
+                        crate::actuator::IndicatorGroup::HealthOnly,
+                        std::sync::Arc::clone(&runtime.indicator)
+                            as std::sync::Arc<dyn crate::actuator::HealthIndicator>,
+                    ) {
+                        tracing::warn!("{e}");
+                    }
+                    replication_worker = Some(runtime.replicator);
+                }
+                Ok(Err(crate::replication::SetupError::Disabled)) => {}
+                // A misconfigured durability story must not boot silently
+                // half-working: the operator asked for replication and is not
+                // getting it, which is exactly the situation this feature exists
+                // to prevent.
+                Ok(Err(e)) => {
+                    tracing::error!("Continuous SQLite replication could not start: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    tracing::error!("Continuous SQLite replication setup panicked: {e}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // When ACME is configured, register a `HealthOnly` indicator backed by a
         // shared status the renewal task writes. Built here (before the router)
         // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
@@ -4527,6 +4610,22 @@ impl AppBuilder {
                 pool,
                 server_shutdown.child_token(),
             );
+        }
+
+        // The replication loop runs on a DEDICATED OS thread, not a
+        // `spawn_blocking` task: it lives for the whole process and does
+        // blocking file, SQLite and HTTP work, which would pin a thread in
+        // tokio's blocking pool (sized for short tasks) forever. It stops with
+        // the server and ships one final time on the way out.
+        #[cfg(feature = "db")]
+        if let Some(replicator) = replication_worker.take() {
+            let replication_shutdown = server_shutdown.child_token();
+            if let Err(e) = std::thread::Builder::new()
+                .name("autumn-sqlite-replication".to_owned())
+                .spawn(move || replicator.run(&replication_shutdown))
+            {
+                tracing::error!("Could not start the SQLite replication thread: {e}");
+            }
         }
 
         #[cfg(feature = "presence")]
@@ -9369,6 +9468,13 @@ async fn setup_database(
     directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
+    // #1628: declare replication BEFORE any pool exists, so every pooled SQLite
+    // connection is created with `wal_autocheckpoint = 0` and the replicator is
+    // the only component that ever checkpoints. Set unconditionally (including
+    // to `false`) so a restart that turns replication off restores the default.
+    crate::db::set_sqlite_replication_active(
+        config.replication.as_ref().is_some_and(|r| r.enabled),
+    );
     let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),

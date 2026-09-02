@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Continuous SQLite replication with point-in-time restore (#1628):** the
+  zero-ops SQLite tier (#1614) had snapshot backups (#1595/#1619) and nothing
+  finer, so a dead VPS cost everything written since the last snapshot — hours.
+  A running app now ships its write-ahead log to an offsite destination
+  continuously, from inside the process it already runs: no sidecar to install
+  and supervise, no external tools, no new credential conventions.
+
+  ```toml
+  [replication]
+  enabled = true
+
+  [replication.s3]
+  bucket = "myapp-replicas"
+  region = "auto"
+  endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+  access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+  secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+  force_path_style = true
+  ```
+
+  The contract is **at most `rpo_secs` (default 10) of committed writes lost**
+  when the machine is destroyed. Only complete transactions ship — a segment
+  always ends on a commit boundary — and a checkpoint is attempted only once
+  everything in the WAL is already offsite, so an unreachable destination costs
+  disk, never data. `[replication]` follows #1619's destination conventions
+  exactly: its own section, profile overlays, `AUTUMN_REPLICATION__*` overrides,
+  env-var-indirected credentials, and a refusal to share the app's blob-storage
+  bucket without `allow_shared_bucket = true`. A `path` destination replicates to
+  a directory (second disk, NFS/SSHFS mount, bind-mounted volume) instead.
+
+  Recovery is one command on a fresh box that has only the binary, `autumn.toml`
+  and the credentials:
+
+  ```bash
+  autumn db replica status                                  # how fresh is it?
+  autumn db replica restore                                 # latest state
+  autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force
+  ```
+
+  Restore **refuses** rather than best-efforts: a hole in the segment sequence, a
+  payload whose SHA-256 does not match, a segment that does not continue the
+  previous one, or a rebuilt database that fails `PRAGMA integrity_check` is an
+  error — handing SQLite a damaged WAL would have looked like a clean restore
+  that was merely missing the last few minutes. Nothing is published until those
+  checks pass, and the same production guard / `--force` protocol as #1595
+  applies (plus `--force` to overwrite an existing database file, whatever the
+  profile).
+
+  Lag, the current generation and the last successful verification are on
+  `/actuator/health` under the `sqlite-replication` indicator and in
+  `autumn db replica status`. Verification is a **real restore** on an interval,
+  not a checksum, so "uploaded" is never mistaken for "restorable"; a
+  verification failure or lag beyond three RPOs takes the indicator `DOWN`, which
+  the existing #1610 alerter escalates on every configured channel. See
+  [SQLite in production → Durability](docs/guide/sqlite-in-production.md#durability-continuous-replication-and-point-in-time-restore).
+
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in

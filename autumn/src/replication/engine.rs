@@ -1,0 +1,857 @@
+//! The replication loop: the in-process worker that ships `SQLite`'s WAL to an
+//! offsite destination, continuously, while the app serves traffic (#1628).
+//!
+//! # The invariant everything else hangs off
+//!
+//! In WAL journal mode `SQLite` **never writes the main database file except
+//! during a checkpoint**. Every committed page goes to the `-wal` sidecar until
+//! someone checkpoints it back. So if exactly one component is allowed to
+//! checkpoint, that component can also take a byte-faithful copy of the main
+//! database file at any other moment and know it is a consistent base for the
+//! WAL frames that follow it.
+//!
+//! That component is this one. Autumn's `SQLite` pool sets
+//! `PRAGMA wal_autocheckpoint = 0` when replication is enabled, and the
+//! replicator holds one connection open for the process's lifetime — which also
+//! stops `SQLite`'s *last connection closing* from checkpointing behind our back.
+//!
+//! # The tick
+//!
+//! ```text
+//! read the -wal header
+//!   no generation yet, or the salt changed, or the WAL shrank
+//!       → open a new generation: copy + gzip the database file, upload it,
+//!         then write snapshot.json as the commit marker
+//! scan the frame chain from the last shipped commit
+//!   → ship [shipped_offset, last commit boundary) as one segment
+//! everything shipped, and the WAL is over its size or age budget
+//!   → checkpoint(TRUNCATE); the next tick opens a fresh generation
+//! ```
+//!
+//! Two orderings carry the whole durability story:
+//!
+//! * a segment ends on a **commit boundary**, so a replica is never a
+//!   half-transaction;
+//! * a checkpoint is attempted **only when nothing is un-shipped**, so
+//!   truncating the WAL can never discard bytes the destination has not
+//!   acknowledged. A destination that is down therefore stalls checkpoints — the
+//!   WAL grows, lag climbs, the health indicator goes `Down`, and data is kept.
+//!   Disk is the thing that gets sacrificed, never durability.
+
+// autumn-panic-gate: durability-critical module — production code path must be
+// panic-free. See CONTRIBUTING.md "Request-path panic gate". Justify exceptions
+// with #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use diesel::SqliteConnection;
+use diesel::connection::SimpleConnection as _;
+use diesel::prelude::*;
+use diesel::sql_types::Text;
+
+use super::destination::{DestinationError, ReplicaDestination};
+use super::restore::{self, RestoreError, RestoreOutcome};
+use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
+use super::sqlite::{self, CheckpointOutcome, SqliteError};
+use super::status::ReplicationStatus;
+use super::wal::{self, ScanCursor, WalError, WalHeader};
+
+/// How long the loop sleeps between shutdown checks while waiting for the next
+/// tick. Short enough that shutdown is prompt, long enough to be free.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// Everything the replication loop needs, already resolved from config.
+#[derive(Debug, Clone)]
+pub struct ReplicationSettings {
+    /// The `SQLite` database file being replicated.
+    pub database_path: PathBuf,
+    /// Destination key prefix for this app/profile (see
+    /// [`segment::root_prefix`]).
+    pub root: String,
+    /// How often the loop ships. The effective RPO is roughly this plus the
+    /// time one upload takes.
+    pub sync_interval: Duration,
+    /// How old a generation may get before the loop checkpoints and starts a
+    /// fresh one (bounding how many segments a restore must replay).
+    pub snapshot_interval: Duration,
+    /// How large the `-wal` may get before the loop checkpoints.
+    pub max_wal_bytes: u64,
+    /// How far back the replica must stay restorable. Older generations are
+    /// pruned, never the one needed to reconstruct the start of the window.
+    pub retention: Duration,
+    /// How often to prove the replica restorable by actually restoring it.
+    /// `None` disables periodic verification.
+    pub verify_interval: Option<Duration>,
+}
+
+/// Why a replication tick failed.
+#[derive(Debug)]
+pub enum ReplicationError {
+    /// The configured database file does not exist.
+    DatabaseMissing {
+        /// The path that was expected.
+        path: String,
+    },
+    /// The database is not in WAL journal mode, so there is nothing to ship.
+    NotWalMode {
+        /// The journal mode `SQLite` reported.
+        mode: String,
+    },
+    /// The `-wal` file could not be read as a WAL.
+    Wal(WalError),
+    /// A segment could not be framed.
+    Segment(SegmentError),
+    /// The destination refused or failed.
+    Destination(DestinationError),
+    /// Local I/O failed.
+    Io {
+        /// What was being attempted.
+        op: &'static str,
+        /// I/O detail.
+        detail: String,
+    },
+    /// `SQLite` refused an operation.
+    Sqlite(SqliteError),
+}
+
+impl fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseMissing { path } => write!(
+                f,
+                "the database file {path} does not exist, so there is nothing to replicate"
+            ),
+            Self::NotWalMode { mode } => write!(
+                f,
+                "continuous replication needs WAL journal mode, but the database reports \
+                 {mode:?}. Autumn's SQLite pool sets `journal_mode = WAL`; a read-only or \
+                 in-memory database cannot be replicated."
+            ),
+            Self::Wal(e) => write!(f, "{e}"),
+            Self::Segment(e) => write!(f, "{e}"),
+            Self::Destination(e) => write!(f, "{e}"),
+            Self::Io { op, detail } => write!(f, "replication {op} failed: {detail}"),
+            Self::Sqlite(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicationError {}
+
+impl From<WalError> for ReplicationError {
+    fn from(e: WalError) -> Self {
+        Self::Wal(e)
+    }
+}
+impl From<SegmentError> for ReplicationError {
+    fn from(e: SegmentError) -> Self {
+        Self::Segment(e)
+    }
+}
+impl From<DestinationError> for ReplicationError {
+    fn from(e: DestinationError) -> Self {
+        Self::Destination(e)
+    }
+}
+impl From<SqliteError> for ReplicationError {
+    fn from(e: SqliteError) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+impl ReplicationError {
+    fn io(op: &'static str) -> impl Fn(std::io::Error) -> Self {
+        move |e| Self::Io {
+            op,
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// What one tick did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TickReport {
+    /// A new generation was opened (a base snapshot was uploaded).
+    pub snapshot_taken: bool,
+    /// Segments shipped this tick (at most one).
+    pub segments: u64,
+    /// Uncompressed WAL bytes shipped this tick.
+    pub bytes: u64,
+    /// WAL bytes written but not yet shipped after this tick.
+    pub pending_bytes: u64,
+    /// The WAL was checkpointed and truncated this tick.
+    pub checkpointed: bool,
+    /// Generations pruned by the retention sweep this tick.
+    pub pruned_generations: u64,
+}
+
+/// Live state for the generation currently being shipped.
+#[derive(Debug)]
+struct GenerationState {
+    /// Generation id (also its key prefix).
+    id: String,
+    /// The WAL salt this generation's segments must all carry. `None` until the
+    /// first write after the generation opened reveals it.
+    salt: Option<(u32, u32)>,
+    /// Database page size, from the WAL header.
+    page_size: u32,
+    /// When the generation opened.
+    started_at: DateTime<Utc>,
+    /// Sequence number for the next segment.
+    next_seq: u64,
+    /// `-wal` bytes already shipped. Starts at `0`, so segment `0` carries the
+    /// 32-byte WAL header and a restore can rebuild the sidecar from objects
+    /// alone.
+    shipped_offset: u64,
+    /// Where the frame scan resumes, with its rolling checksum. `None` until a
+    /// WAL header has been seen.
+    cursor: Option<ScanCursor>,
+}
+
+/// Row shape for `PRAGMA journal_mode`.
+#[derive(QueryableByName)]
+struct JournalModeRow {
+    #[diesel(sql_type = Text)]
+    journal_mode: String,
+}
+
+/// The continuous replicator.
+///
+/// Drive it with [`Replicator::run`] on a dedicated thread, or step it manually
+/// with [`Replicator::tick`] (which is what the tests do, so the loop's
+/// behaviour is asserted without sleeping).
+pub struct Replicator {
+    settings: ReplicationSettings,
+    destination: Arc<dyn ReplicaDestination>,
+    status: Arc<ReplicationStatus>,
+    /// Held open for the process's lifetime so `SQLite` never runs its
+    /// "last connection closing" checkpoint behind the replicator's back.
+    connection: Option<SqliteConnection>,
+    state: Option<GenerationState>,
+}
+
+impl fmt::Debug for Replicator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Replicator")
+            .field("settings", &self.settings)
+            .field("destination", &self.destination.describe())
+            .field("generation", &self.state.as_ref().map(|s| &s.id))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Replicator {
+    /// Build a replicator. Nothing happens until [`tick`](Self::tick) or
+    /// [`run`](Self::run) is called.
+    #[must_use]
+    pub fn new(
+        settings: ReplicationSettings,
+        destination: Arc<dyn ReplicaDestination>,
+        status: Arc<ReplicationStatus>,
+    ) -> Self {
+        Self {
+            settings,
+            destination,
+            status,
+            connection: None,
+            state: None,
+        }
+    }
+
+    /// The destination this replicator ships to.
+    #[must_use]
+    pub fn destination(&self) -> &Arc<dyn ReplicaDestination> {
+        &self.destination
+    }
+
+    /// Run until `shutdown` is cancelled, then ship one final time so a clean
+    /// stop leaves nothing behind.
+    ///
+    /// Blocking: call this on a dedicated thread, never on the async runtime.
+    pub fn run(mut self, shutdown: &tokio_util::sync::CancellationToken) {
+        let mut last_verify = Utc::now();
+        loop {
+            let now = Utc::now();
+            self.tick_and_record(now);
+
+            if let Some(interval) = self.settings.verify_interval {
+                let due = now
+                    .signed_duration_since(last_verify)
+                    .to_std()
+                    .is_ok_and(|elapsed| elapsed >= interval);
+                if due {
+                    last_verify = now;
+                    let result = self.verify().map(|_| ()).map_err(|e| e.to_string());
+                    if let Err(detail) = &result {
+                        tracing::error!(
+                            error = %detail,
+                            "SQLite replica verification FAILED — the replica may not be \
+                             restorable"
+                        );
+                    }
+                    self.status.record_verification(result, Utc::now());
+                }
+            }
+
+            if sleep_or_cancelled(shutdown, self.settings.sync_interval) {
+                break;
+            }
+        }
+        // Final flush: the app is stopping, so ship the last committed frames
+        // before the process (and possibly the machine) goes away.
+        self.tick_and_record(Utc::now());
+    }
+
+    /// Run one tick, folding the outcome into the shared status.
+    fn tick_and_record(&mut self, now: DateTime<Utc>) {
+        match self.tick(now) {
+            Ok(report) => {
+                if report.segments > 0 || report.snapshot_taken {
+                    tracing::debug!(
+                        segments = report.segments,
+                        bytes = report.bytes,
+                        snapshot = report.snapshot_taken,
+                        checkpointed = report.checkpointed,
+                        "SQLite replication tick"
+                    );
+                }
+            }
+            // `tick` has already folded the failure into the shared status, so
+            // lag keeps growing; this arm only surfaces it in the log.
+            Err(e) => tracing::warn!(error = %e, "SQLite replication tick failed"),
+        }
+    }
+
+    /// Perform one replication tick.
+    ///
+    /// Whatever the outcome, it is recorded in the shared [`ReplicationStatus`]
+    /// before returning — success advances the replication point, failure does
+    /// not — so every caller (the loop, a test, a future operator command) sees
+    /// the same observable state.
+    ///
+    /// # Errors
+    ///
+    /// See [`ReplicationError`]. A failed tick never advances the replication
+    /// point, so lag keeps growing until shipping works again.
+    pub fn tick(&mut self, now: DateTime<Utc>) -> Result<TickReport, ReplicationError> {
+        let result = self.tick_inner(now);
+        if let Err(e) = &result {
+            self.status.record_tick_error(e.to_string(), now);
+        }
+        result
+    }
+
+    /// The tick body. Separated so [`tick`](Self::tick) can record the outcome
+    /// on every path without threading the status through each `?`.
+    fn tick_inner(&mut self, now: DateTime<Utc>) -> Result<TickReport, ReplicationError> {
+        let db = self.settings.database_path.clone();
+        if !db.is_file() {
+            return Err(ReplicationError::DatabaseMissing {
+                path: db.display().to_string(),
+            });
+        }
+        self.ensure_connection(&db)?;
+
+        let wal_path = wal::wal_path(&db);
+        let wal_len = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+        let header = read_wal_header(&wal_path, wal_len)?;
+
+        let mut report = TickReport::default();
+        if self.needs_new_generation(header.as_ref(), wal_len) {
+            self.start_generation(&db, now)?;
+            report.snapshot_taken = true;
+            report.pruned_generations = self.prune(now)?;
+        }
+
+        if let Some(header) = header {
+            let shipped = self.ship(&wal_path, &header, wal_len, now)?;
+            report.segments = shipped.0;
+            report.bytes = shipped.1;
+        }
+
+        let pending = self
+            .state
+            .as_ref()
+            .map_or(0, |st| wal_len.saturating_sub(st.shipped_offset));
+        report.pending_bytes = pending;
+
+        // Checkpointing is safe ONLY when the destination already has every byte
+        // the WAL holds (reverse-brainstorm R5).
+        let checkpoint_now = pending == 0 && wal_len > 0 && self.checkpoint_due(wal_len, now);
+        if let Some(conn) = self.connection.as_mut().filter(|_| checkpoint_now)
+            && sqlite::checkpoint_truncate(conn, &db)? == CheckpointOutcome::Truncated
+        {
+            report.checkpointed = true;
+            // The WAL restarts with a new salt; the next tick opens a fresh
+            // generation from the now-complete database file.
+            self.state = None;
+        }
+
+        self.status.record_tick_ok(pending, now);
+        Ok(report)
+    }
+
+    /// Restore this replica into a scratch directory and integrity-check it, so
+    /// "verified" means a restore actually ran (phase 3).
+    ///
+    /// # Errors
+    ///
+    /// See [`RestoreError`].
+    pub fn verify(&self) -> Result<RestoreOutcome, RestoreError> {
+        let parent = self
+            .settings
+            .database_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = parent.join(format!(
+            ".autumn-replica-verify-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let outcome = restore::restore(
+            self.destination.as_ref(),
+            &self.settings.root,
+            None,
+            &scratch.join("verified.db"),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+        outcome
+    }
+
+    /// Open (once) a private connection and prove the database is in WAL mode.
+    fn ensure_connection(&mut self, db: &Path) -> Result<(), ReplicationError> {
+        if self.connection.is_some() {
+            return Ok(());
+        }
+        let mut conn = sqlite::open(db)?;
+        let mode = journal_mode(&mut conn)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            // The app's pool sets WAL; do it here too so a replicator started
+            // against a freshly created file does not have to wait for a write.
+            conn.batch_execute("PRAGMA journal_mode = WAL;")
+                .map_err(|e| {
+                    ReplicationError::Sqlite(SqliteError::Query {
+                        op: "journal_mode = WAL",
+                        detail: e.to_string(),
+                    })
+                })?;
+            let mode = journal_mode(&mut conn)?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                return Err(ReplicationError::NotWalMode { mode });
+            }
+        }
+        self.connection = Some(conn);
+        Ok(())
+    }
+
+    /// Whether a fresh base snapshot is required before anything can be shipped.
+    fn needs_new_generation(&self, header: Option<&WalHeader>, wal_len: u64) -> bool {
+        match (&self.state, header) {
+            // Nothing has been replicated yet.
+            (None, _) => true,
+            // The WAL restarted under a new salt: previously shipped byte
+            // offsets no longer mean anything.
+            (Some(state), Some(header)) => {
+                state.salt.is_some_and(|salt| salt != header.salt())
+                    || wal_len < state.shipped_offset
+            }
+            // The WAL vanished or shrank below what we had shipped — a
+            // checkpoint happened (ours, on the previous tick, or someone
+            // else's).
+            (Some(state), None) => state.shipped_offset > 0 || wal_len < state.shipped_offset,
+        }
+    }
+
+    /// Open a new generation: upload a byte-faithful gzip of the database file,
+    /// then its `snapshot.json` commit marker.
+    fn start_generation(&mut self, db: &Path, now: DateTime<Utc>) -> Result<(), ReplicationError> {
+        let created_ms = now.timestamp_millis();
+        let id = segment::generation_id(created_ms, rand::random::<u64>());
+
+        let staging = staging_path(db);
+        let (sha256, uncompressed_len) = gzip_file(db, &staging)?;
+        let upload = self
+            .destination
+            .put_file(&segment::snapshot_key(&self.settings.root, &id), &staging);
+        let _ = std::fs::remove_file(&staging);
+        upload?;
+
+        let meta = SnapshotMeta {
+            version: segment::LAYOUT_VERSION,
+            generation: id.clone(),
+            created_at: now.to_rfc3339(),
+            created_ms,
+            sha256,
+            uncompressed_len,
+        };
+        let body = serde_json::to_vec(&meta).map_err(|e| ReplicationError::Io {
+            op: "encode snapshot metadata",
+            detail: e.to_string(),
+        })?;
+        // Written LAST: its presence is what makes the generation restorable.
+        self.destination
+            .put(&segment::snapshot_meta_key(&self.settings.root, &id), &body)?;
+
+        tracing::info!(
+            generation = %id,
+            bytes = uncompressed_len,
+            destination = %self.destination.describe(),
+            "opened a new SQLite replication generation"
+        );
+        self.status.record_generation(&id, now);
+        self.state = Some(GenerationState {
+            id,
+            salt: None,
+            page_size: 0,
+            started_at: now,
+            next_seq: 0,
+            shipped_offset: 0,
+            cursor: None,
+        });
+        Ok(())
+    }
+
+    /// Ship everything committed since the last segment. Returns
+    /// `(segments, bytes)`.
+    fn ship(
+        &mut self,
+        wal_path: &Path,
+        header: &WalHeader,
+        wal_len: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(u64, u64), ReplicationError> {
+        let root = self.settings.root.clone();
+        let Some(state) = self.state.as_mut() else {
+            return Ok((0, 0));
+        };
+        if state.salt.is_none() {
+            state.salt = Some(header.salt());
+            state.page_size = header.page_size;
+            state.cursor = Some(ScanCursor::start(header));
+        }
+        if state.salt != Some(header.salt()) {
+            // The salt changed mid-tick; the next tick opens a new generation.
+            return Ok((0, 0));
+        }
+        let Some(cursor) = state.cursor else {
+            return Ok((0, 0));
+        };
+        if wal_len <= cursor.offset {
+            return Ok((0, 0));
+        }
+
+        let buffer = read_range(wal_path, state.shipped_offset, wal_len)?;
+        let scan_at = usize::try_from(cursor.offset.saturating_sub(state.shipped_offset))
+            .unwrap_or(usize::MAX);
+        let outcome = wal::scan_from(header, &cursor, buffer.get(scan_at..).unwrap_or(&[]))?;
+        if outcome.last_commit_end <= cursor.offset {
+            // Frames are present but no transaction has committed yet — shipping
+            // them would put half a transaction offsite.
+            return Ok((0, 0));
+        }
+
+        let take = usize::try_from(outcome.last_commit_end.saturating_sub(state.shipped_offset))
+            .unwrap_or(usize::MAX);
+        let raw = buffer.get(..take).ok_or_else(|| ReplicationError::Io {
+            op: "slice the WAL range",
+            detail: format!(
+                "the -wal shrank while it was being read (wanted {take} bytes, have {})",
+                buffer.len()
+            ),
+        })?;
+
+        let segment_header = SegmentHeader {
+            version: segment::LAYOUT_VERSION,
+            seq: state.next_seq,
+            start_offset: state.shipped_offset,
+            end_offset: outcome.last_commit_end,
+            frame_count: outcome.frames,
+            commit_count: outcome.commits,
+            page_size: header.page_size,
+            db_size_pages: outcome.last_commit_db_pages,
+            salt1: header.salt1,
+            salt2: header.salt2,
+            created_at: now.to_rfc3339(),
+            created_ms: now.timestamp_millis(),
+            sha256: segment::sha256_hex(raw),
+            uncompressed_len: raw.len() as u64,
+        };
+        let payload = segment::encode_segment(&segment_header, raw)?;
+        let key = segment::segment_key(&root, &state.id, state.next_seq, segment_header.created_ms);
+        self.destination.put(&key, &payload)?;
+
+        let bytes = raw.len() as u64;
+        state.shipped_offset = outcome.last_commit_end;
+        state.cursor = Some(outcome.last_commit_cursor);
+        state.next_seq = state.next_seq.saturating_add(1);
+        self.status.record_segment(bytes, now);
+        Ok((1, bytes))
+    }
+
+    /// Whether the WAL is over its size or age budget.
+    fn checkpoint_due(&self, wal_len: u64, now: DateTime<Utc>) -> bool {
+        if wal_len >= self.settings.max_wal_bytes {
+            return true;
+        }
+        self.state.as_ref().is_some_and(|state| {
+            now.signed_duration_since(state.started_at)
+                .to_std()
+                .is_ok_and(|age| age >= self.settings.snapshot_interval)
+        })
+    }
+
+    /// Drop generations that are entirely outside the retention window.
+    ///
+    /// The newest generation that opened at or before the cutoff is **kept**:
+    /// without it the start of the window is not reconstructable. Returns how
+    /// many generations were removed.
+    fn prune(&self, now: DateTime<Utc>) -> Result<u64, ReplicationError> {
+        let Ok(retention) = chrono::Duration::from_std(self.settings.retention) else {
+            return Ok(0);
+        };
+        let cutoff_ms = now
+            .checked_sub_signed(retention)
+            .unwrap_or(now)
+            .timestamp_millis();
+        let keys = self
+            .destination
+            .list(&segment::generations_prefix(&self.settings.root))?;
+
+        let mut generations: BTreeMap<(i64, String), Vec<String>> = BTreeMap::new();
+        let mut complete: Vec<(i64, String)> = Vec::new();
+        for key in keys {
+            let Some(id) = segment::generation_of_key(&self.settings.root, &key) else {
+                continue;
+            };
+            let Some(info) = segment::parse_generation_id(&id) else {
+                continue;
+            };
+            if key.ends_with(segment::SNAPSHOT_META_OBJECT) {
+                complete.push((info.created_ms, id.clone()));
+            }
+            generations
+                .entry((info.created_ms, id))
+                .or_default()
+                .push(key);
+        }
+        complete.sort_unstable();
+
+        // The newest complete generation at or before the cutoff is the floor of
+        // the retention window; everything strictly older than it is droppable.
+        let Some(floor) = complete
+            .iter()
+            .rev()
+            .find(|(ms, _)| *ms <= cutoff_ms)
+            .cloned()
+        else {
+            return Ok(0);
+        };
+
+        let mut pruned: u64 = 0;
+        for ((ms, id), keys) in &generations {
+            if (*ms, id.clone()) >= floor {
+                continue;
+            }
+            for key in keys {
+                self.destination.delete(key)?;
+            }
+            pruned = pruned.saturating_add(1);
+            tracing::debug!(generation = %id, "pruned an expired SQLite replication generation");
+        }
+        Ok(pruned)
+    }
+}
+
+/// Read `PRAGMA journal_mode`.
+fn journal_mode(conn: &mut SqliteConnection) -> Result<String, ReplicationError> {
+    let rows: Vec<JournalModeRow> = diesel::sql_query("PRAGMA journal_mode")
+        .load(conn)
+        .map_err(|e| {
+            ReplicationError::Sqlite(SqliteError::Query {
+                op: "journal_mode",
+                detail: e.to_string(),
+            })
+        })?;
+    Ok(rows
+        .first()
+        .map_or_else(|| "unknown".to_owned(), |row| row.journal_mode.clone()))
+}
+
+/// Read and validate the `-wal` header, or `None` when the WAL is too short to
+/// hold one (an empty WAL, right after a checkpoint).
+fn read_wal_header(wal_path: &Path, wal_len: u64) -> Result<Option<WalHeader>, ReplicationError> {
+    if wal_len < wal::WAL_HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let mut file =
+        std::fs::File::open(wal_path).map_err(ReplicationError::io("open the -wal file"))?;
+    let mut buf = [0u8; wal::WAL_HEADER_SIZE];
+    file.read_exact(&mut buf)
+        .map_err(ReplicationError::io("read the -wal header"))?;
+    match WalHeader::parse(&buf) {
+        Ok(header) => Ok(Some(header)),
+        // A WAL being rewritten under us is transient, not fatal: skip this tick
+        // rather than failing the loop.
+        Err(WalError::HeaderChecksum | WalError::TooShort { .. }) => Ok(None),
+        Err(e) => Err(ReplicationError::Wal(e)),
+    }
+}
+
+/// Read `[start, end)` of a file into memory.
+fn read_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>, ReplicationError> {
+    let len = end.saturating_sub(start);
+    let mut file = std::fs::File::open(path).map_err(ReplicationError::io("open the -wal file"))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(ReplicationError::io("seek the -wal file"))?;
+    let mut buffer = Vec::new();
+    file.take(len)
+        .read_to_end(&mut buffer)
+        .map_err(ReplicationError::io("read the -wal file"))?;
+    Ok(buffer)
+}
+
+/// The staging file a base snapshot is gzip'd into, next to the database so the
+/// rename-free upload stays on the same filesystem.
+fn staging_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(format!(".autumn-replica-{}.gz", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Gzip `source` into `target`, returning the **uncompressed** digest and length.
+///
+/// Streams in fixed-size chunks so a multi-GB database is never buffered.
+fn gzip_file(source: &Path, target: &Path) -> Result<(String, u64), ReplicationError> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut input =
+        std::fs::File::open(source).map_err(ReplicationError::io("open the database file"))?;
+    let output =
+        std::fs::File::create(target).map_err(ReplicationError::io("create the snapshot"))?;
+    let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::fast());
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(ReplicationError::io("read the database file"))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).unwrap_or(&[]);
+        hasher.update(chunk);
+        encoder
+            .write_all(chunk)
+            .map_err(ReplicationError::io("compress the snapshot"))?;
+        total = total.saturating_add(read as u64);
+    }
+    let file = encoder
+        .finish()
+        .map_err(ReplicationError::io("finish the snapshot"))?;
+    file.sync_all()
+        .map_err(ReplicationError::io("flush the snapshot"))?;
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+/// Sleep `total`, waking early if `shutdown` is cancelled. Returns `true` when
+/// cancelled.
+fn sleep_or_cancelled(shutdown: &tokio_util::sync::CancellationToken, total: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let deadline = start.checked_add(total).unwrap_or(start);
+    loop {
+        if shutdown.is_cancelled() {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(SHUTDOWN_POLL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_path_sits_next_to_the_database() {
+        let path = staging_path(Path::new("/srv/app.db"));
+        assert_eq!(path.parent(), Some(Path::new("/srv")));
+        assert!(
+            path.to_string_lossy()
+                .starts_with("/srv/app.db.autumn-replica-"),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn gzip_file_reports_the_uncompressed_digest_and_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("app.db");
+        let payload = b"autumn".repeat(1024);
+        std::fs::write(&source, &payload).expect("write");
+
+        let target = dir.path().join("app.db.gz");
+        let (digest, len) = gzip_file(&source, &target).expect("gzip");
+        assert_eq!(len, payload.len() as u64);
+        assert_eq!(digest, segment::sha256_hex(&payload));
+
+        let mut inflated = Vec::new();
+        let file = std::fs::File::open(&target).expect("open gz");
+        std::io::copy(&mut flate2::read::GzDecoder::new(file), &mut inflated).expect("inflate");
+        assert_eq!(inflated, payload);
+    }
+
+    #[test]
+    fn read_range_returns_exactly_the_requested_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        std::fs::write(&path, (0u8..=255).collect::<Vec<_>>()).expect("write");
+        assert_eq!(
+            read_range(&path, 10, 20).expect("read"),
+            (10u8..20).collect::<Vec<_>>()
+        );
+        // A window past EOF returns what exists rather than failing.
+        assert_eq!(read_range(&path, 250, 300).expect("read").len(), 6);
+    }
+
+    #[test]
+    fn sleep_or_cancelled_returns_immediately_when_already_cancelled() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let start = std::time::Instant::now();
+        assert!(sleep_or_cancelled(&token, Duration::from_secs(30)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn read_wal_header_treats_a_short_wal_as_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db-wal");
+        std::fs::write(&path, [0u8; 8]).expect("write");
+        assert!(read_wal_header(&path, 8).expect("read").is_none());
+    }
+}

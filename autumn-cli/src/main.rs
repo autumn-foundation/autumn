@@ -2096,6 +2096,25 @@ enum DbCommands {
     /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
     #[command(subcommand)]
     Offsite(OffsiteCommands),
+    /// Restore, inspect or verify a continuously replicated `SQLite` database.
+    ///
+    /// `[replication]` ships this app's `SQLite` write-ahead log to an offsite
+    /// destination as it is written (issue #1628). These commands are the other
+    /// half: rebuilding the database on a fresh machine that has nothing but
+    /// this binary, autumn.toml and the destination credentials.
+    ///
+    /// # Examples
+    ///
+    ///   # Fresh box, latest replicated state:
+    ///   autumn db replica restore --profile prod
+    ///
+    ///   # Point-in-time, just before the bad migration:
+    ///   autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force
+    ///
+    ///   # How fresh is the replica right now?
+    ///   autumn db replica status
+    #[command(subcommand, verbatim_doc_comment)]
+    Replica(ReplicaCommands),
 }
 
 /// Subcommands for `autumn db offsite` (issue #1619).
@@ -2107,6 +2126,67 @@ enum OffsiteCommands {
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
+}
+
+/// Subcommands of `autumn db replica` (issue #1628).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum ReplicaCommands {
+    /// Rebuild the database from the replica, optionally at a point in time.
+    ///
+    /// Verifies the whole chain before anything is written: a hole in the
+    /// segment sequence, a payload whose digest does not match, or a rebuilt
+    /// database that fails `PRAGMA integrity_check` is refused rather than
+    /// restored. Gated by the same production guard as `autumn db restore`, and
+    /// overwriting an existing database always needs `--force`.
+    #[command(verbatim_doc_comment)]
+    Restore {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Restore to this RFC 3339 instant instead of the latest state.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// Write the database here instead of the configured database.url.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+        /// Allow a restore against a non-dev/test profile, and allow
+        /// overwriting an existing database file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Report the replica's current generation, segment count and lag.
+    Status {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Prove the replica restorable by restoring it into a scratch directory.
+    Verify {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+}
+
+impl ReplicaCommands {
+    /// Translate the parsed CLI shape into the `db::replica` command.
+    fn into_command(self) -> db::replica::ReplicaCommand {
+        match self {
+            Self::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+            } => db::replica::ReplicaCommand::Restore {
+                profile,
+                timestamp,
+                output,
+                force,
+            },
+            Self::Status { profile } => db::replica::ReplicaCommand::Status { profile },
+            Self::Verify { profile } => db::replica::ReplicaCommand::Verify { profile },
+        }
+    }
 }
 
 impl DbCommands {
@@ -2124,10 +2204,11 @@ impl DbCommands {
             | Self::Restore { .. }
             | Self::Scrub { .. }
             | Self::Retention { .. }
-            | Self::Offsite(_) => {
+            | Self::Offsite(_)
+            | Self::Replica(_) => {
                 unreachable!(
-                    "db pull/backup/restore/scrub/retention/offsite are dispatched before \
-                     into_command"
+                    "db pull/backup/restore/scrub/retention/offsite/replica are dispatched \
+                     before into_command"
                 )
             }
         }
@@ -3974,6 +4055,7 @@ fn run_command(command: Commands) {
             DbCommands::Offsite(OffsiteCommands::List { profile }) => {
                 db::backup::run_offsite_list(profile.as_deref());
             }
+            DbCommands::Replica(cmd) => db::replica::run(&cmd.into_command()),
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());

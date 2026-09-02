@@ -278,8 +278,146 @@ be durable. See [Jobs](./jobs.md).
 `autumn db backup` takes an **online-safe snapshot** of the SQLite file — safe to
 run against a live app, and it neither corrupts nor blocks it. `restore`,
 [`db scrub`](./daemon.md) (#1602), and retention sweeps (#1605) all operate on
-the SQLite file through the same command surface as Postgres. Snapshot backup —
-not streaming replication — is the durability story for this tier.
+the SQLite file through the same command surface as Postgres. Snapshots are the
+coarse-grained, cross-backend story; for second-granularity durability see
+[Durability: continuous replication](#durability-continuous-replication-and-point-in-time-restore)
+below, which composes with them rather than replacing them.
+
+---
+
+## Durability: continuous replication and point-in-time restore
+
+Snapshot backups bound your data loss at **one backup interval** — hours, if you
+back up nightly. Continuous replication (#1628) bounds it at **seconds**, from
+inside the process you already run. No sidecar to install, supervise and monitor;
+no second binary; no new credential conventions.
+
+```toml
+[replication]
+enabled = true
+
+[replication.s3]
+bucket = "myapp-replicas"
+region = "auto"
+endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+force_path_style = true
+```
+
+Credentials are supplied by **env-var indirection**: config names the variables,
+never the secrets, exactly as `[backup.offsite]` does (#1619). Every key also has
+an `AUTUMN_REPLICATION__*` override, so an all-env deployment needs no TOML at
+all. A `path = "/mnt/backup-disk/replica"` destination replicates to a directory
+instead — a second disk, an NFS/SSHFS mount, or a bind-mounted volume.
+
+By default replication refuses to share a bucket with the app's own blob storage
+(`[storage.s3]`): a lifecycle rule written for user uploads would quietly expire
+your replicas. Set `allow_shared_bucket = true` to opt in.
+
+### The RPO contract
+
+| Setting | Default | What it bounds |
+| --- | --- | --- |
+| `rpo_secs` | `10` | Steady-state data loss if the machine dies right now. |
+| `sync_interval_secs` | `rpo_secs / 2` | How often committed frames are shipped. |
+| `snapshot_interval_secs` | `3600` | How long one generation runs before a fresh base snapshot. |
+| `max_wal_bytes` | `16777216` | WAL size that forces a checkpoint + new generation. |
+| `retention_hours` | `168` | How far back a point-in-time restore can reach. |
+| `verify_interval_secs` | `21600` | How often the replica is proved restorable. |
+
+**The contract: at most `rpo_secs` of committed writes are lost when the machine
+is destroyed**, under normal write load. Only *committed transactions* are ever
+shipped — a segment always ends on a commit boundary, so a replica is never half
+a transaction.
+
+`autumn db replica status` reports the live picture; `/actuator/health` carries
+the same numbers under the `sqlite-replication` indicator (`lag_seconds`,
+`generation`, `segments_shipped`, `pending_bytes`, `last_verified_at`).
+
+### Alerting
+
+The `sqlite-replication` indicator goes `DOWN` when lag exceeds three times the
+configured RPO, when shipping is failing, or when a periodic verification could
+not restore the replica. An indicator that stays unhealthy past the alerter's
+grace period is escalated on every channel configured under
+[alerting](./operator-alerts.md) (#1610), with a recovery notice when it clears — no
+separate replication alert to configure.
+
+**Verification is a real restore**, not a checksum: on `verify_interval_secs` the
+process downloads the replica into a scratch directory, replays it, and runs
+`PRAGMA integrity_check`. "Uploaded" is never mistaken for "restorable".
+
+### Fresh-box recovery runbook
+
+The disk is gone. On a new machine, with nothing but the `autumn` binary, your
+`autumn.toml`, and the destination credentials in the environment:
+
+```bash
+export AUTUMN_ENV=prod
+export AUTUMN_REPLICA_ACCESS_KEY_ID=…
+export AUTUMN_REPLICA_SECRET_ACCESS_KEY=…
+
+# 1. What does the destination hold, and how fresh is it?
+autumn db replica status
+
+# 2. Rebuild the database (writes to the configured database.url).
+autumn db replica restore
+
+# 3. Start the app.
+autumn serve
+```
+
+To land **before** a specific moment — a bad migration, a runaway delete — add a
+timestamp inside the retention window:
+
+```bash
+autumn db replica restore --timestamp 2026-09-02T14:29:00Z --force
+```
+
+The command prints the instant it actually landed on. A timestamp older than the
+window is **refused**, with the oldest reachable instant named, rather than
+silently rounded to whatever happened to be there.
+
+Restore is gated the same way `autumn db restore` is (#1595): the production
+profile needs `--force`, and overwriting an existing database file needs `--force`
+whatever the profile. Nothing is written until the rebuilt database has passed
+`PRAGMA integrity_check`, so a refused restore never leaves a half-built database
+in place of a good one.
+
+### What makes it safe against a live app
+
+In WAL journal mode SQLite writes the main database file **only during a
+checkpoint**. When replication is enabled Autumn's pool therefore sets
+`PRAGMA wal_autocheckpoint = 0` and the replicator becomes the only component
+that ever checkpoints — which is also why the tier is single-host and
+single-writer (see [the single-host constraint](#the-single-host-constraint)).
+Two consequences worth knowing:
+
+- **A dead destination costs disk, never data.** A checkpoint is attempted only
+  once everything in the WAL is already offsite, so an unreachable endpoint
+  stalls checkpointing and the `-wal` file grows. Lag climbs, the health
+  indicator goes `DOWN`, and you get paged. Watch free space on the database's
+  filesystem alongside the lag.
+- **Do not run a second writer.** A `sqlite3` shell that checkpoints — or a
+  second app process on the same file — breaks the invariant. The
+  single-host/single-writer contract is not advisory here.
+
+Replication does not block or slow the writer: it reads the `-wal` with ordinary
+file I/O, takes no database locks to ship, and its checkpoints use a one-second
+busy timeout so a contended checkpoint gives up and retries on the next tick
+rather than holding up a write.
+
+### Limits of this slice
+
+- SQLite only. Postgres deployments have mature continuous-archiving ecosystems
+  (WAL-G, pgBackRest); `[replication]` is refused at boot on a Postgres target.
+- One destination. Multi-destination fan-out and cross-region policy are out of
+  scope, the same boundary as #1619.
+- Server-side encryption at rest and TLS in transit; client-side encryption of
+  replicated data is a named follow-up.
+- Replication is not a read replica and not clustering — see
+  [What is NOT supported on SQLite](#what-is-not-supported-on-sqlite).
 
 ---
 
@@ -418,6 +556,8 @@ unsupported feature lurks until first use.
 
 - [Daemon mode: `autumn serve`](./daemon.md) — the single-binary local service
   shape, database backups, and where state lives.
+- [Alerting](./operator-alerts.md) — the channels a replication-lag or
+  verification-failure alert is escalated on.
 - [Deployment](./deployment.md) and `autumn deploy` — persistent-state contract
   for the SQLite data file.
 - [Migrations](./migrations.md) — the classifier, checksums, and advisory-lock

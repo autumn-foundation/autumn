@@ -350,7 +350,12 @@ subtle = "2.6.1"
 base64 = "0.23"
 url = "2.5.8"
 percent-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# `blocking` powers the replication S3 destination (#1628): the replication loop
+# runs on its own OS thread (file + SQLite + network I/O all off the reactor),
+# and `autumn db replica restore` is a synchronous CLI with no runtime at all, so
+# a blocking client is the one shape both can share. It is constructed, used and
+# dropped only on those threads — never inside the async runtime.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"], optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
 secrecy = { version = "0.10.3", features = ["serde"] }

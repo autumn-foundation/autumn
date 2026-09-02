@@ -1009,6 +1009,253 @@ pub struct OffsiteS3Config {
     pub force_path_style: bool,
 }
 
+/// `[replication]` — continuous `SQLite` replication to an offsite destination
+/// (issue #1628).
+///
+/// NOT feature-gated, for the same reason `[backup]` is not: a strict-config app
+/// must accept its own `autumn.toml` keys whatever feature set it was compiled
+/// with. The replication engine itself lives behind the `db` feature.
+///
+/// The section is absent by default. Present-but-`enabled = false` is the shape
+/// a profile overlay wants: keep one destination definition in `autumn.toml` and
+/// turn replication off for `dev`/`test`.
+///
+/// ```toml
+/// [replication]
+/// enabled = true
+/// rpo_secs = 10
+/// retention_hours = 168
+///
+/// [replication.s3]
+/// bucket = "myapp-replicas"
+/// region = "auto"
+/// endpoint = "https://<account>.r2.cloudflarestorage.com"
+/// access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+/// secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+/// force_path_style = true
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplicationConfig {
+    /// Master switch. Off by default, so adding the section is not enough to
+    /// start shipping — the operator must say so.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The recovery point objective in seconds: the steady-state upper bound on
+    /// how much recently committed data a total loss of the machine costs.
+    /// Defaults to 10 (AC #2).
+    #[serde(default = "default_rpo_secs")]
+    pub rpo_secs: u64,
+
+    /// How often the replicator ships, in seconds. Defaults to half the RPO
+    /// (minimum one second) so the steady-state lag stays inside the contract.
+    #[serde(default)]
+    pub sync_interval_secs: Option<u64>,
+
+    /// How old a generation may get before the replicator checkpoints and opens
+    /// a fresh one. Bounds how many segments a restore replays. Default: 1 hour.
+    #[serde(default = "default_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+
+    /// How large the `-wal` file may grow before the replicator checkpoints.
+    /// Default: 16 MiB.
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes: u64,
+
+    /// How far back a point-in-time restore must stay possible. Older
+    /// generations are pruned. Default: 168 hours (7 days).
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+
+    /// How often to prove the replica restorable by actually restoring it into
+    /// a scratch directory. `0` disables periodic verification. Default: 6 hours.
+    #[serde(default = "default_verify_interval_secs")]
+    pub verify_interval_secs: u64,
+
+    /// Key prefix under the destination. Objects are keyed
+    /// `{prefix}/{profile}/generations/…`. Defaults to the bucket/directory root.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// Opt in to pointing replication at the same bucket + endpoint as the app's
+    /// user-facing blob storage (`[storage.s3]`). Off by default so a shared
+    /// bucket — where a lifecycle rule written for user uploads could quietly
+    /// expire the replicas — is a deliberate choice. Mirrors #1619.
+    #[serde(default)]
+    pub allow_shared_bucket: bool,
+
+    /// S3-compatible destination (`[replication.s3]`). Mutually exclusive with
+    /// [`path`](Self::path).
+    #[serde(default)]
+    pub s3: Option<ReplicationS3Config>,
+
+    /// Filesystem destination: a directory to replicate into. A second disk, an
+    /// NFS/SSHFS mount or a bind-mounted volume is a legitimate offsite target.
+    /// Mutually exclusive with [`s3`](Self::s3).
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpo_secs: default_rpo_secs(),
+            sync_interval_secs: None,
+            snapshot_interval_secs: default_snapshot_interval_secs(),
+            max_wal_bytes: default_max_wal_bytes(),
+            retention_hours: default_retention_hours(),
+            verify_interval_secs: default_verify_interval_secs(),
+            prefix: None,
+            allow_shared_bucket: false,
+            s3: None,
+            path: None,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// The effective ship interval: the explicit override, else half the RPO,
+    /// never less than one second.
+    #[must_use]
+    pub fn sync_interval(&self) -> std::time::Duration {
+        let secs = self
+            .sync_interval_secs
+            .unwrap_or_else(|| self.rpo_secs.div_euclid(2))
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// The RPO as a duration, never zero.
+    #[must_use]
+    pub fn rpo(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.rpo_secs.max(1))
+    }
+
+    /// The periodic-verification interval, or `None` when disabled.
+    #[must_use]
+    pub fn verify_interval(&self) -> Option<std::time::Duration> {
+        (self.verify_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.verify_interval_secs))
+    }
+
+    /// Validate the section on its own terms, returning an operator-facing
+    /// message for each problem. Only meaningful when `enabled`.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        match (&self.s3, &self.path) {
+            (Some(_), Some(_)) => errors.push(
+                "[replication] configures both `s3` and `path`; pick exactly one destination"
+                    .to_owned(),
+            ),
+            (None, None) => errors.push(
+                "[replication] enabled = true but no destination is configured; add a \
+                 [replication.s3] section (bucket/region/endpoint plus *_env credential \
+                 indirection) or set `path` to a directory"
+                    .to_owned(),
+            ),
+            (Some(s3), None) => {
+                if s3.bucket.as_deref().unwrap_or("").trim().is_empty() {
+                    errors.push("[replication.s3] bucket is unset".to_owned());
+                }
+                if s3
+                    .access_key_id_env
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                    || s3
+                        .secret_access_key_env
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                {
+                    errors.push(
+                        "[replication.s3] needs access_key_id_env and secret_access_key_env \
+                         (the NAMES of the environment variables the credentials are read \
+                         from — never the credentials themselves)"
+                            .to_owned(),
+                    );
+                }
+            }
+            (None, Some(path)) => {
+                if path.trim().is_empty() {
+                    errors.push("[replication] path is empty".to_owned());
+                }
+            }
+        }
+        if self.rpo_secs == 0 {
+            errors.push("[replication] rpo_secs must be at least 1".to_owned());
+        }
+        if self.retention_hours == 0 {
+            errors.push("[replication] retention_hours must be at least 1".to_owned());
+        }
+        if self.max_wal_bytes < 32 {
+            errors.push(
+                "[replication] max_wal_bytes must be at least 32 (the size of a WAL header)"
+                    .to_owned(),
+            );
+        }
+        errors
+    }
+}
+
+/// `[replication.s3]` — S3-compatible destination for continuous replication.
+///
+/// Same credential posture as `[backup.offsite.s3]`: the secrets are named by
+/// environment variable, never inlined into config, argv, logs, or errors.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReplicationS3Config {
+    /// Target bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// Region for the `SigV4` credential scope (R2 uses `auto`).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Custom endpoint URL. Required for non-AWS providers.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable the access-key id is read from.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+    /// Environment variable the secret access key is read from.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
+    #[serde(default)]
+    pub force_path_style: bool,
+}
+
+/// Default RPO: at most ten seconds of potential data loss (#1628 AC #2).
+const fn default_rpo_secs() -> u64 {
+    10
+}
+
+/// Default generation length: one hour.
+const fn default_snapshot_interval_secs() -> u64 {
+    3600
+}
+
+/// Default WAL ceiling before a checkpoint: 16 MiB.
+const fn default_max_wal_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+/// Default point-in-time window: seven days.
+const fn default_retention_hours() -> u64 {
+    168
+}
+
+/// Default restore-verification cadence: every six hours.
+const fn default_verify_interval_secs() -> u64 {
+    21_600
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -1223,6 +1470,13 @@ pub struct AutumnConfig {
     /// feature.
     #[serde(default)]
     pub backup: BackupConfig,
+    /// Continuous `SQLite` replication (`[replication]` section, issue #1628).
+    ///
+    /// `None` (the default) means the section is absent and nothing is
+    /// replicated. Boxed so an app that never replicates costs one pointer in
+    /// the app-run future rather than the whole section inline.
+    #[serde(default)]
+    pub replication: Option<Box<ReplicationConfig>>,
     /// Transactional email settings.
     #[cfg(feature = "mail")]
     #[serde(default)]
@@ -4834,6 +5088,7 @@ impl AutumnConfig {
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
         self.apply_backup_env_overrides_with_env(env);
+        self.apply_replication_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
         #[cfg(feature = "maud")]
@@ -6252,6 +6507,109 @@ impl AutumnConfig {
     /// destination honors the same `AUTUMN_*` env convention. When no offsite
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
+    /// Apply `AUTUMN_REPLICATION__*` overrides to the `[replication]` section
+    /// (issue #1628). Mirrors the `[backup.offsite]` convention: a *destination*
+    /// key materializes the section for an all-env deployment, while
+    /// optional-only keys never conjure a section that would then fail
+    /// validation.
+    fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Keys that express a real intent to configure a destination. A lone
+        // region/endpoint/prefix cannot replicate anywhere, so it must not
+        // materialize the section; `ENABLED=true` does, because it needs a
+        // destination to act on and the resulting validation error is the honest
+        // answer.
+        const DEST_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_REPLICATION__PATH",
+        ];
+        // The S3 sub-section is materialized only by an S3 key, so a `path`
+        // deployment never grows an empty, invalid `[replication.s3]`.
+        const S3_KEYS: &[&str] = &[
+            "AUTUMN_REPLICATION__S3__BUCKET",
+            "AUTUMN_REPLICATION__S3__REGION",
+            "AUTUMN_REPLICATION__S3__ENDPOINT",
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
+        ];
+        let has_dest_key = DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let enabled_truthy = env
+            .var("AUTUMN_REPLICATION__ENABLED")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.replication.is_none() && !has_dest_key && !enabled_truthy {
+            return;
+        }
+        let replication = self
+            .replication
+            .get_or_insert_with(|| Box::new(ReplicationConfig::default()));
+
+        parse_env_bool(env, "AUTUMN_REPLICATION__ENABLED", &mut replication.enabled);
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RPO_SECS",
+            &mut replication.rpo_secs,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REPLICATION__SYNC_INTERVAL_SECS",
+            &mut replication.sync_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS",
+            &mut replication.snapshot_interval_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__MAX_WAL_BYTES",
+            &mut replication.max_wal_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__RETENTION_HOURS",
+            &mut replication.retention_hours,
+        );
+        parse_env(
+            env,
+            "AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS",
+            &mut replication.verify_interval_secs,
+        );
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PREFIX", &mut replication.prefix);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__PATH", &mut replication.path);
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET",
+            &mut replication.allow_shared_bucket,
+        );
+
+        if replication.s3.is_none() && !S3_KEYS.iter().any(|k| env.var(k).is_ok()) {
+            return;
+        }
+        let s3 = replication
+            .s3
+            .get_or_insert_with(ReplicationS3Config::default);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__BUCKET", &mut s3.bucket);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__REGION", &mut s3.region);
+        parse_env_option_string(env, "AUTUMN_REPLICATION__S3__ENDPOINT", &mut s3.endpoint);
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
+            &mut s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
+            &mut s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE",
+            &mut s3.force_path_style,
+        );
+    }
+
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Keys that signal a genuine intent to CONFIGURE an offsite destination —
         // presence of any REQUIRED destination/credential key materializes the
@@ -12388,6 +12746,214 @@ path = "/healthz"
         assert_eq!(config.storage.variants.max_source_bytes, 5_242_880);
         assert_eq!(config.storage.variants.max_source_width, 2_000);
         assert_eq!(config.storage.variants.max_source_height, 1_500);
+    }
+
+    // ── [replication] (issue #1628) ──────────────────────────────────────────
+
+    #[test]
+    fn replication_parses_from_toml() {
+        let toml = r#"
+            [replication]
+            enabled = true
+            rpo_secs = 5
+            sync_interval_secs = 2
+            snapshot_interval_secs = 900
+            max_wal_bytes = 8388608
+            retention_hours = 48
+            verify_interval_secs = 3600
+            prefix = "db"
+            allow_shared_bucket = true
+
+            [replication.s3]
+            bucket = "myapp-replicas"
+            region = "auto"
+            endpoint = "https://acct.r2.cloudflarestorage.com"
+            access_key_id_env = "AUTUMN_REPLICA_ACCESS_KEY_ID"
+            secret_access_key_env = "AUTUMN_REPLICA_SECRET_ACCESS_KEY"
+            force_path_style = true
+        "#;
+        let config: AutumnConfig = toml::from_str(toml).expect("parse");
+        let replication = *config.replication.expect("section present");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 5);
+        assert_eq!(
+            replication.sync_interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(replication.snapshot_interval_secs, 900);
+        assert_eq!(replication.max_wal_bytes, 8_388_608);
+        assert_eq!(replication.retention_hours, 48);
+        assert_eq!(
+            replication.verify_interval(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(replication.prefix.as_deref(), Some("db"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 destination");
+        assert_eq!(s3.bucket.as_deref(), Some("myapp-replicas"));
+        assert_eq!(s3.region.as_deref(), Some("auto"));
+        assert_eq!(
+            s3.endpoint.as_deref(),
+            Some("https://acct.r2.cloudflarestorage.com")
+        );
+        assert_eq!(
+            s3.access_key_id_env.as_deref(),
+            Some("AUTUMN_REPLICA_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            s3.secret_access_key_env.as_deref(),
+            Some("AUTUMN_REPLICA_SECRET_ACCESS_KEY")
+        );
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_defaults_to_absent_and_carries_the_documented_rpo() {
+        let config = AutumnConfig::default();
+        assert!(config.replication.is_none());
+
+        let defaults = ReplicationConfig::default();
+        assert!(!defaults.enabled, "replication is opt-in");
+        assert_eq!(defaults.rpo_secs, 10, "AC #2: at most 10s of data loss");
+        assert_eq!(defaults.retention_hours, 168);
+        assert_eq!(defaults.max_wal_bytes, 16 * 1024 * 1024);
+        assert!(
+            !defaults.allow_shared_bucket,
+            "#1619's distinct-bucket posture"
+        );
+        assert!(defaults.validation_errors().is_empty(), "disabled is valid");
+    }
+
+    #[test]
+    fn replication_validation_names_every_problem() {
+        let no_destination = ReplicationConfig {
+            enabled: true,
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            no_destination
+                .validation_errors()
+                .iter()
+                .any(|e| e.contains("no destination is configured")),
+            "{:?}",
+            no_destination.validation_errors()
+        );
+
+        let both = ReplicationConfig {
+            enabled: true,
+            path: Some("/mnt/replica".to_owned()),
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            ..ReplicationConfig::default()
+        };
+        assert!(
+            both.validation_errors()
+                .iter()
+                .any(|e| e.contains("pick exactly one destination"))
+        );
+
+        let no_credentials = ReplicationConfig {
+            enabled: true,
+            s3: Some(ReplicationS3Config {
+                bucket: Some("b".to_owned()),
+                ..ReplicationS3Config::default()
+            }),
+            rpo_secs: 0,
+            retention_hours: 0,
+            ..ReplicationConfig::default()
+        };
+        let errors = no_credentials.validation_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("access_key_id_env")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| e.contains("rpo_secs")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("retention_hours")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_replication_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__RPO_SECS", "20")
+            .with("AUTUMN_REPLICATION__SYNC_INTERVAL_SECS", "7")
+            .with("AUTUMN_REPLICATION__SNAPSHOT_INTERVAL_SECS", "600")
+            .with("AUTUMN_REPLICATION__MAX_WAL_BYTES", "1048576")
+            .with("AUTUMN_REPLICATION__RETENTION_HOURS", "12")
+            .with("AUTUMN_REPLICATION__VERIFY_INTERVAL_SECS", "0")
+            .with("AUTUMN_REPLICATION__PREFIX", "replicas")
+            .with("AUTUMN_REPLICATION__ALLOW_SHARED_BUCKET", "true")
+            .with("AUTUMN_REPLICATION__S3__BUCKET", "from-env")
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with(
+                "AUTUMN_REPLICATION__S3__ENDPOINT",
+                "https://minio.test:9000",
+            )
+            .with("AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV", "KEY")
+            .with("AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV", "SECRET")
+            .with("AUTUMN_REPLICATION__S3__FORCE_PATH_STYLE", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        let replication = *config.replication.expect("materialized from env alone");
+        assert!(replication.enabled);
+        assert_eq!(replication.rpo_secs, 20);
+        assert_eq!(replication.sync_interval_secs, Some(7));
+        assert_eq!(replication.snapshot_interval_secs, 600);
+        assert_eq!(replication.max_wal_bytes, 1_048_576);
+        assert_eq!(replication.retention_hours, 12);
+        assert_eq!(replication.verify_interval(), None);
+        assert_eq!(replication.prefix.as_deref(), Some("replicas"));
+        assert!(replication.allow_shared_bucket);
+        let s3 = replication.s3.expect("s3 from env");
+        assert_eq!(s3.bucket.as_deref(), Some("from-env"));
+        assert_eq!(s3.endpoint.as_deref(), Some("https://minio.test:9000"));
+        assert!(s3.force_path_style);
+    }
+
+    #[test]
+    fn replication_env_does_not_materialize_a_section_from_optional_keys_alone() {
+        // A lone region/prefix cannot replicate anywhere, so it must NOT conjure
+        // a section that then fails validation (mirrors #1619's #1791 fix).
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__S3__REGION", "auto")
+            .with("AUTUMN_REPLICATION__PREFIX", "db")
+            .with("AUTUMN_REPLICATION__ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.replication.is_none());
+    }
+
+    #[test]
+    fn a_path_destination_from_env_never_grows_an_empty_s3_section() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REPLICATION__ENABLED", "true")
+            .with("AUTUMN_REPLICATION__PATH", "/mnt/replica");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("materialized");
+        assert_eq!(replication.path.as_deref(), Some("/mnt/replica"));
+        assert!(replication.s3.is_none(), "no S3 key was set");
+        assert!(replication.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn replication_env_overlays_a_toml_section() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[replication]\nenabled = false\nretention_hours = 24\npath = \"/from-toml\"",
+        )
+        .expect("parse");
+        let env = MockEnv::new().with("AUTUMN_REPLICATION__ENABLED", "true");
+        config.apply_env_overrides_with_env(&env);
+        let replication = *config.replication.expect("section");
+        assert!(replication.enabled, "env flips the TOML toggle");
+        assert_eq!(replication.retention_hours, 24, "TOML value survives");
+        assert_eq!(replication.path.as_deref(), Some("/from-toml"));
     }
 
     #[test]

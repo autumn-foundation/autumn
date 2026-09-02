@@ -21,6 +21,7 @@ mod migrate_down;
 mod migrate_sqlite;
 mod offsite_backup;
 mod replay;
+mod replica_restore;
 mod repo_hygiene;
 mod scaffold_belongs_to;
 mod scaffold_bulk_delete;

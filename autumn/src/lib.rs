@@ -327,10 +327,16 @@ pub(crate) mod counter_cache;
 #[cfg(feature = "db")]
 pub mod commentable;
 
+/// Continuous SQLite replication with point-in-time restore (issue #1628).
+#[cfg(feature = "db")]
+pub mod replication;
 #[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
 pub(crate) mod repository_commit_hooks;
+/// AWS Signature Version 4 request signing, shared by the replication and
+/// offsite-backup S3 clients (issues #1628 / #1619).
+pub mod sigv4;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 #[cfg(feature = "db")]
