@@ -186,7 +186,7 @@ def strip_fences(text):
     underline, and deleting a fenced block would splice a paragraph onto a
     following `---` and invent a heading that is not there.
     """
-    out, opener, stack, quoted = [], None, [], 0
+    out, opener, stack, quoted, held = [], None, [], 0, 0
     for line in text.splitlines():
         base = stack[-1] if stack else 0
         depth = quote_depth(line)
@@ -194,8 +194,18 @@ def strip_fences(text):
         # unclosed quoted fence must not blank the prose that follows it all
         # the way to EOF. Depth, not a boolean: a fence opened in `> > ` ends
         # when the line dedents to `> `, even though both are still quoted.
-        if opener is not None and quoted and line.strip() and depth < quoted:
-            opener, quoted = None, 0
+        if opener is not None and line.strip():
+            # A fenced block also ends with the container that holds it: the
+            # quote it was opened in, or the list item. The list stack stops
+            # updating while a fence is open, so the item's content column is
+            # captured at open and compared here — otherwise an unclosed fence
+            # in a list blanks every link after the list, to EOF.
+            plain = BLOCKQUOTE.sub("", line)
+            if (quoted and depth < quoted) or (
+                held and depth == quoted
+                and column(INDENT.match(plain).group(0)) < held
+            ):
+                opener, quoted, held = None, 0, 0
         # A fence inside a block quote (`> ```md`) is still a fence; the
         # corpus has 12 of them. Detection runs on the quote-stripped content
         # while the original line is what gets kept, so real links inside a
@@ -226,7 +236,7 @@ def strip_fences(text):
             # backtick, so ```md`invalid is not an opener — accepting it would
             # open scanner state and blank live links until EOF.
             if m and indent <= base + 3 and not (m.group(2)[0] == "`" and "`" in m.group(3)):
-                opener, quoted = m.group(2), depth
+                opener, quoted, held = m.group(2), depth, base
                 out.append("")
             else:
                 out.append(line)
@@ -242,7 +252,7 @@ def strip_fences(text):
                 # an opener, hiding live prose to the end of the file.
                 and not m.group(3).strip()
             ):
-                opener = None
+                opener, quoted, held = None, 0, 0
     return "\n".join(out)
 
 
@@ -361,28 +371,44 @@ for f in files:
     # underline promotes. Stripping the underline but testing the raw line
     # above it let `>` trip NOT_PARAGRAPH and lose the heading.
     unquoted = [BLOCKQUOTE.sub("", l) for l in lines]
+    depths = [quote_depth(l) for l in lines]
 
     for i in range(start, len(lines)):
         line = unquoted[i]
         atx = re.match(r'^ {0,3}(#{1,6})\s+(.*)$', line)
         if atx:
             add(atx.group(2))
-        elif SETEXT.match(line) and i > start and not NOT_PARAGRAPH.match(unquoted[i - 1]):
+        elif (
+            SETEXT.match(line)
+            and i > start
+            and depths[i - 1] == depths[i]
+            and not NOT_PARAGRAPH.match(unquoted[i - 1])
+        ):
             # A Setext underline promotes the WHOLE paragraph above it, not
             # just its last line: `First line / second line / ---` is one
             # heading slugged `first-line-second-line`. Taking only the last
             # line would both miss that anchor and mint `second-line`, which
             # exists nowhere — and a phantom anchor makes a broken link look
             # resolved.
+            # Stop at the container boundary as well as the paragraph one:
+            # normalising quotes away made an UNquoted paragraph look like it
+            # continued into a quoted heading, minting a joined phantom anchor
+            # and losing the real one.
             j = i - 1
-            while j > start and not NOT_PARAGRAPH.match(unquoted[j - 1]):
+            while (
+                j > start
+                and depths[j - 1] == depths[i]
+                and not NOT_PARAGRAPH.match(unquoted[j - 1])
+            ):
                 j -= 1
             add(" ".join(l.strip() for l in unquoted[j:i]))
 
-    # `id=x`, `id='x'` and `id="x"` are all valid HTML.
+    # `id=x`, `id='x'` and `id="x"` are all valid HTML. Code spans are
+    # removed first: `` `<a id="phantom">` `` displays an anchor, it does
+    # not create one, and a phantom anchor makes a broken link look fine.
     for m in re.finditer(
         r'''<a\s[^>]*?\b(?:id|name)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))''',
-        body,
+        CODE_SPAN.sub('', body),
     ):
         found.add(next(g for g in m.groups() if g is not None))
     anchors[f] = found
@@ -421,6 +447,14 @@ for f in files:
         path, _, anchor = t.partition("#")
         path = path.split("?")[0]
         if not path:
+            # `[x](?view=all#frag)` still targets this page's `#frag`.
+            anchor = urllib.parse.unquote(anchor)
+            if anchor and anchor not in anchors.get(f, ()):
+                defects.append(
+                    f"{f}: no such heading anchor in this page: `{t}`"
+                    + (" (case: anchors are lowercase)"
+                       if anchor.lower() in anchors.get(f, ()) else "")
+                )
             continue
         # A rendered link is a URL: `a%20b.md` addresses the file `a b.md`.
         path = urllib.parse.unquote(path)
@@ -855,6 +889,34 @@ self_test() {
   printf 'See [q](jobs.md#MixedId) and [b](jobs.md#Bare).\n' >> "$c50/docs/guide/mail.md"
   git -C "$c50" commit -qam anchor-quoting-forms
   check "single-quoted and unquoted anchor ids resolve" pass "$c50"
+
+  # An anchor displayed as inline code creates no id.
+  local c51="$tmp/c51"; make_corpus "$c51"
+  printf '\nDisplay: `<a id="phantom"></a>`\n' >> "$c51/docs/guide/jobs.md"
+  printf 'See [p](jobs.md#phantom).\n' >> "$c51/docs/guide/mail.md"
+  git -C "$c51" commit -qam inline-code-anchor
+  check "anchor shown as inline code is not indexed" fail "$c51"
+
+  # `[x](?q#frag)` has an empty path but still targets this page's fragment.
+  local c52="$tmp/c52"; make_corpus "$c52"
+  printf '\nSee [bad](?view=all#no-such-heading).\n' >> "$c52/docs/guide/mail.md"
+  git -C "$c52" commit -qam query-only-fragment
+  check "fragment on a query-only link is checked" fail "$c52"
+
+  # A Setext underline promotes only the paragraph in its own container: an
+  # unquoted paragraph must not be joined onto a quoted heading.
+  local c53="$tmp/c53"; make_corpus "$c53"
+  printf '\nOutside paragraph\n> Quoted heading\n> ---\n' >> "$c53/docs/guide/jobs.md"
+  printf 'See [ok](jobs.md#quoted-heading).\n' >> "$c53/docs/guide/mail.md"
+  git -C "$c53" commit -qam setext-container-boundary
+  check "Setext collection stops at a quote boundary" pass "$c53"
+
+  # A fence ends with the list item that holds it.
+  local c54="$tmp/c54"; make_corpus "$c54"
+  printf '\n- item\n\n  ```md\n  sample\n\nBack at top level: [bad](missing.md).\n' \
+    >> "$c54/docs/guide/mail.md"
+  git -C "$c54" commit -qam fence-ends-with-list-item
+  check "unclosed fence in a list item does not swallow later prose" fail "$c54"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
