@@ -71,6 +71,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mean a typo'd path sheds every request on the way up. An explicit
   `server.max_concurrent_requests` always wins, including an explicit `0`. See
   [docs/guide/capacity-contracts.md](docs/guide/capacity-contracts.md).
+- **Authored, seeded fault scenarios you can commit as regression tests
+  (#1680):** the simulation harness could already inject faults, but only
+  *probabilistically* — `Chaos::db_transient_errors(0.05)` says "5% of
+  connection checkouts fail" and lets the seed pick which. That is the right
+  tool for a sweep hunting rare interleavings and the wrong one for proving a
+  fix, because the sentence a post-mortem produces is "the third connection
+  checkout failed while the second `send_invoice` execution was retrying", and
+  no rate reproduces that on purpose. A new `autumn_web::sim::FaultPlan`
+  authors that scenario by ordinal, attaches to a `TestApp` with no application
+  code changes, and hands back a serializable record of what happened:
+
+  ```rust
+  use autumn_web::sim::{FaultPlan, Sim};
+
+  #[sim_test]
+  async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
+      let plan = FaultPlan::from_seed(sim.seed)
+          .fail_db_checkout(3)           // 3rd checkout on any pool (1-based)
+          .fail_job("send_invoice", 2);  // 2nd execution of that job by name
+
+      sim.build(
+          TestApp::new()
+              .routes(routes![checkout])
+              .plugin(InvoiceJobPlugin)
+              .with_fault_plan(plan),
+      );
+
+      for _ in 0..5 {
+          sim.client().post("/checkout").send().await;
+      }
+      sim.run_to_idle().await;
+
+      let outcome = sim.client().fault_outcome().await;
+      assert_eq!(outcome.fired.len(), 2);
+      assert_eq!(outcome.server_errors[0].status, 503);
+      assert_eq!(outcome.final_state.db_checkouts, 5);
+
+      // Canonical JSON, byte-identical on every replay of this seed.
+      assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoices.json").trim_end());
+  }
+  ```
+
+  Two effect classes fire deterministically through the existing
+  `interceptor.rs` seams: database connection checkout (`fail_db_checkout`,
+  `fail_db_checkout_on("replica", 2)`) and job execution
+  (`fail_job_execution`, `fail_job("send_invoice", 2)`), each targetable by a
+  1-based ordinal on a global or per-target counter. `random_db_checkout_faults(2, 1..=8)`
+  derives ordinals from the plan's seed and resolves them into explicit entries
+  at builder-call time, so `plan.planned()` always describes the whole schedule
+  and an explicit-only plan draws no entropy at all. `only_between(from, to)`
+  confines faults to a half-open window of elapsed time measured on the app's
+  **injected** clock, so `Sim::advance` moves it and no wall-clock read leaks
+  in; an effect outside the window still consumes its ordinal and is recorded
+  as `suppressed` rather than silently vanishing.
+
+  `TestClient::fault_outcome().await` returns a `FaultOutcome` carrying the
+  seed, `fired` (effect, target, global and per-target ordinal, the injected
+  clock's `at` and `elapsed_ms`), `suppressed`, `unfired`, `server_errors`
+  projected from `reporting.rs`, and `final_state` seam totals. It is
+  `Serialize + Deserialize + PartialEq`, its `to_json_string()` is canonical
+  (declaration-order fields, no maps, no floats) and `fingerprint()` is an
+  FNV-1a 64 over it — so a scenario replayed 100× from one seed produces a
+  byte-identical record 100/100 times, which is exactly what the committed
+  determinism test asserts. The `async` on `fault_outcome` is load-bearing: it
+  settles autumn's detached error-report tasks with bounded cooperative yields
+  before snapshotting, without advancing the virtual clock.
+
+  A plan **composes** rather than replaces — it chains behind your own
+  `with_job_interceptor` / `with_db_interceptor`, the always-on job recorder,
+  transactional-DB isolation and `Sim::chaos`, with the injected failure
+  innermost so a user interceptor observes it exactly like a real handler
+  error. Attaching a plan also defaults the app's entropy to `SeededEntropy`
+  from the plan's seed (an explicit `with_entropy` still wins) and asserts the
+  settings replay depends on — one job worker, reporting at
+  `sample_rate = 1.0`, and failure capture off — instead of letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break reproducibility.
+
+  Scope is deliberately narrow: test-only (there is no production fault
+  injection), DB checkout and job execution only (use `Chaos::smtp_faults` for
+  SMTP), and `TestClient::perform_enqueued_jobs` bypasses the
+  `intercept_execute` seam so job faults require `Sim::run_to_idle`.
+  `autumn/tests/integration/sim_fault_plan.rs` is the worked proof: a
+  `charge_card` job whose scenario fails at `max_attempts = 1` and passes at
+  `max_attempts = 3`, the same before/after shape as the retry-storm example.
+  See
+  [Simulation Testing → Authored fault scenarios](docs/guide/simulation-testing.md).
+- **A markdown link gate for the docs corpus [no-plugin]:** `check-docs.sh`
+  gated rustdoc intra-doc links and `check-plugin-freshness.sh` gated the
+  `docs/guide/*.md` paths named from `skills/` and `agents/`, but nothing
+  checked the 383-file markdown corpus itself — so a guide could link to a
+  page that was renamed, never written, or lives one directory up, and
+  nothing noticed. `scripts/check-docs-links.sh` resolves every relative
+  link and heading anchor in tracked markdown and now runs in CI's docs-only
+  job. Its baseline found **19 broken links across 11 pages**, all fixed
+  here: five rustdoc paths pasted into `aggregates.md` as markdown targets
+  (they render as links to a directory that does not exist), three
+  `docs/design/` links off by one directory level, `authorization.md` and
+  `generators.md` pointing into `docs/api/` and `docs/reference/` trees that
+  have never existed, `tauri.md` pointing at a `managed-pg.md` that is
+  really `daemon.md`, two guides promising a `custom_config_loader` example
+  that is not in the workspace, and four heading anchors that no longer
+  match their headings. External links are deliberately out of scope
+  (network-flaky, and not fixable in this repo).
 
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
@@ -121,6 +225,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deserialize. `AuditSink::purge_before` is a *provided* method, so existing
   sinks keep compiling untouched. See the
   [migration guide](docs/migrations/next.md).
+
+- **SSG records each route's intended `Content-Type` at generation time
+  (#1832):** the static-first serve path used to reverse-engineer every cached
+  response's MIME type at *request* time, from the route slug plus the served
+  file name. Because `url_to_file_path` stores every non-root route as
+  `<route>/index.html`, both clues lie: `/sitemap.xml` lands at
+  `sitemap.xml/index.html`, whose file name says HTML. That guess needed three
+  consecutive corrections during review of #1819 — pre-compressed fonts,
+  generated `.txt`/`.xml` routes, and HTML pages whose slug merely contains a
+  dot (`/posts/release.v1`, `/users/alice@example.com`) — each round fixing a
+  case the previous one broke.
+
+  `render_static_routes` now records the `Content-Type` the handler declared on
+  each rendered page into a new optional `content_type` field on
+  `ManifestEntry`, and the static-first middleware serves that value directly
+  via the new `StaticFileLayer::resolve_entry`. The type is determined once,
+  where it is actually known, and never inferred again — which makes all three
+  edge cases impossible by construction and lets a route be served as a type no
+  file extension maps to (`application/rss+xml` from `/feed`, `text/calendar`
+  from `/calendar`), something the extension heuristic could never produce.
+
+  Existing `dist/` directories keep working untouched. `content_type` is
+  `#[serde(default)]`, so a manifest built before this change (or written by
+  hand) deserializes with the field absent, and `static_gen::resolved_content_type`
+  applies the pre-#1832 derivation byte-for-byte: recognized route extension,
+  then served file name, then `application/octet-stream`. Nothing is recorded
+  for a handler that declares no `Content-Type` either — a build-time guess
+  would only bake in the heuristic this change removes. That function also
+  rejects a recorded value that is not a legal header (a CR/LF injection
+  attempt from a tampered manifest) and falls back instead, returning a
+  `HeaderValue` so the request path cannot panic on a bad manifest.
+
+  ISR does not rewrite the manifest (it is immutable behind an `Arc`, with file
+  mtime driving staleness), so the header served for a route is fixed for the
+  process lifetime while the body on disk is not. A regeneration whose handler
+  declares a *different* type — or stops declaring one — is therefore refused
+  rather than written: the previous file stays, still matching its recorded
+  type, so the route degrades to stale-but-correct instead of serving fresh
+  bytes under a header that mislabels them. The refusal is logged; `autumn
+  build` re-records the type.
+
+  Only a type the handler *deliberately* declared is recorded. axum's blanket
+  `IntoResponse` impls always attach one — `text/plain; charset=utf-8` for
+  `String`, `application/octet-stream` for `Vec<u8>` — purely from the return
+  type, so recording those over a route that names its own extension would have
+  served `#[static_get("/theme.css")] async fn theme() -> String` as plain text
+  and let `X-Content-Type-Options: nosniff` drop the stylesheet outright. When a
+  declared type is one of those two generic defaults and the route's final
+  segment carries a recognized asset extension that disagrees, nothing is
+  recorded and the derivation runs as before. An explicit declaration still
+  wins, even against the slug (`/notes.txt` declaring `application/json`).
+
+  One neighbouring fix fell out of the same work: a manifest that is *present
+  but unparseable* now logs a warning instead of disabling static serving with
+  no trace at all (absent stays quiet — that is just an app with no static
+  build). `ManifestEntry::revalidate` also gained an explicit `#[serde(default)]`
+  to state that a hand-written entry may omit the key, though it changes
+  nothing on its own — serde's derive already maps a missing `Option` field to
+  `None`, so the shortest documented entry parsed before this release too.
+
+  **Breaking:** `ManifestEntry` and `StaticManifest` are now `#[non_exhaustive]`
+  and `ManifestEntry` gained a `content_type` field, so struct literals — and
+  exhaustive destructuring patterns like
+  `let ManifestEntry { file, revalidate } = entry;` — must
+  become `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)`
+  and `StaticManifest::new(routes)`. Behaviourally, an *extensionless*
+  `#[static_get]` route whose handler returns a bare `String` is served as the
+  `text/plain; charset=utf-8` axum declares rather than the `text/html` the old
+  heuristic assumed — matching what that same handler already served on the
+  dynamic path. Return `Markup` or `Html<String>` for HTML. See
+  [the migration guide](docs/migrations/next.md).
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
@@ -585,7 +760,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report a divergence against unchanged code; and outbound request and response
   headers are charged against `max_capsule_bytes`, which they had escaped.
 
+- **`autumn_web::redis_tls` (new public module):** `open_client` is the
+  Redis client constructor every Autumn subsystem now uses — it installs the
+  rustls `CryptoProvider` a `rediss://` URL needs before rustls can be asked
+  to resolve one. `ensure_tls_crypto_provider` exposes just that step for code
+  that builds a client another way, and `redact_url` masks the password in a
+  Redis URL before it is logged. `redis` is re-exported as
+  `autumn_web::reexports::redis` so callers can name the returned
+  `redis::Client` without adding their own dependency. Issue #2172.
+
 ### Fixed
+
+- **ACME config: `autumn doctor` and the runtime now reject the same two
+  spellings (#1874):** two low-severity parity gaps let `autumn doctor
+  --strict` bless an `autumn.toml` the server refuses to boot on. A
+  **non-integer `renew_before_days`** — a quoted `renew_before_days = "30"`, a
+  float, or a bool — was read by doctor's `as_integer()` chain as *absent* and
+  silently defaulted to 30, so the check passed while the runtime's typed
+  deserialization rejects the file at boot. Doctor now records the value the
+  operator actually wrote and reports an `acme_config` **Fail** naming it,
+  exactly as it already did for `http_challenge_port` and `directory`. (A
+  negative or out-of-`u32`-range integer already failed, having been clamped to
+  `u32::MAX` and caught by the `>= 90` rule; it now fails with a message about
+  the value rather than about the renewal window.) A
+  **whitespace-padded domain** (`domains = [" app.example.com "]`) passed
+  `AcmeConfig::validate()`, which trims only for its blank and wildcard checks
+  but stores the entry untrimmed — and the untrimmed string is what becomes the
+  certificate's SAN and the ACME order's `Identifier::Dns`, so the padded name
+  was requested as-is and failed mid-issuance with an opaque CA error. Both
+  `validate()` and doctor now reject it at startup with a message naming the
+  entry, its index, and the trimmed spelling to use. Neither gap was a security,
+  denial-of-service, or CA-rate-limit issue: each was already caught fail-fast
+  at boot or at first issuance, just later and less legibly than it should have
+  been.
 
 - **CI now rejects colliding migration versions:** app, framework and plugin
   migrations are applied into one shared version space — diesel keys
@@ -666,15 +873,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::redis_tls::open_client`, which installs `ring` once,
   idempotently, and only when the URL is a TLS one — decided by asking the
   `redis` crate to parse it and checking whether it resolved to a TLS address,
-  so `rediss://`, Valkey's `valkeys://` and any case variant the URL parser
-  accepts are all covered without a scheme list to keep in sync. (The previous
-  `starts_with("rediss://")` check had already missed both.) A plaintext
+  rather than by keeping a second copy of that crate's scheme table. So
+  `rediss://`, Valkey's `valkeys://` and every case variant the URL parser
+  accepts are covered with nothing to re-check on a dependency bump, and
+  prefix lookalikes (`redisstore://`), `unix://` sockets and unparseable input
+  are classified exactly as the connector will classify them. A plaintext
   `redis://` URL deliberately does **not** claim the process-wide default, so
   it cannot pre-empt an application that installs `aws-lc-rs` for something
   else, and an already-installed provider is always kept rather than replaced.
   `autumn-cache-redis` now delegates to the same guard instead of carrying its
-  own copy, and a source scan in each crate keeps a future subsystem from
-  re-opening the hole with a bare `redis::Client::open`.
+  own copy, the `reddit-clone` example is wired through it too (examples get
+  copied), and a source scan in each of the three crates keeps a future
+  subsystem from re-opening the hole with a bare `redis::Client::open`.
+
+  Redis URLs are no longer logged verbatim. A managed Redis carries its access
+  key *inside* the URL, and the rate-limit backend echoed the configured URL
+  into a `WARN` on both of its fallback-to-memory paths — writing that key to
+  whatever log sink the app ships to. `autumn_web::redis_tls::redact_url`
+  masks the password, and deliberately over-redacts rather than under-redacts.
+  Every input it sees on that path is malformed by definition, and malformed
+  is exactly where a redactor gives up: an Azure access key is base64, whose
+  alphabet includes `/`, and an un-encoded `/` ends the URL's authority early
+  — which is both why the URL fails to parse and why the log line is reached.
+  A mistyped scheme delimiter (`rediss:/:key@host`) leaves nothing to split
+  on at all. Neither returns the input untouched. The invalid-URL branch now
+  also logs no URL whatsoever, redacted or not: the `redis` error names the
+  problem without echoing the value.
 
 - **A container that terminates TLS itself is no longer permanently
   `unhealthy`:** the Dockerfile `autumn release init` generates hardcoded its
@@ -741,6 +965,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches any ambient runtime, closing both failure points. Verified against
   a real TLS-enabled Postgres server, on both a `current_thread` and
   `multi_thread` tokio runtime, called directly from an async body.
+- **Admin panel: a create/edit form that fails validation no longer discards
+  everything the admin typed:** `POST /{slug}` and `POST /{slug}/{id}` — the
+  only mutation UI the framework ships, used identically by every model in
+  every admin-plugin deployment — propagated a malformed field (e.g.
+  unparsable JSON) or a model-declared `AdminError::Validation` (e.g. a
+  uniqueness check) as a bare `AutumnError`. That renders as a generic error
+  response with no reference back to the form: a full-page navigation away,
+  a "Go to homepage" link as the only recovery step, and every value the
+  admin had entered gone. Both handlers now catch just that failure class and
+  re-render the same form (HTTP 422) with every submitted value still filled
+  in and the failure shown through the existing persistent, accessible flash
+  banner — no toast, no blank form. On update, the redisplayed form is
+  merged with the stored record so `create_only` fields (rendered read-only,
+  never resubmitted) keep showing their real value instead of going blank.
+  Other failure classes (missing pool, unknown model, database outage) are
+  unchanged and still render the generic error page.
 
 ### Added
 
@@ -1406,6 +1646,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other decline, so the origin serves the request instead.
 
 ### Performance
+
+- **the DB-backed media-room reaper sweeps in one statement instead of one per
+  stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
+  now-empty rooms, run every 60s by the background room reaper in any process
+  wiring in `room_store_backend = "db"` — loaded every stale-room candidate,
+  then issued a `SELECT COUNT(*)` per candidate and a `DELETE` per now-empty
+  one. That is O(n) statements per tick, where n is however many rooms went
+  stale since the last tick, so a busy multi-tenant deployment paid it in
+  proportion to its own traffic. The emptiness test is now a correlated
+  `NOT EXISTS` on the participants' composite key inside the delete itself, so
+  the whole phase is a single anti-join statement. Measured against an 8,704-row
+  production-shaped fixture with 8,002 stale candidates (`pg_stat_statements`,
+  testcontainer Postgres): phase-2 statements per tick 15,504 → **1**, phase-2
+  buffers 78,512 → 41,109 (**-47.6%**). No schema change, no new index. The
+  sweep keeps its exact reap set, its last-write-wins idempotence, and its
+  namespace isolation — and, being one atomic statement, no longer has a
+  per-candidate window between the occupancy check and the delete.
 
 - **a no-database app no longer compiles the framework's database codegen:**
   `autumn-macros` had no `[features]` section at all, so `model.rs` and

@@ -35,7 +35,7 @@ cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
 # Before migrating: configure the database (see the note below) and
 # create it if it does not exist yet:
-createdb my_app
+autumn db create
 autumn migrate
 autumn dev
 ```
@@ -46,8 +46,10 @@ One file edit belongs between `generate` and `migrate`: the generated
 Postgres so both `autumn migrate` and the running app can reach the
 database — without it, `autumn migrate` exits with `✗ No database URL found.`.
 `autumn migrate` runs migrations against that database but does not create
-it, hence the `createdb my_app` above (any equivalent, such as
-`CREATE DATABASE` in psql, works too):
+it, hence `autumn db create` above — it reads the same `url`/`primary_url`
+you just configured and creates that database, idempotently, with no extra
+tooling beyond what `autumn migrate` already needs (an external `createdb` or
+`CREATE DATABASE` in psql works too, if you have a Postgres client installed):
 
 ```toml
 [database]
@@ -1180,7 +1182,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks

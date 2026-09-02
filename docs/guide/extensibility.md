@@ -197,9 +197,9 @@ issue — adding one is mechanical and we generally welcome the patch.
 
 - [`custom-subsystems.md`](custom-subsystems.md) — per-trait how-to for tier-1
   hooks, with full runnable code.
-- [`examples/custom_config_loader`](../../examples/custom_config_loader) — a
-  workspace example demonstrating a JSON-file `ConfigLoader` installed via
-  `with_config_loader`.
+- [`ConfigLoader`](https://docs.rs/autumn-web/latest/autumn_web/config/trait.ConfigLoader.html)
+  — the trait behind `with_config_loader`, for sourcing config from Vault,
+  Secrets Manager, or a JSON/YAML file instead of five-layer TOML.
 - [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) — `Plugin` trait
   documentation, including the naming conventions for distributed plugins.
 

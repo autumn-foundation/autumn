@@ -109,7 +109,9 @@ copy of the publish order.
 | `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap |
-| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)` |
+| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (unreleased, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
+| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (unreleased, #1832) |
+| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (unreleased, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
@@ -1095,6 +1097,30 @@ to a wall-clock jump in production.
 even inside a `#[sim_test]`. For a deadline whose counterparty is
 `tokio::time::sleep`, use `tokio::time::Instant`.
 
+## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
+
+The authored lane beside the probabilistic `sim::Chaos` builder: name the exact
+effect that must fail, attach the plan to a `TestApp`, and assert on (or commit)
+the serializable record of what happened. Test-only; DB checkout and job
+execution only (SMTP faults stay on `Chaos::smtp_faults`).
+
+| API | Purpose |
+|---|---|
+| `FaultPlan::from_seed(u64)` | Start a plan; the seed drives only the `random_*` builders (and, by default, the app's entropy) |
+| `.fail_db_checkout(n)` / `.fail_db_checkout_on("replica", n)` | Fail the n-th checkout (1-based) on the global / per-pool counter (`db` feature) |
+| `.fail_job_execution(n)` / `.fail_job("send_invoice", n)` | Fail the n-th job execution on the global / per-name counter; the runtime's retry policy applies |
+| `.random_db_checkout_faults(count, 1..=k)` / `.random_job_execution_faults(count, 1..=k)` | Seed-derived distinct ordinals, resolved into explicit entries at builder time |
+| `.only_between(from, to)` | Half-open elapsed window on the app's **injected** clock; a match outside it is `suppressed`, not fired |
+| `.planned()` / `.describe()` / `.is_active()` | The full authored schedule (sorted), a printable rendering, whether anything is planned |
+| `TestApp::with_fault_plan(plan)` | Attach; composes with `with_job_interceptor` / `with_db_interceptor`, transactional isolation and `Sim::chaos` (fault innermost). Asserts `jobs.workers == 1`, `reporting.sample_rate == 1.0` and `failure_capture.enabled == false`; defaults entropy to `SeededEntropy(seed)` |
+| `TestClient::fault_outcome().await` | Settle the detached error-report tasks (bounded yields, no clock advance), then snapshot a `FaultOutcome` |
+| `TestClient::fault_ledger()` | The live handle (`Option`); `.outcome()` snapshots without settling |
+| `FaultOutcome { seed, fired, suppressed, unfired, server_errors, final_state }` | `Serialize + Deserialize + Eq`; `to_json_string()` is canonical, `fingerprint()` is FNV-1a 64, `from_json_str` parses a committed record |
+
+Ordinals are exact by construction; *which* pass is the n-th replays only under a
+paused current-thread runtime (`#[sim_test]`) with jobs drained by
+`Sim::run_to_idle` — `perform_enqueued_jobs` bypasses `intercept_execute`.
+
 ## SystemTest builder (`autumn_web::system_test`, feature `system-tests`)
 
 Browser-driven tests: boots the app on an ephemeral port, launches managed
@@ -1163,7 +1189,7 @@ telemetry-otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
-redis = ["dep:redis"]
+redis = ["dep:redis", "dep:rustls"]
 i18n = []
 storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
@@ -1203,7 +1229,7 @@ tracing-opentelemetry = "0.32.1"
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
-redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
+redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
 validator = { version = "0.20", features = ["derive"] }
@@ -1466,11 +1492,13 @@ In-process HTTPS termination on the same host:port (off by default).
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.
 
-- `domains` (required, non-wildcard), `contact_email` (required).
+- `domains` (required, non-wildcard), `contact_email` (required). Each domain is
+  used verbatim as the certificate's SAN and the ACME order's DNS identifier, so
+  an entry with leading/trailing whitespace is rejected at startup (#1874).
 - `directory` — Let's Encrypt staging by default; `production` or a custom URL.
 - `cache_dir` (default `config/acme`).
 - `http_challenge_port` (default `80`).
-- `renew_before_days` (default `30`, must be `< 90`).
+- `renew_before_days` (default `30`, an unquoted whole number, must be `< 90`).
 - `ca_root_path` (unset) — PEM root that signs the ACME **directory's own HTTPS
   certificate**. Needed only for a private CA / Pebble reached through a custom
   `directory`: by default the client verifies the directory against the platform
