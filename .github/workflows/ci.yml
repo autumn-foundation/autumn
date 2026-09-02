@@ -416,6 +416,7 @@ jobs:
           cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
           # Media-room reaper phase-2 profiling harness: asserts the sweep's
           # reap set, its boundary cases (created_at / last_seen_at exactly ON
           # the cutoff), and its namespace isolation against a
@@ -606,6 +607,8 @@ jobs:
             --test scoped_tokens_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test token_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
