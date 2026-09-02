@@ -170,7 +170,22 @@ fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
     // an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins, which is exactly the
     // case (a prod-profile dev run) that the old fixed budget got wrong.
     let profile = crate::serve::effective_profile(None, false);
-    let (prestop, shutdown) = crate::serve::resolve_shutdown_budget(&base_dir, Some(&profile));
+    // Resolve through the SAME `.env` overlay `start_server` injects into the
+    // child. The CLI deliberately never mutates its own environment, so a budget
+    // read from `std::env` alone would miss an `AUTUMN_SERVER__*` override the
+    // child does honor — and the parent would then force-kill the app in the
+    // middle of a valid shutdown, skipping exactly the managed-Postgres teardown
+    // this mechanism exists to protect. Real shell variables still win over
+    // `.env`, which is what `DotenvOsEnv` implements; a malformed `.env` falls
+    // back to the plain environment rather than failing the stop.
+    let denv: Box<dyn autumn_web::config::Env> = match autumn_web::dotenv::os_env_with_dotenv() {
+        Ok(env) => Box::new(env),
+        Err(_) => Box::new(autumn_web::config::OsEnv),
+    };
+    let (prestop, shutdown) =
+        crate::serve::resolve_shutdown_budget_from(&base_dir, Some(&profile), &|key| {
+            denv.var(key).ok().filter(|value| !value.trim().is_empty())
+        });
     cooperative_stop_budget(prestop.saturating_add(shutdown))
 }
 
