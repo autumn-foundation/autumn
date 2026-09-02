@@ -109,7 +109,9 @@ copy of the publish order.
 | `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap |
-| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)` |
+| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (unreleased, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
+| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (unreleased, #1832) |
+| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (unreleased, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
