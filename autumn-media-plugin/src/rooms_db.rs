@@ -497,49 +497,30 @@ impl RoomStore for DbRoomStore {
             // created-never-joined room lingering past the TTL. A fresh empty
             // room (`created_at >= cutoff`) is kept, so a room in the
             // create→first-join window is never reaped out from under a joiner.
-            // Each delete is keyed on the exact `(namespace, room_id)` pair, so
-            // reaping never crosses namespaces.
-            let candidates: Vec<(String, String)> = match media_rooms::table
-                .filter(media_rooms::created_at.lt(cutoff))
-                .select((media_rooms::namespace, media_rooms::room_id))
-                .load(&mut conn)
-                .await
+            // The emptiness test is a correlated `NOT EXISTS` matching the
+            // participants' full composite key, so reaping never crosses
+            // namespaces — and the whole sweep is ONE statement rather than a
+            // candidate scan plus a `COUNT(*)` and a `DELETE` per candidate.
+            match diesel::delete(
+                media_rooms::table.filter(
+                    media_rooms::created_at
+                        .lt(cutoff)
+                        .and(diesel::dsl::not(diesel::dsl::exists(
+                            media_room_participants::table.filter(
+                                media_room_participants::namespace
+                                    .eq(media_rooms::namespace)
+                                    .and(media_room_participants::room_id.eq(media_rooms::room_id)),
+                            ),
+                        ))),
+                ),
+            )
+            .execute(&mut conn)
+            .await
             {
-                Ok(candidates) => candidates,
+                Ok(reaped) => stats.rooms_reaped = reaped,
                 Err(err) => {
-                    tracing::warn!(error = %err, "media rooms: reaper room scan failed");
+                    tracing::warn!(error = %err, "media rooms: reaper room sweep failed");
                     return stats;
-                }
-            };
-            for (namespace, room_id) in candidates {
-                let occupant_count: i64 = match media_room_participants::table
-                    .filter(
-                        media_room_participants::namespace
-                            .eq(&namespace)
-                            .and(media_room_participants::room_id.eq(&room_id)),
-                    )
-                    .count()
-                    .get_result(&mut conn)
-                    .await
-                {
-                    Ok(count) => count,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "media rooms: reaper seat count failed");
-                        continue;
-                    }
-                };
-                if occupant_count == 0
-                    && let Ok(reaped) = diesel::delete(
-                        media_rooms::table.filter(
-                            media_rooms::namespace
-                                .eq(&namespace)
-                                .and(media_rooms::room_id.eq(&room_id)),
-                        ),
-                    )
-                    .execute(&mut conn)
-                    .await
-                {
-                    stats.rooms_reaped += reaped;
                 }
             }
 

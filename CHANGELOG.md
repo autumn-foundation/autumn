@@ -1344,6 +1344,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **the DB-backed media-room reaper sweeps in one statement instead of one per
+  stale room:** `DbRoomStore::reap_stale`'s second phase — the sweep that drops
+  now-empty rooms, run every 60s by the background room reaper in any process
+  wiring in `room_store_backend = "db"` — loaded every stale-room candidate,
+  then issued a `SELECT COUNT(*)` per candidate and a `DELETE` per now-empty
+  one. That is O(n) statements per tick, where n is however many rooms went
+  stale since the last tick, so a busy multi-tenant deployment paid it in
+  proportion to its own traffic. The emptiness test is now a correlated
+  `NOT EXISTS` on the participants' composite key inside the delete itself, so
+  the whole phase is a single anti-join statement. Measured against an 8,704-row
+  production-shaped fixture with 8,002 stale candidates (`pg_stat_statements`,
+  testcontainer Postgres): phase-2 statements per tick 15,504 → **1**, phase-2
+  buffers 78,512 → 41,109 (**-47.6%**). No schema change, no new index. The
+  sweep keeps its exact reap set, its last-write-wins idempotence, and its
+  namespace isolation — and, being one atomic statement, no longer has a
+  per-candidate window between the occupancy check and the delete.
+
 - **a no-database app no longer compiles the framework's database codegen:**
   `autumn-macros` had no `[features]` section at all, so `model.rs` and
   `repository.rs` — together ~40k of the crate's ~60k lines, and the bulk of its
