@@ -233,6 +233,7 @@ mod query_count_asserts;
 mod query_structured;
 #[cfg(feature = "redis")]
 mod queue_dedicated_capacity;
+mod queue_pinning;
 mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;

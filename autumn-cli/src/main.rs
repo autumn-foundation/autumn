@@ -663,6 +663,14 @@ enum Commands {
         /// combined (default) does both.
         #[arg(long, value_enum)]
         role: Option<ServeRole>,
+        /// Pin this process to a subset of job queues (issue #1623). Repeatable
+        /// and comma-separated: `--pin critical,default` or `--pin critical
+        /// --pin default`. A pinned process never claims jobs from queues
+        /// outside the subset, on every backend. Forwarded to the app binary as
+        /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
+        /// own config (the default: drain every configured queue).
+        #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
+        pin: Vec<String>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -3866,6 +3874,7 @@ fn run_command(command: Commands) {
             bundled_pg,
             package,
             role,
+            pin,
         } => {
             let action = action.map(|a| match a {
                 ServeCommands::Stop => serve::ServeAction::Stop,
@@ -3886,6 +3895,20 @@ fn run_command(command: Commands) {
                     // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                     // the child pick its default (combined) or read its own env.
                     role: role.map(|r| r.as_str().to_owned()),
+                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
+                    // at all leaves the variable untouched so the child reads
+                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
+                    // stay distinguishable from that, so presence is carried by
+                    // the `Option`, not by the list being non-empty. Normalized
+                    // here (trim, drop blanks) so the recorded pin and the pin
+                    // the app parses are the same list.
+                    pin: (!pin.is_empty()).then(|| {
+                        pin.iter()
+                            .map(|q| q.trim())
+                            .filter(|q| !q.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    }),
                 },
             );
         }
@@ -6402,6 +6425,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #1623, AC3: a worker-role process must be pinnable to a subset of
+    /// queues "via config/flags". `autumn serve --pin` is the flag half; it
+    /// accepts a comma-separated list (matching `AUTUMN_JOBS__PIN`, which it
+    /// forwards) and may be repeated.
+    #[test]
+    fn serve_parses_pin_as_a_comma_separated_list() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "--role",
+            "worker",
+            "--pin",
+            "critical,default",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "default".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_pin_can_be_repeated() {
+        let cli =
+            Cli::try_parse_from(["autumn", "serve", "--pin", "critical", "--pin", "bulk"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => {
+                assert_eq!(pin, vec!["critical".to_owned(), "bulk".to_owned()]);
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    /// AC4: an app that configures nothing new keeps today's behavior, so a bare
+    /// `autumn serve` must produce an empty pin (the CLI then leaves
+    /// `AUTUMN_JOBS__PIN` untouched and the child reads its own config).
+    #[test]
+    fn serve_pin_defaults_to_empty() {
+        let cli = Cli::try_parse_from(["autumn", "serve"]).unwrap();
+        match cli.command {
+            Commands::Serve { pin, .. } => assert!(pin.is_empty()),
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]

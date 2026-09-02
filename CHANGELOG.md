@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pin a worker tier to queues from the command line, and let `doctor` prove
+  fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
+  and `jobs.pin` already existed, but pinning could only be spelled in
+  `autumn.toml` or `AUTUMN_JOBS__PIN`, and the `[jobs.fleet]` topology that lets
+  `autumn doctor` hard-fail on an uncovered queue was absent from the config
+  schema — declaring it warned as an unknown key (and failed boot under
+  `server.strict_config_enforce_all`) — and went unmentioned in the jobs guide.
+
+  `autumn serve` now takes `--pin`, repeatable and comma-separated, forwarded to
+  the app as `AUTUMN_JOBS__PIN` and restored by `autumn serve restart` so a bare
+  restart can't silently turn a pinned worker tier into an unpinned one:
+
+  ```bash
+  autumn serve --role worker --pin critical
+  ```
+
+  `[jobs.fleet]` (`tiers`, `manifest`, `declared_queues`) is now a first-class,
+  validated config section. It is purely declarative — no process acts on it at
+  runtime — and an app that declares nothing keeps today's behavior exactly. See
+  [Background Jobs](docs/guide/jobs.md#per-queue-worker-pools-caps-and-pinning).
+
+  Also adds the end-to-end coverage the acceptance criteria asked for: a pinned
+  worker never claims an out-of-subset queue on **both** the Postgres and Redis
+  backends, a per-queue `concurrency` cap bounds in-flight jobs below the worker
+  count, and p95 enqueue-to-start latency on a queue with dedicated capacity
+  stays within 2x its unloaded baseline while another queue floods.
 - **A proven capacity contract that travels with the build (#1733):** autumn
   already shed load once too many requests were in flight, but the ceiling it
   enforced was a hand-tuned guess in `autumn.toml`, and nothing told an operator
@@ -296,6 +322,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heuristic assumed — matching what that same handler already served on the
   dynamic path. Return `Markup` or `Html<String>` for HTML. See
   [the migration guide](docs/migrations/next.md).
+
+- **Ledger: a monotonic head outside the revision rows, and transaction time
+  from the database (#2323):** the tamper-evident record ledger allocated each
+  revision's sequence number from the rows that survived in
+  `_autumn_ledger_revisions`, which left an attacker a window they could close
+  themselves. Delete the newest revision, then wait for a *normal* application
+  write: the append read `N-1`, re-allocated `N`, chained cleanly onto its
+  predecessor and matched the live row, so both the chain walk and the live-row
+  cross-check reported intact and the deleted state left no trace.
+
+  A new framework table, `_autumn_ledger_high_water`, keeps a per-record
+  high-water mark where deleting a revision cannot reach it. Every append now
+  allocates `max(chain head, high-water mark) + 1` and raises the mark in the
+  same transaction, so the same attack allocates `N+1` and leaves a **permanent
+  gap** that `ledger_verify` reports as `MissingRevision` — whenever it runs,
+  not only in the window before the next write. The same mark tells a *wholly
+  erased* chain apart from a row that predates ledgering, which the first slice
+  had to stay silent about.
+
+  The mark is cross-checked, never believed — on both paths. `ledger_verify`
+  compares it with the chain in both directions, so rolling it back
+  (`HighWaterBehind`), rewriting it (`HighWaterMismatch`) or deleting its row
+  (`HighWaterMissing`) is itself the accusation; and an append that finds the two
+  in a state no framework code path can produce **refuses** rather than
+  overwriting the evidence. Without that second half, deleting a revision *and*
+  the mark and then waiting for ordinary traffic would have the append quietly
+  re-create both. A mark merely *behind* the head still writes: that is what a
+  pre-#2323 node in a mixed-version fleet leaves, and the next write heals it.
+  It raises the bar rather than closing the class — an attacker who can delete
+  revisions and rewrite the mark to agree with what survives is still invisible
+  from inside the database — so pinning `ledger_head` outside it remains
+  required for an audit posture. `ledger_high_water` exports the mark beside it,
+  from the same statement. The migration backfills a mark for every chain that
+  already exists, so adoption is a plain `autumn migrate` — run it *before*
+  rolling out the new binary.
+
+  `recorded_at` no longer comes from the writing host's clock. It is read from
+  the database (`clock_timestamp()` on Postgres, `strftime(…, 'now')` on SQLite)
+  at the point the append has already read the record's chain head, and clamped
+  against the chain's own floor — so transaction time is **non-decreasing along
+  a chain by construction**, across node clock skew and host clock steps alike,
+  and an as-of query is no longer answered by a revision recorded after the
+  instant asked about (up to the commit-visibility lag the guide documents). The
+  clamp is bounded: a floor more than an hour ahead of the database's clock
+  refuses the write instead of ratcheting the record's transaction time forward
+  for good. A chain where transaction time does move backwards is now reported
+  as `RecordedAtRegression`, ranked last so a chain written before this change
+  cannot mask a truncation. `LedgerBreak` is `#[non_exhaustive]` from here on,
+  and `autumn db scrub` refuses to empty one of the two ledger tables without
+  the other.
 
 - **SBOMs and signed provenance for framework and app releases (#1615):**
   Autumn could not answer "what exactly is in this artifact, and who built it?"
@@ -1788,6 +1864,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   count from one-per-document to one-per-backfill-batch. Every per-field SQL
   expression is unchanged; only how many round trips carry it changed. See
   `docs/reports/2026-08-25-ledger-search-write-documents-batch/`.
+
+- **the admin panel's bulk "delete" action now issues one `UPDATE` instead
+  of one per selected row:** `AdminModel::execute_action`'s trait default
+  (what `POST /admin/{slug}/actions` calls for every model that doesn't
+  override it) looped over the submitted ids and called `delete()` once
+  per id — a full connection checkout plus a single-row `UPDATE` per id, so
+  an operator selecting hundreds of rows in the admin list and clicking
+  "Delete selected" cost hundreds of round trips. `TokenAdminModel` (the
+  built-in `/admin/api-tokens/` model) now overrides `execute_action` for
+  `"delete"` to batch every id into one
+  `UPDATE api_tokens SET revoked_at = ... WHERE id = ANY($1) AND revoked_at IS NULL`
+  round trip; the returned count and end state are unchanged (a duplicate,
+  already-revoked, or nonexistent id is still a silent no-op, still counted
+  as "applied"). Measured against a 50,000-row fixture with a 2,050-id bulk
+  action: revoke statement calls 2,050 → 1. See
+  `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,

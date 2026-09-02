@@ -297,6 +297,15 @@ pub enum ScrubError {
         /// The offending table names, sorted.
         tables: Vec<String>,
     },
+    /// `[framework] purge` names one of the two ledger tables without the other.
+    /// A mark outlives the revisions it names by design, so emptying either
+    /// alone leaves `ledger_verify` accusing every ledgered record (issue #2323).
+    PurgeLedgerTablesUnpaired {
+        /// The ledger table that was named.
+        listed: String,
+        /// The ledger table that must be named alongside it.
+        missing: String,
+    },
     /// A backup/restore step (artifact restore, `--output` re-dump) failed.
     Backup(Box<super::backup::BackupError>),
 }
@@ -518,6 +527,16 @@ impl std::fmt::Display for ScrubError {
                 tables.len(),
                 bullet_list(tables),
             ),
+            Self::PurgeLedgerTablesUnpaired { listed, missing } => write!(
+                f,
+                "[framework] purge in {SCRUB_CONFIG_FILE} names {listed:?} but not \
+                 {missing:?}.\n  \
+                 The ledger's two tables are emptied together or not at all: a high-water \
+                 mark is built to outlive the revisions it names, so a copy holding one \
+                 without the other makes `ledger_verify` report every ledgered record as \
+                 tampered — and, with the marks kept, makes the write path refuse every \
+                 subsequent write. Add {missing:?} to `purge`, or remove {listed:?}."
+            ),
             Self::Backup(e) => write!(f, "{e}"),
         }
     }
@@ -710,6 +729,14 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     // `#[encrypted]` columns — so an unscrubbed ledger hands back exactly the
     // plaintext the column-level scrub just removed.
     "_autumn_ledger_revisions",
+    // Listed for lock-step emptying rather than because it carries a payload:
+    // the #2323 high-water marks hold only table names, tenant keys, sequence
+    // numbers and hashes. But a mark outlives the chain it names, so a copy that
+    // purged the revisions and kept the marks would have `ledger_verify` report
+    // *every* ledgered record as `MissingRevision` — "the whole chain was
+    // erased" — and the write path would then refuse every subsequent write.
+    // `check_purge_list` refuses to empty one of the pair without the other.
+    "_autumn_ledger_high_water",
     // Before/after values for every tracked column; only those named in
     // `#[version_history(sensitive = [...])]` are redacted.
     "_autumn_version_history",
@@ -791,12 +818,47 @@ fn check_purge_list(config: &ScrubConfig) -> Result<(), ScrubError> {
         .filter(|t| !is_framework_table(t))
         .cloned()
         .collect();
-    if offenders.is_empty() {
+    if !offenders.is_empty() {
+        offenders.sort();
+        return Err(ScrubError::PurgeNotFrameworkTable { tables: offenders });
+    }
+    check_ledger_purge_pairing(config)
+}
+
+/// The two ledger tables are emptied together or not at all (issue #2323).
+///
+/// A high-water mark is deliberately built to outlive the revisions it names —
+/// that is what makes a deleted revision permanent evidence. So a staging copy
+/// that purged `_autumn_ledger_revisions` and kept `_autumn_ledger_high_water`
+/// would have `ledger_verify` report every ledgered record as a wholly erased
+/// chain, and the write path would refuse every subsequent write to them. The
+/// reverse — marks purged, revisions kept — is the same shape from the other
+/// side: every record reports `HighWaterMissing`.
+///
+/// Neither is a state an operator asking for a scrub meant to create, and both
+/// are silent until something reads the ledger, so the pairing is enforced here
+/// rather than left as documentation.
+fn check_ledger_purge_pairing(config: &ScrubConfig) -> Result<(), ScrubError> {
+    let has = |table: &str| config.framework.purge.iter().any(|t| t == table);
+    let (revisions, marks) = (has(LEDGER_REVISIONS_TABLE), has(LEDGER_HIGH_WATER_TABLE));
+    if revisions == marks {
         return Ok(());
     }
-    offenders.sort();
-    Err(ScrubError::PurgeNotFrameworkTable { tables: offenders })
+    let (listed, missing) = if revisions {
+        (LEDGER_REVISIONS_TABLE, LEDGER_HIGH_WATER_TABLE)
+    } else {
+        (LEDGER_HIGH_WATER_TABLE, LEDGER_REVISIONS_TABLE)
+    };
+    Err(ScrubError::PurgeLedgerTablesUnpaired {
+        listed: listed.to_owned(),
+        missing: missing.to_owned(),
+    })
 }
+
+/// The ledger's revision rows.
+const LEDGER_REVISIONS_TABLE: &str = "_autumn_ledger_revisions";
+/// The ledger's out-of-band high-water marks (issue #2323).
+const LEDGER_HIGH_WATER_TABLE: &str = "_autumn_ledger_high_water";
 
 /// Parse a `scrub.toml` document.
 ///
@@ -3543,6 +3605,7 @@ mod tests {
         // identities.
         for table in [
             "_autumn_ledger_revisions",
+            "_autumn_ledger_high_water",
             "_autumn_version_history",
             "api_tokens",
             "autumn_experiment_assignments",
@@ -4769,11 +4832,49 @@ mod tests {
         let ok = parse_config_str(
             r#"
             [framework]
-            purge = ["autumn_jobs", "_autumn_ledger_revisions"]
+            purge = ["autumn_jobs", "_autumn_ledger_revisions", "_autumn_ledger_high_water"]
             "#,
         )
         .unwrap();
         assert!(check_purge_list(&ok).is_ok());
+    }
+
+    #[test]
+    fn purging_one_ledger_table_without_the_other_is_refused() {
+        // #2323: a high-water mark outlives the revisions it names on purpose,
+        // so a staging copy holding one without the other has `ledger_verify`
+        // accusing every ledgered record on a database nobody tampered with.
+        for (listed, missing) in [
+            ("_autumn_ledger_revisions", "_autumn_ledger_high_water"),
+            ("_autumn_ledger_high_water", "_autumn_ledger_revisions"),
+        ] {
+            let config = parse_config_str(&format!(
+                "[framework]\npurge = [\"autumn_jobs\", \"{listed}\"]\n"
+            ))
+            .unwrap();
+            let err = check_purge_list(&config)
+                .expect_err("emptying one ledger table alone must be refused");
+            assert!(
+                matches!(
+                    err,
+                    ScrubError::PurgeLedgerTablesUnpaired {
+                        listed: ref got_listed,
+                        missing: ref got_missing,
+                    } if got_listed == listed && got_missing == missing
+                ),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(missing), "{err}");
+        }
+
+        // Both, or neither, is fine.
+        for purge in [
+            r#"["autumn_jobs"]"#,
+            r#"["_autumn_ledger_revisions", "_autumn_ledger_high_water"]"#,
+        ] {
+            let ok = parse_config_str(&format!("[framework]\npurge = {purge}\n")).unwrap();
+            assert!(check_purge_list(&ok).is_ok(), "{purge}");
+        }
     }
 
     #[test]
