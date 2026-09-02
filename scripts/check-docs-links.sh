@@ -67,16 +67,59 @@ files = [
     if "/content/" not in f
 ]
 
-INLINE = re.compile(r'\[(?:[^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
-REFDEF = re.compile(r'^\s{0,3}\[[^\]]+\]:\s*(\S+)', re.M)
+# CommonMark also allows an angle-bracket destination — `[x](<target.md>)` —
+# which is the only way to write a path containing spaces. Both spellings are
+# captured; exactly one of the two groups matches per link. Without this, a
+# valid `(<target.md>)` is reported broken (the brackets end up in the path)
+# and a broken `(<missing file.md>)` is missed entirely.
+INLINE = re.compile(r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|([^)\s]+))(?:\s+"[^"]*")?\s*\)')
+REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
+
+
+def link_targets(text):
+    """Yield every link destination, angle brackets stripped."""
+    for pattern in (INLINE, REFDEF):
+        for bracketed, bare in pattern.findall(text):
+            yield (bracketed or bare).strip()
 # A rustdoc intra-doc path: two or more `::`-joined idents, no slashes.
 RUSTDOC = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$')
 
 
+FENCE = re.compile(r'^[ \t]*(`{3,}|~{3,})')
+
+
 def strip_fences(text):
-    """Drop fenced blocks so headings inside samples don't become anchors."""
-    text = re.sub(r'^```.*?^```', '', text, flags=re.S | re.M)
-    return re.sub(r'^~~~.*?^~~~', '', text, flags=re.S | re.M)
+    """Drop fenced blocks so samples inside them are not read as live links.
+
+    Scanned line by line rather than matched with an anchored regex, because
+    a fence's indentation is relative to its containing block: nested in a
+    list item it routinely sits at four or more columns, which no fixed
+    `^ {0,3}` prefix can express. This corpus uses 2- and 3-space fences in
+    176 places today; treating a markdown sample inside one as a live link
+    would fail this gate on text that renders as code.
+
+    A fence closes on the same character at least as long as the opener, so
+    a ```` ``` ```` sample nested inside a ```` ```` ```` block stays inside it.
+
+    An unclosed fence runs to end of file, which is what CommonMark specifies
+    and what GitHub renders — so a file with an unbalanced fence has its tail
+    treated as code by this gate exactly as a reader sees it. That is correct
+    but worth knowing: it means such a tail is not link-checked. One file is
+    in that state today (`skills/autumn-web/SKILL.md`, whose ```` ```bash ````
+    opener around line 2479 went missing); balancing it is a separate change,
+    not this gate's business.
+    """
+    out, opener = [], None
+    for line in text.splitlines():
+        m = FENCE.match(line)
+        if opener is None:
+            if m:
+                opener = m.group(1)
+            else:
+                out.append(line)
+        elif m and m.group(1)[0] == opener[0] and len(m.group(1)) >= len(opener):
+            opener = None
+    return "\n".join(out)
 
 
 def strip_code(text):
@@ -137,8 +180,7 @@ for f in files:
     text = read(os.path.join(root, f))
     if text is None:
         continue
-    for target in INLINE.findall(strip_code(text)) + REFDEF.findall(strip_code(text)):
-        t = target.strip()
+    for t in link_targets(strip_code(text)):
         if not t or t.startswith(("http://", "https://", "mailto:", "tel:")) or "://" in t:
             continue
         if RUSTDOC.match(t):
@@ -253,6 +295,38 @@ self_test() {
   printf 'See [second](jobs.md#setup-1).\n' >> "$c8/docs/guide/mail.md"
   git -C "$c8" commit -qam dup-headings
   check "duplicate-heading suffix resolves" pass "$c8"
+
+  # CommonMark angle-bracket destinations, both directions: the resolving one
+  # must not be reported (the brackets are not part of the path), and the
+  # broken one must be — it is the spelling used for paths with spaces, so
+  # a regex that only matches bare targets misses it entirely.
+  local c9="$tmp/c9"; make_corpus "$c9"
+  printf 'See [ok](<jobs.md>) and [ok too][ref].\n\n[ref]: <jobs.md>\n' \
+    >> "$c9/docs/guide/mail.md"
+  git -C "$c9" commit -qam angle-ok
+  check "angle-bracket destination resolves" pass "$c9"
+
+  local c10="$tmp/c10"; make_corpus "$c10"
+  printf 'See [gone](<missing file.md>).\n' >> "$c10/docs/guide/mail.md"
+  git -C "$c10" commit -qam angle-broken
+  check "broken angle-bracket destination with a space fails" fail "$c10"
+
+  # A fence indented inside a list item is still a fence. CommonMark allows up
+  # to three spaces; the corpus uses this form widely.
+  local c11="$tmp/c11"; make_corpus "$c11"
+  printf '\n- a nested item:\n\n    ```md\n    [example](totally-made-up.md)\n\n    ## Phantom Heading\n    ```\n' \
+    >> "$c11/docs/guide/mail.md"
+  git -C "$c11" commit -qam indented-fence
+  check "links inside an indented fence are ignored" pass "$c11"
+
+  # ...and the heading inside that indented fence must not become a real
+  # anchor, or a link to it would silently "resolve" to nothing.
+  local c12="$tmp/c12"; make_corpus "$c12"
+  printf '\n- a nested item:\n\n    ```md\n    ## Phantom Heading\n    ```\n' \
+    >> "$c12/docs/guide/jobs.md"
+  printf 'See [phantom](jobs.md#phantom-heading).\n' >> "$c12/docs/guide/mail.md"
+  git -C "$c12" commit -qam phantom-anchor
+  check "heading inside an indented fence is not an anchor" fail "$c12"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
