@@ -106,11 +106,18 @@ ESCAPED_PUNCT = re.compile(r'\\([!-/:-@\[-`{-~])')
 
 
 def link_targets(text):
-    """Yield every link destination once, unescaped and angle brackets removed."""
+    """Yield every link destination once, unescaped and angle brackets removed.
+
+    Escaped backslashes are folded to a placeholder first: `\\\\[x](y.md)` has
+    its bracket left UNescaped (the first backslash consumes the second), and
+    a fixed-width lookbehind cannot count the run to tell that from `\\[`.
+    """
+    text = text.replace("\\\\", "\x00")
     seen = set()
     for pattern in (INLINE, NESTED, REFDEF):
         for bracketed, bare in pattern.findall(text):
-            t = ESCAPED_PUNCT.sub(r'\1', (bracketed or bare).strip())
+            raw = (bracketed or bare).strip().replace("\x00", "\\\\")
+            t = ESCAPED_PUNCT.sub(r'\1', raw)
             if t and t not in seen:
                 seen.add(t)
                 yield t
@@ -348,16 +355,19 @@ for f in files:
         seen[s] = n + 1
         found.add(f"{s}-{n}")
 
+    # A heading nested in a block quote still renders a heading and still
+    # carries an anchor, so quote prefixes come off before any of this — for
+    # the underline, the ATX marker, AND the paragraph lines a Setext
+    # underline promotes. Stripping the underline but testing the raw line
+    # above it let `>` trip NOT_PARAGRAPH and lose the heading.
+    unquoted = [BLOCKQUOTE.sub("", l) for l in lines]
+
     for i in range(start, len(lines)):
-        # A heading nested in a block quote still renders a heading and still
-        # carries an anchor, so the quote prefix is stripped here just as the
-        # fence scanner strips it. Indexing only unquoted headings would
-        # reject a valid link to `> ## Quoted Heading`.
-        line = BLOCKQUOTE.sub("", lines[i])
+        line = unquoted[i]
         atx = re.match(r'^ {0,3}(#{1,6})\s+(.*)$', line)
         if atx:
             add(atx.group(2))
-        elif SETEXT.match(line) and i > start and not NOT_PARAGRAPH.match(lines[i - 1]):
+        elif SETEXT.match(line) and i > start and not NOT_PARAGRAPH.match(unquoted[i - 1]):
             # A Setext underline promotes the WHOLE paragraph above it, not
             # just its last line: `First line / second line / ---` is one
             # heading slugged `first-line-second-line`. Taking only the last
@@ -365,12 +375,16 @@ for f in files:
             # exists nowhere — and a phantom anchor makes a broken link look
             # resolved.
             j = i - 1
-            while j > start and not NOT_PARAGRAPH.match(lines[j - 1]):
+            while j > start and not NOT_PARAGRAPH.match(unquoted[j - 1]):
                 j -= 1
-            add(" ".join(l.strip() for l in lines[j:i]))
+            add(" ".join(l.strip() for l in unquoted[j:i]))
 
-    for m in re.finditer(r'<a\s+(?:id|name)="([^"]+)"', body):
-        found.add(m.group(1))
+    # `id=x`, `id='x'` and `id="x"` are all valid HTML.
+    for m in re.finditer(
+        r'''<a\s[^>]*?\b(?:id|name)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))''',
+        body,
+    ):
+        found.add(next(g for g in m.groups() if g is not None))
     anchors[f] = found
 
 defects = [
@@ -819,6 +833,28 @@ self_test() {
     >> "$c47/docs/guide/mail.md"
   git -C "$c47" commit -qam escaped-open-bracket
   check "escaped opening bracket is not a link" pass "$c47"
+
+  # An even-length backslash run leaves the bracket unescaped: the first
+  # backslash consumes the second, so the link is live.
+  local c48="$tmp/c48"; make_corpus "$c48"
+  printf '\nEven run: \\\\\\\\[x](missing.md) is a live link.\n' >> "$c48/docs/guide/mail.md"
+  git -C "$c48" commit -qam even-backslash-run
+  check "even backslash run leaves the link live" fail "$c48"
+
+  # A Setext heading inside a block quote: the underline AND the paragraph it
+  # promotes both need the quote prefix removed.
+  local c49="$tmp/c49"; make_corpus "$c49"
+  printf '\n> Quoted heading\n> ---\n' >> "$c49/docs/guide/jobs.md"
+  printf 'See [ok](jobs.md#quoted-heading).\n' >> "$c49/docs/guide/mail.md"
+  git -C "$c49" commit -qam quoted-setext
+  check "Setext heading inside a block quote is indexed" pass "$c49"
+
+  # `id=x`, `id='x'` and `id="x"` are all valid HTML.
+  local c50="$tmp/c50"; make_corpus "$c50"
+  printf "\n<a id='MixedId'></a>\n<a name=Bare></a>\n" >> "$c50/docs/guide/jobs.md"
+  printf 'See [q](jobs.md#MixedId) and [b](jobs.md#Bare).\n' >> "$c50/docs/guide/mail.md"
+  git -C "$c50" commit -qam anchor-quoting-forms
+  check "single-quoted and unquoted anchor ids resolve" pass "$c50"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
