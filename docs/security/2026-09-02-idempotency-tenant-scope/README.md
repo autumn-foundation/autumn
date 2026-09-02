@@ -115,6 +115,25 @@ upgrade, and no chance of a mutation retried across a deploy executing twice.
 * `RouteIdempotency::Direct` routes (raw `merge`/`nest` routers, `scoped`
   groups, `#[intercept]`ed routes) were already fail-closed and are unchanged.
 
+### Re-attacked after the fix
+
+* **Alias keys.** `DeferredIdempotencyCommit::add_session_alias` recomputes a
+  storage key after the handler ran. It reuses the `StorageKeyContext`, whose
+  tenant is captured once on the request path, so an alias cannot escape the
+  tenant's namespace even if it is computed outside the middleware's scope.
+* **Forcing a miss.** An attacker who varies the tenant to force a fresh miss
+  only moves into the namespace they resolved to, where their request is a
+  first use — the same position a different session already had.
+* **Tenant ids containing the separator.** Every component is length-delimited
+  inside the digest; `storage_key_tenant_component_is_length_delimited` pins
+  that a tenant id carrying `:` cannot spell another slot.
+* **Residual, by design:** a route listed in `[tenancy] public_paths` is
+  exempted by the tenancy middleware *before* it scopes anything, so requests
+  to it resolve no tenant and still share one namespace. That is the same
+  statement the app made by declaring the path tenant-independent (login pages,
+  static assets, health probes), and such a route has no tenant-scoped data to
+  leak.
+
 ## 📜 Compatibility
 
 No public signature changes (`build_storage_key` and `StorageKeyContext` are

@@ -50,3 +50,23 @@ $ ./scripts/check-panic-gate.sh
 
 $ ./scripts/check-determinism-gate.sh
   EXIT=0 — 18 modules gated (floor 18)
+
+$ ./scripts/pre-push-check.sh
+  check-panic-gate.sh                                        PASS
+  check-determinism-gate.sh                                  PASS
+  cargo fmt --all -- --check                                 PASS
+  cargo clippy --workspace --all-targets -- -D warnings      PASS
+  cargo clippy -p autumn-web --features "<gated set>" --lib  PASS
+  cargo test --workspace --no-run                            NOT COMPLETABLE HERE
+
+  The final compile-only leg cannot finish in this sandbox: the container's
+  38 GB disk cap is exhausted while linking the workspace's test binaries and
+  `ld` dies with `signal 7 [Bus error]` (the ENOSPC symptom), on example
+  crates this change does not touch (`reddit-clone`, `saas`, `invoice`, …).
+  Cleaning and retrying reproduces the same wall.
+
+  Cross-package compile risk for this diff is nil by construction — it adds a
+  private `fn` and one private struct field in `autumn/src/idempotency.rs`,
+  plus a new test module — and `cargo clippy -p autumn-web --all-targets`
+  (green, above) type-checks every autumn-web test target including the
+  consolidated `integration_tests` binary. CI runs the full leg.
