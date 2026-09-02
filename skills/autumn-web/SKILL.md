@@ -87,6 +87,7 @@ the framework almost certainly already generates or ships it:
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
+| Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -1828,8 +1829,12 @@ subset of queues — all config-only, no app-code change:
   comma-separated) makes a `worker`-role process claim *only* those queues,
   preserving weighted/strict order within the subset; empty/unset drains every
   queue. A worker leaving a configured queue uncovered logs a startup `WARN`
-  (an `ERROR` if it would claim nothing); `autumn doctor --strict` reports
-  coverage informationally (`jobs_queue_coverage`) without failing (issue #1623).
+  (an `ERROR` if it would claim nothing). `autumn doctor`'s
+  `jobs_queue_coverage` check reports informationally when no fleet topology is
+  declared; declare every tier's pin under `[jobs.fleet] tiers` and it hard-fails
+  (exit 1, in every mode — not only `--strict`) on a queue drained by no tier
+  (issues #1623, #1756). `autumn serve --pin <queues>` sets the pin as a flag,
+  forwarding `AUTUMN_JOBS__PIN`, and `serve restart` restores it.
 - **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
   with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
   per-job-type gauges (per-process approximations on multi-process backends).
@@ -2057,6 +2062,22 @@ max_concurrent_requests = 256   # unset/0 = unlimited
 Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
 sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
 and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
+
+The ceiling no longer has to be a guess. `autumn calibrate` measures what the
+build sustains and writes a committed `capacity.lock`; `autumn calibrate
+--check` gates rebuilds against it in CI, and pointing the runtime at it
+sources the ceiling from the proven envelope:
+
+```toml
+[server]
+capacity_contract = "capacity.lock"   # explicit max_concurrent_requests still wins
+```
+
+Each route in the contract also carries a resource shape (`db-bound`,
+`io-bound`, `compute-bound`) derived statically from the extractors its handler
+declares. Every contract failure — missing file, malformed document, a contract
+measured on a different host class — falls back to *unlimited*, never to a
+ceiling. See `docs/guide/capacity-contracts.md`.
 
 ## Sharding (0.6.0)
 
@@ -2294,6 +2315,8 @@ autumn canary status
 autumn canary promote
 autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
 autumn dev-loop-bench --dry-run
+autumn calibrate                 # measure the capacity envelope -> capacity.lock
+autumn calibrate --check         # CI gate: fail when a rebuild leaves the envelope
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 autumn plugin list
 autumn plugin add autumn-admin-plugin

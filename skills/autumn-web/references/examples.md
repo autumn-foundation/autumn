@@ -481,6 +481,16 @@ arrange the workload so every label is reachable at any seed and call
 but **not** entropy: pass `.with_entropy(SeededEntropy::new(sim.seed))` or a
 later `Rng` draw silently stops replaying from the seed.
 
+**`FaultPlan`** (#1680) — when the scenario is "the 3rd checkout fails" rather
+than "5% of checkouts fail", author it instead of drawing it:
+`TestApp::new().plugin(app).with_fault_plan(FaultPlan::from_seed(sim.seed).fail_job("charge_card", 1))`,
+drive the run with `sim.run_to_idle()` / `sim.advance(..)`, then
+`sim.client().fault_outcome().await`. `autumn/tests/integration/sim_fault_plan.rs`
+is the worked shape: the same plan against a `max_attempts = 1` job loses the
+charge and against `max_attempts = 3` records it once, and its 100× replay test
+compares `to_json_string()` byte-for-byte. A plan attached with no `Sim` still
+works, but only the paused runtime makes "the n-th execution" reproducible.
+
 **Failure capsules** — put `[failure_capture] enabled = true` in its own
 profile, not the dev one: a capsule is production data and database result rows
 are raw wire bytes that are never masked. Redaction matches parameter names by

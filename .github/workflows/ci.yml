@@ -167,6 +167,23 @@ jobs:
         # job exists standalone: no toolchain, no cache, reports in seconds,
         # and cannot be blocked by a clippy failure in `lint`.
         run: ./scripts/check-skill-version-markers.sh
+      - name: Markdown link gate
+        # `check-docs.sh` gates rustdoc intra-doc links and
+        # `check-plugin-freshness.sh` gates the docs/guide paths named from
+        # skills/ and agents/ — but nothing checked the markdown corpus
+        # itself. A guide could link to a page that was renamed, never
+        # written, or lives one directory up, and nothing noticed: the
+        # baseline run found 19 such links across 11 pages, including five
+        # rustdoc paths (`[x](autumn_web::aggregate::GroupedAggregate)`)
+        # pasted into hand-written markdown, where they render as relative
+        # links to a directory that does not exist.
+        #
+        # Unlike a wrong sentence, a 404 is a defect the reader cannot route
+        # around, so this is a gate rather than a report.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-links.sh
 
   supply-chain:
     name: Supply chain (cargo-deny)
@@ -677,6 +694,7 @@ jobs:
             --test sqlite_dependent_destroy \
             --test sqlite_commit_hook_worker \
             --test sim_chaos \
+            --test sim_fault_plan_db \
             --test sqlite_jobs_scheduler_e2e \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \

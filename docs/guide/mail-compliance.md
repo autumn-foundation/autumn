@@ -120,7 +120,7 @@ with a structured log event (`target: "mail", outcome = "skipped_suppressed"`).
 > **Deferred delivery.** Suppression filtering and header signing happen inside
 > `Mailer::send`. The in-process `deliver_later` fallback re-enters `send`, so it
 > is covered automatically. If you register a durable
-> [`MailDeliveryQueue`](mail.md#deferred-delivery), make its worker deliver by
+> [`MailDeliveryQueue`](mail.md#deferred-delivery-deliver_later), make its worker deliver by
 > calling `Mailer::send` (the standard pattern) rather than invoking a transport
 > directly — otherwise queued list mail would bypass suppression and the
 > List-Unsubscribe headers.

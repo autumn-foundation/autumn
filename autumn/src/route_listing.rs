@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capacity::{POOL_DB, ResourceShape};
+
 use crate::app::ScopedGroup;
 use crate::route::Route;
 
@@ -338,6 +340,22 @@ pub struct RouteInfo {
     /// not agent-operable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_grant: Option<String>,
+    /// Statically derived resource character of the route — the capacity
+    /// contract's per-route shape (issue #1733). Computed from [`Self::pools`]
+    /// by [`ResourceShape::from_pools`], so the classification rule lives in
+    /// exactly one place.
+    #[serde(default)]
+    pub resource_shape: ResourceShape,
+    /// Pool tags this route provably touches, sorted and deduplicated.
+    ///
+    /// A **provable subset**, never a complete accounting: it is read off the
+    /// handler's declared extractors at macro-expansion time, so a pool
+    /// reached through an application-held `State` value is invisible here and
+    /// the route reads as compute-bound. A route with no pools is therefore
+    /// normal, not a defect — the same "provable" caveat the security
+    /// dimensions of the routes manifest carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -498,6 +516,25 @@ fn agent_grant_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
+/// Pool tags proven for one route, sorted and deduplicated.
+///
+/// Repository auto-API routes are database-backed *by construction*: the
+/// generated CRUD handlers own their pool checkout internally, so no extractor
+/// appears in a signature the route macro could read. Adding the database tag
+/// here keeps the contract honest about the routes an app never wrote by hand.
+fn pools_of(
+    api_doc: &crate::openapi::ApiDoc,
+    repository: Option<&crate::route::RepositoryApiMeta>,
+) -> Vec<String> {
+    let mut pools: Vec<String> = api_doc.pools.iter().map(|p| (*p).to_owned()).collect();
+    if repository.is_some() && !pools.iter().any(|p| p == POOL_DB) {
+        pools.push(POOL_DB.to_owned());
+    }
+    pools.sort();
+    pools.dedup();
+    pools
+}
+
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
 ///
 /// `route_sources` is a parallel slice to `routes`; each element is the
@@ -562,6 +599,7 @@ pub fn collect_route_infos(
         let (classification, roles, scopes, policy) =
             classify(&source, &route.api_doc, route.repository.as_ref());
         let authorize_bindings = authorize_bindings_of(&source, &route.api_doc);
+        let pools = pools_of(&route.api_doc, route.repository.as_ref());
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -579,6 +617,8 @@ pub fn collect_route_infos(
             location: source_location_of(&route.api_doc),
             authorize_bindings,
             agent_grant: agent_grant_of(&route.api_doc),
+            resource_shape: ResourceShape::from_pools(&pools),
+            pools,
         });
     }
 
@@ -589,6 +629,7 @@ pub fn collect_route_infos(
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
             let (classification, roles, scopes, policy) =
                 classify(&group.source, &route.api_doc, route.repository.as_ref());
+            let pools = pools_of(&route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
@@ -606,6 +647,8 @@ pub fn collect_route_infos(
                 location: source_location_of(&route.api_doc),
                 authorize_bindings: authorize_bindings_of(&group.source, &route.api_doc),
                 agent_grant: agent_grant_of(&route.api_doc),
+                resource_shape: ResourceShape::from_pools(&pools),
+                pools,
             });
         }
     }
@@ -2126,5 +2169,69 @@ mod tests {
             "unmounted unsubscribe path must not be exempt: {:?}",
             plain_dump.csrf.exempt_paths
         );
+    }
+
+    // ── capacity contract: per-route resource shape (#1733) ──────────────
+
+    #[test]
+    fn a_route_declaring_a_database_pool_is_db_bound() {
+        let mut api_doc = dummy_api_doc();
+        api_doc.pools = &["db"];
+        let route = make_route_with(Method::GET, "/posts", "index", api_doc);
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
+        assert_eq!(infos[0].pools, vec!["db".to_owned()]);
+    }
+
+    #[test]
+    fn a_route_declaring_only_non_database_pools_is_io_bound() {
+        let mut api_doc = dummy_api_doc();
+        api_doc.pools = &["mail"];
+        let route = make_route_with(Method::POST, "/invite", "invite", api_doc);
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::IoBound
+        );
+    }
+
+    #[test]
+    fn a_route_proving_no_pool_is_compute_bound() {
+        let route = make_route(Method::GET, "/about", "about");
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::ComputeBound
+        );
+        assert!(infos[0].pools.is_empty());
+    }
+
+    #[test]
+    fn a_repository_auto_api_route_is_db_bound_without_a_declared_extractor() {
+        // The generated CRUD handlers own their pool checkout internally, so no
+        // extractor appears in a signature the macro could read — but the route
+        // is database-backed by construction.
+        let route = make_repo_route(Method::GET, "/api/posts", "list", Some(repo_meta(true)));
+
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])
+            .expect("route listing should collect");
+
+        assert_eq!(
+            infos[0].resource_shape,
+            crate::capacity::ResourceShape::DbBound
+        );
+        assert_eq!(infos[0].pools, vec!["db".to_owned()]);
     }
 }

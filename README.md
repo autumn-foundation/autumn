@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 [![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
@@ -135,6 +135,12 @@ multi-replica deployment":
 - Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, single-binary startup, and no inbound request deadline (so a debugger pause never 503s you).
 - Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, an experimental zero-dependency [embedded 2-node cluster](docs/guide/clustering.md) (authenticated gossip membership plus an eventually consistent cluster-wide counter — an additional option for a shared counter without standing up Redis, not a production-safe substitute for the backends above and not a leader-election or mutual-exclusion primitive), container scaffolding from `autumn new`, explicit migration jobs before web replicas roll, and a built-in **inbound request timeout** (the `prod` profile smart-defaults `server.timeouts.request_timeout_ms = 30000`) so a single hung handler returns a clean `503` and frees its worker instead of starving the pool — no hand-written tower layers. Streaming responses (SSE) are never interrupted — the deadline bounds the response head, not the body stream — and WebSocket upgrades are bounded only for the handshake, never the live socket. Any route can override with `#[get("/export", timeout_ms = 120000)]` or `timeout = "off"`.
 
+Deploys can also carry a **proven capacity contract**: `autumn calibrate` measures
+what a build sustains and records `capacity.lock`, `autumn calibrate --check`
+gates rebuilds against it in CI, and `[server] capacity_contract` lets the binary
+admission-control against its own proven envelope instead of a hand-tuned guess
+(see [Capacity Contracts](docs/guide/capacity-contracts.md)).
+
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
 done.
@@ -261,6 +267,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Widget Stories](docs/guide/stories.md) — the `/_stories` widget gallery and the `story!` macro
 - [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
+- [Capacity Contracts](docs/guide/capacity-contracts.md)
 - [Logging & PII](docs/guide/logging-pii.md)
 - [Failure Capsules](docs/guide/failure-capsules.md) — `[failure_capture]` records a failing request, its database traffic and its clock reads as one replayable file; `autumn replay` re-runs it offline
 - [Edge Capsules](docs/guide/edge.md) — `#[edge]` compiles read-path routes into a portable `wasm32-wasip1` artifact a CDN can run, byte-identical to the origin and falling back to it for anything the edge cannot serve (experimental)

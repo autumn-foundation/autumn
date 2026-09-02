@@ -503,6 +503,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         }
     }
 
