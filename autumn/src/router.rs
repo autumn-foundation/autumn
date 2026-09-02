@@ -5719,58 +5719,22 @@ pub fn try_build_router_with_static_inner(
                     } else {
                         path
                     };
-                    if let Some(file_path) = static_layer.resolve(normalized)
-                        && let Ok(contents) = tokio::fs::read(&file_path).await
+                    if let Some(hit) = static_layer.resolve_entry(normalized)
+                        && let Ok(contents) = tokio::fs::read(&hit.file_path).await
                     {
-                        // Derive the Content-Type from the request route's
-                        // extension rather than hard-coding text/html. The
-                        // response compression layer (applied OUTSIDE this
-                        // middleware) negotiates gzip/brotli by content type, so
-                        // an accurate MIME type is what lets compressible SSG
-                        // pages (HTML/CSS/JS/JSON/XML/text) be encoded while
-                        // binary manifest assets (images, fonts, octet-stream)
-                        // are left untouched.
+                        // #1832: `resolve_entry` hands back the Content-Type
+                        // the manifest recorded at generation time, already
+                        // decided (see `static_gen::resolved_content_type` for
+                        // the ordering and the legacy fallback). It is a
+                        // `HeaderValue`, so the builder below cannot fail on
+                        // manifest content.
                         //
-                        // The served file name is NOT a reliable MIME source for
-                        // generated routes: `static_gen::url_to_file_path` stores
-                        // every non-root route as `<route>/index.html`, so
-                        // `/robots.txt` -> `robots.txt/index.html` and
-                        // `/sitemap.xml` -> `sitemap.xml/index.html`. Reading the
-                        // extension off `index.html` would mislabel those as
-                        // text/html. The request route carries the true
-                        // extension, so prefer it — but ONLY when its final path
-                        // segment ends in an extension the asset table actually
-                        // recognizes.
-                        //
-                        // A bare `contains('.')` check is too loose: a generated
-                        // page whose slug merely contains a dot
-                        // (`/posts/release.v1`, `/users/alice@example.com`) is
-                        // still stored as `<slug>/index.html` HTML, yet `.v1` /
-                        // `.com` are not asset extensions. Deriving the MIME from
-                        // the route there would mislabel HTML as
-                        // `application/octet-stream` and break its compression.
-                        // `content_type_for_opt` returns `Some` only for a
-                        // recognized extension, so those unrecognized-dot slugs
-                        // fall through to the served file name (`index.html` ->
-                        // text/html), exactly like extensionless pages.
-                        //
-                        // Extensionless routes are real pages (`/about` ->
-                        // `about/index.html`) and resolve to text/html via the
-                        // same file-name fallback. Hand-written manifests that map
-                        // an extensionless route directly at an extensioned file
-                        // (e.g. `/logo` -> `logo.png`, `/inter` ->
-                        // `fonts/inter.woff2`) are likewise covered by it. The URL
-                        // path is always '/'-delimited, so inspecting the last
-                        // segment is unaffected by platform path separators.
-                        let content_type = crate::assets::content_type_for_opt(normalized)
-                            .unwrap_or_else(|| {
-                                file_path
-                                    .file_name()
-                                    .and_then(|name| name.to_str())
-                                    .map_or("application/octet-stream", |name| {
-                                        crate::assets::content_type_for(name)
-                                    })
-                            });
+                        // Why an accurate type matters here specifically: the
+                        // response compression layer is applied OUTSIDE this
+                        // middleware and negotiates gzip/brotli by content
+                        // type, so this header is what lets compressible SSG
+                        // pages be encoded while binary manifest assets are
+                        // left untouched.
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -5778,7 +5742,7 @@ pub fn try_build_router_with_static_inner(
                         };
                         return http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, content_type)
+                            .header(http::header::CONTENT_TYPE, hit.content_type)
                             .body(body)
                             .expect("infallible response builder");
                     }
@@ -11070,10 +11034,23 @@ enabled = true
     /// tuple to a file on disk. Returns the `TempDir` guard; the dist directory
     /// is at `<tmp>/dist`.
     fn create_ssg_dist(entries: &[(&str, &str, &[u8])]) -> tempfile::TempDir {
+        let with_types: Vec<_> = entries
+            .iter()
+            .map(|(route, file, bytes)| (*route, *file, *bytes, None))
+            .collect();
+        create_ssg_dist_with_types(&with_types)
+    }
+
+    /// Like [`create_ssg_dist`], but each entry also carries the `Content-Type`
+    /// recorded in the manifest at generation time (#1832). `None` reproduces a
+    /// pre-#1832 (or hand-written) manifest that records nothing.
+    fn create_ssg_dist_with_types(
+        entries: &[(&str, &str, &[u8], Option<&str>)],
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let dist = dir.path().join("dist");
         let mut routes = std::collections::HashMap::new();
-        for (route, file, bytes) in entries {
+        for (route, file, bytes, content_type) in entries {
             let path = dist.join(file);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("mkdir");
@@ -11081,10 +11058,8 @@ enabled = true
             std::fs::write(&path, bytes).expect("write file");
             routes.insert(
                 (*route).to_owned(),
-                crate::static_gen::ManifestEntry {
-                    file: (*file).to_owned(),
-                    revalidate: None,
-                },
+                crate::static_gen::ManifestEntry::new(*file)
+                    .with_content_type(content_type.map(str::to_owned)),
             );
         }
         let manifest = crate::static_gen::StaticManifest {
@@ -11264,6 +11239,112 @@ enabled = true
             None,
             "pre-compressed woff2 font must not be re-compressed"
         );
+    }
+
+    /// The other half of the two-entry font carve-out: WOFF **v1** is
+    /// pre-compressed too, and `COMPRESSION_EXCLUDED_CONTENT_TYPES` lists
+    /// `font/woff` separately from `font/woff2`. Without this, deleting the
+    /// `font/woff` line leaves the suite green.
+    #[tokio::test]
+    async fn ssg_woff_font_is_not_compressed_and_keeps_mime() {
+        let mut bytes = b"wOFF".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+
+        // Both paths: the legacy derivation from the file name, and a manifest
+        // that recorded `font/woff` at generation time.
+        for (label, recorded) in [("derived", None), ("recorded", Some("font/woff"))] {
+            let tmp =
+                create_ssg_dist_with_types(&[("/inter", "fonts/inter.woff", &bytes, recorded)]);
+            let dist = tmp.path().join("dist");
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/inter")
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("font/woff"),
+                "{label}: woff asset must keep its font/woff MIME type"
+            );
+            assert_eq!(
+                response.headers().get(http::header::CONTENT_ENCODING),
+                None,
+                "{label}: pre-compressed woff font must not be re-compressed"
+            );
+        }
+    }
+
+    /// The carve-out is deliberately narrow: raw SFNT fonts (`.ttf`/`.otf`) are
+    /// *not* pre-compressed and must keep being gzipped. Nothing else in the
+    /// repo defends this, so "tidying" the exclusion list into a `font/` prefix
+    /// match would silently stop compressing them — this is the test that says
+    /// no.
+    #[tokio::test]
+    async fn ssg_raw_sfnt_fonts_stay_compressible() {
+        // Highly compressible padding, well past the size floor.
+        let mut bytes = vec![0u8, 1, 0, 0];
+        bytes.extend(std::iter::repeat_n(b'A', 4096));
+
+        for (route, file, expected) in [
+            ("/inter-ttf", "fonts/inter.ttf", "font/ttf"),
+            ("/inter-otf", "fonts/inter.otf", "font/otf"),
+        ] {
+            let tmp = create_ssg_dist(&[(route, file, &bytes)]);
+            let dist = tmp.path().join("dist");
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "{route} must keep its raw-font MIME type"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some("gzip"),
+                "{route}: raw SFNT fonts are uncompressed data and must still be \
+                 gzipped — only WOFF/WOFF2 embed their own compression"
+            );
+        }
     }
 
     /// A manifest-backed asset served from a nested path with a multi-dot file
@@ -11552,6 +11633,648 @@ enabled = true
         );
     }
 
+    // ── #1832: the manifest's recorded Content-Type is authoritative ────────
+    //
+    // The six tests above pin the *derivation* that runs when a manifest
+    // records nothing — a `dist/` built before #1832, or a hand-written one.
+    // The tests below cover the recorded path, which removes the guess.
+
+    /// A recorded `Content-Type` is served verbatim, even when the route
+    /// extension would have produced something else. `/feed.xml` would derive
+    /// `application/xml`; the manifest says `application/rss+xml`, and the
+    /// manifest wins.
+    #[tokio::test]
+    async fn ssg_recorded_content_type_overrides_route_extension() {
+        let rss = format!(
+            "<?xml version=\"1.0\"?><rss>{}</rss>",
+            "<item><title>Post</title></item>".repeat(64)
+        );
+        let tmp = create_ssg_dist_with_types(&[(
+            "/feed.xml",
+            "feed.xml/index.html",
+            rss.as_bytes(),
+            Some("application/rss+xml"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/feed.xml")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/rss+xml"),
+            "the manifest's recorded Content-Type must win over route-extension derivation"
+        );
+    }
+
+    /// A type no extension in the asset table maps to (`text/calendar`) is
+    /// served from an extensionless route — impossible under the old
+    /// serve-time heuristic, which could only ever have said `text/html` here.
+    #[tokio::test]
+    async fn ssg_recorded_content_type_serves_type_outside_the_asset_table() {
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\n{}END:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\nSUMMARY:Standup\r\nEND:VEVENT\r\n".repeat(64)
+        );
+        let tmp = create_ssg_dist_with_types(&[(
+            "/calendar",
+            "calendar/index.html",
+            ics.as_bytes(),
+            Some("text/calendar; charset=utf-8"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/calendar")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/calendar; charset=utf-8"),
+            "a recorded type outside the asset table must still be served"
+        );
+    }
+
+    /// A recorded *binary* type on an extensionless route is honoured, and the
+    /// compression layer skips it — the recorded value drives transport
+    /// decisions exactly as a derived one does.
+    #[tokio::test]
+    async fn ssg_recorded_binary_content_type_is_not_compressed() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist_with_types(&[(
+            "/badge",
+            "badge/index.html",
+            &bytes,
+            Some("image/png"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/badge")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "recorded binary type must be honoured on an extensionless route"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "a recorded binary type must suppress compression just like a derived one"
+        );
+    }
+
+    /// A manifest whose recorded value cannot be a header (CRLF injection
+    /// attempt from a hand-edited or tampered `dist/`) must not panic the
+    /// request path and must not emit the injected header: the response falls
+    /// back to the derived type.
+    #[tokio::test]
+    async fn ssg_header_illegal_recorded_content_type_falls_back_without_panicking() {
+        let html = format!("<html><body>{}</body></html>", "About us. ".repeat(128));
+        let tmp = create_ssg_dist_with_types(&[(
+            "/about",
+            "about/index.html",
+            html.as_bytes(),
+            Some("text/html\r\nX-Injected: yes"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "a header-illegal recorded value must fall back to the derived type"
+        );
+        assert!(
+            response.headers().get("x-injected").is_none(),
+            "a CRLF in the manifest must never become a response header"
+        );
+    }
+
+    /// M1 — issue evidence item 1 (fonts), on the *recorded* path. The route
+    /// is extensionless and the file is `index.html`, so both legacy clues say
+    /// `text/html` (compressible); only the recorded `font/woff2` stops the
+    /// compression layer from re-encoding an already-compressed font.
+    #[tokio::test]
+    async fn ssg_recorded_woff2_type_suppresses_compression() {
+        let mut bytes = b"wOF2".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist_with_types(&[(
+            "/inter",
+            "inter/index.html",
+            &bytes,
+            Some("font/woff2"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/inter")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("font/woff2"),
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "a recorded pre-compressed font type must suppress compression that              the derived text/html would have allowed"
+        );
+    }
+
+    /// M2 — the other direction: the recorded type *enables* compression that
+    /// the derivation would have refused. `/data` → `data.bin` derives
+    /// `application/octet-stream` (never compressed); the manifest says the
+    /// bytes are text, and they are compressed accordingly.
+    #[tokio::test]
+    async fn ssg_recorded_text_type_enables_compression_derivation_would_refuse() {
+        let text = "log line ".repeat(256);
+        let tmp = create_ssg_dist_with_types(&[(
+            "/data",
+            "data.bin",
+            text.as_bytes(),
+            Some("text/plain; charset=utf-8"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/data")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the recorded text type must enable compression the octet-stream              derivation would have refused"
+        );
+    }
+
+    /// M3 — a manifest route whose file is missing on disk falls through to the
+    /// dynamic router. The recorded type must not leak onto that response: the
+    /// header belongs to a cache *hit*, not to a manifest entry.
+    #[tokio::test]
+    async fn ssg_manifest_route_with_missing_file_falls_through_to_dynamic_router() {
+        async fn dynamic() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                "<h1>dynamic</h1>".to_owned(),
+            )
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/feed",
+            handler: axum::routing::get(dynamic),
+            name: "feed",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/feed",
+                operation_id: "feed",
+                success_status: 200,
+                ..Default::default()
+            },
+            api_version: None,
+            sunset_opt_out: false,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::default(),
+            timeout: crate::route::RouteTimeout::default(),
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        };
+
+        let tmp = create_ssg_dist_with_types(&[(
+            "/feed",
+            "feed/index.html",
+            b"<rss/>",
+            Some("application/rss+xml"),
+        )]);
+        let dist = tmp.path().join("dist");
+        // The manifest still lists the route; the generated file is gone.
+        std::fs::remove_file(dist.join("feed/index.html")).expect("remove generated file");
+
+        let router = try_build_router_with_static(
+            vec![route],
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(Request::builder().uri("/feed").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "a manifest miss on disk must serve the dynamic handler's own type,              not the recorded one"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<h1>dynamic</h1>");
+    }
+
+    /// M7 — a trailing-slash request normalizes to the same manifest entry and
+    /// therefore carries the same recorded type. This is a case the old
+    /// heuristic got wrong: `/robots.txt/` has no recognized extension on its
+    /// final segment, so route-extension derivation fell through to
+    /// `index.html` and said `text/html`.
+    #[tokio::test]
+    async fn ssg_trailing_slash_request_serves_recorded_content_type() {
+        let body_text = format!("User-agent: *\nDisallow:\n{}", "# note\n".repeat(64));
+        let tmp = create_ssg_dist_with_types(&[(
+            "/robots.txt",
+            "robots.txt/index.html",
+            body_text.as_bytes(),
+            Some("text/plain; charset=utf-8"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/robots.txt/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "the normalized path drives both the manifest lookup and the header"
+        );
+    }
+
+    /// A `HEAD` request on a recorded route carries the same recorded type as
+    /// the `GET`, with no body.
+    #[tokio::test]
+    async fn ssg_head_request_carries_recorded_content_type() {
+        let tmp = create_ssg_dist_with_types(&[(
+            "/feed",
+            "feed/index.html",
+            b"<rss/>",
+            Some("application/rss+xml"),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::HEAD)
+                    .uri("/feed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/rss+xml")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "HEAD response must have an empty body");
+    }
+
+    /// End-to-end: a real `render_static_routes` build feeds the real serve
+    /// path. The three routes that each needed a serve-time heuristic
+    /// correction during #1819 — a generated `.txt`, a generated `.xml`, and a
+    /// dotted-slug HTML page — plus two the heuristic could never get right:
+    /// `/feed`, extensionless but RSS, and `/notes.txt`, whose handler declares
+    /// JSON in direct contradiction of its slug.
+    ///
+    /// It asserts the recorded manifest values *and* the served headers.
+    /// Asserting only the headers would be weak: for the three #1819 routes the
+    /// old heuristic produced the same answer, so the header alone proves
+    /// nothing about recording. The manifest assertions are what the pre-#1832
+    /// code cannot satisfy at all, and `/notes.txt` is what no derivation from
+    /// the route or the file name could ever produce.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // five routes x (handler + build + serve assertions)
+    async fn ssg_generated_manifest_round_trips_content_types_end_to_end() {
+        async fn robots() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("User-agent: *\nDisallow:\n{}", "# note\n".repeat(128)),
+            )
+        }
+        // Bodies are padded past the compression size floor throughout, so the
+        // `Content-Encoding` assertions below turn on the recorded *type* and
+        // never on the body being too small to bother with.
+        async fn sitemap() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "application/xml")],
+                format!(
+                    "<?xml version=\"1.0\"?><urlset>{}</urlset>",
+                    "<url><loc>https://example.com/</loc></url>".repeat(16)
+                ),
+            )
+        }
+        async fn release_notes() -> impl axum::response::IntoResponse {
+            axum::response::Html(format!(
+                "<html><body>{}</body></html>",
+                "Release notes. ".repeat(128)
+            ))
+        }
+        async fn feed() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "application/rss+xml")],
+                format!("<rss><channel>{}</channel></rss>", "<item/>".repeat(64)),
+            )
+        }
+        // Slug says `.txt`, handler says JSON. No derivation from the route or
+        // the served file name can produce this; only recording can.
+        async fn notes() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "application/json")],
+                format!(
+                    r#"{{"notes":[{}]}}"#,
+                    r#""note","#.repeat(32).trim_end_matches(',')
+                ),
+            )
+        }
+        // The third #1819 case, on the recorded path: a slug whose final
+        // segment contains dots and an `@` but which is plain HTML.
+        async fn profile() -> impl axum::response::IntoResponse {
+            axum::response::Html(format!(
+                "<html><body>{}</body></html>",
+                "Alice. ".repeat(128)
+            ))
+        }
+        // The behaviour change the changelog calls out as breaking, proven at
+        // the served-header level and not just in the manifest: an
+        // *extensionless* route returning a bare `String` declares
+        // `text/plain; charset=utf-8`, and that is now what is served — where
+        // the pre-#1832 heuristic assumed `text/html` from `about/index.html`.
+        async fn about() -> impl axum::response::IntoResponse {
+            "About us. ".repeat(128)
+        }
+
+        fn meta(path: &'static str, name: &'static str) -> crate::static_gen::StaticRouteMeta {
+            crate::static_gen::StaticRouteMeta {
+                path,
+                name,
+                revalidate: None,
+                params_fn: None,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+            }
+        }
+
+        let build_router = axum::Router::new()
+            .route("/robots.txt", axum::routing::get(robots))
+            .route("/sitemap.xml", axum::routing::get(sitemap))
+            .route("/posts/release.v1", axum::routing::get(release_notes))
+            .route("/feed", axum::routing::get(feed))
+            .route("/notes.txt", axum::routing::get(notes))
+            .route("/users/alice@example.com", axum::routing::get(profile))
+            .route("/about", axum::routing::get(about));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        crate::static_gen::render_static_routes(
+            build_router,
+            &[
+                meta("/robots.txt", "robots"),
+                meta("/sitemap.xml", "sitemap"),
+                meta("/posts/release.v1", "release_notes"),
+                meta("/feed", "feed"),
+                meta("/notes.txt", "notes"),
+                meta("/users/alice@example.com", "profile"),
+                meta("/about", "about"),
+            ],
+            &dist,
+        )
+        .await
+        .expect("static build succeeds");
+
+        // Every generated page is stored as `<route>/index.html` — the layout
+        // that made the serve-time file-name heuristic unreliable.
+        for file in [
+            "robots.txt/index.html",
+            "sitemap.xml/index.html",
+            "posts/release.v1/index.html",
+            "feed/index.html",
+            "notes.txt/index.html",
+            "users/alice@example.com/index.html",
+            "about/index.html",
+        ] {
+            assert!(dist.join(file).is_file(), "{file} must have been generated");
+        }
+
+        // Route, recorded/served type, and whether the type makes the body
+        // compressible — the recorded type's whole transport consequence.
+        let expected = [
+            ("/robots.txt", "text/plain; charset=utf-8", true),
+            ("/sitemap.xml", "application/xml", true),
+            ("/posts/release.v1", "text/html; charset=utf-8", true),
+            ("/feed", "application/rss+xml", true),
+            ("/notes.txt", "application/json", true),
+            ("/users/alice@example.com", "text/html; charset=utf-8", true),
+            ("/about", "text/plain; charset=utf-8", true),
+        ];
+
+        // The build recorded the intended type for every route. This is the
+        // assertion the pre-#1832 generator cannot satisfy — it wrote no type
+        // at all — and it is what makes the header assertions below meaningful
+        // rather than a restatement of the old heuristic.
+        let manifest =
+            crate::static_gen::StaticManifest::load(&dist.join("manifest.json")).expect("manifest");
+        for (route, content_type, _) in expected {
+            assert_eq!(
+                manifest.routes[route].content_type.as_deref(),
+                Some(content_type),
+                "{route} must carry its declared type in the manifest"
+            );
+        }
+
+        for (route, content_type, compressible) in expected {
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(content_type),
+                "{route} must be served as the type its handler declared at build time"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    == Some("gzip"),
+                compressible,
+                "{route}: the recorded type must drive compression negotiation"
+            );
+        }
+    }
+
     /// A dynamic fallback route (not in the manifest) is compressed the same way
     /// as SSG pages, confirming parity between static-first and dynamic
     /// responses.
@@ -11630,17 +12353,12 @@ enabled = true
         let mut routes = std::collections::HashMap::new();
         routes.insert(
             "/".to_owned(),
-            crate::static_gen::ManifestEntry {
-                file: "index.html".to_owned(),
-                revalidate: None,
-            },
+            crate::static_gen::ManifestEntry::new("index.html".to_owned()),
         );
         routes.insert(
             "/about".to_owned(),
-            crate::static_gen::ManifestEntry {
-                file: "about/index.html".to_owned(),
-                revalidate,
-            },
+            crate::static_gen::ManifestEntry::new("about/index.html".to_owned())
+                .with_revalidate(revalidate),
         );
 
         let manifest = crate::static_gen::StaticManifest {
@@ -13016,10 +13734,7 @@ mod trusted_host_tests {
         let mut routes = std::collections::HashMap::new();
         routes.insert(
             "/".to_owned(),
-            crate::static_gen::ManifestEntry {
-                file: "index.html".to_owned(),
-                revalidate: None,
-            },
+            crate::static_gen::ManifestEntry::new("index.html".to_owned()),
         );
         let manifest = crate::static_gen::StaticManifest {
             generated_at: "2026-06-14T00:00:00Z".to_owned(),
