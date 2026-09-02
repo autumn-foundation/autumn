@@ -2318,7 +2318,15 @@ fn render_form_widget(
             // extra pair of quotes, turning `{broken` into the seemingly
             // valid JSON string `"{broken"` and risking a silent resave of
             // the wrong data — Codex review, PR #2422).
-            let json_val = if raw_fields.contains(&field.name) {
+            let json_val = if raw_fields.contains(&field.name) || field.encrypted {
+                // `field.encrypted`: this arm otherwise reads `record`
+                // directly (see the #1341 comment above) rather than the
+                // already-cleared `current_value`/`str_val`, which would
+                // still leak an encrypted JSON field's submitted plaintext
+                // on a create-failure redisplay (Codex review, PR #2422).
+                // `str_val` is `""` here in both cases: it comes from
+                // `current_value`, which is already forced to `Value::Null`
+                // for every encrypted field above.
                 str_val
             } else {
                 match record.and_then(|r| r.get(field.name)) {
@@ -2655,6 +2663,36 @@ mod tests {
             !form.contains("••••••••"),
             "create control is an empty input, not the redaction mask: {form}"
         );
+    }
+
+    #[test]
+    fn create_failure_redisplay_never_echoes_encrypted_plaintext() {
+        // Codex review, PR #2422: a create-validation-failure redisplay
+        // passes `Some(record)` holding the admin's just-typed values
+        // (`is_edit` stays `false`, so this isn't the EDIT-only redacted
+        // branch) — an encrypted field must still never echo that plaintext
+        // back into the response, in any widget kind, including `Json`
+        // (which has its own record lookup, separate from the shared
+        // `current_value` guard, for the #1341 stored-null case).
+        let record = serde_json::json!({
+            "ssn": "123-45-6789",
+            "secret_config": {"token": "sk-live-999"},
+        });
+        for field in [
+            AdminField::new("ssn", AdminFieldKind::Text).encrypted(),
+            AdminField::new("secret_config", AdminFieldKind::Json).encrypted(),
+        ] {
+            let name = field.name;
+            let form = render_form_widget(&field, Some(&record), false, &[]).into_string();
+            assert!(
+                form.contains(&format!("name=\"{name}\"")),
+                "create control must stay submittable for {name}: {form}"
+            );
+            assert!(
+                !form.contains("123-45-6789") && !form.contains("sk-live-999"),
+                "encrypted {name} must not echo the submitted plaintext on a create failure: {form}"
+            );
+        }
     }
 
     #[test]
