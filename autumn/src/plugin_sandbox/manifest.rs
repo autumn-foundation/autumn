@@ -147,7 +147,7 @@ impl SandboxCapability {
     pub fn parse(raw: &str) -> Result<Self, ManifestError> {
         match raw {
             "http-request" => Ok(Self::HttpRequest),
-            other => Err(ManifestError::UnknownCapability(other.to_owned())),
+            other => Err(ManifestError::UnknownCapability(rejected(other))),
         }
     }
 }
@@ -746,7 +746,7 @@ impl SandboxManifest {
             && self.version.len() <= MAX_NAME_LEN
             && self.version.chars().all(|ch| ch.is_ascii_graphic());
         if !version_ok {
-            return Err(ManifestError::InvalidVersion(self.version.clone()));
+            return Err(ManifestError::InvalidVersion(rejected(&self.version)));
         }
         validate_prefix(&self.prefix)?;
         if !self.grants(SandboxCapability::HttpRequest) {
@@ -790,21 +790,21 @@ impl SandboxManifest {
         let mut inserted: Vec<&str> = Vec::with_capacity(self.routes.len());
         for route in &self.routes {
             if !ALLOWED_METHODS.contains(&route.method.as_str()) {
-                return Err(ManifestError::InvalidMethod(route.method.clone()));
+                return Err(ManifestError::InvalidMethod(rejected(&route.method)));
             }
             validate_route_path(&route.path)?;
             if !path_is_under_prefix(&route.path, &self.prefix) {
                 return Err(ManifestError::RouteOutsidePrefix {
-                    method: route.method.clone(),
-                    path: route.path.clone(),
-                    prefix: self.prefix.clone(),
+                    method: rejected(&route.method),
+                    path: rejected(&route.path),
+                    prefix: rejected(&self.prefix),
                 });
             }
             let key = (route.method.as_str(), route.path.as_str());
             if seen.contains(&key) {
                 return Err(ManifestError::DuplicateRoute {
-                    method: route.method.clone(),
-                    path: route.path.clone(),
+                    method: rejected(&route.method),
+                    path: rejected(&route.path),
                 });
             }
             seen.push(key);
@@ -814,8 +814,8 @@ impl SandboxManifest {
                     shapes.insert(route.path.as_str(), ())
                 {
                     return Err(ManifestError::ConflictingRoutes {
-                        first: with,
-                        second: route.path.clone(),
+                        first: rejected(&with),
+                        second: rejected(&route.path),
                     });
                 }
                 inserted.push(route.path.as_str());
@@ -847,7 +847,7 @@ fn validate_name(name: &str) -> Result<(), ManifestError> {
     if legal {
         Ok(())
     } else {
-        Err(ManifestError::InvalidName(name.to_owned()))
+        Err(ManifestError::InvalidName(rejected(name)))
     }
 }
 
@@ -859,7 +859,7 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
     if legal {
         Ok(())
     } else {
-        Err(ManifestError::InvalidDigest(digest.to_owned()))
+        Err(ManifestError::InvalidDigest(rejected(digest)))
     }
 }
 
@@ -929,10 +929,31 @@ pub(super) const fn is_display_reordering(ch: char) -> bool {
     )
 }
 
+/// Carry a rejected value into its error as a bounded, neutralised excerpt.
+///
+/// Every caller of this rejects a value for its *shape* — too long, not 64 hex
+/// digits, not a known capability — which is decided from the value without
+/// ever needing a second copy of it. Cloning it wholesale to say so inverts
+/// that: `SandboxManifest`'s fields are public, so a direct
+/// [`SandboxHost::from_module`](super::host::SandboxHost::from_module) caller
+/// can hand over a name of any size, and the rejection would then hold the
+/// original, this copy, and the `to_string()` `from_module` formats out of it —
+/// three of the thing whose size was the objection. The container reader's
+/// `MAX_MANIFEST_BYTES` does not help here: it bounds a manifest parsed out of
+/// an artifact, not one a caller constructed in Rust.
+///
+/// [`guest_text`](super::host::guest_text) is the bound this crate already
+/// applies to text an untrusted party influenced, and it escapes as well as
+/// truncates — so a name carrying U+202E cannot reorder the consent screen or
+/// the log line that reports it refused.
+fn rejected(value: &str) -> String {
+    super::host::guest_text(value)
+}
+
 fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &'static str| {
         Err(ManifestError::InvalidPrefix {
-            prefix: prefix.to_owned(),
+            prefix: rejected(prefix),
             reason,
         })
     };
@@ -980,7 +1001,7 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
 fn validate_route_path(path: &str) -> Result<(), ManifestError> {
     let refuse = |reason: &'static str| {
         Err(ManifestError::InvalidRoutePath {
-            path: path.to_owned(),
+            path: rejected(path),
             reason,
         })
     };
@@ -1035,7 +1056,7 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
     let mut probe: matchit::Router<()> = matchit::Router::new();
     if let Err(err) = probe.insert(path, ()) {
         return Err(ManifestError::InvalidRoutePath {
-            path: path.to_owned(),
+            path: rejected(path),
             reason: match err {
                 matchit::InsertError::InvalidParam => {
                     "a capture must be spelled `{name}` with a non-empty name"
@@ -1752,6 +1773,60 @@ max_concurrency = 8
     fn the_default_limits_are_within_the_footprint_ceiling() {
         let manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
         assert_eq!(manifest.limits, ResourceLimits::default());
+    }
+
+    #[test]
+    fn a_value_rejected_for_its_size_is_not_copied_at_that_size() {
+        // `SandboxManifest`'s fields are public, so a direct
+        // `SandboxHost::from_module` caller reaches validation with a value the
+        // container reader's `MAX_MANIFEST_BYTES` never saw. Rejecting a name
+        // for being too long, and then carrying the whole thing into the error
+        // to say so, holds the original plus a copy plus the string
+        // `from_module` formats out of it — three of the thing whose size was
+        // the objection.
+        //
+        // The bound is what is asserted, not the exact excerpt: the point is
+        // that the error's size is decided by this crate rather than by the
+        // caller.
+        let huge = "x".repeat(512 * 1024);
+
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
+        manifest.name.clone_from(&huge);
+        let err = manifest
+            .validate()
+            .expect_err("an oversized name is refused");
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() < huge.len() / 100,
+            "the error carries the rejected value at its own size: {} bytes for a {} byte name",
+            rendered.len(),
+            huge.len(),
+        );
+
+        // The sibling fields reject on shape too, and each was its own copy.
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
+        manifest.sha256.clone_from(&huge);
+        let rendered = manifest
+            .validate()
+            .expect_err("an oversized digest is refused")
+            .to_string();
+        assert!(
+            rendered.len() < huge.len() / 100,
+            "the digest error carries the rejected value: {} bytes",
+            rendered.len(),
+        );
+
+        let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
+        manifest.prefix = format!("/{huge}");
+        let rendered = manifest
+            .validate()
+            .expect_err("an oversized prefix is refused")
+            .to_string();
+        assert!(
+            rendered.len() < huge.len() / 100,
+            "the prefix error carries the rejected value: {} bytes",
+            rendered.len(),
+        );
     }
 
     #[test]
