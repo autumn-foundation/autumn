@@ -47,7 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables are not exactly the table's two tiers — moving one row between tiers in
   either file turns it red. A `windows-tier1` CI job walks the whole Tier 1
   journey — scaffold, `doctor`, `setup`, dev-loop edit/rebuild/reload, managed
-  Postgres boot and clean shutdown — on every pull request into `trunk-dev`.
+  Postgres boot and clean shutdown — on every pull request into `trunk-dev`. On
+  its first run the gate immediately earned its keep, surfacing a Windows-only
+  link failure (`LNK4319`, the PDB public-symbol limit) that a debug build of a
+  `--bundled-pg` scaffold hits and that the pre-existing `cargo test
+  --workspace` Windows leg could never see, because it never builds a
+  scaffolded app. The workaround is documented in the platform-support guide;
+  the product-level fix is tracked separately.
 - **Pin a worker tier to queues from the command line, and let `doctor` prove
   fleet-wide queue coverage (#1623):** per-queue `reserved`/`concurrency` pools
   and `jobs.pin` already existed, but pinning could only be spelled in

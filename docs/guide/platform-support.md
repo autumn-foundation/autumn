@@ -29,7 +29,31 @@ Tier 1 is a **gate, not an aspiration**: `.github/workflows/ci.yml` runs a
 and clean shutdown — on every pull request into `trunk-dev`. If a change breaks
 a Tier 1 command on Windows, that job goes red before the change merges.
 
-### Three Windows details worth knowing
+### Four Windows details worth knowing
+
+**A debug build of a managed-Postgres app can exceed the PDB symbol limit.**
+`autumn-web`'s dependency graph plus `managed-pg-bundled` (which embeds the
+Postgres binaries in your executable) produces more public symbols than a
+Windows PDB can hold, and the MSVC linker fails the build outright:
+
+```text
+LNK4318: Very long symbol name encountered while producing debug information
+LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
+```
+
+It is a linker limit, not a code error. Reduce the debug info for the dev
+profile in your project's `Cargo.toml`:
+
+```toml
+[profile.dev]
+debug = "line-tables-only"   # or `0` if that is still too much
+```
+
+`line-tables-only` keeps backtraces useful (file and line, no variable
+inspection) at a fraction of the symbol count. Autumn's own `windows-tier1` CI
+job builds with `debug = 0` for this reason.
+
+### Three other Windows details worth knowing
 
 **Managed Postgres has two native entry points, and one that is not.**
 `autumn dev` and running the built binary directly both boot and cleanly stop a

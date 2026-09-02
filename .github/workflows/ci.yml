@@ -855,6 +855,24 @@ jobs:
       # workflow file invalid, so every job in this file silently stops running.
       # They are exported from the first step instead.
       CARGO_TARGET_DIR: ${{ github.workspace }}\target
+      # The MSVC linker blows its PDB public-symbol limit linking the scaffolded
+      # `--bundled-pg` app with default debug info:
+      #
+      #   LNK4318: Very long symbol name encountered while producing debug information
+      #   LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
+      #
+      # autumn-web's full dependency graph plus `managed-pg-bundled` (which
+      # embeds the Postgres binaries) produces more public symbols in one debug
+      # binary than a PDB can hold. This is a real limit a Windows developer can
+      # hit too — it is documented as a Windows detail in
+      # docs/guide/platform-support.md and tracked for a product-level fix — so
+      # it is named here rather than silently configured around.
+      #
+      # Dropping debug info is a legitimate build configuration and does not
+      # weaken what this job gates: the journey still scaffolds, builds, boots a
+      # managed cluster, reloads, and shuts down. It only means a crash here
+      # yields a backtrace without line numbers.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
