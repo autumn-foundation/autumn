@@ -98,14 +98,20 @@ scheduled CI check with no other owner).
 Individual post-fix runs: 105,371 / 95,988 / 97,482 ms. Net change over the
 pre-fix baseline: **~12.5%** (120,422 → 105,371ms p95) — well short of the
 **~33%** the fix's own controlled same-box test already demonstrated (see
-Prior Art). Applying that confirmed ~33% relative saving to the CI pre-fix
-baseline (120,422ms) predicts a post-fix p95 of roughly **80,100ms**; the
-actual post-fix CI run came in at 105,371ms, about **25,000ms higher** than
-what the already-confirmed fix would predict on this baseline. This is a
-comparison across two different commits, a full week apart, on separate
-GitHub-hosted runners (not the same box PR #2360 used) — not a controlled
-before/after of the fix alone, so intervening changes and runner variance are
-both live confounds for that ~25,000ms residual gap.
+Prior Art). That comparison is directional only, not a quantitative
+prediction: the ~33% figure is a single run per variant on PR #2360's local
+4-core box, while 120,422ms/105,371ms are 3-sample p95s from different
+commits on a different (GitHub-hosted) runner a week apart. A compile-time
+percentage saving is not necessarily invariant across hardware — the ratio of
+macro-compile cost to the build's fixed costs (linking, other crates, I/O)
+can differ by machine — so it cannot be used to derive a specific predicted
+CI p95 or a specific residual millisecond figure. What can be said without
+that unsupported precision: real usage moved much less than the fix's own
+confirmed relative saving would suggest, across two different commits, a
+full week apart, on a different runner than PR #2360 used — intervening
+changes and runner variance are both live confounds, and only a controlled
+before/after on the *same* runner (the follow-up below) can turn "much less"
+into a number.
 
 The post-fix run's diagnosis line ("the first clean compile got heavier. A
 new default dependency or feature likely bloated the from-scratch build") is
@@ -154,15 +160,23 @@ same-box, same-binary comparison (see Prior Art) showed a genuine **-33%**
 end-to-end saving (136,594ms → 90,846ms), and this assay's isolated crate
 rebuild independently reproduces the underlying cause (~94% reduction in
 `autumn-macros`' own compile time, 54.8s → 3.34s). But the real weekly CI
-trajectory only moved **-12.5%** (120,422 → 105,371ms) — a ~25,000ms residual
-gap versus what the confirmed ~33% relative saving predicts on the CI
-baseline. This assay cannot attribute that gap to a specific cause: the two
-CI runs span a week of unrelated commits and a different runner than PR
-#2360's local box, both live confounds, and (per the correction above) CI's
-own diagnosis line is generic boilerplate, not a finding. Isolating it needs
-a `cargo build --timings` bisection over the *full* comparison interval,
-`d1ecb361..ef61ae44` (2026-08-24 → 2026-08-31 — the two runs' actual commits,
-not a narrower guess). Candidate commits worth checking first, because they
+trajectory only moved **-12.5%** (120,422 → 105,371ms). That -33% and -12.5%
+are not directly comparable numbers — one run per variant on PR #2360's
+local box vs. 3-sample p95s from different commits on a different,
+GitHub-hosted runner a week apart — so this assay does **not** claim a
+specific predicted CI value or a specific residual millisecond gap; a
+compile-time percentage is not guaranteed to transfer across hardware.
+What the two figures do support, qualitatively, is that real usage moved far
+less than the fix's own confirmed relative saving would suggest. This assay
+cannot attribute that shortfall to a specific cause: the two CI runs span a
+week of unrelated commits and a different runner than PR #2360's local box,
+both live confounds, and (per the correction above) CI's own diagnosis line
+is generic boilerplate, not a finding. Turning "far less" into a number, and
+isolating why, needs a controlled before/after on the *same* runner (ideally
+CI itself) and/or a `cargo build --timings` bisection over the *full*
+comparison interval, `d1ecb361..ef61ae44` (2026-08-24 → 2026-08-31 — the two
+runs' actual commits, not a narrower guess). Candidate commits worth checking
+first, because they
 touch default features/deps in that window: `1fd6245` Ledgered entities
 (Aug 27), `61bdd9c` Web Push (Aug 27), `fec5221` zero-downtime in-place
 upgrades (Aug 29) — unconfirmed, not evidence of cause, and not necessarily
