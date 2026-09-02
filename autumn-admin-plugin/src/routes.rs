@@ -426,6 +426,76 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
+/// Re-render the create/edit form after a validation failure instead of
+/// navigating away to the generic error page. Preserves every value the
+/// admin typed (`submitted`) and surfaces `error_message` through the same
+/// persistent, accessible flash banner every other page uses — no toast, no
+/// blank form, no lost input.
+#[allow(clippy::too_many_arguments)]
+fn invalid_form_response(
+    registry: &AdminRegistry,
+    slug: &str,
+    model: &dyn AdminModel,
+    fields: &[AdminField],
+    submitted: &Value,
+    error_message: String,
+    id: Option<i64>,
+    csrf: &AdminCsrf,
+    prefix: &str,
+    actuator_prefix: &str,
+    show_config: bool,
+    imp: &AdminImpersonation,
+) -> Response {
+    let messages = [FlashMessage {
+        level: FlashLevel::Error,
+        message: error_message,
+    }];
+    let markup = templates::model_form_page(
+        registry,
+        slug,
+        model.display_name(),
+        model.display_name_plural(),
+        fields,
+        Some(submitted),
+        id,
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        csrf.token_header(),
+        prefix,
+        actuator_prefix,
+        show_config,
+        imp.banner(prefix, csrf.token(), csrf.form_field()).as_ref(),
+    );
+    (StatusCode::UNPROCESSABLE_ENTITY, Html(markup.into_string())).into_response()
+}
+
+/// After a validation failure on update, `submitted` holds only the fields
+/// the browser actually sent — create-only columns render read-only with no
+/// `name` attribute (see `render_readonly_display`), so they never round-trip
+/// through the form post. Merge the submitted edits onto the stored record so
+/// those columns keep showing their real value on redisplay instead of going
+/// blank.
+async fn merge_with_stored_record(
+    model: &dyn AdminModel,
+    pool: &Pool<::autumn_web::RuntimeConnection>,
+    id: i64,
+    submitted: &Value,
+) -> Value {
+    let mut base = model
+        .get(pool, id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| submitted.clone());
+    if let (Some(obj), Some(sub)) = (base.as_object_mut(), submitted.as_object()) {
+        for (k, v) in sub {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    base
+}
+
 /// Extract the value of the `__autumn_reveal` cookie from request headers.
 fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     let cookie_str = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
@@ -709,23 +779,62 @@ async fn model_new_form(
 }
 
 /// `POST /admin/{slug}` — Create a record.
+#[allow(clippy::too_many_arguments)]
 async fn model_create(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
+    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields)
-        .map_err(AutumnError::bad_request_msg)?;
-    let record = model
-        .create(&pool, form_data)
-        .await
-        .map_err(|e| admin_err("Create failed", e))?;
+    let submitted = strip_meta_fields(form_data, &fields, false);
+    let form_data = match coerce_form_fields(submitted.clone(), &fields) {
+        Ok(v) => v,
+        Err(msg) => {
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &submitted,
+                msg,
+                None,
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+    };
+    let record = match model.create(&pool, form_data.clone()).await {
+        Ok(record) => record,
+        Err(AdminError::Validation(msg)) => {
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &form_data,
+                msg,
+                None,
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+        Err(e) => return Err(admin_err("Create failed", e)),
+    };
     // The post-create redirect needs a routable ID. Treat a missing or
     // non-numeric `id` as a model-impl bug rather than silently sending
     // the admin to `/{slug}/0` (which lands on the wrong row or a 404).
@@ -961,23 +1070,63 @@ async fn model_edit_form(
 }
 
 /// `POST /admin/{slug}/{id}` — Update a record.
+#[allow(clippy::too_many_arguments)]
 async fn model_update(
+    imp: AdminImpersonation,
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
+    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields)
-        .map_err(AutumnError::bad_request_msg)?;
-    model
-        .update(&pool, id, form_data)
-        .await
-        .map_err(|e| admin_err("Update failed", e))?;
+    let submitted = strip_meta_fields(form_data, &fields, true);
+    let form_data = match coerce_form_fields(submitted.clone(), &fields) {
+        Ok(v) => v,
+        Err(msg) => {
+            let display = merge_with_stored_record(model, &pool, id, &submitted).await;
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &display,
+                msg,
+                Some(id),
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+    };
+    if let Err(e) = model.update(&pool, id, form_data.clone()).await {
+        if let AdminError::Validation(msg) = e {
+            let display = merge_with_stored_record(model, &pool, id, &form_data).await;
+            return Ok(invalid_form_response(
+                &registry,
+                &slug,
+                model,
+                &fields,
+                &display,
+                msg,
+                Some(id),
+                &csrf,
+                &prefix,
+                &actuator_prefix,
+                show_config,
+                &imp,
+            ));
+        }
+        return Err(admin_err("Update failed", e));
+    }
     flash
         .success(format!("{} #{id} updated.", model.display_name()))
         .await;
@@ -1776,11 +1925,13 @@ mod tests {
         uri: &str,
         pairs: &[(&str, &str)],
     ) -> (StatusCode, String) {
-        let mut ser = form_urlencoded::Serializer::new(String::new());
-        for (k, v) in pairs {
-            ser.append_pair(k, v);
-        }
-        let body = ser.finish();
+        let body = {
+            let mut ser = form_urlencoded::Serializer::new(String::new());
+            for (k, v) in pairs {
+                ser.append_pair(k, v);
+            }
+            ser.finish()
+        };
         let response = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1803,63 +1954,63 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
     }
 
-    // BASELINE (measured on this commit, unfixed): a `POST /{slug}` or
-    // `POST /{slug}/{id}` that fails validation propagates as a bare
-    // `AutumnError`, which turns into a `application/problem+json` body —
-    // status 400, `{"type":...,"title":"Bad Request","detail":"...",...}`.
-    // No `<form>`, no re-rendered field, none of the other values the admin
-    // typed (e.g. `name=Widget X` here). Every one of the four error-path
-    // booleans fails: not adjacent to its cause (it isn't the form at all —
-    // it's a different content type), doesn't state a recovery step beyond
-    // "something was invalid", and every submitted value is gone.
+    // FIXED: a validation failure on `POST /{slug}` or `POST /{slug}/{id}`
+    // now re-renders the same form (422, HTML) with every value the admin
+    // typed still filled in and the failure surfaced through the same
+    // persistent, accessible flash banner every other admin page uses —
+    // instead of discarding the form for a bare `application/problem+json`
+    // body. See the previous commit for the measured baseline this replaces.
     #[tokio::test]
-    async fn model_create_malformed_json_discards_the_whole_form() {
-        let (status, body) = post_form(
+    async fn model_create_malformed_json_redisplays_form_with_entered_data() {
+        let (status, html) = post_form(
             form_test_app(),
             "/widgets",
             &[("name", "Widget X"), ("metadata", "{broken")],
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert!(
-            body.contains(r#""status":400"#) && body.contains("invalid JSON"),
-            "body: {body}"
-        );
-        // The admin's `name` entry never appears anywhere in the response —
-        // it's simply gone.
-        assert!(!body.contains("Widget X"), "body: {body}");
-        assert!(!body.contains("<form"), "body: {body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("New Widget"), "html: {html}");
+        assert!(html.contains(r#"value="Widget X""#), "html: {html}");
+        assert!(html.contains("{broken"), "html: {html}");
+        assert!(html.contains("invalid JSON"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
     }
 
     #[tokio::test]
-    async fn model_create_validation_error_discards_the_whole_form() {
-        let (status, body) = post_form(
+    async fn model_create_validation_error_redisplays_form_with_entered_data() {
+        let (status, html) = post_form(
             form_test_app(),
             "/widgets",
             &[("name", "taken"), ("owner", "bob"), ("metadata", "{}")],
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert!(body.contains("name already taken"), "body: {body}");
-        assert!(!body.contains("<form"), "body: {body}");
-        // The `owner` value the admin typed never appears anywhere either.
-        assert!(!body.contains("bob"), "body: {body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("New Widget"), "html: {html}");
+        assert!(html.contains(r#"value="taken""#), "html: {html}");
+        assert!(html.contains("name already taken"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
     }
 
     #[tokio::test]
-    async fn model_update_validation_error_discards_the_whole_form() {
-        let (status, body) = post_form(
+    async fn model_update_validation_error_preserves_create_only_field_and_entered_data() {
+        let (status, html) = post_form(
             form_test_app(),
             "/widgets/1",
             &[("name", "taken"), ("metadata", "{}")],
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert!(body.contains("name already taken"), "body: {body}");
-        assert!(!body.contains("<form"), "body: {body}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "html: {html}");
+        assert!(html.contains("Edit Widget"), "html: {html}");
+        assert!(html.contains(r#"value="taken""#), "html: {html}");
+        assert!(html.contains("name already taken"), "html: {html}");
+        // `owner` is create_only: never submitted by the edit form (it
+        // renders read-only, with no `name=` attribute). It must still show
+        // its stored value on redisplay instead of going blank.
+        assert!(html.contains("alice"), "html: {html}");
+        assert!(!html.contains("Go to homepage"), "html: {html}");
     }
 
     #[tokio::test]

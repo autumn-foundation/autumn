@@ -678,6 +678,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches any ambient runtime, closing both failure points. Verified against
   a real TLS-enabled Postgres server, on both a `current_thread` and
   `multi_thread` tokio runtime, called directly from an async body.
+- **Admin panel: a create/edit form that fails validation no longer discards
+  everything the admin typed:** `POST /{slug}` and `POST /{slug}/{id}` — the
+  only mutation UI the framework ships, used identically by every model in
+  every admin-plugin deployment — propagated a malformed field (e.g.
+  unparsable JSON) or a model-declared `AdminError::Validation` (e.g. a
+  uniqueness check) as a bare `AutumnError`. That renders as a generic error
+  response with no reference back to the form: a full-page navigation away,
+  a "Go to homepage" link as the only recovery step, and every value the
+  admin had entered gone. Both handlers now catch just that failure class and
+  re-render the same form (HTTP 422) with every submitted value still filled
+  in and the failure shown through the existing persistent, accessible flash
+  banner — no toast, no blank form. On update, the redisplayed form is
+  merged with the stored record so `create_only` fields (rendered read-only,
+  never resubmitted) keep showing their real value instead of going blank.
+  Other failure classes (missing pool, unknown model, database outage) are
+  unchanged and still render the generic error page.
 
 ### Added
 
