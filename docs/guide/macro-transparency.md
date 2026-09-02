@@ -605,10 +605,10 @@ saying why. A `#[repository]` recording version history or a ledger serializes
 the whole model, which a classified model cannot do; gating those sinks is a
 follow-up slice. See [Data Classification](./data-classification.md).
 
-#### `#[normalize(trim, downcase, upcase, squish, with = path)]`
+#### `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path)]`
 
 Runs an ordered normalizer chain over the owned `String` before every insert
-and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`) are
+and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`, `strip_nul`) are
 `fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls your own
 function with the same signature. Normalizers apply left-to-right.
 

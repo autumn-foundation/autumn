@@ -847,6 +847,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A NUL byte in a form field is a validation error, not a 500 (#2423):** a
+  Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, but nothing between the
+  form body and the `INSERT` could say so. An embedded NUL — which a real user
+  can produce by pasting from a binary source or through an input-method glitch,
+  not only deliberately — decoded cleanly, satisfied every `#[validate(...)]`
+  rule (the value is a perfectly good Rust `String`), and failed only when the
+  driver handed the byte to the server: `invalid byte sequence for encoding
+  "UTF8": 0x00`, surfacing as an uncaught `AutumnError` and a `500`. By the
+  framework's own error-class convention that reads as a server bug, when it is
+  malformed client input.
+
+  `ChangesetForm` and `NestedChangesetForm` now sweep every submitted **text**
+  value before it is deserialized — the only point where the offending field is
+  still identifiable by name — and record
+  `autumn_web::form::NUL_CHARACTER_FIELD_ERROR` ("Cannot contain the NUL
+  character (0x00)") against the field or child subfield that carried one.
+  Handlers need no change: it is an ordinary field error, so the form
+  re-renders inline through the existing `ChangesetForm` round-trip. The
+  retained value is the author's text minus the byte, so the re-rendered form
+  keeps their work, never echoes a raw `0x00` into the HTML, and their next
+  submission succeeds. The CSRF and submit tokens are exempt (no template
+  renders them, so an error there would leave the form invalid with nothing on
+  screen); file parts of a multipart body are untouched.
+
+  For the paths no form extractor sees — a JSON API body, a hand-written query,
+  a background job — the Postgres rejection is now classified instead of
+  blanket-500'd: the `AutumnError` carries `422 Unprocessable Entity`, and
+  `autumn_web::error::is_nul_byte_violation` recognizes it (walking the
+  `source()` chain) for handlers that want to fold it back into a form the way
+  `unique_violation_field` is used for a uniqueness clash. Classification is by
+  server message rather than SQLSTATE because `diesel-async` maps `22021` to
+  `DatabaseErrorKind::Unknown` and diesel's `DatabaseErrorInformation` exposes
+  no code; the match requires both the byte literal and the encoding name, so a
+  message that merely mentions `0x00` keeps its 500.
+
+  New: `Changeset::add_error`, for folding a post-decode failure back into a
+  form round-trip; `autumn_web::normalize::strip_nul` and
+  `#[normalize(strip_nul)]`, for columns where dropping the byte silently beats
+  refusing the write. See `docs/guide/forms.md` — "Unstorable bytes: NUL".
+
 - **ACME config: `autumn doctor` and the runtime now reject the same two
   spellings (#1874):** two low-severity parity gaps let `autumn doctor
   --strict` bless an `autumn.toml` the server refuses to boot on. A

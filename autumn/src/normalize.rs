@@ -16,6 +16,8 @@
 //! - [`upcase`] — uppercase (str casing).
 //! - [`squish`] — trim **and** collapse internal runs of whitespace to a single
 //!   space.
+//! - [`strip_nul`] — remove every NUL (`U+0000`), which a Postgres
+//!   `TEXT`/`VARCHAR` column cannot store (#2423).
 //!
 //! All built-ins are idempotent: normalizing an already-normalized value is a
 //! no-op, so applying them on both the write path and on lookups converges on
@@ -68,6 +70,29 @@ pub fn downcase(s: &str) -> String {
 #[must_use]
 pub fn upcase(s: &str) -> String {
     s.to_uppercase()
+}
+
+/// Remove every NUL (`U+0000`) character (issue #2423).
+///
+/// A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying
+/// one is rejected by the server at `INSERT`/`UPDATE` time. Reach for this on
+/// a column fed by input that may legitimately arrive dirty (a paste from a
+/// binary source, a misbehaving input method) and where silently dropping the
+/// byte is preferable to rejecting the write.
+///
+/// Only NUL is removed: every other control character is storable and is left
+/// exactly as written.
+///
+/// Prefer rejecting over cleaning where the author can see and fix the value —
+/// [`crate::form::ChangesetForm`] already surfaces a NUL as an inline field
+/// error without any attribute.
+#[must_use]
+pub fn strip_nul(s: &str) -> String {
+    if s.as_bytes().contains(&0) {
+        s.replace('\u{0}', "")
+    } else {
+        s.to_owned()
+    }
 }
 
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
@@ -220,6 +245,26 @@ mod tests {
     fn trim_strips_edges() {
         assert_eq!(trim("  hi  "), "hi");
         assert_eq!(trim("hi"), "hi");
+    }
+
+    #[test]
+    fn strip_nul_removes_embedded_nuls() {
+        assert_eq!(strip_nul("before\u{0}after"), "beforeafter");
+        assert_eq!(strip_nul("\u{0}\u{0}a\u{0}"), "a");
+    }
+
+    #[test]
+    fn strip_nul_leaves_clean_text_untouched() {
+        assert_eq!(strip_nul("plain text"), "plain text");
+        // Other control characters are storable in a Postgres TEXT column and
+        // are deliberately left alone.
+        assert_eq!(strip_nul("tab\there"), "tab\there");
+    }
+
+    #[test]
+    fn strip_nul_is_idempotent() {
+        let once = strip_nul("a\u{0}b");
+        assert_eq!(strip_nul(&once), once);
     }
 
     #[test]

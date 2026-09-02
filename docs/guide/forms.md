@@ -331,6 +331,7 @@ Built-in normalizers, applied **left to right in the order you write them**:
 | `downcase` | lowercase |
 | `upcase` | uppercase |
 | `squish` | trim, and collapse every internal run of whitespace to one space |
+| `strip_nul` | remove every NUL (`U+0000`) — see [Unstorable bytes](#unstorable-bytes-nul) |
 | `with = path::to::fn` | your own `fn(&str) -> String` |
 
 All the built-ins are **idempotent** — normalizing an already-normal value
@@ -413,6 +414,92 @@ this attribute exists to remove.
   they cannot see inside a per-locale column set.
 - **It does not rewrite history.** Adding `#[normalize]` to an existing column
   canonicalizes future writes only. Backfill existing rows with a migration.
+
+---
+
+## Unstorable bytes: NUL
+
+A Postgres `TEXT` or `VARCHAR` column cannot hold a NUL byte (`0x00`). This is
+not a length or a format rule that `#[validate(...)]` could express — the value
+is a perfectly good Rust `String`, and every validator you can write on it
+passes. It fails much later, when the driver hands the byte to the server, which
+answers `invalid byte sequence for encoding "UTF8": 0x00`.
+
+A real user can produce one without trying: a paste from a binary source, a
+misbehaving input method, a clipboard glitch. So this is a robustness question,
+not only an adversarial one.
+
+The framework handles it at the form boundary. `ChangesetForm` and
+`NestedChangesetForm` sweep every submitted **text** value before it is
+deserialized, and a field that carried a NUL gets an ordinary error:
+
+```text
+Cannot contain the NUL character (0x00)
+```
+
+The message is available as `autumn_web::form::NUL_CHARACTER_FIELD_ERROR`.
+Nothing in your handler changes — it is a field error like any other, so the
+form re-renders inline with your existing `errors_for(...)` markup and whatever
+4xx you already return for a rejected changeset. The retained value is the
+author's text with the byte removed, so the re-rendered form keeps their work
+(and never echoes a raw `0x00` back into the HTML), and their next submission
+succeeds.
+
+Framework plumbing fields are deliberately exempt — the CSRF token, the submit
+token, and the `_method` override. None is a form field any template renders, so
+an error keyed under one would leave the form invalid with nothing on screen to
+explain why, and none is ever written to a column. Each is still rejected on its
+own terms when malformed: `CsrfLayer` and the submit-token guard for the tokens,
+"not a known verb" for the override.
+
+An *unknown* key is not exempt. A submitted name that is not a field of your
+form type is normally ignored, but if it carries a NUL it is still reported —
+under that name. `error_summary` renders it; a hand-written `errors_for("...")`
+per field will not, so a form built that way rejects the submission with no
+visible message. In practice that takes a hand-crafted request: the values your
+own templates emit for non-form fields are server-generated, not pasted.
+
+File parts of a `multipart/form-data` body are untouched — binary uploads are
+supposed to contain arbitrary bytes.
+
+### The paths no form extractor sees
+
+A JSON API body, a hand-written query, a background job argument: these reach
+the database without passing a form extractor, so the byte still gets there. It
+is classified rather than blanket-500'd — the resulting `AutumnError` carries
+`422 Unprocessable Entity`, matching the status a validator would have produced,
+and `autumn_web::error::is_nul_byte_violation` recognizes it if you want to fold
+it back into a form:
+
+```rust,ignore
+if let Err(err) = repo.save(&new_post).await
+    && is_nul_byte_violation(&err)
+{
+    changeset.add_error("body", NUL_CHARACTER_FIELD_ERROR);
+    return Ok(render_rejected(changeset));
+}
+```
+
+This is a backstop, not the mechanism: rejecting at the form boundary is what
+gives the author something actionable.
+
+### When you would rather clean than reject
+
+On a column fed by paste-prone input, where dropping the byte silently is
+better than refusing the write, use the normalizer:
+
+```rust,ignore
+#[model]
+pub struct Profile {
+    #[normalize(strip_nul)]
+    pub bio: String,
+}
+```
+
+Prefer rejecting wherever the author can see and fix the value — they get told
+what happened instead of having their input quietly altered. `strip_nul` removes
+only NUL; every other control character is storable and is left exactly as
+written.
 
 ---
 

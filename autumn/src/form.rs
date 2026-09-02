@@ -298,6 +298,24 @@ impl<T> Changeset<T> {
     pub const fn errors(&self) -> &HashMap<String, Vec<String>> {
         &self.errors
     }
+
+    /// Record one more error message against `field`, keeping any already
+    /// there.
+    ///
+    /// Appends rather than replaces, so a field that failed a
+    /// `#[validate(...)]` rule *and* carried unstorable input shows both
+    /// messages. Adding any error makes the changeset invalid.
+    ///
+    /// Used by [`ChangesetForm`] to attach the
+    /// [`NUL_CHARACTER_FIELD_ERROR`] a validator cannot see, and available to
+    /// handlers that need to fold a post-decode failure (a uniqueness check
+    /// that only the database can answer, say) back into the form round-trip.
+    pub fn add_error(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.errors
+            .entry(field.into())
+            .or_default()
+            .push(message.into());
+    }
 }
 
 impl<T: Serialize> Changeset<T> {
@@ -323,6 +341,73 @@ impl<T: Serialize> Changeset<T> {
             _ => None,
         }
     }
+}
+
+// ── #2423: NUL bytes in submitted text ─────────────────────────────
+
+/// The message recorded against a field whose submitted value carried an
+/// embedded NUL (`U+0000`) character (issue #2423).
+///
+/// A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, so such a value used
+/// to sail past every `#[validate(...)]` rule and fail only at the
+/// Diesel→Postgres boundary, surfacing as an unhandled `500`. [`ChangesetForm`]
+/// now records this message against the offending field instead, so the
+/// submission is rejected the same way any other invalid input is — inline, on
+/// the field, with the author's remaining text intact.
+///
+/// A real user can produce a NUL without meaning to (a paste from a binary
+/// source, an input-method glitch), so the wording names the character rather
+/// than accusing the author of anything.
+pub const NUL_CHARACTER_FIELD_ERROR: &str = "Cannot contain the NUL character (0x00)";
+
+/// Submitted names that carry framework plumbing rather than form data.
+///
+/// No template renders an error against one of these, so a
+/// [`NUL_CHARACTER_FIELD_ERROR`] keyed under one would leave the form invalid
+/// with nothing on screen to explain why. Each is already rejected on its own
+/// terms when malformed — a mangled `_method` simply fails to name a known
+/// verb — and none is ever written to a column.
+///
+/// Only the fixed names live here. The CSRF and submit-token field names are
+/// configurable, so the extractors pass those in from request extensions.
+const PLUMBING_FIELDS: &[&str] = &["_method"];
+
+/// Whether `name` is one of the fixed [`PLUMBING_FIELDS`].
+pub(crate) fn is_plumbing_field(name: &str) -> bool {
+    PLUMBING_FIELDS.contains(&name)
+}
+
+/// Remove every NUL from each submitted value, returning the names of the
+/// fields that carried one (issue #2423).
+///
+/// Runs on the decoded key/value pairs, *before* deserialization, which is the
+/// only point where the offending field is still identifiable by name — after
+/// `serde` has built `T` the bytes are just some `String` field among others.
+///
+/// Values are cleaned rather than left as submitted for two reasons: the
+/// rejected form is re-rendered from this data, and neither the author's
+/// browser nor any downstream consumer should be handed back a raw `0x00`; and
+/// the cleaned text is what the author most likely meant, so the resubmission
+/// they make after reading the error succeeds.
+///
+/// Keys are deliberately left alone. Stripping a NUL out of a *key* would
+/// rename it — potentially onto a real field of `T` — inventing a submission
+/// the client never made. A mangled key simply fails to match any field and is
+/// ignored, exactly as any other unknown key is.
+///
+/// The returned names are deduplicated, so a repeated key (a multi-value
+/// field) contributes at most one message.
+pub(crate) fn strip_nul_from_pairs(pairs: &mut [(String, String)]) -> Vec<String> {
+    let mut offenders: Vec<String> = Vec::new();
+    for (key, value) in pairs {
+        if value.as_bytes().contains(&0) {
+            *value = crate::normalize::strip_nul(value);
+            if !offenders.iter().any(|name| name == key) {
+                offenders.push(key.clone());
+            }
+        }
+    }
+    offenders
 }
 
 // ── IntoChangeset ──────────────────────────────────────────────────
@@ -356,6 +441,18 @@ impl<T: validator::Validate> IntoChangeset for T {
 /// 422 — errors live in the [`Changeset`] and the handler decides how to
 /// respond.  Fails with 400 only when the body cannot be decoded into `T` at
 /// all.
+///
+/// # Unstorable bytes
+///
+/// Submitted text values are swept for NUL (`U+0000`) before deserialization
+/// (issue #2423). A Postgres `TEXT`/`VARCHAR` column cannot hold `0x00`, and no
+/// `#[validate(...)]` rule can express that — the value is a perfectly good
+/// Rust `String` — so such a field used to fail only at the database, as an
+/// unhandled 500. A field that carried one now gets
+/// [`NUL_CHARACTER_FIELD_ERROR`] like any other field error, and the value kept
+/// for re-render is the author's text with the byte removed. The CSRF token is
+/// exempt (no template renders it); file parts of a multipart body are
+/// untouched.
 ///
 /// # CSRF — no extra developer action in POST handlers
 ///
@@ -601,10 +698,24 @@ where
             .get::<crate::security::csrf::CsrfFormField>()
             .map_or_else(|| "_csrf".to_owned(), |f| f.0.clone());
 
-        let data: T = decode_form_body(req, state).await?;
+        let (data, nul_fields) = decode_form_body::<T, S>(req, state).await?;
+
+        let mut changeset = data.into_changeset();
+        for field in nul_fields {
+            // The CSRF token and the method override are transport plumbing,
+            // not form fields: no template renders either, so an error keyed
+            // under one would make the form permanently invalid with nothing
+            // on screen to explain why. Each is rejected on its own terms when
+            // malformed — `CsrfLayer` for the token, "not a known verb" for
+            // the override — and neither is ever written to a column.
+            if field == csrf_field || PLUMBING_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            changeset.add_error(field, NUL_CHARACTER_FIELD_ERROR);
+        }
 
         Ok(Self {
-            changeset: data.into_changeset(),
+            changeset,
             csrf_token,
             csrf_field,
         })
@@ -612,6 +723,10 @@ where
 }
 
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
+///
+/// Returns the decoded `T` alongside the names of the fields whose submitted
+/// value carried a NUL byte (#2423); those values are cleaned before `T` is
+/// built, so the caller only has to decide what to say about them.
 // `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
 // 128 bytes — that is `axum::response::Response`'s own size, not something this
 // crate chose. Returning a ready-made rejection response IS the idiom here, and
@@ -619,7 +734,10 @@ where
 // heuristic. Allowed at the site rather than workspace-wide so the lint stays
 // armed for error types we do control.
 #[allow(clippy::result_large_err)]
-async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+async fn decode_form_body<T, S>(
+    req: Request,
+    state: &S,
+) -> Result<(T, Vec<String>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
@@ -659,8 +777,11 @@ where
         .await
         .map_err(IntoResponse::into_response)?;
 
-    decode_urlencoded_dropping_blank_optional_fields::<T>(&bytes)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+    let mut pairs = parse_urlencoded_pairs(&bytes);
+    let nul_fields = strip_nul_from_pairs(&mut pairs);
+    let data = decode_pairs_dropping_blank_optional_fields::<T>(pairs)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    Ok((data, nul_fields))
 }
 
 /// Deserialize `T` from `application/x-www-form-urlencoded` bytes, tolerating
@@ -699,10 +820,26 @@ where
 pub(crate) fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
-    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(bytes)
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    decode_pairs_dropping_blank_optional_fields(parse_urlencoded_pairs(bytes))
+}
 
+/// Parse an `application/x-www-form-urlencoded` body into owned key/value
+/// pairs — the form in which the #2423 NUL sweep can still name the offending
+/// field.
+pub(crate) fn parse_urlencoded_pairs(bytes: &[u8]) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// The blank-optional-dropping retry loop itself, over already-parsed pairs.
+///
+/// See [`decode_urlencoded_dropping_blank_optional_fields`] for the contract;
+/// this is the same function with the parse step hoisted out so callers can
+/// inspect and clean the pairs first.
+pub(crate) fn decode_pairs_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
+    mut pairs: Vec<(String, String)>,
+) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
     loop {
         let encoded = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -746,7 +883,10 @@ pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
 // `axum::response::Response`, which IS the rejection, and boxing it would cost
 // an allocation on every rejection to satisfy a size heuristic.
 #[allow(clippy::result_large_err)]
-async fn decode_multipart<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+async fn decode_multipart<T, S>(
+    req: Request,
+    state: &S,
+) -> Result<(T, Vec<String>), axum::response::Response>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
@@ -783,6 +923,11 @@ where
         pairs.push((name, value));
     }
 
+    // #2423: the same NUL sweep the URL-encoded path runs, applied to the
+    // text fields only — file parts were skipped above and their bytes are
+    // never text to begin with.
+    let nul_fields = strip_nul_from_pairs(&mut pairs);
+
     // Re-encode as URL-encoded so serde_urlencoded handles type coercions
     // ("30" → u32, "true" → bool, etc.) consistently with the Form extractor.
     let encoded = url::form_urlencoded::Serializer::new(String::new())
@@ -790,7 +935,7 @@ where
         .finish();
 
     match serde_urlencoded::from_str::<T>(&encoded) {
-        Ok(data) => Ok(data),
+        Ok(data) => Ok((data, nul_fields)),
         Err(first_err) => {
             // Same blank-optional-field accommodation as `decode_form_body`:
             // a number/date/uuid field left empty submits an empty text
@@ -807,9 +952,11 @@ where
             let filtered = url::form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(non_blank.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .finish();
-            serde_urlencoded::from_str::<T>(&filtered).map_err(|_| {
-                (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
-            })
+            serde_urlencoded::from_str::<T>(&filtered)
+                .map(|data| (data, nul_fields))
+                .map_err(|_| {
+                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+                })
         }
     }
 }
@@ -6505,6 +6652,171 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        // ── #2423: an embedded NUL byte is a field error, not a 500 ───
+
+        #[derive(serde::Deserialize, serde::Serialize, validator::Validate)]
+        struct NulTestForm {
+            #[validate(length(min = 3))]
+            name: String,
+            #[serde(default)]
+            body: String,
+        }
+
+        /// The shape from issue #2423: a free-text field carrying `%00`
+        /// decodes cleanly and satisfies every `#[validate(...)]` rule, so it
+        /// used to reach Postgres raw and come back as an unhandled 500. It is
+        /// now one ordinary field error on the changeset, which the handler
+        /// re-renders inline like any other rejected submission.
+        #[tokio::test]
+        async fn nul_byte_in_text_field_is_a_field_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} body_errors={}",
+                    form.is_valid(),
+                    form.errors_for("body").join("|")
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=before%00after"))
+                .await
+                .unwrap();
+            assert_body(
+                resp,
+                &format!("valid=false body_errors={NUL_CHARACTER_FIELD_ERROR}"),
+            )
+            .await;
+        }
+
+        /// The retained value is the author's text minus the NUL: the
+        /// re-rendered form keeps their work (the `ChangesetForm` round-trip
+        /// contract) without echoing a raw `0x00` back into the HTML.
+        #[tokio::test]
+        async fn nul_byte_is_stripped_from_the_redisplayed_value() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                form.into_changeset()
+                    .field_value("body")
+                    .unwrap_or_default()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=before%00after"))
+                .await
+                .unwrap();
+            assert_body(resp, "beforeafter").await;
+        }
+
+        /// Only the field that actually carried the byte is flagged.
+        #[tokio::test]
+        async fn nul_byte_flags_only_the_offending_field() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "name={} body={}",
+                    form.errors_for("name").len(),
+                    form.errors_for("body").len()
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=a%00b"))
+                .await
+                .unwrap();
+            assert_body(resp, "name=0 body=1").await;
+        }
+
+        /// No false positives: an ordinary submission is untouched.
+        #[tokio::test]
+        async fn form_without_nul_is_unaffected() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} body={}", form.is_valid(), form.data().body)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&body=plain"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true body=plain").await;
+        }
+
+        /// Framework plumbing fields carry no renderable error key, so a NUL
+        /// in one is cleaned but not reported — same reasoning as `_csrf`.
+        #[tokio::test]
+        async fn nul_byte_in_the_method_override_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req(
+                    "/test",
+                    "_method=PA%00TCH&name=Alice&body=ok",
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        /// A NUL in a *rule-violating* field adds to that field's messages
+        /// rather than replacing the validator's own.
+        #[tokio::test]
+        async fn nul_byte_error_is_appended_to_existing_field_errors() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                let errs = form.errors_for("name");
+                format!(
+                    "count={} has_nul={}",
+                    errs.len(),
+                    errs.iter().any(|e| e == NUL_CHARACTER_FIELD_ERROR)
+                )
+            }
+            // "a\0b" is 2 characters after stripping, so `length(min = 3)`
+            // fails as well.
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=a%00b&body="))
+                .await
+                .unwrap();
+            assert_body(resp, "count=2 has_nul=true").await;
+        }
+
+        /// The CSRF token is transport plumbing, not a form field: a NUL there
+        /// must not surface as a validation error on a name no template
+        /// renders (which would make the form permanently, invisibly invalid).
+        /// CSRF verification itself still rejects the mangled token upstream.
+        #[tokio::test]
+        async fn nul_byte_in_the_csrf_field_is_not_a_form_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!("valid={} errors={}", form.is_valid(), form.errors().len())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "_csrf=to%00ken&name=Alice&body=ok"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true errors=0").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_nul_byte_in_text_field_is_a_field_error() {
+            async fn handler(form: ChangesetForm<NulTestForm>) -> String {
+                format!(
+                    "valid={} body_errors={} body={}",
+                    form.is_valid(),
+                    form.errors_for("body").len(),
+                    form.data().body
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    &[("name", "Alice"), ("body", "before\u{0}after")],
+                ))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=false body_errors=1 body=beforeafter").await;
         }
 
         // ── Helpers ────────────────────────────────────────────────
