@@ -1428,7 +1428,10 @@ mod grant_syntax {
         assert_eq!(ScrambledOrder.rate, Some("10/min"));
         assert_eq!(ScrambledOrder.spend, Some("500.00 USD"));
         assert_eq!(ScrambledOrder.reversibility, Reversibility::Compensable);
-        assert!(ScrambledOrder.location.contains("agent_authority/mod.rs"));
+        // `file!()` uses the host separator, so a Windows build yields
+        // `autumn\src\agent_authority\mod.rs`; normalise before matching.
+        let location = ScrambledOrder.location.replace('\\', "/");
+        assert!(location.contains("agent_authority/mod.rs"), "{location}");
     }
 
     #[test]
