@@ -4,7 +4,7 @@
 //! The sibling `agent_authority_valid.rs` fixture exercises the analysis
 //! against local stand-in types; this one proves the attribute stacks on an
 //! actual MCP-exposed handler in BOTH orders. The order matters: when the
-//! route macro expands first it never sees `#[agent_operable]` at all, so it
+//! `#[agent_operable]` expands first it strips itself, so the route macro
 //! reads the marker const from the body instead — and either way the route's
 //! `ApiDoc` carries the authority, which is what keeps the handler on the
 //! manifest.
@@ -31,7 +31,7 @@ pub struct AaRouteRefund {
 #[autumn_web::repository(AaRouteRefund)]
 pub trait AaRouteRefundRepository {}
 
-autumn_web::authority_grant! {
+authority_grant! {
     /// Draft-only refund authority for the support agent.
     pub RefundDrafter {
         writes: [AaRouteRefund],
@@ -40,8 +40,8 @@ autumn_web::authority_grant! {
     }
 }
 
-/// Route macro outermost: it expands first and never sees the attribute, so
-/// the marker const inside the body is what fills `ApiDoc::agent_authority`.
+/// Route macro outermost: it expands first, while `#[agent_operable]` is still
+/// in the attribute list below it, so the route reads the live attribute.
 #[post("/aa-refunds")]
 #[api_doc(mcp, summary = "Draft a refund")]
 #[agent_operable(grant = RefundDrafter)]
@@ -52,8 +52,9 @@ async fn draft_refund(
     Ok(Json(repo.save(&new).await?))
 }
 
-/// The other order: `#[agent_operable]` outermost, so the route macro sees the
-/// live attribute.
+/// The other order: `#[agent_operable]` outermost. It expands first and strips
+/// itself, so by the time the route macro runs the attribute is gone and the
+/// marker const inside the body is what fills `ApiDoc::agent_authority`.
 #[agent_operable(grant = RefundDrafter)]
 #[post("/aa-refunds/again")]
 #[api_doc(mcp, summary = "Draft a refund, again")]

@@ -647,6 +647,12 @@ fn generate_coherence_items(
 ) -> syn::Result<TokenStream> {
     let overrides = parse_method_coherence_attrs(trait_def)?;
     let model_name = &config.model_name;
+    // The grant spells the model as source does, and `r#Type` is written
+    // `Type` there: `stringify!` would have kept the `r#`.
+    let model_ident = {
+        let spelled = model_name.to_string();
+        spelled.strip_prefix("r#").unwrap_or(&spelled).to_string()
+    };
     let table_name = &config.table_name;
     let trait_name_str = trait_def.ident.to_string();
     let writes = write_method_names(config, trait_def);
@@ -727,8 +733,7 @@ fn generate_coherence_items(
             /// expected to spell; this is the last segment alone, readable in
             /// const context so the authority assertion works across crates.
             #[doc(hidden)]
-            pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str =
-                stringify!(#model_name);
+            pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
         }
     };
 

@@ -2,6 +2,10 @@
 //! itself it would read as a licence covering the whole body, which is exactly
 //! the grant-bypass the hatch must not become — the handler's envelope is the
 //! grant, and nothing else.
+//!
+//! The annotation sits *below* `#[agent_operable]` so that this macro expands
+//! first, diagnoses it, and strips it: above, rustc resolves the unknown
+//! attribute itself and adds a second error nobody needs.
 
 use autumn_web::agent_operable;
 
@@ -26,8 +30,8 @@ autumn_web::authority_grant! {
     }
 }
 
-#[agent_effect(writes(Refund), reason = "the whole handler writes")]
 #[agent_operable(grant = RefundDrafter)]
+#[agent_effect(writes(Refund), reason = "the whole handler writes")]
 async fn draft(repo: PgRefundRepository) -> Result<usize, ()> {
     Ok(repo.find_all().await?.len())
 }

@@ -14,19 +14,29 @@
 //! `autumn data-flow` (#1654), `autumn cache audit` (#1716) and
 //! `autumn routes audit` (#1604).
 //!
-//! Unlike `data-flow`, this command *does* have a gate of its own. The compiler
+//! Unlike `data-flow`, this command *does* have gates of its own — and
+//! `--check` is where they live, which makes it the CI invocation. The compiler
 //! is still the gate for everything a grant covers — an unlisted write does not
-//! build — but a tool with **no** grant at all is invisible to that gate by
-//! construction. `--check` therefore fails on any MCP-exposed *mutating* tool
-//! with no envelope unless `--allow-ungoverned` is passed, and warns about the
-//! read-only ones.
+//! build — but three things are invisible to it by construction, so `--check`
+//! fails on:
+//!
+//! * an MCP-exposed **mutating** tool with no envelope (unless
+//!   `--allow-ungoverned`), because a tool with no grant has no const assertion
+//!   to fail;
+//! * a binary with **no audit sink** that can still take an action nothing can
+//!   undo (unless `--allow-unaudited`) — with no sink installed the audit write
+//!   trivially succeeds, so the runtime's fail-closed refusal never fires and
+//!   the invocation leaves no trace at all;
+//! * a route naming an **authority nothing registered**, which would otherwise
+//!   appear in no list and so in no gate;
+//! * and drift from the committed manifest.
 //!
 //! See `docs/guide/agent-authority.md`.
 
 use std::process::Command;
 
 use autumn_web::agent_authority::manifest::{
-    AgentAuthorityManifest, UngovernedTool, parse_manifest_dump,
+    ActionRow, AgentAuthorityManifest, UngovernedTool, UnregisteredAuthority, parse_manifest_dump,
 };
 
 use crate::routes;
@@ -38,9 +48,14 @@ use crate::routes;
 /// `AppBuilder::run` dispatches this mode after the build, route, cache and
 /// data-flow one-shots and before the server binds a listener, so an inherited
 /// value silently wins over whatever was actually asked for.
-pub const DUMP_ENV: &str = "AUTUMN_DUMP_AGENT_AUTHORITY";
+///
+/// Re-exported from the framework rather than spelled again here: the CLI sets
+/// this string and `AppBuilder::run` reads it, so two independent literals
+/// would be a protocol that could silently drift apart at a typo.
+pub const DUMP_ENV: &str = autumn_web::agent_authority::manifest::DUMP_ENV;
 
 /// Options controlling `autumn agents manifest`.
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
 pub struct AgentsManifestOptions<'a> {
     /// Cargo package to build and run.
     pub package: Option<&'a str>,
@@ -61,6 +76,16 @@ pub struct AgentsManifestOptions<'a> {
     /// tool an agent can call with no declared envelope is the thing this
     /// command exists to surface.
     pub allow_ungoverned: bool,
+    /// Let `--check` pass with no audit sink configured even though the binary
+    /// can take an action nothing can undo.
+    ///
+    /// The twin of [`Self::allow_ungoverned`], and a flag for the same reason:
+    /// a development binary legitimately has no sink. What it must not be is
+    /// the default, because this is the one combination the *runtime* cannot
+    /// catch — `write_from_state` returns `Ok(())` when no logger is installed,
+    /// so the attempt record "succeeds", the fail-closed refusal never fires,
+    /// and nothing is recorded anywhere.
+    pub allow_unaudited: bool,
     /// Cargo feature selection the inspected binary is built under.
     ///
     /// The manifest describes the binary that produced it. An action or a grant
@@ -72,26 +97,166 @@ pub struct AgentsManifestOptions<'a> {
 }
 
 /// Render the human report for a manifest.
+///
+/// The manifest's own summary: the CLI has no second opinion about what the
+/// document says, and two renderings that could disagree is exactly the drift
+/// these commands exist to catch.
 #[must_use]
 pub fn format_report(manifest: &AgentAuthorityManifest) -> String {
-    // RED STUB (#1691).
-    let _ = manifest;
-    String::new()
+    manifest.summary()
 }
 
 /// Describe the difference between a committed manifest and a fresh one.
 ///
-/// Returns `None` when they agree. The report names *which* rows moved, because
-/// "the manifest changed" is not reviewable but "`draft_refund` gained the
-/// effect `outbound https://api.stripe.com/v1/charges`" is.
+/// Returns `None` when they agree. The report names *which* rows moved and
+/// *which* effects they gained, because "the manifest changed" is not
+/// reviewable but "`draft_refund` gained `outbound https://api.stripe.com/…`"
+/// is the one line a reviewer needs.
 #[must_use]
 pub fn format_drift(
     committed: &AgentAuthorityManifest,
     current: &AgentAuthorityManifest,
 ) -> Option<String> {
-    // RED STUB (#1691).
-    let _ = (committed, current);
-    None
+    if committed == current {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+
+    if committed.schema_version != current.schema_version {
+        lines.push(format!(
+            "  manifest schema version {} -> {}",
+            committed.schema_version, current.schema_version
+        ));
+    }
+
+    for row in &current.actions {
+        match committed
+            .actions
+            .iter()
+            .find(|c| action_key(c) == action_key(row))
+        {
+            None => {
+                lines.push(format!(
+                    "  + agent-operable action {} under grant {}",
+                    action_key(row),
+                    row.grant.name
+                ));
+                for effect in &row.effects {
+                    lines.push(format!("      + {} {}", effect.kind, effect.subject));
+                }
+            }
+            Some(before) if before != row => {
+                lines.push(format!("  ~ {}", action_key(row)));
+                lines.extend(action_changes(before, row));
+            }
+            Some(_) => {}
+        }
+    }
+    for row in &committed.actions {
+        if !current
+            .actions
+            .iter()
+            .any(|c| action_key(c) == action_key(row))
+        {
+            lines.push(format!("  - agent-operable action {}", action_key(row)));
+        }
+    }
+
+    lines.extend(tool_changes(committed, current));
+    lines.extend(unregistered_changes(committed, current));
+    lines.extend(grant_changes(committed, current));
+
+    if committed.audit != current.audit {
+        lines.push(format!(
+            "  agent audit sink configured {} -> {}",
+            committed.audit.sink_configured, current.audit.sink_configured
+        ));
+    }
+
+    if lines.is_empty() {
+        lines.push("  (the documents differ in a field this report does not name)".to_string());
+    }
+    Some(format!(
+        "\u{2717} The agent-authority manifest has drifted from the committed copy:\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// Ungoverned MCP tools that appeared or disappeared.
+fn tool_changes(
+    committed: &AgentAuthorityManifest,
+    current: &AgentAuthorityManifest,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for tool in &current.ungoverned_tools {
+        if !committed.ungoverned_tools.contains(tool) {
+            lines.push(format!(
+                "  + ungoverned MCP tool {} [{}]{}",
+                describe_tool(tool),
+                tool.exposed_by,
+                if tool.mutating { " -- MUTATING" } else { "" }
+            ));
+        }
+    }
+    for tool in &committed.ungoverned_tools {
+        if !current.ungoverned_tools.contains(tool) {
+            lines.push(format!("  - ungoverned MCP tool {}", describe_tool(tool)));
+        }
+    }
+    lines
+}
+
+/// Routes naming an unregistered authority that appeared or disappeared.
+fn unregistered_changes(
+    committed: &AgentAuthorityManifest,
+    current: &AgentAuthorityManifest,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in &current.unregistered_authorities {
+        if !committed.unregistered_authorities.contains(row) {
+            lines.push(format!(
+                "  + route naming an unregistered authority {}",
+                describe_unregistered(row)
+            ));
+        }
+    }
+    for row in &committed.unregistered_authorities {
+        if !current.unregistered_authorities.contains(row) {
+            lines.push(format!(
+                "  - route naming an unregistered authority {}",
+                describe_unregistered(row)
+            ));
+        }
+    }
+    lines
+}
+
+/// Declared envelopes that appeared or disappeared.
+///
+/// Keyed on `(name, location)`, never the name alone: two crates can each
+/// declare a `RefundDrafter`, and collapsing them would hide one appearing.
+fn grant_changes(
+    committed: &AgentAuthorityManifest,
+    current: &AgentAuthorityManifest,
+) -> Vec<String> {
+    let key_missing = |haystack: &AgentAuthorityManifest, name: &str, location: &str| {
+        !haystack
+            .grants
+            .iter()
+            .any(|g| g.name == name && g.location == location)
+    };
+    let mut lines = Vec::new();
+    for grant in &current.grants {
+        if key_missing(committed, &grant.name, &grant.location) {
+            lines.push(format!("  + grant {} ({})", grant.name, grant.location));
+        }
+    }
+    for grant in &committed.grants {
+        if key_missing(current, &grant.name, &grant.location) {
+            lines.push(format!("  - grant {} ({})", grant.name, grant.location));
+        }
+    }
+    lines
 }
 
 /// The `--check` gate on tools nothing governs.
@@ -99,32 +264,306 @@ pub fn format_drift(
 /// Returns the failure message when the run must exit non-zero, and `None` when
 /// it may pass (possibly after a warning, which
 /// [`format_ungoverned_warning`] renders).
+///
+/// This is the one gate the compiler cannot supply. Everything a grant covers
+/// is const-asserted at the call site, but a tool with *no* grant has no
+/// assertion to fail — it is invisible to the build, and visible only here.
 #[must_use]
 pub fn format_ungoverned_failure(
     manifest: &AgentAuthorityManifest,
     allow_ungoverned: bool,
 ) -> Option<String> {
-    // RED STUB (#1691).
-    let _ = (manifest, allow_ungoverned);
-    None
+    if allow_ungoverned {
+        return None;
+    }
+    let mutating = manifest.ungoverned_mutating_tools();
+    if mutating.is_empty() {
+        return None;
+    }
+    let listed = mutating
+        .iter()
+        .map(|tool| format!("  {}", describe_tool(tool)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "\u{2717} {} MCP tool{} can change state with no authority envelope:\n{listed}\n\n\
+         An agent can call these, and nothing declares what they are allowed to do. Annotate each \
+         handler with `#[agent_operable(grant = YourGrant)]` and declare the envelope with \
+         `authority_grant!`, or re-run with `--allow-ungoverned` to record them as they are. \
+         See docs/guide/agent-authority.md",
+        mutating.len(),
+        if mutating.len() == 1 { "" } else { "s" },
+    ))
 }
 
 /// The advisory half: read-only tools with no envelope, and mutating ones the
 /// run was explicitly told to allow.
+///
+/// Allowed is not the same as unseen, so `--allow-ungoverned` silences the
+/// failure and not the list.
 #[must_use]
 pub fn format_ungoverned_warning(manifest: &AgentAuthorityManifest) -> Option<String> {
-    // RED STUB (#1691).
-    let _ = manifest;
-    None
+    if manifest.ungoverned_tools.is_empty() {
+        return None;
+    }
+    let listed = manifest
+        .ungoverned_tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "  {} [{}]{}",
+                describe_tool(tool),
+                tool.exposed_by,
+                if tool.mutating {
+                    " -- mutating"
+                } else {
+                    " -- read-only"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "! {} MCP tool{} exposed with no authority envelope:\n{listed}",
+        manifest.ungoverned_tools.len(),
+        if manifest.ungoverned_tools.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+    ))
+}
+
+/// The `--check` gate on a binary that can act irreversibly with nothing
+/// recording it.
+///
+/// Returns the failure message when the run must exit non-zero.
+///
+/// Why this cannot be a runtime check: with no `AuditLogger` installed,
+/// `audit::write_from_state` returns `Ok(())` without writing anything, so the
+/// MCP dispatcher's `refuse_when_unauditable` rule sees a successful attempt
+/// record and refuses nothing. The fail-closed guarantee protects a *configured*
+/// sink that is failing; it says nothing about a sink that was never there.
+/// Build time is therefore the only place the combination can be caught
+/// (#1691 P1-2).
+///
+/// Both halves are required. A missing sink is survivable when every
+/// agent-reachable action is reversible, and a non-reversible action is
+/// survivable when it is recorded; the failure is their conjunction.
+#[must_use]
+pub fn format_unaudited_failure(
+    manifest: &AgentAuthorityManifest,
+    allow_unaudited: bool,
+) -> Option<String> {
+    if allow_unaudited || !manifest.unaudited_and_unrecoverable() {
+        return None;
+    }
+    let mut listed: Vec<String> = manifest
+        .non_reversible_actions()
+        .iter()
+        .map(|row| {
+            format!(
+                "  {}::{} under grant {} ({})",
+                row.module_path, row.action, row.grant.name, row.grant.reversibility
+            )
+        })
+        .collect();
+    listed.extend(
+        manifest
+            .ungoverned_mutating_tools()
+            .iter()
+            .map(|tool| format!("  {} -- mutating, ungoverned", describe_tool(tool))),
+    );
+    Some(format!(
+        "\u{2717} No agent audit sink is configured, and this binary can still take {} action{} \
+         that nothing can undo:\n{}\n\n\
+         Nothing records these. With no sink installed the audit write trivially succeeds, so the \
+         runtime's fail-closed refusal never fires -- the refusal protects a configured sink that \
+         is failing, not a missing one. Install a sink with `AppBuilder::with_audit_sink(..)`, \
+         make the actions `reversible`, or re-run with `--allow-unaudited` to accept it. \
+         See docs/guide/agent-authority.md",
+        listed.len(),
+        if listed.len() == 1 { "" } else { "s" },
+        listed.join("\n"),
+    ))
+}
+
+/// The `--check` gate on a route naming an authority nothing registered.
+///
+/// Always fatal, with no allow-flag twin: unlike an ungoverned tool (a real
+/// adoption state) this cannot arise from the macros at all —
+/// `#[agent_operable]` always emits the static and its `inventory::submit!`
+/// together. A route in this list means someone hand-wrote the pair, and the
+/// effect is a tool in neither `actions` nor `ungoverned_tools`, and so in no
+/// gate (#1691 P3-1).
+#[must_use]
+pub fn format_unregistered_failure(manifest: &AgentAuthorityManifest) -> Option<String> {
+    if manifest.unregistered_authorities.is_empty() {
+        return None;
+    }
+    let listed = manifest
+        .unregistered_authorities
+        .iter()
+        .map(|row| format!("  {}", describe_unregistered(row)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "\u{2717} {} route{} an authority nothing registered:\n{listed}\n\n\
+         The handler carries an `#[agent_operable]` marker but no descriptor reached the manifest, \
+         so the action appears in no list and no gate sees it. This cannot happen through the \
+         macros -- check for a hand-written `__AUTUMN_AGENT_AUTHORITY_*` static, or for an \
+         `#[agent_operable]` behind a `#[cfg]` the route is not behind. \
+         See docs/guide/agent-authority.md",
+        manifest.unregistered_authorities.len(),
+        if manifest.unregistered_authorities.len() == 1 {
+            " names"
+        } else {
+            "s name"
+        },
+    ))
+}
+
+/// One unregistered authority, as the report names it.
+#[must_use]
+pub fn describe_unregistered(row: &UnregisteredAuthority) -> String {
+    format!(
+        "{} {} ({}) -> {}::{}{}",
+        row.method,
+        row.path,
+        row.handler,
+        row.module_path,
+        row.action,
+        if row.mcp_tool { " [mcp tool]" } else { "" }
+    )
 }
 
 /// One ungoverned tool, as the report names it.
-// RED (#1691): only the tests reach this while the report and the gate are
-// stubs; the green phase calls it from both and the allow comes off.
-#[allow(dead_code)]
+///
+/// Names the tool as an MCP client calls it, and the handler too when a route
+/// renamed one: the reader needs the first to recognise the tool and the
+/// second to find the code.
 #[must_use]
 pub fn describe_tool(tool: &UngovernedTool) -> String {
-    format!("{} {} ({})", tool.method, tool.path, tool.tool)
+    if tool.handler == tool.tool {
+        format!("{} {} ({})", tool.method, tool.path, tool.tool)
+    } else {
+        format!(
+            "{} {} ({}, handler {})",
+            tool.method, tool.path, tool.tool, tool.handler
+        )
+    }
+}
+
+/// What changed between two versions of the same action row.
+///
+/// Split out of [`format_drift`] because this is the part a reviewer actually
+/// reads: an effect appearing on a governed action is the whole point of
+/// keeping the manifest under review, and it deserves a line of its own rather
+/// than a "row changed" that sends them to `git diff`.
+fn action_changes(before: &ActionRow, after: &ActionRow) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if before.grant.name != after.grant.name {
+        lines.push(format!(
+            "      grant {} -> {}",
+            before.grant.name, after.grant.name
+        ));
+    }
+    if before.grant.reversibility != after.grant.reversibility {
+        lines.push(format!(
+            "      reversibility {} -> {}",
+            before.grant.reversibility, after.grant.reversibility
+        ));
+    }
+    if before.grant.tenant_scope != after.grant.tenant_scope {
+        lines.push(format!(
+            "      tenant scope {} -> {}",
+            before.grant.tenant_scope, after.grant.tenant_scope
+        ));
+    }
+    if before.grant.rate != after.grant.rate {
+        lines.push(format!(
+            "      declared rate {} -> {}",
+            show(before.grant.rate.as_deref()),
+            show(after.grant.rate.as_deref())
+        ));
+    }
+    if before.grant.spend != after.grant.spend {
+        lines.push(format!(
+            "      declared spend {} -> {}",
+            show(before.grant.spend.as_deref()),
+            show(after.grant.spend.as_deref())
+        ));
+    }
+    for effect in &after.effects {
+        if !before.effects.contains(effect) {
+            lines.push(format!(
+                "      + {} {} ({}, {})",
+                effect.kind, effect.subject, effect.provenance, effect.location
+            ));
+        }
+    }
+    for effect in &before.effects {
+        if !after.effects.contains(effect) {
+            lines.push(format!(
+                "      - {} {} ({})",
+                effect.kind, effect.subject, effect.provenance
+            ));
+        }
+    }
+    if before.exposure != after.exposure {
+        lines.push(format!(
+            "      exposure {} -> {}",
+            before.exposure, after.exposure
+        ));
+    }
+    if before.provenance != after.provenance {
+        // `provable` -> `declared` means someone wrote an effect down by hand.
+        // That is legal, and it is exactly the change a reviewer must see.
+        lines.push(format!(
+            "      provenance {} -> {}",
+            before.provenance, after.provenance
+        ));
+    }
+    // A hatch appearing or disappearing changes what the row *proves*, not
+    // what it lists, so nothing else in this diff would show it. That is
+    // exactly why it is here: adding `#[agent_effect(none, ...)]` over a
+    // statement that really does call out used to produce no drift at all.
+    for site in &after.asserted_effect_free {
+        if !before.asserted_effect_free.contains(site) {
+            lines.push(format!(
+                "      + asserted effect-free at {}: {}",
+                site.location, site.reason
+            ));
+        }
+    }
+    for site in &before.asserted_effect_free {
+        if !after.asserted_effect_free.contains(site) {
+            lines.push(format!(
+                "      - asserted effect-free at {}: {}",
+                site.location, site.reason
+            ));
+        }
+    }
+    if before.unused_grant_entries != after.unused_grant_entries {
+        lines.push(format!(
+            "      granted-but-unused: [{}] -> [{}]",
+            before.unused_grant_entries.join(", "),
+            after.unused_grant_entries.join(", ")
+        ));
+    }
+    lines
+}
+
+/// How a row is identified across two manifests: the module path and the
+/// handler name, never the handler name alone — two crates can each define a
+/// `draft_refund`, and a report that cannot tell them apart would attribute one
+/// crate's new effect to the other.
+fn action_key(row: &ActionRow) -> String {
+    format!("{}::{}", row.module_path, row.action)
+}
+
+fn show(value: Option<&str>) -> String {
+    value.map_or_else(|| "none".to_string(), ToString::to_string)
 }
 
 /// Write the manifest JSON to `path`.
@@ -241,8 +680,21 @@ pub fn run(opts: &AgentsManifestOptions<'_>) {
             eprintln!("\u{2713} The agent-authority manifest matches {path}.");
         }
 
+        // Every gate below is evaluated on the FRESH manifest, never the
+        // committed one, so a doctored file can only cause a drift failure --
+        // it can never certify away a tool the binary really exposes.
         if let Some(ungoverned) = format_ungoverned_failure(&manifest, opts.allow_ungoverned) {
             eprintln!("{ungoverned}");
+            failed = true;
+        }
+
+        if let Some(unaudited) = format_unaudited_failure(&manifest, opts.allow_unaudited) {
+            eprintln!("{unaudited}");
+            failed = true;
+        }
+
+        if let Some(unregistered) = format_unregistered_failure(&manifest) {
+            eprintln!("{unregistered}");
             failed = true;
         }
     }
@@ -254,9 +706,12 @@ pub fn run(opts: &AgentsManifestOptions<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use autumn_web::agent_authority::manifest::RouteSummary;
+    use autumn_web::agent_authority::manifest::{
+        AssertedEffectFreeRow, McpExposedBy, RouteSummary,
+    };
     use autumn_web::agent_authority::{
-        AgentAuthority, Effect, EffectKind, EffectProvenance, Grant, Reversibility, TenantScope,
+        AgentAuthority, AssertedEffectFree, Effect, EffectKind, EffectProvenance, Grant,
+        Reversibility, TenantScope,
     };
 
     use super::*;
@@ -306,6 +761,7 @@ mod tests {
         grant: &REFUND_GRANT,
         effects: WRITE_ONLY,
         asserted_effect_free_sites: 0,
+        asserted_effect_free: &[],
     };
 
     static DRAFT_REFUND_WIDENED: AgentAuthority = AgentAuthority {
@@ -315,6 +771,7 @@ mod tests {
         grant: &REFUND_GRANT,
         effects: WRITE_AND_OUTBOUND,
         asserted_effect_free_sites: 0,
+        asserted_effect_free: &[],
     };
 
     static ARCHIVE_REFUND: AgentAuthority = AgentAuthority {
@@ -324,6 +781,7 @@ mod tests {
         grant: &REFUND_GRANT,
         effects: WRITE_ONLY,
         asserted_effect_free_sites: 0,
+        asserted_effect_free: &[],
     };
 
     fn route(
@@ -338,8 +796,12 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             handler,
+            operation_id: handler,
             module_path,
             mcp_tool,
+            // The fixtures speak in terms of "is a tool"; how it got that way
+            // is the hatch tests' business, and they set it explicitly.
+            exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
             agent_authority: authority,
         }
     }
@@ -575,6 +1037,219 @@ mod tests {
             .first()
             .expect("the route is an ungoverned tool");
         assert_eq!(describe_tool(tool), "DELETE /widgets/{id} (destroy_widget)");
+    }
+
+    // ── The unaudited gate (#1691 P1-2) ──────────────────────────────
+
+    fn manifest_with_sink(
+        authorities: &[&'static AgentAuthority],
+        routes: &[RouteSummary],
+        sink: bool,
+    ) -> AgentAuthorityManifest {
+        AgentAuthorityManifest::from_parts(authorities, &[&REFUND_GRANT], routes, sink)
+    }
+
+    #[test]
+    fn no_sink_plus_an_action_nothing_can_undo_fails_the_check() {
+        // The one combination the runtime cannot catch: with no `AuditLogger`
+        // installed the attempt write returns `Ok(())` without writing, so the
+        // dispatcher's fail-closed refusal sees a success and refuses nothing.
+        // Neither the attempt nor the outcome is recorded anywhere.
+        let manifest =
+            manifest_with_sink(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)], false);
+        let failure = format_unaudited_failure(&manifest, false).expect("must fail");
+        assert!(failure.contains("draft_refund"), "{failure}");
+        assert!(failure.contains("RefundDrafter"), "{failure}");
+        assert!(failure.contains("compensable"), "{failure}");
+        // The message has to say why the runtime did not save them, or the
+        // reader will assume the documented refusal already covers this.
+        assert!(failure.contains("with_audit_sink"), "{failure}");
+        assert!(failure.contains("trivially succeeds"), "{failure}");
+    }
+
+    #[test]
+    fn a_configured_sink_clears_the_gate() {
+        let manifest = manifest_with_sink(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)], true);
+        assert!(format_unaudited_failure(&manifest, false).is_none());
+    }
+
+    #[test]
+    fn an_ungoverned_mutating_tool_trips_the_gate_even_with_no_governed_action() {
+        // Nothing declares what an ungoverned tool may do, so nothing promises
+        // it is undoable either. Unrecorded, that is the same hole.
+        let manifest = manifest_with_sink(
+            &[],
+            &[route(
+                "DELETE",
+                "/widgets/{id}",
+                "destroy_widget",
+                "shop::widgets",
+                true,
+                None,
+            )],
+            false,
+        );
+        let failure = format_unaudited_failure(&manifest, false).expect("must fail");
+        assert!(failure.contains("destroy_widget"), "{failure}");
+    }
+
+    #[test]
+    fn allow_unaudited_silences_the_gate_and_nothing_else() {
+        let manifest =
+            manifest_with_sink(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)], false);
+        assert!(format_unaudited_failure(&manifest, true).is_none());
+        // ...but the report still says the sink is missing. Allowed is not the
+        // same as unseen.
+        assert!(
+            format_report(&manifest).contains("NOT configured"),
+            "{}",
+            format_report(&manifest)
+        );
+    }
+
+    // ── The unregistered-authority gate (#1691 P3-1) ─────────────────
+
+    #[test]
+    fn a_route_naming_an_authority_nothing_registered_fails_the_check() {
+        // The route claims an envelope, so it is not "ungoverned"; no
+        // descriptor registered, so it is not an action either. It used to
+        // land in no list and therefore in no gate.
+        let manifest = manifest_of(&[], &[governed_route(&DRAFT_REFUND)]);
+        assert!(manifest.actions.is_empty());
+        assert!(manifest.ungoverned_tools.is_empty());
+        let failure = format_unregistered_failure(&manifest).expect("must fail");
+        assert!(failure.contains("draft_refund"), "{failure}");
+        assert!(failure.contains("billing::refunds"), "{failure}");
+    }
+
+    #[test]
+    fn a_registered_authority_clears_the_unregistered_gate() {
+        let manifest = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
+        assert!(format_unregistered_failure(&manifest).is_none());
+    }
+
+    #[test]
+    fn an_unregistered_authority_appearing_is_reported_as_drift() {
+        let before = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
+        let after = manifest_of(&[], &[governed_route(&DRAFT_REFUND)]);
+        let drift = format_drift(&before, &after).expect("drifted");
+        assert!(drift.contains("unregistered authority"), "{drift}");
+        assert!(drift.contains("draft_refund"), "{drift}");
+    }
+
+    // ── Hatch sites in the drift report (#1691 P2-5) ─────────────────
+
+    #[test]
+    fn an_added_asserted_effect_free_site_is_a_drift_line() {
+        // The proved effect set does not move when a hatch is added, and
+        // nothing else in the row does either -- so without this the change
+        // that most needs review produced no drift at all.
+        static HATCHED: AgentAuthority = AgentAuthority {
+            action: "draft_refund",
+            module_path: "billing::refunds",
+            location: "billing/refunds.rs:28",
+            grant: &REFUND_GRANT,
+            effects: WRITE_ONLY,
+            asserted_effect_free_sites: 1,
+            asserted_effect_free: &[AssertedEffectFree {
+                location: "billing/refunds.rs:41",
+                reason: "the helper only formats the receipt",
+            }],
+        };
+        let before = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
+        let after = manifest_of(&[&HATCHED], &[governed_route(&HATCHED)]);
+        let drift = format_drift(&before, &after).expect("drifted");
+        assert!(drift.contains("+ asserted effect-free"), "{drift}");
+        assert!(drift.contains("billing/refunds.rs:41"), "{drift}");
+        assert!(
+            drift.contains("the helper only formats the receipt"),
+            "{drift}"
+        );
+        // And removing one is equally visible, in the other direction.
+        let back = format_drift(&after, &before).expect("drifted");
+        assert!(back.contains("- asserted effect-free"), "{back}");
+
+        // The row also carries it, so a reviewer reading the committed file
+        // sees the claim without running the diff.
+        let row = after
+            .actions
+            .iter()
+            .find(|r| r.action == "draft_refund")
+            .expect("row");
+        assert_eq!(
+            row.asserted_effect_free,
+            vec![AssertedEffectFreeRow {
+                location: "billing/refunds.rs:41".to_string(),
+                reason: "the helper only formats the receipt".to_string(),
+            }]
+        );
+    }
+
+    // ── Hatch-exposed tools (#1691 P2-6) ─────────────────────────────
+
+    #[test]
+    fn the_reports_say_whether_an_attribute_or_the_hatch_exposed_a_tool() {
+        // A route nobody annotated, swept in by `expose_all_as_mcp()`, is
+        // agent-callable exactly like an annotated one -- and is the case a
+        // reviewer is least likely to know about.
+        let mut hatched = route(
+            "GET",
+            "/reports",
+            "list_reports",
+            "shop::reports",
+            true,
+            None,
+        );
+        hatched.exposed_by = Some(McpExposedBy::Hatch);
+        let manifest = manifest_of(&[], &[hatched]);
+        let warning = format_ungoverned_warning(&manifest).expect("warned");
+        assert!(warning.contains("[hatch]"), "{warning}");
+        assert!(warning.contains("read-only"), "{warning}");
+
+        let empty = manifest_of(&[], &[]);
+        let drift = format_drift(&empty, &manifest).expect("drifted");
+        assert!(drift.contains("[hatch]"), "{drift}");
+    }
+
+    #[test]
+    fn a_renamed_tool_is_reported_by_both_names() {
+        // The MCP client calls `createWidget`; the developer greps for
+        // `create_widget_handler`. A report carrying only one of them makes
+        // somebody do a lookup by hand.
+        let mut renamed = route(
+            "POST",
+            "/widgets",
+            "create_widget_handler",
+            "shop::widgets",
+            true,
+            None,
+        );
+        renamed.operation_id = "createWidget";
+        let manifest = manifest_of(&[], &[renamed]);
+        let tool = manifest
+            .ungoverned_tools
+            .first()
+            .expect("the route is an ungoverned tool");
+        assert_eq!(
+            describe_tool(tool),
+            "POST /widgets (createWidget, handler create_widget_handler)"
+        );
+        // When the two agree, the report does not repeat itself.
+        let plain = manifest_of(
+            &[],
+            &[route(
+                "DELETE",
+                "/widgets/{id}",
+                "destroy_widget",
+                "shop::widgets",
+                true,
+                None,
+            )],
+        );
+        assert_eq!(
+            describe_tool(&plain.ungoverned_tools[0]),
+            "DELETE /widgets/{id} (destroy_widget)"
+        );
     }
 
     // ── Round trip ───────────────────────────────────────────────────

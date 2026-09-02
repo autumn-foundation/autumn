@@ -232,11 +232,15 @@ pub fn route_macro(
     // when it projects these onto the wire.
     let authorize_bindings =
         api_doc::emit_authorize_binding_slice(&api_doc::extract_authorize_bindings(&input_fn));
-    // RED PHASE (#1691): the authority static is not yet wired. `None` keeps
-    // every existing route's metadata unchanged; the four
-    // `route_macro_*agent_authority*` tests below pin the behaviour this must
-    // grow into.
-    let agent_authority = quote! { ::core::option::Option::None };
+    // `#[agent_operable]` names the authority static after the handler, so the
+    // route macro only needs to know *whether* the handler is governed — the
+    // grant, the proved effects and the const assertions are the analyser's.
+    let agent_authority = if api_doc::extract_agent_authority(&input_fn) {
+        let authority_static = format_ident!("__AUTUMN_AGENT_AUTHORITY_{}", fn_name);
+        quote! { ::core::option::Option::Some(&#authority_static) }
+    } else {
+        quote! { ::core::option::Option::None }
+    };
     let seo_defaults = route_args.seo.emit();
 
     // ── Path helper ─────────────────────────────────────────────
@@ -327,6 +331,13 @@ const EDGE_EXTENSION_ERROR: &str = "`#[edge]` handlers cannot take `Extension<..
                                     would be served as a 500 instead of falling through; use \
                                     `EdgeCache`, or serve this route from the origin";
 
+/// Compile error for `#[edge]` stacked with `#[agent_operable]`.
+const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[agent_operable(...)]` — the edge lane is \
+     read-only, and the capsule has no audit sink or `AppState` to record an agent \
+     invocation against, so a governed action would run there unaudited; serve this \
+     route from the origin.\n\nServe the route from the origin, or drop \
+     `#[agent_operable]`. See docs/guide/agent-authority.md.";
+
 /// Marker consts the auth/rate guards inject into a handler body. A guard that
 /// expanded *before* this route macro left one of these behind instead of an
 /// attribute, and missing it would ship a guarded route to the unauthenticated
@@ -337,6 +348,7 @@ const GUARD_MARKERS: &[&str] = &[
     "__AUTUMN_STEP_UP_MAX_AGE",
     "__AUTUMN_THROTTLE_ROUTE_ID",
     "__AUTUMN_AUTHORIZE_BINDINGS",
+    "__AUTUMN_AGENT_OPERABLE",
 ];
 
 /// Reject an `#[edge]` route the edge lane cannot serve, spanning the error at
@@ -349,6 +361,13 @@ fn reject_ineligible_edge_route(
 ) -> Option<TokenStream> {
     if http_method != "GET" {
         return Some(syn::Error::new(span, EDGE_METHOD_ERROR).to_compile_error());
+    }
+    // Checked before the generic auth/rate guard sweep below: the marker is in
+    // `GUARD_MARKERS` too (so a governed handler can never slip past that
+    // sweep), but its own diagnostic names the real reason — the edge lane is
+    // read-only — instead of talking about session state.
+    if crate::api_doc::extract_agent_authority(input_fn) {
+        return Some(syn::Error::new(span, EDGE_AGENT_OPERABLE_ERROR).to_compile_error());
     }
     if has_auth_or_rate_guard(input_fn) {
         return Some(syn::Error::new(span, EDGE_GUARD_ERROR).to_compile_error());

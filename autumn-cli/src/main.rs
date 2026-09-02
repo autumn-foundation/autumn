@@ -222,6 +222,15 @@ pub struct AgentsManifestArgs {
     /// Compare against a committed manifest and exit non-zero on drift, so a
     /// widened authority envelope has to be reviewed rather than merged
     /// silently.
+    ///
+    /// This is the CI gate. Every check this command performs beyond the
+    /// compiler's own — drift, mutating tools with no envelope, actions nothing
+    /// can undo and nothing records, and routes naming an authority nothing
+    /// registered — runs only under `--check`. Without it the command reports
+    /// and warns but never fails, so a run that does not pass `--check` proves
+    /// nothing. Wire `autumn agents manifest --check <path>` into CI next to
+    /// `autumn data-flow --check`, and commit the manifest it writes with
+    /// `--manifest <path>`.
     #[arg(long, value_name = "PATH")]
     check: Option<String>,
     /// Let `--check` pass with MCP-exposed mutating tools that carry no
@@ -232,8 +241,25 @@ pub struct AgentsManifestArgs {
     /// never a default: a mutating tool an agent can call with nothing declared
     /// about it is what this command exists to surface. Allowed tools are still
     /// listed.
-    #[arg(long)]
+    ///
+    /// `requires = "check"`: the gate it relaxes only runs under `--check`, so
+    /// passing it alone means nothing. Saying so is better than accepting it
+    /// silently and leaving the author believing a gate was waived.
+    #[arg(long, requires = "check")]
     allow_ungoverned: bool,
+    /// Let `--check` pass when no agent audit sink is configured even though
+    /// the binary can take an action nothing can undo.
+    ///
+    /// The one combination the runtime cannot catch: with no sink installed the
+    /// audit write trivially succeeds, so the fail-closed refusal never fires
+    /// and the invocation leaves no trace at all. A development binary
+    /// legitimately has no sink, so the hatch exists — but the default is to
+    /// fail, because "irreversible and unrecorded" is not a state to discover
+    /// afterwards.
+    ///
+    /// `requires = "check"`, for the same reason as `--allow-ungoverned`.
+    #[arg(long, requires = "check")]
+    allow_unaudited: bool,
     /// Cargo features to build the inspected binary with (repeatable; a
     /// comma-separated list also works). An `#[agent_operable]` action or a
     /// grant behind a feature the build does not enable is not compiled in, so
@@ -1555,6 +1581,25 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
 
+    /// Agent-authority tooling — what an agent-operable handler may do (#1691).
+    ///
+    /// `autumn agents manifest` compiles the application, reads back the
+    /// manifest the framework assembles from every `#[agent_operable]` action
+    /// and every declared `authority_grant!`, joins it against the route table,
+    /// and writes the diffable record. `--check` is the CI gate: it fails on
+    /// drift, on an MCP-exposed *mutating* tool with no envelope, on a binary
+    /// that can act irreversibly with no audit sink, and on a route naming an
+    /// authority nothing registered — none of which the compiler can catch,
+    /// because a tool with no grant has no assertion to fail.
+    ///
+    /// # Examples
+    ///
+    ///   autumn agents manifest
+    ///   autumn agents manifest --manifest agent-authority.json
+    ///   autumn agents manifest --check agent-authority.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Agents(AgentsSubcommands),
+
     /// Cache-coherence tooling — prove no write can leave a cached read stale.
     ///
     /// `autumn cache audit` compiles the application, reads back the
@@ -1567,24 +1612,6 @@ enum Commands {
     ///   autumn cache audit
     ///   autumn cache audit --manifest target/cache-coherence.json
     ///   autumn cache audit --strict -p blog
-    /// Agent-authority tooling — what an agent-operable handler may do (#1691).
-    ///
-    /// `autumn agents manifest` compiles the application, reads back the
-    /// manifest the framework assembles from every `#[agent_operable]` action
-    /// and every declared `authority_grant!`, joins it against the route table,
-    /// and writes the diffable record. `--check` fails on drift, and on any
-    /// MCP-exposed *mutating* tool with no envelope at all — the one thing the
-    /// compiler cannot catch, because a tool with no grant has no assertion to
-    /// fail.
-    ///
-    /// # Examples
-    ///
-    ///   autumn agents manifest
-    ///   autumn agents manifest --manifest agent-authority.json
-    ///   autumn agents manifest --check agent-authority.json --release
-    #[command(subcommand, verbatim_doc_comment)]
-    Agents(AgentsSubcommands),
-
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
     /// Emit the classified-data flow manifest (#1654).
@@ -4252,6 +4279,7 @@ fn run_command(command: Commands) {
                 json: args.json,
                 check: args.check.as_deref(),
                 allow_ungoverned: args.allow_ungoverned,
+                allow_unaudited: args.allow_unaudited,
                 features,
                 release: args.release,
             });

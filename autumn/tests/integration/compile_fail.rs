@@ -278,6 +278,9 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     ("agent_authority_outbound_not_allowlisted", false),
     // A `format!`-built URL proves nothing about the host reached.
     ("agent_authority_outbound_dynamic_url", false),
+    // A client alias stands in for a relative literal, never for a URL the
+    // analysis cannot read — the exfiltration shape the alias branch hid.
+    ("agent_authority_outbound_alias_dynamic_url", false),
     // A job the grant does not list, enqueued through the free function that
     // has no signature handle to key on.
     ("agent_authority_job_not_listed", false),
@@ -320,6 +323,23 @@ fn agent_authority_compile_fail_tests() {
         }
         t.compile_fail(format!("tests/compile-fail/{fixture}.rs"));
     }
+}
+
+/// The `#[agent_operable]` compile-*pass* half (#1691), for the reason its
+/// compile-fail sibling has its own test: a self-contained feature worth
+/// running on its own, and two fewer lines in a `compile_pass_tests` that is
+/// already over the line limit.
+#[test]
+fn agent_authority_compile_pass_tests() {
+    let t = trybuild::TestCases::new();
+
+    // Every proved effect, both hatch forms, and the effect-free handler —
+    // the fixture asserts its own manifest rows in `main`.
+    t.pass("tests/compile-pass/agent_authority_valid.rs");
+    // The same analysis against the real route/`#[repository]` surface, with
+    // the attribute stacked in both orders and under `#[secured]`.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_route.rs");
 }
 
 /// Build-time cache coherence (#1716). Its own `TestCases` for the same
@@ -380,15 +400,6 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/query_budget_valid.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/query_budget_route.rs");
-
-    // Build-time authority envelopes (#1691): every conforming effect shape,
-    // both `#[agent_effect]` grammars, and the `AgentAuthority` proof the
-    // expansion leaves behind for the manifest. The route fixture composes the
-    // attribute with `#[post]` / `#[api_doc(mcp)]` / `#[secured]` in both
-    // orders and asserts the `ApiDoc` carries the authority either way.
-    t.pass("tests/compile-pass/agent_authority_valid.rs");
-    #[cfg(feature = "db")]
-    t.pass("tests/compile-pass/agent_authority_route.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
@@ -664,7 +675,13 @@ fn agent_authority_guide_matches_the_real_diagnostics() {
     // what the gate refuses. One row per registered fixture: a fixture missing
     // from it is a refusal nobody documented, and a row naming a fixture that
     // no longer exists is a promise the suite stopped keeping.
-    for (fixture, _) in AGENT_AUTHORITY_FIXTURES {
+    //
+    // The row's *label* is checked too. `E0080` (a failing const assertion:
+    // the effect was proved and the grant did not cover it) and `macro` (the
+    // macro refusing a site it cannot prove) are different promises to a
+    // reader — one says "widen the grant", the other says "the analysis cannot
+    // read this" — and a mislabelled row sends them to the wrong fix.
+    for (fixture, needs_db) in AGENT_AUTHORITY_FIXTURES {
         assert!(
             guide.contains(fixture),
             "the guide's violation matrix has no row for {fixture}"
@@ -673,6 +690,32 @@ fn agent_authority_guide_matches_the_real_diagnostics() {
             root.join(format!("autumn/tests/compile-fail/{fixture}.rs"))
                 .exists(),
             "the fixture registry names a fixture that does not exist: {fixture}"
+        );
+        if *needs_db && !cfg!(feature = "db") {
+            continue;
+        }
+        let golden = std::fs::read_to_string(
+            root.join(format!("autumn/tests/compile-fail/{fixture}.stderr")),
+        )
+        .unwrap_or_else(|_| panic!("{fixture} has a committed golden"));
+        let first_error = golden
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .unwrap_or_else(|| panic!("{fixture}'s golden opens with an error"));
+        let row = guide
+            .lines()
+            .find(|line| line.starts_with('|') && line.contains(fixture))
+            .unwrap_or_else(|| panic!("the guide's matrix row for {fixture} is not a table row"));
+        let labelled_e0080 = row.contains("`E0080`");
+        let labelled_macro = row.contains("`macro`");
+        assert!(
+            labelled_e0080 != labelled_macro,
+            "the guide's row for {fixture} must carry exactly one of `E0080` / `macro`: {row}"
+        );
+        assert_eq!(
+            labelled_e0080,
+            first_error.starts_with("error[E0080]"),
+            "the guide labels {fixture} wrongly.\n\nrow: {row}\ngolden: {first_error}"
         );
     }
 

@@ -1334,6 +1334,87 @@ mod tests {
         assert!(infos[0].policy, "a bound route is still policy-guarded");
     }
 
+    // ── `agent_grant` (#1691) ───────────────────────────────────────────
+
+    /// One hand-built authority, standing in for what `#[agent_operable]`
+    /// emits. `autumn routes` only ever reads the grant's *name* off it.
+    fn refund_authority() -> &'static crate::agent_authority::AgentAuthority {
+        static GRANT: crate::agent_authority::Grant = crate::agent_authority::Grant {
+            name: "RefundDrafter",
+            writes: &["Refund"],
+            unbounded_writes: &[],
+            tenant_scope: crate::agent_authority::TenantScope::Scoped,
+            outbound: &[],
+            webhooks: &[],
+            jobs: &[],
+            rate: None,
+            spend: None,
+            reversibility: crate::agent_authority::Reversibility::Compensable,
+            location: "autumn/src/route_listing.rs",
+        };
+        static AUTHORITY: crate::agent_authority::AgentAuthority =
+            crate::agent_authority::AgentAuthority {
+                action: "draft_refund",
+                module_path: "autumn_web::route_listing::tests",
+                location: "autumn/src/route_listing.rs",
+                grant: &GRANT,
+                effects: &[],
+                asserted_effect_free_sites: 0,
+                asserted_effect_free: &[],
+            };
+        &AUTHORITY
+    }
+
+    #[test]
+    fn collect_carries_the_agent_grant_name() {
+        let api_doc = crate::openapi::ApiDoc {
+            agent_authority: Some(refund_authority()),
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/api/refunds", "draft_refund", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant.as_deref(), Some("RefundDrafter"));
+    }
+
+    #[test]
+    fn collect_leaves_an_ungoverned_route_without_a_grant() {
+        // `None` is the signal the authority manifest keys `ungoverned_tools`
+        // off, so inventing one here would hide the gap the listing exists to
+        // show.
+        let route = make_route_with(Method::POST, "/api/notes", "write_note", dummy_api_doc());
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+
+        assert_eq!(infos[0].agent_grant, None);
+    }
+
+    #[test]
+    fn route_info_elides_an_absent_agent_grant() {
+        // Same compatibility convention as the fields before it: elided when
+        // absent, so an existing dump entry stays byte-stable for an older
+        // consumer.
+        let info = RouteInfo {
+            method: "POST".to_owned(),
+            path: "/api/notes".to_owned(),
+            handler: "write_note".to_owned(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(
+            value.get("agent_grant").is_none(),
+            "an absent grant must not be serialized: {value}"
+        );
+
+        let governed = RouteInfo {
+            agent_grant: Some("RefundDrafter".to_owned()),
+            ..info
+        };
+        let value = serde_json::to_value(&governed).unwrap();
+        assert_eq!(value["agent_grant"], "RefundDrafter");
+        let decoded: RouteInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.agent_grant.as_deref(), Some("RefundDrafter"));
+    }
+
     /// Field 15 follows the field 9-14 convention: elided when empty, so the
     /// first fourteen keys of every existing dump entry stay byte-stable and an
     /// *old* consumer sees the JSON it already knows.

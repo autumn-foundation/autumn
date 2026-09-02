@@ -3931,6 +3931,24 @@ impl AppBuilder {
         // configured. Installed after the mailer so the mail channel can bind
         // to the live `Mailer` extension.
         crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
+        // An MCP endpoint with no audit sink still serves tools; what it does
+        // not do is leave a record that an agent called one. That is a property
+        // of the deployment rather than of any grant, so it is said once, here,
+        // where both are known -- and it is also carried in the agent-authority
+        // manifest's `audit.sink_configured` (#1691 R9).
+        #[cfg(feature = "mcp")]
+        if mcp.is_some()
+            && !audit_logger
+                .as_ref()
+                .is_some_and(|logger| logger.is_enabled())
+        {
+            tracing::warn!(
+                target: "autumn.agent",
+                "MCP is mounted with no audit sink installed: agent tool calls will be traced \
+                 but not recorded. Install one with `AppBuilder::with_audit_sink(..)`. \
+                 See docs/guide/agent-authority.md"
+            );
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -5703,6 +5721,13 @@ impl AppBuilder {
             .audit_logger
             .as_ref()
             .is_some_and(|logger| logger.is_enabled());
+        // The whole-API MCP hatch, when the `mcp` feature is compiled in and
+        // the app opted into it. Without it every route `expose_all_as_mcp()`
+        // exposes would be missing from the document entirely.
+        #[cfg(feature = "mcp")]
+        let expose_all = self.mcp.as_ref().is_some_and(|rt| rt.expose_all);
+        #[cfg(not(feature = "mcp"))]
+        let expose_all = false;
         let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
             .routes
             .iter()
@@ -5711,7 +5736,7 @@ impl AppBuilder {
                     .iter()
                     .flat_map(|group| group.routes.iter()),
             )
-            .map(agent_authority_route_summary)
+            .map(|route| agent_authority_route_summary(route, expose_all))
             .collect();
         crate::agent_authority::manifest::print_manifest_dump(
             &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
@@ -7118,16 +7143,43 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
 /// no dependency on the router, and unconditionally rather than behind the
 /// `openapi` feature: which handlers an agent can reach is not an
 /// documentation concern.
-fn agent_authority_route_summary(route: &Route) -> crate::agent_authority::manifest::RouteSummary {
+///
+/// `expose_all` is the app's whole-API MCP hatch. It has to be threaded in:
+/// deriving tool-ness from `#[api_doc(mcp)]` alone made every route
+/// `expose_all_as_mcp()` swept up invisible to this document — in neither
+/// `actions` nor `ungoverned_tools` — while the document's own `excluded`
+/// section claimed they surfaced there (#1691 P2-6). The same call also
+/// applies the JSON-out eligibility gate, so an HTML route someone tagged
+/// `#[api_doc(mcp)]` is no longer reported as a tool it will never become.
+fn agent_authority_route_summary(
+    route: &Route,
+    expose_all: bool,
+) -> crate::agent_authority::manifest::RouteSummary {
+    // One string, used both for the row and for the predicate, so the two can
+    // never disagree about a route's verb.
+    let method = route.method.to_string();
+    let exposed_by = crate::agent_authority::manifest::mcp_exposure(
+        &crate::agent_authority::manifest::McpExposureInput {
+            method: &method,
+            hidden: route.api_doc.hidden,
+            mcp_tool: route.api_doc.mcp_tool,
+            mcp_exclude: route.api_doc.mcp_exclude,
+            mcp_stream: route.api_doc.mcp_stream,
+            has_response_schema: route.api_doc.response.is_some(),
+            success_status: route.api_doc.success_status,
+            expose_all,
+        },
+    );
     crate::agent_authority::manifest::RouteSummary {
-        method: route.method.to_string(),
+        method,
         path: route.path.to_string(),
         handler: route.name,
+        // The name an MCP client actually calls: `#[api_doc(operation_id =
+        // "...")]` renames the tool without renaming the handler.
+        operation_id: route.api_doc.operation_id,
         module_path: route.api_doc.module_path,
-        // Exclusion always wins, exactly as it does for the MCP derivation
-        // itself -- a route opted out is not a tool, so it is not an agent's
-        // to call and not this document's business.
-        mcp_tool: route.api_doc.mcp_tool && !route.api_doc.mcp_exclude,
+        mcp_tool: exposed_by.is_some(),
+        exposed_by,
         // Filled by the route macro from the handler's `#[agent_operable]`
         // marker, in either attribute order.
         agent_authority: route.api_doc.agent_authority,

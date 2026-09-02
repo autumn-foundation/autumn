@@ -49,6 +49,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -168,6 +169,10 @@ struct McpTool {
     /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
     /// the tool result.
     empty_body: bool,
+    /// The handler's build-time authority envelope (#1691), or `None` for an
+    /// ungoverned tool. Drives the invocation's audit record and the
+    /// reversibility-derived `destructiveHint`.
+    agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
 }
 
 impl McpTool {
@@ -213,6 +218,10 @@ pub(crate) struct McpWiring {
     /// marked [`LoadShedExempt`](crate::middleware::LoadShedExempt) to avoid
     /// consuming a second slot for the same logical request.
     pub envelope_load_shed: bool,
+    /// The application state, so `tools/call` can reach the installed
+    /// [`AuditLogger`](crate::audit::AuditLogger) and the injected entropy seam
+    /// without any per-handler wiring (#1691).
+    pub state: crate::state::AppState,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -252,6 +261,10 @@ pub struct McpServer {
     /// replayed `tools/call` dispatch from double-counting against the same
     /// shared `LoadShedLayer` instance.
     envelope_load_shed: bool,
+    /// The application state. `tools/call` writes its agent-authority audit
+    /// records through this (#1691); an app with no `AuditLogger` installed
+    /// makes those writes a no-op, so nothing here is conditional on one.
+    state: crate::state::AppState,
     server_name: String,
     server_version: String,
 }
@@ -355,13 +368,18 @@ fn default_port(scheme: &str) -> Option<&'static str> {
 
 /// Decide whether a route's `ApiDoc` should be projected as a tool.
 ///
+/// `pub(crate)` for one reason: `agent_authority::manifest` carries an
+/// unconditional copy of this rule (it must report the agent surface even when
+/// the `mcp` feature is off), and a unit test there pins the copy equal to this
+/// original so the two cannot drift.
+///
 /// Eligibility (JSON-out) gates everything: HTML/Maud routes have no response
 /// schema and are silently ineligible. On top of that:
 /// * `mcp_exclude` always wins.
 /// * an explicit `mcp` opt-in always exposes (any verb).
 /// * under the whole-API hatch, un-tagged `GET`s are auto-included but
 ///   mutating verbs are not.
-fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
+pub(crate) fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     if doc.hidden || doc.mcp_exclude {
         return false;
     }
@@ -414,15 +432,41 @@ const fn has_empty_body_contract(status: u16) -> bool {
     matches!(status, 204 | 205)
 }
 
-/// MCP safety annotations derived purely from the HTTP verb.
-fn annotations_for(method: &str, title: &str) -> Value {
+/// MCP safety annotations for a derived tool.
+///
+/// `readOnlyHint` is a statement about the HTTP verb and nothing else.
+///
+/// `destructiveHint` takes the verb as a **floor**, never as a fallback the
+/// grant can talk its way under. A declared
+/// [`Reversibility`](crate::agent_authority::Reversibility) can only ever *add*
+/// the warning: it raises a `POST`/`PATCH` that the verb alone says nothing
+/// about, and it cannot clear the one `DELETE` already carries.
+///
+/// That asymmetry is deliberate. `reversible` means the compiler proved the
+/// effect set is bounded writes only — it does **not** mean the application can
+/// put the row back, and nothing here checks for soft-delete or versioning. An
+/// MCP client skips its confirmation prompt on `destructiveHint: false`, so
+/// letting one unproved adjective in a grant clear a `DELETE`'s warning would
+/// trade a real signal for an unverified claim (issue #1691 review, P2-1).
+fn annotations_for(
+    method: &str,
+    title: &str,
+    authority: Option<&'static crate::agent_authority::AgentAuthority>,
+) -> Value {
+    use crate::agent_authority::Reversibility;
+
     let upper = method.to_ascii_uppercase();
     let read_only = is_read_only(&upper);
     let mut obj = serde_json::Map::new();
     obj.insert("title".into(), json!(title));
     obj.insert("readOnlyHint".into(), json!(read_only));
     // DELETE is the destructive verb; flag it so agents/UIs can warn.
-    if upper == "DELETE" {
+    let verb_is_destructive = upper == "DELETE";
+    if let Some(authority) = authority {
+        let destructive =
+            authority.grant.reversibility != Reversibility::Reversible || verb_is_destructive;
+        obj.insert("destructiveHint".into(), json!(destructive));
+    } else if verb_is_destructive {
         obj.insert("destructiveHint".into(), json!(true));
     }
     Value::Object(obj)
@@ -713,7 +757,7 @@ pub fn derive_tools(
             name: doc.operation_id.to_owned(),
             description: doc.description.or(doc.summary).map(str::to_owned),
             input_schema,
-            annotations: annotations_for(doc.method, title),
+            annotations: annotations_for(doc.method, title, doc.agent_authority),
             method: doc.method.to_owned(),
             path_template: doc.path.to_owned(),
             path_params: doc.path_params.iter().map(|p| (*p).to_owned()).collect(),
@@ -723,11 +767,7 @@ pub fn derive_tools(
             empty_body: doc.response.is_none()
                 && has_empty_body_contract(doc.success_status)
                 && !doc.mcp_stream,
-            // RED PHASE (#1691): not yet copied from `doc.agent_authority`.
-            // `derive_tools_carries_the_handler_authority_onto_the_tool` and
-            // `destructive_hint_follows_declared_reversibility` pin what this
-            // must become.
-            agent_authority: None,
+            agent_authority: doc.agent_authority,
         });
     }
     tools
@@ -832,6 +872,7 @@ impl McpServer {
                 has_query: t.has_query,
                 streams: t.streams,
                 empty_body: t.empty_body,
+                agent_authority: t.agent_authority,
             })
             .collect();
         let by_name = tools
@@ -849,6 +890,7 @@ impl McpServer {
             csrf_header: wiring.csrf_header,
             envelope_rate_limited: wiring.envelope_rate_limited,
             envelope_load_shed: wiring.envelope_load_shed,
+            state: wiring.state,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1383,6 +1425,454 @@ fn single_tools_call(msg: &Value) -> Option<(Value, Value)> {
     Some((id.clone(), params))
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Agent-authority audit (#1691)
+// ──────────────────────────────────────────────────────────────────
+
+/// Most effects recorded on an agent audit event. An action with more than this
+/// is already far outside what a reviewer reads inline; the manifest holds the
+/// complete set.
+const MAX_AUDITED_EFFECTS: usize = 16;
+
+/// Byte cap on the `argument_names` metadata value, so a pathological argument
+/// object cannot bloat every row it touches.
+const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
+
+/// Actor recorded when no principal was resolved for the call. Never empty: an
+/// audit row that cannot name who acted is still a row that must be greppable.
+const ANONYMOUS_AGENT: &str = "agent:anonymous";
+
+/// The tool error returned when a non-reversible action cannot be recorded.
+const UNAUDITABLE_REFUSAL: &str =
+    "audit attempt record could not be written; refusing a non-reversible action";
+
+/// Deadline for the pre-dispatch audit write.
+///
+/// This write sits inline on the request path, ahead of the handler, so a sink
+/// that hangs — a saturated DB pool, a remote collector that accepted the
+/// connection and went quiet — would otherwise stall every `tools/call` until
+/// the envelope's `request_timeout_ms` fires. Expiry is treated as a write
+/// failure, which means a non-reversible action is refused rather than served
+/// unrecorded (issue #1691 review, P3-6).
+const AUDIT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Everything both of an invocation's audit events share, resolved once before
+/// dispatch.
+///
+/// Two events are written per `tools/call` — `agent.tool.<name>.attempt` before
+/// dispatch and `agent.tool.<name>` after it — because an invocation that never
+/// returns (a panic, a hang, a killed process) must still leave evidence that
+/// an agent reached for the action. They share a correlation id, minted here so
+/// it exists before anything can go wrong.
+struct AgentAudit {
+    tool: String,
+    path_template: String,
+    correlation_id: String,
+    reversibility: Option<crate::agent_authority::Reversibility>,
+    grant: Option<&'static str>,
+    actor: String,
+    ip: Option<std::net::IpAddr>,
+    /// Metadata common to both events. Deliberately built once: the pair must
+    /// agree field for field, or joining them is guesswork.
+    shared: std::collections::BTreeMap<String, String>,
+}
+
+impl AgentAudit {
+    /// Resolve the invocation's audit context from the tool's compile-time
+    /// authority and the call's *shape*.
+    fn new(server: &McpServer, tool: &McpTool, arguments: &Value, ctx: &ReplayContext<'_>) -> Self {
+        let authority = tool.agent_authority;
+        let grant = authority.map(|a| a.grant.name);
+        let reversibility = authority.map(|a| a.grant.reversibility);
+        let correlation_id = server.state.entropy().uuid_v4().to_string();
+
+        let mut shared = std::collections::BTreeMap::new();
+        shared.insert("correlation_id".to_owned(), correlation_id.clone());
+        shared.insert("transport".to_owned(), "mcp".to_owned());
+        shared.insert("tool".to_owned(), tool.name.clone());
+        if let Some(grant) = grant {
+            shared.insert("grant".to_owned(), grant.to_owned());
+        }
+        // "unknown" rather than a guess: an ungoverned tool's blast radius is
+        // exactly what nobody has established, and calling it `reversible`
+        // would be the one wrong answer.
+        shared.insert(
+            "reversibility".to_owned(),
+            reversibility.map_or_else(|| "unknown".to_owned(), |r| r.as_str().to_owned()),
+        );
+        if let Some(authority) = authority {
+            shared.insert("effects".to_owned(), render_effects(authority.effects));
+        }
+        shared.insert("argument_names".to_owned(), argument_names(tool, arguments));
+
+        Self {
+            tool: tool.name.clone(),
+            path_template: tool.path_template.clone(),
+            correlation_id,
+            reversibility,
+            grant,
+            // The principal the *envelope* resolved, if any. `Current` is set by
+            // the auth layer on the request scope, so a `secure_mcp` app names
+            // its caller and an open one falls back rather than recording "".
+            actor: crate::current::Current::scoped_actor()
+                .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
+            ip: ctx.peer.map(|peer| peer.ip()),
+            shared,
+        }
+    }
+
+    /// The extension handlers read via `Extension<AgentInvocation>`.
+    fn invocation(&self) -> crate::agent_authority::AgentInvocation {
+        crate::agent_authority::AgentInvocation {
+            correlation_id: self.correlation_id.clone(),
+            tool: self.tool.clone(),
+            grant: self.grant,
+            reversibility: self.reversibility,
+        }
+    }
+
+    /// Whether a lost audit record is grounds for refusing the action.
+    ///
+    /// Only a *proved* `reversible` grant earns the benefit of the doubt.
+    /// Ungoverned (`None`) counts as non-reversible: the whole point of the
+    /// unknown marker is that we do not get to assume.
+    fn refuse_when_unauditable(&self) -> bool {
+        self.reversibility != Some(crate::agent_authority::Reversibility::Reversible)
+    }
+
+    /// Build one of this invocation's events.
+    ///
+    /// `phase` is what tells the three rows apart once they are in the sink:
+    /// `attempt` is written before anything runs, `outcome` after the handler
+    /// returned, and `refused` when the attempt could not be recorded and the
+    /// action was therefore not taken. Without it an operator filtering on
+    /// `status` alone cannot distinguish "an attempt was logged" from "the call
+    /// succeeded" — the attempt is deliberately `Success` (the *write*
+    /// succeeded; nothing has been tried yet) — nor a refusal from a 5xx.
+    fn event(
+        &self,
+        action: String,
+        status: crate::audit::AuditStatus,
+        phase: &str,
+    ) -> crate::audit::AuditEvent {
+        let mut event = crate::audit::AuditEvent::new(
+            self.actor.clone(),
+            action,
+            self.path_template.clone(),
+            self.ip,
+            status,
+        );
+        event.metadata = self.shared.clone();
+        event.metadata.insert("phase".to_owned(), phase.to_owned());
+        event
+    }
+
+    /// Write one event under [`AUDIT_WRITE_TIMEOUT`], flattening an expiry into
+    /// the same `Err` shape a sink failure produces.
+    async fn write_bounded(
+        server: &McpServer,
+        event: crate::audit::AuditEvent,
+    ) -> Result<(), String> {
+        match tokio::time::timeout(
+            AUDIT_WRITE_TIMEOUT,
+            crate::audit::write_from_state(&server.state, event),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_elapsed) => Err(format!(
+                "audit sink did not respond within {AUDIT_WRITE_TIMEOUT:?}"
+            )),
+        }
+    }
+
+    /// The fields every `autumn.agent` line carries, so the attempt and the
+    /// outcome lines describe one invocation in the same vocabulary.
+    fn reversibility_field(&self) -> Option<&str> {
+        self.shared.get("reversibility").map(String::as_str)
+    }
+
+    /// Record the attempt, before anything has run.
+    ///
+    /// `Err` carries the tool-error text: the record could not be written and
+    /// the action is not reversible, so it must not happen at all.
+    async fn record_attempt(&self, server: &McpServer) -> Result<(), &'static str> {
+        let event = self.event(
+            format!("agent.tool.{}.attempt", self.tool),
+            // The *write* is what succeeded here; `phase` carries the fact that
+            // nothing has been attempted yet.
+            crate::audit::AuditStatus::Success,
+            "attempt",
+        );
+        let Err(error) = Self::write_bounded(server, event).await else {
+            // Mirrored to the trace so an app with no sink installed still sees
+            // both halves of every invocation, not just the outcome.
+            tracing::info!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                transport = "mcp",
+                phase = "attempt",
+                grant = self.grant,
+                reversibility = self.reversibility_field(),
+                effects = self.shared.get("effects").map(String::as_str),
+                argument_names = self.shared.get("argument_names").map(String::as_str),
+                actor = %self.actor,
+                target = %self.path_template,
+                "agent tool call attempted"
+            );
+            return Ok(());
+        };
+        if self.refuse_when_unauditable() {
+            tracing::error!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                transport = "mcp",
+                phase = "refused",
+                grant = self.grant,
+                reversibility = self.reversibility_field(),
+                actor = %self.actor,
+                target = %self.path_template,
+                error = %error,
+                "refusing an agent tool call: its attempt record could not be written \
+                 and the action is not reversible"
+            );
+            self.record_refusal(server, &error).await;
+            return Err(UNAUDITABLE_REFUSAL);
+        }
+        tracing::warn!(
+            target: "autumn.agent",
+            tool = %self.tool,
+            correlation_id = %self.correlation_id,
+            phase = "attempt",
+            error = %error,
+            "agent tool attempt record could not be written; the action is reversible, \
+             so the call proceeds"
+        );
+        Ok(())
+    }
+
+    /// Best-effort record that the invocation was refused for want of an audit
+    /// trail.
+    ///
+    /// The write that just failed was an aggregate across every configured sink
+    /// ([`AuditLogger::write`](crate::audit::AuditLogger::write) attempts them
+    /// all and joins the errors), so one broken sink fails the whole call —
+    /// while the healthy ones would happily have taken the row. Retrying here
+    /// gives them the refusal, which is the single most interesting thing that
+    /// happened. Its own failure is ignored on purpose: there is nowhere left to
+    /// report it, the `tracing::error!` above already fired, and the refusal
+    /// itself does not depend on this landing.
+    async fn record_refusal(&self, server: &McpServer, error: &str) {
+        let mut event = self.event(
+            // Its own action, not the outcome action with a different `phase`:
+            // a refusal and a completed call are different things, and an
+            // operator filtering for one should not have to parse metadata to
+            // exclude the other.
+            format!("agent.tool.{}.refused", self.tool),
+            crate::audit::AuditStatus::Failure,
+            "refused",
+        );
+        // No `http_status`: nothing was dispatched.
+        event
+            .metadata
+            .insert("refused_reason".to_owned(), error.to_owned());
+        let _ = Self::write_bounded(server, event).await;
+    }
+
+    /// Record how the invocation ended. Never alters the tool result: a broken
+    /// sink is an operational problem, not a reason to fail a call that already
+    /// happened.
+    async fn record_outcome(
+        &self,
+        server: &McpServer,
+        status: StatusCode,
+        request_id: Option<&str>,
+    ) {
+        let audit_status = if status.is_success() {
+            crate::audit::AuditStatus::Success
+        } else {
+            crate::audit::AuditStatus::Failure
+        };
+        let mut event = self.event(format!("agent.tool.{}", self.tool), audit_status, "outcome");
+        event
+            .metadata
+            .insert("http_status".to_owned(), status.as_u16().to_string());
+        // The replayed pipeline's own id, so an audit row joins to the access
+        // log line and the traces for the same dispatch.
+        if let Some(request_id) = request_id {
+            event
+                .metadata
+                .insert("request_id".to_owned(), request_id.to_owned());
+        }
+        // Emitted whether or not a sink is installed, so an app that configured
+        // none still has a trace of every agent action it served.
+        tracing::info!(
+            target: "autumn.agent",
+            tool = %self.tool,
+            correlation_id = %self.correlation_id,
+            transport = "mcp",
+            phase = "outcome",
+            grant = self.grant,
+            reversibility = self.reversibility_field(),
+            effects = self.shared.get("effects").map(String::as_str),
+            argument_names = self.shared.get("argument_names").map(String::as_str),
+            actor = %self.actor,
+            target = %self.path_template,
+            http_status = status.as_u16(),
+            request_id = request_id,
+            "agent tool call"
+        );
+        // Bounded like the attempt write: the handler has already run, so a
+        // hanging sink here cannot change what happened — but it can still hold
+        // the response open, and the caller is owed one.
+        if let Err(error) = Self::write_bounded(server, event).await {
+            tracing::warn!(
+                target: "autumn.agent",
+                tool = %self.tool,
+                correlation_id = %self.correlation_id,
+                phase = "outcome",
+                error = %error,
+                "agent tool outcome record could not be written"
+            );
+        }
+    }
+}
+
+/// Render an authority's proved effects as `kind:subject`, comma-joined.
+fn render_effects(effects: &[crate::agent_authority::Effect]) -> String {
+    let mut out = String::new();
+    for effect in effects.iter().take(MAX_AUDITED_EFFECTS) {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(effect.kind.as_str());
+        out.push(':');
+        out.push_str(effect.subject);
+    }
+    if effects.len() > MAX_AUDITED_EFFECTS {
+        out.push_str(",…");
+    }
+    out
+}
+
+/// The call's top-level argument **names**, sorted and comma-joined, followed
+/// by a count of the ones this tool does not recognise.
+///
+/// Names only, never values: an audit sink is a long-lived, widely-readable
+/// store, and the arguments of an agent call routinely carry exactly the
+/// payloads that must not be duplicated into one. The shape of a call is what
+/// makes a row reviewable; its contents are the handler's business.
+///
+/// Only names drawn from the tool's own argument surface — the reserved
+/// `body`/`query` keys and its declared path params — are echoed verbatim.
+/// Everything else is counted, never quoted (`body,id,+2 unknown`).
+///
+/// The caller chooses those keys and nothing validates them against the
+/// advertised schema, so an un-intersected name list is an
+/// attacker-controlled string landing in a durable audit row *and* in the
+/// `autumn.agent` trace line, where an embedded newline forges a log entry and
+/// a key like `ssn-123-45-6789` smuggles the very payload the names-only rule
+/// exists to keep out (issue #1691 review, P2-2). Counting the unknowns keeps
+/// the useful signal — "this call carried arguments the tool ignores" — without
+/// reproducing a single byte the caller wrote.
+fn argument_names(tool: &McpTool, arguments: &Value) -> String {
+    let Some(object) = arguments.as_object() else {
+        return String::new();
+    };
+
+    // The keys `build_request` actually reads. Catch-all params (`{*rest}`)
+    // surface from `ApiDoc` with a leading `*` but are addressed by the bare
+    // name, exactly as `build_request` strips it.
+    let is_known = |name: &str| {
+        name == "body"
+            || name == "query"
+            || tool
+                .path_params
+                .iter()
+                .any(|param| param.strip_prefix('*').unwrap_or(param) == name)
+    };
+
+    let mut known: Vec<&str> = Vec::new();
+    let mut unknown: usize = 0;
+    for name in object.keys() {
+        if is_known(name) {
+            known.push(name);
+        } else {
+            unknown += 1;
+        }
+    }
+    known.sort_unstable();
+
+    let mut out = String::new();
+    for name in known {
+        // +1 for the separator this name would need.
+        if out.len() + name.len() + 1 > MAX_ARGUMENT_NAMES_BYTES {
+            out.push_str(",…");
+            break;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(name);
+    }
+    if unknown > 0 {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        // A count, not the names: the whole point is that these are the ones
+        // nobody vouched for.
+        let _ = write!(out, "+{unknown} unknown");
+    }
+    out
+}
+
+/// Carry the envelope's context onto the request the `tools/call` replays.
+///
+/// Everything here exists because the replay traverses the *real* pipeline: it
+/// has to look to that pipeline like the direct HTTP call it stands in for,
+/// while not being double-charged for work the envelope already did.
+fn apply_replay_extensions(
+    request: &mut axum::extract::Request,
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    audit: &AgentAudit,
+) {
+    let extensions = request.extensions_mut();
+
+    // Inserted for EVERY tool — a handler is entitled to know it is being
+    // driven by an agent whether or not anyone declared a grant for it.
+    extensions.insert(audit.invocation());
+
+    // The caller's resolved identity and connection peer, so the dispatch
+    // pipeline attributes the call like a direct request would — the
+    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
+    if let Some(identity) = ctx.identity {
+        extensions.insert(identity.clone());
+    }
+    if let Some(peer) = ctx.peer {
+        extensions.insert(axum::extract::ConnectInfo(peer));
+    }
+    // When the `/mcp` envelope is itself rate-limited, this call was already
+    // counted there; mark the replay envelope-counted so the framework-default
+    // limiter (which shares the envelope bucket) doesn't charge a second token
+    // for the same tool call. User/per-route limiters (path overrides,
+    // `#[throttle]`) don't share that bucket and still charge the replay.
+    if server.envelope_rate_limited {
+        extensions.insert(crate::security::RateLimitEnvelopeCounted);
+    }
+    // Likewise for load shedding: the envelope and the dispatch pipeline share
+    // the SAME `LoadShedLayer` instance (same `Arc` in-flight counter), so
+    // without this a `tools/call` would acquire one slot at the envelope and a
+    // second at this replay for the same logical request — silently halving the
+    // effective ceiling for MCP traffic.
+    if server.envelope_load_shed {
+        extensions.insert(crate::middleware::LoadShedExempt);
+    }
+}
+
 /// Dispatch a `tools/call` through the real router and shape the response as an
 /// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
 /// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
@@ -1417,46 +1907,39 @@ async fn serve_tools_call(
         Err(message) => return json_response(&error(id, -32602, &message)),
     };
 
-    // Carry the caller's resolved identity and connection peer into the replay
-    // so the dispatch pipeline attributes it like a direct request would — the
-    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
-    if let Some(identity) = ctx.identity {
-        request.extensions_mut().insert(identity.clone());
-    }
-    if let Some(peer) = ctx.peer {
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(peer));
-    }
-    // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay envelope-counted so the framework-default
-    // limiter (which shares the envelope bucket) doesn't charge a second token
-    // for the same tool call. User/per-route limiters (path overrides,
-    // `#[throttle]`) don't share that bucket and still charge the replay.
-    if server.envelope_rate_limited {
-        request
-            .extensions_mut()
-            .insert(crate::security::RateLimitEnvelopeCounted);
-    }
-    // Likewise for load shedding: the envelope and the dispatch pipeline
-    // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
-    // counter), so without this a `tools/call` would acquire one slot at the
-    // envelope and a second at this replay for the same logical request —
-    // silently halving the effective ceiling for MCP traffic.
-    if server.envelope_load_shed {
-        request
-            .extensions_mut()
-            .insert(crate::middleware::LoadShedExempt);
+    // Agent-authority envelope (#1691). Resolved before dispatch so the
+    // correlation id exists ahead of anything that can go wrong.
+    let audit = AgentAudit::new(server, tool, &arguments, ctx);
+    apply_replay_extensions(&mut request, server, ctx, &audit);
+
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    if let Err(refusal) = audit.record_attempt(server).await {
+        return json_response(&success(id, tool_error(refusal)));
     }
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
         Err(e) => {
+            audit
+                .record_outcome(server, StatusCode::INTERNAL_SERVER_ERROR, None)
+                .await;
             return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
     let status = response.status();
+    // Recorded here — after the status is known, before the body is consumed or
+    // the SSE projection takes the response — so the streaming and buffered
+    // branches below share one outcome record instead of each growing their own.
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    audit
+        .record_outcome(server, status, request_id.as_deref())
+        .await;
     let is_event_stream = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2544,6 +3027,7 @@ mod tests {
             grant,
             effects: &[],
             asserted_effect_free_sites: 0,
+            asserted_effect_free: &[],
         }
     }
 
@@ -2622,8 +3106,8 @@ mod tests {
             tools[0].annotations().get("destructiveHint").cloned()
         };
 
-        // A declared authority is a *proved* claim about the blast radius, so
-        // it answers the question the verb could only guess at.
+        // A declared authority can *raise* the warning on a verb that says
+        // nothing by itself.
         assert_eq!(
             hint("send_payout", Some(&IRREVERSIBLE_AUTHORITY)),
             Some(json!(true)),
@@ -2637,7 +3121,7 @@ mod tests {
         assert_eq!(
             hint("draft_note", Some(&REVERSIBLE_AUTHORITY)),
             Some(json!(false)),
-            "a reversible action is explicitly NOT destructive"
+            "a POST proved to be bounded writes only is explicitly NOT destructive"
         );
     }
 
@@ -2665,9 +3149,14 @@ mod tests {
     }
 
     #[test]
-    fn declared_reversibility_overrides_the_delete_verb_guess() {
-        // The verb rule is a heuristic; a proved `reversible` grant on a DELETE
-        // (a soft delete, say) is better information and must win.
+    fn the_delete_verb_is_a_floor_a_reversible_grant_cannot_clear() {
+        // `reversible` means the analyser proved the effect set is bounded
+        // writes only — and `delete_by_id` IS a bounded write, so a hard row
+        // delete reaches this shape. It does not mean the row can be put back;
+        // nothing checks for soft-delete or versioning. Since an MCP client
+        // skips its confirmation prompt on `destructiveHint: false`, the verb
+        // stays a floor: the grant may add the warning, never remove it
+        // (issue #1691 review, P2-1).
         let tools = derive_tools(
             &[governed_doc(
                 "DELETE",
@@ -2679,10 +3168,71 @@ mod tests {
         );
         assert_eq!(
             tools[0].annotations().get("destructiveHint"),
-            Some(&json!(false)),
-            "a proved reversible grant overrides the DELETE guess: {:?}",
+            Some(&json!(true)),
+            "one unproved adjective in a grant must not clear a DELETE's warning: {:?}",
             tools[0].annotations()
         );
+    }
+
+    // ── Argument names are intersected with the tool's surface (#1691 P2-2) ──
+
+    /// A tool with one path param plus a body, so all three name categories
+    /// (path param, reserved key, unknown) are reachable.
+    fn tool_with_path_param() -> McpTool {
+        let mut t = tool("POST", "/api/refunds/{id}", true, false);
+        t.path_params = vec!["id".to_owned()];
+        t
+    }
+
+    #[test]
+    fn argument_names_records_the_tools_own_surface_verbatim() {
+        let names = argument_names(
+            &tool_with_path_param(),
+            &json!({ "body": {}, "id": "7", "query": {} }),
+        );
+        assert_eq!(names, "body,id,query", "sorted, and no unknown count");
+    }
+
+    #[test]
+    fn argument_names_counts_unrecognised_keys_instead_of_quoting_them() {
+        // `build_request` reads only `body`/`query`/the path params and ignores
+        // everything else, and nothing rejects extra properties — so every other
+        // key is caller-authored text that must never reach a durable row.
+        let hostile = "\n2026-09-02T00:00:00Z INFO agent tool call actor=admin";
+        let mut args = serde_json::Map::new();
+        args.insert("body".to_owned(), json!({}));
+        args.insert(hostile.to_owned(), json!(1));
+        args.insert("ssn-123-45-6789".to_owned(), json!(2));
+        let names = argument_names(&tool_with_path_param(), &Value::Object(args));
+        assert_eq!(names, "body,+2 unknown");
+        assert!(
+            !names.contains('\n') && !names.contains("ssn-"),
+            "no caller-chosen byte may appear: {names}"
+        );
+    }
+
+    #[test]
+    fn argument_names_of_an_all_unknown_call_is_only_a_count() {
+        let names = argument_names(
+            &tool_with_path_param(),
+            &json!({ "\u{1f648}": 1, "../../etc": 2 }),
+        );
+        assert_eq!(names, "+2 unknown");
+    }
+
+    #[test]
+    fn argument_names_addresses_a_catch_all_param_by_its_bare_name() {
+        // `ApiDoc` surfaces `/files/{*rest}` as `*rest`; clients send `rest`,
+        // and `build_request` strips the star to match. The audit view must
+        // strip it the same way or a legitimate param reads as unknown.
+        let mut t = tool("GET", "/files/{*rest}", false, false);
+        t.path_params = vec!["*rest".to_owned()];
+        assert_eq!(argument_names(&t, &json!({ "rest": "a/b" })), "rest");
+    }
+
+    #[test]
+    fn argument_names_of_a_non_object_is_empty() {
+        assert_eq!(argument_names(&tool_with_path_param(), &json!(null)), "");
     }
 
     #[test]
@@ -2853,14 +3403,20 @@ mod tests {
 
     #[test]
     fn annotations_track_method() {
-        assert_eq!(annotations_for("GET", "t")["readOnlyHint"], json!(true));
-        assert_eq!(annotations_for("POST", "t")["readOnlyHint"], json!(false));
         assert_eq!(
-            annotations_for("DELETE", "t")["destructiveHint"],
+            annotations_for("GET", "t", None)["readOnlyHint"],
+            json!(true)
+        );
+        assert_eq!(
+            annotations_for("POST", "t", None)["readOnlyHint"],
+            json!(false)
+        );
+        assert_eq!(
+            annotations_for("DELETE", "t", None)["destructiveHint"],
             json!(true)
         );
         assert!(
-            annotations_for("POST", "t")
+            annotations_for("POST", "t", None)
                 .get("destructiveHint")
                 .is_none()
         );
@@ -3216,6 +3772,7 @@ mod tests {
             has_query,
             streams: false,
             empty_body: false,
+            agent_authority: None,
         }
     }
 
@@ -3450,6 +4007,7 @@ mod tests {
                 csrf_header: "x-csrf-token".to_owned(),
                 envelope_rate_limited: false,
                 envelope_load_shed: false,
+                state: crate::AppState::for_test(),
             },
         )
     }

@@ -34,11 +34,13 @@ use autumn_web::agent_authority::{
     AgentAuthority, AgentInvocation, Effect, EffectKind, EffectProvenance, Grant, Reversibility,
     TenantScope,
 };
-use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
+use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink, AuditStatus};
 use autumn_web::middleware::RequestId;
 use autumn_web::prelude::*;
+use autumn_web::sse::{Event, Sse};
 use autumn_web::test::{TestApp, TestClient};
 use axum::extract::Extension;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 // ── Authority fixtures ────────────────────────────────────────────────
@@ -80,6 +82,7 @@ const fn test_authority(action: &'static str, grant: &'static Grant) -> AgentAut
             provenance: EffectProvenance::TypeResolved,
         }],
         asserted_effect_free_sites: 0,
+        asserted_effect_free: &[],
     }
 }
 
@@ -139,6 +142,22 @@ impl AuditSink for FailingSink {
     }
 }
 
+/// A sink whose write never resolves — a remote collector that accepted the
+/// connection and went quiet, or a saturated pool. Distinct from
+/// [`FailingSink`]: nothing here ever returns an error to react to, so only a
+/// deadline can turn it back into a decision.
+struct StalledSink;
+
+impl AuditSink for StalledSink {
+    fn write(
+        &self,
+        _event: AuditEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+    {
+        Box::pin(std::future::pending())
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -193,6 +212,7 @@ async fn write_note(Json(_body): Json<NoteRequest>) -> AutumnResult<Json<NoteRec
 
 static PAYOUT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static LINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static STALLED_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize, Deserialize)]
 struct AmountRequest {
@@ -213,6 +233,38 @@ async fn send_payout(Json(body): Json<AmountRequest>) -> AutumnResult<Json<Amoun
     Ok(Json(AmountReceipt {
         accepted: body.amount,
     }))
+}
+
+/// Irreversible tool used with a sink that never answers, so the counter proves
+/// a *deadline* (not an error) stopped the handler.
+#[post("/api/wires")]
+#[api_doc(mcp, summary = "Send a wire")]
+async fn send_wire(Json(body): Json<AmountRequest>) -> AutumnResult<Json<AmountReceipt>> {
+    STALLED_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(Json(AmountReceipt {
+        accepted: body.amount,
+    }))
+}
+
+/// A governed tool whose handler *fails*, so the outcome event has a non-2xx
+/// status to carry.
+#[post("/api/voids")]
+#[api_doc(mcp, summary = "Void a refund")]
+async fn void_refund(Json(_body): Json<RefundRequest>) -> AutumnResult<Json<RefundReceipt>> {
+    Err(AutumnError::not_found_msg("no such refund"))
+}
+
+/// A governed *streaming* tool. The audit path records the outcome before the
+/// SSE projection takes the response, so the pair must be complete even though
+/// the body is still being produced when the record is written.
+#[get("/api/refund-feed")]
+#[api_doc(mcp, stream, summary = "Stream refund events")]
+async fn refund_feed() -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = futures::stream::iter(vec![
+        Ok(Event::default().data("refund 1")),
+        Ok(Event::default().data("refund 2")),
+    ]);
+    Sse::new(stream)
 }
 
 /// Reversible twin of [`send_payout`]: a broken sink must NOT stop it.
@@ -240,10 +292,17 @@ fn governed_by(routes: Vec<Route>, authority: &'static AgentAuthority) -> Vec<Ro
 }
 
 fn app_with_sink(routes: Vec<Route>, sink: Arc<dyn AuditSink>) -> TestClient {
+    app_with_sinks(routes, vec![sink])
+}
+
+fn app_with_sinks(routes: Vec<Route>, sinks: Vec<Arc<dyn AuditSink>>) -> TestClient {
     TestApp::new()
         .routes(routes)
         .state_initializer(move |state| {
-            state.insert_extension(AuditLogger::new().with_sink(sink));
+            let logger = sinks
+                .into_iter()
+                .fold(AuditLogger::new(), AuditLogger::with_sink);
+            state.insert_extension(logger);
         })
         .mount_mcp("/mcp")
         .build()
@@ -319,6 +378,13 @@ async fn governed_tools_call_writes_an_attempt_and_an_outcome_event() {
     );
     assert_eq!(events[0].action, "agent.tool.draft_refund.attempt");
     assert_eq!(events[1].action, "agent.tool.draft_refund");
+    // `phase` is what tells the rows apart once they are in the sink: the
+    // attempt is deliberately `Success` (the *write* succeeded; nothing has run
+    // yet), so `status` alone cannot distinguish it from a completed call.
+    assert_eq!(meta(&events[0], "phase"), "attempt");
+    assert_eq!(meta(&events[1], "phase"), "outcome");
+    assert_eq!(events[0].status, AuditStatus::Success);
+    assert_eq!(events[1].status, AuditStatus::Success);
 
     // The correlation id is minted before dispatch and ties the pair together.
     let correlation = meta(&events[0], "correlation_id");
@@ -386,6 +452,8 @@ async fn ungoverned_tool_is_audited_with_unknown_reversibility() {
         2,
         "an ungoverned tool is audited exactly like a governed one: {events:#?}"
     );
+    assert_eq!(meta(&events[0], "phase"), "attempt");
+    assert_eq!(meta(&events[1], "phase"), "outcome");
     for event in &events {
         assert_eq!(meta(event, "transport"), "mcp");
         assert_eq!(meta(event, "tool"), "write_note");
@@ -440,6 +508,54 @@ async fn metadata_records_argument_names_but_never_values() {
             !event.target_resource_id.contains(SENTINEL),
             "the target must not carry argument values either"
         );
+    }
+}
+
+#[tokio::test]
+async fn metadata_never_echoes_a_caller_chosen_argument_key() {
+    // The caller picks the JSON keys and nothing validates them against the
+    // advertised schema, so an un-intersected name list would be an
+    // attacker-controlled string landing in a durable audit row — with an
+    // embedded newline forging a log line, and a key that is itself PII
+    // smuggling the very payload the names-only rule exists to keep out
+    // (issue #1691 review, P2-2).
+    const FORGED_LINE: &str =
+        "\n2026-09-02T00:00:00Z  INFO autumn.agent: agent tool call actor=admin tool=send_payout";
+    const PII_KEY: &str = "ssn-123-45-6789";
+
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![draft_refund], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    let mut args = serde_json::Map::new();
+    args.insert("body".to_owned(), serde_json::json!({ "memo": "ordinary" }));
+    args.insert(FORGED_LINE.to_owned(), serde_json::json!(1));
+    args.insert(PII_KEY.to_owned(), serde_json::json!(2));
+
+    let out = call_tool(&client, "draft_refund", serde_json::Value::Object(args)).await;
+    // The extra keys are ignored by dispatch, so the call still succeeds.
+    assert_ne!(out["result"]["isError"], true);
+
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 2);
+    for event in &events {
+        assert_eq!(
+            meta(event, "argument_names"),
+            "body,+2 unknown",
+            "the recognised name is kept and the rest are counted, never quoted"
+        );
+        for (key, value) in &event.metadata {
+            assert!(
+                !value.contains("ssn-") && !value.contains("actor=admin"),
+                "metadata[{key}] echoed a caller-chosen key: {value:?}"
+            );
+            assert!(
+                !value.contains('\n'),
+                "metadata[{key}] carries a newline a caller supplied: {value:?}"
+            );
+        }
     }
 }
 
@@ -510,6 +626,86 @@ async fn irreversible_tool_refuses_to_dispatch_when_the_attempt_cannot_be_audite
 }
 
 #[tokio::test]
+async fn a_refusal_is_recorded_by_whichever_sinks_are_still_healthy() {
+    // `AuditLogger::write` attempts every sink and joins the errors, so ONE
+    // broken sink fails the whole write — while the healthy ones would happily
+    // have taken the row. The refusal is the single most interesting thing that
+    // happened, so it is re-offered to them (issue #1691 review, P3-5).
+    let healthy = RecordingSink::default();
+    let client = app_with_sinks(
+        governed_by(routes![send_payout], &SEND_PAYOUT_AUTHORITY),
+        vec![Arc::new(FailingSink), Arc::new(healthy.clone())],
+    );
+
+    let out = call_tool(
+        &client,
+        "send_payout",
+        serde_json::json!({ "body": { "amount": 500 } }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], true);
+
+    let events = healthy.agent_events();
+    let refusal = events
+        .iter()
+        .find(|e| e.metadata.get("phase").map(String::as_str) == Some("refused"))
+        .unwrap_or_else(|| panic!("the healthy sink must receive the refusal: {events:#?}"));
+    assert_eq!(refusal.action, "agent.tool.send_payout.refused");
+    assert_eq!(refusal.status, AuditStatus::Failure);
+    assert_eq!(meta(refusal, "tool"), "send_payout");
+    assert_eq!(meta(refusal, "reversibility"), "irreversible");
+    assert!(
+        !refusal.metadata.contains_key("http_status"),
+        "nothing was dispatched, so there is no status to report: {:?}",
+        refusal.metadata
+    );
+    // …and it joins to the attempt that could not be completed.
+    assert_eq!(
+        meta(refusal, "correlation_id"),
+        meta(&events[0], "correlation_id")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sink_that_never_answers_refuses_an_irreversible_call_on_a_deadline() {
+    // Without a deadline this write would hang the request path until the
+    // envelope's request timeout fired, with the handler still unrun — a slow
+    // sink stalling every agent call (issue #1691 review, P3-6). The paused
+    // clock makes the wait virtual, so the test proves the deadline exists
+    // without spending it.
+    let before = STALLED_CALLS.load(Ordering::SeqCst);
+    let client = app_with_sink(
+        governed_by(routes![send_wire], &SEND_PAYOUT_AUTHORITY),
+        Arc::new(StalledSink),
+    );
+
+    let out = call_tool(
+        &client,
+        "send_wire",
+        serde_json::json!({ "body": { "amount": 900 } }),
+    )
+    .await;
+
+    assert_eq!(
+        out["result"]["isError"], true,
+        "a sink that never answers is not a reason to serve an irreversible \
+         action unrecorded: {out}"
+    );
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("audit"),
+        "the tool error must name the audit record: {text}"
+    );
+    assert_eq!(
+        STALLED_CALLS.load(Ordering::SeqCst),
+        before,
+        "the handler must never run when the attempt could not be recorded in time"
+    );
+}
+
+#[tokio::test]
 async fn reversible_tool_still_dispatches_when_the_attempt_cannot_be_audited() {
     let before = LINE_CALLS.load(Ordering::SeqCst);
     let client = app_with_sink(
@@ -534,6 +730,112 @@ async fn reversible_tool_still_dispatches_when_the_attempt_cannot_be_audited() {
         before + 1,
         "the handler must still be invoked"
     );
+}
+
+// ── 8: the outcome reports what actually happened ─────────────────────
+
+#[tokio::test]
+async fn a_failing_handler_records_a_failure_outcome_with_its_status() {
+    // The audit `status` follows the HTTP status, not whether the dispatch
+    // mechanism worked: an action the application refused is a *failed* agent
+    // action, and an operator filtering `status = Failure` must see it.
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![void_refund], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    let out = call_tool(
+        &client,
+        "void_refund",
+        serde_json::json!({ "body": { "memo": "gone" } }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], true, "the 404 reaches the caller");
+
+    let events = sink.agent_events();
+    assert_eq!(events.len(), 2, "a failed call is still a full pair");
+
+    // The attempt was written before dispatch, so it cannot know any of this.
+    assert_eq!(meta(&events[0], "phase"), "attempt");
+    assert_eq!(events[0].status, AuditStatus::Success);
+    assert!(!events[0].metadata.contains_key("http_status"));
+
+    let outcome = &events[1];
+    assert_eq!(meta(outcome, "phase"), "outcome");
+    assert_eq!(outcome.status, AuditStatus::Failure);
+    assert_eq!(meta(outcome, "http_status"), "404");
+    assert_eq!(
+        meta(outcome, "correlation_id"),
+        meta(&events[0], "correlation_id"),
+        "a failed call still joins to its attempt"
+    );
+}
+
+// ── 9: streaming tools are audited like any other ─────────────────────
+
+#[tokio::test]
+async fn a_streaming_tool_is_audited_without_disturbing_its_stream() {
+    // The outcome is recorded from the response status *before* the SSE
+    // projection consumes the body — so the pair has to be complete even
+    // though, at the moment it is written, the handler is still producing
+    // output.
+    let sink = RecordingSink::default();
+    let client = app_with_sink(
+        governed_by(routes![refund_feed], &DRAFT_REFUND_AUTHORITY),
+        Arc::new(sink.clone()),
+    );
+
+    let resp = client
+        .post("/mcp")
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "refund_feed",
+                "arguments": {},
+                // The projection correlates progress notifications to this
+                // token; without one the client gets only the final result.
+                "_meta": { "progressToken": "tok-1" },
+            },
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+
+    // The stream is untouched: the handler's events still arrive as
+    // `notifications/progress`, terminated by the tool result.
+    let body = resp.text();
+    let messages: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|s| serde_json::from_str(s.trim()).ok())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["method"] == "notifications/progress"),
+        "the SSE projection must be unaffected: {body}"
+    );
+    assert!(
+        messages.iter().any(|m| m.get("result").is_some()),
+        "the stream must still terminate with the tool result: {body}"
+    );
+
+    let events = sink.agent_events();
+    assert_eq!(
+        events.len(),
+        2,
+        "a streaming tool writes exactly one attempt and one outcome: {events:#?}"
+    );
+    assert_eq!(events[0].action, "agent.tool.refund_feed.attempt");
+    assert_eq!(meta(&events[0], "phase"), "attempt");
+    assert_eq!(events[1].action, "agent.tool.refund_feed");
+    assert_eq!(meta(&events[1], "phase"), "outcome");
+    assert_eq!(meta(&events[1], "http_status"), "200");
+    assert_eq!(meta(&events[1], "grant"), "RefundDrafter");
 }
 
 // ── 7: the invocation reaches the handler ─────────────────────────────

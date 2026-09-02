@@ -1393,14 +1393,17 @@ pub use autumn_macros::query_budget;
 /// #[post("/refunds")]
 /// #[api_doc(mcp, summary = "Draft a refund")]
 /// #[agent_operable(grant = RefundDrafter)]
-/// async fn draft_refund(repo: PgRefundRepository) -> AutumnResult<Json<Refund>> { /* … */ }
+/// async fn draft_refund(
+///     repo: PgRefundRepository,
+///     Json(body): Json<NewRefund>,
+/// ) -> AutumnResult<Json<Refund>> {
+///     Ok(Json(repo.create(&body).await?)) // allowed: `writes: [Refund]`
+/// }
 /// ```
 ///
 /// See [`agent_authority`] for the vocabulary and
 /// `docs/guide/agent-authority.md` for the guide.
-//
-// TODO(#1691, agent A): uncomment once `autumn-macros` exports `agent_operable`.
-// pub use autumn_macros::agent_operable;
+pub use autumn_macros::agent_operable;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
