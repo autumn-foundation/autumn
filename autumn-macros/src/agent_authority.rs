@@ -201,7 +201,15 @@ const TRANSACTION_METHODS: &[&str] = &["tx", "tx_with", "transaction"];
 const TRANSACTION_FREE_FNS: &[&str] = &["scoped_transaction", "savepoint"];
 
 /// Free functions that may receive a handle without doing anything with it.
-const SAFE_FREE_FNS: &[&str] = &["drop"];
+/// The exact spellings of `drop` that only *release* a handle.
+///
+/// Compared on the **whole** path, never the last segment: `billing::drop` is
+/// somebody else's function that happens to share a name, and exempting it let
+/// an arbitrary helper erase a table under a grant that allows no write. A
+/// leading `::` is ignored; every other spelling (`mem::drop` through a `use`,
+/// a shadowing local `drop`) goes through the opaque-helper check and is
+/// discharged with `#[agent_effect(none, reason = "...")]`.
+const SAFE_FREE_PATHS: &[&[&str]] = &[&["drop"], &["std", "mem", "drop"], &["core", "mem", "drop"]];
 
 /// Field and accessor names that conventionally *hold* a handle.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
@@ -526,6 +534,25 @@ enum Handle {
     /// own generics. It *may* be an effect handle, so every method call on it
     /// is unprovable (R10). The `String` is the parameter's name.
     Potential(String),
+    /// A container built around tracked things, kept **element-wise**.
+    ///
+    /// `let repos = (refunds, payments);` holds two different repositories,
+    /// and which element a later call acts on decides the subject. Collapsing
+    /// the container to its first handle made `repos.1.delete_all()` prove a
+    /// `Refund` write while it erased `Payout`.
+    Container(Vec<(Part, Self)>),
+    /// A tracked container reached through an access that names no element —
+    /// `repos[i]`, or a verb called on the container itself. Every element is
+    /// a candidate subject, so the site is refused rather than guessed.
+    Ambiguous,
+}
+
+/// How one element of a [`Handle::Container`] is addressed: `.0` / `[1]`
+/// positionally, or `.field` by name.
+#[derive(Clone, PartialEq, Eq)]
+enum Part {
+    Index(usize),
+    Field(String),
 }
 
 impl Handle {
@@ -545,6 +572,18 @@ impl Handle {
                 bounded: a && b,
                 insert,
             },
+            // Two containers joined at a branch keep every element either side
+            // can hold: an element written on one reachable path is written.
+            (Self::Container(left), Self::Container(right)) => {
+                let mut merged = left;
+                for (part, handle) in right {
+                    match merged.iter_mut().find(|(key, _)| *key == part) {
+                        Some(slot) => slot.1 = slot.1.clone().join(handle),
+                        None => merged.push((part, handle)),
+                    }
+                }
+                Self::Container(merged)
+            }
             (handle, _) => handle,
         }
     }
@@ -1137,6 +1176,14 @@ impl Analyzer {
     }
 
     fn rebind(&mut self, pat: &Pat, handle: Option<&Handle>) {
+        // `let (store, payouts) = repos;` takes the container apart, so each
+        // name keeps the element's own identity rather than the whole
+        // container — which would make every later call ambiguous.
+        if let Some(Handle::Container(parts)) = handle
+            && self.rebind_container(pat, parts)
+        {
+            return;
+        }
         let mut names = HashSet::new();
         collect_pat_idents(pat, &mut names);
         for name in names {
@@ -1149,6 +1196,43 @@ impl Analyzer {
                 }
             }
         }
+    }
+
+    /// Bind each element of a container handle to the pattern that takes it
+    /// apart. Returns whether the pattern was element-addressable; when it was
+    /// not, the caller broadcasts the container instead.
+    fn rebind_container(&mut self, pat: &Pat, parts: &[(Part, Handle)]) -> bool {
+        let elems: Vec<&Pat> = match pat {
+            Pat::Paren(p) => return self.rebind_container(&p.pat, parts),
+            Pat::Reference(r) => return self.rebind_container(&r.pat, parts),
+            // `Some((refunds, payments))` — a one-element constructor pattern
+            // is transparent, exactly as the constructor expression is.
+            Pat::TupleStruct(t) if t.elems.len() == 1 => {
+                let Some(only) = t.elems.first() else {
+                    return false;
+                };
+                return self.rebind_container(only, parts);
+            }
+            Pat::Struct(s) => {
+                for field in &s.fields {
+                    let named = part_of_member(&field.member);
+                    let handle = parts
+                        .iter()
+                        .find_map(|(key, h)| (*key == named).then_some(h));
+                    self.rebind(&field.pat, handle);
+                }
+                return true;
+            }
+            Pat::Tuple(t) => t.elems.iter().collect(),
+            Pat::TupleStruct(t) => t.elems.iter().collect(),
+            _ => return false,
+        };
+        for (index, element) in elems.into_iter().enumerate() {
+            let nth = Part::Index(index);
+            let handle = parts.iter().find_map(|(key, h)| (*key == nth).then_some(h));
+            self.rebind(element, handle);
+        }
+        true
     }
 
     /// Read an `#[agent_effect(...)]` statement annotation, reporting a
@@ -1437,6 +1521,23 @@ impl Analyzer {
                              it may write, call out, or enqueue.\n\nTake a concrete repository \
                              or client type, or declare the site with `#[agent_effect(..., reason = \
                              \"...\")]`. {GUIDE}",
+                            method.method
+                        ),
+                    );
+                }
+            }
+            Some(Handle::Container(_) | Handle::Ambiguous) => {
+                if let Some(method) = on_handle.first() {
+                    let action = self.action.clone();
+                    self.error(
+                        method.span(),
+                        format!(
+                            "agent authority: `{}` is called on a container of effect handles \
+                             through an access that names no single element, and which element \
+                             it acts on is what decides the subject — so `{action}`'s effects \
+                             cannot be proven.\n\nAddress the element the call acts on \
+                             (`repos.1`, `repos[0]`), bind it to its own name, or declare the \
+                             site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}",
                             method.method
                         ),
                     );
@@ -1885,6 +1986,30 @@ impl Analyzer {
         }
 
         let Some(name) = name else {
+            // `(select_callback())(repo)`, `callbacks[i](&repo)`,
+            // `(ctx.wipe)(&repo)`, `f.as_ref()(&repo)` — the callee is an
+            // expression, so nothing at this site names what runs. A *named*
+            // helper handed a handle is already refused; the unnamed spelling
+            // is the same call with the one readable thing removed, and
+            // letting it through made the refusal one pair of parentheses
+            // wide.
+            if let Some(arg) = call.args.iter().find(|a| self.carries_handle(a)) {
+                let action = self.action.clone();
+                let handle = handle_arg_name(arg).map_or_else(
+                    || "an effect handle".to_string(),
+                    |name| format!("the effect handle `{name}`"),
+                );
+                self.error(
+                    call.span(),
+                    format!(
+                        "agent authority: this call names no function — it is handed {handle} \
+                         and what an unnamed callee does with it cannot be read, so \
+                         `{action}`'s effects cannot be proven.\n\nCall the effect directly, \
+                         or declare what the call does with `#[agent_effect(..., reason = \
+                         \"...\")]`. {GUIDE}"
+                    ),
+                );
+            }
             return;
         };
 
@@ -1902,7 +2027,7 @@ impl Analyzer {
             self.spawn_error(call.span(), &name);
             return;
         }
-        if SAFE_FREE_FNS.contains(&name.as_str()) {
+        if is_safe_free_call(call) {
             return;
         }
         // `diesel::insert_into(...)`, `diesel::update(...)` — the write is
@@ -2147,10 +2272,27 @@ impl Analyzer {
                 .flatten(),
             // A field of a handle is a handle (`db.inner`, `ctx.repo`), and so
             // is a field conventionally holding one (`self.repo`, `state.db`).
-            Expr::Field(f) => self.expr_handle(&f.base).or_else(|| {
-                member_is_handle_accessor(&f.member)
-                    .then(|| accessor_handle(&member_name(&f.member)))
-            }),
+            // On a container the member picks *which* element: `repos.1` is
+            // the second one, not the first one the container was built from.
+            Expr::Field(f) => self
+                .expr_handle(&f.base)
+                .and_then(|base| select_part(base, &part_of_member(&f.member)))
+                .or_else(|| {
+                    member_is_handle_accessor(&f.member)
+                        .then(|| accessor_handle(&member_name(&f.member)))
+                }),
+            // `repos[0]` names one element; `repos[i]` names one the analysis
+            // cannot read, and which element it is decides the subject — so
+            // the access is marked ambiguous and refused where it is used.
+            Expr::Index(i) => {
+                let base = self.expr_handle(&i.expr)?;
+                if !matches!(base, Handle::Container(_)) {
+                    return Some(base);
+                }
+                literal_index(&i.index).map_or(Some(Handle::Ambiguous), |index| {
+                    select_part(base, &Part::Index(index))
+                })
+            }
             Expr::MethodCall(mc) => {
                 if let Some(produced) = Self::method_handle(mc) {
                     return Some(produced);
@@ -2301,14 +2443,21 @@ impl Analyzer {
             return Some(handle);
         }
         match expr {
-            Expr::Struct(s) => s.fields.iter().find_map(|f| self.container_handle(&f.expr)),
-            Expr::Tuple(t) => t.elems.iter().find_map(|e| self.container_handle(e)),
-            Expr::Array(a) => a.elems.iter().find_map(|e| self.container_handle(e)),
-            // `Some(db)` / `Ok(conn)` / `Ctx(repo)` — a constructor wraps the
-            // handle rather than consuming it.
-            Expr::Call(c) if is_constructor_call(c) => {
-                c.args.iter().find_map(|a| self.container_handle(a))
-            }
+            Expr::Struct(s) => self.container_parts(
+                s.fields
+                    .iter()
+                    .map(|f| (part_of_member(&f.member), &f.expr)),
+            ),
+            Expr::Tuple(t) => self.indexed_parts(t.elems.iter()),
+            Expr::Array(a) => self.indexed_parts(a.elems.iter()),
+            // `Some(db)` / `Ok(conn)` wrap one thing and are transparent, so
+            // `Some((refunds, payments))` reaches the tuple through this arm
+            // and keeps both elements. `Ctx(repo, client)` carries two, and is
+            // addressed like a tuple.
+            Expr::Call(c) if is_constructor_call(c) => match c.args.first() {
+                Some(only) if c.args.len() == 1 => self.container_handle(only),
+                _ => self.indexed_parts(c.args.iter()),
+            },
             Expr::Reference(r) => self.container_handle(&r.expr),
             Expr::RawAddr(r) => self.container_handle(&r.expr),
             Expr::Paren(p) => self.container_handle(&p.expr),
@@ -2317,6 +2466,22 @@ impl Analyzer {
             Expr::Try(t) => self.container_handle(&t.expr),
             _ => None,
         }
+    }
+
+    /// Build a container handle from positionally-addressed elements.
+    fn indexed_parts<'a>(&self, elems: impl Iterator<Item = &'a Expr>) -> Option<Handle> {
+        self.container_parts(elems.enumerate().map(|(i, e)| (Part::Index(i), e)))
+    }
+
+    /// Build a container handle, keeping **every** element that carries one.
+    ///
+    /// `None` when no element does: a tuple of plain values is not a handle,
+    /// and treating it as one reported every later use of it as an escape.
+    fn container_parts<'a>(&self, elems: impl Iterator<Item = (Part, &'a Expr)>) -> Option<Handle> {
+        let parts: Vec<(Part, Handle)> = elems
+            .filter_map(|(part, expr)| self.container_handle(expr).map(|h| (part, h)))
+            .collect();
+        (!parts.is_empty()).then_some(Handle::Container(parts))
     }
 
     /// Does this expression *carry* a handle into a callee — directly, or one
@@ -2689,6 +2854,60 @@ fn is_constructor_call(call: &ExprCall) -> bool {
         .segments
         .last()
         .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
+}
+
+/// Is this call one of the exact `drop` spellings that only releases a handle?
+fn is_safe_free_call(call: &ExprCall) -> bool {
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    SAFE_FREE_PATHS
+        .iter()
+        .any(|safe| safe.len() == segments.len() && safe.iter().zip(&segments).all(|(a, b)| a == b))
+}
+
+/// The container key a field access names: `.0` / `.1` positionally, `.field`
+/// by name.
+fn part_of_member(member: &syn::Member) -> Part {
+    match member {
+        syn::Member::Named(ident) => Part::Field(ident.to_string()),
+        syn::Member::Unnamed(index) => Part::Index(index.index as usize),
+    }
+}
+
+/// Select one element of a container handle.
+///
+/// A handle that is *not* a container keeps its identity through a field
+/// access (`db.inner` is still the connection): it is one handle however it is
+/// spelled. A container returns only the element the access names, and `None`
+/// when the named element holds nothing.
+fn select_part(base: Handle, part: &Part) -> Option<Handle> {
+    let Handle::Container(parts) = base else {
+        return Some(base);
+    };
+    parts
+        .into_iter()
+        .find_map(|(key, handle)| (key == *part).then_some(handle))
+}
+
+/// The compile-known index of `container[0]`, if the subscript is a literal.
+fn literal_index(expr: &Expr) -> Option<usize> {
+    match strip_transparent(expr) {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(int),
+            ..
+        }) => int.base10_parse().ok(),
+        _ => None,
+    }
 }
 
 fn call_path_name(call: &ExprCall) -> Option<String> {
@@ -4274,6 +4493,123 @@ mod tests {
             }"#,
         ),
         (
+            // The named spelling was refused all along; wrapping the callee in
+            // parentheses removed the only readable thing at the site and the
+            // handler expanded clean.
+            "handle handed to a callee produced by a call",
+            ExpectedKind::Rejected,
+            "repo",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                (select_callback())(repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "handle handed to a callee indexed out of a table",
+            ExpectedKind::Rejected,
+            "repo",
+            r"async fn h(repo: PgRefundRepository, i: usize) -> R {
+                callbacks[i](&repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "handle handed to a callee read out of a field",
+            ExpectedKind::Rejected,
+            "repo",
+            r"async fn h(repo: PgRefundRepository, ctx: HandlerCtx) -> R {
+                (ctx.wipe)(&repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "handle handed to a callee produced by a method call",
+            ExpectedKind::Rejected,
+            "repo",
+            r"async fn h(repo: PgRefundRepository, f: Handler) -> R {
+                f.as_ref()(&repo).await?;
+                Ok(())
+            }",
+        ),
+        (
+            // The container kept only its *first* handle, so erasing the
+            // payouts table proved a `Refund` write instead — an effect the
+            // grant allows, against a model the call never touched.
+            "second element of a tuple container",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let repos = (refunds, payments);
+                repos.1.delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "named field of a struct container",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let ctx = Ctx { refunds, payments };
+                ctx.payments.truncate().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "element of an array container addressed by a literal index",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let repos = [refunds, payments];
+                repos[1].delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "element of a container nested inside a constructor",
+            ExpectedKind::UnboundedWrite,
+            "Payout",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let both = Some((refunds, payments));
+                if let Some((_, payouts)) = both {
+                    payouts.delete_all().await?;
+                }
+                Ok(())
+            }",
+        ),
+        (
+            // Which element a runtime subscript names is what decides the
+            // subject, so the site is refused rather than attributed to one.
+            "container element addressed by a runtime index",
+            ExpectedKind::Rejected,
+            "delete_all",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository, i: usize) -> R {
+                let repos = [refunds, payments];
+                repos[i].delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "write verb called on the container itself",
+            ExpectedKind::Rejected,
+            "delete_all",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let repos = (refunds, payments);
+                repos.delete_all().await?;
+                Ok(())
+            }",
+        ),
+        (
+            // The exemption compared only the last path segment, so any
+            // module's `drop` inherited `std::mem::drop`'s free pass.
+            "a qualified drop that is not the one that releases a handle",
+            ExpectedKind::Rejected,
+            "drop",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                billing::drop(repo);
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -4437,6 +4773,25 @@ mod tests {
             r"async fn h(repo: PgRefundRepository) -> R {
                 let rows = repo.find_all().await?;
                 drop(repo);
+                Ok(rows)
+            }",
+        ),
+        (
+            // The polarity check for element-wise container tracking: each
+            // element used as itself is exactly as clean as two bindings.
+            "tuple container whose elements are each used correctly",
+            r"async fn h(refunds: PgRefundRepository, payments: PgPayoutRepository) -> R {
+                let repos = (refunds, payments);
+                let r = repos.0.create(&b).await?;
+                let seen = repos.1.find_all().await?;
+                Ok((r, seen))
+            }",
+        ),
+        (
+            "std::mem::drop releases a handle",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let rows = repo.find_all().await?;
+                std::mem::drop(repo);
                 Ok(rows)
             }",
         ),
