@@ -1468,11 +1468,13 @@ In-process HTTPS termination on the same host:port (off by default).
 Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
 default. Mutually exclusive with static `cert_path` / `key_path`.
 
-- `domains` (required, non-wildcard), `contact_email` (required).
+- `domains` (required, non-wildcard), `contact_email` (required). Each domain is
+  used verbatim as the certificate's SAN and the ACME order's DNS identifier, so
+  an entry with leading/trailing whitespace is rejected at startup (#1874).
 - `directory` — Let's Encrypt staging by default; `production` or a custom URL.
 - `cache_dir` (default `config/acme`).
 - `http_challenge_port` (default `80`).
-- `renew_before_days` (default `30`, must be `< 90`).
+- `renew_before_days` (default `30`, an unquoted whole number, must be `< 90`).
 - `ca_root_path` (unset) — PEM root that signs the ACME **directory's own HTTPS
   certificate**. Needed only for a private CA / Pebble reached through a custom
   `directory`: by default the client verifies the directory against the platform
