@@ -1477,10 +1477,12 @@ impl TestApp {
     /// # Panics
     ///
     /// [`build`](Self::build) panics if the config would make the fault schedule
-    /// non-reproducible: more than one job worker (`jobs.workers`), or error
+    /// non-reproducible: more than one job worker (`jobs.workers`), error
     /// reporting disabled / sampled below `1.0` (the sampler draws OS
     /// randomness, so a sampled-out 5xx would be missing from the outcome at
-    /// random).
+    /// random), or failure capture enabled (reporting awaits the capsule's
+    /// blocking persistence before any reporter runs, so an observed 5xx could
+    /// still be in flight when the outcome is read).
     #[must_use]
     pub fn with_fault_plan(mut self, plan: crate::sim::fault::FaultPlan) -> Self {
         self.fault_plan = Some(plan);
@@ -1768,8 +1770,8 @@ impl TestApp {
         crate::events::clear_global_event_bus();
 
         // An attached fault plan (issue #1680) only replays byte-for-byte when
-        // the surrounding config cannot reorder or drop what it records, so the
-        // two knobs that would are checked up front rather than silently
+        // the surrounding config cannot reorder, drop, or delay what it records,
+        // so the knobs that would are checked up front rather than silently
         // producing a flaky scenario.
         if let Some(plan) = self.fault_plan.as_ref() {
             assert_eq!(
@@ -1783,6 +1785,22 @@ impl TestApp {
                 "a fault plan needs `reporting.enabled = true` and \
                  `reporting.sample_rate = 1.0`: the sampler draws OS randomness, so a \
                  sampled-out 5xx would drop out of `FaultOutcome::server_errors` at random"
+            );
+            // Codex review (round 2): with capture on, `ReporterChain::dispatch`
+            // awaits the capsule's blocking persistence (a directory scan, a
+            // write and a `sync_all` on the blocking pool) BEFORE any reporter
+            // runs, so `fault_outcome()`'s cooperative settle could snapshot
+            // while that write is still in flight on slow storage and miss a
+            // 5xx the client already observed. Capsules are production
+            // evidence with no place in a fault scenario, so refuse the
+            // combination rather than make the settle depend on disk speed.
+            #[cfg(feature = "reporting")]
+            assert!(
+                !self.config.failure_capture.enabled,
+                "a fault plan needs `failure_capture.enabled = false`: reporting awaits \
+                 the capsule's blocking persistence before any reporter runs, so a 5xx \
+                 could be missing from `FaultOutcome::server_errors` when the outcome is \
+                 read"
             );
             // Replay the app's identifier stream (request ids, job-retry jitter)
             // from the plan's seed unless the test injected its own source.
@@ -3055,7 +3073,15 @@ impl TestClient {
     /// virtual clock, which would corrupt a sim's timeline) until the ledger has
     /// recorded at least as many server errors as this client observed, up to a
     /// bounded number of yields — then snapshots regardless, so a 5xx the
-    /// reporting layer never sees can only cost a bounded spin, not a hang.
+    /// reporting layer never sees (one raised outside `ReportingLayer`, e.g. by
+    /// the session layer) can only cost a bounded spin, not a hang.
+    ///
+    /// The bound is sufficient because [`TestApp::build`] refuses the two
+    /// configurations under which the dispatch could still be pending after
+    /// it: a sampled reporter (`reporting.sample_rate < 1.0`) and failure
+    /// capture (`failure_capture.enabled`), whose blocking capsule persistence
+    /// reporting awaits before any reporter runs. With both refused the
+    /// dispatch task reaches the ledger's projector on its first poll.
     ///
     /// # Panics
     ///

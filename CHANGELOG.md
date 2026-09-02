@@ -82,9 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   innermost so a user interceptor observes it exactly like a real handler
   error. Attaching a plan also defaults the app's entropy to `SeededEntropy`
   from the plan's seed (an explicit `with_entropy` still wins) and asserts the
-  two settings replay depends on — one job worker and reporting at
-  `sample_rate = 1.0` — instead of letting a second worker or a sampled-out 5xx
-  quietly break reproducibility.
+  settings replay depends on — one job worker, reporting at
+  `sample_rate = 1.0`, and failure capture off — instead of letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break reproducibility.
 
   Scope is deliberately narrow: test-only (there is no production fault
   injection), DB checkout and job execution only (use `Chaos::smtp_faults` for

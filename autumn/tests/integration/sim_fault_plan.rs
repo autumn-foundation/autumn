@@ -29,6 +29,7 @@
 //! | `worked_example_charge_card_fails_before_the_fix_and_passes_after` | AC5 — one scenario failing before a fix and passing after |
 //! | `a_multi_worker_config_is_rejected_at_build_time` | the determinism guards in `TestApp::build` refuse a config that would make ordinals unreplayable |
 //! | `a_sampled_reporting_config_is_rejected_at_build_time` | ditto, for the sampler that would randomly drop 5xx out of the outcome |
+//! | `a_failure_capture_config_is_rejected_at_build_time` | ditto, for capsule persistence that reporting awaits before any reporter runs |
 //!
 //! Every test that drives jobs runs under the process-global job runtime lock
 //! (`job::global_job_runtime_test_lock`) and starts from a cleared global job
@@ -997,6 +998,27 @@ async fn a_multi_worker_config_is_rejected_at_build_time() {
 async fn a_sampled_reporting_config_is_rejected_at_build_time() {
     let mut config = AutumnConfig::default();
     config.reporting.sample_rate = 0.5;
+
+    let _client = TestApp::new()
+        .config(config)
+        .routes(routes![ping])
+        .with_fault_plan(FaultPlan::from_seed(SEED).fail_job_execution(1))
+        .build();
+}
+
+/// Codex review (round 2, P2): with `failure_capture.enabled = true`, reporting
+/// awaits the capsule's **blocking** persistence (directory scan, write,
+/// `sync_all`) before any reporter runs, so `fault_outcome()`'s cooperative
+/// settle could snapshot while that write is still in flight on slow storage
+/// and silently miss a 5xx the client already observed. Capsules are
+/// production evidence with no place in an authored fault scenario, so
+/// `TestApp::build` refuses the combination outright.
+#[cfg(feature = "reporting")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[should_panic(expected = "failure_capture.enabled = false")]
+async fn a_failure_capture_config_is_rejected_at_build_time() {
+    let mut config = AutumnConfig::default();
+    config.failure_capture.enabled = true;
 
     let _client = TestApp::new()
         .config(config)

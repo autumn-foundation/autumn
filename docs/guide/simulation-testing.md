@@ -282,9 +282,11 @@ enforces the parts it can:
   `SeededEntropy` derived from the plan's seed, so retry jitter and minted IDs
   replay from it too. Unlike the rest of the sim this one *is* automatic — an
   explicit `with_entropy` still wins.
-- **One job worker** (`jobs.workers = 1`) and **reporting at
-  `sample_rate = 1.0`**. `build` asserts both when a plan is attached, rather
-  than letting a second worker or a sampled-out 5xx quietly break replay.
+- **One job worker** (`jobs.workers = 1`), **reporting at
+  `sample_rate = 1.0`**, and **failure capture off** (the default). `build`
+  asserts all three when a plan is attached, rather than letting a second
+  worker, a sampled-out 5xx, or a capsule write that reporting awaits before
+  any reporter runs quietly break replay.
 
 #### What it does not cover
 

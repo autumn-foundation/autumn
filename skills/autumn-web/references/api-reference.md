@@ -1112,7 +1112,7 @@ execution only (SMTP faults stay on `Chaos::smtp_faults`).
 | `.random_db_checkout_faults(count, 1..=k)` / `.random_job_execution_faults(count, 1..=k)` | Seed-derived distinct ordinals, resolved into explicit entries at builder time |
 | `.only_between(from, to)` | Half-open elapsed window on the app's **injected** clock; a match outside it is `suppressed`, not fired |
 | `.planned()` / `.describe()` / `.is_active()` | The full authored schedule (sorted), a printable rendering, whether anything is planned |
-| `TestApp::with_fault_plan(plan)` | Attach; composes with `with_job_interceptor` / `with_db_interceptor`, transactional isolation and `Sim::chaos` (fault innermost). Asserts `jobs.workers == 1` and `reporting.sample_rate == 1.0`; defaults entropy to `SeededEntropy(seed)` |
+| `TestApp::with_fault_plan(plan)` | Attach; composes with `with_job_interceptor` / `with_db_interceptor`, transactional isolation and `Sim::chaos` (fault innermost). Asserts `jobs.workers == 1`, `reporting.sample_rate == 1.0` and `failure_capture.enabled == false`; defaults entropy to `SeededEntropy(seed)` |
 | `TestClient::fault_outcome().await` | Settle the detached error-report tasks (bounded yields, no clock advance), then snapshot a `FaultOutcome` |
 | `TestClient::fault_ledger()` | The live handle (`Option`); `.outcome()` snapshots without settling |
 | `FaultOutcome { seed, fired, suppressed, unfired, server_errors, final_state }` | `Serialize + Deserialize + Eq`; `to_json_string()` is canonical, `fingerprint()` is FNV-1a 64, `from_json_str` parses a committed record |
