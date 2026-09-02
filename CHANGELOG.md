@@ -9,6 +9,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Authored, seeded fault scenarios you can commit as regression tests
+  (#1680):** the simulation harness could already inject faults, but only
+  *probabilistically* — `Chaos::db_transient_errors(0.05)` says "5% of
+  connection checkouts fail" and lets the seed pick which. That is the right
+  tool for a sweep hunting rare interleavings and the wrong one for proving a
+  fix, because the sentence a post-mortem produces is "the third connection
+  checkout failed while the second `send_invoice` execution was retrying", and
+  no rate reproduces that on purpose. A new `autumn_web::sim::FaultPlan`
+  authors that scenario by ordinal, attaches to a `TestApp` with no application
+  code changes, and hands back a serializable record of what happened:
+
+  ```rust
+  use autumn_web::sim::{FaultPlan, Sim};
+
+  #[sim_test]
+  async fn the_third_checkout_and_the_second_invoice_fail(mut sim: Sim) {
+      let plan = FaultPlan::from_seed(sim.seed)
+          .fail_db_checkout(3)           // 3rd checkout on any pool (1-based)
+          .fail_job("send_invoice", 2);  // 2nd execution of that job by name
+
+      sim.build(
+          TestApp::new()
+              .routes(routes![checkout])
+              .plugin(InvoiceJobPlugin)
+              .with_fault_plan(plan),
+      );
+
+      for _ in 0..5 {
+          sim.client().post("/checkout").send().await;
+      }
+      sim.run_to_idle().await;
+
+      let outcome = sim.client().fault_outcome().await;
+      assert_eq!(outcome.fired.len(), 2);
+      assert_eq!(outcome.server_errors[0].status, 503);
+      assert_eq!(outcome.final_state.db_checkouts, 5);
+
+      // Canonical JSON, byte-identical on every replay of this seed.
+      assert_eq!(outcome.to_json_string(), include_str!("fixtures/invoices.json"));
+  }
+  ```
+
+  Two effect classes fire deterministically through the existing
+  `interceptor.rs` seams: database connection checkout (`fail_db_checkout`,
+  `fail_db_checkout_on("replica", 2)`) and job execution
+  (`fail_job_execution`, `fail_job("send_invoice", 2)`), each targetable by a
+  1-based ordinal on a global or per-target counter. `random_db_checkout_faults(2, 1..=8)`
+  derives ordinals from the plan's seed and resolves them into explicit entries
+  at builder-call time, so `plan.planned()` always describes the whole schedule
+  and an explicit-only plan draws no entropy at all. `only_between(from, to)`
+  confines faults to a half-open window of elapsed time measured on the app's
+  **injected** clock, so `Sim::advance` moves it and no wall-clock read leaks
+  in; an effect outside the window still consumes its ordinal and is recorded
+  as `suppressed` rather than silently vanishing.
+
+  `TestClient::fault_outcome().await` returns a `FaultOutcome` carrying the
+  seed, `fired` (effect, target, global and per-target ordinal, the injected
+  clock's `at` and `elapsed_ms`), `suppressed`, `unfired`, `server_errors`
+  projected from `reporting.rs`, and `final_state` seam totals. It is
+  `Serialize + Deserialize + PartialEq`, its `to_json_string()` is canonical
+  (declaration-order fields, no maps, no floats) and `fingerprint()` is an
+  FNV-1a 64 over it — so a scenario replayed 100× from one seed produces a
+  byte-identical record 100/100 times, which is exactly what the committed
+  determinism test asserts. The `async` on `fault_outcome` is load-bearing: it
+  settles autumn's detached error-report tasks with bounded cooperative yields
+  before snapshotting, without advancing the virtual clock.
+
+  A plan **composes** rather than replaces — it chains behind your own
+  `with_job_interceptor` / `with_db_interceptor`, the always-on job recorder,
+  transactional-DB isolation and `Sim::chaos`, with the injected failure
+  innermost so a user interceptor observes it exactly like a real handler
+  error. Attaching a plan also defaults the app's entropy to `SeededEntropy`
+  from the plan's seed (an explicit `with_entropy` still wins) and asserts the
+  two settings replay depends on — one job worker and reporting at
+  `sample_rate = 1.0` — instead of letting a second worker or a sampled-out 5xx
+  quietly break reproducibility.
+
+  Scope is deliberately narrow: test-only (there is no production fault
+  injection), DB checkout and job execution only (use `Chaos::smtp_faults` for
+  SMTP), and `TestClient::perform_enqueued_jobs` bypasses the
+  `intercept_execute` seam so job faults require `Sim::run_to_idle`.
+  `autumn/tests/integration/sim_fault_plan.rs` is the worked proof: a
+  `charge_card` job whose scenario fails at `max_attempts = 1` and passes at
+  `max_attempts = 3`, the same before/after shape as the retry-storm example.
+  See
+  [Simulation Testing → Authored fault scenarios](docs/guide/simulation-testing.md).
+
 - **One retention policy for every table Autumn creates (#1605):** every
   deployed Autumn app accumulated framework-owned data forever by default —
   job history, tracking records, idempotency responses, experiment
