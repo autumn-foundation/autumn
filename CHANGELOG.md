@@ -880,10 +880,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself changes the outcome only for input carrying no letter or number at
   all.
 
-  The same rule is now also applied in `PostHooks`, because the generated
-  `/api/posts` routes run the model's `#[validate]` attributes and the mutation
-  hooks — never the route-local validator — so `{"title": "***"}` could reach
-  the database through the API even with the form path fixed.
+  The same rule is now also applied in `PostHooks` and a new `SubredditHooks`,
+  because the generated `/api/posts` and `/api/subreddits` routes run the
+  model's `#[validate]` attributes and the mutation hooks — never the
+  route-local validator — so `{"title": "***"}` could reach the database
+  through the API even with the form path fixed. A model-level
+  `#[validate(custom(...))]` would not have been enough: `#[model]`
+  deliberately drops `custom` from the `UpdateModel` PATCH path (`Patch<T>`
+  implements only the declarative per-field traits), so it would have covered
+  an API create and left an API rename to `"***"` open. A hook sees the merged
+  model on both.
 
   Two adjacent corrections in the same example, both surfaced while fixing the
   above: the community-name length rule counted **bytes** (`str::len`) while
