@@ -866,7 +866,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (from the `CURRENT_TENANT` task-local, not from the wire, so a legitimate
   same-tenant retry still replays). Apps that do not use tenancy compute
   byte-identical keys to before, so no cached entry is invalidated on upgrade.
-  See `docs/security/2026-09-02-idempotency-tenant-scope/`.
+  For `[tenancy] source = "session"`, a handler that itself changes the
+  session's tenancy key (an organization switch) now has its deferred replay
+  alias keyed by the *finalized* tenant rather than the one resolved before the
+  handler ran, so a retry after such a switch still replays instead of
+  re-running the mutation. See
+  `docs/security/2026-09-02-idempotency-tenant-scope/`.
 
 ### Fixed
 

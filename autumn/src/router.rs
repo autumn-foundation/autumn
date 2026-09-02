@@ -4720,12 +4720,19 @@ fn apply_middleware(
     // `SessionLayer<ArcSessionStore>` so it joins the merged tuple below; see
     // that function for the boxed-future-per-store-op cost that buys the
     // nesting level back.
+    // Only when tenancy resolves the tenant from the session itself: a
+    // handler that mutates that session key (an org switch, a tenant-scoped
+    // login) needs its deferred idempotency alias keyed by the finalized
+    // tenant, not the one resolved before the handler ran.
+    let tenancy_session_key = (config.tenancy.enabled && config.tenancy.source == "session")
+        .then(|| Arc::<str>::from(config.tenancy.session_key.as_str()));
     let session_layer = crate::session::build_session_layer(
         &config.session,
         config.profile.as_deref(),
         session_store,
         signing_keys_opt,
         &state.entropy_arc(),
+        tenancy_session_key,
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 

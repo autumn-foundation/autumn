@@ -139,3 +139,40 @@ upgrade, and no chance of a mutation retried across a deploy executing twice.
 No public signature changes (`build_storage_key` and `StorageKeyContext` are
 private). Storage keys change only for requests that resolve a tenant, which is
 the point. `## [Unreleased] → Security` in `CHANGELOG.md`.
+
+## Follow-up: `[tenancy] source = "session"` alias staleness (same day, pre-merge)
+
+Codex's automated review on PR #2447 caught a correctness gap in the fix
+itself: `StorageKeyContext::tenant` is captured once, before the handler runs.
+For `header`/`subdomain`/`jwt` tenancy that's always correct — those sources
+never depend on session state a handler could mutate. For `source = "session"`
+it is not: a handler that changes the session's tenancy key mid-request (an
+organization switch, `examples/teams`'s `switch_organization` shape) leaves the
+deferred replay alias keyed by the *pre-switch* tenant. A retry presenting the
+same session (no id rotation required — `session.insert` alone is enough)
+resolves the *post-switch* tenant, misses the alias, and re-runs the mutation.
+
+This is a correctness regression (duplicate execution), not a cross-tenant
+leak — the retry lands in its own new slot rather than reading someone else's
+data — but it undermines the idempotency guarantee for a legitimate, session
+first-class pattern, and it ships in the same PR as the fix above, so it was
+closed before merge rather than filed as a separate issue.
+
+**Reproduction:** `session_tenancy_alias_uses_finalized_tenant_after_switch` in
+`autumn/tests/integration/idempotency_tenant_scope.rs`. Red run:
+`session-alias-follow-up-red.txt` (`left: "switched-2"`, `right: "switched-1"`
+— the retry re-executed the handler). Green run:
+`session-alias-follow-up-green.txt`.
+
+**Fix:** `SessionLayer` gains an internal (`pub(crate)`) `tenancy_session_key`,
+set by `build_session_layer`'s caller in `router.rs` only when
+`[tenancy] source == "session"`. When the session middleware finalizes a dirty
+session, it reads the tenancy key live from the just-saved session data and
+passes it to `add_deferred_session_replay_key` as a `tenant_override`, which
+`DeferredIdempotencyCommit::add_session_alias` uses in place of the captured
+tenant for that alias's storage key. The primary key for the request that
+performed the switch is untouched (it correctly reflects the tenant the
+*request itself* ran as); only the alias a future retry will compute is
+corrected. No public API changed — `SessionLayer::new`'s signature is
+unchanged, and the new field defaults to `None` (today's behavior) for every
+other tenancy source and for apps not using session tenancy.

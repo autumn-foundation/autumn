@@ -166,13 +166,13 @@ impl StorageKeyContext {
         }
     }
 
-    fn storage_key(&self, session_id: Option<&str>) -> String {
+    fn storage_key(&self, session_id: Option<&str>, tenant_override: Option<&str>) -> String {
         build_storage_key(
             &self.idempotency_key,
             self.method.as_str(),
             &self.target,
             session_id,
-            self.tenant.as_deref(),
+            tenant_override.or(self.tenant.as_deref()),
         )
     }
 }
@@ -1360,13 +1360,18 @@ impl DeferredIdempotencyCommit {
         Ok(())
     }
 
-    fn add_session_alias(&self, session_id: Option<&str>, primary_replay_after_guard_denial: bool) {
+    fn add_session_alias(
+        &self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(state) = guard.as_mut() else {
             return;
         };
 
-        let storage_key = state.key_context.storage_key(session_id);
+        let storage_key = state.key_context.storage_key(session_id, tenant_override);
         if primary_replay_after_guard_denial && storage_key != state.storage_key {
             state.primary_replay_after_guard_denial = true;
         }
@@ -1406,13 +1411,30 @@ pub(crate) fn finalize_deferred_session_commit(
     commit.commit_with_final_headers(response.headers())
 }
 
+/// Register the storage key a retry presenting `session_id` will compute as
+/// an alias of the primary key, so that retry replays the response instead of
+/// re-executing the mutation.
+///
+/// `tenant_override`, when set, is the tenant `[tenancy] source = "session"`
+/// will resolve for that retry — read live from the finalized session data
+/// rather than the tenant captured before the handler ran, which a handler
+/// that itself changes the tenancy session key (an org switch, a
+/// tenant-scoped login) may have just moved. `None` leaves the alias in the
+/// same tenant namespace as the primary key, which is correct for every
+/// other tenancy source and for a session mutation that doesn't touch the
+/// tenancy session key.
 pub(crate) fn add_deferred_session_replay_key(
     response: &Response<Body>,
     session_id: Option<&str>,
     primary_replay_after_guard_denial: bool,
+    tenant_override: Option<&str>,
 ) {
     if let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() {
-        commit.add_session_alias(session_id, primary_replay_after_guard_denial);
+        commit.add_session_alias(
+            session_id,
+            primary_replay_after_guard_denial,
+            tenant_override,
+        );
     }
 }
 
@@ -1452,9 +1474,9 @@ async fn prepare_idempotency_request(
     let (mut parts, body) = req.into_parts();
     let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
     let session_id = storage_session_id_for_parts(&parts).await;
-    let storage_key = key_context.storage_key(session_id.as_deref());
+    let storage_key = key_context.storage_key(session_id.as_deref(), None);
     let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts).and_then(|id| {
-        let key = key_context.storage_key(Some(&id));
+        let key = key_context.storage_key(Some(&id), None);
         (key != storage_key).then_some(key)
     });
     parts.extensions.insert(IdempotencyContext::new(

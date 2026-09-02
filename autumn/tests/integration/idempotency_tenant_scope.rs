@@ -18,7 +18,10 @@
 //! `idempotency_middleware::test_app_wide_generated_route_fails_closed_for_opaque_tenant_scope`).
 //! These tests hold the framework's own tenancy middleware to the same bar.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use autumn_web::config::AutumnConfig;
+use autumn_web::session::Session;
 use autumn_web::test::TestApp;
 use autumn_web::{post, public, routes};
 
@@ -160,5 +163,76 @@ async fn same_tenant_retry_still_replays() {
         retry.header("x-idempotent-replayed"),
         Some("true"),
         "a same-tenant retry must still be served from the idempotency cache"
+    );
+}
+
+static SWITCH_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Exempt from tenancy (`public_paths`) so a session with no tenant yet can
+/// reach it: establishes `tenant_id = "org-a"` for the rest of the test.
+#[post("/login")]
+#[public]
+async fn establish_session_tenant(session: Session) -> &'static str {
+    session.insert("tenant_id", "org-a").await;
+    "ok"
+}
+
+/// Mimics an organization-switch handler (`examples/teams`'s
+/// `switch_organization`): mutates the *same* session's tenancy key without
+/// rotating the session id, so the request that resolved "org-a" leaves a
+/// session now holding "org-b".
+#[post("/switch-org")]
+#[public]
+async fn switch_org(session: Session) -> String {
+    let calls = SWITCH_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    session.insert("tenant_id", "org-b").await;
+    format!("switched-{calls}")
+}
+
+/// Session-sourced tenancy: the tenant captured before the handler ran is
+/// stale the instant the handler itself changes the session's tenancy key.
+/// A retry presents the *same* session (no id rotation), which now resolves
+/// "org-b" — its deferred idempotency alias must be keyed by that finalized
+/// tenant, not the "org-a" the request started as, or the retry misses the
+/// cache and re-runs the switch a second time.
+#[tokio::test]
+async fn session_tenancy_alias_uses_finalized_tenant_after_switch() {
+    let mut config = tenancy_config("session");
+    config.tenancy.public_paths = vec!["/login".to_owned()];
+    let app = TestApp::new()
+        .config(config)
+        .idempotent()
+        .routes(routes![establish_session_tenant, switch_org])
+        .build();
+
+    let login = app.post("/login").body("{}").send().await;
+    login.assert_ok();
+
+    let first = app
+        .post("/switch-org")
+        .header("idempotency-key", "switch-key")
+        .body("{}")
+        .send()
+        .await;
+    first.assert_ok();
+    assert_eq!(first.text(), "switched-1");
+
+    let retry = app
+        .post("/switch-org")
+        .header("idempotency-key", "switch-key")
+        .body("{}")
+        .send()
+        .await;
+    retry.assert_ok();
+    assert_eq!(
+        retry.text(),
+        "switched-1",
+        "a retry after an org switch must replay the cached response instead of re-running \
+         the handler under the tenant it switched *to*"
+    );
+    assert_eq!(
+        retry.header("x-idempotent-replayed"),
+        Some("true"),
+        "the retry must be served from the idempotency cache"
     );
 }
