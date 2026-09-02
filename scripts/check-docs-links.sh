@@ -80,8 +80,12 @@ files = [
 # stopping at the first `)` would check `guide(v2` and fail on a file that
 # exists. One level of nesting covers any realistic path.
 BARE = r'(?:[^()\s]|\([^()\s]*\))+'
+# A link title may be delimited by ", ' or (). Accepting only double quotes
+# meant a link like `[x](missing.md 'why')` failed to match at all, so it was
+# skipped rather than checked — the gate reporting success on a broken link.
+TITLE = r'''(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?'''
 INLINE = re.compile(
-    r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|(' + BARE + r'))(?:\s+"[^"]*")?\s*\)'
+    r'\[(?:[^\]]*)\]\(\s*(?:<([^<>]*)>|(' + BARE + r'))' + TITLE + r'\s*\)'
 )
 REFDEF = re.compile(r'^ {0,3}\[[^\]]+\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 
@@ -98,7 +102,12 @@ RUSTDOC = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+$')
 FENCE = re.compile(r'^([ \t]*)(`{3,}|~{3,})')
 LIST_ITEM = re.compile(r'^([ \t]*)(?:[-*+]|\d{1,9}[.)])([ \t]+)(?=\S)')
 INDENT = re.compile(r'^[ \t]*')
-BLOCKQUOTE = re.compile(r'^[ \t]*(?:>[ \t]?)+')
+# A block-quote marker may carry up to three spaces of indentation. Allowing
+# more would let `    > ``` ` — an *indented code* line that merely starts
+# with a quote marker — have both its marker and its four spaces stripped,
+# turning a non-fence into a column-zero fence and reopening the swallowed-
+# paragraph bug the indent bound above exists to prevent.
+BLOCKQUOTE = re.compile(r'^ {0,3}(?:>[ \t]?)+')
 # A Setext underline, and the paragraph line it may promote to a heading.
 SETEXT = re.compile(r'^ {0,3}(=+|-+)[ \t]*$')
 NOT_PARAGRAPH = re.compile(r'^(?: {0,3}[#>|]| {0,3}(?:[-*+=]|\d{1,9}[.)])[ \t]|\s*$|\s{4,})')
@@ -252,8 +261,16 @@ for f in files:
         if atx:
             add(atx.group(2))
         elif SETEXT.match(line) and i > start and not NOT_PARAGRAPH.match(lines[i - 1]):
-            # A Setext underline promotes the paragraph line above it.
-            add(lines[i - 1])
+            # A Setext underline promotes the WHOLE paragraph above it, not
+            # just its last line: `First line / second line / ---` is one
+            # heading slugged `first-line-second-line`. Taking only the last
+            # line would both miss that anchor and mint `second-line`, which
+            # exists nowhere — and a phantom anchor makes a broken link look
+            # resolved.
+            j = i - 1
+            while j > start and not NOT_PARAGRAPH.match(lines[j - 1]):
+                j -= 1
+            add(" ".join(l.strip() for l in lines[j:i]))
 
     for m in re.finditer(r'<a\s+(?:id|name)="([^"]+)"', body):
         found.add(m.group(1))
@@ -472,6 +489,39 @@ self_test() {
   printf 'See [phantom](jobs.md#description-not-a-heading).\n' >> "$c19/docs/guide/mail.md"
   git -C "$c19" commit -qam frontmatter-closer
   check "front-matter closer is not a Setext heading" fail "$c19"
+
+  # An indented-code line that merely begins with a quote marker is not a
+  # fence. Stripping the marker together with its four spaces would turn it
+  # into a column-zero fence and swallow the paragraph between two of them.
+  local c20="$tmp/c20"; make_corpus "$c20"
+  printf '\n    > ```\n\nLive paragraph with [bad](missing.md).\n\n    > ```\n' \
+    >> "$c20/docs/guide/mail.md"
+  git -C "$c20" commit -qam quoted-indented-code
+  check "quote marker in indented code does not hide a live link" fail "$c20"
+
+  # CommonMark titles come in three delimiters. A link whose title the pattern
+  # cannot parse is not merely mis-parsed, it is skipped — so a broken target
+  # passes and the gate reports success.
+  local c21="$tmp/c21"; make_corpus "$c21"
+  printf "\nSee [x](missing.md 'a title') and [y](gone.md (a title)).\n" \
+    >> "$c21/docs/guide/mail.md"
+  git -C "$c21" commit -qam link-titles
+  check "broken link with a single-quoted title is caught" fail "$c21"
+
+  # A Setext underline promotes the whole paragraph above it, not its last
+  # line: taking only the last line misses `#first-line-second-line` AND mints
+  # `#second-line`, an anchor that exists nowhere.
+  local c22="$tmp/c22"; make_corpus "$c22"
+  printf '\nFirst line\nsecond line\n---\n' >> "$c22/docs/guide/jobs.md"
+  printf 'See [ok](jobs.md#first-line-second-line).\n' >> "$c22/docs/guide/mail.md"
+  git -C "$c22" commit -qam multiline-setext
+  check "multiline Setext heading resolves as one anchor" pass "$c22"
+
+  local c23="$tmp/c23"; make_corpus "$c23"
+  printf '\nFirst line\nsecond line\n---\n' >> "$c23/docs/guide/jobs.md"
+  printf 'See [phantom](jobs.md#second-line).\n' >> "$c23/docs/guide/mail.md"
+  git -C "$c23" commit -qam multiline-setext-phantom
+  check "last line alone is not a Setext anchor" fail "$c23"
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
