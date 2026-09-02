@@ -10,7 +10,11 @@ a fix as "a large, deliberate refactor" needing its own scoped PR.
 
 PR #2360 (merged 2026-08-28, `651929b`) shipped exactly that refactor: it put
 the `#[model]`/`#[repository]` codegen behind a `db` feature on
-`autumn-macros`, forwarded from `autumn-web`'s own `db` feature, default-off.
+`autumn-macros`. That feature is default-**on** in `autumn-macros`' own
+`Cargo.toml` (`default = ["db"]`, so a direct dependant or `cargo test -p
+autumn-macros` still gets the full macro surface) — the no-DB saving is
+specific to `autumn-web`, which depends on it with `default-features = false`
+and forwards its own `db` feature.
 
 **Falsifiable question:** does the merged fix actually bring the no-DB
 cold-start build under budget — or at least close most of the gap — on the
@@ -31,8 +35,11 @@ scheduled CI check with no other owner).
   measurement predicted.
 - **Conditions:** measured by the existing `Cold-Start Onboarding Gate`
   workflow (`.github/workflows/cold-start-latency.yml`), 3 runs, no-DB
-  `autumn new --daemon` shape, `ubuntu-latest` GitHub-hosted runner,
-  `CARGO_INCREMENTAL=0`.
+  `autumn new --daemon` shape, `ubuntu-latest` GitHub-hosted runner. The job
+  logs show `CARGO_INCREMENTAL=0` in the runtime environment, but neither the
+  workflow file nor `cold_start_driver::cold_build` sets it, so it comes from
+  a repo/org-level Actions variable outside this checkout — the local control
+  below does not set it and is not a full reproduction of that setting.
 - **Time box:** same day (one investigation session); riskiest assumption
   first — whether the crate-level fix actually reduces end-to-end wall time,
   rather than building anything new.
@@ -74,10 +81,19 @@ scheduled CI check with no other owner).
 | 2026-08-24, `d1ecb361` (pre-fix) | — | 120,422ms | 120,422ms | FAIL (100% over p95) |
 | 2026-08-31, `ef61ae44` (post-fix, first run after `651929b`) | 97,482ms | 105,371ms | 105,371ms | FAIL (75% over p95) |
 
-Individual post-fix runs: 105,371 / 95,988 / 97,482 ms. Improvement over the
-pre-fix baseline: **~12.5%** (120,422 → 105,371ms). CI's own auto-generated
-regression note on the post-fix run: *"the first clean compile got heavier. A
-new default dependency or feature likely bloated the from-scratch build."*
+Individual post-fix runs: 105,371 / 95,988 / 97,482 ms. Net change over the
+pre-fix baseline: **~12.5%** (120,422 → 105,371ms p95). This is a comparison
+across two different commits, a full week apart, on separate GitHub-hosted
+runners — not a controlled before/after of the fix alone, so intervening
+changes and runner variance are both live confounds; it should be read as
+"the net change over that week," not as the fix's isolated impact.
+
+The post-fix run's diagnosis line ("the first clean compile got heavier. A
+new default dependency or feature likely bloated the from-scratch build") is
+**not evidence of a specific cause** — it is static boilerplate that
+`build_diagnostics` (`autumn-cli/src/dev_loop_bench.rs:329-334`) prints for
+every `ColdStartHello`/`ColdStartDb` result that exceeds its budget,
+regardless of cause. No historical or per-dependency comparison backs it.
 
 **Control — isolated `autumn-macros` self-compile, this sandbox** (4-core,
 15GiB, rustc/cargo 1.94.1, deps pre-warmed, only the crate's own fingerprint
@@ -109,15 +125,20 @@ the workflow's creation, including the first run after the targeted fix
 merged. p95 105,371ms is still 75% over the 60,000ms budget.
 
 The interesting finding is *why*: the crate-level fix works exactly as
-designed (~51s saved, verified directly), but only ~15s of that shows up
-end-to-end (120,422 → 105,371ms). Roughly 35–40s of the expected saving did
-not reach the benchmark. CI's own regression note points at the likely
-cause — something added to the default (non-DB) build path grew in the same
-window. Candidate commits merged 2026-08-26 → 2026-08-28 that touch default
-features/dependencies and warrant a `cargo build --timings` diff next:
-`1fd6245` (Ledgered entities), `61bdd9c` (Web Push), `fec5221` (zero-downtime
-in-place upgrades). This assay did not bisect further — that is the
-follow-up, not this verification.
+designed (~51s saved, verified directly, in isolation), yet the net change in
+the full end-to-end build over the same week was only ~15s (120,422 →
+105,371ms). That gap is real, but this assay cannot attribute it to a
+specific cause — the two CI numbers span a week of unrelated commits and
+runner-to-runner variance, and (per the correction above) CI's own diagnosis
+line is generic boilerplate, not a finding. The honest statement is: net
+improvement was far short of what the isolated fix predicts, and isolating
+why requires a controlled comparison this assay did not run — e.g. building
+the *same* commit with `autumn-macros` `db` on vs. off end-to-end, or a
+`cargo build --timings` bisection across 2026-08-26 → 2026-08-28 (candidate
+commits worth checking first, because they touch default features/deps in
+that window: `1fd6245` Ledgered entities, `61bdd9c` Web Push, `fec5221`
+zero-downtime in-place upgrades — unconfirmed, not evidence of cause). That
+bisection is the follow-up, not this verification.
 
 No open issue or PR is currently tracking this gap; #2309 remains open and
 accurately reflects unresolved state, but nobody has checked the merged fix
