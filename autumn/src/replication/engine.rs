@@ -462,8 +462,8 @@ impl Replicator {
                 && let Some(pending) = header.as_ref()
             {
                 let shipped = self.ship(&wal_path, pending, wal_len)?;
-                report.segments += shipped.0;
-                report.bytes += shipped.1;
+                report.segments = report.segments.saturating_add(shipped.0);
+                report.bytes = report.bytes.saturating_add(shipped.1);
             }
             self.start_generation(&db)?;
             report.snapshot_taken = true;

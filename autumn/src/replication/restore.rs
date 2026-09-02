@@ -306,6 +306,43 @@ fn ms_to_utc(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
 }
 
+/// Refuse a latest restore whose chain stops short of the generation's head.
+///
+/// The chain walk in [`plan`] catches a hole in the middle — a later sequence
+/// exposes it — but a missing *tail* leaves a perfectly contiguous prefix, so a
+/// replica whose newest objects were lost (a lifecycle rule, a manual delete, a
+/// stale listing from an eventually-consistent endpoint) would restore
+/// "cleanly" without its newest commits, and periodic verification would agree.
+///
+/// Called only for a latest restore: a point-in-time restore stops short of the
+/// head by construction, which is the whole point of asking for one. A head that
+/// is absent (a replica written before this object existed) or older than what
+/// is present cannot fail the check — it can only under-claim.
+fn check_reaches_head(
+    destination: &dyn ReplicaDestination,
+    root: &str,
+    generation: &str,
+    segments: &[PlannedSegment],
+) -> Result<(), RestoreError> {
+    let head = match destination.get(&segment::head_key(root, generation)) {
+        Ok(bytes) => serde_json::from_slice::<segment::GenerationHead>(&bytes).ok(),
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(RestoreError::from(e)),
+    };
+    let Some(head) = head else {
+        return Ok(());
+    };
+    let found = segments.last().map(|s| (s.index, s.seq));
+    if found.is_none_or(|f| f < (head.index, head.seq)) {
+        return Err(RestoreError::TruncatedTail {
+            generation: generation.to_owned(),
+            head: (head.index, head.seq),
+            found,
+        });
+    }
+    Ok(())
+}
+
 /// Decide what to restore, reading only the destination's key listing.
 ///
 /// `target` is the instant to restore to; `None` means "the latest replicated
@@ -415,33 +452,8 @@ pub fn plan(
         });
     }
 
-    // A latest restore must reach the generation's own head. The chain walk
-    // above catches a hole in the middle — a later sequence exposes it — but a
-    // missing *tail* leaves a perfectly contiguous prefix, so a replica whose
-    // newest objects were lost (a lifecycle rule, a manual delete, a stale
-    // listing from an eventually-consistent endpoint) would restore "cleanly"
-    // without its newest commits, and periodic verification would agree.
-    //
-    // Only for a latest restore: a point-in-time restore stops short of the head
-    // by construction, which is the whole point of asking for one. A head that
-    // is absent (a replica written before this object existed) or older than
-    // what is present cannot fail the check — it can only under-claim.
     if target.is_none() {
-        let head = match destination.get(&segment::head_key(root, &generation)) {
-            Ok(bytes) => serde_json::from_slice::<segment::GenerationHead>(&bytes).ok(),
-            Err(e) if e.is_not_found() => None,
-            Err(e) => return Err(RestoreError::from(e)),
-        };
-        if let Some(head) = head {
-            let found = segments.last().map(|s| (s.index, s.seq));
-            if found.is_none_or(|f| f < (head.index, head.seq)) {
-                return Err(RestoreError::TruncatedTail {
-                    generation,
-                    head: (head.index, head.seq),
-                    found,
-                });
-            }
-        }
+        check_reaches_head(destination, root, &generation, &segments)?;
     }
 
     let generation_started_at = ms_to_utc(generation_ms);
