@@ -1182,7 +1182,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../reference/widgets.md), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
