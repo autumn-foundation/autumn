@@ -7169,7 +7169,7 @@ fn agent_authority_route_summary(
     // spec cannot disagree about where a route lives.
     let path = scope_prefix.map_or_else(
         || route.path.to_string(),
-        |prefix| crate::router::join_nested_path(prefix, &route.path),
+        |prefix| crate::router::join_nested_path(prefix, route.path),
     );
     let exposed_by = crate::agent_authority::manifest::mcp_exposure(
         &crate::agent_authority::manifest::McpExposureInput {
